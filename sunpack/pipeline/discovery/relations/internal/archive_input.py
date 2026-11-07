@@ -37,6 +37,7 @@ def archive_input_for_group(group: CandidateGroup) -> ArchiveInputDescriptor | N
                 ) for slot in layout) for layout in raw["layouts"]),
                 raw.get("head_size_from_total"),
                 raw.get("minimum_size"),
+                tuple(tuple(pair) for pair in raw.get("tail_totals", ())),
             )
             return replace(descriptor, volume_attempts=plan, analysis={"volume_completeness": "unknown"})
         analysis = {"volume_completeness": "missing" if metadata.get("volume_set_incomplete") else (

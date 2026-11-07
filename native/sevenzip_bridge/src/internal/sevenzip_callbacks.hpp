@@ -45,6 +45,46 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
+    // Callback streams have independent trace storage; only the first failure
+    // is published atomically. Decoder/prefetch threads never share trace fields.
+    class VolumeInStream final : public CMyUnknownImp, public IInStream {
+        Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+    public:
+        VolumeInStream(const std::wstring& path, const ExtractInputRange* range,
+                       InputPrefetchConfig prefetch, std::shared_ptr<std::atomic<HRESULT>> error)
+            : error_(std::move(error)) {
+            if (range) {
+                auto* stream = new MultiRangeInStream({*range}, &trace_, prefetch, true);
+                stream_ = stream;
+                opened_ = stream->is_open();
+            } else {
+                auto* stream = new FileInStream(path, &trace_, L"file", prefetch);
+                stream_ = stream;
+                opened_ = stream->is_open();
+            }
+            if (!opened_) record(trace_.last_hresult ? static_cast<HRESULT>(trace_.last_hresult) : E_FAIL);
+        }
+        bool is_open() const { return opened_; }
+        HRESULT STDMETHODCALLTYPE Read(void* data, UInt32 size, UInt32* processed) SUP7Z_NOEXCEPT override {
+            return record(stream_->Read(data, size, processed));
+        }
+        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 origin, UInt64* position) SUP7Z_NOEXCEPT override {
+            return record(stream_->Seek(offset, origin, position));
+        }
+    private:
+        HRESULT record(HRESULT hr) {
+            if (FAILED(hr) && hr != E_ABORT) {
+                HRESULT expected = S_OK;
+                error_->compare_exchange_strong(expected, hr, std::memory_order_relaxed);
+            }
+            return hr;
+        }
+        ExtractInputTrace trace_;
+        std::shared_ptr<std::atomic<HRESULT>> error_;
+        CMyComPtr<IInStream> stream_;
+        bool opened_ = false;
+    };
+
     class OpenCallback final : public CMyUnknownImp, public IArchiveOpenCallback, public IArchiveOpenVolumeCallback, public ICryptoGetTextPassword
     {
         Z7_COM_UNKNOWN_IMP_3(IArchiveOpenCallback, IArchiveOpenVolumeCallback, ICryptoGetTextPassword)
@@ -182,17 +222,11 @@ namespace sunpack::sevenzip
 
             const auto index = found->second;
             const auto &path = part_paths_[index];
-            bool opened = false;
-            CMyComPtr<IInStream> stream_holder;
-            if (index < part_ranges_.size()) {
-                auto *stream = new MultiRangeInStream({part_ranges_[index]}, nullptr, volume_prefetch_config_);
-                stream_holder = CMyComPtr<IInStream>(stream);
-                opened = stream->is_open();
-            } else {
-                auto *stream = new FileInStream(path, nullptr, L"file", volume_prefetch_config_);
-                stream_holder = CMyComPtr<IInStream>(stream);
-                opened = stream->is_open();
-            }
+            auto* stream = new VolumeInStream(path,
+                index < part_ranges_.size() ? &part_ranges_[index] : nullptr,
+                volume_prefetch_config_, input_error_);
+            CMyComPtr<IInStream> stream_holder(stream);
+            const bool opened = stream->is_open();
             if (!opened) {
                 volume_open_failed_ = true;
                 failed_volume_name_ = std::filesystem::path(path).filename().wstring();
@@ -207,6 +241,7 @@ namespace sunpack::sevenzip
         }
 
         bool missing_volume_requested() const { return missing_volume_requested_; }
+        HRESULT input_error() const { return input_error_->load(std::memory_order_relaxed); }
         bool volume_open_failed() const { return volume_open_failed_; }
         bool password_requested() const { return password_requested_; }
         const std::wstring &missing_volume_name() const { return missing_volume_name_; }
@@ -248,6 +283,7 @@ namespace sunpack::sevenzip
 
         std::map<std::wstring, std::size_t> volume_paths_;
 
+        std::shared_ptr<std::atomic<HRESULT>> input_error_ = std::make_shared<std::atomic<HRESULT>>(S_OK);
         bool missing_volume_requested_ = false;
         bool volume_open_failed_ = false;
         bool password_requested_ = false;

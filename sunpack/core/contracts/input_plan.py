@@ -187,6 +187,12 @@ class InputRecovery:
             # New analysis may add advisory facts without changing readable
             # bytes. Completed output is reusable only for the exact mapping.
             if previous.complete:
+                if (source_generation(previous.input, generation) == previous.generation
+                        and node.descriptor.admits_selected_volumes(previous.input.descriptor)):
+                    # Compare only the proven winner's dependencies. Losing or
+                    # newly arrived alternatives do not invalidate its output.
+                    node = replace(node, descriptor=previous.input.descriptor)
+                    current = source_generation(node, generation)
                 same_mapping = (node.descriptor.open_mode == previous.input.descriptor.open_mode
                                 and node.descriptor.parts == previous.input.descriptor.parts
                                 and node.descriptor.extents == previous.input.descriptor.extents)

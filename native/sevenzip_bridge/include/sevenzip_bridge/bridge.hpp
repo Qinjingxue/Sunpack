@@ -131,6 +131,7 @@ struct ExtractInputTrace {
     int last_hresult = 0;
     int last_win32_error = 0;
     bool read_error = false;
+    int read_hresult = 0;
     std::wstring last_source_path;
 };
 

@@ -169,7 +169,11 @@ impl BucketView<'_> {
     /// Only raw chunks may use sparse filename labels as relative order.
     /// Internal RAR/ZIP identities remain fixed. Work on the sparse ordered map,
     /// never enumerate 1..largest_label or try permutations of bucket members.
-    fn finish_mapping(&self, mut mapping: VolumeAssignment) -> Option<VolumeAssignment> {
+    pub(super) fn finish_mapping(
+        &self,
+        mut mapping: VolumeAssignment,
+        domain_slack: u64,
+    ) -> Option<VolumeAssignment> {
         if !self.mapping_roles_legal(&mapping) {
             return None;
         }
@@ -227,7 +231,27 @@ impl BucketView<'_> {
             }
         }
         let labels = std::mem::replace(&mut mapping.slots, compact);
-        if !self.mapping_roles_legal(&mapping) || !self.complete(&mapping) {
+        // A domain representative uses maximum extents. A different choice
+        // may close the byte count; keep that hypothesis without enumerating
+        // combinations. Unique mappings have zero slack and retain exact checks.
+        let possible_size = domain_slack > 0
+            && self.format == "7z"
+            && mapping
+                .slots
+                .get(&1)
+                .and_then(|i| self.rows[*i].anchor.as_ref())
+                .filter(|head| head.confidence == "strong")
+                .and_then(|head| {
+                    head.expected_logical_size?
+                        .checked_sub(head.structure_offset.unwrap_or(0))
+                })
+                .zip(mapping.slots.values().try_fold(0u64, |total, i| {
+                    total.checked_add(self.rows[*i].anchor.as_ref()?.payload_size())
+                }))
+                .is_some_and(|(expected, maximum)| {
+                    expected <= maximum && expected >= maximum.saturating_sub(domain_slack)
+                });
+        if !self.mapping_roles_legal(&mapping) || !(self.complete(&mapping) || possible_size) {
             mapping.slots = labels;
         }
         Some(mapping)
@@ -307,7 +331,7 @@ impl BucketView<'_> {
         if inferred == 0 {
             return None;
         }
-        self.finish_mapping(out)
+        self.finish_mapping(out, 0)
     }
 
     fn solve_loose_numeric(
@@ -352,7 +376,7 @@ impl BucketView<'_> {
         if numeric::solve(&mut out, domains)? {
             return Err(RelationFailureReason::AmbiguousVolumeMapping);
         }
-        self.finish_mapping(out)
+        self.finish_mapping(out, 0)
             .ok_or(RelationFailureReason::StructuralConflict)
     }
 

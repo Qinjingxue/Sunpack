@@ -81,6 +81,7 @@ class VolumeAttemptPlan:
     layouts: tuple[tuple[VolumeAttemptSlot, ...], ...]
     head_size_from_total: int | None = None
     minimum_size: int | None = None
+    tail_totals: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.sources or not self.layouts:
@@ -105,18 +106,21 @@ class VolumeAttemptPlan:
             result["head_size_from_total"] = self.head_size_from_total
         if self.minimum_size is not None:
             result["minimum_size"] = self.minimum_size
+        if self.tail_totals:
+            result["tail_totals"] = [{"source": source, "total": total} for source, total in self.tail_totals]
         return result
 
     def remap(self, mapper) -> "VolumeAttemptPlan":
         return VolumeAttemptPlan(tuple(InputExtent(mapper(s.path), s.start, s.end) for s in self.sources),
-                                 self.layouts, self.head_size_from_total, self.minimum_size)
+                                 self.layouts, self.head_size_from_total, self.minimum_size, self.tail_totals)
 
     @classmethod
     def from_dict(cls, raw: dict) -> "VolumeAttemptPlan":
         return cls(tuple(InputExtent(**source) for source in raw["sources"]),
                    tuple(tuple(VolumeAttemptSlot(int(s["number"]), s["canonical_name"], tuple(s["choices"]))
                                for s in layout["slots"]) for layout in raw["layouts"]),
-                   raw.get("head_size_from_total"), raw.get("minimum_size"))
+                   raw.get("head_size_from_total"), raw.get("minimum_size"),
+                   tuple((pair["source"], pair["total"]) for pair in raw.get("tail_totals", ())))
 
 
 @dataclass(frozen=True)
@@ -224,15 +228,46 @@ class ArchiveInputDescriptor:
                 raise ValueError("worker selected an unplanned volume")
             parts.append(ArchiveInputPart(plan.sources[source], "first" if slot.number == 1 else "member",
                                           slot.number, slot.canonical_name))
-        if plan.head_size_from_total is not None:
+        total = next((total for source, total in plan.tail_totals if source == sources[-1]),
+                     plan.head_size_from_total)
+        if total is not None:
             # Execute the Rust extent formula, exactly as the worker did.
-            length = plan.head_size_from_total - sum(p.extent.end - p.extent.start for p in parts[1:])
+            length = total - sum(p.extent.end - p.extent.start for p in parts[1:])
             head = parts[0].extent
             if length <= 0 or head.end is None or head.start + length > head.end:
                 raise ValueError("invalid selected carrier extent")
             parts[0] = replace(parts[0], extent=InputExtent(head.path, head.start, head.start + length))
         return replace(self, parts=parts, volume_attempts=None,
                        analysis={**self.analysis, "volume_completeness": "complete"})
+
+    def admits_selected_volumes(self, selected: "ArchiveInputDescriptor") -> bool:
+        """Match a checkpoint against domains without enumerating compositions."""
+        plan = self.volume_attempts
+        if (plan is None or selected.volume_attempts is not None
+                or self.open_mode != selected.open_mode or self.format_hint != selected.format_hint
+                or self.volume_style != selected.volume_style or self.extents != selected.extents):
+            return False
+        for index, layout in enumerate(plan.layouts):
+            if len(layout) != len(selected.parts):
+                continue
+            sources = []
+            for slot, part in zip(layout, selected.parts):
+                if slot.number != part.volume_number or slot.canonical_name != part.canonical_name:
+                    break
+                source = next((i for i in slot.choices if plan.sources[i] == part.extent or (
+                    slot.number == 1 and (plan.head_size_from_total is not None or plan.tail_totals)
+                    and plan.sources[i].path == part.path and plan.sources[i].start == part.extent.start)), None)
+                if source is None:
+                    break
+                sources.append(source)
+            if len(sources) == len(layout):
+                try:
+                    candidate = self.select_volumes({"layout": index, "sources": sources})
+                except ValueError:
+                    continue
+                if candidate.parts == selected.parts:
+                    return True
+        return False
 
     def with_path_mapping(self, mapper) -> "ArchiveInputDescriptor":
         parts = [

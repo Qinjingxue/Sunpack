@@ -16,6 +16,7 @@ struct VolumeAttemptPlan {
     unsigned long long head_size_from_total = 0;
     unsigned long long minimum_size = 0;
     std::vector<ExtractInputRange> sources;
+    std::vector<unsigned long long> tail_totals;
     std::vector<std::vector<VolumeAttemptSlot>> layouts;
 };
 

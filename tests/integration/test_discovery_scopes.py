@@ -488,8 +488,13 @@ def test_complete_same_named_local_volume_sets_remain_independent(tmp_path, arch
             async with PipelineEngine(config) as engine:
                 return (await engine.run([str(root)], recursive=True)).summary
         summary = asyncio.run(execute())
-        assert summary.success_count == len(expected)
-        assert bool(summary.failures) == (layout != "unique")
+        # Competing tails now form a worker plan rather than an ambiguity
+        # blocker. Raw ZIP's two-head inference remains a separate boundary.
+        trials = layout == "ambiguous" and archive_format in {"7z", "rar"}
+        if trials:
+            assert next(task for task in tasks if Path(task.main_path).parent.name == "second").archive_input().volume_attempts
+        assert summary.success_count == len(expected) + int(trials)
+        assert bool(summary.failures) == (layout != "unique" and not trials)
         if layout == "missing":
             # Force the ordering where another task has cleaned up its complete
             # local set before the incomplete task retries from the old snapshot.

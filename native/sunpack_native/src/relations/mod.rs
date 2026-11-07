@@ -252,6 +252,15 @@ impl NativeRelationGroup {
         Ok(dict)
     }
 
+    pub(crate) fn speculative_paths(&self) -> impl Iterator<Item = &str> {
+        let plan = match self {
+            Self::Proposal(validation, _) => validation.attempts.as_ref(),
+            _ => None,
+        };
+        plan.into_iter()
+            .flat_map(|plan| plan.sources.iter().map(|source| source.path.as_str()))
+    }
+
     pub(crate) fn candidate_data(&self) -> RelationCandidateData<'_> {
         match self {
             Self::Ordinary(row, confirmed) => {

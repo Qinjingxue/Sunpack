@@ -40,3 +40,37 @@ def test_one_input_can_wait_for_password_and_volumes_without_replaying_completed
     assert [node.input_id for node in selected] == [pending.input_id]
     assert carried.output_dir == recovery.output_dir
     assert next(item for item in carried.checkpoints if item.input.input_id == complete.input_id).complete
+
+
+def test_selected_volume_checkpoint_reuses_winner_and_preserves_shared_cleanup(tmp_path):
+    # Completed winners and pending plans differ by design. This covers both
+    # reuse after password retry and a completed sibling's physical dependency.
+    from sunpack.core.contracts.archive_input import VolumeAttemptPlan, VolumeAttemptSlot
+    from sunpack.core.contracts.tasks import ArchiveTask
+    paths = [str(tmp_path / name) for name in ("head", "winner", "shared", "pending")]
+    extents = tuple(InputExtent(path, 0, 100) for path in paths)
+    plan = VolumeAttemptPlan(extents[:3], ((VolumeAttemptSlot(1, "x.001", (0,)),
+                                           VolumeAttemptSlot(2, "x.002", (1, 2))),),
+                             head_size_from_total=180)
+    descriptor = ArchiveInputDescriptor(paths[0], "native_volumes", "7z", volume_style="numeric_suffix",
+        parts=[ArchiveInputPart(extents[0], "first", 1, "x.001")], volume_attempts=plan)
+    discovered = LogicalArchiveInput(descriptor)
+    winner = replace(discovered, descriptor=descriptor.select_volumes({"layout": 0, "sources": [0, 1]}))
+    generation = tuple((path_key(path), "generation") for path in paths)
+    recovery = InputRecovery((InputCheckpoint(winner, generation[:2], "out/winner", complete=True),), "out", 2)
+    # Alternative replacement does not replay the selected unchanged bytes.
+    changed_loser = (*generation[:2], (path_key(paths[2]), "new generation"), generation[3])
+    active, retained = recovery.select((discovered,), changed_loser, password_changed=True)
+    assert not active and retained.output_dir == "out"
+    assert retained.checkpoints[0].input.descriptor == winner.descriptor
+    changed_winner = (generation[0], (path_key(paths[1]), "new generation"), *generation[2:])
+    assert recovery.select((discovered,), changed_winner, password_changed=False)[0] == (discovered,)
+    removed_winner = replace(discovered, descriptor=replace(descriptor, volume_attempts=replace(plan,
+        layouts=((plan.layouts[0][0], VolumeAttemptSlot(2, "x.002", (2,))),))))
+    assert recovery.select((removed_winner,), generation, password_changed=False)[0]
+
+    sibling = LogicalArchiveInput(ArchiveInputDescriptor(paths[2], format_hint="zip"))
+    task = ArchiveTask.from_archive_input(descriptor, discovery_source="test")
+    task.recovery = InputRecovery((InputCheckpoint(sibling, (generation[2],), "out/sibling", complete=True),))
+    task.select_volumes(discovered, winner.descriptor)
+    assert set(task.cleanup_parts) == set(paths[:3])

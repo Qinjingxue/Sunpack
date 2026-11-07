@@ -239,9 +239,10 @@ impl NativeEmbeddedBatch {
         table: &NativeCandidateTable,
         outcomes: impl Iterator<Item = (usize, EmbeddedOutcome)>,
     ) -> PyResult<Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>> {
-        outcomes
-            .into_iter()
-            .map(|(index, outcome)| match outcome {
+        let mut projected = Vec::new();
+        for (index, outcome) in outcomes {
+            let claimed = self.excluded.contains(&path_key(&table.summary(index)?.0));
+            let row: PyResult<_> = match outcome {
                 EmbeddedOutcome::Residual => {
                     unreachable!("residuals are filtered before projection")
                 }
@@ -251,7 +252,16 @@ impl NativeEmbeddedBatch {
                     Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
                 }
                 EmbeddedOutcome::Scan(scan) => {
-                    let anchors = scan.relation_anchors();
+                    let mut anchors = scan.relation_anchors();
+                    if claimed {
+                        // Existing volume hypotheses remain authoritative.
+                        // Independent encrypted archives still use the normal
+                        // boundary/password resolution before projection.
+                        anchors.retain(|a| a.standalone || (!a.multivolume && a.needs_password));
+                        if anchors.is_empty() && !scan.has_independent_archive() {
+                            continue;
+                        }
+                    }
                     if !anchors.is_empty() {
                         let independent = scan.has_independent_archive();
                         for mut anchor in anchors {
@@ -270,8 +280,10 @@ impl NativeEmbeddedBatch {
                         Ok((index, 1, "", Some(scan.to_py_dict(py)?)))
                     }
                 }
-            })
-            .collect()
+            };
+            projected.push(row?);
+        }
+        Ok(projected)
     }
 }
 
@@ -765,6 +777,16 @@ impl NativeCandidateTable {
             self.filesystem_routed = true;
             self.targets = targets.map(FileTargets::new);
             let groups = self.relation_groups(raw_snapshot, filtered_snapshot, None, None);
+            let speculative: HashSet<_> = groups
+                .iter()
+                .flat_map(|group| {
+                    let head = group.candidate_data().entry_path;
+                    group
+                        .speculative_paths()
+                        .filter(move |path| *path != head)
+                        .map(path_key)
+                })
+                .collect();
             let selected = self
                 .targets
                 .as_ref()
@@ -779,7 +801,8 @@ impl NativeCandidateTable {
             );
             for &row in &filtered_snapshot.rows {
                 if !filtered_snapshot.table.is_dirs[row]
-                    && filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
+                    && (filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
+                        || speculative.contains(&path_key(&filtered_snapshot.table.paths[row])))
                 {
                     self.rows
                         .push(Candidate::File(Arc::clone(&filtered_snapshot.table), row));
@@ -1027,6 +1050,7 @@ impl NativeCandidateTable {
         cancellation.check()?;
         let mut routes = NativeDiscoveryRoutes::default();
         let mut claimed: HashSet<String> = HashSet::new();
+        let mut speculative = HashSet::new();
         let mut blocked: HashSet<String> = HashSet::new();
         for (index, row) in self.rows.iter().enumerate() {
             let Candidate::Relation(group) = row else {
@@ -1050,6 +1074,12 @@ impl NativeCandidateTable {
                     data.parts()
                         .chain(data.companions.iter().map(String::as_str))
                         .map(|path| path_key(path)),
+                );
+                speculative.extend(
+                    group
+                        .speculative_paths()
+                        .filter(|path| *path != data.entry_path)
+                        .map(path_key),
                 );
                 routes.relation_resolved.push(index);
                 routes.relation_events.push((index, 1));
@@ -1146,7 +1176,9 @@ impl NativeCandidateTable {
         // residuals, then Detection residuals.
         for (index, row) in self.rows.iter().enumerate() {
             if let Candidate::File(table, file_index) = row {
-                if table.file_routes[*file_index] == FILE_ROUTE_RESIDUAL {
+                if speculative.contains(&path_key(&table.paths[*file_index])) {
+                    routes.embedded.push(index);
+                } else if table.file_routes[*file_index] == FILE_ROUTE_RESIDUAL {
                     let key = path_key(&table.paths[*file_index]);
                     if !claimed.contains(&key) && !blocked.contains(&key) {
                         routes.embedded.push(index);

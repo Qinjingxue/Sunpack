@@ -137,6 +137,9 @@ class ArchiveTask:
         self.inputs = tuple(replace(item, descriptor=descriptor) if item.input_id == node.input_id else item
                             for item in self.inputs)
         retained = {path_key(path) for item in self.inputs for path in item.source_paths}
+        retained.update(path_key(path) for checkpoint in self.recovery.checkpoints
+                        if checkpoint.input.input_id != node.input_id
+                        for path in checkpoint.input.source_paths)
         unused = rejected - retained
         self.cleanup_parts = [path for path in self.cleanup_parts if path_key(path) not in unused]
         if self._archive_input is node.descriptor:

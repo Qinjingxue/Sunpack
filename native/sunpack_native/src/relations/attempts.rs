@@ -11,6 +11,7 @@ pub(super) struct VolumeAttempts {
     pub layouts: Vec<Vec<(u32, Vec<usize>)>>,
     pub head_size_from_total: Option<u64>,
     pub minimum_size: Option<u64>,
+    pub tail_totals: Vec<(usize, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,8 +32,30 @@ impl AttemptSource {
     }
 }
 
+fn zip_total(anchor: &VolumeAnchor) -> Option<u64> {
+    let directory = anchor.zip_directory.as_ref()?;
+    directory
+        .offset
+        .checked_add(directory.size)?
+        .checked_add(anchor.extent_end().checked_sub(directory.end)?)
+}
+
+fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>, bool) {
+    let trim = head.payload_end.is_none()
+        && (head.carrier_limit.is_some() || head.structure_offset.unwrap_or(0) > 0);
+    let minimum = (format == "7z")
+        .then(|| {
+            head.expected_logical_size
+                .and_then(|end| end.checked_sub(head.structure_offset.unwrap_or(0)))
+        })
+        .flatten();
+    (minimum.filter(|_| trim), minimum, trim)
+}
+
 pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts {
     let proposal = &validation.proposal;
+    let head = &validation.anchors[&path_key(&proposal.volumes[0].0)];
+    let (head_size_from_total, minimum_size, trim) = head_geometry(head, &proposal.format);
     VolumeAttempts {
         sources: proposal
             .volumes
@@ -45,8 +68,20 @@ pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts
             .enumerate()
             .map(|(i, part)| (part.1, vec![i]))
             .collect()],
-        head_size_from_total: None,
-        minimum_size: None,
+        head_size_from_total,
+        minimum_size,
+        tail_totals: if trim && proposal.format == "zip" && proposal.style != "zip_spanned" {
+            proposal
+                .volumes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, part)| {
+                    zip_total(&validation.anchors[&path_key(&part.0)]).map(|total| (index, total))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -101,11 +136,11 @@ pub(super) fn expand_carrier_sources(
                     && a.structure_offset.unwrap_or(0) != source.start
                     && a.internal_volume_number != Some(1)
             })
-            .map(|a| AttemptSource::new(&source.path, a))
+            .map(|a| (AttemptSource::new(&source.path, a), zip_total(a)))
             .collect();
         if !replacements.is_empty() {
             let mut choices = vec![i];
-            for source in replacements {
+            for (source, total) in replacements {
                 let index = plan
                     .sources
                     .iter()
@@ -114,6 +149,13 @@ pub(super) fn expand_carrier_sources(
                         plan.sources.push(source);
                         plan.sources.len() - 1
                     });
+                if !plan.tail_totals.is_empty()
+                    && !plan.tail_totals.iter().any(|(i, _)| *i == index)
+                {
+                    if let Some(total) = total {
+                        plan.tail_totals.push((index, total));
+                    }
+                }
                 if !choices.contains(&index) {
                     choices.push(index);
                 }
@@ -331,6 +373,68 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     });
                     choices.dedup();
                 }
+                if channel.is_some()
+                    && (view.format == "7z" || (view.format == "zip" && !view.spanned()))
+                {
+                    let represented: HashSet<_> = slots.values().flatten().copied().collect();
+                    let mapping = VolumeAssignment {
+                        slots: slots
+                            .iter()
+                            .map(|(&n, choices)| {
+                                (
+                                    n,
+                                    *choices
+                                        .iter()
+                                        .max_by_key(|i| {
+                                            view.rows[**i]
+                                                .anchor
+                                                .as_ref()
+                                                .map_or(0, |a| a.payload_size())
+                                        })
+                                        .unwrap(),
+                                )
+                            })
+                            .collect(),
+                        unresolved: indexes
+                            .iter()
+                            .copied()
+                            .filter(|i| !represented.contains(i))
+                            .collect(),
+                        ..Default::default()
+                    };
+                    let slack = slots.values().fold(0u64, |total, choices| {
+                        let sizes = || {
+                            choices.iter().map(|i| {
+                                view.rows[*i]
+                                    .anchor
+                                    .as_ref()
+                                    .map_or(0, |a| a.payload_size())
+                            })
+                        };
+                        total.saturating_add(sizes().max().unwrap() - sizes().min().unwrap())
+                    });
+                    if let Some(normalized) = local.finish_mapping(mapping, slack) {
+                        if normalized
+                            .slots
+                            .keys()
+                            .copied()
+                            .zip(1u32..)
+                            .all(|(n, rank)| n == rank)
+                            && slots.values().zip(1u32..).all(|(choices, rank)| {
+                                choices.iter().all(|i| {
+                                    view.facts[i].exact_slot.is_none_or(|n| n == rank)
+                                        && view.legal(*i, rank, Some(slots.len() as u32))
+                                })
+                            })
+                        {
+                            slots = slots
+                                .into_values()
+                                .zip(1u32..)
+                                .map(|(choices, rank)| (rank, choices))
+                                .collect();
+                        }
+                    }
+                }
                 let layout: Vec<_> = slots.into_iter().collect();
                 if !layouts.contains(&layout) {
                     layouts.push(layout);
@@ -373,45 +477,23 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         // No speculative bytes are parsed again here.
         proposal.status = ProposalStatus::Valid;
         let head_anchor = view.rows[head].anchor.as_ref().unwrap();
-        let head_size_from_total = if head_anchor.payload_end.is_none()
-            && (head_anchor.carrier_limit.is_some()
-                || head_anchor.structure_offset.unwrap_or(0) > 0)
-        {
-            if view.format == "7z" {
-                head_anchor
-                    .expected_logical_size
-                    .and_then(|end| end.checked_sub(head_anchor.structure_offset.unwrap_or(0)))
-            } else if view.format == "zip" && !view.spanned() {
-                let mut tails = sources
-                    .iter()
-                    .filter_map(|i| view.rows[*i].anchor.as_ref())
-                    .filter(|a| a.zip_directory.is_some());
-                let total = tails.next().and_then(|a| {
-                    let d = a.zip_directory.as_ref()?;
-                    d.offset
-                        .checked_add(d.size)?
-                        .checked_add(a.extent_end().checked_sub(d.end)?)
-                });
-                if tails.next().is_none() {
-                    total
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        let (head_size_from_total, minimum_size, trim_head) =
+            head_geometry(head_anchor, view.format);
+        let tail_totals = if trim_head && view.format == "zip" && !view.spanned() {
+            sources
+                .iter()
+                .enumerate()
+                .filter_map(|(index, i)| {
+                    zip_total(view.rows[*i].anchor.as_ref()?).map(|total| (index, total))
+                })
+                .collect()
         } else {
-            None
+            Vec::new()
         };
         proposal.attempts = Some(VolumeAttempts {
             head_size_from_total,
-            minimum_size: (view.format == "7z")
-                .then(|| {
-                    head_anchor
-                        .expected_logical_size
-                        .and_then(|end| end.checked_sub(head_anchor.structure_offset.unwrap_or(0)))
-                })
-                .flatten(),
+            tail_totals,
+            minimum_size,
             sources: sources
                 .iter()
                 .map(|i| {
@@ -443,6 +525,9 @@ pub(super) fn to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResu
     }
     if let Some(size) = attempts.minimum_size {
         result.set_item("minimum_size", size)?;
+    }
+    if !attempts.tail_totals.is_empty() {
+        result.set_item("tail_totals", &attempts.tail_totals)?;
     }
     let sources = PyList::empty(py);
     for extent in &attempts.sources {

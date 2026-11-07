@@ -579,6 +579,16 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
         attempts.uint_field("head_size_from_total", &plan.head_size_from_total);
         attempts.uint_field("minimum_size", &plan.minimum_size);
         plan.sources = parse_ranges_from_objects(attempts.object_array_field("sources"), "");
+        for (auto raw : attempts.object_array_field("tail_totals")) {
+            unsigned long long source = 0, total = 0;
+            const JsonObjectView entry(raw);
+            if (!entry.uint_field("source", &source) || source >= plan.sources.size() ||
+                !entry.uint_field("total", &total) || !total) {
+                input.validation_error = "invalid volume tail total"; return input;
+            }
+            if (plan.tail_totals.empty()) plan.tail_totals.resize(plan.sources.size());
+            plan.tail_totals[source] = total;
+        }
         for (auto raw_layout : attempts.object_array_field("layouts")) {
             std::vector<sunpack::sevenzip::VolumeAttemptSlot> slots;
             unsigned long long previous = 0;
@@ -1128,8 +1138,11 @@ void select_volume_attempt(const WorkerArchiveInput& source,
         remaining -= (std::min)(remaining, range.end - range.start);
     }
     if (remaining) { input.missing_volume_number = 1; return; }
-    if (source.volume_attempts.head_size_from_total) {
-        auto length = source.volume_attempts.head_size_from_total;
+    const auto total = source.volume_attempts.tail_totals.empty()
+        ? source.volume_attempts.head_size_from_total
+        : source.volume_attempts.tail_totals[cursor.selected.back()];
+    if (total) {
+        auto length = total;
         for (std::size_t i = 1; i < input.ranges.size(); ++i) {
             const auto& range = input.ranges[i];
             if (!range.has_end || range.end - range.start >= length) { input.missing_volume_number = 1; return; }
@@ -1141,20 +1154,32 @@ void select_volume_attempt(const WorkerArchiveInput& source,
     }
 }
 
+bool uncertain_volume_password(const sunpack::sevenzip::ExtractArchiveResult& result,
+                               const sunpack::sevenzip::ExtractionReplay& replay) {
+    using namespace sunpack::sevenzip;
+    return result.encrypted && !result.password_crc_proven && !result.password_rejected &&
+        !result.input_trace.read_error && result.status != PasswordTestStatus::Error &&
+        result.failure_stage == "item_extract" &&
+        (result.operation_result == kOpCrcError || result.operation_result == kOpDataError ||
+         result.operation_result == kOpUnexpectedEnd || result.operation_result == kOpHeadersError) &&
+        replay.uncertain_read.load(std::memory_order_relaxed);
+}
+
 bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& result,
                                 const sunpack::sevenzip::ExtractionReplay& replay,
                                 bool password_verified) {
     using namespace sunpack::sevenzip;
     if ((result.status == PasswordTestStatus::Ok && result.command_ok) ||
-        (result.wrong_password && !password_verified) || result.password_rejected ||
-        (result.encrypted && !result.password_crc_proven && !password_verified) ||
+        (result.wrong_password && !password_verified && !uncertain_volume_password(result, replay)) || result.password_rejected ||
+        (result.encrypted && !result.password_crc_proven && !password_verified && !uncertain_volume_password(result, replay)) ||
         result.unsupported_method || result.status == PasswordTestStatus::BackendUnavailable ||
-        result.status == PasswordTestStatus::Error || result.input_trace.read_error) return false;
+        result.status == PasswordTestStatus::Error ||
+        (result.input_trace.read_error && result.missing_volume_evidence != "open_volume_file_missing")) return false;
     if (result.missing_volume) return true;
     if (result.failure_stage != "archive_open" && result.failure_stage != "item_extract") return false;
     if (result.failure_kind != "structure_recognition" && result.failure_kind != "checksum_error" &&
         result.failure_kind != "data_error" && result.failure_kind != "headers_error" &&
-        !(password_verified && result.failure_kind == "encrypted_or_wrong_password") &&
+        !((password_verified || uncertain_volume_password(result, replay)) && result.failure_kind == "encrypted_or_wrong_password") &&
         result.failure_kind != "unexpected_end" && result.failure_kind != "missing_volume_or_tail") return false;
     // Binary readers record whether a variable source/range participated.
     // Seeks, fixed tails and failures confined to the fixed head are not proof.
@@ -1310,6 +1335,7 @@ int run_request(
                 volume_replay->clear_output();
                 volume_replay->uncertain_read.store(false, std::memory_order_relaxed);
                 volume_replay->candidate_index = 0;
+                volume_replay->volume_password_uncertain = false;
                 volume_replay->candidates_started = volume_replay->candidate_output_owned = volume_replay->candidate_discard_pending = false;
                 cursor.discard_pending = false;
             }
@@ -1321,7 +1347,8 @@ int run_request(
             for (std::size_t i = 0; i < selected_input.ranges.size(); ++i) {
                 const auto& range = selected_input.ranges[i];
                 const auto length = range.has_end ? (std::min)(range.end - range.start, UINT64_MAX - offset) : UINT64_MAX - offset;
-                bool variable = i == 0 && request.archive_input.volume_attempts.head_size_from_total != 0;
+                bool variable = i == 0 && (request.archive_input.volume_attempts.head_size_from_total != 0 ||
+                    !request.archive_input.volume_attempts.tail_totals.empty());
                 bool variable_length = variable;
                 for (const auto& layout : request.archive_input.volume_attempts.layouts) {
                     if (i >= layout.size() || layout[i].number != static_cast<unsigned int>(selected_input.volume_numbers[i])) {
@@ -1401,8 +1428,10 @@ int run_request(
                     // Only ambiguous failures need the existing read-only probe.
                     result = extract_with_password(password_candidates[index]);
                     const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
+                    const bool uncertain_password = volume_trials && uncertain_volume_password(result, *volume_replay);
+                    if (uncertain_password) volume_replay->volume_password_uncertain = true;
                     // ENC authenticates the password during Open; later MAC/CRC failures are data damage.
-                    if (!direct_ok && result.encrypted && result.archive_type != L"enc" &&
+                    if (!direct_ok && !uncertain_password && result.encrypted && result.archive_type != L"enc" &&
                         !result.password_crc_proven &&
                         !(cancel_token && cancel_token->load(std::memory_order_acquire)) &&
                         result.status != PasswordTestStatus::Error && result.failure_kind != "resource_unavailable" &&
@@ -1428,7 +1457,7 @@ int run_request(
                     result.matched_index = direct_ok ? static_cast<int>(index) : -1;
                     result.password_candidates_all_rejected =
                         result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
-                    if (direct_ok || !result.password_candidates_all_rejected || password_candidates.size() == 1 ||
+                    if (direct_ok || (!result.password_candidates_all_rejected && !uncertain_password) || password_candidates.size() == 1 ||
                         (cancel_token && cancel_token->load(std::memory_order_acquire))) break;
                     result.password_candidates_all_rejected = false;
                     replay->candidate_discard_pending = true;
@@ -1456,6 +1485,14 @@ int run_request(
 
         if (cancel_token && cancel_token->load(std::memory_order_acquire)) return cancelled_result(job_id);
 
+        if (volume_trials && (uncertain_volume_password(result, *volume_replay) ||
+            (volume_replay->volume_password_uncertain && result.password_candidates_all_rejected))) {
+            result.status = PasswordTestStatus::Damaged;
+            result.wrong_password = result.password_rejected = result.password_candidates_all_rejected = false;
+            result.failure_stage = "item_extract";
+            result.failure_kind = "encrypted_or_wrong_password";
+            result.operation_result = kOpDataError;
+        }
         if (!volume_trials || !volume_composition_failure(result, *volume_replay, request.password_verified)) break;
         if (archive_input.missing_volume_number > 0 &&
             std::none_of(request.archive_input.volume_attempts.layouts.begin(), request.archive_input.volume_attempts.layouts.end(),

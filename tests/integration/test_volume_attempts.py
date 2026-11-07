@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 import subprocess
 import zipfile
+import random
+import struct
 
 import pytest
 
@@ -190,3 +192,154 @@ def test_conflicting_rar_slot_uses_winner_without_claiming_loser(tmp_path, carri
     assert set(release.cleanup_paths) == set(map(str, parts))
     if not carrier_slices:
         assert bad.exists()
+
+
+def _run_trial(tmp_path, descriptor, **kwargs):
+    request = {"job_id": "trial", "archive_input": descriptor.to_dict(),
+               "output_dir": str(tmp_path / "worker-out"), **kwargs}
+    run = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
+                         input=json.dumps(request), text=True, capture_output=True)
+    results = [event for line in run.stdout.splitlines()
+               if (event := json.loads(line)).get("type") == "result"]
+    assert len(results) == 1, run.stdout + run.stderr
+    return results[0]
+
+
+def test_single_zipcrypto_member_does_not_reject_password_on_wrong_volume_order(tmp_path):
+    # Unlike the multi-member encryption fixture, no small member can prove
+    # the password before a CRC failure in a reordered encrypted stream.
+    from tests.helpers.tool_config import require_7z
+    source = tmp_path / "only.bin"
+    expected = random.Random(13).randbytes(160 * 1024)
+    source.write_bytes(expected)
+    archive = tmp_path / "encrypted.zip"
+    subprocess.run([require_7z(), "a", "-tzip", "-mx=0", "-psecret", str(archive), str(source)],
+                   check=True, capture_output=True)
+    root = tmp_path / "parts"
+    root.mkdir()
+    data = archive.read_bytes()
+    for index, offset in enumerate(range(0, len(data), 48 * 1024), 1):
+        build = {2: 3, 3: 2}.get(index, index)
+        (root / f"shared.build{build:02}.chunk{index:02}.opaque").write_bytes(data[offset:offset + 48 * 1024])
+    task = ArchiveTaskProvider(make_config()).discover_targets([str(root)]).tasks[0]
+    descriptor = task.archive_input()
+    assert descriptor.volume_attempts
+    # Exercise extraction confirmation, not the already-verified password path.
+    final = _run_trial(tmp_path, descriptor, password_candidates=["secret", "wrong"])
+    assert final["status"] == "ok" and final["volume_attempts"] == 2, final
+    assert not final["password_candidates_all_rejected"] and final["matched_index"] == 0
+    assert (tmp_path / "worker-out/only.bin").read_bytes() == expected
+
+
+@pytest.mark.parametrize("total_delta", [0, 3])
+def test_zip_carrier_competing_tails_trim_the_selected_geometry(tmp_path, total_delta):
+    case, paths, config, _ = _ambiguous_case(tmp_path, "zip", carrier=True)
+    tail = paths[-1]
+    bad = tail.with_name(tail.name.replace(".opaque", ".a.opaque"))
+    data = bytearray(tail.read_bytes())
+    data[100] ^= 1
+    eocd = data.rfind(b"PK\x05\x06")
+    struct.pack_into("<I", data, eocd + 16, struct.unpack_from("<I", data, eocd + 16)[0] + total_delta)
+    bad.write_bytes(data)
+    tasks = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)]).tasks
+    task = next(t for t in tasks if t.archive_input().volume_attempts)
+    plan = task.archive_input().volume_attempts
+    assert len(plan.tail_totals) == 2
+    final = _run_trial(tmp_path, task.archive_input())
+    assert final["status"] == "ok", final
+    selected = task.archive_input().select_volumes(final["volume_selection"])
+    assert selected.parts[0].extent.end < paths[0].stat().st_size
+    assert str(bad) not in selected.part_paths()
+
+    assert next((tmp_path / "worker-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+@pytest.mark.parametrize("archive_format", ["7z", "zip"])
+def test_sparse_raw_labels_with_competing_member_are_ranked(tmp_path, archive_format):
+    case = ArchiveFixtureFactory().create(tmp_path, "sparse", archive_format, split=True,
+        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+    parts = []
+    originals = sorted(case.archive_dir.iterdir())
+    assert len(originals) == 4
+    for label, source in zip((1, 3, 10, 11), originals):
+        target = source.with_name(f"shared.part{label:03}.z.opaque")
+        source.rename(target)
+        parts.append(target)
+    bad = parts[1].with_name(parts[1].name.replace(".z.", ".a."))
+    bad.write_bytes(b"\0" * (parts[1].stat().st_size + 1))
+    task = ArchiveTaskProvider(make_config()).discover_targets([str(case.archive_dir)]).tasks[0]
+    assert task.archive_input().volume_attempts
+    final = _run_trial(tmp_path, task.archive_input())
+    assert final["status"] == "ok", final
+    assert next((tmp_path / "worker-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+def test_callback_volume_sharing_error_is_not_candidate_exhaustion(tmp_path):
+    # A real Windows sharing violation reaches the RAR callback stream's lazy
+    # CreateFile; existence/size checks still succeed. No sleeps or races.
+    import ctypes
+    from ctypes import wintypes
+    case = ArchiveFixtureFactory().create(tmp_path, "locked", "rar", split=True,
+        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+    parts = sorted(case.archive_dir.iterdir())
+    bad = parts[1].with_name("locked.part2.a.opaque")
+    bad.write_bytes(parts[1].read_bytes())
+    task = ArchiveTaskProvider(make_config()).discover_targets([str(case.archive_dir)]).tasks[0]
+    assert task.archive_input().volume_attempts
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    plan = task.archive_input().volume_attempts
+    locked = plan.sources[plan.layouts[0][1].choices[0]].path
+    from sunpack_native import release_reader_handles_under
+    release_reader_handles_under(str(case.archive_dir))
+    handle = kernel.CreateFileW(locked, 0x80000000, 0, None, 3, 0, None)
+    assert handle != wintypes.HANDLE(-1).value
+    try:
+        final = _run_trial(tmp_path, task.archive_input())
+        # The ordinary native-volume path opens peers through GetStream;
+        # explicit plan ranges also exercise the primary concatenated reader.
+        selected = task.archive_input().select_volumes({"layout": 0,
+            "sources": [slot.choices[0] for slot in plan.layouts[0]]})
+        ordinary = selected.to_dict()
+        for part in ordinary["parts"]:
+            part.pop("start", None)
+            part.pop("end", None)
+        callback = _run_trial(tmp_path, ArchiveInputDescriptor.from_dict(ordinary))
+    finally:
+        kernel.CloseHandle(handle)
+    assert final["volume_attempts"] == 1 and not final["missing_volume"], final
+    assert final["diagnostics"]["input_trace"]["read_error"]
+    assert final["diagnostics"]["input_trace"]["last_win32_error"] == 32, json.dumps(final)
+    assert callback["failure_kind"] == "input_stream" and not callback["missing_volume"], callback
+    assert callback["diagnostics"]["input_trace"]["last_win32_error"] == 32
+    Path(locked).unlink()
+    missing = _run_trial(tmp_path, task.archive_input())
+    assert missing["status"] == "ok" and missing["volume_attempts"] == 2, missing
+
+
+def test_rejected_candidate_keeps_its_independent_embedded_archive(tmp_path):
+    import io
+    case = ArchiveFixtureFactory().create(tmp_path, "mixed", "rar", split=True,
+        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+    parts = sorted(case.archive_dir.iterdir())
+    extra = io.BytesIO()
+    with zipfile.ZipFile(extra, "w") as archive:
+        archive.writestr("independent.txt", "independent content")
+    damaged = bytearray(parts[1].read_bytes())
+    damaged[len(damaged) // 2] ^= 1
+    bad = parts[1].with_name("mixed.part2.a.opaque")
+    bad.write_bytes(damaged + b"carrier gap" * 19 + extra.getvalue())
+    tasks = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(case.archive_dir)]).tasks
+    extractor = ExtractionScheduler()
+    extractor.sevenzip_runner.worker_path = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
+    try:
+        for index, task in enumerate(tasks):
+            result = extractor.extract(task, str(tmp_path / "outputs" / str(index)))
+            assert result.success, (result.error, result.diagnostics)
+    finally:
+        extractor.close()
+    assert len(list((tmp_path / "outputs").rglob(case.marker_name))) == 1
+    assert [p.read_text(encoding="utf-8") for p in (tmp_path / "outputs").rglob("independent.txt")] == ["independent content"]

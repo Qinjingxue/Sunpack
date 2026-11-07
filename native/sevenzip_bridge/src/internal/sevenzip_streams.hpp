@@ -476,6 +476,7 @@ namespace sunpack::sevenzip
 
                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr))
         {
+            const DWORD open_error = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
             // A failed constructor does not run ~FileInStream. Keep the input
             // handle owned while trace/prefetch setup can still allocate.
             std::unique_ptr<void, decltype(&CloseHandle)> handle_owner(
@@ -501,11 +502,12 @@ namespace sunpack::sevenzip
                 else if (handle_ == INVALID_HANDLE_VALUE)
                 {
 
-                    const DWORD error = GetLastError();
+                    const DWORD error = open_error;
 
                     trace_->read_error = true;
 
                     trace_->last_hresult = HRESULT_FROM_WIN32(error);
+                    if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                     trace_->last_win32_error = static_cast<int>(error);
                 }
@@ -606,6 +608,7 @@ namespace sunpack::sevenzip
                     {
                         trace_->read_error = true;
                         trace_->last_hresult = hr;
+                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
                         trace_->last_win32_error = static_cast<int>(error);
                     }
                     return hr;
@@ -636,6 +639,7 @@ namespace sunpack::sevenzip
                     trace_->read_error = true;
 
                     trace_->last_hresult = hr;
+                    if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                     trace_->last_win32_error = static_cast<int>(error);
                 }
@@ -953,6 +957,7 @@ namespace sunpack::sevenzip
                         trace_->read_error = true;
 
                         trace_->last_hresult = hr;
+                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                         trace_->last_win32_error = static_cast<int>(error);
                     }
@@ -982,6 +987,7 @@ namespace sunpack::sevenzip
                             trace_->read_error = true;
 
                             trace_->last_hresult = hr;
+                            if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                             trace_->last_win32_error = static_cast<int>(error);
                         }
@@ -1018,6 +1024,7 @@ namespace sunpack::sevenzip
                         trace_->read_error = true;
 
                         trace_->last_hresult = hr;
+                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                         trace_->last_win32_error = static_cast<int>(error);
                     }
@@ -1238,9 +1245,10 @@ namespace sunpack::sevenzip
         explicit MultiRangeInStream(
             const std::vector<ExtractInputRange> &ranges,
             ExtractInputTrace *trace = nullptr,
-            InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024})
+            InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024},
+            bool physical_volume = false)
 
-            : trace_(trace)
+            : trace_(trace), physical_volume_(physical_volume)
         {
 
             UInt64 virtual_offset = 0;
@@ -1263,9 +1271,14 @@ namespace sunpack::sevenzip
 
                     file_size = static_cast<UInt64>(std::filesystem::file_size(input.path));
                 }
-                catch (...)
+                catch (const std::filesystem::filesystem_error& error)
                 {
-
+                    if (trace_) {
+                        trace_->read_error = true;
+                        trace_->last_win32_error = error.code().value();
+                        trace_->last_hresult = HRESULT_FROM_WIN32(error.code().value());
+                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
+                    }
                     valid_ = false;
 
                     continue;
@@ -1338,7 +1351,7 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
-            if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, trace_ || ranges_.empty() ? nullptr : &ranges_.front().path);
+            if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, !physical_volume_ || ranges_.empty() ? nullptr : &ranges_.front().path);
 
 
             if (processedSize)
@@ -1437,6 +1450,7 @@ namespace sunpack::sevenzip
                         trace_->read_error = true;
 
                         trace_->last_hresult = hr;
+                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                         trace_->last_win32_error = static_cast<int>(error);
                     }
@@ -1468,6 +1482,7 @@ namespace sunpack::sevenzip
                             trace_->read_error = true;
 
                             trace_->last_hresult = hr;
+                            if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                             trace_->last_win32_error = static_cast<int>(error);
                         }
@@ -1504,6 +1519,7 @@ namespace sunpack::sevenzip
                         trace_->read_error = true;
 
                         trace_->last_hresult = hr;
+                        if (!trace_->read_hresult) trace_->read_hresult = trace_->last_hresult;
 
                         trace_->last_win32_error = static_cast<int>(error);
                     }
@@ -1692,6 +1708,7 @@ namespace sunpack::sevenzip
         UInt64 position_ = 0;
 
         ExtractInputTrace *trace_ = nullptr;
+        bool physical_volume_ = false;
 
         HANDLE cached_handle_ = INVALID_HANDLE_VALUE;
 
