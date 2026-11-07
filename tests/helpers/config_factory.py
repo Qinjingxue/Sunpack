@@ -19,23 +19,18 @@ def make_config(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 
 CONFIGS: dict[str, dict[str, Any]] = {
     "minimal": {
-        "detection": {"enabled": True},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 0}]},
     },
     "embedded_archive_loose": {
-        "detection": {"enabled": True},
         "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 1e-9},
     },
     "embedded_archive_carrier_tail": {
-        "detection": {"enabled": True},
         "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 1e-9},
     },
     "archive_scan_full": {
-        "detection": {"enabled": True},
         "embedded_scan": {"enabled": True},
     },
     "archive_scan_deep_embedded": {
-        "detection": {"enabled": True},
         "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 1e-9},
     },
 }

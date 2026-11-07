@@ -943,11 +943,10 @@ impl NativeCandidateTable {
         })
     }
 
-    #[pyo3(signature = (detection_enabled=true, include_residual_details=true))]
+    #[pyo3(signature = (include_residual_details=true))]
     fn resolve(
         &self,
         py: Python<'_>,
-        detection_enabled: bool,
         include_residual_details: bool,
     ) -> PyResult<NativeDiscoveryRoutes> {
         let cancellation = crate::io::cancellation::Cancellation::current();
@@ -1024,12 +1023,10 @@ impl NativeCandidateTable {
                             }
                             let anchor = table.relation_anchors[*file_index].as_ref();
                             let format = anchor.map(|anchor| anchor.format.as_str()).unwrap_or("");
-                            let accepted = detection_enabled
-                                && matches!(
-                                    format,
-                                    "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
-                                )
-                                && anchor.is_some_and(|anchor| anchor.standalone);
+                            let accepted = matches!(
+                                format,
+                                "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
+                            ) && anchor.is_some_and(|anchor| anchor.standalone);
                             let scan = if accepted && format != "enc" {
                                 Some(
                                     scan_detected_path(path, format, parallel_files)

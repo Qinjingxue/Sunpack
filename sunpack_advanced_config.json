@@ -253,11 +253,6 @@
   },
   "analysis": {
     "max_concurrent_reads": 1,
-    "prepass": {
-      "enabled": true,
-      "head_bytes": 1048576,
-      "tail_bytes": 1048576
-    },
     "modules": [
       {
         "name": "zip",
@@ -324,8 +319,5 @@
         "max_reported_items": 20
       }
     ]
-  },
-  "detection": {
-    "enabled": true
   }
 }

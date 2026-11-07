@@ -97,8 +97,6 @@ class VolumeEvidenceIndex:
 def probe_volume_anchor_paths(
     paths: Iterable[str],
     *,
-    prefix_limit: int = 1024 * 1024,
-    tail_limit: int = 65_557,
     path_passwords: dict[str, str] | None = None,
 ) -> VolumeEvidenceIndex:
     ordered = list(dict.fromkeys(str(path) for path in paths if path))
@@ -113,8 +111,6 @@ def probe_volume_anchor_paths(
     )
     rows = _native_probe_volume_anchors(
         ordered,
-        max(64, int(prefix_limit)),
-        max(22, int(tail_limit)),
         password_pairs,
     )
     evidences = [VolumeAnchorEvidence.from_mapping(row) for row in rows]

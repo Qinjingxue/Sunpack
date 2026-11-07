@@ -159,14 +159,14 @@ def test_invalid_coff_carriers_are_scanned_instead_of_skipped(tmp_path, pe_offse
 @pytest.mark.parametrize("archive_format,payload", [
     ("7z", make_minimal_7z()), ("zip", make_zip({"payload.txt": "contents"})),
 ], ids=["7z", "zip"])
-def test_deep_anchor_reuses_pe_facts_for_nonleading_archives(tmp_path, pe_offset, archive_format, payload):
+def test_deep_anchor_does_not_discover_nonleading_archives(tmp_path, pe_offset, archive_format, payload):
     image = make_minimal_pe(pe_offset=pe_offset)
     path = tmp_path / "image.jpg"
     path.write_bytes(image + payload)
     [anchor] = probe_volume_anchors([str(path)])
-    assert anchor["pe_structure"] is True
-    assert anchor["format"] == archive_format
-    assert anchor["structure_offset"] == len(image)
+    assert anchor["structure_offset"] is None
+    assert anchor["standalone"] is False
+    assert anchor["multivolume"] is False
     assert anchor["sfx"] is False
 
 
@@ -177,7 +177,8 @@ def test_deep_anchor_candidate_refined_to_none_does_not_authorize_archive_search
     image = make_minimal_pe(pe_offset=0x800).replace(b"PE\x00\x00", b"NO\x00\x00")
     path = tmp_path / "invalid_image.jpg"
     path.write_bytes(image + payload)
-    [anchor] = probe_volume_anchors([str(path)], tail_limit=0)
+    [anchor] = probe_volume_anchors([str(path)])
     assert anchor["pe_structure"] is False
-    assert anchor["format"] == ""
+    assert anchor["structure_offset"] is None
+    assert anchor["standalone"] is False
     assert anchor["sfx"] is False

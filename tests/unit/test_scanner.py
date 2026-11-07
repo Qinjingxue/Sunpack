@@ -431,10 +431,16 @@ def test_target_scan_reuses_session_for_duplicate_directories(tmp_path, monkeypa
     assert scan_count == 1
 
 
-def test_archive_task_provider_detection_disabled_does_not_use_extension_fallback(tmp_path):
+def test_default_detection_recognizes_disguised_content_without_extension_fallback(tmp_path):
+    import gzip
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
     path = tmp_path / "fake.zip"
     path.write_bytes(b"not an archive")
+    stream = tmp_path / "payload.opaque"
+    stream.write_bytes(gzip.compress(b"actual archive content"))
+    # Even a stale retired switch cannot disable the built-in mechanism.
     provider = ArchiveTaskProvider(make_config({"detection": {"enabled": False}}))
-    assert provider.scan_targets([str(path)]) == []
+    tasks = provider.scan_targets([str(path), str(stream)])
+    assert [task.main_path for task in tasks] == [str(stream)]
+    assert tasks[0].discovery_source == "detection"

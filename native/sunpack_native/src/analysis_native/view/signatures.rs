@@ -94,23 +94,48 @@ struct SignaturePrepassData {
     scanned_tail: usize,
 }
 
-fn signature_prepass_native(
-    reader: &ManagedReader,
-    head_bytes: usize,
-    tail_bytes: usize,
-) -> io::Result<SignaturePrepassData> {
+fn signature_prepass_native(reader: &ManagedReader) -> io::Result<SignaturePrepassData> {
     let size = reader.len();
-    let head_len = head_bytes.min(size as usize);
-    let tail_len = tail_bytes.min(size as usize);
-    let tail_start = size.saturating_sub(tail_len as u64);
+    // This view already represents a logical input. Its origin is zero;
+    // embedded discovery supplies its own validated roots through prepass.
+    let mut head = reader.read_at(0, size.min(8) as usize)?;
+    let zip = head.starts_with(ZIP_LOCAL)
+        || head.starts_with(ZIP_EOCD)
+        || head.starts_with(ZIP64_EOCD)
+        || head.starts_with(b"PK\x07\x08")
+        || head.starts_with(b"PK00");
+    let header_len = standard_header_len(&head).min(size as usize);
+    if header_len > head.len() {
+        head.extend(reader.read_at(head.len() as u64, header_len - head.len())?);
+    }
     let mut hits = Vec::new();
-    if tail_start <= head_len as u64 {
-        let data = reader.read_cached_at(0, size as usize)?;
-        collect_signature_hits(&mut hits, 0, data.as_slice());
-    } else {
-        let ranges = reader.read_many(&[(0, head_len), (tail_start, tail_len)])?;
-        collect_signature_hits(&mut hits, 0, &ranges[0]);
-        collect_signature_hits(&mut hits, tail_start, &ranges[1]);
+    for (pattern, &(name, signature)) in ANALYSIS_SIGNATURES.iter().enumerate() {
+        let Some(signature) = signature.filter(|_| name != "zip_eocd") else {
+            continue;
+        };
+        let offset = if name == "tar_ustar" { 257 } else { 0 };
+        if head.get(offset..offset + signature.len()) == Some(signature) {
+            hits.push(SignatureHit::new(pattern, offset as u64));
+        }
+    }
+    if (head.starts_with(b"PK\x07\x08") || head.starts_with(b"PK00"))
+        && head.get(4..8) == Some(ZIP_LOCAL)
+    {
+        hits.push(SignatureHit::new(0, 4));
+    }
+    if head.starts_with(ZIP64_EOCD) {
+        // A ZIP64 empty archive may start with its end record.
+        hits.push(SignatureHit::new(ANALYSIS_SIGNATURES.len() - 1, 0));
+    }
+    let mut tail_bytes = 0;
+    if zip {
+        let (tail, tail_start) =
+            crate::formats::zip::read_eocd_tail(reader, 0, size, &head, &mut tail_bytes)?;
+        // No trailing-junk search here. Only the declared comment can follow
+        // the EOCD; arbitrary suffixes belong to embedded discovery.
+        if let Some(eocd) = crate::formats::zip::find_eocd_record(&tail, false) {
+            hits.push(SignatureHit::new(1, tail_start + eocd.offset as u64));
+        }
     }
     hits.sort_unstable_by_key(|hit| (hit.offset(), hit.pattern));
     hits.dedup();
@@ -125,9 +150,46 @@ fn signature_prepass_native(
     Ok(SignaturePrepassData {
         hits: hits.into(),
         formats,
-        scanned_head: head_len,
-        scanned_tail: tail_len,
+        scanned_head: head.len(),
+        scanned_tail: tail_bytes as usize,
     })
+}
+
+// Initial standard headers only. Variable fields and subsequent records are
+// read by the existing format parsers using their declared lengths/offsets.
+fn standard_header_len(head: &[u8]) -> usize {
+    if head.starts_with(ZIP_LOCAL) {
+        30
+    } else if head.starts_with(b"PK\x07\x08") || head.starts_with(b"PK00") {
+        34
+    } else if head.starts_with(ZIP_EOCD) {
+        22
+    } else if head.starts_with(ZIP64_EOCD) {
+        56
+    } else if head.starts_with(RAR4) {
+        7
+    } else if head.starts_with(RAR5) {
+        8
+    } else if head.starts_with(SEVEN_ZIP) {
+        32
+    } else if head.starts_with(GZIP) {
+        10
+    } else if head.starts_with(BZIP2) {
+        4
+    } else if head.starts_with(XZ) {
+        12
+    } else if head.starts_with(ZSTD) {
+        18
+    } else if head.starts_with(LZ4) {
+        19
+    } else if crate::formats::lz4::leading(head) {
+        8
+    }
+    // TAR has no mandatory magic, including V7. Read one record at the
+    // origin and leave checksum/PAX/GNU validation to the canonical walker.
+    else {
+        TAR_BLOCK_SIZE
+    }
 }
 
 fn signature_prepass_to_python(py: Python<'_>, data: SignaturePrepassData) -> PyResult<Py<PyDict>> {
@@ -140,23 +202,6 @@ fn signature_prepass_to_python(py: Python<'_>, data: SignaturePrepassData) -> Py
     dict.set_item("head_bytes", data.scanned_head)?;
     dict.set_item("tail_bytes", data.scanned_tail)?;
     Ok(dict.unbind())
-}
-
-fn collect_signature_hits(target: &mut Vec<SignatureHit>, base: u64, data: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-    for (pattern, &(_name, signature)) in ANALYSIS_SIGNATURES.iter().enumerate() {
-        let Some(signature) = signature else { continue };
-        let finder = memchr::memmem::Finder::new(signature);
-        let mut start = 0;
-        while let Some(index) = finder.find(&data[start..]) {
-            let index = start + index;
-            target.push(SignatureHit::new(pattern, base + index as u64));
-            // Keep overlaps; the caller orders and deduplicates once.
-            start = index + 1;
-        }
-    }
 }
 
 fn format_for_hit(name: &str) -> &'static str {
@@ -180,48 +225,5 @@ fn format_for_hit(name: &str) -> &'static str {
         "lz4"
     } else {
         ""
-    }
-}
-
-#[cfg(test)]
-mod signature_search_tests {
-    use super::*;
-
-    // Public window tests cover only some signatures. Check every name/offset
-    // against a byte-by-byte oracle, including short and truncated edges.
-    #[test]
-    fn signature_byte_search_keeps_all_names_offsets_and_short_edges() {
-        let patterns = ANALYSIS_SIGNATURES
-            .iter()
-            .filter_map(|&(name, signature)| signature.map(|signature| (name, signature)))
-            .collect::<Vec<_>>();
-        let mut data = (0..65536usize)
-            .map(|i| (i * 73 + 19) as u8)
-            .collect::<Vec<_>>();
-        for (index, (_, signature)) in patterns.iter().enumerate() {
-            let start = index * 13;
-            data[start..start + signature.len()].copy_from_slice(signature);
-        }
-        data.extend_from_slice(b"ustarustarPK\x03\x04PK\x05\x06");
-        for len in (0..=160).chain([data.len() - 1, data.len()]) {
-            let sample = &data[..len];
-            let mut expected = Vec::new();
-            for index in 0..sample.len() {
-                for &(name, signature) in &patterns {
-                    if sample.get(index..index + signature.len()) == Some(signature) {
-                        expected.push((name, 37 + index as u64));
-                    }
-                }
-            }
-            let mut actual = Vec::new();
-            collect_signature_hits(&mut actual, 37, sample);
-            let mut actual = actual
-                .iter()
-                .map(|hit| (hit.name(), hit.offset()))
-                .collect::<Vec<_>>();
-            actual.sort_unstable_by_key(|&(name, offset)| (offset, name));
-            expected.sort_unstable_by_key(|&(name, offset)| (offset, name));
-            assert_eq!(actual, expected);
-        }
     }
 }

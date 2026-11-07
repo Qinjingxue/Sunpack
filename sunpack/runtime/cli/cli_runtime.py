@@ -36,9 +36,6 @@ def build_effective_config(config: dict) -> dict[str, Any]:
             "controller": "native_worker",
             "sizing": "selected_by_worker",
         },
-        "detection": {
-            "enabled": bool(config.get("detection", {}).get("enabled", True)),
-        },
         "embedded_scan": dict(config.get("embedded_scan") or {}),
         "filesystem": {
             "scan_filters_enabled": scan_filters_enabled(config),

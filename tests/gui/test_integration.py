@@ -731,7 +731,7 @@ def test_split_arrivals_publish_only_confirmed_cards(tmp_path, monkeypatch):
                    check=True, capture_output=True)
     parts = sorted(tmp_path.glob("split.7z.*"))
     assert len(parts) == 3
-    config = make_config({"recursive_extract": "1", "detection": {"enabled": True},
+    config = make_config({"recursive_extract": "1",
                           "watch": {"clipboard_monitor_enabled": False},
                           "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False}})
 
@@ -791,7 +791,7 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
     root.mkdir()
     source = root / "A.disguised"
     config = make_config({
-        "recursive_extract": "3", "detection": {"enabled": True},
+        "recursive_extract": "3",
         "watch": {"clipboard_monitor_enabled": False},
         "post_extract": {"archive_cleanup_mode": "d"},
     })

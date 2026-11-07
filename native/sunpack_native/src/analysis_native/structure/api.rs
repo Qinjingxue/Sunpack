@@ -651,6 +651,7 @@ pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u
         && !head.starts_with(b"PK\x03\x04")
         && !head.starts_with(b"PK\x05\x06")
         && !head.starts_with(b"PK\x07\x08")
+        && !head.starts_with(b"PK00")
         && !head.starts_with(b"PK\x06\x06")
     {
         rejected |= UNIFIED_PREFILTER_ZIP;

@@ -191,3 +191,19 @@ Persistent passwords come only from `builtin_passwords.json`, including its `cli
 For less common settings, inspect `sunpack_advanced_config.json` and run `config show`. `SUNPACK_CONFIG_OVERRIDES` accepts an inline JSON object or a JSON file path for temporary overrides.
 
 Archive analysis determines extraction feasibility from validated format structure, exact carrier boundaries, password requirements and missing-volume facts. Numeric analysis confidence scores and `analysis.thresholds.extractable_confidence` have been removed. Candidate selection follows proven outer ranges and physical order; damaged or unresolved peers do not inherit another candidate's extraction eligibility. CLI inspection reports these states and facts without a numeric confidence score.
+
+`analysis.prepass` (including `enabled`, `head_bytes` and `tail_bytes`) and `detection` have been removed. Standard prepass and format detection always run as built-in mechanisms, reusing existing analysis facts when available. Standard probing uses internal format rules at the logical input's origin (zero for an ordinary input). It first dispatches from at most 8 bytes, then reads the relevant initial structure below. These are initial reads, not limits on structural analysis: existing Rust parsers follow declared lengths, offsets, blocks and concatenated members. Signatures inside payloads or comments are not additional roots.
+
+| Format | Initial structure and subsequent reads |
+| --- | --- |
+| ZIP | 30-byte local header (34 with a split marker), then declared name/extra fields. Check the final 22-byte EOCD first; a comment can require up to 65,557 tail bytes. ZIP64 follows its locator and record fields. [APPNOTE](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT) |
+| 7z | 32-byte signature/start header, then the declared next-header offset and size. [Specification](https://raw.githubusercontent.com/ip7z/7zip/main/DOC/7zFormat.txt) |
+| RAR4 / RAR5 | 7 / 8-byte signature, then declared block/header sizes; encrypted headers reuse native password parsing. [RAR specification](https://www.rarlab.com/technote.htm) |
+| TAR | One 512-byte record at the origin, including V7 without `ustar`; the existing walker handles checksums, metadata and following records. [7-Zip format definition](https://raw.githubusercontent.com/ip7z/7zip/main/CPP/7zip/Archive/Tar/TarHeader.h) |
+| GZIP | 10-byte fixed header, followed by optional fields and member parsing. [RFC 1952](https://www.rfc-editor.org/rfc/rfc1952) |
+| BZIP2 | 4-byte stream header; the existing bitstream parser determines block/member boundaries. [Reference decoder](https://raw.githubusercontent.com/libarchive/bzip2/master/decompress.c) |
+| XZ | 12-byte header; follow blocks/index/footer, stream padding and concatenated streams. [Specification](https://tukaani.org/xz/xz-file-format.txt) |
+| Zstandard | Up to 18 bytes including magic; follow frame descriptors, blocks and skippable frames. [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) |
+| LZ4 | Up to 19 bytes including magic; follow descriptor/block sizes and 8-byte skippable headers. [Specification](https://raw.githubusercontent.com/lz4/lz4/dev/doc/lz4_Frame_format.md) |
+
+Carrier discovery still enters the existing embedded scheduling stage naturally. Its validated roots/ranges are reused without a second signature search; volume anchors return to the existing relation flow and use the same leading-header parsers at their known offsets. No bypass or separate carrier discovery path is added to detection or relation. Reported `head_bytes` / `tail_bytes` are read statistics, not configuration.

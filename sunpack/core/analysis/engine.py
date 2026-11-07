@@ -71,7 +71,6 @@ class AnalysisEngine:
         native = view.analyze(
             self._native_config,
             initial_prepass=initial_prepass,
-            signature_prepass=AnalysisCapability.SIGNATURE_PREPASS in requested,
             format_structure=AnalysisCapability.FORMAT_STRUCTURE in requested,
         )
         return _report_from_native(report_path or view.path, native)

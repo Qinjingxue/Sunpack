@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crc32fast::hash as crc32;
@@ -24,8 +24,6 @@ const RAR5: &[u8] = b"Rar!\x1a\x07\x01\x00";
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_EOCD: &[u8] = b"PK\x05\x06";
 const ZIP_SPLIT_MARKER: &[u8] = b"PK\x07\x08";
-const DEFAULT_PREFIX_LIMIT: usize = 1024 * 1024;
-const DEFAULT_TAIL_LIMIT: usize = 65_557;
 const RAR4_MAIN_HEADER_PASSWORD: u16 = 0x0080;
 const VOLUME_ANCHOR_PROBE_THREADS: usize = 4;
 const CHEAP_FAST_PROBE_THREADS: usize = 8;
@@ -123,48 +121,30 @@ impl VolumeAnchor {
 }
 
 #[pyfunction]
-#[pyo3(signature = (paths, prefix_limit=DEFAULT_PREFIX_LIMIT, tail_limit=DEFAULT_TAIL_LIMIT, path_passwords=None))]
+#[pyo3(signature = (paths, path_passwords=None))]
 pub(crate) fn probe_volume_anchors(
     py: Python<'_>,
     paths: Vec<String>,
-    prefix_limit: usize,
-    tail_limit: usize,
     path_passwords: Option<Vec<(String, String)>>,
 ) -> PyResult<Vec<Py<PyDict>>> {
-    py.detach(|| {
-        probe_volume_anchor_paths(&paths, prefix_limit, tail_limit, path_passwords.as_deref())
-    })
-    .into_iter()
-    .map(|anchor| anchor.into_dict(py))
-    .collect()
+    py.detach(|| probe_volume_anchor_paths(&paths, path_passwords.as_deref()))
+        .into_iter()
+        .map(|anchor| anchor.into_dict(py))
+        .collect()
 }
 
 pub(crate) fn probe_volume_anchor_paths(
     paths: &[String],
-    prefix_limit: usize,
-    tail_limit: usize,
     path_passwords: Option<&[(String, String)]>,
 ) -> Vec<VolumeAnchor> {
-    probe_volume_anchor_paths_with_depth(
-        paths,
-        prefix_limit,
-        tail_limit,
-        path_passwords,
-        VolumeAnchorProbeDepth::Deep,
-    )
+    probe_volume_anchor_paths_with_depth(paths, path_passwords, VolumeAnchorProbeDepth::Deep)
 }
 
 pub(crate) fn probe_volume_anchor_paths_cheap(
     paths: &[String],
     path_passwords: Option<&[(String, String)]>,
 ) -> Vec<VolumeAnchor> {
-    probe_volume_anchor_paths_with_depth(
-        paths,
-        512,
-        0,
-        path_passwords,
-        VolumeAnchorProbeDepth::Cheap,
-    )
+    probe_volume_anchor_paths_with_depth(paths, path_passwords, VolumeAnchorProbeDepth::Cheap)
 }
 
 /// One password-independent fact per catalog row generation. Relations may
@@ -220,8 +200,6 @@ fn cheap_fast_probe_pool() -> &'static rayon::ThreadPool {
 
 fn probe_volume_anchor_paths_with_depth(
     paths: &[String],
-    prefix_limit: usize,
-    tail_limit: usize,
     path_passwords: Option<&[(String, String)]>,
     depth: VolumeAnchorProbeDepth,
 ) -> Vec<VolumeAnchor> {
@@ -239,8 +217,6 @@ fn probe_volume_anchor_paths_with_depth(
             .map(|path| {
                 probe_path(
                     path,
-                    prefix_limit,
-                    tail_limit,
                     password_map.get(&crate::path_keys::path_key(path)).copied(),
                     depth,
                 )
@@ -259,13 +235,7 @@ fn volume_anchor_probe_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-fn probe_path(
-    path: &str,
-    prefix_limit: usize,
-    tail_limit: usize,
-    password: Option<&str>,
-    depth: VolumeAnchorProbeDepth,
-) -> VolumeAnchor {
+fn probe_path(path: &str, password: Option<&str>, depth: VolumeAnchorProbeDepth) -> VolumeAnchor {
     let mut result = VolumeAnchor {
         path: path.to_string(),
         ..VolumeAnchor::default()
@@ -278,91 +248,27 @@ fn probe_path(
         }
     };
     let size = reader.len();
-    let mut file = reader.cursor();
     result.size = size;
-    // Most formats put their identifying structure in the first few hundred
-    // bytes. Deep probing may expand a canonical PE candidate or an encrypted
-    // leading RAR4 header. Cheap probing never adds I/O to confirm PE facts.
-    let base_prefix_len = size.min(512) as usize;
-    let mut prefix_len = base_prefix_len;
-    let mut prefix = vec![0u8; base_prefix_len];
-    if let Err(error) = file.read_exact(&mut prefix) {
-        result.error = error.to_string();
-        return result;
-    }
+    let prefix = match reader.read_at(0, size.min(512) as usize) {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            result.error = error.to_string();
+            return result;
+        }
+    };
     result.bytes_read += prefix.len() as u64;
     result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
-
     if depth == VolumeAnchorProbeDepth::Cheap {
         return probe_cheap_prefix(result, &prefix, password);
     }
-
     let pe = probe_pe_prefix(&prefix, size);
     result.pe_state = pe.state();
     result.pe_image_end = pe.image_end();
-    let allow_embedded = result.pe_state != PeState::None;
-    let has_rar4_signature = anchored_signature(&prefix, RAR4, allow_embedded).is_some();
-    if (allow_embedded || (password.is_some() && has_rar4_signature))
-        && prefix_limit > base_prefix_len
-    {
-        prefix_len = size.min(prefix_limit as u64) as usize;
+    // No prefix search. The ordinary origin is zero; embedded feedback calls
+    // the same parsers with its already established logical origin.
+    if let Err(error) = probe_anchor_reader_prefix(&reader, 0, "", password, &prefix, &mut result) {
+        result.error = error.to_string();
     }
-    if prefix_len > base_prefix_len {
-        // The expanded SFX search prefix is reused by the parsers below, then
-        // dropped. The ordinary leading header keeps its existing cache path.
-        let mut file = reader.probe_reader().cursor();
-        prefix.resize(prefix_len, 0);
-        if file.seek(SeekFrom::Start(base_prefix_len as u64)).is_err()
-            || file.read_exact(&mut prefix[base_prefix_len..]).is_err()
-        {
-            result.error = "sfx_prefix_read_failed".to_string();
-            return result;
-        }
-        result.bytes_read += (prefix_len - base_prefix_len) as u64;
-        if result.pe_state == PeState::Candidate {
-            // Refine only when expansion supplied missing structure. Reuse a
-            // previously Confirmed boundary without parsing the image again.
-            let pe = probe_pe_prefix(&prefix, size);
-            result.pe_state = pe.state();
-            result.pe_image_end = pe.image_end();
-        }
-    }
-
-    let prefix = complete_anchor_prefix(&prefix, &mut result, 0, None);
-    let prefix = prefix.as_ref();
-    let allow_embedded = result.pe_state != PeState::None;
-
-    // RAR and 7z have all relation-seed structure at the head.  Do not pay
-    // the ZIP EOCD tail read for a proposal that has already identified one
-    // of these formats; ZIP is the only format below that needs the tail.
-    if let Some(offset) = anchored_signature(&prefix, RAR5, allow_embedded)
-        .or_else(|| anchored_signature(&prefix, RAR4, allow_embedded))
-        .filter(|offset| probe_rar(&prefix, *offset, &mut result, password))
-    {
-        let _ = offset;
-        return result;
-    }
-    if let Some(offset) = anchored_signature(&prefix, SEVEN_ZIP, allow_embedded)
-        .filter(|offset| probe_seven_zip(&prefix, *offset, size, &mut result))
-    {
-        let _ = offset;
-        return result;
-    }
-
-    let (tail, tail_start) = read_zip_tail_for_anchor(
-        &reader,
-        0,
-        size,
-        tail_limit as u64,
-        &prefix,
-        &mut result.bytes_read,
-    )
-    .unwrap_or_else(|_| (Vec::new(), size));
-
-    if probe_zip_reader(&prefix, &tail, tail_start, &mut result, &reader, 0) {
-        return result;
-    }
-    probe_standalone_stream(&prefix, &mut result);
     result
 }
 
@@ -377,14 +283,14 @@ fn probe_cheap_prefix(
     // detector.  The cheap pass only keeps structure that can itself seed
     // a split suspicion, plus the leading stream facts that prevent a
     // numbered ordinary archive from being mistaken for a volume.
-    if let Some(offset) = anchored_signature(prefix, RAR5, false)
-        .or_else(|| anchored_signature(prefix, RAR4, false))
+    if let Some(offset) = anchored_signature(prefix, RAR5)
+        .or_else(|| anchored_signature(prefix, RAR4))
         .filter(|offset| probe_rar(prefix, *offset, &mut result, password))
     {
         let _ = offset;
         return result;
     }
-    if let Some(offset) = anchored_signature(prefix, SEVEN_ZIP, false)
+    if let Some(offset) = anchored_signature(prefix, SEVEN_ZIP)
         .filter(|offset| probe_seven_zip(prefix, *offset, result.size, &mut result))
     {
         let _ = offset;
@@ -476,10 +382,9 @@ fn complete_anchor_prefix<'a>(
     base: u64,
     reader: Option<&ManagedReader>,
 ) -> Cow<'a, [u8]> {
-    let embedded = out.pe_state != PeState::None;
-    let required = if let Some(at) = anchored_signature(prefix, RAR5, embedded) {
+    let required = if let Some(at) = anchored_signature(prefix, RAR5) {
         rar5_header_len(&prefix[at + RAR5.len()..]).and_then(|n| (at + RAR5.len()).checked_add(n))
-    } else if let Some(at) = anchored_signature(prefix, RAR4, embedded) {
+    } else if let Some(at) = anchored_signature(prefix, RAR4) {
         let main = at + RAR4.len();
         u16_le(prefix, main + 5)
             .filter(|&n| n >= 13)
@@ -488,7 +393,7 @@ fn complete_anchor_prefix<'a>(
         let at = if prefix.starts_with(ZIP_SPLIT_MARKER) {
             Some(4)
         } else {
-            anchored_signature(prefix, ZIP_LOCAL, embedded)
+            anchored_signature(prefix, ZIP_LOCAL)
         };
         at.and_then(|at| {
             crate::formats::zip::relation_local_header_len(prefix, at)
@@ -811,51 +716,6 @@ fn probe_seven_zip(prefix: &[u8], offset: usize, size: u64, out: &mut VolumeAnch
     true
 }
 
-fn read_zip_tail_for_anchor(
-    reader: &ManagedReader,
-    archive_start: u64,
-    file_size: u64,
-    tail_limit: u64,
-    prefix: &[u8],
-    bytes_read: &mut u64,
-) -> std::io::Result<(Vec<u8>, u64)> {
-    let remaining = file_size.saturating_sub(archive_start);
-    let tail_len = remaining.min(tail_limit);
-    if tail_len == 0 {
-        return Ok((Vec::new(), remaining));
-    }
-
-    if remaining <= prefix.len() as u64 {
-        let start = (remaining - tail_len) as usize;
-        return Ok((
-            prefix[start..remaining as usize].to_vec(),
-            remaining - tail_len,
-        ));
-    }
-
-    const EOCD_MIN_SIZE: u64 = 22;
-    let fast_len = tail_len.min(EOCD_MIN_SIZE);
-    let fast_start = file_size - fast_len;
-    let fast = reader.read_at(fast_start, fast_len as usize)?;
-    *bytes_read += fast.len() as u64;
-
-    let exact_eocd = fast.len() == EOCD_MIN_SIZE as usize
-        && fast.starts_with(ZIP_EOCD)
-        && u16::from_le_bytes([fast[20], fast[21]]) == 0
-        && u16_le(&fast, 4) != Some(0xffff)
-        && u16_le(&fast, 6) != Some(0xffff);
-    if exact_eocd || tail_len == fast_len {
-        return Ok((fast, remaining - fast_len));
-    }
-
-    let preceding_len = tail_len - fast_len;
-    let full_start = file_size - tail_len;
-    let mut tail = reader.read_at(full_start, preceding_len as usize)?;
-    *bytes_read += tail.len() as u64;
-    tail.extend_from_slice(&fast);
-    Ok((tail, remaining - tail_len))
-}
-
 fn probe_zip_reader(
     prefix: &[u8],
     tail: &[u8],
@@ -946,14 +806,13 @@ fn probe_zip_eocd(
     out: &mut VolumeAnchor,
     eocd: Option<crate::formats::zip::EocdInfo>,
 ) -> bool {
-    let allow_embedded = out.pe_state != PeState::None;
     let split_start_offset = prefix
         .starts_with(ZIP_SPLIT_MARKER)
         .then_some(ZIP_SPLIT_MARKER.len())
         .filter(|offset| plausible_zip_local(prefix, *offset));
-    let empty_eocd_offset = zip_empty_eocd_offset(prefix, allow_embedded);
+    let empty_eocd_offset = zip_empty_eocd_offset(prefix);
     let start_offset = split_start_offset.or_else(|| {
-        anchored_signature(prefix, ZIP_LOCAL, allow_embedded)
+        anchored_signature(prefix, ZIP_LOCAL)
             .filter(|offset| plausible_zip_local(prefix, *offset))
             .or(empty_eocd_offset)
     });
@@ -1079,14 +938,9 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
     let Ok(reader) = ManagedReader::open(&anchor.path) else {
         return out;
     };
-    let Ok((tail, start)) = read_zip_tail_for_anchor(
-        &reader,
-        0,
-        reader.len(),
-        DEFAULT_TAIL_LIMIT as u64,
-        &[],
-        &mut out.bytes_read,
-    ) else {
+    let Ok((tail, start)) =
+        crate::formats::zip::read_eocd_tail(&reader, 0, reader.len(), &[], &mut out.bytes_read)
+    else {
         return out;
     };
     out.evidence.push("relation:zip_tail_checked");
@@ -1508,25 +1362,8 @@ pub(crate) fn probe_volume_anchor_reader_at_offset(
     let prefix = reader.read_at(offset, prefix_len)?;
     result.bytes_read += prefix.len() as u64;
 
-    let prefix = complete_anchor_prefix(&prefix, &mut result, offset, Some(reader));
-    let prefix = prefix.as_ref();
-    let recognized = match format {
-        "rar" => probe_rar_at_reader(&prefix, 0, &mut result, password, offset, Some(reader)),
-        "7z" => probe_seven_zip(&prefix, 0, remaining, &mut result),
-        "zip" => {
-            const ZIP_TAIL_MAX: u64 = 22 + 65_535;
-            let (tail, tail_start) = read_zip_tail_for_anchor(
-                &reader,
-                offset,
-                size,
-                ZIP_TAIL_MAX,
-                &prefix,
-                &mut result.bytes_read,
-            )?;
-            probe_zip_reader(&prefix, &tail, tail_start, &mut result, &reader, offset)
-        }
-        _ => false,
-    };
+    let recognized =
+        probe_anchor_reader_prefix(reader, offset, format, password, &prefix, &mut result)?;
     if !recognized {
         result.error = "archive_structure_not_confirmed".to_string();
         return Ok(result);
@@ -1552,6 +1389,50 @@ pub(crate) fn probe_volume_anchor_reader_at_offset(
         }
     }
     Ok(result)
+}
+
+fn probe_anchor_reader_prefix(
+    reader: &ManagedReader,
+    offset: u64,
+    format: &str,
+    password: Option<&str>,
+    prefix: &[u8],
+    result: &mut VolumeAnchor,
+) -> std::io::Result<bool> {
+    let prefix = complete_anchor_prefix(prefix, result, offset, Some(reader));
+    let prefix = prefix.as_ref();
+    let remaining = reader.len().saturating_sub(offset);
+    if (format.is_empty() || format == "rar")
+        && (prefix.starts_with(RAR4) || prefix.starts_with(RAR5))
+        && probe_rar_at_reader(prefix, 0, result, password, offset, Some(reader))
+    {
+        return Ok(true);
+    }
+    if (format.is_empty() || format == "7z")
+        && prefix.starts_with(SEVEN_ZIP)
+        && probe_seven_zip(prefix, 0, remaining, result)
+    {
+        return Ok(true);
+    }
+    if format.is_empty() && offset == 0 {
+        probe_standalone_stream(prefix, result);
+        if !result.format.is_empty() {
+            return Ok(true);
+        }
+    }
+    if format.is_empty() || format == "zip" {
+        let (tail, tail_start) = crate::formats::zip::read_eocd_tail(
+            reader,
+            offset,
+            reader.len(),
+            prefix,
+            &mut result.bytes_read,
+        )?;
+        if probe_zip_reader(prefix, &tail, tail_start, result, reader, offset) {
+            return Ok(true);
+        }
+    }
+    Ok(!result.format.is_empty())
 }
 
 fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
@@ -1586,22 +1467,12 @@ fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
     out.evidence.push("stream:format_identity");
 }
 
-fn find_signature(data: &[u8], signature: &[u8]) -> Option<usize> {
-    memmem::find(data, signature)
+fn anchored_signature(data: &[u8], signature: &[u8]) -> Option<usize> {
+    data.starts_with(signature).then_some(0)
 }
 
-fn anchored_signature(data: &[u8], signature: &[u8], allow_embedded: bool) -> Option<usize> {
-    if data.starts_with(signature) {
-        Some(0)
-    } else if allow_embedded {
-        find_signature(data, signature)
-    } else {
-        None
-    }
-}
-
-fn zip_empty_eocd_offset(data: &[u8], allow_embedded: bool) -> Option<usize> {
-    let offset = anchored_signature(data, ZIP_EOCD, allow_embedded)?;
+fn zip_empty_eocd_offset(data: &[u8]) -> Option<usize> {
+    let offset = anchored_signature(data, ZIP_EOCD)?;
     let record = data.get(offset..offset + 22)?;
     let disk = u16::from_le_bytes([record[4], record[5]]);
     let cd_disk = u16::from_le_bytes([record[6], record[7]]);
@@ -1661,15 +1532,9 @@ mod tests {
                 bytes[..2].copy_from_slice(b"MZ");
                 bytes[offset..offset + archive.len()].copy_from_slice(&archive);
                 let path = crate::test_support::temp_file("mz_not_pe_deep_anchor", &bytes);
-                let anchor = probe_path(
-                    path.to_str().unwrap(),
-                    DEFAULT_PREFIX_LIMIT,
-                    0,
-                    None,
-                    VolumeAnchorProbeDepth::Deep,
-                );
+                let anchor = probe_path(path.to_str().unwrap(), None, VolumeAnchorProbeDepth::Deep);
                 assert_eq!(anchor.pe_state, PeState::None);
-                assert_eq!(anchor.bytes_read, 512);
+                assert!(anchor.bytes_read <= 512 + crate::formats::zip::EOCD_SEARCH_BYTES);
                 assert!(anchor.format.is_empty());
                 assert!(!anchor.sfx);
                 std::fs::remove_file(path).unwrap();

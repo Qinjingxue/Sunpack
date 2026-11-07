@@ -126,7 +126,6 @@ def test_truncated_7z_sfx_is_confirmed_by_relations_and_projected_to_declared_ra
     assert descriptor.primary_extent.end == pe_end + len(payload)
 
     result = ArchiveTaskProvider(make_config({
-        "detection": {"enabled": True},
         "embedded_scan": {"enabled": True},
     })).discover_targets([str(path)])
 
@@ -147,7 +146,6 @@ def test_arbitrary_pe_zip_overlay_requires_deep_detect_for_embedded_discovery(tm
     assert group.head_metadata.get("relation_confirmed") is not True
 
     config = make_config({
-        "detection": {"enabled": True},
         "embedded_scan": {"enabled": True},
     })
     default_result = ArchiveTaskProvider(config).discover_targets([str(path)])

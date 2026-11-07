@@ -692,14 +692,6 @@ impl ManagedReader {
         self.source.prefetch(ranges)
     }
 
-    pub(crate) fn read_many(&self, ranges: &[(u64, usize)]) -> io::Result<Vec<Vec<u8>>> {
-        self.prefetch(ranges)?;
-        ranges
-            .iter()
-            .map(|&(offset, len)| self.read_at(offset, len))
-            .collect()
-    }
-
     pub(crate) fn stats(&self) -> io::Result<ReaderStats> {
         let mut stats = self.lock_inner()?.stats;
         stats.read_bytes = stats
@@ -3417,7 +3409,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_slices_and_batch_reads_preserve_requested_bytes() {
+    fn cached_slices_preserve_requested_bytes() {
         let data = vec![0x5au8; BLOCK_SIZE + 32];
         let path = temp_file("managed_reader_slices", &data);
         let reader = ManagedReader::open(&path).unwrap();
@@ -3427,8 +3419,6 @@ mod tests {
         let cached = reader.read_cached_at(4, 8).unwrap();
         assert!(matches!(cached, CachedBytes::Slice(_)));
         assert_eq!(&*cached, &[0x5a; 8]);
-        let many = reader.read_many(&[(0, 4), (BLOCK_SIZE as u64, 4)]).unwrap();
-        assert_eq!(many, vec![vec![0x5a; 4], vec![0x5a; 4]]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -3440,7 +3430,8 @@ mod tests {
         let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
 
         let ranges = [(BLOCK_SIZE as u64 - 4, 8), ((BLOCK_SIZE * 2) as u64 - 4, 8)];
-        let many = reader.read_many(&ranges).unwrap();
+        reader.prefetch(&ranges).unwrap();
+        let many = ranges.iter().map(|&(offset, len)| reader.read_at(offset, len).unwrap()).collect::<Vec<_>>();
         let after = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
 
         assert_eq!(many, vec![vec![0x6b; 8], vec![0x6b; 8]]);

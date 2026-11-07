@@ -125,32 +125,24 @@ impl AnalysisMultiVolumeView {
         self.view.stats(py)
     }
 
-    #[pyo3(signature = (config, initial_prepass=None, signature_prepass=true, format_structure=true))]
+    #[pyo3(signature = (config, initial_prepass=None, format_structure=true))]
     fn analyze<'py>(
         &self,
         py: Python<'py>,
         config: PyRef<'py, NativeAnalysisConfig>,
         initial_prepass: Option<Bound<'py, PyDict>>,
-        signature_prepass: bool,
         format_structure: bool,
     ) -> PyResult<Py<PyDict>> {
         self.view.analyze_report(
             py,
             &config,
             initial_prepass.as_ref(),
-            signature_prepass,
             format_structure,
             Some(&self.volume_starts),
         )
     }
 
-    #[pyo3(signature = (head_bytes=1048576, tail_bytes=1048576))]
-    fn signature_prepass(
-        &self,
-        py: Python<'_>,
-        head_bytes: usize,
-        tail_bytes: usize,
-    ) -> PyResult<Py<PyDict>> {
-        self.view.signature_prepass(py, head_bytes, tail_bytes)
+    fn signature_prepass(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.view.signature_prepass(py)
     }
 }

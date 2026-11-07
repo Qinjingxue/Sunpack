@@ -33,7 +33,7 @@ def _candidate(path, size: int, *, format_hint: str = "", route: str = "residual
 def test_disguised_zip_is_resolved_by_relations(tmp_path):
     path = tmp_path / "movie.dat"
     path.write_bytes(_zip_bytes())
-    result = ArchiveTaskProvider(make_config({"detection": {"enabled": True}})).discover_targets([str(path)])
+    result = ArchiveTaskProvider(make_config({})).discover_targets([str(path)])
     assert len(result.tasks) == 1
     assert result.tasks[0].discovery_source == "relations"
 

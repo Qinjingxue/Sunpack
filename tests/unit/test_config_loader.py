@@ -33,7 +33,6 @@ def _advanced_payload():
         "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
         "performance": {"worker": {"writer_threads": 6, "space_poll_interval_ms": 1000}},
         "verification": _verification_config(),
-        "detection": {"enabled": True},
     }
 
 
@@ -99,7 +98,6 @@ def test_everyday_clipboard_and_report_controls_override_advanced_defaults(tmp_p
 @pytest.mark.parametrize(
     ("override", "field"),
     [
-        ({"detection": {"enabled": "false"}}, "detection.enabled"),
         ({"filesystem": {"scan_filters_enabled": "false"}}, "filesystem.scan_filters_enabled"),
         ({"post_extract": {"flatten_single_directory": "false"}}, "post_extract.flatten_single_directory"),
         ({"passwords": {"clipboard_passwords_enabled": "false"}}, "passwords.clipboard_passwords_enabled"),
@@ -264,16 +262,6 @@ def test_embedded_candidate_ratio_simple_config_overrides_advanced(tmp_path, mon
     _write_json(simple, {"embedded_scan": {"recursive_candidate_ratio": 0.8}})
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     assert loader.load_config()["embedded_scan"]["recursive_candidate_ratio"] == 0.8
-
-
-def test_removed_detection_pipeline_configuration_is_rejected(tmp_path, monkeypatch):
-    simple = tmp_path / "sunpack_config.json"
-    advanced = tmp_path / "sunpack_advanced_config.json"
-    _write_json(advanced, _advanced_payload())
-    _write_json(simple, {"detection": {"rule_pipeline": {"precheck": []}}})
-    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
-    with pytest.raises(loader.ConfigError, match="rule_pipeline"):
-        loader.load_config()
 
 
 def test_load_config_applies_inline_env_override_last(tmp_path, monkeypatch):

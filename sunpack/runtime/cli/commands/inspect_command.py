@@ -117,7 +117,6 @@ def handle(args, ctx):
             "archives_only": bool(args.archives_only),
             "analyze": bool(args.analyze),
             "effective_config": effective_config,
-            "detection": effective_config["detection"],
             "deep_detect": bool(args.deep_detect),
         },
         summary=summary,

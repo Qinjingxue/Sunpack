@@ -11,7 +11,6 @@ from tests.helpers.fs_builder import make_minimal_7z, make_zip
 
 def pressure_scan_config() -> dict:
     return make_config({
-        "detection": {"enabled": True},
         "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 1e-9},
         "filesystem": {"scan_filters": [
             {"name": "size_range", "enabled": True, "min_bytes": 0},

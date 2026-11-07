@@ -10,7 +10,7 @@ from tests.helpers.config_factory import make_config
 
 
 def _payload():
-    return {"detection": {"enabled": True}, "verification": {}}
+    return {"verification": {}}
 
 
 def test_config_validate_checks_embedded_ratio_type():
@@ -102,7 +102,7 @@ def test_omitted_output_dir_keeps_default_beside_archive_behavior(tmp_path):
     assert "output" not in config or "root" not in config["output"]
 
 
-def test_effective_config_includes_native_worker_and_format_switch():
+def test_effective_config_includes_native_worker_without_detection_switch():
     config = _payload()
     config["filesystem"] = {
         "scan_filters": [
@@ -121,4 +121,4 @@ def test_effective_config_includes_native_worker_and_format_switch():
     assert "directory_scan_mode" not in effective["filesystem"]
     assert effective["worker"]["controller"] == "native_worker"
     assert effective["worker"]["sizing"] == "selected_by_worker"
-    assert effective["detection"] == {"enabled": True}
+    assert "detection" not in effective

@@ -60,10 +60,9 @@ class _BinaryView:
         config,
         *,
         initial_prepass: dict | None,
-        signature_prepass: bool,
         format_structure: bool,
     ) -> dict:
-        return self._native.analyze(config, initial_prepass, signature_prepass, format_structure)
+        return self._native.analyze(config, initial_prepass, format_structure)
 
 
 class SharedBinaryView(_BinaryView):

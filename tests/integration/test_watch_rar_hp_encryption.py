@@ -46,7 +46,6 @@ def _watch_config() -> dict:
         "clipboard_monitor_enabled": False,
         "password_retry_debounce_seconds": 0,
     }
-    config["detection"] = {"enabled": False}
     return config
 
 

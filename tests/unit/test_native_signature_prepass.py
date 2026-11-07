@@ -1,5 +1,5 @@
-import base64
-import subprocess
+from io import BytesIO
+import zipfile
 
 import pytest
 from sunpack_native import AnalysisBinaryView, AnalysisMultiVolumeView
@@ -7,39 +7,59 @@ from sunpack_native import AnalysisBinaryView, AnalysisMultiVolumeView
 
 @pytest.fixture
 def signature_paths(tmp_path):
-    data = bytearray(b"x" * 128)
-    for offset, signature in [(5, b"PK\x03\x04"), (60, b"7z\xbc\xaf\x27\x1c"),
-                              (100, b"\x1f\x8b\x08"), (119, b"Rar!\x1a\x07\x01\x00")]:
-        data[offset:offset + len(signature)] = signature
+    # A standard signature crossing a physical volume boundary must still
+    # be at the logical origin. Interior signatures are payload.
+    data = b"7z\xbc\xaf\x27\x1c" + b"x" * 54 + b"PK\x03\x04\x1f\x8b\x08Rar!\x1a\x07\x01\x00"
     paths = [tmp_path / "disguised.bin", tmp_path / "first.any", tmp_path / "second.any"]
-    statements = ["$ErrorActionPreference='Stop'"]
-    for path, content in zip(paths, [data, data[:62], data[62:]]):
-        literal = str(path).replace("'", "''")
-        encoded = base64.b64encode(content).decode("ascii")
-        statements.append(f"[IO.File]::WriteAllBytes('{literal}',[Convert]::FromBase64String('{encoded}'))")
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ";".join(statements)],
-                   check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    for path, content in zip(paths, [data, data[:3], data[3:]]):
+        path.write_bytes(content)
     return list(map(str, paths))
 
 
-@pytest.mark.parametrize("head,tail,offsets", [
-    (32, 16, [5, 119]), (80, 80, [5, 60, 100, 119]),
-    (64, 64, [5, 60, 100, 119]), (0, 0, []), (20, 0, [5]),
-])
-def test_single_and_split_prepass_agree_on_ranges_and_cross_volume_signatures(signature_paths, head, tail, offsets):
+def test_standard_prepass_reuses_logical_origin_across_volumes(signature_paths):
     single = AnalysisBinaryView(signature_paths[0], cache_bytes=0)
     split = AnalysisMultiVolumeView(signature_paths[1:], cache_bytes=0)
     try:
-        actual = single.signature_prepass(head, tail)
-        assert actual == split.signature_prepass(head, tail)
-        assert [hit["offset"] for hit in actual["hits"]] == offsets
-        assert actual["head_bytes"] == min(head, 128)
-        assert actual["tail_bytes"] == min(tail, 128)
-        expected_reads = 128 if head + tail >= 128 else head + tail
-        assert single.stats()["read_bytes"] == split.stats()["read_bytes"] == expected_reads
+        actual = single.signature_prepass()
+        assert actual == split.signature_prepass()
+        assert [(hit["name"], hit["offset"]) for hit in actual["hits"]] == [("7z", 0)]
+        assert actual["tail_bytes"] == 0
+        assert single.stats()["read_bytes"] == split.stats()["read_bytes"] == 32
     finally:
         single.close()
         split.close()
+
+
+@pytest.mark.parametrize("marker", [b"", b"PK00", b"PK\x07\x08"])
+def test_standard_zip_prepass_handles_maximum_comment_without_scanning_comment_signatures(tmp_path, marker):
+    # A maximum comment puts the real EOCD at the exact search limit;
+    # embedded-looking bytes in the comment must remain data.
+    stream = BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("entry", b"7z\xbc\xaf\x27\x1c")
+        archive.comment = b"Rar!\x1a\x07\x01\x00" + b"x" * (65535 - 8)
+    path = tmp_path / "standard.any"
+    data = marker + stream.getvalue()
+    path.write_bytes(data)
+    view = AnalysisBinaryView(str(path), cache_bytes=0)
+    try:
+        result = view.signature_prepass()
+        assert list(result["formats"]) == ["zip"]
+        assert [(hit["name"], hit["offset"]) for hit in result["hits"]] == [
+            ("zip_local", len(marker)), ("zip_eocd", len(data) - 65557),
+        ]
+        assert result["tail_bytes"] == 65557
+    finally:
+        view.close()
+    # An unknown origin does not search for the ZIP inside its carrier.
+    path.write_bytes(b"x" * 600 + stream.getvalue() + b"suffix")
+    view = AnalysisBinaryView(str(path), cache_bytes=0)
+    try:
+        result = view.signature_prepass()
+        assert list(result["hits"]) == []
+        assert result["head_bytes"] == 512 and result["tail_bytes"] == 0
+    finally:
+        view.close()
 
 
 @pytest.mark.parametrize("multivolume", [False, True])
@@ -47,13 +67,11 @@ def test_analysis_operations_preserve_closed_view_contract(signature_paths, mult
     view = (AnalysisMultiVolumeView(signature_paths[1:], cache_bytes=0)
             if multivolume else AnalysisBinaryView(signature_paths[0], cache_bytes=0))
     try:
-        view.signature_prepass(32, 16)
+        view.signature_prepass()
     finally:
         view.close()
-    # Prepass alone cannot catch format-specific entry points reading a retired
-    # reader and reporting archive damage instead of a closed-view error.
     for operation, args in (
-        (view.signature_prepass, (0, 0)),
+        (view.signature_prepass, ()),
         (view.read_at, (0, 0)),
         (view.read_tail, (0,)),
         (view.stats, ()),

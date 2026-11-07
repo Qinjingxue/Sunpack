@@ -201,13 +201,15 @@ if ($previousStateDirectory -ne $stateDirectory -and
 
 # Runtime code has no migration aliases. Remove retired public controls here;
 # installation deploys the new advanced template separately.
-if ($user.PSObject.Properties['input_planning']) {
-    $user.PSObject.Properties.Remove('input_planning'); $changed = $true
+foreach ($section in @('input_planning', 'detection')) {
+    if ($user.PSObject.Properties[$section]) {
+        $user.PSObject.Properties.Remove($section); $changed = $true
+    }
 }
 foreach ($field in @(
     @('watch', 'state_dir'), @('watch', 'runtime_cache_cleanup_enabled'),
     @('watch', 'toast_report_max_files'), @('watch', 'toast_report_max_bytes'),
-    @('analysis', 'shared_cache_mb'), @('analysis', 'thresholds')
+    @('analysis', 'shared_cache_mb'), @('analysis', 'thresholds'), @('analysis', 'prepass')
 )) {
     $section = $field[0]; $name = $field[1]
     if ($user.PSObject.Properties[$section] -and $null -ne $user.$section -and

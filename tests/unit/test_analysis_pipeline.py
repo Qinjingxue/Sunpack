@@ -32,7 +32,8 @@ def _rar4_block(header_type: int, flags: int = 0, payload: bytes = b"") -> bytes
 
 
 def _rar4_bytes() -> bytes:
-    return b"Rar!\x1a\x07\x00" + _rar4_block(0x73) + _rar4_block(0x7B)
+    main = b"\x73\x00\x00\x0d\x00" + bytes(6)
+    return b"Rar!\x1a\x07\x00" + (crc32(main) & 0xFFFF).to_bytes(2, "little") + main + _rar4_block(0x7B)
 
 
 def _rar5_vint(value: int) -> bytes:
@@ -59,7 +60,7 @@ def _rar5_block(header_type: int, flags: int = 0, data: bytes = b"", *, body: by
 
 
 def _rar5_bytes() -> bytes:
-    return b"Rar!\x1a\x07\x01\x00" + _rar5_block(1) + _rar5_block(5)
+    return b"Rar!\x1a\x07\x01\x00" + _rar5_block(1, body=b"\x00") + _rar5_block(5, body=b"\x00")
 
 
 def _rar5_oversized_size_vint_block() -> bytes:
@@ -177,6 +178,9 @@ def test_rar4_large_packed_sizes_agree_across_native_analysis_paths(tmp_path):
 
 def test_clean_whole_input_formats_use_structure_evidence(tmp_path):
     payload = b"clean payload" * 32
+    # Standard prepass is implicit, including when old configuration is fed
+    # directly to the engine without going through installation migration.
+    engine = AnalysisEngine({"analysis": {"prepass": {"enabled": False}}})
     cases = {
         "zip": _zip_bytes(tmp_path),
         "7z": _seven_zip_bytes(),
@@ -194,7 +198,7 @@ def test_clean_whole_input_formats_use_structure_evidence(tmp_path):
     }
     for name, data in cases.items():
         path = _write_bytes(tmp_path / f"clean-{name}.bin", data)
-        report = AnalysisEngine().analyze_path(str(path))
+        report = engine.analyze_path(str(path))
 
         expected = {"rar4": "rar", "rar5": "rar", "7z-empty": "7z",
                     "tar.gz": "gzip", "tar.bz2": "bzip2", "tar.xz": "xz"}.get(name, name)
@@ -204,15 +208,23 @@ def test_clean_whole_input_formats_use_structure_evidence(tmp_path):
 
 
 @pytest.mark.parametrize("rar_bytes", [_rar4_bytes, _rar5_bytes])
-def test_analysis_scheduler_finds_embedded_archive_segments(tmp_path, rar_bytes):
-    samples = [("zip", _zip_bytes(tmp_path)), ("rar", rar_bytes()), ("7z", _seven_zip_bytes())]
-    payload = b"shell"
+def test_analysis_reuses_embedded_roots_without_searching_for_them(tmp_path, rar_bytes):
+    zip_data = _zip_bytes(tmp_path)
+    samples = [("rar", rar_bytes()), ("7z", _seven_zip_bytes()), ("zip", zip_data)]
+    # A plausible leading ZIP header must not authorize an unrelated ZIP
+    # root inferred from a valid terminal record at the end of its payload.
+    payload = zip_data[:40] + b"shell"
     expected = []
     for fmt, data in samples:
         expected.append((fmt, len(payload), len(payload) + len(data)))
-        payload += data + b"junk-between-archives"
+        payload += data
+        if fmt != "zip":
+            payload += b"junk-between-archives"
     path = _write_bytes(tmp_path / "mixed.bin", payload)
-    report = AnalysisEngine().analyze_path(str(path))
+    engine = AnalysisEngine()
+    assert engine.analyze_path(str(path)).selected == []
+    scan = scan_embedded_archives(str(path))
+    report = engine.analyze_path(str(path), initial_prepass=scan.to_prepass())
     actual = {(item.format, segment.start_offset, segment.end_offset)
               for item in report.evidences for segment in item.segments}
     assert set(expected) <= actual

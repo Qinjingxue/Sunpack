@@ -22,7 +22,6 @@ class ConfigField:
 CONFIG_FIELD_PROVIDER_MODULES = (
     "sunpack.core.config.fields.cli",
     "sunpack.core.config.fields.coordinator",
-    "sunpack.core.config.fields.detection",
     "sunpack.core.config.fields.embedded",
     "sunpack.core.config.fields.extraction",
     "sunpack.core.config.fields.filesystem",

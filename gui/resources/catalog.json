@@ -873,10 +873,6 @@
     "verification": {
       "zh": "结果验证",
       "en": "Result verification"
-    },
-    "detection": {
-      "zh": "格式检测",
-      "en": "Format detection"
     }
   },
   "fields": {
@@ -1297,30 +1293,6 @@
       "max": null,
       "integer": true
     },
-    "/analysis/prepass/enabled": {
-      "label": {
-        "zh": "文件头尾预读",
-        "en": "Read file headers and tails"
-      }
-    },
-    "/analysis/prepass/head_bytes": {
-      "label": {
-        "zh": "文件头读取量（字节）",
-        "en": "Header read size (bytes)"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
-    "/analysis/prepass/tail_bytes": {
-      "label": {
-        "zh": "文件尾读取量（字节）",
-        "en": "Tail read size (bytes)"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
     "/analysis/modules/@zip/enabled": {
       "label": {
         "zh": "ZIP",
@@ -1479,16 +1451,6 @@
       "min": 0,
       "integer": true
     },
-    "/detection/enabled": {
-      "label": {
-        "zh": "格式检测",
-        "en": "Format detection"
-      },
-      "description": {
-        "zh": "按内容识别格式，支持伪装扩展名和分卷",
-        "en": "Identify formats by content, including disguised extensions and split volumes"
-      }
-    },
     "/watch/event_log_retention_days": {
       "label": {
         "zh": "日志保留天数",
@@ -1636,14 +1598,6 @@
     "/performance/worker": {
       "zh": "解压任务调度",
       "en": "Extraction scheduling"
-    },
-    "/analysis/prepass": {
-      "zh": "文件头尾预读",
-      "en": "Read file headers and tails"
-    },
-    "/analysis/thresholds": {
-      "zh": "识别要求",
-      "en": "Detection threshold"
     }
   }
 }

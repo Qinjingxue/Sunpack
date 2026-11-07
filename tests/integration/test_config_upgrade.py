@@ -70,7 +70,9 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
                     "memory_reserve_bytes": 1024, "writer_threads": 6, "job_buffer_budget_bytes": 2048}},
                 "input_planning": {"enabled": False, "cache_size": 0, "unknown": "retire whole section"},
                 "analysis": {"shared_cache_mb": 0, "max_concurrent_reads": 3,
-                             "thresholds": {"extractable_confidence": 0.5}, "unknown": "keep"},
+                             "thresholds": {"extractable_confidence": 0.5},
+                             "prepass": {"enabled": False, "head_bytes": 1, "tail_bytes": 1}, "unknown": "keep"},
+                "detection": {"enabled": False},
                 "unknown": "keep"}
     user.write_text(json.dumps(original), encoding="utf-8")
     command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -83,6 +85,7 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
     assert migrated["passwords"]["clipboard_passwords_enabled"] is False
     assert migrated["performance"]["worker"] == {"writer_threads": 6}
     assert "input_planning" not in migrated
+    assert "detection" not in migrated
     assert migrated["analysis"] == {"max_concurrent_reads": 3, "unknown": "keep"}
     # The old advanced snapshot is read-only; deployment replaces the installed
     # template instead of migrating it through a second compatibility chain.

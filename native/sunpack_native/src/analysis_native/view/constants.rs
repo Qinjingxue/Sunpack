@@ -13,8 +13,8 @@ const LZ4: &[u8] = crate::formats::lz4::MAGIC;
 const TAR_USTAR: &[u8] = b"ustar";
 const TAR_BLOCK_SIZE: usize = 512;
 
-// The same IDs name retained native hits and drive the window scanner.
-// Embedded-only markers have no pattern in the window prepass.
+// The same IDs name retained native hits and standard leading structures.
+// Embedded-only markers have no leading signature in the standard prepass.
 const ANALYSIS_SIGNATURES: &[(&str, Option<&[u8]>)] = &[
     ("zip_local", Some(ZIP_LOCAL)),
     ("zip_eocd", Some(ZIP_EOCD)),

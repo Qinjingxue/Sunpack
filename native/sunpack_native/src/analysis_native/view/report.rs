@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-const DEFAULT_PREPASS_BYTES: usize = 1024 * 1024;
 const STREAM_STRUCTURE_CACHE_ENTRIES: usize = 512;
 
 const RAR_TRUNCATION_ERRORS: &[&str] = &[
@@ -79,9 +78,6 @@ struct ModuleConfig {
 /// Parsed analysis configuration, built once per engine and shared by calls.
 #[pyclass(frozen)]
 pub(crate) struct NativeAnalysisConfig {
-    prepass_enabled: bool,
-    head_bytes: usize,
-    tail_bytes: usize,
     modules: Vec<ModuleConfig>,
 }
 
@@ -89,18 +85,6 @@ pub(crate) struct NativeAnalysisConfig {
 impl NativeAnalysisConfig {
     #[new]
     fn new(config: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let prepass = dict_item(config, "prepass")?;
-        let (prepass_enabled, head_bytes, tail_bytes) = match prepass {
-            Some(prepass) => (
-                match prepass.get_item("enabled")? {
-                    Some(value) => value.is_truthy()?,
-                    None => true,
-                },
-                positive_int_or(&prepass, "head_bytes", DEFAULT_PREPASS_BYTES as u64)? as usize,
-                positive_int_or(&prepass, "tail_bytes", DEFAULT_PREPASS_BYTES as u64)? as usize,
-            ),
-            None => (true, DEFAULT_PREPASS_BYTES, DEFAULT_PREPASS_BYTES),
-        };
         let mut modules: Vec<ModuleConfig> = Vec::new();
         if let Some(items) = config.get_item("modules")? {
             if let Ok(items) = items.cast::<PyList>() {
@@ -131,12 +115,7 @@ impl NativeAnalysisConfig {
                 }
             }
         }
-        Ok(Self {
-            prepass_enabled,
-            head_bytes,
-            tail_bytes,
-            modules,
-        })
+        Ok(Self { modules })
     }
 
     #[getter]
@@ -334,7 +313,6 @@ impl AnalysisBinaryView {
         py: Python<'py>,
         config: &NativeAnalysisConfig,
         initial_prepass: Option<&Bound<'py, PyDict>>,
-        signature_prepass: bool,
         format_structure: bool,
         disk_starts: Option<&[u64]>,
     ) -> PyResult<Py<PyDict>> {
@@ -346,16 +324,13 @@ impl AnalysisBinaryView {
                 let hits = signature_hits_from_prepass(prepass)?;
                 (prepass.copy()?, hits)
             }
-            _ if (signature_prepass || format_structure) && config.prepass_enabled => {
+            _ => {
                 let data = py
-                    .detach(|| {
-                        signature_prepass_native(&self.reader, config.head_bytes, config.tail_bytes)
-                    })
+                    .detach(|| signature_prepass_native(&self.reader))
                     .map_err(reader_error_to_py)?;
                 let hits = Arc::clone(&data.hits);
                 (signature_prepass_to_python(py, data)?.into_bound(py), hits)
             }
-            _ => (PyDict::new(py), Arc::from([])),
         };
         let mut embedded: HashMap<String, Vec<Bound<'py, PyDict>>> = HashMap::new();
         for item in prepass_dicts(&prepass, "embedded_candidates")? {
@@ -708,6 +683,17 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             if native.is_empty()
                 || !(truthy(&native, "magic_matched")? || truthy(&native, "plausible")?)
             {
+                continue;
+            }
+            let archive_offset = u64_of(&native, "archive_offset")?;
+            if archive_offset != 0
+                && !hits.iter().any(|hit| {
+                    hit.kind == ReportHitKind::ZipLocal && hit.offset == archive_offset
+                })
+            {
+                // A terminal record may belong to a ZIP inside a damaged
+                // leading input. Reuse the parser's origin fact; discovering
+                // a different root belongs to the existing embedded stage.
                 continue;
             }
             evidences.push(
@@ -2100,13 +2086,6 @@ fn str_list(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<String>> {
         items.push(item?.str()?.to_string());
     }
     Ok(items)
-}
-
-fn positive_int_or(dict: &Bound<'_, PyDict>, key: &str, default: u64) -> PyResult<u64> {
-    match present(dict, key)? {
-        Some(value) => Ok(value.extract::<i64>()?.max(0) as u64),
-        None => Ok(default),
-    }
 }
 
 fn set_default<'py, V: IntoPyObject<'py>>(

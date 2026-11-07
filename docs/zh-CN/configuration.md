@@ -152,3 +152,19 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 其他较少使用的设置可查看 `sunpack_advanced_config.json` 和 `config show`。`SUNPACK_CONFIG_OVERRIDES` 接受内联 JSON 对象或 JSON 文件路径，用于临时覆盖配置。
 
 压缩包分析直接根据已验证的格式结构、载体精确边界、密码需求和缺卷事实判断执行资格。数值分析置信度及 `analysis.thresholds.extractable_confidence` 已删除。候选按已证明的外层范围归属和物理位置选择；损坏或边界未定的候选不会继承其他候选的解压资格。CLI inspect 展示状态与结构事实，不再输出数值置信度。
+
+`analysis.prepass`（含 `enabled`、`head_bytes`、`tail_bytes`）和 `detection` 配置已删除。标准预探测和格式检测是固定执行的内置机制，已有分析事实优先复用。标准预探测使用内部格式规则，只检查逻辑输入的起点；普通输入默认起点为 0。先用最多 8 字节区分格式，再读取对应起始结构。下表是起始读取量，不是整个分析的读取上限：可变长度字段、后续头、块和拼接成员仍由已有 Rust 解析器按声明长度、偏移继续读取。数据或注释中的其他格式签名不会成为新起点。
+
+| 格式 | 起始结构与后续读取规则 |
+| --- | --- |
+| ZIP | 本地头固定 30 字节，带分卷标记时 34 字节，再按名称及扩展字段长度读取。先检查尾部 22 字节 EOCD；有注释时最多检查 65,557 字节。ZIP64 按 locator 定位后续记录。[APPNOTE](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT) |
+| 7z | 起始头 32 字节，后续头按其中声明的偏移和长度读取。[规范](https://raw.githubusercontent.com/ip7z/7zip/main/DOC/7zFormat.txt) |
+| RAR4 / RAR5 | 签名分别为 7 / 8 字节，再按块头声明长度读取；加密头复用原生密码解析。[RAR 规范](https://www.rarlab.com/technote.htm) |
+| TAR | 起点一个 512 字节记录，包含无 `ustar` 的 V7；校验和、元数据及后续记录复用已有遍历器。[7-Zip 格式定义](https://raw.githubusercontent.com/ip7z/7zip/main/CPP/7zip/Archive/Tar/TarHeader.h) |
+| GZIP | 固定头 10 字节，再按标志解析可选字段和后续成员。[RFC 1952](https://www.rfc-editor.org/rfc/rfc1952) |
+| BZIP2 | 流头 4 字节；块和成员边界由已有位流解析器确认。[参考解码器](https://raw.githubusercontent.com/libarchive/bzip2/master/decompress.c) |
+| XZ | 流头 12 字节，继续解析块、索引、页脚、合法 padding 和拼接流。[规范](https://tukaani.org/xz/xz-file-format.txt) |
+| Zstandard | 含 magic 的帧头最多 18 字节；按描述符、块长度及 skippable 帧结构继续解析。[RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) |
+| LZ4 | 含 magic 的帧头最多 19 字节；按描述符、块长度及 8 字节 skippable 头继续解析。[规范](https://raw.githubusercontent.com/lz4/lz4/dev/doc/lz4_Frame_format.md) |
+
+载体仍自然进入已有 embedded 调度阶段；扫描确认的起点、范围直接复用，不重复搜索签名。分卷锚点继续返回已有 relation 流程，从已知偏移复用标准头解析，不新增 detection/relation 载体发现旁路。报告中的 `head_bytes` / `tail_bytes` 仅为实际读取统计，不再是配置项。

@@ -22,7 +22,6 @@ class ArchiveDiscoveryPipeline:
         include_details: bool = True,
     ) -> StageResult:
         routes = table.resolve(
-            self.config.get("detection", {}).get("enabled", True),
             include_residual_details=include_details,
         )
         result = StageResult()
@@ -52,7 +51,6 @@ class ArchiveDiscoveryPipeline:
                     format=format_hint,
                 ))
 
-        detection_enabled = self.config.get("detection", {}).get("enabled", True)
         for index, status in routes.detection_events:
             if status == 1:
                 candidate = session.project_native_candidate(table, index)
@@ -74,7 +72,6 @@ class ArchiveDiscoveryPipeline:
                     source="detection",
                     status="residual",
                     format=format_hint,
-                    reason="" if detection_enabled else "detection_disabled",
                 ))
 
         embedded_result = self.embedded.discover_native(

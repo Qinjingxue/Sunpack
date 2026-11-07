@@ -43,7 +43,6 @@ def test_watch_promoted_sibling_controls_verified_group_cleanup(tmp_path, monkey
             state.close()
     output = tmp_path / "out"
     config = make_config({
-        "detection": {"enabled": True},
         "user_passwords": ["known"],
         "watch": {"clipboard_monitor_enabled": False},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},

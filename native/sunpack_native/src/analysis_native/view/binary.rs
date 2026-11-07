@@ -124,35 +124,27 @@ impl AnalysisBinaryView {
         Ok(result.unbind())
     }
 
-    #[pyo3(signature = (config, initial_prepass=None, signature_prepass=true, format_structure=true))]
+    #[pyo3(signature = (config, initial_prepass=None, format_structure=true))]
     fn analyze<'py>(
         &self,
         py: Python<'py>,
         config: PyRef<'py, NativeAnalysisConfig>,
         initial_prepass: Option<Bound<'py, PyDict>>,
-        signature_prepass: bool,
         format_structure: bool,
     ) -> PyResult<Py<PyDict>> {
         self.analyze_report(
             py,
             &config,
             initial_prepass.as_ref(),
-            signature_prepass,
             format_structure,
             None,
         )
     }
 
-    #[pyo3(signature = (head_bytes=1048576, tail_bytes=1048576))]
-    fn signature_prepass(
-        &self,
-        py: Python<'_>,
-        head_bytes: usize,
-        tail_bytes: usize,
-    ) -> PyResult<Py<PyDict>> {
+    fn signature_prepass(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         self.ensure_open()?;
         let data = py
-            .detach(|| signature_prepass_native(&self.reader, head_bytes, tail_bytes))
+            .detach(|| signature_prepass_native(&self.reader))
             .map_err(reader_error_to_py)?;
         signature_prepass_to_python(py, data)
     }

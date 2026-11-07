@@ -7,7 +7,7 @@ from tests.helpers.config_factory import make_config
 
 
 def detection_pipeline_config() -> dict:
-    return make_config({"detection": {"enabled": True}, "embedded_scan": {"enabled": True}})
+    return make_config({"embedded_scan": {"enabled": True}})
 
 
 def detect_archive_hits(path: Path, config: dict | None = None):
