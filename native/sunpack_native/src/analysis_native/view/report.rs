@@ -1,18 +1,17 @@
 // Canonical archive analysis report.
 //
-// This is the only place that turns format probes into evidence, confidence,
+// This is the only place that turns format probes into evidence,
 // segment boundaries, selection, and the extraction segment plan. Python only
 // projects the returned report into its task contracts.
 
+use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::reader::FileIdentity;
-use crate::io::cancellation::{Cancellation, CancellableOnce};
 use pyo3::types::PyTuple;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const DEFAULT_PREPASS_BYTES: usize = 1024 * 1024;
-const DEFAULT_EXTRACTABLE_CONFIDENCE: f64 = 0.85;
 const STREAM_STRUCTURE_CACHE_ENTRIES: usize = 512;
 
 const RAR_TRUNCATION_ERRORS: &[&str] = &[
@@ -83,7 +82,6 @@ pub(crate) struct NativeAnalysisConfig {
     prepass_enabled: bool,
     head_bytes: usize,
     tail_bytes: usize,
-    extractable_confidence: f64,
     modules: Vec<ModuleConfig>,
 }
 
@@ -102,13 +100,6 @@ impl NativeAnalysisConfig {
                 positive_int_or(&prepass, "tail_bytes", DEFAULT_PREPASS_BYTES as u64)? as usize,
             ),
             None => (true, DEFAULT_PREPASS_BYTES, DEFAULT_PREPASS_BYTES),
-        };
-        let extractable_confidence = match dict_item(config, "thresholds")? {
-            Some(thresholds) => match thresholds.get_item("extractable_confidence")? {
-                Some(value) if !value.is_none() => value.extract::<f64>()?,
-                _ => DEFAULT_EXTRACTABLE_CONFIDENCE,
-            },
-            None => DEFAULT_EXTRACTABLE_CONFIDENCE,
         };
         let mut modules: Vec<ModuleConfig> = Vec::new();
         if let Some(items) = config.get_item("modules")? {
@@ -144,7 +135,6 @@ impl NativeAnalysisConfig {
             prepass_enabled,
             head_bytes,
             tail_bytes,
-            extractable_confidence,
             modules,
         })
     }
@@ -165,23 +155,19 @@ fn strict_subrange(start: u64, end: Option<u64>, size: u64) -> bool {
 struct Segment {
     start: u64,
     end: Option<u64>,
-    confidence: f64,
+    extractable: bool,
+    password_required: Option<bool>,
     damage_flags: Vec<String>,
     evidence: Vec<String>,
 }
 
 impl Segment {
-    fn new(
-        start: u64,
-        end: Option<u64>,
-        confidence: f64,
-        damage_flags: Vec<String>,
-        evidence: Vec<String>,
-    ) -> Self {
+    fn new(start: u64, end: Option<u64>, damage_flags: Vec<String>, evidence: Vec<String>) -> Self {
         Self {
             start,
             end,
-            confidence,
+            extractable: false,
+            password_required: None,
             damage_flags,
             evidence,
         }
@@ -235,7 +221,6 @@ impl<'py> EvidenceDetails<'py> {
 
 struct Evidence<'py> {
     format: String,
-    confidence: f64,
     status: &'static str,
     segments: Vec<Segment>,
     warnings: Vec<String>,
@@ -245,14 +230,15 @@ struct Evidence<'py> {
 impl<'py> Evidence<'py> {
     fn new(
         format: &str,
-        confidence: f64,
         status: &'static str,
-        segments: Vec<Segment>,
+        mut segments: Vec<Segment>,
         details: impl Into<EvidenceDetails<'py>>,
     ) -> Self {
+        for segment in &mut segments {
+            segment.extractable |= status == "extractable";
+        }
         Self {
             format: format.to_string(),
-            confidence,
             status,
             segments,
             warnings: Vec::new(),
@@ -260,8 +246,23 @@ impl<'py> Evidence<'py> {
         }
     }
 
+    fn range_key(&self) -> (u64, std::cmp::Reverse<u64>) {
+        let extractable = self.segments.iter().any(|segment| segment.extractable);
+        self.segments
+            .iter()
+            .filter(|segment| !extractable || segment.extractable)
+            .map(|segment| {
+                (
+                    segment.start,
+                    std::cmp::Reverse(segment.end.unwrap_or(segment.start)),
+                )
+            })
+            .min()
+            .unwrap_or((u64::MAX, std::cmp::Reverse(0)))
+    }
+
     fn not_found(_py: Python<'py>, format: &str) -> Self {
-        Self::new(format, 0.0, "not_found", Vec::new(), EvidenceDetails::Empty)
+        Self::new(format, "not_found", Vec::new(), EvidenceDetails::Empty)
     }
 
     fn with_warnings(mut self, warnings: Vec<String>) -> Self {
@@ -386,61 +387,28 @@ impl AnalysisBinaryView {
                             details.set_item("error", "out_of_memory")?;
                             details.set_item("failure_kind", "resource_unavailable")?;
                         }
-                        Evidence::new(
-                            module.kind.format(),
-                            0.0,
-                            "error",
-                            Vec::new(),
-                            details,
-                        )
-                        .with_warnings(vec![message])
+                        Evidence::new(module.kind.format(), "error", Vec::new(), details)
+                            .with_warnings(vec![message])
                     }
                 });
             }
         }
         cancellation.check()?;
         let size = self.reader.len();
-        let selected_in_module_order = evidences
+        // Feasibility comes from format structure, not a cross-format score.
+        let selected = evidences
             .iter()
             .enumerate()
-            .filter(|(_, evidence)| {
-                evidence.status == "extractable"
-                    && evidence.confidence >= config.extractable_confidence
-                    && !evidence.segments.is_empty()
-            })
+            .filter(|(_, evidence)| evidence.segments.iter().any(|s| s.extractable))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        // Stable descending order keeps module order for equal confidences.
-        let mut order = (0..evidences.len()).collect::<Vec<_>>();
-        order.sort_by(|left, right| {
-            evidences[*right]
-                .confidence
-                .partial_cmp(&evidences[*left].confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut position = vec![0usize; evidences.len()];
-        for (sorted_index, original) in order.iter().enumerate() {
-            position[*original] = sorted_index;
-        }
-        let selected = selected_in_module_order
+        // Prefer the first proven outer range. Module order only breaks ties
+        // between indistinguishable ranges; independent peers remain planned.
+        let best_selected = selected
             .iter()
-            .map(|index| position[*index])
-            .collect::<Vec<_>>();
-        // The first selected evidence with the highest confidence names the input format.
-        let mut best_selected = None::<usize>;
-        for index in &selected_in_module_order {
-            if best_selected
-                .is_none_or(|best| evidences[*index].confidence > evidences[best].confidence)
-            {
-                best_selected = Some(*index);
-            }
-        }
-        let best_selected = best_selected.map(|index| position[index]);
-        let mut slots = evidences.into_iter().map(Some).collect::<Vec<_>>();
-        let sorted = order
-            .iter()
-            .map(|index| slots[*index].take().expect("evidence moved once"))
-            .collect::<Vec<_>>();
+            .copied()
+            .min_by_key(|index| evidences[*index].range_key());
+        let sorted = evidences;
 
         let plan = SegmentPlan::build(&sorted, &selected, size)?;
         let stats = self.reader.stats()?;
@@ -521,7 +489,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 continue;
             }
             exact_starts.insert(start);
-            let confidence = f64_of(item, "confidence")?;
+
             let validation = str_or(item, "validation", "complete_header_walk")?;
             let details = PyDict::new(py);
             details.set_item("source", "embedded_scan")?;
@@ -531,12 +499,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             details.set_item("integrity_confidence", "deferred")?;
             candidates.push(Evidence::new(
                 "rar",
-                confidence,
                 "extractable",
                 vec![Segment::new(
                     start,
                     Some(end),
-                    confidence,
                     Vec::new(),
                     vec![format!("rar:{validation}")],
                 )],
@@ -612,12 +578,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 let exact = end.is_some()
                     && boundary_kind.str()?.to_string() == "exact"
                     && required_item(item, "extractable")?.is_truthy()?;
-                let confidence = f64_of(item, "confidence")?;
-                let confidence = if exact {
-                    confidence
-                } else {
-                    confidence.min(0.80)
-                };
+
                 let validation = str_or(item, "validation", "validated_structure")?;
                 let details = PyDict::new(py);
                 details.set_item("source", "embedded_scan")?;
@@ -625,12 +586,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 details.set_item("boundary_kind", boundary_kind)?;
                 candidates.push(Evidence::new(
                     "tar",
-                    confidence,
                     if exact { "extractable" } else { "damaged" },
                     vec![Segment::new(
                         start,
                         end,
-                        confidence,
                         if exact {
                             Vec::new()
                         } else {
@@ -646,7 +605,9 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         // Ordinary analysis owns only a TAR starting at the logical input start.
         // Nonzero TAR candidates belong to the canonical embedded scanner;
         // raw ustar hits can also be bytes inside a compression stream.
-        Ok(self.tar_candidate(0)?.unwrap_or_else(|| Evidence::not_found(py, "tar")))
+        Ok(self
+            .tar_candidate(0)?
+            .unwrap_or_else(|| Evidence::not_found(py, "tar")))
     }
 
     fn tar_observation(&self, start: u64) -> PyResult<Bound<'py, PyDict>> {
@@ -678,23 +639,14 @@ impl<'a, 'py> ReportContext<'a, 'py> {
     fn tar_candidate(&self, start: u64) -> PyResult<Option<Evidence<'py>>> {
         let result = self.tar_observation(start)?;
         if truthy(&result, "plausible")? {
-            let confidence = if truthy(&result, "end_zero_blocks")? {
-                0.94
-            } else if truthy(&result, "walk_complete")? {
-                0.90
-            } else {
-                0.86
-            };
             let segment = Segment::new(
                 start,
                 opt_u64_of(&result, "segment_end")?,
-                confidence,
                 read_fault_damage_flags(&result)?,
                 str_list(&result, "evidence")?,
             );
             return Ok(Some(Evidence::new(
                 "tar",
-                confidence,
                 "extractable",
                 vec![segment],
                 result.copy()?,
@@ -710,9 +662,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             details.set_item("route_evidence_flags", damage_flags.clone())?;
             return Ok(Some(Evidence::new(
                 "tar",
-                0.72,
                 "damaged",
-                vec![Segment::new(start, None, 0.72, damage_flags, evidence)],
+                vec![Segment::new(start, None, damage_flags, evidence)],
                 details,
             )));
         }
@@ -782,12 +733,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             details.set_item("boundary_confidence", "low")?;
             evidences.push(Evidence::new(
                 "zip",
-                0.70,
                 "damaged",
                 vec![Segment::new(
                     start,
                     None,
-                    0.70,
                     vec!["central_directory_unavailable".to_string()],
                     vec!["zip:validated_local_header".to_string()],
                 )],
@@ -887,34 +836,26 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         let embedded = self.embedded(format, true)?;
         if !embedded.is_empty() {
             let mut complete = true;
-            let mut confidence = f64::NEG_INFINITY;
-            for item in &embedded {
-                complete &= opt_u64_of(item, "end_offset")?.is_some()
-                    && required_item(item, "boundary_kind")?.str()?.to_string() == "exact"
-                    && required_item(item, "extractable")?.is_truthy()?;
-                confidence = confidence.max(f64_of(item, "confidence")?);
-            }
-            let confidence = confidence.min(0.99);
-            let effective = if complete {
-                confidence
-            } else {
-                confidence.min(0.80)
-            };
             let mut segments = Vec::new();
             for item in &embedded {
                 let end = opt_u64_of(item, "end_offset")?;
+                let extractable = end.is_some()
+                    && required_item(item, "boundary_kind")?.str()?.to_string() == "exact"
+                    && required_item(item, "extractable")?.is_truthy()?;
+                complete &= extractable;
                 let validation = str_or(item, "validation", "validated_header")?;
-                segments.push(Segment::new(
+                let mut segment = Segment::new(
                     u64_of(item, "offset")?,
                     end,
-                    effective,
                     if end.is_some() {
                         Vec::new()
                     } else {
                         vec!["stream_boundary_inferred".to_string()]
                     },
                     vec![format!("{format}:{validation}")],
-                ));
+                );
+                segment.extractable = extractable;
+                segments.push(segment);
             }
             let details = PyDict::new(py);
             details.set_item("source", "embedded_scan")?;
@@ -922,7 +863,6 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             details.set_item("boundary_confidence", if complete { "high" } else { "low" })?;
             return Ok(Evidence::new(
                 format,
-                effective,
                 if complete { "extractable" } else { "damaged" },
                 segments,
                 details,
@@ -930,7 +870,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         }
         let result = self.stream_observation(format)?;
         if !truthy(&result, "magic_matched")? {
-            return Ok(Evidence::new(format, 0.0, "not_found", Vec::new(), result));
+            return Ok(Evidence::new(format, "not_found", Vec::new(), result));
         }
         let mut damage_flags = str_list(&result, "damage_flags")?;
         let error = str_of(&result, "error")?;
@@ -955,9 +895,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             };
             return Ok(Evidence::new(
                 format,
-                0.97,
                 "extractable",
-                vec![Segment::new(0, Some(end), 0.97, Vec::new(), evidence)],
+                vec![Segment::new(0, Some(end), Vec::new(), evidence)],
                 result,
             ));
         }
@@ -966,15 +905,14 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 damage_flags.push("structure_validation_incomplete".to_string());
                 damage_flags = sorted_unique(damage_flags);
             }
-            let confidence = if damage_flags.is_empty() { 0.78 } else { 0.68 };
+
             let end = opt_u64_of(&result, "segment_end")?;
             let details = result.copy()?;
             details.set_item("route_evidence_flags", damage_flags.clone())?;
             return Ok(Evidence::new(
                 format,
-                confidence,
                 "damaged",
-                vec![Segment::new(0, end, confidence, damage_flags, evidence)],
+                vec![Segment::new(0, end, damage_flags, evidence)],
                 details,
             ));
         }
@@ -985,13 +923,12 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         details.set_item("route_evidence_flags", damage_flags.clone())?;
         Ok(Evidence::new(
             format,
-            0.35,
             if damage_flags.iter().any(|flag| flag != "stream_unverified") {
                 "damaged"
             } else {
                 "weak"
             },
-            vec![Segment::new(0, None, 0.35, damage_flags, evidence)],
+            vec![Segment::new(0, None, damage_flags, evidence)],
             details,
         ))
     }
@@ -1015,8 +952,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             Some(match self.view.reader.file_identity().ok() {
                 Some(identity) => stream_structure_cached(self.py, identity, &self.view.path)?,
                 None => crate::analysis_native::inspect_compression_stream_structure(
-                    self.py, &self.view.path,
-                )?.into_bound(self.py),
+                    self.py,
+                    &self.view.path,
+                )?
+                .into_bound(self.py),
             })
         } else {
             // No compression family can match; the requested-format mismatch
@@ -1026,7 +965,6 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         self.stream_structure = Some(structure.clone());
         Ok(structure)
     }
-
 }
 
 fn native_read_fault_flags(fault: &ReadFault) -> Vec<String> {
@@ -1123,7 +1061,6 @@ fn rar_from_native<'py>(mut raw: RarObservation, start: u64) -> PyResult<Evidenc
     if !raw.magic_matched {
         return Ok(Evidence::new(
             "rar",
-            0.0,
             "not_found",
             Vec::new(),
             EvidenceDetails::Rar(Box::new(RarReportDetails {
@@ -1146,16 +1083,16 @@ fn rar_from_native<'py>(mut raw: RarObservation, start: u64) -> PyResult<Evidenc
             ""
         };
     let segment_end = Some(raw.segment_end).filter(|end| *end != 0);
-    let (status, confidence, end) = if raw.strong_accept && segment_end.is_some() {
-        ("extractable", 0.97, segment_end)
+    let (status, end) = if raw.strong_accept && segment_end.is_some() {
+        ("extractable", segment_end)
     } else if taxonomy == "probably_truncated" {
-        ("damaged", 0.82, None)
+        ("damaged", None)
     } else if taxonomy == "valid_encrypted_but_unwalkable" {
-        ("damaged", 0.72, None)
+        ("damaged", None)
     } else if raw.plausible {
-        ("damaged", 0.65, None)
+        ("damaged", None)
     } else {
-        ("weak", 0.35, None)
+        ("weak", None)
     };
     let mut segment_flags = damage_flags.clone();
     append_native_field_flag(&mut segment_flags, raw.read_fault.as_ref());
@@ -1187,15 +1124,8 @@ fn rar_from_native<'py>(mut raw: RarObservation, start: u64) -> PyResult<Evidenc
     };
     Ok(Evidence::new(
         "rar",
-        confidence,
         status,
-        vec![Segment::new(
-            start,
-            end,
-            confidence,
-            segment_flags,
-            evidence,
-        )],
+        vec![Segment::new(start, end, segment_flags, evidence)],
         EvidenceDetails::Rar(Box::new(RarReportDetails {
             raw,
             damage_flags,
@@ -1212,7 +1142,7 @@ fn seven_zip_from_embedded<'py>(
 ) -> PyResult<Evidence<'py>> {
     let start = u64_of(item, "offset")?;
     let end = required_item(item, "end_offset")?.extract::<u64>()?;
-    let confidence = f64_of(item, "confidence")?;
+
     let validation = str_or(item, "validation", "start_header_crc_and_declared_end")?;
     let details = PyDict::new(py);
     details.set_item("source", "embedded_scan")?;
@@ -1223,12 +1153,10 @@ fn seven_zip_from_embedded<'py>(
     details.set_item("integrity_confidence", "deferred")?;
     Ok(Evidence::new(
         "7z",
-        confidence,
         "extractable",
         vec![Segment::new(
             start,
             Some(end),
-            confidence,
             Vec::new(),
             vec![
                 format!("7z:{validation}"),
@@ -1316,18 +1244,17 @@ fn seven_zip_from_native<'py>(mut raw: SevenZipObservation, start: u64) -> PyRes
     if !raw.magic_matched {
         return Ok(Evidence::new(
             "7z",
-            0.0,
             "not_found",
             Vec::new(),
             EvidenceDetails::SevenZip(Box::new(details)),
         ));
     }
-    let (status, confidence) = if raw.strong_accept {
-        ("extractable", 0.97)
+    let status = if raw.strong_accept {
+        "extractable"
     } else if raw.plausible {
-        ("damaged", 0.65)
+        "damaged"
     } else {
-        ("weak", 0.35)
+        "weak"
     };
     let end = if unreliable {
         None
@@ -1352,9 +1279,8 @@ fn seven_zip_from_native<'py>(mut raw: SevenZipObservation, start: u64) -> PyRes
     };
     Ok(Evidence::new(
         "7z",
-        confidence,
         status,
-        vec![Segment::new(start, end, confidence, damage_flags, evidence)],
+        vec![Segment::new(start, end, damage_flags, evidence)],
         EvidenceDetails::SevenZip(Box::new(details)),
     )
     .with_warnings(warnings))
@@ -1387,7 +1313,7 @@ fn zip_observation(raw: &Bound<'_, PyDict>) -> PyResult<()> {
 fn zip_from_embedded<'py>(py: Python<'py>, item: &Bound<'py, PyDict>) -> PyResult<Evidence<'py>> {
     let start = u64_of(item, "offset")?;
     let end = opt_u64_of(item, "end_offset")?;
-    let confidence = f64_of(item, "confidence")?;
+
     let validation = str_or(item, "validation", "validated_structure")?;
     let boundary_kind = required_item(item, "boundary_kind")?.str()?.to_string();
     let bounded_end = end.filter(|end| *end > start);
@@ -1414,8 +1340,7 @@ fn zip_from_embedded<'py>(py: Python<'py>, item: &Bound<'py, PyDict>) -> PyResul
     )?;
     Ok(Evidence::new(
         "zip",
-        confidence,
-        if confidence >= 0.85 && extractable {
+        if extractable {
             "extractable"
         } else {
             "damaged"
@@ -1423,7 +1348,6 @@ fn zip_from_embedded<'py>(py: Python<'py>, item: &Bound<'py, PyDict>) -> PyResul
         vec![Segment::new(
             start,
             bounded_end,
-            confidence,
             Vec::new(),
             vec![
                 format!("zip:{validation}"),
@@ -1441,7 +1365,7 @@ fn zip_from_native<'py>(
 ) -> PyResult<Evidence<'py>> {
     let magic_matched = truthy(&native, "magic_matched")?;
     if !magic_matched && hits.is_empty() {
-        return Ok(Evidence::new("zip", 0.0, "not_found", Vec::new(), native));
+        return Ok(Evidence::new("zip", "not_found", Vec::new(), native));
     }
     let archive_offset = u64_of(&native, "archive_offset")?;
     let eocd_offset = u64_of(&native, "eocd_offset")?;
@@ -1460,12 +1384,12 @@ fn zip_from_native<'py>(
     let plausible = truthy(&native, "plausible")?;
     let walk_ok =
         truthy(&native, "central_directory_walk_ok")? && truthy(&native, "local_header_links_ok")?;
-    let (status, mut confidence): (&str, f64) = if plausible && walk_ok {
-        ("extractable", 0.99)
+    let status = if plausible && walk_ok {
+        "extractable"
     } else if plausible {
-        ("damaged", 0.65)
+        "damaged"
     } else {
-        ("weak", if hits.is_empty() { 0.0 } else { 0.35 })
+        "weak"
     };
     let mut damage_flags = read_fault_damage_flags(&native)?;
     let error = str_of(&native, "error")?;
@@ -1477,7 +1401,6 @@ fn zip_from_native<'py>(
         damage_flags.push("content_integrity_bad_or_unknown".to_string());
         native.set_item("integrity_confidence", "low")?;
         native.set_item("content_damage_reason", &crc_warning)?;
-        confidence = confidence.min(0.90);
     } else {
         set_default(
             &native,
@@ -1490,7 +1413,7 @@ fn zip_from_native<'py>(
         "boundary_confidence",
         if plausible && walk_ok { "high" } else { "low" },
     )?;
-    let segments = if confidence > 0.0 {
+    let segments = if !hits.is_empty() || plausible {
         if evidence.is_empty() {
             evidence.push(
                 if magic_matched {
@@ -1504,14 +1427,13 @@ fn zip_from_native<'py>(
         vec![Segment::new(
             archive_offset,
             end_offset.map(|end| end.min(view_size)),
-            confidence,
             damage_flags,
             evidence,
         )]
     } else {
         Vec::new()
     };
-    Ok(Evidence::new("zip", confidence, status, segments, native))
+    Ok(Evidence::new("zip", status, segments, native))
 }
 
 fn zip_local_header_recovery<'py>(
@@ -1542,12 +1464,10 @@ fn zip_local_header_recovery<'py>(
     Ok(Some(
         Evidence::new(
             "zip",
-            0.70,
             "damaged",
             vec![Segment::new(
                 start,
                 None,
-                0.70,
                 vec![
                     "central_directory_unreliable".to_string(),
                     "local_header_recovery".to_string(),
@@ -1659,7 +1579,7 @@ fn combine_candidates<'py>(
 ) -> PyResult<Evidence<'py>> {
     let mut usable = candidates
         .into_iter()
-        .filter(|item| item.confidence > 0.0 || !item.segments.is_empty())
+        .filter(|item| !item.segments.is_empty())
         .collect::<Vec<_>>();
     if usable.is_empty() {
         return Ok(Evidence::not_found(py, format));
@@ -1670,21 +1590,21 @@ fn combine_candidates<'py>(
     {
         usable.retain(|item| item.status == "damaged" || item.status == "extractable");
     }
-    // The first maximal candidate wins, matching a stable max.
+    // Prefer established format state, then the first outer physical range.
     let mut best = 0usize;
     for (index, item) in usable.iter().enumerate().skip(1) {
         let current = &usable[best];
         let rank = status_rank(item.status);
         let best_rank = status_rank(current.status);
-        if rank > best_rank || (rank == best_rank && item.confidence > current.confidence) {
+        if rank > best_rank || (rank == best_rank && item.range_key() < current.range_key()) {
             best = index;
         }
     }
     if !preserve_multiple {
         return Ok(usable.swap_remove(best));
     }
-    let mut seen = HashSet::new();
-    let mut segments = Vec::new();
+    let mut seen = HashMap::new();
+    let mut segments: Vec<Segment> = Vec::new();
     let mut warnings = Vec::new();
     let candidate_details = PyList::empty(py);
     let mut best_details = None;
@@ -1705,11 +1625,25 @@ fn combine_candidates<'py>(
         .copy()?;
     details.set_item("candidate_count", usable.len())?;
     details.set_item("candidate_details", candidate_details)?;
-    let (confidence, status) = (usable[best].confidence, usable[best].status);
+    let status = usable[best].status;
     for item in usable {
-        for segment in item.segments {
-            // Every candidate segment carries the primary role.
-            if seen.insert((segment.start, segment.end)) {
+        let password_required = item.details.password_required()?;
+        for mut segment in item.segments {
+            // Merging evidence must not promote a damaged peer or lose an
+            // encrypted peer's password requirement with the primary details.
+            segment.password_required =
+                Some(segment.password_required.unwrap_or(password_required));
+            let key = (segment.start, segment.end);
+            if let Some(&index) = seen.get(&key) {
+                let previous: &mut Segment = &mut segments[index];
+                let password = previous.password_required.unwrap_or(false)
+                    || segment.password_required.unwrap_or(false);
+                if !previous.extractable && segment.extractable {
+                    *previous = segment;
+                }
+                previous.password_required = Some(password);
+            } else {
+                seen.insert(key, segments.len());
                 segments.push(segment);
             }
         }
@@ -1723,7 +1657,6 @@ fn combine_candidates<'py>(
     });
     Ok(Evidence {
         format: format.to_string(),
-        confidence,
         status,
         segments,
         warnings,
@@ -1750,51 +1683,48 @@ struct SegmentPlan {
 impl SegmentPlan {
     /// Order the canonical extractable carved segments by physical position.
     fn build(evidences: &[Evidence<'_>], selected: &[usize], size: u64) -> PyResult<Self> {
-        let mut by_confidence = selected.to_vec();
-        by_confidence.sort_by(|left, right| {
-            evidences[*right]
-                .confidence
-                .partial_cmp(&evidences[*left].confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
         let mut candidates = Vec::new();
-        for evidence_index in by_confidence {
+        for &evidence_index in selected {
             let evidence = &evidences[evidence_index];
             if evidence.details.embedded_anchor()? {
                 continue;
             }
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
-                if !strict_subrange(segment.start, segment.end, size) {
+                if !segment.extractable
+                    || !matches!(segment.end, Some(end) if segment.start < end && end <= size)
+                {
                     continue;
                 }
-                candidates.push((evidence_index, segment_index, candidates.len()));
+                candidates.push((evidence_index, segment_index));
             }
         }
-        candidates.sort_by(|left, right| {
-            let left_segment = &evidences[left.0].segments[left.1];
-            let right_segment = &evidences[right.0].segments[right.1];
-            left_segment
-                .start
-                .cmp(&right_segment.start)
-                .then_with(|| evidences[left.0].format.cmp(&evidences[right.0].format))
-                .then_with(|| left.2.cmp(&right.2))
+        candidates.sort_by_key(|&(evidence, segment)| {
+            let segment = &evidences[evidence].segments[segment];
+            (
+                segment.start,
+                std::cmp::Reverse(segment.end.unwrap()),
+                evidence,
+            )
+        });
+        crate::scan::embedded::retain_outer_ranges(&mut candidates, |&(evidence, segment)| {
+            let segment = &evidences[evidence].segments[segment];
+            (segment.start, segment.end.unwrap())
+        });
+        candidates.retain(|&(evidence, segment)| {
+            let segment = &evidences[evidence].segments[segment];
+            strict_subrange(segment.start, segment.end, size)
         });
         let mut password_segment = None::<(usize, usize)>;
         for (evidence_index, evidence) in evidences.iter().enumerate() {
-            if !evidence.details.password_required()? {
-                continue;
-            }
+            let password_required = evidence.details.password_required()?;
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
-                if segment.start == 0 {
+                if segment.start == 0 || !segment.password_required.unwrap_or(password_required) {
                     continue;
                 }
                 let better = match password_segment {
                     None => true,
                     Some((best_evidence, best_segment)) => {
-                        let best = &evidences[best_evidence];
-                        evidence.confidence > best.confidence
-                            || (evidence.confidence == best.confidence
-                                && segment.start < best.segments[best_segment].start)
+                        segment.start < evidences[best_evidence].segments[best_segment].start
                     }
                 };
                 if better {
@@ -1833,10 +1763,7 @@ impl SegmentPlan {
         }
 
         Ok(Self {
-            extractable: candidates
-                .into_iter()
-                .map(|(evidence, segment, _)| (evidence, segment))
-                .collect(),
+            extractable: candidates,
             password_segment,
             missing_volume_evidence,
         })
@@ -1852,7 +1779,6 @@ fn evidence_to_python<'py>(
         segments.append((
             segment.start,
             segment.end,
-            segment.confidence,
             segment.damage_flags.clone(),
             segment.evidence.clone(),
         ))?;
@@ -1905,7 +1831,6 @@ fn evidence_to_python<'py>(
         py,
         [
             evidence.format.clone().into_pyobject(py)?.into_any(),
-            evidence.confidence.into_pyobject(py)?.into_any(),
             evidence.status.into_pyobject(py)?.into_any(),
             segments.into_any(),
             evidence.warnings.clone().into_pyobject(py)?.into_any(),
@@ -2150,13 +2075,6 @@ fn opt_u64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
     }
 }
 
-fn f64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<f64> {
-    match present(dict, key)? {
-        Some(value) => value.extract::<f64>(),
-        None => Ok(0.0),
-    }
-}
-
 fn str_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
     match present(dict, key)? {
         Some(value) => Ok(value.str()?.to_string()),
@@ -2224,7 +2142,6 @@ mod report_tests {
     fn evidence<'py>(
         py: Python<'py>,
         format: &str,
-        confidence: f64,
         status: &'static str,
         segments: &[(u64, Option<u64>)],
         details: &[(&str, &str)],
@@ -2235,11 +2152,10 @@ mod report_tests {
         }
         Evidence::new(
             format,
-            confidence,
             status,
             segments
                 .iter()
-                .map(|(start, end)| Segment::new(*start, *end, confidence, Vec::new(), Vec::new()))
+                .map(|(start, end)| Segment::new(*start, *end, Vec::new(), Vec::new()))
                 .collect(),
             dict,
         )
@@ -2284,11 +2200,10 @@ mod report_tests {
         Python::initialize();
         Python::attach(|py| {
             let evidences = vec![
-                evidence(py, "rar", 0.97, "extractable", &[(40, Some(60))], &[]),
+                evidence(py, "rar", "extractable", &[(40, Some(60))], &[]),
                 evidence(
                     py,
                     "7z",
-                    0.96,
                     "extractable",
                     &[(4, Some(32)), (0, Some(14))],
                     &[],
@@ -2296,30 +2211,28 @@ mod report_tests {
                 evidence(
                     py,
                     "zip",
-                    0.94,
                     "extractable",
                     &[(13, Some(81))],
                     &[("source", "embedded_scan"), ("candidate_kind", "anchor")],
                 ),
-                evidence(py, "tar", 0.90, "extractable", &[(90, None)], &[]),
+                evidence(py, "tar", "extractable", &[(90, None)], &[]),
             ];
             let plan = SegmentPlan::build(&evidences, &[0, 1, 2, 3], 100).unwrap();
             assert_eq!(
                 planned(&evidences, &plan),
-                vec![("7z".into(), 0), ("7z".into(), 4), ("rar".into(), 40)]
+                vec![("7z".into(), 0), ("rar".into(), 40)]
             );
         });
     }
 
     #[test]
-    fn plan_picks_most_confident_carved_password_segment() {
+    fn plan_picks_first_carved_password_segment() {
         Python::initialize();
         Python::attach(|py| {
             let evidences = vec![
                 evidence(
                     py,
                     "7z",
-                    0.80,
                     "damaged",
                     &[(0, None)],
                     &[("password_required", "yes")],
@@ -2327,7 +2240,6 @@ mod report_tests {
                 evidence(
                     py,
                     "rar",
-                    0.72,
                     "damaged",
                     &[(90, None), (64, None)],
                     &[("password_required", "yes")],
@@ -2335,14 +2247,13 @@ mod report_tests {
                 evidence(
                     py,
                     "zip",
-                    0.60,
                     "damaged",
                     &[(10, None)],
                     &[("password_required", "yes")],
                 ),
             ];
             let plan = SegmentPlan::build(&evidences, &[], 200).unwrap();
-            assert_eq!(plan.password_segment, Some((1, 1)));
+            assert_eq!(plan.password_segment, Some((2, 0)));
             assert!(plan.extractable.is_empty());
         });
     }
@@ -2351,7 +2262,7 @@ mod report_tests {
     fn plan_proves_missing_volume_from_seven_zip_declared_end() {
         Python::initialize();
         Python::attach(|py| {
-            let seven = evidence(py, "7z", 0.65, "damaged", &[(0, None)], &[]);
+            let seven = evidence(py, "7z", "damaged", &[(0, None)], &[]);
             seven
                 .details
                 .to_python(py)
@@ -2393,15 +2304,14 @@ mod report_tests {
     }
 
     #[test]
-    fn combine_keeps_first_best_and_deduplicates_segments() {
+    fn combine_prefers_first_outer_range_and_deduplicates_segments() {
         Python::initialize();
         Python::attach(|py| {
             let candidates = vec![
-                evidence(py, "rar", 0.35, "weak", &[(9, None)], &[("id", "weak")]),
+                evidence(py, "rar", "weak", &[(9, None)], &[("id", "weak")]),
                 evidence(
                     py,
                     "rar",
-                    0.97,
                     "extractable",
                     &[(30, Some(50))],
                     &[("id", "first")],
@@ -2409,7 +2319,6 @@ mod report_tests {
                 evidence(
                     py,
                     "rar",
-                    0.97,
                     "extractable",
                     &[(4, Some(20)), (30, Some(50))],
                     &[("id", "second")],
@@ -2419,7 +2328,7 @@ mod report_tests {
             assert_eq!(combined.status, "extractable");
             assert_eq!(
                 str_of(&combined.details.to_python(py).unwrap(), "id").unwrap(),
-                "first"
+                "second"
             );
             assert_eq!(
                 i64_of(&combined.details.to_python(py).unwrap(), "candidate_count").unwrap(),
@@ -2431,6 +2340,49 @@ mod report_tests {
                 .map(|segment| (segment.start, segment.end))
                 .collect::<Vec<_>>();
             assert_eq!(spans, vec![(4, Some(20)), (30, Some(50))]);
+        });
+    }
+
+    #[test]
+    fn merged_plan_preserves_peer_eligibility_and_password_ownership() {
+        // Existing isolated-format tests cannot expose promotion of bounded
+        // damaged peers, lost password facts, or a duplicate hiding a valid
+        // segment. One in-memory plan covers those independent merge effects.
+        Python::initialize();
+        Python::attach(|py| {
+            let candidates = vec![
+                evidence(py, "zip", "damaged", &[(40, Some(60)), (80, Some(90))], &[]),
+                evidence(py, "zip", "extractable", &[(40, Some(60))], &[]),
+                evidence(
+                    py,
+                    "zip",
+                    "damaged",
+                    &[(10, Some(20))],
+                    &[("password_required", "yes")],
+                ),
+            ];
+            let combined = combine_candidates(py, "zip", candidates, true).unwrap();
+            let evidences = vec![combined];
+            let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
+            assert_eq!(planned(&evidences, &plan), vec![("zip".into(), 40)]);
+            assert_eq!(plan.password_segment, Some((0, 0)));
+            assert_eq!(evidences[0].range_key().0, 40);
+
+            // An encrypted primary must likewise not transfer its password
+            // requirement to an earlier, unencrypted damaged peer.
+            let candidates = vec![
+                evidence(
+                    py,
+                    "rar",
+                    "extractable",
+                    &[(40, Some(60))],
+                    &[("password_required", "yes")],
+                ),
+                evidence(py, "rar", "damaged", &[(10, Some(20))], &[]),
+            ];
+            let evidences = vec![combine_candidates(py, "rar", candidates, true).unwrap()];
+            let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
+            assert_eq!(plan.password_segment, Some((0, 1)));
         });
     }
 

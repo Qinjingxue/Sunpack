@@ -120,7 +120,6 @@ struct EmbeddedCandidate {
     format: &'static str,
     offset: u64,
     end_offset: Option<u64>,
-    confidence: f64,
     validation: &'static str,
     candidate_kind: &'static str,
     boundary_kind: &'static str,
@@ -370,7 +369,6 @@ impl NativeScanResult {
             row.set_item("format", candidate.format)?;
             row.set_item("offset", candidate.offset)?;
             row.set_item("end_offset", resolved_end.or(candidate.end_offset))?;
-            row.set_item("confidence", candidate.confidence)?;
             if resolved_end.is_some() {
                 row.set_item(
                     "validation",
@@ -890,25 +888,27 @@ fn candidate_rank(candidate: &EmbeddedCandidate) -> u8 {
 }
 
 fn resolve_logical_candidates(candidates: &mut Vec<EmbeddedCandidate>) {
-    // Once an exact logical range is proven, every signature strictly inside
-    // that range belongs to the archive payload. Nested archives are discovered
-    // after extraction by the recursive pipeline, never as peer carrier slices.
-    // The caller sorts by offset. Delay each same-start group's coverage so
-    // equal starts survive the original strict start < offset rule. Ranges
-    // from removed candidates still contribute, preserving overlap semantics.
+    retain_outer_ranges(candidates, |item| {
+        (item.offset, if item.candidate_kind == "logical_archive" { item.end_offset.unwrap_or(item.offset) } else { item.offset })
+    });
+}
+
+/// Reuse the canonical physical ownership rule for already analyzed ranges.
+/// The caller orders by start; a proven outer archive owns inner signatures.
+pub(crate) fn retain_outer_ranges<T>(items: &mut Vec<T>, range: impl Fn(&T) -> (u64, u64)) {
     let mut group_start = None;
     let mut covered_until = 0;
     let mut group_end = 0;
-    candidates.retain(|item| {
-        if group_start != Some(item.offset) {
+    items.retain(|item| {
+        let (start, end) = range(item);
+        if group_start != Some(start) {
             covered_until = covered_until.max(group_end);
-            group_start = Some(item.offset);
+            group_start = Some(start);
             group_end = 0;
         }
-        if item.candidate_kind == "logical_archive" {
-            group_end = group_end.max(item.end_offset.unwrap_or(0));
-        }
-        item.offset >= covered_until
+        // Suppressed ranges still contribute to coverage, as in the scanner.
+        group_end = group_end.max(end);
+        start >= covered_until
     });
 }
 
@@ -1320,7 +1320,6 @@ fn validate_candidate(
                 "lz4",
                 offset,
                 index.complete.then_some(index.end),
-                if index.complete { 0.98 } else { 0.72 },
                 "lz4_frame_structure",
             );
             item.lz4_index = Some(Box::new(index));
@@ -1521,7 +1520,6 @@ fn validate_zip_eocd(
         "zip",
         archive_offset,
         Some(end),
-        1.0,
         if needs_zip64 {
             "zip64_eocd_geometry_and_first_local_link"
         } else {
@@ -1696,7 +1694,6 @@ fn validate_zip(
     }
     let mut compressed_size = compressed_32 as u64;
     let mut validation = "local_header_and_data_range";
-    let mut confidence = 0.94;
     if compressed_32 == u32::MAX || uncompressed_32 == u32::MAX {
         let extra_start = offset + 30 + name_len;
         let extra = read_at(file, extra_start, extra_len as usize)?;
@@ -1732,7 +1729,6 @@ fn validate_zip(
                 u64::from_le_bytes(zip64[value_cursor..value_cursor + 8].try_into().unwrap());
         }
         validation = "zip64_local_header_and_data_range";
-        confidence = 0.99;
     }
     let Some(_data_end) = header_end.checked_add(compressed_size) else {
         return Ok(None);
@@ -1743,7 +1739,6 @@ fn validate_zip(
         "zip",
         root,
         None,
-        if split { 1.0 } else { confidence },
         if split {
             "zip_split_local_header"
         } else {
@@ -1793,7 +1788,6 @@ fn validate_seven_zip(
             "7z",
             offset,
             None,
-            0.90,
             "start_header_crc_truncated_declared_range",
         );
         let next = crate::formats::seven_zip::RelationNextHeader::parse(&header).unwrap();
@@ -1857,7 +1851,6 @@ fn validate_seven_zip_next(
         "7z",
         offset,
         Some(end),
-        1.0,
         "start_and_next_header_crc_and_declared_end",
     )))
 }
@@ -1897,7 +1890,7 @@ fn validate_rar(
     if end.is_none() && !anchor.multivolume && !anchor.needs_password {
         return Ok(None);
     }
-    let mut item = logical_candidate("rar", offset, end, 1.0, validation);
+    let mut item = logical_candidate("rar", offset, end, validation);
     if anchor.multivolume || (anchor.needs_password && !anchor.standalone) {
         item.volume_anchor = Some(Box::new(anchor));
     }
@@ -1971,7 +1964,6 @@ fn validate_gzip(
         "gzip",
         offset,
         Some(structure.end_offset),
-        0.99,
         if structure.stream_count > 1 {
             "rfc1952_concatenated_members_complete_deflate_walk"
         } else {
@@ -1996,7 +1988,6 @@ fn validate_bzip2(
         "bzip2",
         offset,
         Some(structure.end_offset),
-        0.99,
         if structure.stream_count > 1 {
             "bzip2_concatenated_streams_complete_huffman_walk"
         } else {
@@ -2052,7 +2043,6 @@ fn validate_xz(
                 "xz",
                 offset,
                 Some(end),
-                0.99,
                 "xz_header_index_footer_boundary",
             )));
         }
@@ -2094,7 +2084,6 @@ fn validate_zstd(
         "zstd",
         offset,
         Some(structure.end_offset),
-        0.99,
         "rfc8878_complete_frame_block_walk",
     )))
 }
@@ -2228,7 +2217,6 @@ fn walk_tar_candidate(
                 "tar",
                 offset,
                 Some(tar_padding_end(file, cursor + 1024, size)?),
-                1.0,
                 "member_walk_checksums_and_end_blocks",
             ));
         }
@@ -2242,7 +2230,6 @@ fn walk_tar_candidate(
                     "tar",
                     offset,
                     None,
-                    0.90,
                     "tar_analysis_resource_limit",
                 ));
             }
@@ -2278,7 +2265,6 @@ fn candidate(
     format: &'static str,
     offset: u64,
     end: Option<u64>,
-    confidence: f64,
     validation: &'static str,
 ) -> EmbeddedCandidate {
     let exact = end.is_some();
@@ -2286,7 +2272,6 @@ fn candidate(
         format,
         offset,
         end_offset: end,
-        confidence,
         validation,
         candidate_kind: if exact { "logical_archive" } else { "anchor" },
         boundary_kind: if exact { "exact" } else { "unresolved" },
@@ -2301,10 +2286,9 @@ fn logical_candidate(
     format: &'static str,
     offset: u64,
     end: Option<u64>,
-    confidence: f64,
     validation: &'static str,
 ) -> EmbeddedCandidate {
-    let mut item = candidate(format, offset, end, confidence, validation);
+    let mut item = candidate(format, offset, end, validation);
     item.candidate_kind = "logical_archive";
     item
 }
@@ -2540,7 +2524,7 @@ mod tests {
                 .map(|i| {
                     let offset = i / 3;
                     let end = (i % 7 != 0).then_some(offset + (i * 17 + shift) % 21);
-                    let mut item = candidate("zip", offset, end, 1.0, "matrix");
+                    let mut item = candidate("zip", offset, end, "matrix");
                     if i % 5 == 0 {
                         item.candidate_kind = "anchor";
                     }

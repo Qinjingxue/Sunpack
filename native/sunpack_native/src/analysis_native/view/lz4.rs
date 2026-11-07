@@ -56,14 +56,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             if !error.is_empty() {
                 flags.push(error);
             }
-            let confidence = if complete { 0.98 } else { 0.72 };
-            segments.push(Segment::new(
-                offset,
-                end,
-                confidence,
-                flags,
-                vec!["lz4:frame_structure".to_string()],
-            ));
+            let mut segment =
+                Segment::new(offset, end, flags, vec!["lz4:frame_structure".to_string()]);
+            segment.extractable = complete;
+            segments.push(segment);
             plans.set_item(offset.to_string(), &plan)?;
             if offset == 0 {
                 details.set_item("stream_plan", &plan)?;
@@ -77,7 +73,6 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         details.set_item("candidates", pyo3::types::PyList::new(py, &rows)?)?;
         Ok(Evidence::new(
             format,
-            if blocked { 0.72 } else { 0.98 },
             if blocked { "damaged" } else { "extractable" },
             segments,
             details,

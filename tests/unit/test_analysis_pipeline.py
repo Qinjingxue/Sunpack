@@ -263,6 +263,30 @@ def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_pa
         ("zip", 2 * 1024 * 1024),
     ]
 
+def test_mixed_stream_plan_keeps_valid_peers_without_promoting_unresolved_ranges(tmp_path):
+    # Isolated streams cannot expose aggregate damage blocking a valid peer.
+    # Canonical facts cover that plan decision without another scan or worker.
+    path = _write_bytes(tmp_path / "stream-plan.bin", bytes(100))
+    prepass = {
+        "source": "embedded_scan",
+        "full_scan_complete": True,
+        "embedded_candidates": [
+            {"format": "gzip", "offset": 10, "end_offset": 20,
+             "candidate_kind": "logical_archive", "boundary_kind": "exact",
+             "extractable": True, "validation": "validated_stream"},
+            {"format": "gzip", "offset": 30, "end_offset": 40,
+             "candidate_kind": "logical_archive", "boundary_kind": "unresolved",
+             "extractable": False, "validation": "truncated_stream"},
+        ],
+    }
+    report = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
+    assert [(e.format, s.start_offset, s.end_offset) for e, s in report.extractable_segments] == [
+        ("gzip", 10, 20),
+    ]
+    assert report.best_selected.format == "gzip"
+    assert report.best_selected.status == "damaged"
+
+
 def test_analysis_reuses_detection_hit_map_and_preserves_same_format_segments(tmp_path):
     first = _zip_bytes(tmp_path)
     second_path = tmp_path / "second.zip"
@@ -340,7 +364,6 @@ def test_zip_bad_central_directory_recovers_from_local_header(tmp_path):
     zip_evidence = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}["zip"]
 
     assert zip_evidence.status == "damaged"
-    assert zip_evidence.confidence == 0.70
     assert zip_evidence.segments[0].end_offset is None
     assert "local_header_recovery" in zip_evidence.segments[0].damage_flags
     assert zip_evidence.segments[0].evidence == ["zip:local_header"]
@@ -355,7 +378,6 @@ def test_rar_missing_end_block_is_probably_truncated(tmp_path):
     rar = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}["rar"]
 
     assert rar.status == "damaged"
-    assert rar.confidence == 0.82
     assert rar.segments[0].end_offset is None
     assert "probably_truncated" in rar.segments[0].damage_flags
     assert rar.details["boundary_confidence"] == "low"
@@ -368,7 +390,6 @@ def test_rar_missing_main_header_marks_encrypted_unwalkable(tmp_path):
     rar = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}["rar"]
 
     assert rar.status == "damaged"
-    assert rar.confidence == 0.72
     assert rar.segments[0].end_offset is None
     assert "valid_encrypted_but_unwalkable" in rar.segments[0].damage_flags
     assert rar.details["password_required"] is True
@@ -444,15 +465,15 @@ def test_damaged_7z_next_header_never_becomes_exact_embedded_evidence(tmp_path):
     assert seven.status != "extractable"
 
 @pytest.mark.parametrize(
-    ("extension", "build_data", "split_at", "expected_format", "confidence"),
+    ("extension", "build_data", "split_at", "expected_format"),
     [
-        ("zip", _zip_bytes, 37, "zip", 0.99),
-        ("7z", lambda _tmp_path: _seven_zip_bytes(), 20, "7z", 0.97),
+        ("zip", _zip_bytes, 37, "zip"),
+        ("7z", lambda _tmp_path: _seven_zip_bytes(), 20, "7z"),
     ],
     ids=["zip", "seven-zip"],
 )
 def test_analysis_scheduler_uses_structure_for_clean_archives_across_split_volumes(
-    tmp_path, extension, build_data, split_at, expected_format, confidence
+    tmp_path, extension, build_data, split_at, expected_format
 ):
     data = build_data(tmp_path)
     first = tmp_path / f"archive.{extension}.001"
@@ -464,7 +485,6 @@ def test_analysis_scheduler_uses_structure_for_clean_archives_across_split_volum
     evidence = {item.format: item for item in report.evidences}[expected_format]
 
     assert evidence.status == "extractable"
-    assert evidence.confidence == confidence
     assert evidence.segments[0].start_offset == 0
     assert evidence.segments[0].end_offset == len(data)
 

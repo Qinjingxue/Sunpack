@@ -150,3 +150,5 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 ```
 
 其他较少使用的设置可查看 `sunpack_advanced_config.json` 和 `config show`。`SUNPACK_CONFIG_OVERRIDES` 接受内联 JSON 对象或 JSON 文件路径，用于临时覆盖配置。
+
+压缩包分析直接根据已验证的格式结构、载体精确边界、密码需求和缺卷事实判断执行资格。数值分析置信度及 `analysis.thresholds.extractable_confidence` 已删除。候选按已证明的外层范围归属和物理位置选择；损坏或边界未定的候选不会继承其他候选的解压资格。CLI inspect 展示状态与结构事实，不再输出数值置信度。

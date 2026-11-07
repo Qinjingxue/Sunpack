@@ -27,13 +27,11 @@ def test_planning_projects_proven_7z_split_tail_without_native_rescan():
     )
     evidence = ArchiveFormatEvidence(
         format="7z",
-        confidence=0.80,
         status="damaged",
         segments=[
             ArchiveSegment(
                 start_offset=0,
                 end_offset=None,
-                confidence=0.80,
                 damage_flags=["next_header_out_of_range"],
             )
         ],
@@ -65,7 +63,6 @@ def test_planning_does_not_label_single_truncated_7z_as_missing_volume():
     )
     evidence = ArchiveFormatEvidence(
         format="7z",
-        confidence=0.80,
         status="damaged",
         details={
             "start_header_crc_ok": True,

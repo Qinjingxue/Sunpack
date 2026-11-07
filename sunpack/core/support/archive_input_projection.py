@@ -37,12 +37,10 @@ def write_source_selected_segment(
         {
             "index": int(index),
             "format": evidence.format,
-            "confidence": float(evidence.confidence or 0.0),
             "status": evidence.status,
             "segment": asdict(segment),
         },
         source_layer="detection",
         source_module="archive_input_planner",
-        confidence=float(evidence.confidence or 0.0),
     )
     commit_task_knowledge(task, knowledge)

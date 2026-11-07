@@ -888,7 +888,7 @@ impl AnalysisBinaryView {
         result.set_item("magic_matched", false)?;
         result.set_item("plausible", false)?;
         result.set_item("error", "")?;
-        result.set_item("confidence", 0.0f64)?;
+
         result.set_item("boundary_confidence", "medium")?;
         result.set_item("integrity_confidence", "unknown")?;
         result.set_item("evidence", PyList::empty(py))?;
@@ -918,7 +918,7 @@ impl AnalysisBinaryView {
                     return Ok(result);
                 }
                 result.set_item("plausible", true)?;
-                result.set_item("confidence", 0.90f64)?;
+
                 let evidence = PyList::new(
                     py,
                     ["gzip:magic", "gzip:method:deflate", "gzip:flags_valid"],
@@ -956,7 +956,7 @@ impl AnalysisBinaryView {
                     return Ok(result);
                 }
                 result.set_item("plausible", true)?;
-                result.set_item("confidence", 0.92f64)?;
+
                 result.set_item(
                     "evidence",
                     PyList::new(py, ["bzip2:magic", "bzip2:block_marker"])?,
@@ -982,7 +982,7 @@ impl AnalysisBinaryView {
                         return Ok(result);
                     }
                     result.set_item("plausible", true)?;
-                    result.set_item("confidence", 0.95f64)?;
+
                     result.set_item("boundary_confidence", "high")?;
                     result.set_item(
                         "evidence",
@@ -990,7 +990,7 @@ impl AnalysisBinaryView {
                     )?;
                 } else {
                     result.set_item("plausible", true)?;
-                    result.set_item("confidence", 0.72f64)?;
+
                     result.set_item("error", "xz_footer_magic_not_found")?;
                     result.set_item("damage_flags", PyList::new(py, ["xz_footer_crc_bad"])?)?;
                     result.set_item("evidence", PyList::new(py, ["xz:magic"])?)?;
@@ -1008,7 +1008,7 @@ impl AnalysisBinaryView {
                     return Ok(result);
                 }
                 result.set_item("plausible", true)?;
-                result.set_item("confidence", 0.88f64)?;
+
                 result.set_item(
                     "evidence",
                     PyList::new(py, ["zstd:magic", "zstd:frame_descriptor"])?,

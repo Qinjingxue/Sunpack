@@ -699,7 +699,6 @@ class SingleArchiveExtractor:
                 "logical_name": segment.get("logical_name") or "",
                 "start_offset": segment.get("start_offset"),
                 "end_offset": segment.get("end_offset"),
-                "confidence": segment.get("confidence"),
                 "archive_input": segment.get("archive_input"),
                 "out_dir": segment_dir,
                 "success": segment_success,

@@ -21,7 +21,6 @@ def test_file_range_serializes_only_canonical_extent_boundary():
             )
         ],
         analysis={
-            "segment_confidence": 0.95,
             "segment_source": "analysis",
             "damage_flags": ["carrier_prefix"],
         },
@@ -69,7 +68,7 @@ def test_archive_task_accepts_paired_discovery_segments():
                 extent=InputExtent(path="carrier.bin", start=128, end=512)
             )
         ],
-        analysis={"segment_confidence": 0.95},
+        analysis={"segment_source": "embedded"},
     )
 
     task = ArchiveTask.from_archive_input(
@@ -81,7 +80,7 @@ def test_archive_task_accepts_paired_discovery_segments():
     segments = [node.projection() for node in task.inputs]
     assert len(segments) == 1
     assert segments[0]["archive_input"]["parts"][0]["start"] == 128
-    assert segments[0]["confidence"] == 0.95
+    assert "confidence" not in segments[0]
 
 
 def test_path_mapping_moves_each_input_once_and_preserves_the_shared_plan(tmp_path):

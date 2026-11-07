@@ -53,7 +53,6 @@ def _normalize_native_result(value: dict[str, Any]) -> EmbeddedScanResult:
             format=archive_format,
             offset=offset,
             end_offset=None if end_offset is None else int(end_offset),
-            confidence=float(row["confidence"]),
             validation=str(row["validation"]),
             candidate_kind=str(row["candidate_kind"]),
             boundary_kind=str(row["boundary_kind"]),

@@ -24,7 +24,7 @@ def test_input_retry_distinguishes_provenance_from_changed_execution_facts(tmp_p
         volume_style="rar_part" if "volumes" in mode else "",
         parts=[ArchiveInputPart(extent, volume_number=1, canonical_name="payload.part1.rar")],
         extents=[extent] if mode == "concat_ranges" else [],
-        analysis={"needs_password": True, "segment_confidence": 0.9},
+        analysis={"needs_password": True, "segment_source": "original scan"},
     )
     generation = ((path_key(path), 512, 100),)
     failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "password required")
@@ -36,7 +36,7 @@ def test_input_retry_distinguishes_provenance_from_changed_execution_facts(tmp_p
         details={"input_recovery": recovery.to_dict()},
     ))
     advisory = replace(original, descriptor=replace(descriptor, analysis={
-        **descriptor.analysis, "segment_confidence": 0.8, "segment_source": "new scan",
+        **descriptor.analysis, "segment_source": "new scan",
     }))
     selected, carried = recovery.select((advisory,), generation, password_changed=False)
     assert not selected and len(carried.checkpoints) == 1

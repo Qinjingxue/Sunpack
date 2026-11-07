@@ -15,7 +15,7 @@ ArchiveOpenMode = Literal[
     "sfx_with_volumes",
 ]
 
-_SEGMENT_PROVENANCE = frozenset({"segment_confidence", "segment_source"})
+_SEGMENT_PROVENANCE = frozenset({"segment_source"})
 
 
 @dataclass(frozen=True)

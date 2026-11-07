@@ -22,7 +22,7 @@ def _segment(path: str, archive_format: str, start: int, end: int, name: str):
                 role="main",
             )
         ],
-        analysis={"segment_confidence": 1.0, "segment_source": "embedded"},
+        analysis={"segment_source": "embedded"},
     )
     return descriptor
 

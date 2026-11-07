@@ -100,7 +100,7 @@ class CliBasicTests(unittest.TestCase):
         analysis = analyzed[0]["analysis"]
         self.assertIn("status", analysis)
         self.assertIn("selected_format", analysis)
-        self.assertIn("selected_confidence", analysis)
+        self.assertNotIn("selected_confidence", analysis)
         self.assertIn("primary_segment", analysis)
         self.assertIn("candidates", analysis)
         self.assertLessEqual(len(analysis["candidates"]), 3)

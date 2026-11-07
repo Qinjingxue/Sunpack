@@ -258,9 +258,6 @@
       "head_bytes": 1048576,
       "tail_bytes": 1048576
     },
-    "thresholds": {
-      "extractable_confidence": 0.85
-    },
     "modules": [
       {
         "name": "zip",

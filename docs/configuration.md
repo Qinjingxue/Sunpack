@@ -189,3 +189,5 @@ Persistent passwords come only from `builtin_passwords.json`, including its `cli
 ```
 
 For less common settings, inspect `sunpack_advanced_config.json` and run `config show`. `SUNPACK_CONFIG_OVERRIDES` accepts an inline JSON object or a JSON file path for temporary overrides.
+
+Archive analysis determines extraction feasibility from validated format structure, exact carrier boundaries, password requirements and missing-volume facts. Numeric analysis confidence scores and `analysis.thresholds.extractable_confidence` have been removed. Candidate selection follows proven outer ranges and physical order; damaged or unresolved peers do not inherit another candidate's extraction eligibility. CLI inspection reports these states and facts without a numeric confidence score.

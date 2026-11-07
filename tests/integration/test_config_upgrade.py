@@ -57,7 +57,7 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
                   "clipboard_builtin_max_entries": 17, "toast_report_retention_days": 61},
         "passwords": {"clipboard_passwords_enabled": False},
         "input_planning": {"enabled": False, "cache_size": 8},
-        "analysis": {"shared_cache_mb": 4},
+        "analysis": {"shared_cache_mb": 4, "thresholds": {"extractable_confidence": 0.99}},
         "performance": {"worker": {"job_buffer_budget_bytes": 1024}},
     }), encoding="utf-8")
     advanced_before = advanced.read_bytes()
@@ -69,7 +69,8 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
                     "max_pending_stage_jobs": 4, "max_queue_jobs": 5, "space_gate_enabled": False,
                     "memory_reserve_bytes": 1024, "writer_threads": 6, "job_buffer_budget_bytes": 2048}},
                 "input_planning": {"enabled": False, "cache_size": 0, "unknown": "retire whole section"},
-                "analysis": {"shared_cache_mb": 0, "max_concurrent_reads": 3, "unknown": "keep"},
+                "analysis": {"shared_cache_mb": 0, "max_concurrent_reads": 3,
+                             "thresholds": {"extractable_confidence": 0.5}, "unknown": "keep"},
                 "unknown": "keep"}
     user.write_text(json.dumps(original), encoding="utf-8")
     command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",

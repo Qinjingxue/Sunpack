@@ -387,7 +387,7 @@ class EmbeddedDiscovery:
                 ) if include_details else ()
             return None, "no_complete_embedded_archive", ()
 
-        physical.sort(key=lambda item: (item["offset"], -item["confidence"], item["format"]))
+        physical.sort(key=lambda item: (item["offset"], item["format"]))
         segments: list[LogicalArchiveInput] = []
         base_name = candidate.logical_name or relations_logical_name(os.path.basename(path), True)
         logical = physical
@@ -402,7 +402,6 @@ class EmbeddedDiscovery:
                 item["offset"],
                 item["end_offset"],
                 base_name,
-                confidence=float(item["confidence"]),
                 password_required=embedded_candidate_requires_password(item["format"], item["validation"]),
                 execution_analysis={"stream_plan": item["stream_plan"]} if item.get("stream_plan") else None,
             )
@@ -506,12 +505,10 @@ def _descriptor_for_candidate(
     end: int | None,
     logical_name: str,
     *,
-    confidence: float,
     password_required: bool = False,
     execution_analysis: dict[str, Any] | None = None,
 ) -> ArchiveInputDescriptor:
     analysis = {
-        "segment_confidence": confidence,
         "segment_source": "embedded",
         "volume_completeness": "complete" if end is not None else "unknown",
     }

@@ -9,7 +9,6 @@ AnalysisStatus = Literal["not_found", "weak", "damaged", "extractable", "error"]
 class ArchiveSegment:
     start_offset: int
     end_offset: int | None
-    confidence: float
     role: str = "primary"
     damage_flags: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
@@ -18,7 +17,6 @@ class ArchiveSegment:
 @dataclass(frozen=True)
 class ArchiveFormatEvidence:
     format: str
-    confidence: float
     status: AnalysisStatus
     segments: list[ArchiveSegment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

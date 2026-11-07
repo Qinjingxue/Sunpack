@@ -48,7 +48,6 @@ class EmbeddedCandidate:
     format: str
     offset: int
     end_offset: int | None
-    confidence: float
     validation: str
     candidate_kind: str
     boundary_kind: str
@@ -65,7 +64,6 @@ class EmbeddedCandidate:
             "format": self.format,
             "offset": self.offset,
             "end_offset": self.end_offset,
-            "confidence": self.confidence,
             "validation": self.validation,
             "candidate_kind": self.candidate_kind,
             "boundary_kind": self.boundary_kind,

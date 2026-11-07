@@ -1321,14 +1321,6 @@
       "max": null,
       "integer": true
     },
-    "/analysis/thresholds/extractable_confidence": {
-      "label": {
-        "zh": "识别置信度",
-        "en": "Detection confidence"
-      },
-      "min": 0,
-      "max": 1
-    },
     "/analysis/modules/@zip/enabled": {
       "label": {
         "zh": "ZIP",

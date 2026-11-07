@@ -47,7 +47,7 @@ def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carvin
             try:
                 assert view.probe_compression_stream("gzip")["plausible"]
                 report = view.analyze(cfg)
-                assert report["evidences"][0][1:3] == (0.97, "extractable")
+                assert report["evidences"][0][1] == "extractable"
             finally:
                 view.close()
             if crc:

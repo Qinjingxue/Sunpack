@@ -64,7 +64,7 @@ def _multi_report(path, evidences, *, prepass=None, size=200, read_bytes=64):
         prepass=prepass or {"formats": [evidence.format for evidence in evidences]},
         read_bytes=read_bytes,
         cache_hits=1,
-        best_selected=max(evidences, key=lambda item: item.confidence) if evidences else None,
+        best_selected=evidences[0] if evidences else None,
         extractable_segments=carved,
         password_segment=password,
     )
@@ -75,9 +75,8 @@ def test_input_planning_stage_reuses_report_for_equivalent_inputs(tmp_path):
     archive.write_bytes(b"zip")
     evidence = ArchiveFormatEvidence(
         format="zip",
-        confidence=0.99,
         status="extractable",
-        segments=[ArchiveSegment(start_offset=0, end_offset=3, confidence=0.99)],
+        segments=[ArchiveSegment(start_offset=0, end_offset=3)],
     )
     first = _task(archive)
     second = _task(archive, logical_name="case_copy")
@@ -141,9 +140,8 @@ def test_input_planning_preserves_structured_password_probe_for_split_segment_at
     second.write_bytes(b"7z-second")
     evidence = ArchiveFormatEvidence(
         format="7z",
-        confidence=0.99,
         status="extractable",
-        segments=[ArchiveSegment(start_offset=0, end_offset=None, confidence=0.99)],
+        segments=[ArchiveSegment(start_offset=0, end_offset=None)],
         details={"password_required": True},
     )
     task = _task(first)
@@ -181,11 +179,10 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
     ]
     evidence = ArchiveFormatEvidence(
         format="7z",
-        confidence=0.97,
         status="extractable",
         # Logical offset 18 maps to physical offset 8 in the second volume.
         # Probe reuse must follow the plan identity, not compare these offsets.
-        segments=[ArchiveSegment(start_offset=18, end_offset=24, confidence=0.97)],
+        segments=[ArchiveSegment(start_offset=18, end_offset=24)],
     )
     task = _task(part1, parts=[part1, part2, part3], volumes=volumes)
     stage = ArchiveInputPlanningStage()
@@ -205,7 +202,7 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
             {"path": str(part2), "start": 8, "end": 10},
             {"path": str(part3), "start": 0, "end": 4},
         ],
-        "analysis": {"status": "extractable", "confidence": 0.97, "damage_flags": []},
+        "analysis": {"status": "extractable", "damage_flags": []},
     }
     assert task.archive_input().open_mode == "native_volumes"
     assert task.password_probe_input is task.inputs[0].descriptor

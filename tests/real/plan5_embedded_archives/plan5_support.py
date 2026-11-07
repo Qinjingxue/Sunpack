@@ -408,7 +408,6 @@ def assert_plan5_native_scan_coverage(
                 "format": candidate.format,
                 "offset": candidate.offset,
                 "end_offset": candidate.end_offset,
-                "confidence": candidate.confidence,
                 "validation": candidate.validation,
             }
             for candidate in result.candidates
@@ -486,7 +485,6 @@ def assert_plan5_success(
                         "format": candidate.format,
                         "offset": candidate.offset,
                         "end_offset": candidate.end_offset,
-                        "confidence": candidate.confidence,
                         "validation": candidate.validation,
                     }
                     for candidate in native_scan.candidates

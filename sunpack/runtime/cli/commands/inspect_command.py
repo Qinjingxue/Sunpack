@@ -97,7 +97,6 @@ def handle(args, ctx):
                 reporter.info(ctx.t("cli.inspect.analysis",
                     status=analysis.get("status") or "-",
                     selected=analysis.get("selected_format") or "-",
-                    confidence=_confidence_label(analysis.get("selected_confidence")),
                     segment=_segment_label(analysis.get("primary_segment")),
                     damage=", ".join(analysis.get("damage_flags") or []) or "-",
                 ))
@@ -160,7 +159,6 @@ def _analysis_preview_by_path(results, config: dict) -> dict[str, dict]:
                 "error": str(exc),
                 "has_extractable": False,
                 "selected_format": "",
-                "selected_confidence": 0.0,
                 "primary_segment": None,
                 "damage_flags": [],
                 "candidates": [],
@@ -201,18 +199,17 @@ def _analysis_summary(task: ArchiveTask, report) -> dict:
             "error": str(task.knowledge().get("inspection.error", "") or ""),
             "has_extractable": False,
             "selected_format": "",
-            "selected_confidence": 0.0,
             "primary_segment": None,
             "damage_flags": [],
             "candidates": [],
         }
     selected = list(report.selected or [])
-    primary = selected[0] if selected else None
+    primary = report.best_selected
     segment = primary.segments[0] if primary and primary.segments else None
     candidates = [
         _evidence_summary(evidence)
-        for evidence in sorted(report.evidences, key=lambda item: item.confidence, reverse=True)[:3]
-    ]
+        for evidence in report.evidences if evidence.status != "not_found"
+    ][:3]
     damage_flags = _dedupe([
         flag
         for evidence in selected[:2]
@@ -223,7 +220,6 @@ def _analysis_summary(task: ArchiveTask, report) -> dict:
         "status": "extractable" if report.has_extractable else "not_extractable",
         "has_extractable": bool(report.has_extractable),
         "selected_format": getattr(primary, "format", "") if primary else "",
-        "selected_confidence": float(getattr(primary, "confidence", 0.0) or 0.0) if primary else 0.0,
         "selected_status": getattr(primary, "status", "") if primary else "",
         "primary_segment": _segment_summary(segment),
         "damage_flags": damage_flags,
@@ -243,7 +239,6 @@ def _evidence_summary(evidence) -> dict:
     return {
         "format": evidence.format,
         "status": evidence.status,
-        "confidence": float(evidence.confidence or 0.0),
         "segments": len(evidence.segments or []),
         "damage_flags": damage_flags,
         "warnings": list(evidence.warnings[:3]),
@@ -259,7 +254,6 @@ def _segment_summary(segment) -> dict | None:
         "start": int(segment.start_offset),
         "end": int(end) if end is not None else None,
         "length": length,
-        "confidence": float(segment.confidence or 0.0),
         "role": segment.role,
     }
 
@@ -278,16 +272,9 @@ def _candidate_label(candidates: list[dict]) -> str:
     parts = []
     for candidate in candidates:
         parts.append(
-            f"{candidate.get('format') or '?'}:{candidate.get('status') or '?'}@{_confidence_label(candidate.get('confidence'))}"
+            f"{candidate.get('format') or '?'}:{candidate.get('status') or '?'}"
         )
     return ", ".join(parts)
-
-
-def _confidence_label(value) -> str:
-    try:
-        return f"{float(value or 0.0):.2f}"
-    except (TypeError, ValueError):
-        return "0.00"
 
 
 def _dedupe(values: list[str]) -> list[str]:

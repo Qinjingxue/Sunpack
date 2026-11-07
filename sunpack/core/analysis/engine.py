@@ -93,22 +93,20 @@ def _report_from_native(path: str, native: dict) -> ArchiveAnalysisReport:
     evidences = [
         ArchiveFormatEvidence(
             format=fmt,
-            confidence=confidence,
             status=status,
             segments=[
                 ArchiveSegment(
                     start_offset=start,
                     end_offset=end,
-                    confidence=segment_confidence,
                     damage_flags=damage_flags,
                     evidence=segment_evidence,
                 )
-                for start, end, segment_confidence, damage_flags, segment_evidence in segments
+                for start, end, damage_flags, segment_evidence in segments
             ],
             warnings=warnings,
             details=details,
         )
-        for fmt, confidence, status, segments, warnings, details in native["evidences"]
+        for fmt, status, segments, warnings, details in native["evidences"]
     ]
     password = native["password_segment"]
     best = native["best_selected"]

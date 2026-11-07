@@ -244,9 +244,7 @@ class ArchiveInputPlanningStage:
             return None
         segment_analysis = {
             "status": evidence.status,
-            "confidence": float(evidence.confidence),
             "damage_flags": list(segment.damage_flags),
-            "segment_confidence": float(segment.confidence),
             "segment_source": "analysis",
         }
         segment_analysis.update(_stream_execution_analysis(evidence, segment.start_offset))
@@ -298,7 +296,6 @@ def _write_plan_knowledge(
             "read_bytes": report.read_bytes,
             "cache_hits": report.cache_hits,
             "selected_format": getattr(selected, "format", "") if selected is not None else "",
-            "confidence": float(getattr(selected, "confidence", 0.0) or 0.0) if selected is not None else 0.0,
         },
         source_layer="detection",
         source_module="archive_input_planner",
