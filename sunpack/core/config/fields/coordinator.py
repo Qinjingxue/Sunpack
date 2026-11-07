@@ -38,9 +38,7 @@ def normalize_recursive_authorization(value: Any) -> dict[str, Any]:
     try:
         byte_ratio_exponent = float(config["byte_ratio_exponent"])
         project_ratio_exponent = float(config["project_ratio_exponent"])
-        authorization_bias = float(config["authorization_bias"])
         minimum_score = float(config["minimum_authorization_score"])
-        minimum_ratio = float(config["minimum_archive_byte_ratio"])
     except (TypeError, ValueError) as exc:
         raise ValueError("recursive_authorization thresholds must be numeric") from exc
     if not math.isfinite(byte_ratio_exponent) or byte_ratio_exponent <= 0.0:
@@ -51,21 +49,13 @@ def normalize_recursive_authorization(value: Any) -> dict[str, Any]:
         raise ValueError(
             "recursive_authorization.project_ratio_exponent must be positive"
         )
-    if not math.isfinite(authorization_bias):
-        raise ValueError("recursive_authorization.authorization_bias must be finite")
     if not math.isfinite(minimum_score) or not 0.0 <= minimum_score <= 1.0:
         raise ValueError(
             "recursive_authorization.minimum_authorization_score must be between 0 and 1"
         )
-    if not math.isfinite(minimum_ratio) or not 0.0 <= minimum_ratio <= 1.0:
-        raise ValueError(
-            "recursive_authorization.minimum_archive_byte_ratio must be between 0 and 1"
-        )
     config["byte_ratio_exponent"] = byte_ratio_exponent
     config["project_ratio_exponent"] = project_ratio_exponent
-    config["authorization_bias"] = authorization_bias
     config["minimum_authorization_score"] = minimum_score
-    config["minimum_archive_byte_ratio"] = minimum_ratio
     return config
 
 

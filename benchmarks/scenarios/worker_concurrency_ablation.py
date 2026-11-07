@@ -47,10 +47,6 @@ MIB = 1024 ** 2
 # product default; every other entry changes exactly one input.
 VARIANTS: dict[str, tuple[dict, dict]] = {
     "default": ({}, {}),
-    "writers1": ({"writer_threads": 1}, {}),
-    "writers8": ({"writer_threads": 8}, {}),
-    "writers16": ({"writer_threads": 16}, {}),
-    "writers32": ({"writer_threads": 32}, {}),
     "buffers256": ({}, {"SUNPACK_ASYNC_WRITER_BUFFERS": "256"}),
     "spacegate_off": ({}, {"SUNPACK_VOLUME_SPACE_GATE": "0"}),
     "cap8": ({"thread_capacity": 8}, {}),

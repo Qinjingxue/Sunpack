@@ -15,9 +15,7 @@ def _config(**overrides):
             "enabled": True,
             "byte_ratio_exponent": 1,
             "project_ratio_exponent": 1,
-            "authorization_bias": 0,
             "minimum_authorization_score": 0.85,
-            "minimum_archive_byte_ratio": 0.1,
             **overrides,
         }
     }
@@ -58,27 +56,12 @@ def test_first_depth_bypasses_policy_for_the_user_requested_scope(tmp_path):
         ("byte_ratio_exponent", float("inf")),
         ("project_ratio_exponent", -1),
         ("project_ratio_exponent", float("nan")),
-        ("authorization_bias", float("inf")),
         ("minimum_authorization_score", float("nan")),
     ],
 )
 def test_odds_fusion_settings_must_be_finite_and_in_range(field, value):
     with pytest.raises(ValueError, match=field):
         normalize_recursive_authorization({field: value})
-
-
-def test_second_depth_root_child_has_no_special_privilege(tmp_path):
-    archive = tmp_path / "nested.zip"
-    entries = [
-        FileEntry(archive, False, 10),
-        FileEntry(tmp_path / ".sunpack", True),
-        *[FileEntry(tmp_path / ".sunpack" / f"asset_{index}", False, 100) for index in range(10)],
-    ]
-
-    result = _authorize(tmp_path, entries, [archive], depth=2)
-
-    assert result.allowed_tasks == []
-    assert result.skipped[0]["reason"] == "archive_byte_ratio_below_floor"
 
 
 def test_recursive_policy_rejects_game_dlc_payload_shape(tmp_path):

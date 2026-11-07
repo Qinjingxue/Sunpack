@@ -62,9 +62,7 @@ def _config() -> dict:
             "enabled": True,
             "byte_ratio_exponent": 1.0,
             "project_ratio_exponent": 1.0,
-            "authorization_bias": 0.0,
             "minimum_authorization_score": 0.85,
-            "minimum_archive_byte_ratio": 0.1,
         },
         "filesystem": {
             "scan_filters": [

@@ -892,8 +892,9 @@ def test_native_environment_only_maps_supported_worker_controls():
         "max_queue_jobs": 1,
         "space_gate_enabled": False,
         "writer_threads": 3,
+        "space_poll_interval_ms": 2000,
     })
-    assert environment == {"SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME": "3"}
+    assert environment == {"SUNPACK_VOLUME_SPACE_POLL_MS": "2000"}
 
 
 def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path):
@@ -1297,7 +1298,7 @@ def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
     archive = tmp_path / "ok.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("ok.txt", "batch payload")
-    runner = SevenZipRunner()
+    runner = SevenZipRunner({})
     runner.worker_path = worker
     try:
         bad = runner.submit_attempt(

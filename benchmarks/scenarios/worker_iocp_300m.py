@@ -27,8 +27,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
-    parser.add_argument("--baseline-writer-threads", type=int, choices=range(1, 9), default=4)
-    parser.add_argument("--candidate-writer-threads", type=int, choices=range(1, 9), default=4)
     parser.add_argument("--concurrency", default="1,8")
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--format", action="append", choices=DEFAULT_FORMATS)
@@ -50,9 +48,8 @@ def main():
     os.environ["SUNPACK_WRITER_PROBE"] = "0"
     report = {"complete": False, "runs": args.runs, "prefetch": args.prefetch,
               "baseline": str(args.baseline.resolve()), "candidate": str(args.candidate.resolve()),
-              "writer_threads": {"baseline": args.baseline_writer_threads, "iocp": args.candidate_writer_threads},
               "candidate_only": args.candidate_only,
-              "method": "Same 300 MiB cached inputs; configured IOCP consumers, unchanged file/job/buffer limits. "
+              "method": "Same 300 MiB cached inputs; worker-default IOCP consumers, unchanged file/job/buffer limits. "
                         "Rotated paired order. wall_ms is extraction return; flush_ms is Rust sync_all "
                         "including helper launch immediately after run returns. extract_and_flush_ms "
                         "includes harness setup/sampler teardown between those boundaries. "
@@ -94,8 +91,6 @@ def main():
                         try:
                             if mode != "cli":
                                 binary = args.baseline if mode == "baseline" else args.candidate
-                                threads = args.baseline_writer_threads if mode == "baseline" else args.candidate_writer_threads
-                                worker = _NativeWorkerProcess(str(binary.resolve()), None, {"writer_threads": threads})
                             before = psutil.disk_io_counters(perdisk=True)
                             started = time.perf_counter()
                             row = (run_cli(seven, batch, output, width, 180) if mode == "cli"

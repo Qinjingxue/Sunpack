@@ -83,7 +83,7 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
     assert migrated["watch"] == {"clipboard_monitor_enabled": True, "clipboard_builtin_max_entries": 17,
                                  "toast_report_retention_days": 61}
     assert migrated["passwords"]["clipboard_passwords_enabled"] is False
-    assert migrated["performance"]["worker"] == {"writer_threads": 6}
+    assert migrated["performance"]["worker"] == {}
     assert "input_planning" not in migrated
     assert "detection" not in migrated
     assert migrated["analysis"] == {"max_concurrent_reads": 3, "unknown": "keep"}

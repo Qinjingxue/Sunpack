@@ -194,9 +194,7 @@ void editing(Fixture& f) {
     fails([&]{validate_setting("/runtime/process_mode",Json("typo"));});
     fails([&]{validate_setting("/watch/clipboard_builtin_max_entries",Json(0));});
     for(auto bounds:{std::make_tuple("/performance/worker/space_poll_interval_ms",50,60000),
-                     std::make_tuple("/performance/worker/space_status_report_interval_ms",1000,600000),
-                     std::make_tuple("/performance/worker/writer_threads",1,8),
-                     std::make_tuple("/performance/worker/max_queue_jobs",1,1000000)}) {
+                     std::make_tuple("/performance/worker/space_status_report_interval_ms",1000,600000)}) {
         const auto& [pointer,lower,upper]=bounds;
         validate_setting(pointer,Json(lower)); validate_setting(pointer,Json(upper));
         fails([&]{validate_setting(pointer,Json(lower-1));});

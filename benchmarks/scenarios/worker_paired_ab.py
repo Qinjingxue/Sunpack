@@ -76,7 +76,7 @@ def main():
                     os.environ.pop("SUNPACK_ASYNC_WRITER_FILE_INFLIGHT_MIB", None)
                     os.environ.update(overrides.get(name, {}))
                     try:
-                        worker = _NativeWorkerProcess(str(engines[name]), None, {"writer_threads": 8})
+                        worker = _NativeWorkerProcess(str(engines[name]), None)
                         try:
                             row = run_worker(worker, [case] * width, output, width, dll, 600, False)
                         finally:

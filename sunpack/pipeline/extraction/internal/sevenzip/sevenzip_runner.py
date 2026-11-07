@@ -100,7 +100,6 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
         if value >= minimum:
             environment[environment_key] = str(value)
 
-    set_int("writer_threads", "SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME")
     set_int("space_poll_interval_ms", "SUNPACK_VOLUME_SPACE_POLL_MS", minimum=50)
     set_int(
         "space_status_report_interval_ms",

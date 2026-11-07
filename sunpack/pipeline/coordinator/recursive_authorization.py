@@ -86,9 +86,7 @@ class RecursiveAuthorization:
                 candidates,
                 float(self.config.get("byte_ratio_exponent", 1.0)),
                 float(self.config.get("project_ratio_exponent", 1.0)),
-                float(self.config.get("authorization_bias", 0.0)),
                 float(self.config.get("minimum_authorization_score", 0.85)),
-                float(self.config.get("minimum_archive_byte_ratio", 0.1)),
             )
             if len(rows) != len(root_tasks):
                 raise RuntimeError("Native nested extraction authorization returned an invalid row count")

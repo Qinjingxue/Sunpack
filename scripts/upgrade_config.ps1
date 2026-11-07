@@ -221,7 +221,7 @@ if ($user.PSObject.Properties['performance'] -and $null -ne $user.performance -a
     $user.performance.PSObject.Properties['worker'] -and $null -ne $user.performance.worker) {
     foreach ($name in @('thread_capacity', 'stage_thread_capacity', 'max_pending_stage_jobs',
                        'max_queue_jobs', 'space_gate_enabled', 'memory_reserve_bytes',
-                       'job_buffer_budget_bytes')) {
+                       'job_buffer_budget_bytes', 'writer_threads')) {
         if ($user.performance.worker.PSObject.Properties[$name]) {
             $user.performance.worker.PSObject.Properties.Remove($name); $changed = $true
         }

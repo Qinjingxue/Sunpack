@@ -275,7 +275,6 @@ def _run_phase(
     worker_path: Path,
     dll_path: Path,
     thread_capacity: int,
-    writer_threads: int,
     timeout_seconds: float,
     sample_interval: float,
     prefetch: bool,
@@ -289,7 +288,6 @@ def _run_phase(
         None,
         {
             "thread_capacity": thread_capacity,
-            "writer_threads": writer_threads,
         },
     )
     sampler = ProcessSampler(interval_seconds=sample_interval)
@@ -660,7 +658,6 @@ def main() -> int:
             "separates a working per-volume layout from the pipeline's own ceiling"
         ),
     )
-    parser.add_argument("--writer-threads", type=int, default=4)
     parser.add_argument("--thread-capacity", type=int, default=8)
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--sample-interval", type=float, default=0.01)
@@ -688,8 +685,6 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmups >= 0")
     if args.payload_gib <= 0:
         parser.error("--payload-gib must be positive")
-    if not 1 <= args.writer_threads <= 32:
-        parser.error("--writer-threads must be between 1 and 32")
     if args.thread_capacity < MIN_CONCURRENT_JOBS:
         parser.error(f"--thread-capacity must be >= {MIN_CONCURRENT_JOBS} for the pair phase")
 
@@ -805,7 +800,6 @@ def main() -> int:
                     worker_path=worker_path,
                     dll_path=dll_path,
                     thread_capacity=args.thread_capacity,
-                    writer_threads=args.writer_threads,
                     timeout_seconds=args.timeout_seconds,
                     sample_interval=args.sample_interval,
                     prefetch=True,
@@ -844,7 +838,6 @@ def main() -> int:
                 worker_path=worker_path,
                 dll_path=dll_path,
                 thread_capacity=args.thread_capacity,
-                writer_threads=args.writer_threads,
                 timeout_seconds=args.timeout_seconds,
                 sample_interval=args.sample_interval,
                 prefetch=True,
@@ -891,7 +884,6 @@ def main() -> int:
                 worker_path=worker_path,
                 dll_path=dll_path,
                 thread_capacity=args.thread_capacity,
-                writer_threads=args.writer_threads,
                 timeout_seconds=args.timeout_seconds,
                 sample_interval=args.sample_interval,
                 prefetch=True,
@@ -926,7 +918,6 @@ def main() -> int:
                 "small_job_mib": args.small_job_mib,
                 "runs": args.runs,
                 "warmups": args.warmups,
-                "writer_threads": args.writer_threads,
                 "thread_capacity": args.thread_capacity,
                 "timeout_seconds": args.timeout_seconds,
                 "sample_interval": args.sample_interval,

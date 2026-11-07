@@ -31,7 +31,7 @@ def _advanced_payload():
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
-        "performance": {"worker": {"writer_threads": 6, "space_poll_interval_ms": 1000}},
+        "performance": {"worker": {"space_poll_interval_ms": 1000, "space_status_report_interval_ms": 15000}},
         "verification": _verification_config(),
     }
 
@@ -49,7 +49,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
         "runtime": {"process_mode": "high"},
         "extraction": {"content_requirement": "complete"},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 2097152, "max_bytes": None}]},
-        "performance": {"worker": {"writer_threads": 4}},
+        "performance": {"worker": {"space_poll_interval_ms": 2000}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     config = loader.load_config()
@@ -62,8 +62,8 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["recursive_extract"] == {"mode": "infinite"}
     assert config["filesystem"]["scan_filters"][0]["min_bytes"] == 2097152
     assert config["filesystem"]["scan_filters"][0]["max_bytes"] is None
-    assert config["performance"]["worker"]["space_poll_interval_ms"] == 1000
-    assert config["performance"]["worker"]["writer_threads"] == 4
+    assert config["performance"]["worker"]["space_poll_interval_ms"] == 2000
+    assert config["performance"]["worker"]["space_status_report_interval_ms"] == 15000
 
 
 def test_everyday_clipboard_and_report_controls_override_advanced_defaults(tmp_path, monkeypatch):

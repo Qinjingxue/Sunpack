@@ -78,7 +78,7 @@ uv run --locked python -m benchmarks extraction worker-read-patterns --runs 2 --
 # Compare production-policy prefetch on/off in alternating order. Two 512 MiB members retain a meaningful solid-7z case.
 uv run --locked python -m benchmarks extraction worker-read-patterns --format tar --format rar-split --format 7z --7z-variant solid --large-files 2 --large-file-mib 512 --large-content random --runs 5 --prefetch compare
 uv run --locked python -m benchmarks extraction worker-small-file-scheduling --jobs 256 --clients 4 --capacities 1,2,4,8 --runs 3
-uv run --locked python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --writer-threads 4 --runs 3 --warmups 1
+uv run --locked python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --runs 3 --warmups 1
 uv run --locked python -m benchmarks extraction worker-resource-pressure --modes cpu,io --capacities 1,2,4 --jobs 4
 uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
 uv run --locked python -m benchmarks watch cli-format-matrix --runs 3 --json-out benchmarks/results/watch-cli-format-matrix.json
@@ -328,8 +328,8 @@ the mixed batch contains two rounds of all cases at every concurrency. Reports
 include paired trials with alternating engine order, throughput, sampled RSS,
 process CPU time, and worker start/finish timelines. `--resume` continues completed
 batches after checking binary and configuration fingerprints. For diagnosis,
-`--dry-run` compares decode/verify against `7z t`, `--writer-threads` changes the
-per-volume writer width, and `--profile` enables available native diagnostics.
+`--dry-run` compares decode/verify against `7z t`, and `--profile` enables available
+native diagnostics. Writer thread counts use each worker binary's internal defaults.
 `--format` and `--no-mixed` restrict diagnostic runs. These direct worker tests
 exclude CLI/watch planning, recursive extraction, and post-extract verification.
 Compressed TAR codecs are measured as one outer stream layer for both engines.

@@ -1311,20 +1311,13 @@ void phase_6c_default_enabled() {
     const DWORD saved_length = GetEnvironmentVariableW(kName, saved, 16);
     const bool had_value = saved_length > 0 && saved_length < 16;
 
-    constexpr const wchar_t *kThreads = L"SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME";
     constexpr const wchar_t *kQueue = L"SUNPACK_ASYNC_WRITER_QUEUE_LIMIT";
-    wchar_t saved_threads[32]{}, saved_queue[32]{};
-    GetEnvironmentVariableW(kThreads, saved_threads, 32);
+    wchar_t saved_queue[32]{};
     GetEnvironmentVariableW(kQueue, saved_queue, 32);
-    SetEnvironmentVariableW(kThreads, nullptr);
     SetEnvironmentVariableW(kQueue, L"1");
     auto defaults = sunpack::sevenzip::configured_async_writer_config();
     check(defaults.threads_per_volume == 4 && defaults.queue_limit == 4096,
           "Writer defaults must use four threads and internal queue capacity");
-    SetEnvironmentVariableW(kThreads, L"3");
-    check(sunpack::sevenzip::configured_async_writer_config().threads_per_volume == 3,
-          "Writer threads must remain configurable");
-    SetEnvironmentVariableW(kThreads, saved_threads[0] ? saved_threads : nullptr);
     SetEnvironmentVariableW(kQueue, saved_queue[0] ? saved_queue : nullptr);
 
     // Removed environment toggles cannot disable gate creation.

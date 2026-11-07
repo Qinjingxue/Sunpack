@@ -234,7 +234,6 @@ def main():
     parser.add_argument("--format", action="append", choices=DEFAULT_FORMATS)
     parser.add_argument("--worker", type=Path)
     parser.add_argument("--worker-capacity", type=int, help="Override native total CPU credits; default uses product defaults")
-    parser.add_argument("--writer-threads", type=int, choices=range(1, 9), help="Diagnostic: override writers per volume")
     parser.add_argument("--no-mixed", action="store_true", help="Only homogeneous format batches")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--prefetch", choices=("default", "on", "off"), default="default",
@@ -266,7 +265,7 @@ def main():
         report = {"source_commit": _git_commit(), "binaries": binaries, "environment": _collect_environment(workspace.root),
                   "corpus": corpus, "cases": cases, "concurrency": widths, "runs": args.runs,
                   "worker_capacity": args.worker_capacity, "profile": args.profile, "dry_run": args.dry_run,
-                  "writer_threads": args.writer_threads, "mixed_enabled": not args.no_mixed,
+                  "mixed_enabled": not args.no_mixed,
                   "prefetch": args.prefetch,
                   "complete": False,
                   "method": "Same cached input, unique outputs. Single persistent worker with product CPU budget; c fresh 7z processes. c jobs per homogeneous burst, fixed two rounds of all formats per mixed batch. Three paired trials, alternating order; no cache flush, no fsync. Output validation/cleanup outside timer. RSS sampled every 20ms; CPU from Windows process handles.",
@@ -278,8 +277,8 @@ def main():
                     raise ValueError(f"Cannot resume with changed {key}")
             if previous.get("dry_run", False) != args.dry_run:
                 raise ValueError("Cannot resume a different output mode")
-            if previous.get("writer_threads") != args.writer_threads or previous.get("mixed_enabled", True) != (not args.no_mixed):
-                raise ValueError("Cannot resume a different writer/workload configuration")
+            if previous.get("mixed_enabled", True) != (not args.no_mixed):
+                raise ValueError("Cannot resume a different workload configuration")
             if previous.get("prefetch", "off") != args.prefetch:
                 raise ValueError("Cannot resume a different prefetch configuration")
             if [c["case_id"] for c in previous["cases"]] != [c["case_id"] for c in cases]:
@@ -291,8 +290,6 @@ def main():
             workloads.append(("mixed", cases * 2))
         for case_id, base in workloads:
             config = {} if args.worker_capacity is None else {"thread_capacity": args.worker_capacity}
-            if args.writer_threads is not None:
-                config["writer_threads"] = args.writer_threads
             worker = _NativeWorkerProcess(str(worker_path), None, config)
             try:
                 for width in widths:

@@ -25,7 +25,7 @@ from sunpack.core.support.output_paths import resolve_output_volume_key
 from benchmarks.scenarios.worker_writer_probe import WriterProbeWorker, profiles
 from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
 
-MODES = ("real", "memory", "memory-nocopy", "eof", "cli", "writers1", "writers8", "writers16", "writers32")
+MODES = ("real", "memory", "memory-nocopy", "eof", "cli")
 
 
 def phase_totals(probes):
@@ -99,7 +99,6 @@ def main():
                     rows = []
                     for run in range(args.runs):
                         os.environ["SUNPACK_WRITER_PROBE_MODE"] = mode if mode in {"memory", "memory-nocopy", "eof"} else "real"
-                        config = {"writer_threads": int(mode.removeprefix("writers"))} if mode.startswith("writers") else {}
                         output = workspace.outputs / f"{case['format']}-{width}-{mode}-{run}"
                         # 7z.exe 的 -aoa 只在单次调用内覆盖；跨 run 复用同一目录会让它
                         # 把重名条目写成 "name(1).bin"，校验看到的字节数翻倍。
@@ -109,7 +108,7 @@ def main():
                             validate(row, [case] * width, output, tar_bytes)
                             row["memory_sink"] = False
                         else:
-                            worker = WriterProbeWorker(str(args.worker.resolve()), None, config)
+                            worker = WriterProbeWorker(str(args.worker.resolve()), None)
                             try:
                                 row = run_worker(worker, [case] * width, output, width, dll, 600, False)
                                 row["probes"] = profiles(worker, width, timeout=5)

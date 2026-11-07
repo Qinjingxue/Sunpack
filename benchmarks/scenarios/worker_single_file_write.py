@@ -120,7 +120,6 @@ def _run_worker(
     worker_path: Path,
     dll_path: Path,
     corpus: dict[str, Any],
-    writer_threads: int,
     timeout_seconds: float,
     sample_interval: float,
     prefetch_archive: bool,
@@ -139,7 +138,6 @@ def _run_worker(
         None,
         {
             "thread_capacity": 1,
-            "writer_threads": writer_threads,
         },
     )
     sampler = ProcessSampler(interval_seconds=sample_interval)
@@ -444,7 +442,6 @@ def main() -> int:
     parser.add_argument("--chunk-mib", type=int, default=8)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--writer-threads", type=int, default=4)
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
     parser.add_argument("--sample-interval", type=float, default=0.01)
     parser.add_argument("--worker-path", type=Path, help="Run one worker executable without a before/after comparison.")
@@ -481,8 +478,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.payload_gib <= 0 or args.chunk_mib < 1 or args.runs < 1 or args.warmups < 0:
         parser.error("payload size, chunk size, and runs must be positive; warmups must be non-negative")
-    if not 1 <= args.writer_threads <= 32:
-        parser.error("--writer-threads must be between 1 and 32")
     if args.timeout_seconds <= 0 or args.sample_interval <= 0:
         parser.error("--timeout-seconds and --sample-interval must be positive")
     if args.max_regression_percent < 0:
@@ -517,7 +512,7 @@ def main() -> int:
             run = iteration if phase == "warmup" else iteration - args.warmups
             ordered_specs = worker_specs if iteration % 2 == 0 else list(reversed(worker_specs))
             for label, worker_path in ordered_specs:
-                print(f"{phase}-{run} {label}: extracting with {args.writer_threads} writer threads ...", flush=True)
+                print(f"{phase}-{run} {label}: extracting with worker defaults ...", flush=True)
                 row = _run_worker(
                     workspace=workspace,
                     label=label,
@@ -526,7 +521,6 @@ def main() -> int:
                     worker_path=worker_path,
                     dll_path=dll_path,
                     corpus=corpus,
-                    writer_threads=args.writer_threads,
                     timeout_seconds=args.timeout_seconds,
                     sample_interval=args.sample_interval,
                     prefetch_archive=bool(args.prefetch_archive),
@@ -547,7 +541,6 @@ def main() -> int:
                 "chunk_mib": args.chunk_mib,
                 "runs": args.runs,
                 "warmups": args.warmups,
-                "writer_threads": args.writer_threads,
                 "timeout_seconds": args.timeout_seconds,
                 "sample_interval": args.sample_interval,
                 "prefetch_archive": bool(args.prefetch_archive),

@@ -71,7 +71,7 @@ def summarize(rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", action="append", choices=("dry", "baseline", "real", "memory", "memory-nocopy", "eof", "writers1", "writers8"))
+    parser.add_argument("--mode", action="append", choices=("dry", "baseline", "real", "memory", "memory-nocopy", "eof"))
     parser.add_argument("--concurrency", default="1,8")
     parser.add_argument("--format", action="append", choices=("gz", "zip"))
     parser.add_argument("--runs", type=int, default=2)
@@ -109,9 +109,8 @@ def main():
                         os.environ["SUNPACK_WRITER_PROBE"] = "1" if diagnostic else "0"
                         os.environ["SUNPACK_WRITER_PROBE_MODE"] = mode if mode in {"memory", "memory-nocopy", "eof"} else "real"
                         binary = ROOT / "benchmarks/.cache/writer-probe" / ("probe.exe" if diagnostic else "baseline.exe")
-                        config = {"writer_threads": int(mode.removeprefix("writers"))} if mode.startswith("writers") else {}
                         output = workspace.outputs / f"{fmt}-{width}-{mode}-{trial}"
-                        worker = WriterProbeWorker(str(binary), None, config)
+                        worker = WriterProbeWorker(str(binary), None)
                         try:
                             disk_before = psutil.disk_io_counters(perdisk=True)
                             row = run_worker(worker, [case] * width, output, width, dll, 60, mode == "dry")

@@ -65,7 +65,6 @@ def main():
     os.environ["SUNPACK_SEVENZIP_PROFILE_READS"] = "0"
     os.environ["SUNPACK_SEVENZIP_PROFILE_PIPELINE"] = "0"
     os.environ["SUNPACK_WRITER_PROBE"] = "1"
-    os.environ["SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME"] = "8"
     report = {"format": args.format, "concurrency": args.concurrency, "trials": args.trials,
               "windows_mib": windows, "complete": False, "results": []}
     BINARIES.mkdir(parents=True, exist_ok=True)
@@ -86,7 +85,7 @@ def main():
                 order = windows if trial % 2 == 0 else list(reversed(windows))
                 for window in order:
                     output = workspace.outputs / f"{args.format}-{window}-{trial}"
-                    worker = WriterProbeWorker(str(binaries[window]), None, {"writer_threads": 8})
+                    worker = WriterProbeWorker(str(binaries[window]), None)
                     try:
                         row = run_worker(worker, [case] * args.concurrency, output,
                                          args.concurrency, dll, 600, False)

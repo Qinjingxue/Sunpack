@@ -12,8 +12,6 @@ namespace sunpack::sevenzip
     namespace
     {
 
-        constexpr std::size_t kDefaultThreadsPerVolume = 4;
-        constexpr std::size_t kMaxThreadsPerVolume = 8;
         constexpr std::size_t kDefaultBufferCount = 64;
         constexpr std::size_t kMaxBufferCount = 256;
         constexpr unsigned long long kDefaultIdleTimeoutMs = 20000;
@@ -76,11 +74,6 @@ namespace sunpack::sevenzip
     AsyncWriterConfig configured_async_writer_config() noexcept
     {
         AsyncWriterConfig config;
-        config.threads_per_volume = configured_size(
-            L"SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME",
-            kDefaultThreadsPerVolume,
-            1,
-            kMaxThreadsPerVolume);
         config.buffer_count = configured_size(
             L"SUNPACK_ASYNC_WRITER_BUFFERS", kDefaultBufferCount, 4, kMaxBufferCount);
         config.write_through = configured_flag(L"SUNPACK_ASYNC_WRITER_WRITE_THROUGH");

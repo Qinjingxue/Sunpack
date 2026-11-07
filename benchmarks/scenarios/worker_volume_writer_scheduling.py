@@ -209,7 +209,6 @@ def _run_configuration(
     worker_path: Path,
     dll_path: Path,
     thread_capacity: int,
-    writer_threads: int,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     for job in jobs:
@@ -219,7 +218,6 @@ def _run_configuration(
         None,
         {
             "thread_capacity": thread_capacity,
-            "writer_threads": writer_threads,
         },
     )
     try:
@@ -320,7 +318,6 @@ def main() -> int:
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--writer-threads", type=int, default=4)
     parser.add_argument("--thread-capacity", type=int, default=4)
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--worker-path", type=Path)
@@ -333,8 +330,6 @@ def main() -> int:
         parser.error("--payload-mib must be at least 64 to stay out of the cached regime")
     if args.repeats < 1 or args.warmups < 0:
         parser.error("--repeats must be >= 1 and --warmups >= 0")
-    if not 1 <= args.writer_threads <= 32:
-        parser.error("--writer-threads must be between 1 and 32")
     if args.thread_capacity < MIN_CONCURRENT_JOBS:
         parser.error(f"--thread-capacity must be >= {MIN_CONCURRENT_JOBS}")
 
@@ -433,7 +428,6 @@ def main() -> int:
                     worker_path=worker_path,
                     dll_path=dll_path,
                     thread_capacity=args.thread_capacity,
-                    writer_threads=args.writer_threads,
                     timeout_seconds=args.timeout_seconds,
                 )
                 result["configuration"] = configuration
@@ -544,7 +538,6 @@ def main() -> int:
                 "payload_mib": args.payload_mib,
                 "repeats": args.repeats,
                 "warmups": args.warmups,
-                "writer_threads": args.writer_threads,
                 "thread_capacity": args.thread_capacity,
             },
             "environment": {

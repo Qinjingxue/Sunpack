@@ -79,9 +79,7 @@ struct Evaluation {
     candidates,
     byte_ratio_exponent,
     project_ratio_exponent,
-    authorization_bias,
-    minimum_authorization_score,
-    minimum_archive_byte_ratio
+    minimum_authorization_score
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn authorize_nested_candidates(
@@ -91,9 +89,7 @@ pub(crate) fn authorize_nested_candidates(
     candidates: Vec<CandidateTuple>,
     byte_ratio_exponent: f64,
     project_ratio_exponent: f64,
-    authorization_bias: f64,
     minimum_authorization_score: f64,
-    minimum_archive_byte_ratio: f64,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let root = PathBuf::from(root_path);
     // The frozen snapshot owns immutable Rust storage. Borrow it directly while
@@ -204,14 +200,7 @@ pub(crate) fn authorize_nested_candidates(
                 .map(|member| member_sizes.get(member.as_str()).copied().unwrap_or(0))
                 .fold(0u64, u64::saturating_add);
         }
-        let evaluate_scope = |stats| {
-            evaluate(
-                stats,
-                byte_ratio_exponent,
-                project_ratio_exponent,
-                authorization_bias,
-            )
-        };
+        let evaluate_scope = |stats| evaluate(stats, byte_ratio_exponent, project_ratio_exponent);
         let root_evaluation = evaluate_scope(root_accumulator.finish(&root_candidates));
         let scope_evaluations: HashMap<String, Evaluation> = scope_accumulators
             .into_iter()
@@ -235,11 +224,8 @@ pub(crate) fn authorize_nested_candidates(
             } else {
                 (local.score, "local")
             };
-            let minimum_byte_ratio = local.byte_ratio.min(root_evaluation.byte_ratio);
             let (allowed, reason) = if context.scope_key.is_empty() {
                 (false, "outside_scan_root")
-            } else if minimum_byte_ratio < minimum_archive_byte_ratio {
-                (false, "archive_byte_ratio_below_floor")
             } else if authorization_score < minimum_authorization_score {
                 (false, "authorization_score_below_threshold")
             } else {
@@ -314,7 +300,6 @@ fn evaluate(
     stats: ScopeStats,
     byte_ratio_exponent: f64,
     project_ratio_exponent: f64,
-    authorization_bias: f64,
 ) -> Evaluation {
     let byte_ratio = ratio(stats.candidate_bytes, stats.total_bytes);
     let project_ratio = project_ratio(stats.candidate_projects, stats.other_project_count());
@@ -323,7 +308,6 @@ fn evaluate(
         project_ratio,
         byte_ratio_exponent,
         project_ratio_exponent,
-        authorization_bias,
     );
     Evaluation {
         stats,
@@ -347,7 +331,6 @@ fn odds_fusion_score(
     project_ratio: f64,
     byte_ratio_exponent: f64,
     project_ratio_exponent: f64,
-    authorization_bias: f64,
 ) -> f64 {
     if byte_ratio <= 0.0 || project_ratio <= 0.0 {
         return 0.0;
@@ -355,8 +338,7 @@ fn odds_fusion_score(
     const EPSILON: f64 = 1e-12;
     let byte_ratio = byte_ratio.clamp(EPSILON, 1.0 - EPSILON);
     let project_ratio = project_ratio.clamp(EPSILON, 1.0 - EPSILON);
-    let log_odds = authorization_bias
-        + byte_ratio_exponent * (byte_ratio / (1.0 - byte_ratio)).ln()
+    let log_odds = byte_ratio_exponent * (byte_ratio / (1.0 - byte_ratio)).ln()
         + project_ratio_exponent * (project_ratio / (1.0 - project_ratio)).ln();
     if log_odds >= 0.0 {
         1.0 / (1.0 + (-log_odds).exp())
@@ -463,7 +445,7 @@ mod tests {
 
     #[test]
     fn odds_fusion_accelerates_at_extreme_ratios() {
-        let score = |bytes, projects| odds_fusion_score(bytes, projects, 1.0, 1.0, 0.0);
+        let score = |bytes, projects| odds_fusion_score(bytes, projects, 1.0, 1.0);
         assert!(score(0.99, 1.0 / 6.0) > 0.95);
         assert!((score(0.99, 0.05) - 0.839).abs() < 0.002);
         assert!(score(0.99, 1.0 / 31.0) < 0.77);

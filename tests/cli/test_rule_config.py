@@ -109,12 +109,6 @@ def test_effective_config_includes_native_worker_without_detection_switch():
             {"name": "size_range", "enabled": True, "min_bytes": 1048576}
         ]
     }
-    config["performance"] = {
-        "worker": {
-            "writer_threads": 4,
-        }
-    }
-
     effective = build_effective_config(make_config(config))
 
     assert effective["size_range_min_bytes"] == 1048576
