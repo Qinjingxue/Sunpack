@@ -206,20 +206,23 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
          1, stat.st_mtime_ns, b"temp".hex()],
         [2, "escape.bin", "../escape.bin", 4, 4, 0, 0, 0, 0, 1, 1,
          1, stat.st_mtime_ns, b"evil".hex()],
+        [3, "alias.bin", allowed.name, 4, 4, 0, 0, 0, 0, 1, 1,
+         1, stat.st_mtime_ns, b"last".hex()],
     ]
+    allowed.write_bytes(b"last")
     worker_result = {
         "status": "ok",
         "verified_manifest": {
             "validated": True,
             "inventory": {
                 "complete": True,
-                "file_count": 3,
+                "file_count": 4,
                 "dir_count": 0,
-                "total_size": stat.st_size + 8,
-                "identity_paths": True,
+                "total_size": stat.st_size + 12,
+                "identity_paths": False,
             },
             "native_rows": worker_manifest_from_rows(
-                rows, True, 3, 0, stat.st_size + 8, True,
+                rows, True, 4, 0, stat.st_size + 12, False,
             ),
         },
     }
@@ -241,6 +244,10 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
     assert str(tmp_path / "ignored.tmp") not in filtered_paths
     assert str(tmp_path / "ignored.tmp") in raw_paths
     assert str(tmp_path.parent / "escape.bin") not in raw_paths
+    # Manifest aliases use the final record for the same output path. Ordinary
+    # directory scans cannot expose this filtered-row remapping regression.
+    paths, _dirs, sizes, _mtimes = snapshot.native_snapshot.materialize_columns()
+    assert [size for path, size in zip(paths, sizes) if path == str(allowed)] == [4, 4]
 
 
 def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projection(tmp_path):
