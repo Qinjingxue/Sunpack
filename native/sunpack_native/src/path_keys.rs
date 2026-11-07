@@ -7,6 +7,16 @@ extern "system" {
     fn RtlDowncaseUnicodeChar(source: u16) -> u16;
 }
 
+/// Use the same non-expanding filesystem map for strings and handle buffers.
+#[cfg(windows)]
+pub(crate) fn case_key_unit(unit: u16) -> u16 {
+    if unit <= 0x7f {
+        (unit as u8).to_ascii_lowercase() as u16
+    } else {
+        unsafe { RtlDowncaseUnicodeChar(unit) }
+    }
+}
+
 pub(crate) fn case_key(value: &str) -> String {
     if value.is_ascii() {
         return value.to_ascii_lowercase();
@@ -18,8 +28,7 @@ pub(crate) fn case_key(value: &str) -> String {
             if ch as u32 <= u16::MAX as u32 {
                 // NT's filesystem mapping is independent of the process locale
                 // and does not expand characters or fold surrogate pairs.
-                return char::from_u32(unsafe { RtlDowncaseUnicodeChar(ch as u16) } as u32)
-                    .unwrap_or(ch);
+                return char::from_u32(case_key_unit(ch as u16) as u32).unwrap_or(ch);
             }
             ch.to_ascii_lowercase()
         })

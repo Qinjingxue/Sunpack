@@ -198,6 +198,11 @@ pub(super) fn collect(
         })
         .collect();
     for i in pe_rows {
+        // One managed context supplies PE headers, overlay, stub and archive
+        // confirmation. Its existing caches/guard live only through this row.
+        let Ok(reader) = crate::io::reader::ManagedReader::open(&rows[i].path) else {
+            continue;
+        };
         if rows[i]
             .anchor
             .as_ref()
@@ -205,7 +210,7 @@ pub(super) fn collect(
         {
             // Refine only structure facts. Stage ownership and filesystem routes
             // stay unchanged; the native residual retains this refined anchor.
-            let probe = inspect_pe_image_native(&rows[i].path);
+            let probe = inspect_pe_image_reader(&reader, reader.len(), &[]);
             let Ok(probe) = probe else {
                 // A transient read error is not evidence against PE identity.
                 continue;
@@ -214,7 +219,7 @@ pub(super) fn collect(
             anchor.pe_state = probe.state();
             anchor.pe_image_end = probe.image_end();
         }
-        if let Some(anchor) = promote_sfx_archive_anchor(&rows[i], passwords) {
+        if let Some(anchor) = promote_sfx_archive_anchor(&rows[i], &reader, passwords) {
             rows[i].anchor = Some(anchor);
         }
         if let Some(anchor) = rows[i].anchor.as_mut() {
@@ -376,6 +381,14 @@ fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
     let Some(old) = cached.as_ref() else {
         return;
     };
+    let negative;
+    let old = match old.anchor() {
+        Some(anchor) => anchor,
+        None => {
+            negative = old.materialize(&row.path, row.size.unwrap_or(0));
+            &negative
+        }
+    };
     if old.path != anchor.path
         || old.size != anchor.size
         || old.structure_offset != anchor.structure_offset
@@ -395,7 +408,9 @@ fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
     {
         return;
     }
-    *cached = Some(Arc::new(anchor.clone()));
+    *cached = Some(crate::analysis_native::volume_anchor::CheapAnchor::Full(
+        Arc::new(anchor.clone()),
+    ));
 }
 
 fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {

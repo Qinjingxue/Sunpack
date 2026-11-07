@@ -150,12 +150,79 @@ pub(crate) fn probe_volume_anchor_paths_cheap(
 /// One password-independent fact per catalog row generation. Relations may
 /// refine the cheap head with password-independent tail facts. Contention is per file,
 /// never on the catalog lock; failed reads remain retryable.
-pub(crate) type CheapAnchorCell = Arc<Mutex<Option<Arc<VolumeAnchor>>>>;
+pub(crate) type CheapAnchorCell = Arc<Mutex<Option<CheapAnchor>>>;
+
+/// Ordinary heads need no duplicate path or empty structural fields. The owning
+/// snapshot/catalog generation supplies path and size when Relations selects a row.
+#[derive(Debug, Clone)]
+pub(crate) enum CheapAnchor {
+    Negative { bytes_read: u16, reject_mask: u32 },
+    Full(Arc<VolumeAnchor>),
+}
+
+impl CheapAnchor {
+    pub(crate) fn from_cheap(anchor: VolumeAnchor) -> Self {
+        if anchor.format.is_empty()
+            && anchor.pe_state == PeState::None
+            && anchor.error.is_empty()
+            && anchor.evidence.is_empty()
+            && anchor.bytes_read <= 512
+        {
+            Self::Negative {
+                bytes_read: anchor.bytes_read as u16,
+                reject_mask: anchor.format_reject_mask,
+            }
+        } else {
+            Self::Full(Arc::new(anchor))
+        }
+    }
+
+    pub(crate) fn anchor(&self) -> Option<&VolumeAnchor> {
+        match self {
+            Self::Full(anchor) => Some(anchor),
+            Self::Negative { .. } => None,
+        }
+    }
+
+    pub(crate) fn materialize(&self, path: &str, size: u64) -> VolumeAnchor {
+        match self {
+            Self::Full(anchor) => (**anchor).clone(),
+            Self::Negative {
+                bytes_read,
+                reject_mask,
+            } => VolumeAnchor {
+                path: path.to_owned(),
+                size,
+                bytes_read: u64::from(*bytes_read),
+                format_reject_mask: *reject_mask,
+                ..VolumeAnchor::default()
+            },
+        }
+    }
+
+    pub(crate) fn reject_mask(&self) -> u32 {
+        match self {
+            Self::Full(anchor) => anchor.format_reject_mask,
+            Self::Negative { reject_mask, .. } => *reject_mask,
+        }
+    }
+
+    pub(crate) fn bytes_read(&self) -> u64 {
+        match self {
+            Self::Full(anchor) => anchor.bytes_read,
+            Self::Negative { bytes_read, .. } => u64::from(*bytes_read),
+        }
+    }
+
+    pub(crate) fn reusable(&self) -> bool {
+        self.anchor().is_none_or(|anchor| anchor.error.is_empty())
+    }
+}
 
 pub(crate) fn probe_volume_anchor_records_cheap(
     records: &[(&str, u64, Option<&CheapAnchorCell>)],
     root: Option<&str>,
-) -> Vec<Arc<VolumeAnchor>> {
+) -> Vec<CheapAnchor> {
     // A conflicting promotion retains the original per-file error/retry path.
     let scope = root.and_then(|root| NativeReadScope::new(std::path::Path::new(root)).ok());
     cheap_fast_probe_pool().install(|| {
@@ -163,14 +230,24 @@ pub(crate) fn probe_volume_anchor_records_cheap(
             .par_iter()
             .map(|(path, size, cell)| {
                 let Some(cell) = cell else {
-                    return Arc::new(probe_path_cheap_direct(path, *size, None, scope.as_ref()));
+                    return CheapAnchor::from_cheap(probe_path_cheap_direct(
+                        path,
+                        *size,
+                        None,
+                        scope.as_ref(),
+                    ));
                 };
                 let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(anchor) = cached.as_ref() {
                     return anchor.clone();
                 }
-                let anchor = Arc::new(probe_path_cheap_direct(path, *size, None, scope.as_ref()));
-                if anchor.error.is_empty() {
+                let anchor = CheapAnchor::from_cheap(probe_path_cheap_direct(
+                    path,
+                    *size,
+                    None,
+                    scope.as_ref(),
+                ));
+                if anchor.reusable() {
                     *cached = Some(anchor.clone());
                 }
                 anchor

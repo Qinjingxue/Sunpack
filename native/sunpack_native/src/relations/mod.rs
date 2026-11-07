@@ -1,12 +1,11 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap, CheapAnchorCell, VolumeAnchor,
+    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap,
+    probe_volume_anchor_reader_at_offset, CheapAnchorCell, VolumeAnchor,
 };
 use crate::path_keys::{case_key, path_key};
 use crate::scan::directory::NativeDirectorySnapshot;
 use crate::scan::executable_carrier::executable_sfx_stub_profile;
-use crate::scan::pe_overlay::{
-    inspect_pe_image_native, inspect_pe_overlay_from_image_end, PeState,
-};
+use crate::scan::pe_overlay::{inspect_pe_image_reader, inspect_pe_overlay_reader, PeState};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use regex::{Regex, RegexBuilder};
@@ -906,6 +905,7 @@ fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
 
 fn promote_sfx_archive_anchor(
     row: &RelationInput,
+    reader: &crate::io::reader::ManagedReader,
     path_passwords: Option<&[(String, String)]>,
 ) -> Option<VolumeAnchor> {
     let Some(facts) = row.anchor.as_ref() else {
@@ -917,7 +917,7 @@ fn promote_sfx_archive_anchor(
     let Some(image_end) = facts.pe_image_end else {
         return None;
     };
-    let overlay = inspect_pe_overlay_from_image_end(&row.path, facts.size, image_end);
+    let overlay = inspect_pe_overlay_reader(reader, facts.size, image_end);
     let archive_like = overlay.archive_like;
     let format = overlay.format;
     if archive_like && !matches!(format, "rar" | "7z" | "zip") {
@@ -933,9 +933,9 @@ fn promote_sfx_archive_anchor(
     // executable carriers, while explicit deep-detect may scan them separately.
     // Prove the decompressor stub first with a bounded image-only probe, then
     // validate the archive at the overlay offset below.
-    let sfx_profile = executable_sfx_stub_profile(&row.path, image_end);
+    let sfx_profile = executable_sfx_stub_profile(reader, image_end).ok()?;
     if !archive_like {
-        let evidence = match sfx_profile.as_str() {
+        let evidence = match sfx_profile {
             "seven_zip_sfx" => "sfx:seven_zip_stub",
             "winrar_sfx" => "sfx:winrar_stub",
             _ => return None,
@@ -947,7 +947,7 @@ fn promote_sfx_archive_anchor(
         anchor.evidence.push(evidence);
         return Some(anchor);
     }
-    let sfx_matches_format = match sfx_profile.as_str() {
+    let sfx_matches_format = match sfx_profile {
         "seven_zip_sfx" => matches!(format, "7z" | "zip"),
         "winrar_sfx" => matches!(format, "rar" | "zip"),
         _ => false,
@@ -967,7 +967,9 @@ fn promote_sfx_archive_anchor(
             .find(|(candidate, _)| path_key(candidate) == row.path_key)
             .map(|(_, password)| password.as_str())
     });
-    let mut anchor = probe_volume_anchor_at_offset(&row.path, archive_offset, format, password);
+    let mut anchor =
+        probe_volume_anchor_reader_at_offset(reader, &row.path, archive_offset, format, password)
+            .ok()?;
     if anchor.format != format || anchor.confidence != "strong" {
         return None;
     }

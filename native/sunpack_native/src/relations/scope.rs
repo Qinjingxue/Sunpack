@@ -44,7 +44,9 @@ impl<'a> RelationSource<'a> {
         match self {
             Self::Snapshot(snapshot, cached) => cached
                 .and_then(|cache| cache.anchors.get(&path_key(self.path(row))))
-                .or(snapshot.table.relation_anchors[row].as_deref()),
+                .or(snapshot.table.relation_anchors[row]
+                    .as_ref()
+                    .and_then(|fact| fact.anchor())),
             Self::Physical(rows) => rows[row].anchor.as_ref(),
         }
     }
@@ -63,7 +65,12 @@ impl<'a> RelationSource<'a> {
             name: self.name(row).to_owned(),
             size,
             relation_member_eligible,
-            anchor: self.anchor(row).cloned(),
+            anchor: self.anchor(row).cloned().or_else(|| match self {
+                Self::Snapshot(snapshot, _) => snapshot.table.relation_anchors[row]
+                    .as_ref()
+                    .map(|fact| fact.materialize(self.path(row), size.unwrap_or(0))),
+                Self::Physical(_) => None,
+            }),
             anchor_cell: match self {
                 Self::Snapshot(snapshot, _) => snapshot
                     .table

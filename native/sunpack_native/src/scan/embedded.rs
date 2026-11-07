@@ -1061,7 +1061,6 @@ unsafe fn scan_sample_avx2(
     while start + 34 <= sample.len() {
         let first = _mm256_loadu_si256(sample.as_ptr().add(start).cast());
         let second = _mm256_loadu_si256(sample.as_ptr().add(start + 1).cast());
-        let third = _mm256_loadu_si256(sample.as_ptr().add(start + 2).cast());
         let first_bits = _mm256_and_si256(
             _mm256_shuffle_epi8(low_first, _mm256_and_si256(first, nibble_mask)),
             _mm256_shuffle_epi8(
@@ -1076,6 +1075,20 @@ unsafe fn scan_sample_avx2(
                 _mm256_and_si256(_mm256_srli_epi16(second, 4), nibble_mask),
             ),
         );
+        let prefix_matches = _mm256_and_si256(first_bits, second_bits);
+        let footer_matches = _mm256_and_si256(
+            _mm256_cmpeq_epi8(first, footer_first),
+            _mm256_cmpeq_epi8(second, footer_second),
+        );
+        // Most blocks contain no two-byte prefix at all. Avoid the third
+        // unaligned load and both table shuffles on that common path. Dense
+        // rejected prefixes still use the same three-byte filter below.
+        let possible = _mm256_or_si256(prefix_matches, footer_matches);
+        if _mm256_testz_si256(possible, possible) != 0 {
+            start += 32;
+            continue;
+        }
+        let third = _mm256_loadu_si256(sample.as_ptr().add(start + 2).cast());
         let third_bits = _mm256_and_si256(
             _mm256_shuffle_epi8(low_third, _mm256_and_si256(third, nibble_mask)),
             _mm256_shuffle_epi8(
@@ -1083,12 +1096,7 @@ unsafe fn scan_sample_avx2(
                 _mm256_and_si256(_mm256_srli_epi16(third, 4), nibble_mask),
             ),
         );
-        let header_matches =
-            _mm256_and_si256(_mm256_and_si256(first_bits, second_bits), third_bits);
-        let footer_matches = _mm256_and_si256(
-            _mm256_cmpeq_epi8(first, footer_first),
-            _mm256_cmpeq_epi8(second, footer_second),
-        );
+        let header_matches = _mm256_and_si256(prefix_matches, third_bits);
         let matches = _mm256_or_si256(header_matches, footer_matches);
         let mut mask = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(matches, zero)) as u32);
         while mask != 0 {

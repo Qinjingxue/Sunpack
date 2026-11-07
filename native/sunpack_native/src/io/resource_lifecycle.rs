@@ -48,6 +48,9 @@ enum FileResource {
 }
 
 pub(crate) struct NativeReadScope {
+    #[cfg(windows)]
+    root: Vec<u16>,
+    #[cfg(not(windows))]
     root: PathBuf,
     guard: Arc<NativeResourceGuard>,
 }
@@ -60,6 +63,15 @@ impl NativeReadScope {
             vec![root.clone()],
             true,
         )?;
+        #[cfg(windows)]
+        let root = {
+            use std::os::windows::ffi::OsStrExt;
+            let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+            while wide.last() == Some(&(b'\\' as u16)) {
+                wide.pop();
+            }
+            wide
+        };
         Ok(Self {
             root,
             guard: Arc::new(guard),
@@ -70,7 +82,7 @@ impl NativeReadScope {
         let file = open_shared_reader(Path::new(path))?;
         // Verify the opened object, including reparse/rename races, without
         // opening a second handle just to canonicalize every file's name.
-        if handle_path(&file).is_ok_and(|actual| actual.starts_with(&self.root)) {
+        if handle_path_is_under(&file, &self.root).unwrap_or(false) {
             return Ok(TrackedFile {
                 file,
                 _resource: FileResource::Shared {
@@ -84,8 +96,8 @@ impl NativeReadScope {
 }
 
 #[cfg(windows)]
-fn handle_path(file: &File) -> io::Result<PathBuf> {
-    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+fn handle_path_is_under(file: &File, root: &[u16]) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     extern "system" {
         fn GetFinalPathNameByHandleW(
@@ -104,10 +116,10 @@ fn handle_path(file: &File) -> io::Result<PathBuf> {
             0,
         )
     };
-    let wide = if len == 0 {
+    if len == 0 {
         return Err(io::Error::last_os_error());
     } else if (len as usize) < stack.len() {
-        std::ffi::OsString::from_wide(&stack[..len as usize])
+        Ok(handle_path_has_root(&stack[..len as usize], root))
     } else {
         let mut data = vec![0u16; len as usize + 1];
         let actual = unsafe {
@@ -121,15 +133,25 @@ fn handle_path(file: &File) -> io::Result<PathBuf> {
         if actual == 0 || actual as usize >= data.len() {
             return Err(io::Error::last_os_error());
         }
-        std::ffi::OsString::from_wide(&data[..actual as usize])
-    };
-    Ok(PathBuf::from(crate::path_keys::path_key(
-        &wide.to_string_lossy(),
-    )))
+        Ok(handle_path_has_root(&data[..actual as usize], root))
+    }
+}
+
+#[cfg(windows)]
+fn handle_path_has_root(actual: &[u16], root: &[u16]) -> bool {
+    // Compare only the root component prefix, directly in the OS buffer. A
+    // sibling named root-extra must never inherit this root's promotion guard.
+    !root.is_empty()
+        && actual.len() >= root.len()
+        && (actual.len() == root.len() || actual[root.len()] == b'\\' as u16)
+        && actual
+            .iter()
+            .zip(root)
+            .all(|(&unit, &expected)| crate::path_keys::case_key_unit(unit) == expected)
 }
 
 #[cfg(not(windows))]
-fn handle_path(_file: &File) -> io::Result<PathBuf> {
+fn handle_path_is_under(_file: &File, _root: &Path) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "scoped probes require Windows",
@@ -569,12 +591,15 @@ mod tests {
     // One scope checks close ordering and the existing per-file fallback.
     #[test]
     fn scoped_readers_keep_promotion_protection_until_handles_close() {
-        let root = crate::test_support::temp_file("read_scope", b"");
+        let root = crate::test_support::temp_file("read_scope_İ_Σ_测试", b"");
         std::fs::remove_file(&root).unwrap();
         std::fs::create_dir(&root).unwrap();
         let path = root.join("inside.fake");
         std::fs::write(&path, b"inside").unwrap();
-        let outside = crate::test_support::temp_file("outside_scope", b"outside");
+        // A same-prefix sibling exercises the component boundary as well as
+        // the non-ASCII root's shared filesystem case mapping.
+        let outside = root.with_extension("sibling");
+        std::fs::write(&outside, b"outside").unwrap();
         let scope = NativeReadScope::new(&root).unwrap();
         let id = scope.guard.id;
         let mut inside = scope.open_reader(path.to_str().unwrap()).unwrap();

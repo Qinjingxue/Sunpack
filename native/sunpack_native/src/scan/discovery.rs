@@ -1,3 +1,4 @@
+use crate::analysis_native::volume_anchor::CheapAnchor;
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
     build_native_candidate_groups_from_snapshot,
@@ -32,7 +33,9 @@ impl Candidate {
         match self {
             Self::File(table, row) => (
                 table.paths[*row].as_str(),
-                table.relation_anchors[*row].as_ref().map(|a| a.pe_state),
+                table.relation_anchors[*row]
+                    .as_ref()
+                    .map(|a| a.anchor().map_or(PeState::None, |a| a.pe_state)),
             ),
             Self::Relation(group) => (
                 group.candidate_data().entry_path,
@@ -433,7 +436,9 @@ impl NativeEmbeddedBatch {
                 let anchor = cache
                     .anchors
                     .get(&key)
-                    .or(snapshot.table.relation_anchors[row].as_deref());
+                    .or(snapshot.table.relation_anchors[row]
+                        .as_ref()
+                        .and_then(CheapAnchor::anchor));
                 if let Some(anchor) = anchor.filter(|a| a.needs_password) {
                     requests
                         .entry(path.clone())
@@ -475,8 +480,11 @@ impl NativeEmbeddedBatch {
                     && !pending_keys.contains(&key)
                     && !cache.anchors.contains_key(&key)
                 {
-                    if let Some(anchor) = &snapshot.table.relation_anchors[row] {
-                        cache.anchors.insert(key, (**anchor).clone());
+                    if let Some(anchor) = snapshot.table.relation_anchors[row]
+                        .as_ref()
+                        .and_then(CheapAnchor::anchor)
+                    {
+                        cache.anchors.insert(key, anchor.clone());
                     }
                 }
             }
@@ -893,7 +901,9 @@ impl NativeCandidateTable {
         match row {
             Candidate::File(table, index) => {
                 let path = &table.paths[*index];
-                let anchor = table.relation_anchors[*index].as_ref();
+                let anchor = table.relation_anchors[*index]
+                    .as_ref()
+                    .and_then(CheapAnchor::anchor);
                 let route = table.file_routes[*index];
                 Ok((
                     "file",
@@ -902,7 +912,10 @@ impl NativeCandidateTable {
                         table.sizes[*index],
                         filesystem_route_name(route),
                         anchor.map(|a| a.format.as_str()).unwrap_or(""),
-                        anchor.map(|a| a.format_reject_mask).unwrap_or(0),
+                        table.relation_anchors[*index]
+                            .as_ref()
+                            .map(CheapAnchor::reject_mask)
+                            .unwrap_or(0),
                         filesystem_logical_name(path),
                     ),
                 )
@@ -937,6 +950,7 @@ impl NativeCandidateTable {
                 table.paths[*index].clone(),
                 table.relation_anchors[*index]
                     .as_ref()
+                    .and_then(CheapAnchor::anchor)
                     .map(|anchor| anchor.format.clone())
                     .unwrap_or_default(),
             ),
@@ -1046,7 +1060,9 @@ impl NativeCandidateTable {
                             if claimed.contains(&key) || blocked.contains(&key) {
                                 return None;
                             }
-                            let anchor = table.relation_anchors[*file_index].as_ref();
+                            let anchor = table.relation_anchors[*file_index]
+                                .as_ref()
+                                .and_then(CheapAnchor::anchor);
                             let format = anchor.map(|anchor| anchor.format.as_str()).unwrap_or("");
                             let accepted = matches!(
                                 format,

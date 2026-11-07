@@ -1,9 +1,11 @@
 use crate::analysis_native::inspect_zip_local_header;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
+use memchr::memmem;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
 const OVERLAY_SCAN_WINDOW_BYTES: u64 = 65_536;
 const PE_SIGNATURE: &[u8] = b"PE\x00\x00";
@@ -13,7 +15,7 @@ const SECTION_HEADER_SIZE: usize = 40;
 const MAX_PE_SECTIONS: usize = 96;
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 
-const ARCHIVE_MAGICS: &[(&[u8], &str, &str)] = &[
+const ARCHIVE_MAGICS: [(&[u8], &str, &str); 9] = [
     (b"7z\xbc\xaf\x27\x1c", "7z", ".7z"),
     (b"Rar!\x1a\x07\x01\x00", "rar", ".rar"),
     (b"Rar!\x1a\x07\x00", "rar", ".rar"),
@@ -161,7 +163,7 @@ pub(crate) fn probe_pe_prefix(prefix: &[u8], actual_size: u64) -> PeProbe {
     .unwrap()
 }
 
-fn inspect_pe_image_reader(
+pub(crate) fn inspect_pe_image_reader(
     reader: &ManagedReader,
     actual_size: u64,
     prefix: &[u8],
@@ -266,19 +268,8 @@ pub(crate) fn inspect_pe_overlay_native(
     result
 }
 
-/// Relations consumes a confirmed image boundary without parsing headers again.
-pub(crate) fn inspect_pe_overlay_from_image_end(
-    path: &str,
-    file_size: u64,
-    image_end: u64,
-) -> PeOverlayStructure {
-    let Ok(reader) = ManagedReader::open(path) else {
-        return PeOverlayStructure::failed("os_error");
-    };
-    inspect_pe_overlay_reader(&reader, file_size, image_end)
-}
-
-fn inspect_pe_overlay_reader(
+/// Relations reuses its reader and confirmed boundary without parsing headers again.
+pub(crate) fn inspect_pe_overlay_reader(
     reader: &ManagedReader,
     actual_size: u64,
     pe_end: u64,
@@ -431,12 +422,15 @@ fn empty_result<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict
 
 fn find_archive_magic(sample: &[u8]) -> Option<(&'static str, &'static str, usize)> {
     let mut best: Option<(&'static str, &'static str, usize)> = None;
-    for (magic, archive_format, detected_ext) in ARCHIVE_MAGICS {
-        let Some(index) = find_subslice(sample, magic) else {
+    static MATCHERS: OnceLock<[memmem::Finder<'static>; ARCHIVE_MAGICS.len()]> = OnceLock::new();
+    let matchers =
+        MATCHERS.get_or_init(|| ARCHIVE_MAGICS.map(|(magic, _, _)| memmem::Finder::new(magic)));
+    for ((_, archive_format, detected_ext), matcher) in ARCHIVE_MAGICS.iter().zip(matchers) {
+        let Some(index) = matcher.find(sample) else {
             continue;
         };
         if best.is_none_or(|(_, _, best_index)| index < best_index) {
-            best = Some((archive_format, detected_ext, index));
+            best = Some((*archive_format, *detected_ext, index));
         }
     }
     if let Some(offset) = memchr::memmem::find_iter(sample, b"\x2a\x4d\x18")
@@ -448,15 +442,6 @@ fn find_archive_magic(sample: &[u8]) -> Option<(&'static str, &'static str, usiz
         }
     }
     best
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn u16_le(bytes: &[u8], offset: usize) -> u16 {

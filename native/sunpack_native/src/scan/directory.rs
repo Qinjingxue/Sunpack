@@ -13,7 +13,7 @@ use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCata
 use super::path_filter::{FilterPath, NativePathRule, PathRule, PathRuleScratch};
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
-    probe_volume_anchor_records_cheap, CheapAnchorCell, VolumeAnchor,
+    probe_volume_anchor_records_cheap, CheapAnchor, CheapAnchorCell,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -25,7 +25,7 @@ pub(crate) struct DirectoryEntryRecord {
     #[serde(skip)]
     pub(super) relation_member_eligible: bool,
     #[serde(skip)]
-    pub(super) relation_anchor: Option<Arc<VolumeAnchor>>,
+    pub(super) relation_anchor: Option<CheapAnchor>,
 }
 
 #[derive(Debug)]
@@ -36,7 +36,7 @@ pub(crate) struct DirectorySnapshotTable {
     pub(crate) sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
     pub(crate) relation_member_eligible: Vec<bool>,
-    pub(crate) relation_anchors: Vec<Option<Arc<VolumeAnchor>>>,
+    pub(crate) relation_anchors: Vec<Option<CheapAnchor>>,
     pub(crate) relation_anchor_cells: Vec<Option<CheapAnchorCell>>,
     pub(crate) file_routes: Vec<u8>,
 }
@@ -123,7 +123,7 @@ impl NativeDirectorySnapshot {
             file_routes: Vec::with_capacity(records.len()),
         };
         for record in records {
-            let route = filesystem_file_route(record.is_dir, record.relation_anchor.as_deref());
+            let route = filesystem_file_route(record.is_dir, record.relation_anchor.as_ref());
             table.paths.push(record.path);
             table.is_dirs.push(record.is_dir);
             table.sizes.push(record.size);
@@ -164,12 +164,19 @@ impl NativeDirectorySnapshot {
     }
 }
 
-fn filesystem_file_route(is_dir: bool, anchor: Option<&VolumeAnchor>) -> u8 {
+fn filesystem_file_route(is_dir: bool, fact: Option<&CheapAnchor>) -> u8 {
     if is_dir {
         return 0;
     }
-    let Some(anchor) = anchor else {
+    let Some(fact) = fact else {
         return FILE_ROUTE_RESIDUAL;
+    };
+    let Some(anchor) = fact.anchor() else {
+        return if fact.bytes_read() >= 512 && fact.reject_mask() & FORMAT_REJECT_TAR == 0 {
+            FILE_ROUTE_DETECTION
+        } else {
+            FILE_ROUTE_RESIDUAL
+        };
     };
     // PE facts authorize Relations refinement; they never terminate discovery.
     if anchor.pe_state != crate::scan::pe_overlay::PeState::None
@@ -673,7 +680,14 @@ impl NativeDirectorySnapshot {
             .iter()
             .filter_map(|&row| {
                 (!self.table.is_dirs[row] && self.table.file_routes[row] == FILE_ROUTE_RELATIONS)
-                    .then(|| (row, self.table.relation_anchors[row].as_deref()))
+                    .then(|| {
+                        (
+                            row,
+                            self.table.relation_anchors[row]
+                                .as_ref()
+                                .and_then(CheapAnchor::anchor),
+                        )
+                    })
             })
             .filter_map(|(row, anchor)| anchor.map(|anchor| (row, anchor)))
             .map(|(row, anchor)| {
@@ -696,7 +710,9 @@ impl NativeDirectorySnapshot {
                 continue;
             }
             let path = &self.table.paths[row];
-            let anchor = self.table.relation_anchors[row].as_deref();
+            let anchor = self.table.relation_anchors[row]
+                .as_ref()
+                .and_then(CheapAnchor::anchor);
             specs.push((
                 path.clone(),
                 self.table.sizes[row],
@@ -704,7 +720,10 @@ impl NativeDirectorySnapshot {
                 anchor
                     .map(|value| value.format.to_ascii_lowercase())
                     .unwrap_or_default(),
-                anchor.map(|value| value.format_reject_mask).unwrap_or(0),
+                self.table.relation_anchors[row]
+                    .as_ref()
+                    .map(CheapAnchor::reject_mask)
+                    .unwrap_or(0),
                 filesystem_logical_name(path),
             ));
         }
@@ -730,12 +749,19 @@ impl NativeDirectorySnapshot {
             if self.table.is_dirs[row] || self.table.file_routes[row] == FILE_ROUTE_RELATIONS {
                 continue;
             }
-            let anchor = self.table.relation_anchors[row].as_deref();
+            let anchor = self.table.relation_anchors[row]
+                .as_ref()
+                .and_then(CheapAnchor::anchor);
             paths.push(self.table.paths[row].clone());
             sizes.push(self.table.sizes[row]);
             routes.push(self.table.file_routes[row]);
             formats.push(anchor.map(|value| value.format.clone()).unwrap_or_default());
-            reject_masks.push(anchor.map(|value| value.format_reject_mask).unwrap_or(0));
+            reject_masks.push(
+                self.table.relation_anchors[row]
+                    .as_ref()
+                    .map(CheapAnchor::reject_mask)
+                    .unwrap_or(0),
+            );
         }
         (paths, sizes, routes, formats, reject_masks)
     }
@@ -1148,7 +1174,7 @@ impl NativeDirectoryScanOptions {
                     {
                         record.relation_anchor = previous.table.relation_anchors[row]
                             .as_ref()
-                            .filter(|anchor| anchor.error.is_empty())
+                            .filter(|anchor| anchor.reusable())
                             .cloned();
                     }
                 }
@@ -1503,7 +1529,7 @@ fn build_inventory_snapshot_views(
         }
         let item = &files[item_index];
         if item.magic.len() >= item.size.min(512) as usize {
-            record.relation_anchor = Some(Arc::new(probe_volume_anchor_from_head(
+            record.relation_anchor = Some(CheapAnchor::from_cheap(probe_volume_anchor_from_head(
                 &record.path,
                 item.size,
                 &item.magic,
@@ -2083,7 +2109,10 @@ fn populate_relation_anchors_cached(
         let anchor = if records[index].size.is_some() {
             known_anchors.next()
         } else {
-            unknown_anchors.next().map(Arc::new)
+            // Without a size column the full anchor owns the probed size.
+            unknown_anchors
+                .next()
+                .map(|anchor| CheapAnchor::Full(Arc::new(anchor)))
         };
         records[index].relation_anchor = anchor;
     }
