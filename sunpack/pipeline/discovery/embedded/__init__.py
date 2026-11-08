@@ -1,4 +1,4 @@
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
-from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery, EmbeddedScanGate, EmbeddedScanPlan
+from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 
-__all__ = ["EmbeddedDiscovery", "EmbeddedOptions", "EmbeddedScanGate", "EmbeddedScanPlan"]
+__all__ = ["EmbeddedDiscovery", "EmbeddedOptions"]

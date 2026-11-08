@@ -8,7 +8,6 @@ from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
-from sunpack.pipeline.discovery.embedded.discovery import select_single_candidate_ratio
 from tests.helpers.config_factory import make_config
 
 
@@ -75,14 +74,14 @@ def test_detection_does_not_accept_relation_metadata(tmp_path):
 
 def test_recursive_embedded_ratio_uses_individual_candidate_share(tmp_path):
     paths = [tmp_path / name for name in ("large", "medium", "small")]
-    candidates = [
-        _candidate(path, size)
-        for path, size in zip(paths, (70, 25, 5))
-    ]
+    carrier = b"prefix" + gzip.compress(b"payload")
+    for path, size in zip(paths, (7000, 2500, 500)):
+        path.write_bytes(carrier.ljust(size, b"x"))
 
-    assert select_single_candidate_ratio(candidates, 0.3) == [candidates[0]]
-    assert select_single_candidate_ratio(candidates, 0.05) == candidates
-    assert select_single_candidate_ratio(candidates, 0) == []
+    for ratio, expected in ((0.3, paths[:1]), (0.05, paths), (0, [])):
+        config = make_config({"embedded_scan": {"recursive_candidate_ratio": ratio}})
+        result = ArchiveTaskProvider(config).discover_targets([str(tmp_path)], is_recursive_scan=True)
+        assert {task.carrier_path for task in result.tasks} == {str(path) for path in expected}
 
 
 @pytest.mark.parametrize("force", [False, True])

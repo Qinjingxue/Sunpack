@@ -286,8 +286,7 @@ class WatchScheduler:
         self._ready_heap: list[tuple[float, int, int, str, str]] = []
         self._quiet_trackers: dict[str, AdaptiveQuietTracker] = {}
         self._closed = False
-        self._password_reload_pending = False
-        self._password_update_pending = False
+        self._password_update_reload: bool | None = None
         self._password_retry_at: float | None = None
         self._observer = Observer()
         self._observer_resource = None
@@ -970,8 +969,7 @@ class WatchScheduler:
                 self._claims_by_owner.clear()
                 self._dirty_during_claim.clear()
                 self._source_probes.clear()
-                self._password_reload_pending = False
-                self._password_update_pending = False
+                self._password_update_reload = None
                 self._password_retry_at = None
 
     def _stop_blocking(self):
@@ -1020,11 +1018,9 @@ class WatchScheduler:
         # Clear before the read. In-flight events leave a dirty bit and an
         # immediate next turn, without starving retries during continuous edits.
         with self._lock:
-            update_passwords = self._password_update_pending
-            reload = self._password_reload_pending
-            self._password_reload_pending = False
-            self._password_update_pending = False
-        if update_passwords:
+            reload = self._password_update_reload
+            self._password_update_reload = None
+        if reload is not None:
             await self.pipeline_engine.work_broker.run(
                 "password_reload", "watch", self._publish_password_update, reload,
                 request_id="watch", origin="watch",
@@ -1256,7 +1252,7 @@ class WatchScheduler:
         now = monotonic_now = time.monotonic()
         with self._lock:
             if (self._directory_pending or self._watch_rearm or self._usn_checkpoint_pending
-                    or self._password_update_pending):
+                    or self._password_update_reload is not None):
                 return 0.0
             # Completion callbacks wake the service when admission space opens.
             # A full request window must not turn due candidates into polling.
@@ -1741,8 +1737,8 @@ class WatchScheduler:
         with self._lock:
             if self._closed:
                 return
-            self._password_reload_pending |= reload
-            self._password_update_pending = True
+            if reload or self._password_update_reload is None:
+                self._password_update_reload = reload
         self._wake_service()
 
     def _publish_password_update(self, reload: bool = False) -> None:

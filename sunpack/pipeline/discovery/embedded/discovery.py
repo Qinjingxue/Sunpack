@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 import os
 from typing import Any
 
 from sunpack.core.support.path_keys import case_key, path_key
-from sunpack_native import NativeEmbeddedBatch, inspect_pe_image, relations_logical_name
+from sunpack_native import NativeEmbeddedBatch, relations_logical_name
 
+from sunpack.core.config.fields.embedded import DEFAULT_EMBEDDED_SCAN
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
@@ -23,10 +24,7 @@ from sunpack.core.contracts.discovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
-from sunpack.core.analysis.embedded import (
-    resolve_encrypted_rar_boundaries,
-    scan_embedded_archives,
-)
+from sunpack.core.analysis.embedded import resolve_encrypted_rar_boundaries
 from sunpack.core.analysis.embedded.result import (
     embedded_candidate_requires_password,
     embedded_scan_prepass,
@@ -36,78 +34,20 @@ from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
 
-DEFAULT_DEEP_SCAN_SINGLE_CANDIDATE_RATIO = 0.3
-
-
-@dataclass(frozen=True)
-class EmbeddedScanPlan:
-    allowed_ids: frozenset[int]
-
-
-class EmbeddedScanGate:
-    def __init__(self, config: dict[str, Any], options: EmbeddedOptions | None = None):
-        self.config = config
-        self.options = options or EmbeddedOptions()
-
-    def plan(
-        self,
-        candidates: list[DiscoveryCandidate],
-        *,
-        is_recursive_scan: bool,
-    ) -> EmbeddedScanPlan:
-        embedded_config = self.config.get("embedded_scan")
-        if isinstance(embedded_config, dict) and not embedded_config.get("enabled", True):
-            return EmbeddedScanPlan(frozenset())
-        if self.options.force_scan or not is_recursive_scan:
-            return EmbeddedScanPlan(frozenset(map(id, candidates)))
-        selected = select_single_candidate_ratio(candidates, self._recursive_candidate_ratio())
-        return EmbeddedScanPlan(
-            frozenset(map(id, selected)),
-        )
-
-    def _recursive_candidate_ratio(self) -> float:
-        embedded = self.config.get("embedded_scan") or {}
-        try:
-            return min(1.0, max(0.0, float(embedded.get(
-                "recursive_candidate_ratio",
-                DEFAULT_DEEP_SCAN_SINGLE_CANDIDATE_RATIO,
-            ))))
-        except (TypeError, ValueError):
-            return 0.0
-
-
 class EmbeddedDiscovery:
     """Confirm archive payloads only in unclaimed physical files."""
 
     def __init__(self, config: dict[str, Any], options: EmbeddedOptions | None = None):
         self.config = config
         self.options = options or EmbeddedOptions()
-        self.gate = EmbeddedScanGate(config, self.options)
         self.password_store = PasswordStore.from_config(config)
 
-    def discover(
-        self,
-        candidates: list[DiscoveryCandidate],
-        *,
-        is_recursive_scan: bool = False,
-    ) -> StageResult:
-        result = StageResult()
-        plan = self.gate.plan(candidates, is_recursive_scan=is_recursive_scan)
-        for candidate in candidates:
-            if id(candidate) not in plan.allowed_ids:
-                continue
-
-            self._discover_into(result, candidate)
-
-        result.validate()
-        return result
-
     def prepare_native(self, table, routes, *, is_recursive_scan=False):
-        embedded_config = self.config.get("embedded_scan") or {}
+        embedded_config = self.config.get("embedded_scan") or DEFAULT_EMBEDDED_SCAN
         return table.prepare_embedded(
             routes, recursive=is_recursive_scan, force_scan=self.options.force_scan,
-            enabled=embedded_config.get("enabled", True),
-            recursive_ratio=self.gate._recursive_candidate_ratio(),
+            enabled=embedded_config.get("enabled", DEFAULT_EMBEDDED_SCAN["enabled"]),
+            recursive_ratio=embedded_config.get("recursive_candidate_ratio", DEFAULT_EMBEDDED_SCAN["recursive_candidate_ratio"]),
         )
 
     def discover_many_native(self, scans, session) -> list[StageResult]:
@@ -219,12 +159,10 @@ class EmbeddedDiscovery:
         result.tasks = combined
 
     def _discover_into(
-        self, result: StageResult, candidate: DiscoveryCandidate, precomputed_scan=None,
+        self, result: StageResult, candidate: DiscoveryCandidate, scan,
     ) -> None:
         try:
-            resolved, reason, findings = self._discover_candidate(
-                candidate, precomputed_scan=precomputed_scan,
-            )
+            resolved, reason, findings = self._discover_candidate(candidate, scan)
         except OSError as exc:
             result.add_blocked(candidate, source="embedded", reason="embedded_scan_io_error", error=str(exc))
             return
@@ -237,22 +175,12 @@ class EmbeddedDiscovery:
     def _discover_candidate(
         self,
         candidate: DiscoveryCandidate,
-        *,
-        precomputed_scan=None,
+        scan,
     ) -> tuple[ArchiveTask | None, str, tuple[DiscoveryFinding, ...]]:
         path = candidate.entry_path
         if not path:
             return None, "missing_or_empty_file", ()
-        if precomputed_scan is None:
-            if not self.options.force_scan and inspect_pe_image(path):
-                return None, "embedded_executable_skipped", ()
-            scan = scan_embedded_archives(path).to_dict()
-            size = int(scan["file_size"])
-            if size <= 0:
-                return None, "missing_or_empty_file", ()
-        else:
-            scan = precomputed_scan
-            size = int(scan["file_size"])
+        size = int(scan["file_size"])
 
         password_by_offset: dict[int, str] = dict(scan.get("resolved_passwords") or ())
         pending_failures = {item["offset"]: item["discovery_failure_reason"]
@@ -445,27 +373,6 @@ def _blocked_findings(
             extractable=False,
         ))
     return tuple(findings)
-
-
-def select_single_candidate_ratio(
-    candidates: list[DiscoveryCandidate],
-    ratio: float,
-) -> list[DiscoveryCandidate]:
-    sized = [
-        (size, candidate.entry_path, candidate)
-        for candidate in candidates
-        if (size := logical_candidate_size(candidate)) > 0
-    ]
-    if not sized or ratio <= 0.0:
-        return []
-    sized.sort(key=lambda item: (-item[0], case_key(os.path.normpath(item[1]))))
-    threshold = sum(size for size, _path, _candidate in sized) * min(1.0, ratio)
-    return [candidate for size, _path, candidate in sized if size >= threshold]
-
-
-def logical_candidate_size(candidate: DiscoveryCandidate) -> int:
-    size = candidate.logical_size if candidate.is_split else candidate.size
-    return int(size) if isinstance(size, int) and size > 0 else 0
 
 
 def _descriptor_for_candidate(

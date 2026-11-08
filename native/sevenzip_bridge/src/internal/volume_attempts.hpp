@@ -32,7 +32,9 @@ struct VolumeAttemptPlan {
     // by ordinal AND slot number across layouts (paths alone lose slice identity).
     void prepare() {
         std::vector<VolumeSlotVariation> summaries;
+        summaries.reserve(domains.size());
         domain_capacity.clear();
+        if (minimum_size) domain_capacity.reserve(domains.size());
         for (const auto& choices : domains) {
             VolumeSlotVariation info;
             info.source = choices.front();
@@ -79,8 +81,7 @@ struct VolumeAttemptCursor {
     std::vector<std::size_t> domain_remaining, shared_domains;
     bool started = false, discard_pending = false, output_owned = false;
     void reserve(const VolumeAttemptPlan& plan) {
-        std::size_t maximum = 0;
-        for (const auto& slots : plan.layouts) maximum = (std::max)(maximum, slots.size());
+        const auto maximum = plan.variation.size();
         digits.reserve(maximum); selected.reserve(maximum);
         if (plan.minimum_size) { remaining.reserve(maximum + 1); suffix_capacity.reserve(maximum + 1); }
         used.assign(plan.sources.size(), 0);
@@ -114,7 +115,8 @@ struct VolumeAttemptCursor {
             const auto& slots = plan.layouts[layout];
             std::size_t depth = 0;
             if (digits.empty()) {
-                std::fill(domain_remaining.begin(), domain_remaining.end(), 0);
+                // Only domains referenced by this layout can be read below.
+                for (const auto& slot : slots) domain_remaining[slot.domain] = 0;
                 shared_domains.clear();
                 for (const auto& slot : slots)
                     if (++domain_remaining[slot.domain] == 2) shared_domains.push_back(slot.domain);
@@ -175,9 +177,14 @@ struct VolumeAttemptCursor {
                     if (previous.size() != slots.size()) continue;
                     duplicate = true;
                     for (std::size_t i = 0; i < slots.size(); ++i)
-                        if (previous[i].number != slots[i].number || previous[i].name != slots[i].name ||
-                            std::find(plan.domains[previous[i].domain].begin(), plan.domains[previous[i].domain].end(), selected[i]) == plan.domains[previous[i].domain].end()) {
+                        if (previous[i].number != slots[i].number || previous[i].name != slots[i].name) {
                             duplicate = false; break;
+                        }
+                        else if (previous[i].domain != slots[i].domain) {
+                            const auto& domain = plan.domains[previous[i].domain];
+                            if (std::find(domain.begin(), domain.end(), selected[i]) == domain.end()) {
+                                duplicate = false; break;
+                            }
                         }
                 }
                 if (!duplicate) { ++attempts; return true; }

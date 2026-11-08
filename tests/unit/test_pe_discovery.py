@@ -3,11 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from sunpack_native import inspect_pe_image, inspect_pe_overlay_structure, probe_volume_anchors
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.target_scan import build_native_table_for_targets
-from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.pipeline.discovery.relations import RelationsScheduler
@@ -22,18 +19,10 @@ def _config():
     })
 
 
-def _candidate(path):
-    return DiscoveryCandidate(
-        archive_input=ArchiveInputDescriptor.from_parts(archive_path=str(path), logical_name=path.name),
-        carrier_path=str(path), cleanup_paths=(str(path),), route="residual",
-        size=path.stat().st_size,
-    )
-
-
 @pytest.mark.parametrize("filename", ["image.jpg", "image.bin", "image.EXE", "image.dll"])
 @pytest.mark.parametrize("pe_offset", [0x80, 0x180, 0x800])
 @pytest.mark.parametrize("pe64", [False, True])
-def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filename, pe_offset, pe64, monkeypatch):
+def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filename, pe_offset, pe64):
     image = make_minimal_pe(pe_offset=pe_offset, pe64=pe64)
     path = tmp_path / filename
     path.write_bytes(image + make_minimal_7z() + b"trailing junk")
@@ -48,11 +37,6 @@ def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filenam
     assert group.head_metadata.get("relation_confirmed") is not True
 
     # Both file and directory target paths consume native refined residuals.
-    # Python fallback PE detection must never run for their precomputed scans.
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_pe_image",
-        lambda *_: pytest.fail("native residual facts must not pass through Python PE detection"),
-    )
     for target in [path, tmp_path]:
         ordinary = ArchiveTaskProvider(_config()).discover_targets([str(target)])
         assert ordinary.tasks == []
@@ -71,28 +55,13 @@ def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filenam
         id="candidate-refined-to-none",
     ),
 ])
-def test_non_pe_exe_carrier_is_scanned_in_native_and_fallback_paths(tmp_path, prefix):
+def test_non_pe_exe_carrier_is_scanned(tmp_path, prefix):
     path = tmp_path / "disguised.exe"
     path.write_bytes(prefix + make_minimal_7z() + b"trailing junk")
     assert inspect_pe_image(str(path)) is False
-    for result in [
-        ArchiveTaskProvider(_config()).discover_targets([str(path)]),
-        EmbeddedDiscovery(_config()).discover([_candidate(path)]),
-    ]:
-        [task] = result.tasks
-        assert task.discovery_source == "embedded"
-        assert task.archive_input().primary_extent.start == len(prefix)
-
-
-@pytest.mark.parametrize("pe_offset", [0x80, 0x800])
-def test_python_fallback_uses_canonical_pe_policy(tmp_path, pe_offset):
-    path = tmp_path / "disguised.jpg"
-    path.write_bytes(make_minimal_pe(pe_offset=pe_offset) + make_minimal_7z())
-    result = EmbeddedDiscovery(_config()).discover([_candidate(path)])
-    assert result.tasks == []
-    assert result.traces == []
-    deep = EmbeddedDiscovery(_config(), EmbeddedOptions(force_scan=True)).discover([_candidate(path)])
-    assert len(deep.tasks) == 1
+    [task] = ArchiveTaskProvider(_config()).discover_targets([str(path)]).tasks
+    assert task.discovery_source == "embedded"
+    assert task.archive_input().primary_extent.start == len(prefix)
 
 
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])
@@ -143,13 +112,9 @@ def test_invalid_coff_carriers_are_scanned_instead_of_skipped(tmp_path, pe_offse
     path = tmp_path / "invalid_image.exe"
     path.write_bytes(image + make_minimal_7z() + b"trailing junk")
     assert inspect_pe_image(str(path)) is False
-    for result in [
-        ArchiveTaskProvider(_config()).discover_targets([str(path)]),
-        EmbeddedDiscovery(_config()).discover([_candidate(path)]),
-    ]:
-        [task] = result.tasks
-        assert task.discovery_source == "embedded"
-        assert task.archive_input().primary_extent.start == len(image)
+    [task] = ArchiveTaskProvider(_config()).discover_targets([str(path)]).tasks
+    assert task.discovery_source == "embedded"
+    assert task.archive_input().primary_extent.start == len(image)
 
 
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])

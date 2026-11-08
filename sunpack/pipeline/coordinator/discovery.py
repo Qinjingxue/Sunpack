@@ -10,7 +10,6 @@ from sunpack.core.support.path_keys import path_key
 
 class ArchiveDiscoveryPipeline:
     def __init__(self, config: dict, options: EmbeddedOptions):
-        self.config = config
         self.embedded = EmbeddedDiscovery(config, options)
 
     def discover_native(

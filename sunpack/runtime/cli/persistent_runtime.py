@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 import asyncio
 import copy
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, AsyncIterator, Callable
 
-from sunpack.core.config.loader import config_source_key, load_config, load_raw_config_payload, clear_config_cache
+from sunpack.core.config.loader import (
+    clear_config_cache, config_source_key, load_config, load_raw_config_payload, normalize_config_payload,
+)
 from sunpack.core.config.advanced_defaults import advanced_config_value
 from sunpack.pipeline.coordinator.engine import PipelineEngine, new_work_broker
 from sunpack.runtime.cli.runtime_state import server_runtime_active, set_server_runtime_active
@@ -39,7 +41,9 @@ _ENGINE_LOCK = asyncio.Lock()
 _CONFIG_SNAPSHOT_LIMIT = 64
 _CONFIG_SNAPSHOTS: OrderedDict[ConfigSourceKey, _ConfigSnapshot] = OrderedDict()
 _CONFIG_DIRTY_SOURCES: set[ConfigSourceKey] = set()
+_CONFIG_READERS: Counter[ConfigSourceKey] = Counter()
 _CONFIG_SNAPSHOT_LOCK = RLock()
+_CONFIG_SUBSCRIPTIONS_LOCK = Lock()
 _CONFIG_GENERATION = 0
 _CONFIG_SNAPSHOT_EPOCH = 0
 _LATEST_IDLE_SECONDS: float | None = None
@@ -68,9 +72,8 @@ def enable_persistent_runtime(*, state_changed: Callable[[], None] | None = None
 
 def _configuration_files_changed() -> None:
     global _CONFIG_RELOAD_TASK, _CONFIG_RELOAD_PENDING, _CONFIG_GENERATION
+    clear_config_cache()
     with _CONFIG_SNAPSHOT_LOCK:
-        # Claiming a dirty source must not race ahead of cache invalidation.
-        clear_config_cache()
         _CONFIG_GENERATION += 1
         _CONFIG_DIRTY_SOURCES.update(_CONFIG_SNAPSHOTS)
     _CONFIG_RELOAD_PENDING = True
@@ -120,9 +123,10 @@ async def close_persistent_runtime() -> None:
     global _ENGINE, _WORK_BROKER, _LATEST_IDLE_SECONDS, _STATE_CHANGED_CALLBACK, _CONFIG_OBSERVER
     global _CONFIG_SNAPSHOT_EPOCH
     set_server_runtime_active(False)
-    if _CONFIG_OBSERVER is not None:
-        _CONFIG_OBSERVER.stop()
-        _CONFIG_OBSERVER = None
+    with _CONFIG_SUBSCRIPTIONS_LOCK:
+        observer, _CONFIG_OBSERVER = _CONFIG_OBSERVER, None
+        if observer is not None:
+            observer.stop()
     if _CONFIG_RELOAD_TASK is not None:
         await _CONFIG_RELOAD_TASK
     if _PASSWORD_RELOAD_TASK is not None:
@@ -136,6 +140,7 @@ async def close_persistent_runtime() -> None:
             _CONFIG_SNAPSHOT_EPOCH += 1
             _CONFIG_SNAPSHOTS.clear()
             _CONFIG_DIRTY_SOURCES.clear()
+            _CONFIG_READERS.clear()
         _LATEST_IDLE_SECONDS = None
         try:
             if engine is not None:
@@ -194,21 +199,19 @@ def _snapshot_for(request_cwd: str | Path | None, *, refresh: bool = False) -> _
         # worker-thread IO must remain dirty even if this attempt is invalid.
         _CONFIG_DIRTY_SOURCES.discard(source_key)
         generation, epoch = _CONFIG_GENERATION, _CONFIG_SNAPSHOT_EPOCH
-        sources = (*_CONFIG_SNAPSHOTS, source_key)
-        # An earlier in-flight loader can repopulate its cache after the
-        # notification invalidated it. This claimed read must use current data.
-        clear_config_cache()
+        _CONFIG_READERS[source_key] += 1
     # Never hold the state lock during IO or observer operations: a worker
     # reading a partial file must not block event-loop invalidation.
-    _observe_config_sources(sources)
     replacement = None
     failure = None
     try:
-        config_path, raw_payload = load_raw_config_payload(request_cwd)
+        if previous is None:
+            _observe_config_sources()
+        config_path, raw_payload = load_raw_config_payload(request_cwd, refresh=True)
         replacement = _ConfigSnapshot(
             config_path=config_path,
             raw_payload=raw_payload,
-            normalized_config=load_config(request_cwd),
+            normalized_config=normalize_config_payload(raw_payload),
         )
     except Exception as exc:
         failure = exc
@@ -217,6 +220,9 @@ def _snapshot_for(request_cwd: str | Path | None, *, refresh: bool = False) -> _
         snapshot = current or replacement or previous
         reconcile = False
         if epoch == _CONFIG_SNAPSHOT_EPOCH:
+            _CONFIG_READERS[source_key] -= 1
+            if not _CONFIG_READERS[source_key]:
+                del _CONFIG_READERS[source_key]
             # A slower reader cannot overwrite a newer published snapshot.
             if replacement is not None and (current is previous or current is None):
                 snapshot = replacement
@@ -230,10 +236,9 @@ def _snapshot_for(request_cwd: str | Path | None, *, refresh: bool = False) -> _
                 evicted, _ = _CONFIG_SNAPSHOTS.popitem(last=False)
                 _CONFIG_DIRTY_SOURCES.discard(evicted)
                 reconcile = True
-            reconcile |= snapshot is None
-            sources = tuple(_CONFIG_SNAPSHOTS)
+            reconcile |= source_key not in _CONFIG_SNAPSHOTS and source_key not in _CONFIG_READERS
     if reconcile:
-        _observe_config_sources(sources)
+        _observe_config_sources()
     if failure is not None:
         if refresh or snapshot is None:
             raise failure
@@ -241,18 +246,23 @@ def _snapshot_for(request_cwd: str | Path | None, *, refresh: bool = False) -> _
     return snapshot
 
 
-def _observe_config_sources(sources) -> None:
-    if _CONFIG_OBSERVER is None:
-        return
-    files = set()
-    for simple, advanced, override in sources:
-        files.update(path for path in (simple, advanced) if path)
-        if override and override.startswith("file:"):
-            files.add(override[len("file:"):])
-    _CONFIG_OBSERVER.set_additional_files([
-        (Path(path).parent, [Path(path).name], _configuration_files_changed)
-        for path in sorted(files)
-    ])
+def _observe_config_sources() -> None:
+    with _CONFIG_SUBSCRIPTIONS_LOCK:
+        if _CONFIG_OBSERVER is None:
+            return
+        # Every update reflects current state, including cold sources whose
+        # readers have started but have yet to publish their snapshots.
+        with _CONFIG_SNAPSHOT_LOCK:
+            sources = _CONFIG_SNAPSHOTS.keys() | _CONFIG_READERS.keys()
+        files = set()
+        for simple, advanced, override in sources:
+            files.update(path for path in (simple, advanced) if path)
+            if override and override.startswith("file:"):
+                files.add(override[len("file:"):])
+        paths = map(Path, sorted(files))
+        _CONFIG_OBSERVER.set_additional_files([
+            (path.parent, [path.name], _configuration_files_changed) for path in paths
+        ])
 
 
 def load_request_config(request_cwd: str | Path | None = None) -> dict[str, Any]:
@@ -268,9 +278,7 @@ def load_request_config_payload(
 ) -> tuple[Path, dict[str, Any]]:
     """Return request data, or strictly read current files for explicit diagnostics."""
     if not server_runtime_active():
-        if refresh:
-            clear_config_cache()
-        return load_raw_config_payload(request_cwd)
+        return load_raw_config_payload(request_cwd, refresh=refresh)
     snapshot = _snapshot_for(request_cwd, refresh=refresh)
     return snapshot.config_path, copy.deepcopy(snapshot.raw_payload)
 

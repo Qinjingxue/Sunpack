@@ -28,7 +28,7 @@ def test_explicit_diagnostics_reject_current_file_without_losing_last_good_confi
     monkeypatch.setattr(runtime, "server_runtime_active", lambda: True)
     monkeypatch.setattr(runtime, "_CONFIG_SNAPSHOTS", OrderedDict())
     monkeypatch.setattr(runtime, "_CONFIG_DIRTY_SOURCES", set())
-    monkeypatch.setattr(runtime, "_observe_config_sources", lambda sources: None)
+    monkeypatch.setattr(runtime, "_observe_config_sources", lambda: None)
     monkeypatch.setattr(builtin, "password_file_source", lambda: SimpleNamespace(snapshot=None))
     stdout, stderr = StringIO(), StringIO()
     ctx = CliContext(

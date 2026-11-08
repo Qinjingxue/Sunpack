@@ -6,7 +6,8 @@ import pytest
 
 from sunpack.core.analysis.embedded.result import EmbeddedCandidate, EmbeddedScanResult
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.core.contracts.discovery import DiscoveryCandidate
+from sunpack.core.contracts.discovery import DiscoveryCandidate, StageResult
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from tests.helpers.config_factory import make_config
@@ -95,10 +96,17 @@ def _candidate(path):
     )
 
 
+def _project_scan(candidate, scan):
+    result = StageResult()
+    EmbeddedDiscovery({})._discover_into(result, candidate, scan.to_dict())
+    result.validate()
+    return result
+
+
 def test_embedded_layer_finds_disguised_stream_after_junk(tmp_path):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"leading junk" + gzip.compress(b"payload") + b"trailing junk")
-    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+    result = ArchiveTaskProvider(make_config()).discover_targets([str(path)])
 
     assert len(result.tasks) == 1
     assert result.tasks[0].discovery_source == "embedded"
@@ -108,46 +116,13 @@ def test_embedded_layer_finds_disguised_stream_after_junk(tmp_path):
 def test_embedded_layer_rejects_plain_data(tmp_path):
     path = tmp_path / "plain.bin"
     path.write_bytes(b"not an archive")
-    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+    result = ArchiveTaskProvider(make_config()).discover_targets([str(path)])
 
     assert result.tasks == []
     assert result.traces == []
 
 
-def test_recursive_gate_may_exclude_small_residual_candidate(tmp_path):
-    large = tmp_path / "large.bin"
-    small = tmp_path / "small.bin"
-    large.write_bytes(b"x" * 1000)
-    small.write_bytes(gzip.compress(b"small archive"))
-
-    result = EmbeddedDiscovery({
-        "embedded_scan": {"recursive_candidate_ratio": 0.3},
-    }).discover([_candidate(large), _candidate(small)], is_recursive_scan=True)
-
-    assert result.tasks == []
-    assert result.traces == []
-
-
-def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, monkeypatch):
-    from tests.helpers.fs_builder import make_minimal_pe
-
-    path = tmp_path / "application.jpg"
-    path.write_bytes(make_minimal_pe())
-
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("confirmed PE gate must reject before full scan")
-        ),
-    )
-
-    result = EmbeddedDiscovery({}).discover([_candidate(path)])
-
-    assert result.tasks == []
-    assert result.traces == []
-
-
-def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_path, monkeypatch):
+def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_path):
     path = tmp_path / "growing.gz"
     path.write_bytes(b"x" * 48)
     candidate = _candidate(path)
@@ -158,32 +133,23 @@ def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_p
         route=candidate.route,
         size=32,
     )
-    observed = {}
-
-    def fake_scan(scan_path):
-        observed["path"] = scan_path
-        return EmbeddedScanResult(
-            complete=True,
-            candidates=(),
-            hits=(),
-            read_bytes=48,
-            file_size=48,
-            logical_resolution_complete=True,
-            raw_hit_count=0,
-            budget_exhausted=False,
-        )
-
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        fake_scan,
+    scan = EmbeddedScanResult(
+        complete=True,
+        candidates=(EmbeddedCandidate(
+            format="gzip", offset=0, end_offset=40,
+            validation="gzip_stream", candidate_kind="logical_archive",
+            boundary_kind="exact", extractable=True,
+        ),),
+        hits=(), read_bytes=48, file_size=48, logical_resolution_complete=True,
+        raw_hit_count=1, budget_exhausted=False,
     )
 
-    EmbeddedDiscovery({}).discover([candidate])
+    [task] = _project_scan(candidate, scan).tasks
+    assert task.archive_input().open_mode == "file_range"
+    assert task.archive_input().primary_extent.end == 40
 
-    assert observed["path"] == str(path)
 
-
-def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypatch):
+def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"x" * 128)
     scan = EmbeddedScanResult(
@@ -206,12 +172,7 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypat
         raw_hit_count=1,
         budget_exhausted=False,
     )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        lambda *_args, **_kwargs: scan,
-    )
-
-    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+    result = _project_scan(_candidate(path), scan)
 
     assert len(result.tasks) == 1
     assert result.tasks[0].discovery_failure.kind.value == "damaged"
@@ -229,7 +190,7 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypat
     assert finding.extractable is False
 
 
-def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, monkeypatch):
+def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path):
     path = tmp_path / "archive.7z.001"
     path.write_bytes(b"x" * 128)
     scan = EmbeddedScanResult(
@@ -252,10 +213,6 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, mon
         raw_hit_count=1,
         budget_exhausted=False,
     )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        lambda *_args, **_kwargs: scan,
-    )
     base = _candidate(path)
     split = DiscoveryCandidate(
         archive_input=base.archive_input,
@@ -267,7 +224,7 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, mon
         relation_anchor={"format": "7z", "multivolume": True},
     )
 
-    result = EmbeddedDiscovery({}).discover([split])
+    result = _project_scan(split, scan)
 
     assert result.tasks == []
     assert not result.blocked_paths
@@ -317,10 +274,6 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
         budget_exhausted=False,
     )
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        lambda *_args, **_kwargs: scan,
-    )
-    monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
         lambda _path, _offsets, _passwords: {
             "status": status,
@@ -329,7 +282,7 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
         },
     )
 
-    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+    result = _project_scan(_candidate(path), scan)
 
     assert len(result.tasks) == 1
     assert result.tasks[0].discovery_failure is None

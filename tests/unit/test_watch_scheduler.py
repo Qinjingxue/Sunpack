@@ -685,8 +685,7 @@ def _indexed_scheduler_for_test():
     watcher._source_probes = {}
     watcher._wake_callback = None
     watcher.should_ignore_event_path = lambda path: False
-    watcher._password_reload_pending = False
-    watcher._password_update_pending = False
+    watcher._password_update_reload = None
     watcher._password_retry_at = None
     watcher._cache_cleanup_deadline = None
     watcher.log = SimpleNamespace(next_history_expiry=None, clear_expired_history=lambda: None)

@@ -1110,17 +1110,15 @@ def test_persistent_config_snapshot_reuses_a_source_without_mtime_checks(tmp_pat
     }
 
     monkeypatch.setattr(persistent_runtime, "config_source_key", lambda cwd=None: sources[str(cwd)])
-    monkeypatch.setattr(
-        persistent_runtime,
-        "load_raw_config_payload",
-        lambda cwd=None: (tmp_path / f"{cwd}.json", {"cli": {"language": str(cwd)}}),
-    )
-
-    def load_config(cwd=None):
+    def load_payload(cwd=None, *, refresh):
+        assert refresh
         calls.append(str(cwd))
-        return {"cli": {"language": str(cwd)}, "output": {"root": str(cwd)}}
+        return tmp_path / f"{cwd}.json", {"cli": {"language": str(cwd)}}
 
-    monkeypatch.setattr(persistent_runtime, "load_config", load_config)
+    monkeypatch.setattr(persistent_runtime, "load_raw_config_payload", load_payload)
+    monkeypatch.setattr(persistent_runtime, "normalize_config_payload", lambda raw: {
+        **raw, "output": {"root": raw["cli"]["language"]},
+    })
 
     async def scenario():
         await persistent_runtime.close_persistent_runtime()
@@ -1192,6 +1190,45 @@ def test_external_config_sources_reload_between_requests_and_evict_watches(tmp_p
         finally:
             read_allowed.set()
             await runtime.close_persistent_runtime()
+    asyncio.run(scenario())
+
+
+def test_concurrent_cold_config_reads_keep_each_sources_watch(tmp_path, monkeypatch):
+    from sunpack.runtime.cli import persistent_runtime as runtime
+
+    first = tmp_path / "first" / "config.json"
+    second = tmp_path / "second" / "config.json"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    release = threading.Event()
+
+    async def scenario():
+        await runtime.close_persistent_runtime()
+        entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def read(path, *, refresh):
+            if path == first:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(5), "test did not release the first config reader"
+            return path, {}
+
+        monkeypatch.setattr(runtime, "config_source_key", lambda path: (str(path), None, None))
+        monkeypatch.setattr(runtime, "load_raw_config_payload", read)
+        monkeypatch.setattr(runtime, "normalize_config_payload", dict)
+        runtime.enable_persistent_runtime()
+        pending = asyncio.create_task(asyncio.to_thread(runtime.load_request_config, first))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            await asyncio.to_thread(runtime.load_request_config, second)
+            assert {first.parent, second.parent} <= runtime._CONFIG_OBSERVER._watches.keys()
+        finally:
+            release.set()
+            try:
+                await pending
+            finally:
+                await runtime.close_persistent_runtime()
+
     asyncio.run(scenario())
 
 
@@ -1483,23 +1520,23 @@ def test_config_reload_retains_last_good_snapshot_and_merges_inflight_edits(tmp_
         monkeypatch.setattr(runtime, "_CONFIG_DIRTY_SOURCES", set())
         monkeypatch.setattr(runtime, "_CONFIG_RELOAD_TASK", None)
         monkeypatch.setattr(runtime, "_CONFIG_RELOAD_PENDING", False)
-        monkeypatch.setattr(runtime, "_observe_config_sources", lambda sources: None)
+        monkeypatch.setattr(runtime, "_observe_config_sources", lambda: None)
         monkeypatch.setattr(runtime, "clear_config_cache", lambda: None)
         monkeypatch.setattr(runtime, "config_source_key", lambda cwd: (str(tmp_path / "config.json"), None, None))
-        monkeypatch.setattr(runtime, "load_raw_config_payload", lambda cwd: (tmp_path / "config.json", {}))
-        monkeypatch.setattr(runtime, "load_config", lambda cwd: {"version": 1})
+        monkeypatch.setattr(runtime, "load_raw_config_payload", lambda cwd, *, refresh: (tmp_path / "config.json", {"version": 1}))
+        monkeypatch.setattr(runtime, "normalize_config_payload", dict)
         first = runtime._snapshot_for(None)
         runtime._configuration_files_changed()
         await entered.wait()
         task = runtime._CONFIG_RELOAD_TASK
-        def invalid(cwd):
+        def invalid(cwd, *, refresh):
             raise ValueError("partial JSON")
-        monkeypatch.setattr(runtime, "load_config", invalid)
+        monkeypatch.setattr(runtime, "load_raw_config_payload", invalid)
         assert runtime._snapshot_for(None) is first
         for _ in range(256):
             runtime._configuration_files_changed()
         assert runtime._CONFIG_RELOAD_TASK is task
-        monkeypatch.setattr(runtime, "load_config", lambda cwd: {"version": 2})
+        monkeypatch.setattr(runtime, "load_raw_config_payload", lambda cwd, *, refresh: (tmp_path / "config.json", {"version": 2}))
         assert runtime._snapshot_for(None).normalized_config == {"version": 2}
         assert first.normalized_config == {"version": 1}
         release.set()
@@ -1520,7 +1557,6 @@ def test_config_snapshot_claim_preserves_events_during_worker_reads(tmp_path, mo
     async def scenario():
         entered, release = asyncio.Event(), threading.Event()
         loop = asyncio.get_running_loop()
-        local = threading.local()
         key = (str(tmp_path / "config.json"), None, None)
         version = 1
         block_next = False
@@ -1533,10 +1569,10 @@ def test_config_snapshot_claim_preserves_events_during_worker_reads(tmp_path, mo
         # above and must not add another independent reload while IO is held.
         monkeypatch.setattr(runtime, "_CONFIG_RELOAD_TASK", object())
         monkeypatch.setattr(runtime, "_CONFIG_RELOAD_PENDING", False)
-        monkeypatch.setattr(runtime, "_observe_config_sources", lambda sources: None)
+        monkeypatch.setattr(runtime, "_observe_config_sources", lambda: None)
         monkeypatch.setattr(runtime, "clear_config_cache", lambda: None)
         monkeypatch.setattr(runtime, "config_source_key", lambda cwd: key)
-        def read(cwd):
+        def read(cwd, *, refresh):
             nonlocal block_next
             value = version
             if block_next:
@@ -1545,10 +1581,9 @@ def test_config_snapshot_claim_preserves_events_during_worker_reads(tmp_path, mo
                 assert release.wait(5), "test did not release the configuration reader"
             if value is None:
                 raise ValueError("partial JSON")
-            local.version = value
             return tmp_path / "config.json", {"version": value}
         monkeypatch.setattr(runtime, "load_raw_config_payload", read)
-        monkeypatch.setattr(runtime, "load_config", lambda cwd: {"version": local.version})
+        monkeypatch.setattr(runtime, "normalize_config_payload", dict)
         if read_state != "cold":
             assert runtime._snapshot_for(None).normalized_config == {"version": 1}
             runtime._configuration_files_changed()

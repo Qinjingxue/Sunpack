@@ -240,18 +240,15 @@ pub(crate) struct NativeDiscoveryRoutes {
     pub(crate) relation_events: Vec<(usize, u8)>,
     #[pyo3(get)]
     pub(crate) detection_events: Vec<(usize, u8)>,
-    #[pyo3(get)]
-    pub(crate) relation_resolved: Vec<usize>,
-    #[pyo3(get)]
-    pub(crate) relation_blocked: Vec<usize>,
-    #[pyo3(get)]
-    pub(crate) relation_residual: Vec<usize>,
-    #[pyo3(get)]
-    pub(crate) detection_resolved: Vec<usize>,
-    #[pyo3(get)]
-    pub(crate) detection_residual: Vec<usize>,
-    #[pyo3(get)]
-    pub(crate) embedded: Vec<usize>,
+    embedded: Vec<usize>,
+}
+
+impl NativeDiscoveryRoutes {
+    fn resolved_relations(&self) -> impl Iterator<Item = usize> + '_ {
+        self.relation_events
+            .iter()
+            .filter_map(|&(index, status)| (status == 1).then_some(index))
+    }
 }
 
 enum EmbeddedOutcome {
@@ -293,7 +290,6 @@ impl NativeEmbeddedBatch {
     ) -> PyResult<Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>> {
         let mut projected = Vec::new();
         for (index, outcome) in outcomes {
-            let key = path_key(&table.summary(index)?.0);
             let row: PyResult<_> = match outcome {
                 EmbeddedOutcome::Residual => {
                     unreachable!("residuals are filtered before projection")
@@ -304,6 +300,8 @@ impl NativeEmbeddedBatch {
                     Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
                 }
                 EmbeddedOutcome::Scan(scan) => {
+                    let path = table.rows[index].embedded_source().0;
+                    let key = path_key(path);
                     let mut anchors = scan.relation_anchors();
                     if self.claimed_ranges.contains_key(&key) {
                         // Only proven extents (or the identical known anchor)
@@ -322,7 +320,7 @@ impl NativeEmbeddedBatch {
                     if !anchors.is_empty() {
                         let independent = scan.has_independent_archive();
                         for mut anchor in anchors {
-                            anchor.path = table.summary(index)?.0;
+                            anchor.path = path.to_owned();
                             let retain_scan = anchor.needs_password || independent;
                             self.pending_volumes.push(PendingEmbeddedVolume {
                                 index,
@@ -448,7 +446,7 @@ impl NativeEmbeddedBatch {
         self.ids.len()
     }
 
-    /// Page only selected jobs across roots, never the original candidate rows.
+    /// Process selected jobs across roots and consume their cached scan evidence.
     /// Root-local policy, relation ownership and password evidence stay in each batch.
     #[staticmethod]
     #[pyo3(signature = (groups, offset=0, limit=256))]
@@ -473,6 +471,15 @@ impl NativeEmbeddedBatch {
             .map(|(table, batch)| (&**table, &**batch))
             .collect();
         let outcomes = scan_embedded_jobs(py, &borrowed, &jobs)?;
+        for (group, index) in jobs {
+            let (_, batch) = &mut groups[group];
+            if !batch.scans.is_empty()
+                && batch.scans.remove(&index).is_some()
+                && batch.scans.is_empty()
+            {
+                batch.scans = HashMap::new();
+            }
+        }
         let mut by_group: BTreeMap<usize, Vec<_>> = BTreeMap::new();
         for (group, index, outcome) in outcomes {
             by_group.entry(group).or_default().push((index, outcome));
@@ -1110,6 +1117,8 @@ impl NativeCandidateTable {
         let mut claimed: HashSet<String> = HashSet::new();
         let mut speculative = HashSet::new();
         let mut blocked: HashSet<String> = HashSet::new();
+        let mut relation_residual = Vec::new();
+        let mut detection_residual = Vec::new();
         for (index, row) in self.rows.iter().enumerate() {
             let Candidate::Relation(group) = row else {
                 continue;
@@ -1125,7 +1134,6 @@ impl NativeCandidateTable {
                     data.carrier_path,
                     data.entry_path,
                 ));
-                routes.relation_blocked.push(index);
                 routes.relation_events.push((index, 2));
             } else if data.relation_confirmed && matches!(data.format_hint, "rar" | "7z" | "zip") {
                 claimed.extend(
@@ -1139,10 +1147,9 @@ impl NativeCandidateTable {
                         .filter(|path| *path != data.entry_path)
                         .map(path_key),
                 );
-                routes.relation_resolved.push(index);
                 routes.relation_events.push((index, 1));
             } else {
-                routes.relation_residual.push(index);
+                relation_residual.push(index);
             }
         }
         let detection_indices = self
@@ -1221,10 +1228,9 @@ impl NativeCandidateTable {
                     }
                     if accepted {
                         claimed.insert(key);
-                        routes.detection_resolved.push(index);
                         routes.detection_events.push((index, 1));
                     } else {
-                        routes.detection_residual.push(index);
+                        detection_residual.push(index);
                     }
                 }
             }
@@ -1244,7 +1250,7 @@ impl NativeCandidateTable {
                 }
             }
         }
-        for &index in &routes.relation_residual {
+        for index in relation_residual {
             if let Candidate::Relation(group) = &self.rows[index] {
                 let data = group.candidate_data();
                 let keys = relation_path_keys(
@@ -1261,10 +1267,10 @@ impl NativeCandidateTable {
                 }
             }
         }
-        for &index in &routes.detection_residual {
+        for index in detection_residual {
             if let Candidate::File(table, file_index) = &self.rows[index] {
                 let key = path_key(&table.paths[*file_index]);
-                if !claimed.contains(&key) && !blocked.contains(&key) {
+                if !speculative.contains(&key) && !claimed.contains(&key) && !blocked.contains(&key) {
                     routes.embedded.push(index);
                 }
             }
@@ -1276,7 +1282,7 @@ impl NativeCandidateTable {
     #[pyo3(signature = (routes, recursive=false, force_scan=false, enabled=true, recursive_ratio=0.3))]
     fn prepare_embedded(
         &mut self,
-        routes: PyRef<'_, NativeDiscoveryRoutes>,
+        mut routes: PyRefMut<'_, NativeDiscoveryRoutes>,
         recursive: bool,
         force_scan: bool,
         enabled: bool,
@@ -1332,12 +1338,13 @@ impl NativeCandidateTable {
             // This root has no remaining I/O or cached errors. Its primary
             // decisions are already owned by Python; no recovery can use it.
             *self = Self::default();
+            routes.scans = HashMap::new();
             return NativeEmbeddedBatch::default();
         }
-        let mut excluded: HashSet<_> = routes.relation_resolved.iter().filter(|&&index| {
+        let mut excluded: HashSet<_> = routes.resolved_relations().filter(|&index| {
             !matches!(&self.rows[index], Candidate::Relation(group) if group.is_incomplete())
-        }).chain(&routes.detection_resolved)
-            .flat_map(|&index| self.path_keys(index).unwrap_or_default()).collect();
+        }).chain(routes.detection_events.iter().map(|&(index, _)| index))
+            .flat_map(|index| self.path_keys(index).unwrap_or_default()).collect();
         // Keep only the evidence used by volume recovery, not resolved groups
         // and their execution metadata from every root. Raw snapshots still
         // supply all eligible peers; primary decisions have been projected.
@@ -1347,7 +1354,7 @@ impl NativeCandidateTable {
             .iter()
             .map(|&index| path_key(self.rows[index].embedded_source().0))
             .collect();
-        for &index in &routes.relation_resolved {
+        for index in routes.resolved_relations() {
             if let Candidate::Relation(group) = &self.rows[index] {
                 group.collect_source_ranges(&scanned_paths, &mut claimed_ranges);
                 // Candidate membership is a lease, not exclusive ownership.
@@ -1360,13 +1367,14 @@ impl NativeCandidateTable {
                 }
             }
         }
+        let mut prepass = std::mem::take(&mut routes.scans);
         let mut scans = HashMap::new();
         if ids.len() == self.rows.len() {
             // A full deep scan already uses every row; do not duplicate its
             // candidate storage merely to reproduce the same indices.
             scans
                 .extend(ids.iter().filter_map(|index| {
-                    routes.scans.get(index).map(|scan| (*index, scan.clone()))
+                    prepass.remove(index).map(|scan| (*index, scan))
                 }));
         } else {
             let positions: HashMap<_, _> = ids
@@ -1379,8 +1387,8 @@ impl NativeCandidateTable {
                 if let Some(&position) = positions.get(&index) {
                     let remapped = rows.len();
                     ids[position] = remapped;
-                    if let Some(scan) = routes.scans.get(&index) {
-                        scans.insert(remapped, scan.clone());
+                    if let Some(scan) = prepass.remove(&index) {
+                        scans.insert(remapped, scan);
                     }
                     rows.push(row);
                 }

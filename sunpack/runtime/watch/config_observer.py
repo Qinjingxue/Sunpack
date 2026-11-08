@@ -47,10 +47,7 @@ class ConfigFileObserver:
         loop: asyncio.AbstractEventLoop,
         additional_files=(),
     ) -> None:
-        self.directory = Path(directory).resolve()
-        self.filenames = {str(name).casefold() for name in filenames}
-        self.callback = callback
-        self._base_files = [(self.directory, self.filenames, callback), *additional_files]
+        self._base_files = [(directory, tuple(filenames), callback), *additional_files]
         self._files = {}
         self._directories = {}
         self._pending_callbacks = set()
@@ -78,17 +75,17 @@ class ConfigFileObserver:
             if self._stopped:
                 return
             started = self._started
-            previous = self._directories
             # Dispatch may start inside schedule(); publish filters first.
             self._files = selected
             self._directories = directories
         # Watchdog dispatch holds its own lock before calling our handler.
         # Never take that lock while holding the callback lock.
         if started:
-            for directory in directories.keys() - previous.keys():
+            for directory in directories.keys() - self._watches.keys():
                 self._watches[directory] = self._observer.schedule(self._handler, str(directory), recursive=False)
-            for directory in previous.keys() - directories.keys():
-                self._observer.unschedule(self._watches.pop(directory))
+            for directory in self._watches.keys() - directories.keys():
+                self._observer.unschedule(self._watches[directory])
+                del self._watches[directory]
 
     def start(self) -> None:
         with self._lock:
@@ -116,7 +113,6 @@ class ConfigFileObserver:
             scheduled = self._scheduled_emit
             self._scheduled_emit = None
             self._pending_callbacks.clear()
-            self.callback = None
             self._base_files.clear()
             self._files.clear()
             self._directories.clear()

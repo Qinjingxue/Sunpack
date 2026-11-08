@@ -221,21 +221,19 @@ def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, ph
             path.write_bytes(b"a different physical generation")
         # Detection failures must survive even an explicitly disabled fallback.
         batch = table.prepare_embedded(routes, enabled=phase == "embedded")
-        rows = [row for _, page in type(batch).scan_pages([(table, batch)], 0, 1) for row in page]
         provider = ArchiveTaskProvider(make_config({}))
         session = DiscoveryScanSession(config=provider.config)
         result = provider.discovery.embedded.discover_many_native([(table, batch)], session)[0]
         provider._record_discovery_failures(result)
         if source_state == "departed":
-            assert rows == []
-            assert not result.tasks and not result.blocked_paths and not provider.failed_candidate_failures
+            assert not result.tasks and not result.traces and not provider.failed_candidate_failures
         else:
-            row, = rows
-            assert row[1:3] == (2, "embedded_scan_io_error") and row[3]["error"]
+            trace, = result.traces
+            assert trace.reason == "embedded_scan_io_error" and trace.error
             failure, = provider.failed_candidate_failures
             assert result.blocked_paths
             assert failure.kind == FailureKind.FILESYSTEM_ERROR
-            assert failure.details["path"] == str(path) and failure.message == row[3]["error"]
+            assert failure.details["path"] == str(path) and failure.message == trace.error
     finally:
         if handle is not None:
             assert kernel.CloseHandle(handle)
@@ -285,8 +283,8 @@ def test_native_detection_batches_keep_order_during_concurrent_resolves(tmp_path
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda _index: table.resolve(), range(4)))
 
-    expected = results[0].detection_resolved
+    expected = results[0].detection_events
     assert len(expected) == 550
     assert expected == sorted(expected)
-    assert all(result.detection_resolved == expected for result in results)
+    assert all(result.detection_events == expected for result in results)
     assert reader_cache_stats()["cache_entries"] == cache_entries_before
