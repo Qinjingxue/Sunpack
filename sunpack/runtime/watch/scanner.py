@@ -33,15 +33,12 @@ def scan_watch_candidates(roots: list[str], *, recursive: bool = True) -> tuple[
     return [_candidate_from_native(item) for item in candidates], errors
 
 
-def _candidate_for(path: str, *, since_usn: int = 0) -> WatchCandidate | None:
-    item = _native_watch_candidate_for_path(str(path), int(since_usn) or None)
-    return _candidate_from_native(item) if item is not None else None
-
-
 def watch_candidate_for_path(path: str, *, since_usn: int = 0) -> WatchCandidate | None:
     """Return the native identity and change journal observation for a path."""
-
-    return _candidate_for(path, since_usn=since_usn)
+    if not path:
+        return None
+    item = _native_watch_candidate_for_path(str(path), int(since_usn) or None)
+    return _candidate_from_native(item) if item is not None else None
 
 
 def _candidate_from_native(item: dict) -> WatchCandidate:

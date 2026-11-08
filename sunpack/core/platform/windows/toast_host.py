@@ -222,12 +222,14 @@ class ToastManager:
         # watch reload can register a new activator. Never abandon that thread.
         thread.join()
         with self._condition:
-            self._thread = None
-            self._snapshot = None
+            if self._thread is thread:
+                self._thread = None
+                self._snapshot = None
+                self._revision = 0
 
     def _run(self) -> None:
         presenter = None
-        sent_revision = -1
+        consumed_revision = 0
         next_progress_send = 0.0
         sequence = 0
         active_progress = False
@@ -236,11 +238,11 @@ class ToastManager:
                 with self._condition:
                     if self._stopping:
                         break
-                    snapshot, revision = self._snapshot, self._revision
+                    revision = self._revision
                     now = time.monotonic()
-                    changed = revision != sent_revision
+                    changed = revision != consumed_revision
                     due = changed and (
-                        snapshot is None or snapshot.kind != ToastSnapshotKind.PROGRESS
+                        self._snapshot is None or self._snapshot.kind != ToastSnapshotKind.PROGRESS
                         or now >= next_progress_send
                     )
                     if not due:
@@ -249,7 +251,26 @@ class ToastManager:
                             lambda: self._stopping or self._revision != revision, timeout=timeout,
                         )
                         continue
+                    # Once accepted, only the in-flight send needs this snapshot.
+                    # A newer publish can independently fill the pending slot.
+                    consumed_revision = revision
+                    snapshot = self._snapshot
+                    self._snapshot = None
                 try:
+                    if snapshot is None:
+                        if presenter is not None:
+                            presenter.clear()
+                            next_progress_send = time.monotonic() + self._update_interval
+                        active_progress = False
+                        continue
+                    try:
+                        payload = encode_snapshot(snapshot)
+                    except ValueError as exc:
+                        self._log("toast_snapshot_rejected", error=str(exc))
+                        with self._condition:
+                            if revision == self._revision:
+                                self._revision += 1  # Clear existing progress only if still current.
+                        continue
                     if presenter is None:
                         try:
                             presenter = self._presenter_factory(
@@ -263,33 +284,19 @@ class ToastManager:
                             self._log("toast_unavailable", error=str(exc))
                             return
                         self._log("toast_started", pid=os.getpid())
-                    if due:
-                        if snapshot is None:
-                            presenter.clear()
-                            active_progress = False
-                        else:
-                            try:
-                                payload = encode_snapshot(snapshot)
-                            except ValueError as exc:
-                                self._log("toast_snapshot_rejected", error=str(exc))
-                                with self._condition:
-                                    if revision == self._revision:
-                                        self._snapshot = None
-                                        self._revision += 1
-                                continue
-                            sequence += 1
-                            presenter.show(payload, sequence)
-                            active_progress = snapshot.kind == ToastSnapshotKind.PROGRESS
-                        sent_revision = revision
-                        if snapshot is None or snapshot.kind == ToastSnapshotKind.PROGRESS:
-                            next_progress_send = time.monotonic() + self._update_interval
+                    sequence += 1
+                    presenter.show(payload, sequence)
+                    active_progress = snapshot.kind == ToastSnapshotKind.PROGRESS
+                    if active_progress:
+                        next_progress_send = time.monotonic() + self._update_interval
                 except Exception as exc:
                     self._log("toast_error", error=str(exc))
-                    sent_revision = revision
                     active_progress = False
                     if presenter is not None:
                         self._close_presenter(presenter)
                         presenter = None
+                finally:
+                    snapshot = payload = None
         finally:
             if presenter is not None:
                 if active_progress:

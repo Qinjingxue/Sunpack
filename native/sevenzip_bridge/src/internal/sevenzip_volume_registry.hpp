@@ -82,24 +82,11 @@ namespace sunpack::sevenzip
 
         Lease acquire(const std::string &key);
 
-        bool empty() const noexcept;
-
-        std::vector<std::string> volume_keys() const;
-
-        struct Aggregate
-        {
-            WriterMeterSnapshot meters;
-            std::size_t live_facilities = 0;
-            bool any_active_jobs = false;
-        };
-
-        Aggregate snapshot() const;
+        std::size_t volume_count() const noexcept;
 
         std::vector<std::string> reap_idle();
 
         std::optional<std::chrono::steady_clock::time_point> next_reap_deadline() const;
-
-        std::size_t reclaimed_count() const noexcept;
 
         // 默认只返回仍有 affected job 的 Blocked / Probing 卷，供空间监控采样。
         // 关停路径可传 false，以便唤醒没有 job id 的 gate waiter。
@@ -130,7 +117,6 @@ namespace sunpack::sevenzip
         const VolumeSpaceChangeSink sink_;
         mutable std::mutex mutex_;
         std::unordered_map<std::string, Entry> entries_;
-        std::size_t reclaimed_count_ = 0;
     };
 
     using VolumeWriterRegistryPtr = std::shared_ptr<VolumeWriterRegistry>;

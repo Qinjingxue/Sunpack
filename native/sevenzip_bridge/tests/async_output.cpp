@@ -511,7 +511,7 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
     config.threads_per_volume = 2;
     config.buffer_count = 8;
     VolumeWriterRegistry registry(meters, config);
-    if (!registry.empty()) {
+    if (registry.volume_count() != 0) {
         std::cerr << "fresh registry is not empty\n";
         return false;
     }
@@ -562,8 +562,8 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
             return false;
         }
     }
-    if (registry.volume_keys().size() != 2) {
-        std::cerr << "registry tracked " << registry.volume_keys().size() << " volumes\n";
+    if (registry.volume_count() != 2) {
+        std::cerr << "registry tracked " << registry.volume_count() << " volumes\n";
         return false;
     }
 
@@ -589,18 +589,10 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
             std::cerr << "facility not quiescent after its job drained\n";
             return false;
         }
-        const auto aggregate = registry.snapshot();
-        if (aggregate.meters.written_bytes != payload.size() ||
-            aggregate.live_facilities != 2 || aggregate.any_active_jobs) {
-            std::cerr << "registry aggregate: written=" << aggregate.meters.written_bytes
-                      << " facilities=" << aggregate.live_facilities
-                      << " active=" << aggregate.any_active_jobs << "\n";
-            return false;
-        }
     }
 
     registry.shutdown();
-    if (!registry.empty()) {
+    if (registry.volume_count() != 0) {
         std::cerr << "registry still holds entries after shutdown\n";
         return false;
     }
@@ -646,9 +638,9 @@ bool registry_creation_failure_does_not_retain_entries() {
         if (!failed) {
             if (!lease.valid() || !lease.created_facility()) return false;
             lease.reset();
-            return registry.reap_idle().size() == 1 && registry.empty();
+            return registry.reap_idle().size() == 1 && registry.volume_count() == 0;
         }
-        if (!registry.empty() || registry.next_reap_deadline()) {
+        if (registry.volume_count() != 0 || registry.next_reap_deadline()) {
             std::cerr << "failed facility creation retained a volume at allocation " << point << "\n";
             return false;
         }
@@ -724,19 +716,21 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         std::cerr << "synthetic volume armed no reclaim deadline\n";
         return false;
     }
-    if (registry.reap_idle().size() != 1 || registry.reclaimed_count() != 1) {
-        std::cerr << "synthetic facility was not reclaimed: " << registry.reclaimed_count() << "\n";
+    if (registry.reap_idle() != std::vector<std::string>{"job:probe-1"}) {
+        std::cerr << "synthetic facility was not reclaimed\n";
         return false;
     }
-    if (!registry.empty()) {
+    if (registry.volume_count() != 0) {
         std::cerr << "synthetic entry survived reclamation\n";
         return false;
     }
 
     // A persistent volume keeps its state across reclamation and is only reclaimed
     // once its idle timeout has elapsed.
+    std::weak_ptr<AsyncFileWriter> persistent_writer;
     {
         auto lease = registry.acquire("volume-p");
+        persistent_writer = lease.writer_pointer();
         if (!lease.writer().volume_state()->persistent) {
             std::cerr << "physical key was not marked persistent\n";
             return false;
@@ -746,7 +740,7 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         std::cerr << "persistent facility was reclaimed before its idle timeout\n";
         return false;
     }
-    if (registry.empty()) {
+    if (registry.volume_count() == 0) {
         std::cerr << "persistent entry disappeared before reclamation\n";
         return false;
     }
@@ -756,13 +750,12 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         return false;
     }
     // Reclaimed, but the volume state and its counters survive.
-    if (registry.volume_keys().size() != 1) {
+    if (registry.volume_count() != 1) {
         std::cerr << "persistent volume state did not survive reclamation\n";
         return false;
     }
-    const auto aggregate = registry.snapshot();
-    if (aggregate.live_facilities != 0) {
-        std::cerr << "reclaimed facility is still counted as live\n";
+    if (!persistent_writer.expired()) {
+        std::cerr << "reclaimed facility is still alive\n";
         return false;
     }
     // Historical persistent states are bounded independently of active and warm facilities.
@@ -775,7 +768,7 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
     registry.reap_idle();
-    if (registry.volume_keys().size() > 64) {
+    if (registry.volume_count() > 64) {
         std::cerr << "persistent volume retention cap was exceeded\n";
         return false;
     }

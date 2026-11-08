@@ -51,6 +51,7 @@ def test_pipeline_pins_snapshot_without_reading_password_files_or_copying_tables
     snapshot = read_builtin_password_file(path)
     config = make_config({"post_extract": {"archive_cleanup_mode": "k"}})
     config["password_snapshot"] = snapshot
+    config["user_passwords"] = ["first-request-only"]
     def forbidden(*args, **kwargs):
         raise AssertionError("password IO in request")
     monkeypatch.setattr(builtin, "read_shared_utf8_text", forbidden)
@@ -60,8 +61,10 @@ def test_pipeline_pins_snapshot_without_reading_password_files_or_copying_tables
             factory = engine._request_runtime_factory
             entered, release = asyncio.Event(), asyncio.Event()
             snapshots = []
+            user_passwords = []
             def capture(services, submission, *args):
                 snapshots.append(submission.password_store.snapshot)
+                user_passwords.append(submission.password_store.user_passwords)
                 assert "password_snapshot" not in submission.config
                 runtime = factory(services, submission, *args)
                 execute = runtime.execute_async
@@ -77,11 +80,14 @@ def test_pipeline_pins_snapshot_without_reading_password_files_or_copying_tables
             first = asyncio.create_task(engine.run([str(source / "first.zip")]))
             await entered.wait()
             latest = PasswordSnapshot(("new-secret",))
-            engine.reconfigure_request({**engine.config, "password_snapshot": latest})
+            replacement = {**engine.config, "password_snapshot": latest}
+            replacement.pop("user_passwords")
+            engine.reconfigure_request(replacement)
             second = asyncio.create_task(engine.run([str(source / "second.zip")]))
             release.set()
             responses = await asyncio.gather(first, second)
             assert snapshots == [snapshot, latest]
+            assert user_passwords == [["first-request-only"], []]
             assert all(response.summary.success_count == 1 for response in responses)
     asyncio.run(run())
     assert (source / "sunpack-passwords.txt").read_text(encoding="utf-8") == "ignored"

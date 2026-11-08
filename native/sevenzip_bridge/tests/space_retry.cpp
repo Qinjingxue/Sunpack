@@ -599,7 +599,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
     std::this_thread::sleep_for(80ms);
     const auto reclaimed = registry->reap_idle();
     check(reclaimed.size() == 1, "R-16: 空闲 facility 必须被回收");
-    check(registry->volume_keys().size() == 1, "R-16: persistent 卷状态必须存活");
+    check(registry->volume_count() == 1, "R-16: persistent 卷状态必须存活");
 
     // 重建 writer 后必须仍能正常等待与恢复。
     {

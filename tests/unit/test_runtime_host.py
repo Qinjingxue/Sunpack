@@ -317,7 +317,7 @@ def test_watch_start_disconnect_releases_request_and_keeps_host_ownership(tmp_pa
             result = await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 1)
             assert isinstance(result[0], asyncio.CancelledError)
             assert host._foreground_requests == 0
-            assert not host._foreground_gate_requested
+            assert host._foreground_requests == 0
             assert host.watch_enabled and not watch_task.done()
 
             release.set()
@@ -376,11 +376,10 @@ def test_archive_registry_tracks_directory_and_missing_input_ownership(tmp_path)
     sibling = tmp_path / "input-other" / "archive.jpg"
     registry = ActiveArchiveRegistry()
     assert registry.reserve("watch", "watch", [str(root)]) is None
-    assert registry.reserve("cli", "foreground", [str(nested)]) is not None
-    assert registry.watch_conflict([str(nested)]) is not None
+    conflict = registry.reserve("cli", "foreground", [str(nested)])
+    assert conflict is not None and conflict.origin == "watch"
     assert registry.reserve("sibling", "foreground", [str(sibling)]) is None
     registry.release("watch")
-    assert registry.watch_conflict([str(nested)]) is None
     assert registry.reserve("cli", "foreground", [str(nested)]) is None
     assert registry.reserve("same", "watch", [str(nested).upper()]) is not None
     registry.release("cli")
@@ -703,7 +702,7 @@ def test_runtime_host_does_not_bypass_a_waiting_first_foreground():
         second = asyncio.create_task(host.foreground_started())
         await asyncio.sleep(0)
         assert not second.done()
-        assert host._foreground_requests == 0
+        assert host._foreground_requests == 1
 
         scheduler.release.set()
         await asyncio.gather(first, second)

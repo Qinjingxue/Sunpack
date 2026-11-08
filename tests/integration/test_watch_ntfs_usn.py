@@ -10,7 +10,7 @@ import pytest
 import sunpack_native
 
 from sunpack.runtime.watch.scheduler import WatchScheduler
-from sunpack.runtime.watch.scanner import _candidate_for
+from sunpack.runtime.watch.scanner import watch_candidate_for_path
 from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
@@ -50,7 +50,7 @@ def test_watch_root_is_ntfs_and_has_file_usn(tmp_path):
 
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"PK\x03\x04payload")
-    candidate = _candidate_for(str(archive))
+    candidate = watch_candidate_for_path(str(archive))
 
     assert candidate is not None
     assert candidate.file_id
@@ -61,7 +61,7 @@ def test_same_size_same_mtime_in_place_overwrite_changes_usn(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"A" * 1024 * 1024)
     original_mtime_ns = archive.stat().st_mtime_ns
-    before = _candidate_for(str(archive))
+    before = watch_candidate_for_path(str(archive))
 
     with archive.open("r+b") as stream:
         stream.seek(128 * 1024)
@@ -69,7 +69,7 @@ def test_same_size_same_mtime_in_place_overwrite_changes_usn(tmp_path):
         stream.flush()
         os.fsync(stream.fileno())
     os.utime(archive, ns=(original_mtime_ns, original_mtime_ns))
-    after = _candidate_for(str(archive), since_usn=before.change_usn)
+    after = watch_candidate_for_path(str(archive), since_usn=before.change_usn)
 
     assert after.size == before.size
     assert after.mtime == before.mtime

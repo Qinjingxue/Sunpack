@@ -626,58 +626,40 @@ impl Projection {
                     | "partial_rejected"
             )
         {
-            if matches!(
+            let terminal = matches!(
                 event.as_str(),
                 "done" | "failed_terminal" | "partial_rejected"
-            ) && self
-                .owner_tasks
-                .get(field(value, "owner"))
-                .is_some_and(|ids| {
-                    ids.iter().any(|id| {
+            );
+            let owner = field(value, "owner");
+            if terminal
+                && (self.owner_tasks.get(owner).is_some_and(|ids| {
+                    ids.iter().any(|previous| {
                         self.retiring
-                            .get(id)
+                            .get(previous)
                             .is_some_and(|task| task.members.contains(&physical))
                     })
-                })
-            {
-                return None;
-            }
-            if matches!(
-                event.as_str(),
-                "done" | "failed_terminal" | "partial_rejected"
-            ) && self
-                .retiring
-                .get(&id)
-                .is_some_and(|task| task.owners.contains(field(value, "owner")))
+                }) || self
+                    .retiring
+                    .get(&id)
+                    .is_some_and(|task| task.owners.contains(owner)))
             {
                 // A transferred request can finish after the real owner. Keep
                 // only routing metadata until those in-flight owners release.
                 return None;
             }
-            if field(value, "task_id").is_empty()
-                && matches!(
-                    event.as_str(),
-                    "processing_started"
-                        | "failed_password"
-                        | "suspended_missing_volume"
-                        | "done"
-                        | "failed_terminal"
-                        | "partial_rejected"
-                )
-                && !self.tasks.contains_key(&id)
-            {
-                id = self.instance_id(field(value, "owner"), &physical);
+            if field(value, "task_id").is_empty() && !self.tasks.contains_key(&id) {
+                id = self.instance_id(owner, &physical);
             }
             // A transferred family may still receive an older request's
             // completion. It cannot overwrite the current owner's result.
             if event != "processing_started"
-                && !field(value, "owner").is_empty()
+                && !owner.is_empty()
                 && self
                     .tasks
                     .get(&id)
-                    .is_some_and(|t| !t.owner.is_empty() && t.owner != field(value, "owner"))
+                    .is_some_and(|t| !t.owner.is_empty() && t.owner != owner)
             {
-                value["task_id"] = json!(self.instance_id(field(value, "owner"), &physical));
+                value["task_id"] = json!(self.instance_id(owner, &physical));
                 value["event"] = json!("stale_task_completion");
                 return None;
             }
@@ -703,10 +685,7 @@ impl Projection {
                 task.owner = field(value, "owner").to_owned();
             }
             task.order = self.order;
-            if matches!(
-                event.as_str(),
-                "done" | "failed_terminal" | "partial_rejected"
-            ) {
+            if terminal {
                 if !task.owners.is_empty() {
                     let mut members = std::mem::take(&mut task.members);
                     if let Some(group) = &task.group {
@@ -790,6 +769,17 @@ pub(crate) struct Shared {
     stateful: bool,
 }
 impl Shared {
+    fn configure_retention(&self, retention_days: u32) {
+        let retention_days = retention_days.max(1);
+        let mut state = self.state.lock().unwrap();
+        if state.retention_days != retention_days {
+            state.retention_days = retention_days;
+            state.live_dirty = self.stateful;
+            state.revision += 1;
+            self.wake.notify();
+        }
+    }
+
     pub(crate) fn submit(&self, mut value: Value) {
         let mut state = self.state.lock().unwrap();
         if state.stopping {
@@ -839,7 +829,11 @@ impl Drop for Owner {
             let _ = thread.join();
         }
         let (owners, retired) = owners();
-        owners.lock().unwrap().remove(&self.key);
+        {
+            let mut owners = owners.lock().unwrap();
+            owners.remove(&self.key);
+            crate::collections::trim_map(&mut owners);
+        }
         retired.notify_all();
     }
 }
@@ -853,13 +847,12 @@ fn timestamp(value: &Value) -> i64 {
 fn writer(shared: Arc<Shared>, path: PathBuf) {
     let mut store = None;
     let mut deadline = None;
-    let mut completed = 0;
     loop {
         let now = utc_us();
         let (rows, live, days, dropped, revision, rebuild) = {
             let mut state = shared.state.lock().unwrap();
             let due = deadline.is_some_and(|time| time <= now);
-            if completed == state.revision && !due {
+            if state.published == state.revision && !due {
                 state.working = false;
                 shared.drained.notify_all();
                 if state.stopping {
@@ -968,7 +961,6 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             }
         }
         state.dropped = state.dropped.saturating_sub(dropped);
-        completed = revision;
         state.published = revision;
         shared.drained.notify_all();
     }
@@ -997,15 +989,7 @@ impl NativeEventLog {
         let id = key(&path.to_string_lossy());
         while let Some(owner) = owners.get(&id) {
             if let Some(owner) = owner.upgrade() {
-                {
-                    let mut state = owner.shared.state.lock().unwrap();
-                    if state.retention_days != retention_days.max(1) {
-                        state.retention_days = retention_days.max(1);
-                        state.live_dirty = stateful;
-                        state.revision += 1;
-                        owner.shared.wake.notify();
-                    }
-                }
+                owner.shared.configure_retention(retention_days);
                 return Ok(Self { owner: Some(owner) });
             }
             owners = retired.wait(owners).unwrap();
@@ -1043,14 +1027,7 @@ impl NativeEventLog {
         Ok(Self { owner: Some(owner) })
     }
     fn configure_retention(&self, retention_days: u32) -> PyResult<()> {
-        let shared = self.shared()?;
-        let mut state = shared.state.lock().unwrap();
-        if state.retention_days != retention_days.max(1) {
-            state.retention_days = retention_days.max(1);
-            state.live_dirty = shared.stateful;
-            state.revision += 1;
-            shared.wake.notify();
-        }
+        self.shared()?.configure_retention(retention_days);
         Ok(())
     }
     fn write(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {

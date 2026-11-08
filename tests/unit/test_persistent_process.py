@@ -1042,14 +1042,14 @@ def test_protocol_disconnect_releases_request_and_discards_late_output(monkeypat
             await asyncio.wait_for(protocol.flush_output(), 1)
             assert protocol.output_queue.empty()
             assert host._foreground_requests == 0
-            assert not host._foreground_gate_requested
+            assert host._foreground_requests == 0
             assert closed == [True]
             assert completed == ([True] if disconnect_phase == "finishing" else [])
             # The shared host must still admit and release the next request.
             await host.foreground_started()
             await host.foreground_finished()
             assert host._foreground_requests == 0
-            assert not host._foreground_gate_requested
+            assert host._foreground_requests == 0
         finally:
             if host._foreground_state_lock.locked():
                 host._foreground_state_lock.release()

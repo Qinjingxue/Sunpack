@@ -702,7 +702,7 @@ def _claim_scheduler_for_test():
     watcher._claim_gate = threading.RLock()
     watcher._active_claims = {}
     watcher._dirty_during_claim = {}
-    watcher.log = SimpleNamespace(write=lambda *args, **kwargs: None)
+    watcher.log = SimpleNamespace(write=lambda *args, **kwargs: None, next_history_expiry=None)
     return watcher
 
 
@@ -742,14 +742,14 @@ def test_source_claim_transfer_releases_only_current_owner_without_claim_scan():
     watcher._active_claims = _NoScanDict(watcher._active_claims)
     watcher._claim_pipeline_sources("b", (second,))
     watcher._claim_pipeline_sources("b", (second.upper(), second))
-    assert watcher._claims_by_owner == {"a": {first_key}, "b": {second_key}}
+    assert watcher._claims_by_owner == {"a": {first_key: ()}, "b": {second_key: ()}}
 
     watcher._release_pipeline_source_claims("a")
     watcher._release_pipeline_source_claims("a")
     watcher._release_pipeline_source_claims("unknown")
     assert replayed == [(first, {"event_type": "pipeline_claim_released"})]
     assert watcher._active_claims.get(second_key).owner == "b"
-    assert watcher._claims_by_owner == {"b": {second_key}}
+    assert watcher._claims_by_owner == {"b": {second_key: ()}}
     watcher._release_pipeline_source_claims("b")
     assert replayed == [(path, {"event_type": "pipeline_claim_released"}) for path in (first, second)]
     assert len(watcher._active_claims) == 0
@@ -771,33 +771,40 @@ def test_source_indexes_release_buckets_and_peak_tables_after_each_batch():
             watcher._claim_pipeline_sources(owner, paths[offset:offset + 4])
         assert all(reference() is None for reference in pending_refs)
         assert sys.getsizeof(watcher._pending_by_key) == empty_table_bytes
-        owner_refs = [weakref.ref(bucket) for bucket in watcher._claims_by_owner.values()]
         # Transfer dirty paths and release the old owners first: neither the
         # old owner bucket nor its deferred events may keep paths alive.
         with watcher._claim_gate:
-            for path in paths[:4]:
+            for path in paths:
                 assert watcher._defer_claimed_path_locked(path)
         watcher._claim_pipeline_sources("transferred", paths[:4])
-        transferred_ref = weakref.ref(watcher._claims_by_owner["transferred"])
         for owner in owners:
             watcher._release_pipeline_source_claims(owner)
-        assert all(reference() is None for reference in owner_refs)
+        assert watcher._claims_by_owner == {
+            "transferred": {scheduler_module.path_key(path): (path,) for path in paths[:4]},
+        }
         watcher._release_pipeline_source_claims("transferred")
-        assert transferred_ref() is None
         assert watcher._pending == watcher._pending_by_key == {}
         assert watcher._active_claims == watcher._claims_by_owner == watcher._dirty_during_claim == {}
-        assert sys.getsizeof(watcher._claims_by_owner) == empty_table_bytes
+        assert all(sys.getsizeof(index) == empty_table_bytes for index in (
+            watcher._active_claims, watcher._claims_by_owner, watcher._dirty_during_claim,
+        ))
 
 
-@pytest.mark.parametrize("completion", ["success", "error", "cancelled"])
+@pytest.mark.parametrize("completion", ["success", "error", "cancelled", "release_error"])
 def test_request_completion_always_releases_source_index(completion):
     watcher = _claim_scheduler_for_test()
     path = os.path.abspath("completion.disguised")
+    registry_releases = []
     request = SimpleNamespace(source_groups={"group": object()}, source_observations={}, top_level_keys=set(),
         notification_id="owner", candidate=WatchCandidate(path, 10, 1.0, "file", 1),
-        registry_owner="", interruption_cleanup_failed=False,
+        archive_registry=SimpleNamespace(release=registry_releases.append), interruption_cleanup_failed=False,
     )
-    watcher.enqueue = lambda *args, **kwargs: None
+
+    def enqueue(*args, **kwargs):
+        if completion == "release_error":
+            raise RuntimeError("dirty replay failed")
+
+    watcher.enqueue = enqueue
     watcher._notify = lambda *args, **kwargs: None
     watcher._arm_idle_cache_cleanup = lambda: None
     watcher.state = SimpleNamespace(complete_work_if_matches=lambda candidate: None)
@@ -811,15 +818,20 @@ def test_request_completion_always_releases_source_index(completion):
 
     watcher._complete_candidate = complete
     watcher._claim_pipeline_sources("owner", (path,))
-    owner_ref = weakref.ref(watcher._claims_by_owner["owner"])
+    if completion == "release_error":
+        with watcher._claim_gate:
+            assert watcher._defer_claimed_path_locked(path)
     if completion == "cancelled":
         with pytest.raises(asyncio.CancelledError):
+            _await(watcher._finish_active_request(request))
+    elif completion == "release_error":
+        with pytest.raises(RuntimeError, match="dirty replay failed"):
             _await(watcher._finish_active_request(request))
     else:
         result = _await(watcher._finish_active_request(request))
         assert result.failed == (completion == "error")
+    assert registry_releases == ["owner"]
     assert watcher._active_claims == watcher._claims_by_owner == watcher._dirty_during_claim == {}
-    assert owner_ref() is None
     assert request.source_groups == {}
     assert sys.getsizeof(watcher._claims_by_owner) == sys.getsizeof({})
 
@@ -959,7 +971,7 @@ def test_watch_ready_index_compacts_event_bursts_without_losing_live_candidates(
         recreated = watcher._new_active_state_locked(last_event_at=500.0, quiet_seconds=5.0)
         watcher._active_states[paths[2]] = recreated
         watcher._schedule_active_locked(paths[2], recreated)
-        watcher._inflight_path_counts[watcher._scheduler_path_key(paths[3])] = 1
+        watcher._inflight_path_counts[scheduler_module.absolute_path_key(paths[3])] = 1
         watcher._active_states = _NoItemsDict(watcher._active_states)
         watcher._pending = _NoItemsDict(watcher._pending)
         busy = watcher._active_states[paths[1]]
@@ -969,6 +981,16 @@ def test_watch_ready_index_compacts_event_bursts_without_losing_live_candidates(
             watcher._schedule_active_locked(paths[1], busy)
             watcher._schedule_active_locked(paths[1], busy)
         assert len(watcher._ready_heap) <= 64
+        retired = [os.path.abspath(f"claimed-{index}.002") for index in range(256)]
+        for path in retired:
+            watcher._store_pending_locked(path, WatchCandidate(path, 10, 1.0, "file", 1))
+            state = watcher._new_active_state_locked(last_event_at=800.0, quiet_seconds=5.0)
+            watcher._active_states[path] = state
+            watcher._schedule_active_locked(path, state)
+
+    watcher._claim_pipeline_sources("claimed", retired)
+    watcher.next_delay_seconds()
+    assert all(entry[-1] in candidates for entry in watcher._ready_heap)
 
     watcher.state = SimpleNamespace(
         record_attempt=lambda *args, **kwargs: None,
@@ -1056,7 +1078,6 @@ def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(mo
         watcher._active_states[path] = first_state
         watcher._schedule_active_locked(path, first_state)
         watcher._remove_pending_locked(path)
-        watcher._active_states.pop(path)
 
         second_state = watcher._new_active_state_locked(
             last_event_at=100.0,
@@ -1095,7 +1116,7 @@ def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(m
     with watcher._lock:
         watcher._schedule_active_locked(first_path, first_state)
         watcher._schedule_active_locked(second_path, second_state)
-        watcher._register_inflight_requests_locked([request])
+        watcher._register_inflight_request_locked(request)
 
     monkeypatch.setattr(scheduler_module.time, "time", lambda: 100.0)
     monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 100.0)
@@ -1779,7 +1800,33 @@ def test_closed_scheduler_releases_callback_owners_without_cyclic_gc(tmp_path):
             gc.enable()
 
 
-def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
+@pytest.mark.parametrize("boundary", ["_pop_ready", "_prepare_ready"])
+def test_filtered_admission_retires_tracker_before_global_idle(tmp_path, monkeypatch, boundary):
+    # At either boundary the candidate has left the ready heap, but a new
+    # exclusion means no request exists to run the usual completion callback.
+    watcher = _watcher(tmp_path)
+    source = tmp_path / "retired.zip"
+    _write_zip(source)
+    watcher.enqueue(str(source))
+    assert str(source) in watcher._quiet_trackers
+    select_ready = getattr(watcher, boundary)
+
+    def exclude_after_selection(*args, **kwargs):
+        ready = select_ready(*args, **kwargs)
+        monkeypatch.setattr(watcher, "should_ignore_event_path", lambda path: path == str(source))
+        return ready
+
+    monkeypatch.setattr(watcher, boundary, exclude_after_selection)
+    try:
+        result = _await(watcher.run_once())
+        assert result.processed == result.pending == 0
+        assert str(source) not in watcher._quiet_trackers
+    finally:
+        watcher._close_blocking()
+
+
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, RuntimeError])
+def test_interrupted_harvest_and_close_wait_for_completion_callbacks(tmp_path, failure):
     from sunpack.runtime.watch.journal_commit import journal_stats
 
     async def scenario():
@@ -1788,7 +1835,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
         _write_zip(archive)
         watcher.enqueue(str(archive))
         candidate = watcher._pop_ready(time.monotonic())[0]
-        entered, release = asyncio.Event(), asyncio.Event()
+        entered, release, failed = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
         async def completed_pipeline():
             return None
@@ -1804,17 +1851,40 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
         request = scheduler_module._ActivePipelineRequest("request", candidate, task,
             watcher._password_signature_for_scope(str(tmp_path)))
         request.source_paths = (str(archive),)
-        watcher._register_inflight_requests_locked([request])
+        watcher._register_inflight_request_locked(request)
+        if failure is RuntimeError:
+            finish_request = watcher._finish_active_request
+            failing_candidate = WatchCandidate(str(tmp_path / "broken.zip"), 10, 1.0)
+            watcher._register_inflight_request_locked(scheduler_module._ActivePipelineRequest(
+                "broken", failing_candidate, task, "",
+            ))
+
+            async def finish_with_failure(active):
+                if active.notification_id == "broken":
+                    failed.set()
+                    raise RuntimeError("completion callback failed")
+                return await finish_request(active)
+
+            watcher._finish_active_request = finish_with_failure
         harvest = asyncio.create_task(watcher._harvest_completed_requests())
         await entered.wait()
-        harvest.cancel()
+        if failure is asyncio.CancelledError:
+            harvest.cancel()
+            await asyncio.sleep(0)  # Enter the cancellation drain.
+            harvest.cancel()
+        else:
+            await failed.wait()
+            await asyncio.sleep(0)  # Dispatch the failing task's completion callback.
         closing = asyncio.create_task(watcher.aclose())
-        await asyncio.sleep(0)
-        assert not closing.done()
-        assert watcher._completion_batches
-        assert watcher._quiet_trackers
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
+        try:
+            await asyncio.sleep(0)
+            assert not harvest.done()
+            assert not closing.done()
+            assert watcher._completion_batches
+            assert watcher._quiet_trackers
+        finally:
+            release.set()
+        with pytest.raises(failure):
             await harvest
         await closing
         assert not watcher._completion_batches
@@ -3562,6 +3632,7 @@ def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
     watcher = _watcher(
         tmp_path,
     )
+    watcher.enqueue(str(first_volume))
     watcher.enqueue(str(sibling_volume))
     watcher._claim_pipeline_sources(
         "pipeline-owner",
@@ -3577,6 +3648,7 @@ def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
         return real_candidate(path, since_usn=since_usn)
 
     monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", recording_candidate)
+    watcher.enqueue(str(first_volume), event_type="modified")
     sibling_volume.write_bytes(b"new sibling generation with more bytes")
     watcher.enqueue(str(sibling_volume), event_type="modified")
 
@@ -3585,11 +3657,13 @@ def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
 
     watcher._release_pipeline_source_claims("pipeline-owner")
 
-    assert observed == [os.path.abspath(str(sibling_volume))]
+    assert observed == [str(first_volume), str(sibling_volume)]
     assert watcher.pending_count == 1
+    assert str(first_volume) not in watcher._quiet_trackers
+    assert str(sibling_volume) in watcher._quiet_trackers
 
 
-def test_watch_scheduler_transfers_dirty_generation_between_pipeline_claims(
+def test_watch_scheduler_transfers_dirty_replay_and_tracker_to_claim_during_release(
     tmp_path,
     monkeypatch,
 ):
@@ -3611,18 +3685,26 @@ def test_watch_scheduler_transfers_dirty_generation_between_pipeline_claims(
         return real_candidate(path, since_usn=since_usn)
 
     monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", recording_candidate)
-    source.write_bytes(b"new generation with more bytes")
     watcher.enqueue(str(source), event_type="modified")
 
     assert observed == []
-    watcher._claim_pipeline_sources("owner-b", (str(source),))
+    original_enqueue = watcher.enqueue
+
+    def claim_during_replay(path, **kwargs):
+        monkeypatch.setattr(watcher, "enqueue", original_enqueue)
+        watcher._claim_pipeline_sources("owner-b", (path,))
+        original_enqueue(path, **kwargs)
+
+    monkeypatch.setattr(watcher, "enqueue", claim_during_replay)
     watcher._release_pipeline_source_claims("owner-a")
     assert observed == []
+    assert str(source) in watcher._quiet_trackers
 
     watcher._release_pipeline_source_claims("owner-b")
 
     assert observed == [os.path.abspath(str(source))]
-    assert watcher.pending_count == 1
+    assert watcher.pending_count == 0
+    assert str(source) not in watcher._quiet_trackers
 
 
 def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_finishes(

@@ -15,10 +15,6 @@ from sunpack.runtime.watch.service import WatchService
 _LOG = logging.getLogger(__name__)
 
 
-def _configured_runtime_process_mode(config: dict) -> str:
-    return config["runtime"]["process_mode"]
-
-
 class RuntimeHost:
     """Own the one engine and optional watch lifecycle for one installed executable."""
 
@@ -48,10 +44,6 @@ class RuntimeHost:
         self._watch_generation = 0
         self._last_watch_error = ""
         self._foreground_requests = 0
-        # Set before the first foreground request awaits its scheduler gate and
-        # cleared when the last one finishes, so a scheduler attached in
-        # between (watch start/reload/root change) inherits the gate.
-        self._foreground_gate_requested = False
         self._configured_process_mode = "normal"
         self._cli_process_mode_override: str | None = None
         self._state_changed = state_changed
@@ -113,7 +105,7 @@ class RuntimeHost:
                 tray_factory=tray_factory,
                 toast_manager_factory=toast_manager_factory,
                 config_applied_callback=self._watch_config_applied,
-                external_activity_active=lambda: self._foreground_gate_requested,
+                external_activity_active=lambda: self._foreground_requests > 0,
             )
             task = asyncio.create_task(
                 service.run(),
@@ -282,28 +274,29 @@ class RuntimeHost:
             foreground_requests=self._foreground_requests,
             exit_reason=str(exit_reason),
         )
-        if self.watch_enabled:
-            await self.stop_watch()
-        self.log_event("host_stopped", exit_reason=str(exit_reason))
-        if self._event_log is not None:
-            await asyncio.to_thread(self._event_log.close)
+        try:
+            if self.watch_enabled:
+                await self.stop_watch()
+            self.log_event("host_stopped", exit_reason=str(exit_reason))
+        finally:
+            if self._event_log is not None:
+                await asyncio.to_thread(self._event_log.close)
 
     async def foreground_started(self) -> None:
         async with self._foreground_state_lock:
-            first = self._foreground_requests == 0
-            if first:
-                self._foreground_gate_requested = True
-            if first and self.watch_enabled:
+            # Publish admission before awaiting the gate so a replacement
+            # scheduler inherits it during start or reload.
+            self._foreground_requests += 1
+            if self._foreground_requests == 1 and self.watch_enabled:
                 service = self._watch_service
                 scheduler = service.scheduler if service is not None else None
                 if scheduler is not None:
                     try:
                         await scheduler.set_external_activity(True)
                     except BaseException:
-                        # Admission has not incremented the count yet, so the
-                        # protocol cannot release it. Roll back both the gate
-                        # we awaited and a replacement that inherited it.
-                        self._foreground_gate_requested = False
+                        # The protocol releases only successful admissions.
+                        # Roll back the gate on both possible schedulers.
+                        self._foreground_requests = 0
                         try:
                             await scheduler.set_external_activity(False)
                         finally:
@@ -312,16 +305,12 @@ class RuntimeHost:
                             if current is not None and current is not scheduler:
                                 await current.set_external_activity(False)
                         raise
-            self._foreground_requests += 1
         self.log_event("foreground_started", foreground_requests=self._foreground_requests)
 
     async def foreground_finished(self) -> None:
         async with self._foreground_state_lock:
             self._foreground_requests = max(0, self._foreground_requests - 1)
             if self._foreground_requests == 0:
-                self._foreground_gate_requested = False
-            last = self._foreground_requests == 0
-            if last:
                 service = self._watch_service if self.watch_enabled else None
                 scheduler = service.scheduler if service is not None else None
                 if scheduler is not None:
@@ -363,7 +352,7 @@ class RuntimeHost:
     async def _set_configured_process_mode(self, config: dict) -> None:
         if self._event_log is not None:
             self._event_log.configure_retention(config["watch"]["event_log_retention_days"])
-        self._configured_process_mode = _configured_runtime_process_mode(config)
+        self._configured_process_mode = config["runtime"]["process_mode"]
         await self._apply_effective_process_mode()
 
     async def _apply_effective_process_mode(self, *, engine=None) -> None:

@@ -139,7 +139,7 @@ async def handle(args, ctx):
         json_mode=bool(args.json),
     )
     deep_detect = bool(getattr(args, "deep_detect", False))
-    engine_context = pipeline_engine(run_config)
+    engine_context = pipeline_engine(config)
     if not args.json and getattr(ctx.stdout, "isatty", lambda: False)():
         reporter.info(ctx.t("interrupt.hint"))
     async with engine_context as engine:

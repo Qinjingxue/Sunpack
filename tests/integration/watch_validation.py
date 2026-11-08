@@ -313,7 +313,7 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
     )
     observations = ObservationMetrics()
     event_types: Counter[str] = Counter()
-    original_observer = scheduler_module._watch_candidate_for_path
+    original_observer = scheduler_module._candidate_for_event_path
 
     def measured_observer(path: str, *, since_usn: int = 0):
         started = time.perf_counter()
@@ -333,7 +333,7 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
                 observations.errors[candidate.change_reason_error] += 1
         return candidate
 
-    scheduler_module._watch_candidate_for_path = measured_observer
+    scheduler_module._candidate_for_event_path = measured_observer
     watcher = WatchScheduler(
         _watch_config(),
         [str(scenario_root)],
@@ -423,7 +423,7 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
             result.errors.append("final archive was not declared ready before timeout")
     finally:
         _stop_detection_scheduler(watcher)
-        scheduler_module._watch_candidate_for_path = original_observer
+        scheduler_module._candidate_for_event_path = original_observer
     result.write_seconds = max(0.0, writer_finished_at[0] - writer_started_at[0]) if writer_started.is_set() else 0.0
     result.total_seconds = time.perf_counter() - suite_started
     result.cpu_seconds = max(0.0, sum(process.cpu_times()[:2]) - cpu_before)

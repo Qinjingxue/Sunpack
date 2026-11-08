@@ -11,10 +11,11 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 import sunpack_native
-from sunpack.core.support.path_keys import absolute_path_key
+from sunpack.core.support.path_keys import absolute_path_key, case_key
 from sunpack_native import NativeArchiveSession, clear_reader_resources
 
 from sunpack.core.support.resource_lifecycle import (
+    FileIdentity,
     ResourceKind,
     ResourceLease,
     current_task_resource_scope,
@@ -35,9 +36,8 @@ class _SessionEntry:
     generation: str
     session: NativeArchiveSession
     borrowers: set[str] = field(default_factory=set)
-    process_lease: ResourceLease | None = None
+    process_lease: ResourceLease = field(init=False)
     retired: bool = False
-    closed: bool = False
 
 
 _SESSIONS: OrderedDict[str, _SessionEntry] = OrderedDict()
@@ -67,51 +67,25 @@ def archive_session_scope():
 def _release_borrow(entry: _SessionEntry, task_id: str) -> None:
     with _CHANGED:
         entry.borrowers.discard(task_id)
-        close_retired = entry.retired and not entry.borrowers and not entry.closed
+        close_retired = entry.retired and not entry.borrowers
         _CHANGED.notify_all()
-    if close_retired and entry.process_lease is not None:
+    if close_retired:
         entry.process_lease.close()
-
-
-def _attach_task_borrow_locked(entry: _SessionEntry) -> None:
-    scope = current_task_resource_scope()
-    if scope is None or scope.task_id in entry.borrowers:
-        return
-    task_id = scope.task_id
-    scope.register(
-        entry.session,
-        (entry.path,),
-        lambda entry=entry, task_id=task_id: _release_borrow(entry, task_id),
-        kind=ResourceKind.ARCHIVE_SESSION_BORROW,
-        registration_held=True,
-    )
-    entry.borrowers.add(task_id)
 
 
 def _close_entry(entry: _SessionEntry) -> None:
     with _CHANGED:
         entry.retired = True
+        if _SESSIONS.get(entry.path) is entry:
+            del _SESSIONS[entry.path]
         # The borrower owns release; elapsed time alone cannot invalidate its lease.
         while entry.borrowers:
             _CHANGED.wait()
-        if entry.closed:
-            return
     entry.session.close()
-    with _CHANGED:
-        entry.closed = True
-        _CHANGED.notify_all()
 
 
 def _close_entries(entries: list[_SessionEntry]) -> int:
-    closed = 0
-    for entry in entries:
-        lease = entry.process_lease
-        if lease is not None:
-            closed += int(lease.close())
-        else:
-            _close_entry(entry)
-            closed += 1
-    return closed
+    return sum(entry.process_lease.close() for entry in entries)
 
 
 def _retire_entries(entries: list[_SessionEntry]) -> None:
@@ -119,68 +93,74 @@ def _retire_entries(entries: list[_SessionEntry]) -> None:
     with _CHANGED:
         for entry in entries:
             entry.retired = True
-            if not entry.borrowers and not entry.closed:
+            if not entry.borrowers:
                 ready.append(entry)
         _CHANGED.notify_all()
     _close_entries(ready)
 
 
-def get_archive_session(path: str) -> NativeArchiveSession:
-    return _get_archive_session(path)
+def get_archive_session(path: str, *, identity: FileIdentity | None = None) -> NativeArchiveSession:
+    """Get a cached session. Pass the identity when already holding its registration gate."""
+    path = os.path.abspath(os.path.normpath(path))
+    if identity is not None:
+        return _get_archive_session(path, identity)
+    with lifecycle_registration((path,)) as (identity,):
+        return _get_archive_session(path, identity)
 
 
 def _get_archive_session(
-    path: str,
+    normalized: str,
+    identity: FileIdentity,
     *,
     borrow_token: str | None = None,
     leases: list[ResourceLease] | None = None,
 ) -> NativeArchiveSession:
-    normalized = os.path.abspath(os.path.normpath(path))
     stale_entries: list[_SessionEntry] = []
     unowned: NativeArchiveSession | None = None
     try:
-        with lifecycle_registration((normalized,)):
-            operation_sessions = _CURRENT_SESSIONS.get()
-            if operation_sessions is not None:
-                operation_key = absolute_path_key(normalized)
-                with _CHANGED:
-                    entry = operation_sessions.get(operation_key)
-                    if (
-                        entry is not None and not entry.retired and not entry.closed
-                        and _SESSIONS.get(entry.path) is entry
-                    ):
-                        _SESSIONS.move_to_end(entry.path)
-                        _attach_borrow_locked(entry, borrow_token, leases)
-                        return entry.session
-            # Rust validates the current path against an opened physical file and
-            # retains the pooled reader/cache only for the same generation.
-            session = unowned = NativeArchiveSession(normalized)
-            generation = session.generation_token
+        operation_sessions = _CURRENT_SESSIONS.get()
+        if operation_sessions is not None:
+            operation_key = identity.path
             with _CHANGED:
-                existing = _SESSIONS.get(normalized)
-                if existing is not None and existing.generation == generation and not existing.retired:
-                    entry = existing
-                else:
-                    entry = _SessionEntry(path=normalized, generation=generation, session=session)
-                    entry.process_lease = register_process_cache_resource(
-                        session,
-                        (normalized,),
-                        lambda entry=entry: _close_entry(entry),
-                        kind=ResourceKind.NATIVE_ARCHIVE_SESSION,
-                        registration_held=True,
-                    )
-                    unowned = None
-                    if existing is not None:
-                        stale_entries.append(existing)
-                    _SESSIONS[normalized] = entry
-                _SESSIONS.move_to_end(normalized)
-                while len(_SESSIONS) > _MAX_SESSIONS:
-                    _old_path, old_entry = _SESSIONS.popitem(last=False)
-                    stale_entries.append(old_entry)
-                _attach_borrow_locked(entry, borrow_token, leases)
-                if operation_sessions is not None:
-                    operation_sessions[operation_key] = entry
-                return entry.session
+                entry = operation_sessions.get(operation_key)
+                if (
+                    entry is not None and not entry.retired
+                    and _SESSIONS.get(entry.path) is entry
+                ):
+                    _SESSIONS.move_to_end(entry.path)
+                    if borrow_token is not None:
+                        _attach_borrow_locked(entry, identity, borrow_token, leases)
+                    return entry.session
+        # Rust validates the current path against an opened physical file and
+        # retains the pooled reader/cache only for the same generation.
+        session = unowned = NativeArchiveSession(normalized)
+        generation = session.generation_token
+        with _CHANGED:
+            existing = _SESSIONS.get(normalized)
+            if existing is not None and existing.generation == generation and not existing.retired:
+                entry = existing
+            else:
+                entry = _SessionEntry(path=normalized, generation=generation, session=session)
+                entry.process_lease = register_process_cache_resource(
+                    session,
+                    (identity,),
+                    lambda entry=entry: _close_entry(entry),
+                    kind=ResourceKind.NATIVE_ARCHIVE_SESSION,
+                    registration_held=True,
+                )
+                unowned = None
+                if existing is not None:
+                    stale_entries.append(existing)
+                _SESSIONS[normalized] = entry
+            _SESSIONS.move_to_end(normalized)
+            while len(_SESSIONS) > _MAX_SESSIONS:
+                _old_path, old_entry = _SESSIONS.popitem(last=False)
+                stale_entries.append(old_entry)
+            if borrow_token is not None:
+                _attach_borrow_locked(entry, identity, borrow_token, leases)
+            if operation_sessions is not None:
+                operation_sessions[operation_key] = entry
+            return entry.session
     finally:
         if unowned is not None:
             unowned.close()
@@ -190,17 +170,15 @@ def _get_archive_session(
 
 def _attach_borrow_locked(
     entry: _SessionEntry,
-    borrow_token: str | None,
+    identity: FileIdentity,
+    borrow_token: str,
     leases: list[ResourceLease] | None,
 ) -> None:
-    if borrow_token is None:
-        _attach_task_borrow_locked(entry)
-        return
     assert leases is not None
     scope = current_task_resource_scope()
     lease = register_resource(
         entry.session,
-        (entry.path,),
+        (identity,),
         lambda: _release_borrow(entry, borrow_token),
         kind=ResourceKind.ARCHIVE_SESSION_BORROW,
         task_id=scope.task_id if scope is not None else borrow_token,
@@ -222,15 +200,16 @@ def borrow_archive_sessions(paths: Iterable[os.PathLike[str] | str | None]):
     unique: dict[str, str] = {}
     for path in paths:
         if path:
-            unique.setdefault(absolute_path_key(path), os.fspath(path))
+            normalized = os.path.abspath(os.path.normpath(path))
+            unique.setdefault(case_key(normalized), normalized)
     paths = tuple(unique.values())
     leases: list[ResourceLease] = []
     token = uuid.uuid4().hex
     try:
-        with lifecycle_registration(paths):
+        with lifecycle_registration(paths) as identities:
             sessions = tuple(
-                _get_archive_session(path, borrow_token=token, leases=leases)
-                for path in paths
+                _get_archive_session(path, identity, borrow_token=token, leases=leases)
+                for path, identity in zip(paths, identities, strict=True)
             )
         yield sessions
     finally:

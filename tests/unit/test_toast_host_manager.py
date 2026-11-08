@@ -1,6 +1,6 @@
 import os
 import threading
-import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -71,15 +71,28 @@ def test_lifecycle_owns_native_objects_on_one_main_process_thread(tmp_path):
     manager.stop()
 
 
-def test_terminal_does_not_self_expire():
+def test_terminal_releases_snapshot_without_clearing_presented_notification(monkeypatch):
     recorder = Recorder()
     manager = ToastManager(presenter_factory=recorder.factory)
-    manager.publish(snapshot())
-    manager.start()
-    recorder.wait('show')
-    time.sleep(.15)
-    assert not any(e[0] == 'clear' for e in recorder.events)
-    manager.stop()
+    item = snapshot()
+    retained = weakref.ref(item)
+    manager.publish(item)
+    del item
+    original_wait = manager._condition.wait_for
+
+    def wait_for(predicate, timeout=None):
+        recorder.record('waiting', timeout)
+        return original_wait(predicate, timeout)
+
+    monkeypatch.setattr(manager._condition, 'wait_for', wait_for)
+    try:
+        manager.start()
+        recorder.wait('waiting')
+        assert retained() is None
+        assert [e[0] for e in recorder.events] == ['create', 'show', 'waiting']
+        assert recorder.events[-1][3] is None  # No expiration deadline.
+    finally:
+        manager.stop()
     assert not any(e[0] == 'clear' for e in recorder.events)
 
 
@@ -105,7 +118,7 @@ def test_idle_thread_does_not_poll(monkeypatch):
 
     monkeypatch.setattr(manager._condition, 'wait_for', wait_for)
     manager._run()
-    assert waits == [None]
+    assert waits == [None] and not recorder.events
 
 
 def test_progress_coalesces_but_terminal_bypasses_throttle():
@@ -146,12 +159,14 @@ def test_latest_progress_is_sent_after_throttle_deadline():
 def test_bad_snapshot_is_rejected_without_killing_thread():
     recorder = Recorder()
     manager = ToastManager(presenter_factory=recorder.factory)
-    manager.publish(snapshot(title='x' * 65536))
+    manager.publish(snapshot(ToastSnapshotKind.PROGRESS))
     try:
         manager.start()
+        recorder.wait('show')
+        manager.publish(snapshot(title='x' * 65536))
         recorder.wait('clear')
         manager.publish(snapshot())
-        recorder.wait('show')
+        recorder.wait('show', 2)
         assert manager._thread.is_alive()
     finally:
         manager.stop()
@@ -189,17 +204,29 @@ def test_native_start_failure_stays_unavailable_until_lifecycle_restart():
         manager.stop()
 
 
-def test_restart_does_not_replay_previous_watch_snapshot():
+def test_restart_stays_idle_until_a_new_snapshot(monkeypatch):
     recorder = Recorder()
     manager = ToastManager(presenter_factory=recorder.factory)
+    original_wait = manager._condition.wait_for
+
+    def wait_for(predicate, timeout=None):
+        recorder.record('waiting')
+        return original_wait(predicate, timeout)
+
+    monkeypatch.setattr(manager._condition, 'wait_for', wait_for)
     manager.publish(snapshot())
     manager.start()
-    recorder.wait('show')
+    recorder.wait('waiting')
     manager.stop()
     try:
         manager.start()
-        recorder.wait('clear')
+        recorder.wait('waiting', 2)
+        manager.clear()
+        recorder.wait('waiting', 3)
+        assert sum(e[0] == 'create' for e in recorder.events) == 1
         assert sum(e[0] == 'show' for e in recorder.events) == 1
+        manager.publish(snapshot(title='fresh'))
+        recorder.wait('show', 2)
     finally:
         manager.stop()
 

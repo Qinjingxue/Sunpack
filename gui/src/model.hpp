@@ -1,6 +1,7 @@
 #pragma once
 #include "platform.hpp"
 #include <nlohmann/json.hpp>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -14,27 +15,18 @@ Json parse_json(const std::string& text);
 Json read_json(const fs::path& path);
 void validate_passwords(const Json& document);
 bool password_matches_scope(const Json& record, const std::string& scope);
-void save_config_field(const fs::path& path, const std::string& pointer, const std::string& original,
-    const std::string& type, const std::string& text, bool boolean);
-// original is the exact selected record, not an index that external edits can move.
-void edit_password(const fs::path& path, const std::string& operation, const Json& original,
-    const Json& replacement, const std::string& scope = {});
 struct WatchRoot { fs::path input; std::string output; bool deep = false; bool initial_scanned = false; bool recursive = false; };
 struct WatchRoots { std::vector<WatchRoot> entries; std::vector<std::string> comments; };
 WatchRoots parse_roots(const std::string& text, const fs::path& base);
 WatchRoots read_roots(const fs::path& path);
-void edit_root(const fs::path& path, const std::string& operation, const std::string& original,
-    const std::string& input, const std::string& output, bool deep);
 Json apply_password_changes(Json document, const Json& edits, Json* saved_record = nullptr);
-WatchRoots apply_root_changes(WatchRoots roots, const fs::path& base, const Json& edits);
 // The saved document is already parsed while validating the write; return it
 // to the GUI instead of immediately re-reading and re-projecting the file.
-struct PasswordSaveSnapshot { Json document; std::string file_text; Json record, rebases; bool count_changed = false; };
+struct PasswordSaveSnapshot { Json document; std::string file_text; Json record, rebases; bool delta_base_matches = false; };
 // Preflight every file under the existing locks, then replace each file once.
 // A write failure reports completed sections so remaining drafts can be retried.
 Json save_changes(const fs::path& directory, const Json& fields, const Json& passwords,
-    const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr);
-std::string root_for(const fs::path& path, const WatchRoots& roots);
+    const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr, std::string_view password_baseline = {});
 class EventLog {
     fs::path path_;
 public:
@@ -42,7 +34,7 @@ public:
     std::function<bool()> cancelled;
     Json query(const WatchRoots& roots, const struct View& view, const std::string& language = "zh") const;
     void set_path(const fs::path& path);
-    bool refresh(bool missing_is_final = false);
+    bool refresh();
     const fs::path& path() const { return path_; }
 };
 struct View {

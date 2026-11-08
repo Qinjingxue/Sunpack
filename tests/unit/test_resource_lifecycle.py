@@ -267,10 +267,11 @@ def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path
     release_under_entered = threading.Event()
     revisit_succeeded = threading.Event()
     revisited = threading.Event()
+    borrows = contextlib.ExitStack()
 
     try:
         with reader_scope.activate():
-            session = archive_sessions.get_archive_session(str(path))
+            (session,) = borrows.enter_context(archive_sessions.borrow_archive_sessions((path,)))
             reader_context = contextvars.copy_context()
 
         real_release_under = promoter_scope.release_under
@@ -317,6 +318,7 @@ def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path
         revisitor.start()
         assert revisited.wait(0.5)
     finally:
+        borrows.close()
         reader_scope.close()
         promoter_scope.close()
         if revisitor is not None:

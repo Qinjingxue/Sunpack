@@ -272,9 +272,6 @@ Json project_task(const Json& value,const RootIndex& roots,const std::string& la
 }
 
 }
-std::string root_for(const fs::path& path,const WatchRoots& roots) {
-    return indexed_root(path_key(path),index_roots(roots));
-}
 Json EventLog::query(const WatchRoots& roots,const View& view,const std::string& language) const {
     if(manifest.is_null()) return {{"rows",Json::array()},{"total",0},{"hasMore",false},{"dropped",0},{"next",""}};
     const auto root_index=index_roots(roots);

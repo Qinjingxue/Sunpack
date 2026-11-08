@@ -18,6 +18,22 @@ struct Fixture {
     Fixture() { GUID id{}; CoCreateGuid(&id); wchar_t token[40]; StringFromGUID2(id,token,40); dir=fs::temp_directory_path()/token; fs::create_directory(dir); }
     ~Fixture() { std::error_code ec; fs::remove_all(dir,ec); }
 };
+void require_save(const Json& result) {
+    if(result["error"]!="") throw std::runtime_error(result["error"].get<std::string>());
+}
+void save_config_field(const fs::path& path,const std::string& pointer,const std::string& original,
+    const std::string& type,const std::string& text,bool boolean) {
+    Json edit={{"pointer",pointer},{"original",original},{"type",type},{"text",text},{"boolean",boolean}};
+    require_save(save_changes(path.parent_path(),Json::array({edit}),Json::array(),Json::array()));
+}
+void save_password_edit(const fs::path& path,Json edit) {
+    require_save(save_changes(path.parent_path(),Json::array(),Json::array({std::move(edit)}),Json::array()));
+}
+void edit_root(const fs::path& path,const std::string& op,const std::string& original,
+    const std::string& input,const std::string& output,bool deep) {
+    Json edit={{"operation",op},{"original",original},{"input",input},{"output",output},{"deep",deep}};
+    require_save(save_changes(path.parent_path(),Json::array(),Json::array(),Json::array({edit})));
+}
 std::string event(const std::string& type,const fs::path& p,int ts) {
     return Json({{"event",type},{"path",utf8(p.wstring())},{"ts",ts}}).dump()+"\n";
 }
@@ -79,7 +95,7 @@ void projection(Fixture& f) {
         log.cancelled={}; mark(revision);
     }
     view.task_query.clear(); assert(log.query({},view)==stable);
-    fs::remove(p); fails([&]{log.refresh();}); log.refresh(true); assert(log.manifest.is_null());
+    fs::remove(p); fails([&]{log.refresh();}); assert(log.query({},view)==stable);
     // Numeric UTC epochs display in local wall time. TZ is process-only.
     auto publish=[&](const Json& value) { publish_events(p,value.dump()+"\n"); assert(log.refresh()); };
     char* previous=nullptr; size_t count=0; _dupenv_s(&previous,&count,"TZ");
@@ -105,10 +121,21 @@ void projection(Fixture& f) {
     auto monitor=f.dir/L"监控", nested=monitor/L"子目录", output=f.dir/L"输出";
     fs::create_directories(nested); fs::create_directory(output);
     auto file=nested/L"已删除的载体.001";
-    WatchRoots roots; roots.entries={{f.dir,"",false},{monitor,"",false}};
-    publish(Json{{"event","done"},{"path",utf8(file.wstring())},{"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}});
-    auto row=log.query(roots,{}).at("rows").at(0);
+    auto sibling=f.dir/"Data2";
+    WatchRoots roots; roots.entries={{f.dir,"",false},{monitor,"",false},{sibling,"",false}};
+    auto history_rows=Json{{"event","done"},{"path",utf8(file.wstring())},{"ts",4},
+        {"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}}.dump()+"\n";
+    // Exercise component-prefix matching through the projected rows.
+    history_rows+=event("done",sibling/"part.zip",3);
+    history_rows+=event("done",f.dir/"Data20"/"part.zip",2);
+    history_rows+=event("done",f.dir.parent_path()/"untracked.zip",1);
+    publish_events(p,history_rows); assert(log.refresh());
+    auto rows=log.query(roots,{}).at("rows");
+    auto row=rows.at(0);
     assert(row["root"]==utf8(monitor.wstring()));
+    assert(rows.at(1)["root"]==utf8(sibling.wstring()));
+    assert(rows.at(2)["root"]==utf8(f.dir.wstring()));
+    assert(rows.at(3)["root"]=="@other");
     assert(row["directory"]==utf8(nested.wstring()));
     assert(task_directory(row)==output);
     fs::remove(output);
@@ -125,23 +152,23 @@ void editing(Fixture& f) {
     auto p=f.dir/"builtin_passwords.json";
     Json original={{"value","  #中文 密码  "},{"scopes",{"C:/A","D:/B"}}};
     atomic_write(p,Json({{"passwords",{original}},{"clipboard_history",{"后台密码"}}}).dump());
-    edit_password(p,"removeScope",original,Json(),"c:\\a");
+    save_password_edit(p,{{"operation","removeScope"},{"original",original.dump()},{"scope","c:\\a"}});
     auto j=read_json(p); assert(j["passwords"][0]["scopes"]==Json::array({"D:/B"}));
     assert(j["clipboard_history"][0]=="后台密码");
-    edit_password(p,"removeScope",j["passwords"][0],Json(),"d:\\b");
+    save_password_edit(p,{{"operation","removeScope"},{"original",j["passwords"][0].dump()},{"scope","d:\\b"}});
     assert(read_json(p)["passwords"].empty());
-    edit_password(p,"add",Json(),Json({{"value"," p # "}})); assert(read_json(p)["passwords"][0]["value"]==" p # ");
-    fails([&]{edit_password(p,"replace",original,Json({{"value","wrong record"}}));});
+    save_password_edit(p,{{"operation","add"},{"value"," p # "}}); assert(read_json(p)["passwords"][0]["value"]==" p # ");
+    fails([&]{save_password_edit(p,{{"operation","replace"},{"original",original.dump()},{"value","wrong record"}});});
     for(auto raw:{"{\"passwords\":[{\"value\":\"a\",\"scopes\":[]}]}","{\"passwords\":[],\"unknown\":1}","{\"passwords\":[{\"value\":\"a\",\"unknown\":1}]}","{\"passwords\":[],\"passwords\":[]}"})
         fails([&]{validate_passwords(parse_json(raw));});
     validate_passwords(parse_json(R"({"passwords":[{"value":"#","scopes":["\\\\server\\share","C:/中文"]}],"clipboard_history":[]})"));
     // Coordinate with a second writer using the exact production lock.
     std::thread writer([&]{ FileMutex lock(p); auto current=read_json(p); current["clipboard_history"].push_back("latest"); atomic_write(p,current.dump()); }); writer.join();
-    edit_password(p,"add",Json(),Json({{"value","after history"}})); assert(read_json(p)["clipboard_history"].back()=="latest");
+    save_password_edit(p,{{"operation","add"},{"value","after history"}}); assert(read_json(p)["clipboard_history"].back()=="latest");
     auto before=read_file(p);
-    fails([&]{edit_password(p,"addMany",Json(),Json::array({Json{{"value","valid"}},Json{{"value","invalid"},{"scopes",Json::array()}}}));});
+    fails([&]{save_password_edit(p,{{"operation","addMany"},{"values",{"valid",42}}});});
     assert(read_file(p)==before); // A bad record cannot commit a partial batch.
-    edit_password(p,"addMany",Json(),Json::array({Json{{"value"," # batch "}},Json{{"value"," # batch "}},Json{{"value","other"}}}));
+    save_password_edit(p,{{"operation","addMany"},{"values",{" # batch "," # batch ","other"}}});
     assert(read_json(p)["passwords"].size()==4 && read_json(p)["clipboard_history"].back()=="latest");
     // Add, replacement and scope changes share runtime-compatible coverage:
     // globals subsume scoped copies; distinct scopes share one stored record.
@@ -174,8 +201,8 @@ void editing(Fixture& f) {
     auto selected=document["passwords"][0];
     document=apply_password_changes(std::move(document),Json::array({Json{{"operation","removeScope"},{"original",selected.dump()},{"scope","C:/A"}}}));
     assert(document["passwords"]==Json::array({Json{{"value","old"},{"scopes",{"D:/B"}}}}));
-    edit_password(p,"add",Json(),Json{{"value","shared stored"},{"scopes",{"C:/A"}}});
-    edit_password(p,"add",Json(),Json{{"value","shared stored"},{"scopes",{"D:/B","c:\\a\\"}}});
+    save_password_edit(p,{{"operation","add"},{"value","shared stored"},{"scopes",{"C:/A"}}});
+    save_password_edit(p,{{"operation","add"},{"value","shared stored"},{"scopes",{"D:/B","c:\\a\\"}}});
     auto stored=read_json(p)["passwords"];
     assert(std::count_if(stored.begin(),stored.end(),[](const Json& row){return row["value"]=="shared stored";})==1);
     auto shared=std::find_if(stored.begin(),stored.end(),[](const Json& row){return row["value"]=="shared stored";});
@@ -261,7 +288,7 @@ void range_editing(Fixture& fixture) {
     auto foldModule=timeModule;foldModule["start_utc"]="2024-11-03T05:30Z";
     auto fold=range_editor(foldModule,&us); assert(range_configuration(fold,true,&us)==foldModule);
     fold["lower"]="2024-03-10 02:30";fails([&]{range_configuration(fold,true,&us);});
-    auto path=fixture.dir/"ranges.json";
+    auto path=fixture.dir/"sunpack_config.json";
     std::string source="{\"filesystem\":{\"scan_filters\":["+sizeModule.dump()+","+timeModule.dump()+"]},\"unknown\":123456789012345678901234567890}";
     atomic_write(path,source); auto rows=config_fields(parse_json(source),source); assert(rows.size()==3);
     auto field=rows[0]; assert(field["type"]=="object" && field["range"]["lower"]=="1");
@@ -322,16 +349,6 @@ void roots(Fixture& f) {
     edit_root(p,"save",utf8(nested.wstring()),utf8(f.dir.wstring()),"末条",true);
     edit_root(p,"save","",utf8(nested.wstring()),"",false);
     auto all=read_roots(p); assert(all.entries.size()==2);
-    assert(root_for(nested/"x.bin",all)==utf8(nested.wstring()));
-    assert(root_for(f.dir/"Data2"/"x.bin",all)==utf8(f.dir.wstring()));
-    // The nearest path-component root wins even with hundreds of unrelated
-    // roots; sibling prefixes must never match each other.
-    WatchRoots prefix_roots;
-    prefix_roots.entries={{f.dir,"",false},{nested,"",false},{f.dir/"Data2","",false}};
-    assert(root_for(nested/"deep"/"part.zip",prefix_roots)==utf8(nested.wstring()));
-    assert(root_for(f.dir/"Data2"/"part.zip",prefix_roots)==utf8((f.dir/"Data2").wstring()));
-    assert(root_for(f.dir/"Data20"/"part.zip",prefix_roots)==utf8(f.dir.wstring()));
-    assert(root_for(f.dir.parent_path()/"untracked.zip",prefix_roots)=="@other");
     auto duplicate_before=read_file(p);
     edit_root(p,"save","",utf8(nested.wstring()),"",false);
     assert(read_file(p)==duplicate_before);
@@ -387,8 +404,10 @@ void batch_editing(Fixture& fixture) {
     Json updated_password=Json::array({Json{{"operation","replace"},
         {"original",Json{{"value","changed"},{"scopes",{utf8(dir.wstring())}}}.dump()},
         {"value","fast-delta"},{"scopes",{utf8(dir.wstring())}}}});
-    auto committed=save_changes(dir,Json::array(),updated_password,Json::array(),&snapshot);
+    // Equal row count cannot make an older file snapshot a valid delta base.
+    auto committed=save_changes(dir,Json::array(),updated_password,Json::array(),&snapshot,before_passwords);
     assert(committed["error"]=="" && committed["saved"]==Json::array({"passwords"}));
+    assert(!snapshot.delta_base_matches);
     assert(snapshot.document==read_json(passwords) && snapshot.file_text==read_file(passwords));
     assert(snapshot.document["passwords"][0]["value"]=="fast-delta");
     assert(read_file(config).find("123456789012345678901234567890")!=std::string::npos);
@@ -398,8 +417,8 @@ void batch_editing(Fixture& fixture) {
     assert(read_roots(roots).entries[0].deep && read_file(roots).find("# retained")!=std::string::npos);
     PasswordSaveSnapshot joined;
     auto previous_record=snapshot.record.dump(),joined_scope=utf8((dir.parent_path()/L"joined-scope").wstring());
-    auto joined_result=save_changes(dir,Json::array(),Json::array({Json{{"operation","addMany"},{"values",{"fast-delta"}},{"scopes",{joined_scope}}}}),Json::array(),&joined);
-    assert(joined_result["error"]=="" && !joined.count_changed);
+    auto joined_result=save_changes(dir,Json::array(),Json::array({Json{{"operation","addMany"},{"values",{"fast-delta"}},{"scopes",{joined_scope}}}}),Json::array(),&joined,snapshot.file_text);
+    assert(joined_result["error"]=="" && joined.delta_base_matches);
     assert(joined.document["passwords"].size()==1 && joined.record["scopes"].size()==2);
     assert(joined.rebases.size()==1 && joined.rebases[0]["originals"]==Json::array({previous_record}) && joined.rebases[0]["record"]==joined.record);
     assert(password_matches_scope(joined.record,utf8(dir.wstring())) && password_matches_scope(joined.record,joined_scope));
@@ -465,7 +484,7 @@ int wmain(int argc,wchar_t** argv) {
     }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
-    if(argc==4 && std::wstring(argv[1])==L"--password-add") { edit_password(argv[2],"add",Json(),Json({{"value",utf8(argv[3])}})); return 0; }
+    if(argc==4 && std::wstring(argv[1])==L"--password-add") { save_password_edit(argv[2],{{"operation","add"},{"value",utf8(argv[3])}}); return 0; }
     if(argc==2 && std::wstring(argv[1])==L"--ranges") {
         auto size=range_editor(Json{{"name","size_range"},{"enabled",true},{"min_bytes",1},{"max_bytes",Json()}});
         size["lower"]="9007199254740993";

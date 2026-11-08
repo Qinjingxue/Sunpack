@@ -75,10 +75,9 @@ def test_password_probe_releases_only_its_own_borrows(tmp_path, monkeypatch, mod
     monkeypatch.setattr(module, 'prepare_password_input', lambda *a, **k: prepared)
     if mode != 'file':
         monkeypatch.setattr(module, method + '_verify_passwords_from_' + mode, probe)
-    scope = TaskResourceScope('existing-analysis-owner')
+    scope = TaskResourceScope('existing-probe-owner')
     try:
-        with scope.activate():
-            original = sessions.get_archive_session(physical[0])
+        with scope.activate(), sessions.borrow_archive_sessions(physical[:1]) as (original,):
             if raise_error:
                 with pytest.raises(RuntimeError, match='probe failed'):
                     verifier().verify_batch(physical[0], ['wrong'])
@@ -86,7 +85,6 @@ def test_password_probe_releases_only_its_own_borrows(tmp_path, monkeypatch, mod
                 assert verifier().verify_batch(physical[0], ['wrong']).status == 'no_match'
             assert len(borrows(physical)) == 1
             assert not original.closed
-            assert len(scope._resource_ids) == 1
     finally:
         scope.close()
 

@@ -190,11 +190,6 @@ static std::string patch_config(std::string source,const Json& edits) {
     }
     return source;
 }
-void save_config_field(const fs::path& p,const std::string& pointer,const std::string& original,
-    const std::string& type,const std::string& text,bool boolean) {
-    FileMutex lock(p);
-    atomic_write(p,patch_config(read_file(p),Json::array({Json{{"pointer",pointer},{"original",original},{"type",type},{"text",text},{"boolean",boolean}}})));
-}
 // Scope identity and ancestry match the runtime's directory-scoped lookup.
 // Only values touched by this edit are normalized; unrelated entries
 // and significant password whitespace remain intact.
@@ -311,10 +306,6 @@ static Json patch_password(Json& j, const std::string& op, const Json& original,
     if(op!="add" && op!="addMany" && op!="replace") target=records.size();
     return deduplicate_passwords(records,touched,target,op=="addMany"?previous_count:records.size());
 }
-void edit_password(const fs::path& p,const std::string& op,const Json& original,const Json& replacement,const std::string& scope) {
-    FileMutex lock(p); auto document=read_json(p); validate_passwords(document);
-    patch_password(document,op,original,replacement,scope); atomic_write(p,document.dump(2)+"\n");
-}
 Json apply_password_changes(Json document,const Json& edits,Json* saved_record) {
     validate_passwords(document);
     bool first=true;
@@ -370,7 +361,7 @@ WatchRoots read_roots(const fs::path& p) {
     if (!fs::exists(p)) return {};
     return parse_roots(read_file(p),p.parent_path());
 }
-WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& edits) {
+static WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& edits) {
     // Normalize each existing key once. A multi-line paste must not rescan
     // and normalize the complete directory list for every added row.
     std::unordered_map<std::wstring,size_t> indices;
@@ -440,19 +431,15 @@ static std::string roots_text(const WatchRoots& roots) {
         " | "+r.output+" | "+(r.deep?"true":"false")+" | "+(r.initial_scanned?"true":"false")+" | "+(r.recursive?"true":"false")+"\n";
     return content;
 }
-void edit_root(const fs::path& p,const std::string& op,const std::string& original,const std::string& input,const std::string& output,bool deep) {
-    auto result=save_changes(p.parent_path(),Json::array(),Json::array(),Json::array({Json{{"operation",op},{"original",original},{"input",input},{"output",output},{"deep",deep}}}));
-    if(result["error"]!="") throw std::runtime_error(result["error"].get<std::string>());
-}
 Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots,
-    PasswordSaveSnapshot* password_snapshot) {
+    PasswordSaveSnapshot* password_snapshot,std::string_view password_baseline) {
     Json result={{"saved",Json::array()},{"error",""},{"section",""}};
     struct Write { std::string section; fs::path path; std::string text; };
     std::vector<Write> writes;
     Json committed_passwords;
     Json saved_record;
     Json password_rebases=Json::array();
-    bool password_count_changed=false;
+    bool delta_base_matches=false;
     const bool deleting_roots=std::any_of(roots.begin(),roots.end(),[](const Json& edit){return edit.at("operation")=="delete";});
     std::unordered_set<std::wstring> removed_scopes;
     std::string root_text,original_password_text;
@@ -481,18 +468,24 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
             original_password_text=read_file(path);
             auto current=parse_json(original_password_text); validate_passwords(current);
             auto count=current["passwords"].size();
-            std::unordered_map<std::string,std::vector<std::string>> originals;
+            struct RebaseRows { std::vector<std::string> before; const Json* after = nullptr; };
+            std::unordered_map<std::string,RebaseRows> rebases;
             if(password_snapshot) {
-                std::unordered_set<std::string> affected;
                 for(auto& edit:passwords) {
-                    if(edit.contains("value") && edit["value"].is_string()) affected.insert(edit["value"].get<std::string>());
-                    if(edit.contains("values")) for(auto& value:edit["values"]) if(value.is_string()) affected.insert(value.get<std::string>());
+                    if(edit.contains("value") && edit["value"].is_string()) rebases.try_emplace(edit["value"].get_ref<const std::string&>());
+                    if(edit.contains("values")) for(auto& value:edit["values"]) if(value.is_string()) rebases.try_emplace(value.get_ref<const std::string&>());
                     auto original=edit.value("original",std::string());
-                    if(!original.empty()) affected.insert(parse_json(original)["value"].get<std::string>());
+                    if(!original.empty()) rebases.try_emplace(parse_json(original)["value"].get<std::string>());
                 }
-                for(auto& record:current["passwords"]) {
-                    const auto& value=record["value"].get_ref<const std::string&>();
-                    if(affected.count(value)) originals[value].push_back(record.dump());
+                if(!rebases.empty()) {
+                    for(auto& record:current["passwords"]) {
+                        auto found=rebases.find(record["value"].get_ref<const std::string&>());
+                        if(found!=rebases.end()) found->second.before.push_back(record.dump());
+                    }
+                    for(auto it=rebases.begin();it!=rebases.end();) {
+                        if(it->second.before.empty()) it=rebases.erase(it);
+                        else ++it;
+                    }
                 }
             }
             committed_passwords=apply_password_changes(std::move(current),passwords,&saved_record);
@@ -518,18 +511,19 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
                 }
                 rows.erase(rows.begin()+kept,rows.end());
             }
-            if(!originals.empty()) {
-                std::unordered_map<std::string,const Json*> records;
-                for(auto& record:committed_passwords["passwords"]) records.emplace(record["value"].get<std::string>(),&record);
-                for(auto& [value,previous]:originals) {
-                    auto found=records.find(value);
-                    const auto record=found==records.end()?Json():*found->second;
-                    const auto encoded=record.is_null()?std::string():record.dump();
+            if(!rebases.empty()) {
+                for(auto& record:committed_passwords["passwords"]) {
+                    auto found=rebases.find(record["value"].get_ref<const std::string&>());
+                    if(found!=rebases.end() && !found->second.after) found->second.after=&record;
+                }
+                for(auto& [value,rebase]:rebases) {
+                    auto& previous=rebase.before;
+                    const auto encoded=rebase.after?rebase.after->dump():std::string();
                     previous.erase(std::remove(previous.begin(),previous.end(),encoded),previous.end());
-                    if(!previous.empty()) password_rebases.push_back({{"originals",std::move(previous)},{"record",record}});
+                    if(!previous.empty()) password_rebases.push_back({{"originals",std::move(previous)},{"record",rebase.after?*rebase.after:Json()}});
                 }
             }
-            password_count_changed=count!=committed_passwords["passwords"].size();
+            delta_base_matches=count==committed_passwords["passwords"].size() && original_password_text==password_baseline;
             if(!passwords.empty() || cleaned) writes.push_back({section,path,committed_passwords.dump(2)+"\n"});
         }
         if(!roots.empty()) writes.push_back({"roots",dir/"sunpack_watch_roots.txt",std::move(root_text)});
@@ -550,7 +544,7 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
                 password_snapshot->file_text=std::move(write.text);
                 password_snapshot->record=std::move(saved_record);
                 password_snapshot->rebases=std::move(password_rebases);
-                password_snapshot->count_changed=password_count_changed;
+                password_snapshot->delta_base_matches=delta_base_matches;
             }
         }
     } catch(const ConfigEditError& error) { result["error"]=error.what(); result["section"]=section; result["field"]=error.pointer; }
@@ -562,27 +556,20 @@ void EventLog::set_path(const fs::path& p) {
     manifest=Json();
     path_=p;
 }
-bool EventLog::refresh(bool missing_is_final) {
-    try {
-        auto next=read_json(path_);
-        if(!next.is_object() || next.value("format",0)!=1) throw std::runtime_error("logRecordTooLarge");
-        // File identity detects rebuilt storage even when counters collide.
-        // Diagnostic-only appends can change run sizes without changing tasks.
-        auto same_run=[](const Json& a,const Json& b) {
-            return a.is_null() || b.is_null()?a==b:a.at("name")==b.at("name");
-        };
-        auto changed=manifest.is_null() || next.value("task_revision",uint64_t(0))!=manifest.value("task_revision",uint64_t(0)) ||
-            next.value("dropped",uint64_t(0))!=manifest.value("dropped",uint64_t(0)) ||
-            !std::equal(next.at("runs").begin(),next.at("runs").end(),manifest.at("runs").begin(),manifest.at("runs").end(),same_run) ||
-            !same_run(next.at("live"),manifest.at("live"));
-        manifest=std::move(next);
-        return changed;
-    } catch(const WinError& error) {
-        if(missing_is_final && (error.code==ERROR_FILE_NOT_FOUND || error.code==ERROR_PATH_NOT_FOUND)) {
-            bool changed=!manifest.is_null(); manifest=Json(); return changed;
-        }
-        throw;
-    }
+bool EventLog::refresh() {
+    auto next=read_json(path_);
+    if(!next.is_object() || next.value("format",0)!=1) throw std::runtime_error("logRecordTooLarge");
+    // File identity detects rebuilt storage even when counters collide.
+    // Diagnostic-only appends can change run sizes without changing tasks.
+    auto same_run=[](const Json& a,const Json& b) {
+        return a.is_null() || b.is_null()?a==b:a.at("name")==b.at("name");
+    };
+    auto changed=manifest.is_null() || next.value("task_revision",uint64_t(0))!=manifest.value("task_revision",uint64_t(0)) ||
+        next.value("dropped",uint64_t(0))!=manifest.value("dropped",uint64_t(0)) ||
+        !std::equal(next.at("runs").begin(),next.at("runs").end(),manifest.at("runs").begin(),manifest.at("runs").end(),same_run) ||
+        !same_run(next.at("live"),manifest.at("live"));
+    manifest=std::move(next);
+    return changed;
 }
 
 fs::path task_directory(const Json& row) {

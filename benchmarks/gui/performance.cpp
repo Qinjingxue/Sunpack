@@ -816,7 +816,7 @@ int wmain(int argc,wchar_t** argv) {
         auto backend_passwords=read_json(dir/"builtin_passwords.json");
         EventLog backend_log; backend_log.set_path(dir/".sunpack_watch"/"events.json");
         measure("model_log_refresh",[&]{
-            ensure(backend_log.refresh(true),"event log refresh failed");
+            ensure(backend_log.refresh(),"event log refresh failed");
         });
         View backend_view;
         Json first_page;

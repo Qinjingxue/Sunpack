@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from sunpack.core.support.path_keys import case_key, path_key, absolute_path_key, path_key_is_under
 from sunpack_native import fast_hash128, NativeWatchCatalog
@@ -34,12 +34,12 @@ from sunpack.runtime.watch.scanner import (
     WatchCandidate,
     scan_watch_candidates,
     validate_ntfs_watch_roots,
+    watch_candidate_for_path as _candidate_for_event_path,
     watch_file_is_ready,
     watch_volume_cursor,
     watch_path_identity,
     watch_catalog_changes,
 )
-from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
 from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore, _recorded_file_presence
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
 from sunpack.runtime.watch.roots import WatchRootEntry, watch_path_available
@@ -61,6 +61,9 @@ from sunpack.core.support.resource_lifecycle import (
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from sunpack.runtime.watch.observer import Observer
+
+if TYPE_CHECKING:
+    from sunpack.pipeline.coordinator.archive_registry import ActiveArchiveRegistry
 
 
 USN_REASON_DATA_OVERWRITE = 0x00000001
@@ -116,13 +119,13 @@ class _ActiveCandidateState:
     epoch: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class _ActivePipelineRequest:
     notification_id: str
     candidate: WatchCandidate
     task: asyncio.Task
     password_signature: str
-    registry_owner: str = ""
+    archive_registry: ActiveArchiveRegistry | None = None
     source_input_root: str = ""
     deep_detect: bool = False
     source_paths: tuple[str, ...] = ()
@@ -133,6 +136,21 @@ class _ActivePipelineRequest:
     cancellation: object = None
     cancellation_pending: asyncio.Future | None = None
     interruption_cleanup_failed: bool = False
+
+
+async def _wait_for_owned_work(future: asyncio.Future):
+    # The waiter may be cancelled repeatedly, but the owner must finish
+    # publishing state and releasing claims before its resources can close.
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = future.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 class WatchScheduler:
@@ -179,15 +197,7 @@ class WatchScheduler:
             stage, file_id, self.state.wait_for_journal,
             tickets, request_id="watch", origin="watch",
         ))
-        cancelled = False
-        while not waiter.done():
-            try:
-                await asyncio.shield(waiter)
-            except asyncio.CancelledError:
-                cancelled = True
-        waiter.result()
-        if cancelled:
-            raise asyncio.CancelledError
+        await _wait_for_owned_work(waiter)
 
     def __init__(
         self,
@@ -259,7 +269,9 @@ class WatchScheduler:
         # Probes and WAL waits run outside; claims cancel probes before publish.
         self._claim_gate = threading.RLock()
         self._active_claims: dict[str, _SourceClaim] = {}
-        self._claims_by_owner: dict[str, set[str]] = {}
+        # Claimed paths can carry the retired pending spellings until their
+        # final owner has reconciled notifications received during the claim.
+        self._claims_by_owner: dict[str, dict[str, tuple[str, ...]]] = {}
         self._dirty_during_claim: dict[str, dict[str, str]] = {}
         self._source_probes: dict[str, _SourceProbe] = {}
         self._password_source_lock = threading.RLock()
@@ -910,7 +922,9 @@ class WatchScheduler:
                 active = list(self._inflight_requests)
             if not active:
                 if self._completion_batches:
-                    await asyncio.gather(*tuple(self._completion_batches), return_exceptions=True)
+                    await _wait_for_owned_work(asyncio.gather(
+                        *self._completion_batches, return_exceptions=True,
+                    ))
                     continue
                 return result
             await asyncio.gather(*(request.task for request in active), return_exceptions=True)
@@ -929,12 +943,7 @@ class WatchScheduler:
                         request_id="watch", origin="watch",
                     )
 
-        task = asyncio.create_task(close())
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
+        await _wait_for_owned_work(asyncio.create_task(close()))
 
     def _close_blocking(self) -> None:
         with self._claim_gate, self._lock:
@@ -1034,19 +1043,21 @@ class WatchScheduler:
             await self.pipeline_engine.work_broker.run(
                 "watch_usn_checkpoint", "watch", self._recover_usn_gap, request_id="watch", origin="watch",
             )
-        active_requests = []
+        submitted = False
         for candidate in ready:
             request = await self._submit_candidate(candidate)
-            if request is not None:
-                active_requests.append(request)
-                # A later candidate may await deferred state I/O. Publish
-                # this request before its task can run during that await.
-                with self._lock:
-                    self._register_inflight_requests_locked((request,))
+            if request is None:
+                self._retire_quiet_tracker(candidate.path)
+                continue
+            submitted = True
+            # A later candidate may await deferred state I/O. Publish
+            # this request before its task can run during that await.
+            with self._lock:
+                self._register_inflight_request_locked(request)
         # Give newly submitted candidate coroutines one scheduling turn.  Fast
         # no-op/failure requests can be harvested in this tick without ever
         # waiting for slow candidates.
-        if active_requests:
+        if submitted:
             await asyncio.sleep(0)
         self._merge_run_result(result, await self._harvest_completed_requests())
         result.pending = self.pending_count
@@ -1072,13 +1083,11 @@ class WatchScheduler:
         if completed:
             finishing = asyncio.gather(
                 *(self._finish_active_request(request) for request in completed),
+                return_exceptions=True,
             )
             self._completion_batches.add(finishing)
             try:
-                finished = await asyncio.shield(finishing)
-            except asyncio.CancelledError:
-                await finishing
-                raise
+                finished = await _wait_for_owned_work(finishing)
             finally:
                 with self._lock:
                     self._unregister_inflight_requests_locked(completed)
@@ -1088,6 +1097,8 @@ class WatchScheduler:
                 if not self._completion_batches:
                     self._completion_batches.clear()
             for single in finished:
+                if isinstance(single, BaseException):
+                    raise single
                 self._merge_run_result(result, single)
         return result
 
@@ -1129,17 +1140,17 @@ class WatchScheduler:
             request.top_level_keys.clear()
             request.source_groups.clear()
             request.source_observations.clear()
-            await self.pipeline_engine.work_broker.run(
-                "watch_release", request.candidate.path, self._release_pipeline_source_claims,
-                request.notification_id, request_path=request.candidate.path,
-                request_id="watch", origin="watch",
-            )
-            if request.registry_owner:
-                from sunpack.runtime.cli.runtime_state import runtime_host
-
-                host = runtime_host()
-                if host is not None:
-                    host.archive_registry.release(request.registry_owner)
+            try:
+                await self.pipeline_engine.work_broker.run(
+                    "watch_release", request.candidate.path, self._release_pipeline_source_claims,
+                    request.notification_id, request_path=request.candidate.path,
+                    request_id="watch", origin="watch",
+                )
+            finally:
+                registry = request.archive_registry
+                request.archive_registry = None
+                if registry is not None:
+                    registry.release(request.notification_id)
 
     @staticmethod
     def _merge_run_result(target: WatchRunResult, source: WatchRunResult) -> None:
@@ -1148,18 +1159,10 @@ class WatchScheduler:
         target.failed += source.failed
         target.errors.extend(source.errors)
 
-    @staticmethod
-    def _scheduler_path_key(path: str) -> str:
-        return case_key(os.path.abspath(path))
-
-    def _register_inflight_requests_locked(
-        self,
-        requests: Iterable[_ActivePipelineRequest],
-    ) -> None:
-        for request in requests:
-            self._inflight_requests.append(request)
-            key = self._scheduler_path_key(request.candidate.path)
-            self._inflight_path_counts[key] = self._inflight_path_counts.get(key, 0) + 1
+    def _register_inflight_request_locked(self, request: _ActivePipelineRequest) -> None:
+        self._inflight_requests.append(request)
+        key = absolute_path_key(request.candidate.path)
+        self._inflight_path_counts[key] = self._inflight_path_counts.get(key, 0) + 1
 
     def _unregister_inflight_requests_locked(
         self,
@@ -1167,7 +1170,7 @@ class WatchScheduler:
     ) -> None:
         for request in requests:
             path = request.candidate.path
-            key = self._scheduler_path_key(path)
+            key = absolute_path_key(path)
             count = self._inflight_path_counts.get(key, 0)
             if count <= 1:
                 self._inflight_path_counts.pop(key, None)
@@ -1197,7 +1200,7 @@ class WatchScheduler:
         *,
         path_key_value: str | None = None,
     ) -> None:
-        key = path_key_value or self._scheduler_path_key(path)
+        key = path_key_value or absolute_path_key(path)
         if key in self._inflight_path_counts:
             return
         heapq.heappush(
@@ -1210,19 +1213,23 @@ class WatchScheduler:
                 path,
             ),
         )
-        if len(self._ready_heap) > max(64, len(self._active_states) * 2):
-            # Later deadlines can accumulate behind an unchanged live head.
-            # Compact amortized from queued entries, never reschedule candidates
-            # whose admission already popped their deadline from the heap.
-            current = {}
-            for entry in self._ready_heap:
-                _, epoch, generation, key, path = entry
-                active = self._active_states.get(path)
-                if (active is not None and active.epoch == epoch
-                        and active.generation == generation and key not in self._inflight_path_counts):
-                    current[path] = entry
-            self._ready_heap = list(current.values())
-            heapq.heapify(self._ready_heap)
+        self._compact_ready_heap_locked()
+
+    def _compact_ready_heap_locked(self) -> None:
+        count = len(self._ready_heap)
+        if count <= 64 or count <= len(self._active_states) * 2:
+            return
+        # Later deadlines can accumulate behind an unchanged live head.
+        # Compact from queued entries so already dequeued admissions stay out.
+        current = {}
+        for entry in self._ready_heap:
+            _, epoch, generation, key, path = entry
+            active = self._active_states.get(path)
+            if (active is not None and active.epoch == epoch
+                    and active.generation == generation and key not in self._inflight_path_counts):
+                current[path] = entry
+        self._ready_heap = list(current.values())
+        heapq.heapify(self._ready_heap)
 
     def _next_ready_entry_locked(self) -> tuple[float, int, int, str, str] | None:
         while self._ready_heap:
@@ -1245,8 +1252,11 @@ class WatchScheduler:
             return len(self._pending)
 
     def next_delay_seconds(self) -> float | None:
-        now = monotonic_now = time.monotonic()
+        now = time.monotonic()
         with self._lock:
+            # A claim or departure can shrink the active set without another
+            # push. Release stale entries before waiting on a live deadline.
+            self._compact_ready_heap_locked()
             if (self._directory_pending or self._watch_rearm or self._usn_checkpoint_pending
                     or self._password_update_reload is not None):
                 return 0.0
@@ -1261,14 +1271,14 @@ class WatchScheduler:
                 else max(0.0, next_ready[0] - now)
             )
             if self._password_retry_at is not None:
-                password_delay = max(0.0, self._password_retry_at - monotonic_now)
+                password_delay = max(0.0, self._password_retry_at - now)
                 delay = password_delay if delay is None else min(delay, password_delay)
             if self._cache_cleanup_deadline is not None and not self._cache_cleanup_blocked_locked():
-                cleanup_delay = max(0.0, self._cache_cleanup_deadline - monotonic_now)
+                cleanup_delay = max(0.0, self._cache_cleanup_deadline - now)
                 delay = cleanup_delay if delay is None else min(delay, cleanup_delay)
         history_expiry = self.log.next_history_expiry
         if history_expiry is not None:
-            history_delay = max(0.0, history_expiry - monotonic_now)
+            history_delay = max(0.0, history_expiry - now)
             delay = history_delay if delay is None else min(delay, history_delay)
         return delay
 
@@ -1576,16 +1586,17 @@ class WatchScheduler:
 
     def _store_pending_locked(self, path: str, candidate: WatchCandidate) -> None:
         if path not in self._pending:
-            key = path_key(os.path.abspath(path))
+            key = absolute_path_key(path)
             self._pending_by_key.setdefault(key, set()).add(path)
         self._pending[path] = candidate
 
     def _remove_pending_locked(
-        self, path: str, *, normalized_key: str | None = None,
+        self, path: str,
     ) -> WatchCandidate | None:
         candidate = self._pending.pop(path, None)
         if candidate is not None:
-            key = normalized_key if normalized_key is not None else path_key(os.path.abspath(path))
+            self._active_states.pop(path, None)
+            key = absolute_path_key(path)
             paths = self._pending_by_key[key]
             paths.remove(path)
             if not paths:
@@ -1593,6 +1604,8 @@ class WatchScheduler:
                 if not self._pending_by_key:
                     # pop/del retain an empty dict's peak table allocation.
                     self._pending_by_key.clear()
+                    self._pending.clear()
+                    self._active_states.clear()
         return candidate
 
     def _defer_claimed_path_locked(self, path: str) -> bool:
@@ -1619,10 +1632,10 @@ class WatchScheduler:
         ordinary_claim = _SourceClaim(owner)
         promoted_claim = None
         promoted = False
-        retired_pending: list[tuple[str, str]] = []
+        retired_count = 0
         with self._claim_gate:
             claimed_keys = [path_key(path) for path in normalized]
-            owned_keys = self._claims_by_owner.setdefault(owner, set())
+            owned_keys = self._claims_by_owner.setdefault(owner, {})
             for key in claimed_keys:
                 probe = self._source_probes.pop(key, None)
                 if probe is not None:
@@ -1631,7 +1644,7 @@ class WatchScheduler:
                 previous_owner = previous_claim.owner if previous_claim else ""
                 if previous_owner and previous_owner != owner:
                     previous_keys = self._claims_by_owner[previous_owner]
-                    previous_keys.remove(key)
+                    owned_keys[key] = previous_keys.pop(key)
                     if not previous_keys:
                         del self._claims_by_owner[previous_owner]
                     previous_dirty = self._dirty_during_claim.get(previous_owner)
@@ -1646,18 +1659,23 @@ class WatchScheduler:
                     promoted_claim = _SourceClaim(owner, True)
                 self._active_claims[key] = promoted_claim if source_promoted else ordinary_claim
                 promoted |= source_promoted
-                owned_keys.add(key)
+                owned_keys.setdefault(key, ())
             if not self._source_probes:
                 self._source_probes.clear()
             with self._lock:
-                retired_pending = [
-                    (key, candidate_path)
-                    for key in claimed_keys
-                    for candidate_path in self._pending_by_key.get(key, ())
-                ]
-                for key, candidate_path in retired_pending:
-                    self._remove_pending_locked(candidate_path, normalized_key=key)
-                    self._active_states.pop(candidate_path, None)
+                for key in claimed_keys:
+                    aliases = self._pending_by_key.pop(key, None)
+                    if aliases is None:
+                        continue
+                    owned_keys[key] = tuple(aliases)
+                    retired_count += len(aliases)
+                    for candidate_path in aliases:
+                        self._pending.pop(candidate_path)
+                        self._active_states.pop(candidate_path, None)
+                if not self._pending_by_key:
+                    self._pending_by_key.clear()
+                    self._pending.clear()
+                    self._active_states.clear()
         self.log.write(
             "pipeline_sources_claimed",
             path=path,
@@ -1665,7 +1683,7 @@ class WatchScheduler:
             processing=processing,
             owner=owner,
             path_count=len(normalized),
-            retired_pending=len(retired_pending),
+            retired_pending=retired_count,
         )
         return promoted
 
@@ -1675,13 +1693,17 @@ class WatchScheduler:
         reconcile: list[str] = []
         released = 0
         with self._claim_gate:
-            owned_keys = self._claims_by_owner.pop(owner, ())
+            owned_keys = self._claims_by_owner.pop(owner, {})
             if not self._claims_by_owner:
                 self._claims_by_owner.clear()
             for key in owned_keys:
                 self._active_claims.pop(key, None)
+            if not self._active_claims:
+                self._active_claims.clear()
             released = len(owned_keys)
             dirty = self._dirty_during_claim.pop(owner, {})
+            if not self._dirty_during_claim:
+                self._dirty_during_claim.clear()
             reconcile = [
                 path
                 for key, path in dirty.items()
@@ -1696,8 +1718,25 @@ class WatchScheduler:
                 released=released,
                 dirty=len(reconcile),
             )
-        for dirty_path in reconcile:
-            self.enqueue(dirty_path, event_type="pipeline_claim_released")
+        try:
+            for dirty_path in reconcile:
+                self.enqueue(dirty_path, event_type="pipeline_claim_released")
+        finally:
+            if owned_keys:
+                with self._claim_gate, self._lock:
+                    for key, aliases in owned_keys.items():
+                        if not aliases:
+                            continue
+                        claim = self._active_claims.get(key)
+                        if claim is not None:
+                            # An overlapping request can take ownership while
+                            # replay runs. It now owns the observations too.
+                            current = self._claims_by_owner[claim.owner]
+                            existing = current[key]
+                            current[key] = tuple(dict.fromkeys((*existing, *aliases))) if existing else aliases
+                        else:
+                            for path in aliases:
+                                self._retire_quiet_tracker_locked(path, key)
 
     def should_ignore_event_path(self, path: str) -> bool:
         if not path:
@@ -1707,7 +1746,7 @@ class WatchScheduler:
                 or self._outputs.protected(path))
 
     def _log_candidate_ignored(self, path: str, reason: str, **payload) -> None:
-        normalized = case_key(os.path.abspath(str(path))) if path else ""
+        normalized = absolute_path_key(path) if path else ""
         self.log.write_throttled(
             "candidate_ignored",
             throttle_key=f"{normalized}|{reason}",
@@ -1720,7 +1759,7 @@ class WatchScheduler:
     def is_builtin_password_file(self, path: str) -> bool:
         if not path:
             return False
-        return case_key(os.path.abspath(path)) == case_key(self.builtin_password_file)
+        return absolute_path_key(path) == case_key(self.builtin_password_file)
 
     def notify_password_source_changed(self, reason: str, path: str = "") -> None:
         self._schedule_password_update(reload=True)
@@ -1811,11 +1850,10 @@ class WatchScheduler:
             for mapping, rows in snapshots:
                 for key, value in rows:
                     if (key not in missing or mapping.get(key) is not value
-                            or path_key(os.path.abspath(key)) in self._source_probes):
+                            or absolute_path_key(key) in self._source_probes):
                         continue
                     if mapping is self._pending:
                         self._remove_pending_locked(key)
-                        self._active_states.pop(key, None)
                         pending_paths.append(key)
                     else:
                         mapping.pop(key, None)
@@ -1856,10 +1894,12 @@ class WatchScheduler:
             internal = bool(pending and pending.internal_recovery)
             if self.should_ignore_event_path(candidate.path) and not internal:
                 self.state.complete_work([candidate.path])
+                self._retire_quiet_tracker(candidate.path)
                 self.log.write("task_retired", path=candidate.path)
                 continue
             root = self._source_input_root_for(candidate.path)
             if path_key(root) not in self.root_entries:
+                self._retire_quiet_tracker(candidate.path)
                 self.log.write("processing_deferred_missing_input_root", path=candidate.path, source_input_root=root)
                 continue
             scope = pending.discovery_scope if internal else self.scopes[path_key(root)].to_record()
@@ -1950,7 +1990,7 @@ class WatchScheduler:
                     with self._claim_gate:
                         if admit():
                             self._record_boundary_activity(path, epoch, generation, refreshed, now, content_changed=False)
-                    self.log.write_throttled("candidate_busy", throttle_key=case_key(os.path.abspath(path)),
+                    self.log.write_throttled("candidate_busy", throttle_key=absolute_path_key(path),
                                              interval_seconds=30.0, path=path)
                     continue
                 self.state.record_attempt(refreshed.path, refreshed.size, refreshed.mtime,
@@ -1961,7 +2001,6 @@ class WatchScheduler:
                     with self._lock:
                         ready.append(refreshed)
                         self._remove_pending_locked(path)
-                        self._active_states.pop(path, None)
                 self.log.write("candidate_quiet", path=path, generation=generation, quiet_seconds=quiet_seconds)
             except Exception as exc:
                 with self._claim_gate:
@@ -1969,7 +2008,7 @@ class WatchScheduler:
                         self._record_boundary_activity(path, epoch, generation, candidate, now, content_changed=False)
                 try:
                     self.log.write_throttled(
-                        "candidate_error", throttle_key=self._scheduler_path_key(path), interval_seconds=30.0,
+                        "candidate_error", throttle_key=absolute_path_key(path), interval_seconds=30.0,
                         path=path, error=str(exc), error_type=type(exc).__name__,
                     )
                 except Exception:
@@ -1988,7 +2027,6 @@ class WatchScheduler:
             ):
                 return
             self._remove_pending_locked(path)
-            self._active_states.pop(path, None)
             self._quiet_trackers.pop(path, None)
             self._catalog.forget_observation(path)
             if not self._quiet_trackers:
@@ -2055,20 +2093,22 @@ class WatchScheduler:
 
     def _retire_quiet_tracker(self, path: str) -> None:
         with self._claim_gate, self._lock:
-            key = path_key(os.path.abspath(path))
-            if (key in self._pending_by_key or key in self._inflight_path_counts
-                    or key in self._active_claims):
-                return
-            tracker = self._quiet_trackers.pop(path, None)
-            self._catalog.retire_observation(
-                path,
-                quiet_seconds=tracker.quiet_seconds if tracker is not None else None,
-                last_content_event_at=tracker.last_content_event_at if tracker is not None else None,
-                cadence_seconds=tracker.cadence_seconds if tracker is not None else 0.0,
-                pending_interval_seconds=tracker.pending_interval_seconds if tracker is not None else 0.0,
-            )
-            if not self._quiet_trackers:
-                self._quiet_trackers.clear()
+            self._retire_quiet_tracker_locked(path, absolute_path_key(path))
+
+    def _retire_quiet_tracker_locked(self, path: str, key: str) -> None:
+        if (key in self._pending_by_key or key in self._inflight_path_counts
+                or key in self._active_claims or key in self._source_probes):
+            return
+        tracker = self._quiet_trackers.pop(path, None)
+        self._catalog.retire_observation(
+            path,
+            quiet_seconds=tracker.quiet_seconds if tracker is not None else None,
+            last_content_event_at=tracker.last_content_event_at if tracker is not None else None,
+            cadence_seconds=tracker.cadence_seconds if tracker is not None else 0.0,
+            pending_interval_seconds=tracker.pending_interval_seconds if tracker is not None else 0.0,
+        )
+        if not self._quiet_trackers:
+            self._quiet_trackers.clear()
 
     def _candidate_baseline_locked(self, path: str) -> WatchCandidate | NativeWatchObservation | None:
         normalized = os.path.abspath(path)
@@ -2185,9 +2225,9 @@ class WatchScheduler:
         from sunpack.runtime.cli.runtime_state import runtime_host
 
         host = runtime_host()
-        reservation_paths = [candidate.path]
-        if host is not None:
-            conflict = host.archive_registry.reserve(notification_id, "watch", reservation_paths)
+        archive_registry = host.archive_registry if host is not None else None
+        if archive_registry is not None:
+            conflict = archive_registry.reserve(notification_id, "watch", (candidate.path,))
             if conflict is not None:
                 self.log.write(
                     "processing_deferred_active_owner",
@@ -2218,14 +2258,14 @@ class WatchScheduler:
                 ),
                 request_config=run_config,
                 origin="watch",
-                discovery_scope=internal_scope or self.scopes[path_key(source_input_root)],
+                discovery_scope=scope,
                 catalog=None if internal_scope else (self._catalog, self._scan_options_for(scope), candidate.path),
                 detection_options=options,
                 cancellation=cancellation,
             ))
         except BaseException:
-            if host is not None:
-                host.archive_registry.release(notification_id)
+            if archive_registry is not None:
+                archive_registry.release(notification_id)
             raise
         self._reset_idle_cache_cleanup()
         task.add_done_callback(lambda _task: self._wake_service())
@@ -2236,7 +2276,7 @@ class WatchScheduler:
             candidate=candidate,
             task=task,
             password_signature=password_signature,
-            registry_owner=notification_id if host is not None else "",
+            archive_registry=archive_registry,
             source_input_root=source_input_root,
             deep_detect=options.force_scan,
             password_scope_dir=run_config["password_scope_dir"],
@@ -2669,7 +2709,7 @@ class WatchScheduler:
                 path for path in normalized
                 if path_key(path) not in self._pending_by_key and path_key(path) not in inflight_candidates
             ]
-            candidate_pending = path_key(os.path.abspath(candidate.path)) in self._pending_by_key
+            candidate_pending = absolute_path_key(candidate.path) in self._pending_by_key
         cleared = list(retired)
         for path in normalized:
             inflight = inflight_candidates.get(path_key(path))
@@ -2847,12 +2887,6 @@ class _WatchEventHandler(FileSystemEventHandler):
             )
 
 
-def _candidate_for_event_path(path: str, *, since_usn: int = 0) -> WatchCandidate | None:
-    if not path:
-        return None
-    return _watch_candidate_for_path(path, since_usn=since_usn)
-
-
 def _candidate_observation_changed(previous: WatchCandidate | NativeWatchObservation, current: WatchCandidate) -> bool:
     return (
         previous.size != current.size
@@ -2864,7 +2898,7 @@ def _candidate_observation_changed(previous: WatchCandidate | NativeWatchObserva
 
 def _candidate_matches_password_failure(candidate: WatchCandidate, entry: WatchStateEntry) -> bool:
     return (
-        case_key(os.path.abspath(candidate.path)) == case_key(os.path.abspath(entry.path))
+        absolute_path_key(candidate.path) == absolute_path_key(entry.path)
         and _candidate_change_kind(_candidate_from_state_entry(entry), candidate)
         != _CandidateChangeKind.CONTENT_CHANGED
     )
@@ -2945,8 +2979,8 @@ def _response_claimed_paths(response: PipelineResponse, fallback_path: str) -> l
 
 
 def _target_result_for_path(summary: RunSummary, path: str) -> TargetRunResult | None:
-    expected = path_key(os.path.abspath(path))
-    return next((item for item in summary.target_results if path_key(os.path.abspath(item.input_path)) == expected), None)
+    expected = absolute_path_key(path)
+    return next((item for item in summary.target_results if absolute_path_key(item.input_path) == expected), None)
 
 
 def _summary_outcome_kind(summary: RunSummary, target_result: TargetRunResult | None) -> OutcomeKind:

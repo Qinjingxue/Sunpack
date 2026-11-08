@@ -61,6 +61,29 @@ Json page_value(UiPage page,const char* name) {
     if(!value) return Json();
     std::string text(value); ui_page_free(value); return parse_json(text);
 }
+// The window already owns the tree. Register only the child used by the C API.
+ui::Widget* find_widget(ui::UiWindowImpl* owner,const std::string& id) {
+    return owner && owner->Root()?owner->Root()->FindById(id):nullptr;
+}
+class ScopedWidget {
+    UiWidget handle_;
+public:
+    explicit ScopedWidget(UiWidget handle):handle_(handle) {}
+    ~ScopedWidget() { if(handle_) ui_widget_destroy(handle_); }
+    ScopedWidget(const ScopedWidget&)=delete;
+    ScopedWidget& operator=(const ScopedWidget&)=delete;
+    operator UiWidget() const { return handle_; }
+};
+ScopedWidget widget_handle(UiWindow window,const std::string& id) {
+    auto& context=ui::GetContext();
+    auto* widget=find_widget(context.GetWindow(window),id);
+    return ScopedWidget(widget?context.handles.Insert(widget->shared_from_this()):0);
+}
+void scroll_top(UiWindow window,const std::string& id) {
+    auto* owner=ui::GetContext().GetWindow(window);
+    if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(find_widget(owner,id)))
+        owner->ScrollWithMeasureContext(scroll,0);
+}
 void set_text(UiPage page,const char* name,const std::string& value) {
     auto encoded=Json(value).dump(); ui_page_set_json(page,name,encoded.c_str());
 }
@@ -115,10 +138,8 @@ void Application::changed(unsigned flags) {
 void Application::publish(Json patch) {
     std::lock_guard<std::mutex> lock(mutex_);
     if(stopping_) return;
-    // Preserve all deltas while an earlier UI update is still pending.
     // A later full snapshot supersedes previous incremental updates.
     if(patch.contains("passwords")) pending_.erase("passwordDelta");
-    if(patch.contains("passwordDelta") && pending_.contains("passwords")) patch.erase("passwordDelta");
     if(patch.contains("tasks") && pending_.contains("tasks") &&
         patch["tasks"]["generation"]==pending_["tasks"]["generation"] && pending_["tasks"].value("reset",false))
         patch["tasks"]["reset"]=true;
@@ -378,10 +399,7 @@ void Application::apply_pending() {
         if(list && !list->Indices().empty()) task_snapshot["range"]={{"first",list->Indices().front()},{"last",list->Indices().back()+1}};
         auto encoded=task_snapshot.dump();
         if(ui_page_call_json(page_,"applyTasks",encoded.c_str())!=0) throw std::runtime_error("uiBindingFailed");
-        if(task_snapshot.value("reset",false)) {
-            auto widget=ui_widget_find_by_id(ui_page_root(page_),"taskListScroll");
-            if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
-        }
+        if(task_snapshot.value("reset",false)) scroll_top(window_,"taskListScroll");
         schedule_task_range();
     }
     if(!directory_snapshot.is_null()) {
@@ -408,11 +426,8 @@ void Application::apply_pending() {
                 it=controls_.erase(it); continue;
             }
             if(it->second->field["editor"]=="toggle") { ++it; continue; }
-            auto widget=ui_widget_find_by_id(ui_page_root(page_),("select-"+it->first).c_str());
-            if(widget) {
-                if(!drafts.contains(it->first)) ui_combobox_set_selected(widget,it->second->field["choice"].get<int>());
-                ui_widget_destroy(widget);
-            }
+            auto widget=widget_handle(window_,"select-"+it->first);
+            if(widget && !drafts.contains(it->first)) ui_combobox_set_selected(widget,it->second->field["choice"].get<int>());
             ++it;
         }
     }
@@ -422,10 +437,7 @@ void Application::apply_pending() {
     if(!ack.is_null() || !directory_snapshot.is_null()) ui_page_call_json(page_,"pruneRootDrafts","{}");
     if(patch.contains("fields") || !ack.is_null()) sync_toggles();
     if(patch.contains("fields") || !ack.is_null()) sync_tags();
-    for(auto& id:reset_scroll) {
-        auto widget=ui_widget_find_by_id(ui_page_root(page_),id.get<std::string>().c_str());
-        if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
-    }
+    for(auto& id:reset_scroll) scroll_top(window_,id.get_ref<const std::string&>());
     // Only an acknowledgement advances the save queue. Data/log publishes
     // must not rewrite recordSaving/pendingFields and rebind hidden editors.
     if(!ack.is_null()) start_save();
@@ -477,10 +489,10 @@ void Application::navigate(const std::string& tab) {
 void Application::sync_toggles() {
     auto drafts=page_value(page_,"toggleDrafts");
     for(auto& pair:controls_) if(pair.second->field["editor"]=="toggle") {
-        auto widget=ui_widget_find_by_id(ui_page_root(page_),("toggle-"+pair.first).c_str());
+        auto widget=widget_handle(window_,"toggle-"+pair.first);
         if(!widget) continue;
         bool on=drafts.contains(pair.first)?drafts[pair.first]["boolean"].get<bool>():pair.second->field["boolean"].get<bool>();
-        ui_toggle_set_on(widget,on); ui_widget_destroy(widget);
+        ui_toggle_set_on(widget,on);
     }
 }
 void Application::sync_tags(const std::string& id) {
@@ -579,7 +591,7 @@ void Application::bind_controls(const Json& fields) {
     }
 }
 void Application::rebuild_theme(const std::string& language) {
-    auto host=ui_widget_find_by_id(ui_page_root(page_),"themeHost");
+    auto host=widget_handle(window_,"themeHost");
     if(!host) return;
     if(theme_widget_) { ui_widget_remove_child(host,theme_widget_); ui_widget_destroy(theme_widget_); theme_widget_=0; }
     std::wstring labels[]={wide(tr("system",language)),wide(tr("light",language)),wide(tr("dark",language))};
@@ -592,10 +604,10 @@ void Application::rebuild_theme(const std::string& language) {
         set_text(self->page_,"theme",index==1?"light":index==2?"dark":"system");
         apply_theme(self->page_,index==1?UI_THEME_LIGHT:index==2?UI_THEME_DARK:system_theme(),self->hwnd_);
     },this);
-    ui_widget_add_child(host,theme_widget_); ui_widget_destroy(host);
-    host=ui_widget_find_by_id(ui_page_root(page_),"taskStatusHost");
-    if(!host) return;
-    if(status_widget_) { ui_widget_remove_child(host,status_widget_); ui_widget_destroy(status_widget_); }
+    ui_widget_add_child(host,theme_widget_);
+    auto status_host=widget_handle(window_,"taskStatusHost");
+    if(!status_host) return;
+    if(status_widget_) { ui_widget_remove_child(status_host,status_widget_); ui_widget_destroy(status_widget_); }
     std::vector<std::wstring> statuses={wide(tr("allStatus",language))};
     for(auto& status:page_value(page_,"statusNames")) if(status!="") statuses.push_back(wide(tr(status.get<std::string>(),language)));
     std::vector<const wchar_t*> status_texts; for(auto& status:statuses) status_texts.push_back(status.c_str());
@@ -607,7 +619,7 @@ void Application::rebuild_theme(const std::string& language) {
         ui_page_set_int(self->page_,"taskStatus",index);
         ui_page_call_json(self->page_,"filterTasks","{}");
     },this);
-    ui_widget_add_child(host,status_widget_); ui_widget_destroy(host);
+    ui_widget_add_child(status_host,status_widget_);
 }
 void Application::dispatch() {
     VisualBatch visual(window_);
@@ -635,8 +647,8 @@ void Application::handle_command(Json command) {
         return;
     }
     if(op=="focusTag") {
-        auto widget=ui_widget_find_by_id(ui_page_root(page_),("tag-input-"+p.at("id").get<std::string>()).c_str());
-        if(widget) { ui_window_focus_widget(window_,widget); ui_widget_destroy(widget); }
+        auto widget=widget_handle(window_,"tag-input-"+p.at("id").get<std::string>());
+        if(widget) ui_window_focus_widget(window_,widget);
         return;
     }
     if(op=="syncTags") { sync_tags(p.at("id").get<std::string>()); return; }
@@ -653,10 +665,7 @@ void Application::handle_command(Json command) {
             set_text(page_,"configCategory",p.at("category").get<std::string>());
         }
         const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":nullptr;
-        if(scroll) {
-            auto widget=ui_widget_find_by_id(ui_page_root(page_),scroll);
-            if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
-        }
+        if(scroll) scroll_top(window_,scroll);
         return;
     }
     if(op=="clearRootError") { save_error("@root:"+p.at("id").get<std::string>(),""); return; }
@@ -684,10 +693,7 @@ void Application::handle_command(Json command) {
         }
         if(root) { if((part!="input" && part!="output") || page_value(page_,"rootCell")!=id || page_value(page_,"rootPart")!=part) return; }
         else if(part!="value" || page_value(page_,"passwordCell")!=id) return;
-        if(p.value("top",false)) {
-            auto scroll=ui_widget_find_by_id(ui_page_root(page_),root?"rootListScroll":"passwordListScroll");
-            if(scroll) { ui_debug_scroll_set(scroll,0); ui_widget_destroy(scroll); }
-        }
+        if(p.value("top",false)) scroll_top(window_,root?"rootListScroll":"passwordListScroll");
         ui_window_relayout(window_);
         auto* target=window->Root()->FindById(root?"root-"+part+"-input-"+id:"password-input-"+id);
         if(target) {
@@ -734,11 +740,9 @@ void Application::handle_command(Json command) {
         auto id=p.at("id").get<std::string>();
         if(page_value(page_,"tab")!="config") return;
         ui_window_relayout(window_);
-        auto root=ui_page_root(page_);
-        auto anchor=ui_widget_find_by_id(root,("range-"+side+"-"+id).c_str());
-        ui_widget_destroy(root);
+        auto anchor=widget_handle(window_,"range-"+side+"-"+id);
         if(!anchor) return; // The virtual row may have been filtered/unmounted.
-        auto rect=ui_widget_get_rect(anchor); ui_widget_destroy(anchor);
+        auto rect=ui_widget_get_rect(anchor);
         auto dpi=ui_window_dpi(window_);
         POINT start{LONG(std::lround(rect.left*dpi/96)),LONG(std::lround(rect.top*dpi/96))};
         POINT end{LONG(std::lround(rect.right*dpi/96)),LONG(std::lround(rect.bottom*dpi/96))};
@@ -1098,14 +1102,14 @@ void Application::work() {
                         auto result=save_changes(dir,p.value("fields",Json::array()),
                             password_edits,
                             kind=="roots"?p.at("edits"):Json::array(),
-                            &saved_passwords);
+                            &saved_passwords,last_passwords);
                         std::string password_original;
                         for(auto& section:result["saved"]) {
                             if(section=="config") flags|=Config;
                             if(section=="passwords") {
                                 // The atomic write already validated and built this snapshot.
-                                // Under the single-writer GUI contract there is no need to
-                                // parse the same file again after our own rename notification.
+                                // Our own rename notification can reuse it. Concurrent changes
+                                // are detected against the bytes read under the write lock.
                                 passwords=std::move(saved_passwords.document);
                                 last_passwords=std::move(saved_passwords.file_text);
                                 passwords_read=true;
@@ -1116,7 +1120,7 @@ void Application::work() {
                                 const auto edit=p.find("edit");
                                 if(!saved_passwords.record.is_null()) password_original=saved_passwords.record.dump();
                                 if(edit!=p.end() && edit->value("operation",std::string())=="replace" &&
-                                   !saved_passwords.count_changed && !password_original.empty() && !saved_passwords.record.contains("scopes") &&
+                                   saved_passwords.delta_base_matches && !password_original.empty() && !saved_passwords.record.contains("scopes") &&
                                    edit->at("values").size()<=1 && view.password_query.empty() && view.password_scope=="@all" &&
                                    !passwords_changed && previous_patch.contains("passwords")) {
                                     password_delta={{"scope",view.password_scope},{"original",edit->at("original")},
@@ -1278,7 +1282,14 @@ void Application::work() {
                 } catch(...) {} // A later log operation can request recovery again.
             }
             if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
-                if(!password_delta.is_null() && !language_changed && previous_patch.contains("passwords"))
+                bool send_delta=!password_delta.is_null() && !language_changed && previous_patch.contains("passwords");
+                if(send_delta) {
+                    // This worker is the sole password publisher. An earlier full
+                    // snapshot can only be drained between here and publication.
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    send_delta=!pending_.contains("passwords");
+                }
+                if(send_delta)
                     patch["passwordDelta"]=std::move(password_delta);
                 else patch["passwords"]=password_rows(passwords,view);
             }

@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from sunpack.core.support.archive_sessions import (
+    borrow_archive_sessions,
     clear_archive_sessions,
     get_archive_session,
     release_archive_sessions_under_roots,
@@ -189,28 +190,22 @@ def test_multi_volume_view_registers_and_releases_every_member(tmp_path):
         view.read_at(0, 1)
 
 
-def test_shared_session_cache_waits_for_all_task_borrowers(tmp_path):
+def test_shared_session_cache_waits_for_all_probe_borrowers(tmp_path):
     path = tmp_path / "shared.bin"
     path.write_bytes(b"payload")
-    first_scope = TaskResourceScope("first-borrower")
-    second_scope = TaskResourceScope("second-borrower")
-    with first_scope.activate():
-        first = get_archive_session(os.fspath(path))
-    with second_scope.activate():
-        second = get_archive_session(os.fspath(path))
-    assert first is second
     released = threading.Event()
 
     def release() -> None:
         release_archive_sessions_under_roots((os.fspath(tmp_path),))
         released.set()
 
-    worker = threading.Thread(target=release)
-    worker.start()
-    assert not released.wait(0.05)
-    first_scope.close()
-    assert not released.wait(0.05)
-    second_scope.close()
+    with borrow_archive_sessions((path,)) as (first,):
+        with borrow_archive_sessions((path,)) as (second,):
+            assert first is second
+            worker = threading.Thread(target=release)
+            worker.start()
+            assert not released.wait(0.05)
+        assert not released.wait(0.05)
     worker.join(1.0)
 
     assert released.is_set()

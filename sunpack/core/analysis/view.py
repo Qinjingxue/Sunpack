@@ -75,12 +75,13 @@ class SharedBinaryView(_BinaryView):
         cache_bytes: int = 64 * 1024 * 1024,
     ):
         self.path = path
-        with lifecycle_registration((path,)):
-            session = get_archive_session(path)
+        with lifecycle_registration((path,)) as identities:
+            # The native view owns its reader independently of the cached session.
+            session = get_archive_session(path, identity=identities[0])
             self._native = session.analysis_view(
                 cache_bytes=max(0, int(cache_bytes or 0)),
             )
-            self._register_native((path,), ResourceKind.NATIVE_ANALYSIS_VIEW)
+            self._register_native(identities, ResourceKind.NATIVE_ANALYSIS_VIEW)
 
 
 class MultiVolumeBinaryView(_BinaryView):
@@ -99,12 +100,12 @@ class MultiVolumeBinaryView(_BinaryView):
         volumes = _volume_paths(paths)
         if not volumes:
             raise ValueError("MultiVolumeBinaryView requires at least one volume")
-        with lifecycle_registration(volumes):
+        with lifecycle_registration(volumes) as identities:
             self._native = _NativeAnalysisMultiVolumeView(
                 volumes,
                 cache_bytes=max(0, int(cache_bytes or 0)),
             )
-            self._register_native(volumes, ResourceKind.NATIVE_MULTI_VOLUME_VIEW)
+            self._register_native(identities, ResourceKind.NATIVE_MULTI_VOLUME_VIEW)
         self.path = str(self._native.path)
 
 

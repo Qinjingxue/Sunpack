@@ -127,46 +127,27 @@ namespace sunpack::sevenzip
         }
     }
 
-    VolumeWriterRegistry::Aggregate VolumeWriterRegistry::snapshot() const
-    {
-        std::vector<std::shared_ptr<AsyncFileWriter>> writers;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            writers.reserve(entries_.size());
-            for (const auto &item : entries_)
-            {
-                if (item.second.writer)
-                {
-                    writers.push_back(item.second.writer);
-                }
-            }
-        }
-        Aggregate aggregate;
-
-        aggregate.meters = snapshot_counters(meters_->counters);
-        aggregate.live_facilities = writers.size();
-        for (const auto &writer : writers)
-        {
-            if (writer->has_active_jobs())
-            {
-                aggregate.any_active_jobs = true;
-            }
-        }
-        return aggregate;
-    }
-
     std::vector<std::string> VolumeWriterRegistry::reap_idle()
     {
         std::vector<std::string> reclaimed;
         std::vector<std::shared_ptr<AsyncFileWriter>> retired;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            const auto previous_size = entries_.size();
             const auto now = std::chrono::steady_clock::now();
+            std::size_t retained_states = 0;
             for (auto it = entries_.begin(); it != entries_.end();)
             {
                 Entry &entry = it->second;
+                // Only persistent entries survive without a writer.
+                if (!entry.writer)
+                {
+                    ++retained_states;
+                    ++it;
+                    continue;
+                }
                 const bool armed = entry.reap_deadline != std::chrono::steady_clock::time_point{};
-                if (entry.leases != 0 || !entry.writer || !armed ||
+                if (entry.leases != 0 || !armed ||
                     now < entry.reap_deadline ||
                     !entry.writer->is_quiescent())
                 {
@@ -178,49 +159,35 @@ namespace sunpack::sevenzip
                 if (entry.state && entry.state->persistent)
                 {
                     entry.reap_deadline = std::chrono::steady_clock::time_point{};
+                    ++retained_states;
                     ++it;
                 }
                 else
                 {
                     it = entries_.erase(it);
                 }
-                ++reclaimed_count_;
             }
 
-            const auto is_retained_state = [](const Entry &entry) noexcept
-            {
-                return entry.state && entry.state->persistent && entry.leases == 0 &&
-                       !entry.writer;
-            };
-            std::size_t retained_states = 0;
-            for (const auto &item : entries_)
-            {
-                if (is_retained_state(item.second))
-                {
-                    ++retained_states;
-                }
-            }
             if (retained_states > kMaxRetainedVolumeStates)
             {
                 std::size_t to_remove = retained_states - kMaxRetainedVolumeStates;
-                bool trimmed = false;
                 for (auto it = entries_.begin(); it != entries_.end() && to_remove != 0;)
                 {
-                    if (is_retained_state(it->second))
+                    if (!it->second.writer)
                     {
                         it = entries_.erase(it);
                         --to_remove;
-                        trimmed = true;
                     }
                     else
                     {
                         ++it;
                     }
                 }
-                if (trimmed)
-                {
-                    entries_.rehash(0);
-                }
+            }
+            if (entries_.size() < previous_size &&
+                entries_.bucket_count() > (std::max)(kMaxRetainedVolumeStates, entries_.size() * 4))
+            {
+                entries_.rehash(0);
             }
         }
 
@@ -248,28 +215,10 @@ namespace sunpack::sevenzip
         return earliest;
     }
 
-    std::size_t VolumeWriterRegistry::reclaimed_count() const noexcept
+    std::size_t VolumeWriterRegistry::volume_count() const noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return reclaimed_count_;
-    }
-
-    bool VolumeWriterRegistry::empty() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return entries_.empty();
-    }
-
-    std::vector<std::string> VolumeWriterRegistry::volume_keys() const
-    {
-        std::vector<std::string> keys;
-        std::lock_guard<std::mutex> lock(mutex_);
-        keys.reserve(entries_.size());
-        for (const auto &item : entries_)
-        {
-            keys.push_back(item.first);
-        }
-        return keys;
+        return entries_.size();
     }
 
     std::vector<VolumeStatePtr> VolumeWriterRegistry::blocked_volumes(bool require_affected_jobs) const

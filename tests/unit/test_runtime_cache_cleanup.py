@@ -572,14 +572,14 @@ def test_disconnect_during_foreground_admission_restores_idle_cleanup(tmp_path, 
                 current = scheduler("replacement.json")
                 host._watch_service.scheduler = current
                 # WatchService hands an outstanding host gate to its successor.
-                await current.set_external_activity(host._foreground_gate_requested)
+                await current.set_external_activity(host._foreground_requests > 0)
             protocol.connection_lost(None)
             result = await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 1)
             assert isinstance(result[0], asyncio.CancelledError)
             engine.release_cleanup.set()
             await cleanup
             assert host._foreground_requests == 0
-            assert not host._foreground_gate_requested
+            assert host._foreground_requests == 0
             for item in {watcher, current}:
                 assert not item._external_activity_requested
                 assert not item._runtime_cache_gate.locked()

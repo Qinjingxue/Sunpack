@@ -99,7 +99,6 @@ class PipelineEngine:
         self._request_runtime_factory = _RequestRuntime
         self._path_leases = _PathLeaseRegistry(self._active_requests)
         self._recent_passwords: list[str] = []
-        self._user_passwords = tuple(config.get("user_passwords", []) or [])
         self._password_snapshot = config.get("password_snapshot")
         if self._password_snapshot is None:
             self._password_snapshot = PasswordStore.from_config(config).snapshot
@@ -174,13 +173,17 @@ class PipelineEngine:
             raise ValueError("PipelineEngine.run requires at least one target")
         source = request_config if request_config is not None else self.config
         password_snapshot = source.get("password_snapshot", self._password_snapshot)
-        request_config = copy.deepcopy({k: v for k, v in source.items() if k not in {"password_snapshot", "builtin_passwords", "password_store", "password_scope_context"}})
+        request_config = copy.deepcopy({
+            key: value for key, value in source.items()
+            if key not in {
+                "user_passwords", "clipboard_passwords", "builtin_passwords", "password_snapshot",
+                "password_store", "password_scope_context",
+            }
+        })
         detection_options = detection_options or EmbeddedOptions()
-        user_passwords = tuple(request_config.get("user_passwords", self._user_passwords) or [])
-        request_config["user_passwords"] = list(user_passwords)
         password_store = PasswordStore.from_sources(
-            cli_passwords=user_passwords,
-            clipboard_passwords=request_config.get("clipboard_passwords"),
+            cli_passwords=source.get("user_passwords"),
+            clipboard_passwords=source.get("clipboard_passwords"),
             recent_passwords=self._recent_passwords,
             password_snapshot=password_snapshot,
         )
@@ -826,12 +829,6 @@ def _replace_mapping_in_place(target: dict, source: dict) -> None:
             target[key] = copy.deepcopy(value)
 
 
-def _postprocess_actions_factory(config: dict, **kwargs):
-    """Indirection point for callers that replace PostProcessActions."""
-
-    return PostProcessActions(config, **kwargs)
-
-
 def _worker_config(config: dict) -> dict:
     performance = config.get("performance") if isinstance(config.get("performance"), dict) else {}
     worker = performance.get("worker") if isinstance(performance.get("worker"), dict) else {}
@@ -879,7 +876,6 @@ class _SourceCleanup:
         self,
         context: RunState,
         config: dict,
-        factory: Callable[..., Any],
         request_id: str,
         *,
         notify: Callable = notify_shell_directories_updated,
@@ -888,7 +884,6 @@ class _SourceCleanup:
 
         self._context = context
         self._config = config
-        self._factory = factory
         self._notify = notify
         self.request_id = str(request_id or "")
         self._table = CleanupRefTable()
@@ -971,7 +966,7 @@ class _SourceCleanup:
                             [[path] for path in existing],
                         ))
                     else:
-                        actions = self._factory(self._config, stdout=None, cleanup_mode_override=mode)
+                        actions = PostProcessActions(self._config, stdout=None, cleanup_mode_override=mode)
                         with promotion_barrier(
                             existing,
                             cache_releasers=(release_archive_sessions_under_roots,),
@@ -1106,7 +1101,6 @@ class _RequestRuntime:
         self.source_cleanup = _SourceCleanup(
             self.context,
             self.config,
-            _postprocess_actions_factory,
             submission.request_id,
             notify=self._shell_updates.add,
         )
@@ -1939,7 +1933,7 @@ class _RequestRuntime:
                 cache_releasers=(release_archive_sessions_under_roots,),
                 quiesce=False,
             ):
-                result = _postprocess_actions_factory(
+                result = PostProcessActions(
                     self.config,
                     stdout=self.submission.stdout,
                 ).flattener.flatten_dirs(output_dir, work_path=work_path,

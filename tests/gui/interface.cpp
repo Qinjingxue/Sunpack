@@ -2022,6 +2022,9 @@ int wmain(int argc,wchar_t** argv) {
             Options options; options.data_dir=dir; options.allow_cli=true;
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
+            // Opening the selectors must not leave an owning root handle behind.
+            auto& context=ui::GetContext();
+            assert(!context.handles.FindHandle(context.GetWindow(app.window())->Root().get()));
             window_icon_contracts(app);
             // The old show-before-load path flashed an incomplete first page.
             assert(!IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));

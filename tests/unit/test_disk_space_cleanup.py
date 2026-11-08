@@ -4,6 +4,7 @@ import os
 import pytest
 
 import sunpack.core.support.resource_lifecycle as resource_lifecycle
+import sunpack.pipeline.coordinator.engine as engine
 import sunpack.pipeline.postprocess.internal.cleanup as cleanup
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.core.contracts.run_state import RunState
@@ -46,7 +47,6 @@ def _scope(mode="recycle"):
     return _SourceCleanup(
         RunState(),
         config(mode),
-        PostProcessActions,
         "request-1",
     )
 
@@ -198,8 +198,8 @@ def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
     assert busy.exists()
 
 
-@pytest.mark.parametrize("failure_site", ["factory", "broker"])
-def test_unexpected_source_cleanup_error_reaches_summary_for_each_volume(tmp_path, failure_site):
+@pytest.mark.parametrize("failure_site", ["actions", "broker"])
+def test_unexpected_source_cleanup_error_reaches_summary_for_each_volume(tmp_path, monkeypatch, failure_site):
     paths = [tmp_path / "first.001", tmp_path / "second.disguised"]
     for path in paths:
         path.write_text("payload")
@@ -209,15 +209,15 @@ def test_unexpected_source_cleanup_error_reaches_summary_for_each_volume(tmp_pat
     error = OSError("cleanup service unavailable")
     error.winerror = 5
 
-    def failing_factory(*_args, **_kwargs):
+    def failing_actions(*_args, **_kwargs):
         raise error
 
     class FailingBroker:
         async def run(self, *_args, **_kwargs):
             raise error
 
-    if failure_site == "factory":
-        scope._factory = failing_factory
+    if failure_site == "actions":
+        monkeypatch.setattr(engine, "PostProcessActions", failing_actions)
     outcome = asyncio.run(scope.apply(
         scope.release_task(task, outcome_kind=OutcomeKind.COMPLETE_SUCCESS),
         broker=FailingBroker() if failure_site == "broker" else _InlineBroker(),

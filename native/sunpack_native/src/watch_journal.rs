@@ -33,24 +33,24 @@ pub(crate) struct NativeJournalTicket {
     stream: String,
     seq: u64,
     goal: TicketGoal,
-    bytes_written: Arc<AtomicU64>,
+    bytes_written: Option<Arc<AtomicU64>>,
     retired: Arc<OnceLock<StreamFrontier>>,
 }
 
 impl NativeJournalTicket {
-    fn new(shared: Arc<Shared>, stream: String, seq: u64, goal: TicketGoal) -> Self {
-        let retired = lock_state(&shared)
-            .streams
-            .entry(stream.clone())
-            .or_default()
-            .retired
-            .clone();
+    fn new(
+        shared: Arc<Shared>,
+        stream: String,
+        seq: u64,
+        goal: TicketGoal,
+        retired: Arc<OnceLock<StreamFrontier>>,
+    ) -> Self {
         Self {
             shared,
             stream,
             seq,
             goal,
-            bytes_written: Arc::new(AtomicU64::new(0)),
+            bytes_written: None,
             retired,
         }
     }
@@ -161,7 +161,9 @@ impl NativeJournalTicket {
 
     #[getter]
     fn bytes_written(&self) -> u64 {
-        self.bytes_written.load(Ordering::Acquire)
+        self.bytes_written
+            .as_ref()
+            .map_or(0, |bytes| bytes.load(Ordering::Acquire))
     }
 }
 
@@ -221,15 +223,7 @@ enum WriterCommand {
         stream: String,
         done: Option<mpsc::Sender<u64>>,
     },
-    Append {
-        stream: String,
-        path: PathBuf,
-        segment_start: u64,
-        seq: u64,
-        operations: JournalPayload,
-        durable: bool,
-        bytes_written: Arc<AtomicU64>,
-    },
+    Append(AppendWorkItem),
     Seal {
         stream: String,
         old_path: PathBuf,
@@ -247,6 +241,27 @@ struct JournalRuntime {
 }
 
 impl JournalRuntime {
+    fn ticket(
+        &self,
+        stream: String,
+        seq: u64,
+        goal: TicketGoal,
+    ) -> Result<NativeJournalTicket, String> {
+        let retired = lock_state(&self.shared)
+            .streams
+            .get(&stream)
+            .ok_or("Watch journal stream is unavailable")?
+            .retired
+            .clone();
+        Ok(NativeJournalTicket::new(
+            self.shared.clone(),
+            stream,
+            seq,
+            goal,
+            retired,
+        ))
+    }
+
     fn open(self: &Arc<Self>, stream: String) -> Result<NativeJournalStream, String> {
         // Ownership admission shares the writer's ordering with Release. A
         // queued GC release cannot retire a newly opened incarnation, and a
@@ -326,17 +341,19 @@ impl JournalRuntime {
         } else {
             TicketGoal::Written
         };
-        let ticket = NativeJournalTicket::new(self.shared.clone(), stream.clone(), seq, goal);
+        let mut ticket = self.ticket(stream.clone(), seq, goal)?;
+        let bytes_written = Arc::new(AtomicU64::new(0));
+        ticket.bytes_written = Some(Arc::clone(&bytes_written));
         self.writer_tx
-            .send(WriterCommand::Append {
+            .send(WriterCommand::Append(AppendWorkItem {
                 stream,
                 path,
                 segment_start,
                 seq,
                 operations,
                 durable,
-                bytes_written: ticket.bytes_written.clone(),
-            })
+                bytes_written,
+            }))
             .map_err(|_| "native Watch journal writer is unavailable".to_string())?;
         Ok(ticket)
     }
@@ -348,12 +365,7 @@ impl JournalRuntime {
         old_start: u64,
         boundary: u64,
     ) -> Result<NativeJournalTicket, String> {
-        let ticket = NativeJournalTicket::new(
-            self.shared.clone(),
-            stream.clone(),
-            boundary,
-            TicketGoal::Sealed,
-        );
+        let ticket = self.ticket(stream.clone(), boundary, TicketGoal::Sealed)?;
         self.writer_tx
             .send(WriterCommand::Seal {
                 stream,
@@ -365,14 +377,27 @@ impl JournalRuntime {
         Ok(ticket)
     }
 
-    fn request_flush(&self, stream: String, target_seq: u64) -> NativeJournalTicket {
-        {
-            let mut state = lock_state(&self.shared);
-            let stream_state = state.streams.entry(stream.clone()).or_default();
-            stream_state.requested_seq = stream_state.requested_seq.max(target_seq);
-            self.shared.cv.notify_all();
-        }
-        NativeJournalTicket::new(self.shared.clone(), stream, target_seq, TicketGoal::Durable)
+    fn request_flush(
+        &self,
+        stream: String,
+        target_seq: u64,
+    ) -> Result<NativeJournalTicket, String> {
+        let mut state = lock_state(&self.shared);
+        let stream_state = state
+            .streams
+            .get_mut(&stream)
+            .ok_or("Watch journal stream is unavailable")?;
+        stream_state.requested_seq = stream_state.requested_seq.max(target_seq);
+        // Capture the same stream incarnation while its request is registered.
+        let retired = stream_state.retired.clone();
+        self.shared.cv.notify_all();
+        Ok(NativeJournalTicket::new(
+            self.shared.clone(),
+            stream,
+            target_seq,
+            TicketGoal::Durable,
+            retired,
+        ))
     }
 
     fn seed(&self, stream: String, seq: u64) -> Result<(), String> {
@@ -471,13 +496,7 @@ fn retire_closed_stream(state: &mut RuntimeState, key: &str) {
         sealed: stream.sealed_seq,
         error: stream.error,
     });
-    if state.streams.is_empty() {
-        state.streams = HashMap::new();
-    } else if state.streams.capacity() > 256.max(state.streams.len().saturating_mul(4)) {
-        state
-            .streams
-            .shrink_to(state.streams.len().saturating_mul(2));
-    }
+    crate::collections::trim_map(&mut state.streams);
 }
 
 fn open_segment(path: &Path, kind: Kind) -> io::Result<TrackedFile> {
@@ -571,10 +590,6 @@ impl JournalPayload {
     }
 }
 
-fn write_file(file: &TrackedFile, payload: &[u8]) -> io::Result<()> {
-    file.write_shared(payload)
-}
-
 struct AppendWorkItem {
     stream: String,
     path: PathBuf,
@@ -583,26 +598,6 @@ struct AppendWorkItem {
     operations: JournalPayload,
     durable: bool,
     bytes_written: Arc<AtomicU64>,
-}
-
-fn append_work_item(
-    stream: String,
-    path: PathBuf,
-    segment_start: u64,
-    seq: u64,
-    operations: JournalPayload,
-    durable: bool,
-    bytes_written: Arc<AtomicU64>,
-) -> AppendWorkItem {
-    AppendWorkItem {
-        stream,
-        path,
-        segment_start,
-        seq,
-        operations,
-        durable,
-        bytes_written,
-    }
 }
 
 fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<()> {
@@ -652,7 +647,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         &first.path,
         first.operations.kind(),
     )?;
-    write_file(&file, &payload.finish()?)?;
+    file.write_shared(&payload.finish()?)?;
 
     let mut state = lock_state(shared);
     let stream_state = state.streams.entry(first.stream.clone()).or_default();
@@ -687,6 +682,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
 
 fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
     let mut pending: Option<WriterCommand> = None;
+    let mut batch = Vec::new();
     loop {
         let command = match pending.take() {
             Some(command) => command,
@@ -721,67 +717,19 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                     let _ = done.send(target);
                 }
             }
-            WriterCommand::Append {
-                stream,
-                path,
-                segment_start,
-                seq,
-                operations,
-                durable,
-                bytes_written,
-            } => {
-                let batch_stream = stream.clone();
-                let batch_path = path.clone();
-                let batch_start = segment_start;
-                let mut batch = vec![append_work_item(
-                    stream,
-                    path,
-                    segment_start,
-                    seq,
-                    operations,
-                    durable,
-                    bytes_written,
-                )];
-
+            WriterCommand::Append(first) => {
+                batch.push(first);
                 // Zero-wait opportunistic batching: once one append is ready,
                 // consume only commands that are already queued for the same
                 // stream/segment. Never sleep to manufacture a writer batch.
                 while batch.len() < WRITER_BATCH_MAX_RECORDS {
                     match rx.try_recv() {
-                        Ok(WriterCommand::Append {
-                            stream,
-                            path,
-                            segment_start,
-                            seq,
-                            operations,
-                            durable,
-                            bytes_written,
-                        }) => {
-                            if stream == batch_stream
-                                && path == batch_path
-                                && segment_start == batch_start
-                            {
-                                batch.push(append_work_item(
-                                    stream,
-                                    path,
-                                    segment_start,
-                                    seq,
-                                    operations,
-                                    durable,
-                                    bytes_written,
-                                ));
-                            } else {
-                                pending = Some(WriterCommand::Append {
-                                    stream,
-                                    path,
-                                    segment_start,
-                                    seq,
-                                    operations,
-                                    durable,
-                                    bytes_written,
-                                });
-                                break;
-                            }
+                        Ok(WriterCommand::Append(next))
+                            if next.stream == batch[0].stream
+                                && next.path == batch[0].path
+                                && next.segment_start == batch[0].segment_start =>
+                        {
+                            batch.push(next);
                         }
                         Ok(other) => {
                             pending = Some(other);
@@ -792,17 +740,17 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                     }
                 }
 
-                if stream_failed(&shared, &batch_stream) {
+                let batch_stream = &batch[0].stream;
+                if stream_failed(&shared, batch_stream) {
                     shared.cv.notify_all();
-                    continue;
-                }
-                if let Err(error) = write_append_batch(&shared, &batch) {
+                } else if let Err(error) = write_append_batch(&shared, &batch) {
                     fail_stream(
                         &shared,
-                        &batch_stream,
+                        batch_stream,
                         format!("native Watch journal append failed: {error}"),
                     );
                 }
+                batch.clear();
             }
             WriterCommand::Seal {
                 stream,
@@ -1087,8 +1035,13 @@ pub(crate) fn watch_journal_submit_seal(
 }
 
 #[pyfunction]
-pub(crate) fn watch_journal_request_flush(stream: String, target_seq: u64) -> NativeJournalTicket {
-    runtime().request_flush(stream, target_seq)
+pub(crate) fn watch_journal_request_flush(
+    stream: String,
+    target_seq: u64,
+) -> PyResult<NativeJournalTicket> {
+    runtime()
+        .request_flush(stream, target_seq)
+        .map_err(PyRuntimeError::new_err)
 }
 
 #[pyfunction]
@@ -1154,6 +1107,20 @@ mod tests {
 
     fn empty_operations() -> JournalPayload {
         JournalPayload::Task(Arc::new(Operations::default()))
+    }
+
+    #[test]
+    fn flush_request_retains_its_stream_outcome_without_reviving_closed_streams() {
+        let runtime = runtime();
+        let stream = unique_path("flush_retire").to_string_lossy().into_owned();
+        let mut owner = runtime.open(stream.clone()).unwrap();
+        runtime.seed(stream.clone(), 1).unwrap();
+        let ticket = runtime.request_flush(stream.clone(), 1).unwrap();
+        runtime.release(owner.stream.take().unwrap()).unwrap();
+
+        assert!(runtime.request_flush(stream.clone(), 1).is_err());
+        assert!(!lock_state(&runtime.shared).streams.contains_key(&stream));
+        ticket.wait_for(TicketGoal::Durable).unwrap();
     }
 
     #[test]
@@ -1239,6 +1206,7 @@ mod tests {
         ticket.wait_for(TicketGoal::Written).unwrap();
         runtime
             .request_flush(stream.clone(), 1)
+            .unwrap()
             .wait_for(TicketGoal::Durable)
             .unwrap();
         let first = {
@@ -1247,6 +1215,7 @@ mod tests {
         };
         runtime
             .request_flush(stream.clone(), 1)
+            .unwrap()
             .wait_for(TicketGoal::Durable)
             .unwrap();
         let second = {
@@ -1310,7 +1279,7 @@ mod tests {
         let path = unique_path("writer_batch");
         let stream = path.to_string_lossy().to_string();
         for seq in 1..=32u64 {
-            tx.send(WriterCommand::Append {
+            tx.send(WriterCommand::Append(AppendWorkItem {
                 stream: stream.clone(),
                 path: path.clone(),
                 segment_start: 1,
@@ -1318,7 +1287,7 @@ mod tests {
                 operations: empty_operations(),
                 durable: false,
                 bytes_written: Arc::new(AtomicU64::new(0)),
-            })
+            }))
             .unwrap();
         }
         drop(tx);
@@ -1355,11 +1324,11 @@ pub(crate) fn append_cache(
         false,
     )?;
     ticket.wait_for(TicketGoal::Written)?;
-    Ok(ticket.bytes_written.load(Ordering::Acquire))
+    Ok(ticket.bytes_written())
 }
 pub(crate) fn flush_cache(stream: &str, seq: u64) -> Result<(), String> {
     runtime()
-        .request_flush(stream.to_owned(), seq)
+        .request_flush(stream.to_owned(), seq)?
         .wait_for(TicketGoal::Durable)
 }
 pub(crate) fn close_cache(handle: &mut NativeJournalStream) -> Result<(), String> {

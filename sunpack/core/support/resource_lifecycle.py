@@ -332,6 +332,7 @@ def lifecycle_registration(
 ) -> Iterator[tuple[FileIdentity, ...]]:
     """Hold the shared coordination lock across handle creation + registry insert."""
 
+    files = tuple(files)
     identities = file_identities(files)
     with _CHANGED:
         while True:
@@ -342,7 +343,10 @@ def lifecycle_registration(
                 roots = ", ".join(item.path for item in conflict[1])
                 raise ResourceBusyError(f"resource registration blocked by promotion roots: {roots}")
             # A live promotion owns the conflicting resources until it releases them.
-            _CHANGED.wait()
+            while conflict[0] in _ACTIVE_PROMOTIONS:
+                _CHANGED.wait()
+            # A promotion can replace a path while the gate is held.
+            identities = file_identities(files)
         yield identities
 
 
