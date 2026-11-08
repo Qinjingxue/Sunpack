@@ -112,29 +112,6 @@ struct Snapshot {
     std::vector<Action> actions;
 };
 
-std::wstring quote_argument(std::wstring_view value) {
-    std::wstring result = L"\"";
-    std::size_t backslashes = 0;
-    for (const wchar_t ch : value) {
-        if (ch == L'\\') {
-            ++backslashes;
-            continue;
-        }
-        if (ch == L'\"') {
-            result.append(backslashes * 2 + 1, L'\\');
-            result.push_back(L'\"');
-            backslashes = 0;
-            continue;
-        }
-        result.append(backslashes, L'\\');
-        backslashes = 0;
-        result.push_back(ch);
-    }
-    result.append(backslashes * 2, L'\\');
-    result.push_back(L'\"');
-    return result;
-}
-
 void set_registry_string(HKEY root, const std::wstring& subkey,
                          const wchar_t* value_name, const std::wstring& value,
                          DWORD value_type = REG_SZ) {
@@ -221,21 +198,6 @@ bool toast_app_identity_registered(const std::wstring& executable) noexcept {
                    kClsidText;
     } catch (...) {
         return false;
-    }
-}
-
-void register_toast_activator(const std::wstring& executable, const std::wstring& arguments) {
-    const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
-    set_registry_string(
-        HKEY_LOCAL_MACHINE, com_path, nullptr, quote_argument(executable) + L" " + arguments
-    );
-}
-
-void unregister_toast_activator() noexcept {
-    try {
-        const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText;
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE, com_path.c_str());
-    } catch (...) {
     }
 }
 
@@ -1043,18 +1005,6 @@ HRESULT sunpack_toast_clear(void* raw) noexcept {
 
 HRESULT sunpack_toast_destroy(void* raw) noexcept {
     return protect([&] { delete &context_on_owner_thread(raw); });
-}
-
-HRESULT sunpack_toast_register(const wchar_t* executable, const wchar_t* arguments) noexcept {
-    return protect([&] {
-        if (!executable || !arguments) winrt::throw_hresult(E_INVALIDARG);
-        WinrtApartmentScope apartment;
-        register_toast_activator(executable, arguments);
-    });
-}
-
-HRESULT sunpack_toast_unregister() noexcept {
-    return protect([] { unregister_toast_activator(); });
 }
 
 HRESULT sunpack_toast_activate() noexcept {

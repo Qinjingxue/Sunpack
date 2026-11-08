@@ -1,5 +1,6 @@
 #include "platform.hpp"
 #include "presentation.hpp"
+#include <shellapi.h>
 #include <shobjidl.h>
 #include <shlobj.h>
 #include <xxhash.h>
@@ -193,6 +194,45 @@ bool startup_enabled() {
     RegCloseKey(key);
     if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) { SetLastError(rc); win_error("opReadStartupValue"); }
     return rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ);
+}
+bool context_menu_enabled() {
+    // A surviving Explorer entry is enough to offer removal of a partial registration.
+    constexpr const wchar_t* keys[] = {
+        L"Software\\Classes\\Directory\\shell\\SunPack",
+        L"Software\\Classes\\Directory\\Background\\shell\\SunPack",
+        L"Software\\Classes\\*\\shell\\SunPack",
+    };
+    for (auto path : keys) {
+        HKEY key{};
+        auto rc = RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_QUERY_VALUE, &key);
+        if (rc == ERROR_SUCCESS) { RegCloseKey(key); return true; }
+        if (rc != ERROR_FILE_NOT_FOUND && rc != ERROR_PATH_NOT_FOUND) {
+            SetLastError(rc); win_error("opReadContextMenu");
+        }
+    }
+    return false;
+}
+void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop) {
+    // Source launches bind the venv CLI and use the checkout as their data directory.
+    const bool source = cli.prefix.size() == 2 && cli.prefix[0] == L"-m" && cli.prefix[1] == L"sunpack";
+    const auto app = source ? cli.cwd : executable_path().parent_path();
+    const auto script = app / "scripts" / (enabled ? "register_context_menu.ps1" : "unregister_context_menu.ps1");
+    std::error_code ec;
+    if (!fs::is_regular_file(script, ec)) throw std::runtime_error("contextMenuScriptMissing");
+
+    wchar_t system_directory[MAX_PATH];
+    if (!GetSystemDirectoryW(system_directory, MAX_PATH)) win_error("opChangeContextMenu");
+    const auto powershell = fs::path(system_directory) / L"WindowsPowerShell\\v1.0\\powershell.exe";
+    std::vector<std::wstring> args{
+        L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass", L"-File", script.wstring()};
+    if (source && enabled) {
+        args.push_back(L"-PythonPath");
+        args.push_back(cli.executable.wstring());
+    }
+    auto result = run_cli({powershell, app, {}}, args, stop);
+    if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return;
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    if (result.code != 0) throw std::runtime_error(error_text("contextMenuScriptFailed", {{"code", result.code}}));
 }
 fs::path choose_directory(HWND owner, const fs::path& initial) {
     IFileOpenDialog* dialog = nullptr;

@@ -296,7 +296,7 @@ python sunpack.py version
 
 ## Windows context menu
 
-Machine-wide context menu scripts (they require an elevated shell):
+Run these scripts in a regular PowerShell session to manage the current user's context menu.
 
 ```powershell
 .\scripts\register_context_menu.ps1

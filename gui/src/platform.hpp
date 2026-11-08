@@ -53,9 +53,11 @@ public:
     bool direct() const { return direct_; }
 };
 bool startup_enabled();
+bool context_menu_enabled();
 fs::path choose_directory(HWND owner, const fs::path& initial = {});
 std::wstring quote_arg(const std::wstring& arg);
 struct CliCommand { fs::path executable, cwd; std::vector<std::wstring> prefix; };
+void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop);
 struct CliResult { DWORD code; std::string output; };
 CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop,const std::string* input=nullptr);
 fs::path executable_path();

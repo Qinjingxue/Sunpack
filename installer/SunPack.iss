@@ -64,10 +64,10 @@ english.BrokerExecutableMissing=Packaged Watch Broker executable is missing: %s
 english.BrokerCreateFailed=Failed to create %s (sc.exe exit code %d).
 english.BrokerSidTypeFailed=Failed to set the service SID type (sc.exe exit code %d).
 english.BrokerSecurityFailed=Failed to secure the Watch Broker service (sc.exe exit code %d).
-english.StartupEnableLaunchFailed=Failed to run sunpack while configuring startup.
-english.StartupEnableCommandFailed=sunpack could not configure startup (exit code %d).
-english.ToastRegisterLaunchFailed=Failed to run sunpack while registering machine-wide notifications.
-english.ToastRegisterCommandFailed=sunpack could not register machine-wide notifications (exit code %d).
+english.StartupEnableLaunchFailed=Failed to launch the startup configuration script.
+english.StartupEnableCommandFailed=The startup configuration script failed (exit code %d).
+english.ToastRegisterLaunchFailed=Failed to launch the notification registration script.
+english.ToastRegisterCommandFailed=The notification registration script failed (exit code %d).
 english.TaskAddToPathFailed=Failed to add sunpack to the system PATH.
 english.TaskContextMenuFailed=Failed to register the sunpack folder context menu.
 english.TaskContextMenuRemoveFailed=Failed to remove the existing sunpack context menu.
@@ -93,10 +93,10 @@ chinesesimplified.BrokerExecutableMissing=安装包中缺少 Watch Broker 可执
 chinesesimplified.BrokerCreateFailed=无法创建 %s（sc.exe 退出码 %d）。
 chinesesimplified.BrokerSidTypeFailed=无法设置服务 SID 类型（sc.exe 退出码 %d）。
 chinesesimplified.BrokerSecurityFailed=无法设置 Watch Broker 服务权限（sc.exe 退出码 %d）。
-chinesesimplified.StartupEnableLaunchFailed=配置开机启动时无法运行 sunpack。
-chinesesimplified.StartupEnableCommandFailed=sunpack 无法配置开机启动（退出码 %d）。
-chinesesimplified.ToastRegisterLaunchFailed=注册机器级通知时无法运行 sunpack。
-chinesesimplified.ToastRegisterCommandFailed=sunpack 无法注册机器级通知（退出码 %d）。
+chinesesimplified.StartupEnableLaunchFailed=无法运行开机启动配置脚本。
+chinesesimplified.StartupEnableCommandFailed=开机启动配置脚本执行失败（退出码 %d）。
+chinesesimplified.ToastRegisterLaunchFailed=无法运行通知注册脚本。
+chinesesimplified.ToastRegisterCommandFailed=通知注册脚本执行失败（退出码 %d）。
 chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到系统 PATH。
 chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜单。
 chinesesimplified.TaskContextMenuRemoveFailed=无法清理现有 sunpack 右键菜单。
@@ -120,6 +120,7 @@ Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:Gro
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1,scripts\initialize_config_language.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "integration.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
 Source: "{#SourceDir}\scripts\upgrade_config.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
@@ -141,8 +142,9 @@ Name: "{autoprograms}\SunPack\SunPack GUI"; Filename: "{app}\SunPackGUI.exe"; Wo
 Name: "{autoprograms}\SunPack\Uninstall SunPack"; Filename: "{uninstallexe}"
 
 [UninstallRun]
-Filename: "{app}\sunpack-runtime.exe"; Parameters: "--configure-startup-current-user disable"; RunOnceId: "SunPackStartup"; Flags: runhidden waituntilterminated skipifdoesntexist
-Filename: "{app}\sunpack-runtime.exe"; Parameters: "--unregister-toast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\integration.ps1"" -Action DisableStartup"; RunOnceId: "SunPackStartup"; Flags: runhidden waituntilterminated
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\integration.ps1"" -Action DisableContextMenu"; RunOnceId: "SunPackContextMenu"; Flags: runhidden waituntilterminated
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\integration.ps1"" -Action UninstallToast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated
 Filename: "{app}\bin\sunpack.exe"; Parameters: "--persistent-shutdown"; RunOnceId: "SunPackFinalRuntimeShutdown"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\wait_sunpack_runtime_exit.ps1"" -CliAppPath ""{app}\bin\sunpack.exe"" -RuntimeAppPath ""{app}\sunpack-runtime.exe"" -TimeoutSeconds 20"; RunOnceId: "SunPackFinalRuntimeWait"; Flags: runhidden waituntilterminated
 
@@ -586,44 +588,33 @@ begin
     Log(Format('Existing SunPack Watch state query failed with exit code %d; upgrade will not auto-start Watch.', [ResultCode]));
 end;
 
-function RunContextMenuScript(RegisterMenu: Boolean): Boolean;
+function RunInstallerIntegration(const Action: string; var ResultCode: Integer): Boolean;
+begin
+  ResultCode := -1;
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+      AddQuotes(ExpandConstant('{app}\scripts\integration.ps1')) + ' -Action ' + Action,
+    ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure ApplySelectedContextMenuState;
 var
-  PowerShellPath: string;
-  ScriptPath: string;
-  Parameters: string;
+  Action: string;
   ResultCode: Integer;
 begin
-  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
-  if RegisterMenu then
-  begin
-    ScriptPath := ExpandConstant('{app}\scripts\register_context_menu.ps1');
-    Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-      AddQuotes(ScriptPath) + ' -AppPath ' + AddQuotes(ExpandConstant('{app}\bin\sunpack.exe')) +
-      ' -IconPath ' + AddQuotes(ExpandConstant('{app}\sunpack.ico'));
-  end
+  if WizardIsTaskSelected('contextmenu') then
+    Action := 'EnableContextMenu'
   else
+    Action := 'DisableContextMenu';
+
+  if not RunInstallerIntegration(Action, ResultCode) or (ResultCode <> 0) then
   begin
-    ScriptPath := ExpandConstant('{app}\scripts\unregister_context_menu.ps1');
-    Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + AddQuotes(ScriptPath);
+    Log(Format('Current-user context menu helper (%s) failed with code %d.', [Action, ResultCode]));
+    if Action = 'EnableContextMenu' then
+      RaiseException(CustomMessage('TaskContextMenuFailed'))
+    else
+      RaiseException(CustomMessage('TaskContextMenuRemoveFailed'));
   end;
-  if not FileExists(ScriptPath) then
-  begin
-    Log('Context menu script was not found: ' + ScriptPath);
-    Result := False;
-    Exit;
-  end;
-  if not Exec(PowerShellPath, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-  begin
-    Log('Failed to start context menu script: ' + ScriptPath);
-    Result := False;
-  end
-  else if ResultCode <> 0 then
-  begin
-    Log(Format('Context menu script exited with code %d: %s', [ResultCode, ScriptPath]));
-    Result := False;
-  end
-  else
-    Result := True;
 end;
 
 procedure StopExistingProcesses;
@@ -749,14 +740,7 @@ begin
   if not RestartWatchAfterUpgrade then
     Exit;
 
-  if not Exec(
-    ExpandConstant('{app}\sunpack-runtime.exe'),
-    '--launch-watch-unelevated',
-    ExpandConstant('{app}'),
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode
-  ) then
+  if not RunInstallerIntegration('StartWatch', ResultCode) then
     Log('Failed to run the unelevated SunPack Watch restore helper after upgrade.')
   else if ResultCode <> 0 then
     Log(Format('SunPack Watch restore helper exited with code %d.', [ResultCode]))
@@ -794,18 +778,11 @@ var
   ResultCode: Integer;
 begin
   if WizardIsTaskSelected('autostart') then
-    StartupAction := 'enable'
+    StartupAction := 'EnableStartup'
   else
-    StartupAction := 'disable';
+    StartupAction := 'DisableStartup';
 
-  if not Exec(
-    ExpandConstant('{app}\sunpack-runtime.exe'),
-    '--configure-startup-current-user ' + StartupAction,
-    ExpandConstant('{app}'),
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode
-  ) then
+  if not RunInstallerIntegration(StartupAction, ResultCode) then
     RaiseException(CustomMessage('StartupEnableLaunchFailed'))
   else if ResultCode <> 0 then
     RaiseException(Format(CustomMessage('StartupEnableCommandFailed'), [ResultCode]));
@@ -960,24 +937,11 @@ begin
     UpgradeConfigurationFields;
     InitializeInstalledLanguage;
     InstallBrokerService;
-    if not Exec(
-      ExpandConstant('{app}\bin\sunpack.exe'),
-      '--register-toast',
-      '',
-      SW_HIDE,
-      ewWaitUntilTerminated,
-      ResultCode
-    ) then
+    if not RunInstallerIntegration('RegisterToast', ResultCode) then
       RaiseException(CustomMessage('ToastRegisterLaunchFailed'))
     else if ResultCode <> 0 then
       RaiseException(Format(CustomMessage('ToastRegisterCommandFailed'), [ResultCode]));
-    if not RunContextMenuScript(False) then
-      RaiseException(CustomMessage('TaskContextMenuRemoveFailed'));
-    if WizardIsTaskSelected('contextmenu') then
-    begin
-      if not RunContextMenuScript(True) then
-        RaiseException(CustomMessage('TaskContextMenuFailed'));
-    end;
+    ApplySelectedContextMenuState;
     if WizardIsTaskSelected('addtopath') then
     begin
       if not AddMachinePath then
@@ -994,7 +958,6 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     StopAndDeleteBrokerService;
-    RunContextMenuScript(False);
     RemoveMachinePath(ExpandConstant('{app}'));
   end;
 end;

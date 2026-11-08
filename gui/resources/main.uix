@@ -9,7 +9,7 @@ export default {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
     actionError:'',errors:{},cliAllowed:false,runtime:{known:false,running:false},
     taskCursors:[],taskPages:[],taskPending:null,taskRevision:0,tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
-    startupEnabled:false,directoryQuery:'',directorySelection:'',
+    startupEnabled:false,contextMenuEnabled:false,directoryQuery:'',directorySelection:'',
     taskQuery:'',taskDirectoryDirty:false,taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
@@ -53,6 +53,8 @@ export default {
     matchingBlocks() { return this.configBlocks.filter(g=>(!this.configCategory||g.category===this.configCategory)&&(!this.configQuery.trim()||this.matchesConfig([g.label,...g.fields.map(f=>this.configText(f))].join(' ')))); },
     showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.startupEnabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
     showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
+    contextMenuAction() { return this.contextMenuEnabled?this.texts.contextMenuOff:this.texts.contextMenuOn; },
+    showContextMenuSetting() { return !this.configCategory&&this.matchesConfig([this.texts.contextMenu,this.contextMenuAction].join(' ')); },
   },
   methods: {
     // Project display text only; filtering, drafts and task paging stay owned
@@ -80,6 +82,7 @@ export default {
           query=query.trim();
           if(this.showStartupSetting) {add(-1,'startup-title',this.texts.startup);add(-1,'startupToggle',this.startupEnabled?this.texts.startupOff:this.texts.startupOn);}
           if(this.showThemeSetting) {add(-1,'theme-title',this.texts.theme);add(-1,'themeSelector',[this.texts.system,this.texts.light,this.texts.dark][this.themeChoice]);}
+          if(this.showContextMenuSetting) {add(-1,'context-menu-title',this.texts.contextMenu);add(-1,'contextMenuToggle',this.contextMenuAction);}
           let rows=this.matchingBlocks;
           rows.forEach((g,i)=>{
             if((g.fields.length>1||g.module)&&!g.primary) add(i,'block-title-'+g.id,g.label);
@@ -131,7 +134,7 @@ export default {
     rememberCellPointer(id,part,event) { this.cellPointer=event.button===0?{id:id,part:part,x:event.offsetX}:null; },
     cellPointerX(id,part) { let p=this.cellPointer; this.cellPointer=null; return p&&p.id===id&&p.part===part?p.x:null; },
     send(op,payload) {
-      if(op==='cli') { if(this.busy) return; this.busy=true; this.actionError=''; }
+      if(op==='cli'||op==='contextMenu') { if(this.busy) return; this.busy=true; this.actionError=''; }
       let requests=op==='filterTasks'||op==='filterPasswords'||op==='refreshSearch'?this.requests.filter(r=>r.op!==op):this.requests;
       this.requests=requests.concat([{op:op,payload:payload||{}}]); this.dispatch=true;
     },
@@ -946,6 +949,11 @@ export default {
             <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startupEnabled?'startupDisable':'startupEnable'})">{{ startupEnabled?texts.startupOff:texts.startupOn }}</button>
           </div>
           <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label id="theme-title" class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" class="selector-host"/></div>
+          <div id="contextMenuSetting" v-show="showContextMenuSetting" class="card settings-row">
+            <div class="setting-copy"><label id="context-menu-title" class="setting-title">{{ texts.contextMenu }}</label></div>
+            <button id="contextMenuToggle" :enabled="cliAllowed &amp;&amp; !busy" @click="send('contextMenu',{enabled:!contextMenuEnabled})">{{ contextMenuAction }}</button>
+          </div>
+          <label v-show="actionError" class="error">{{ errorText(actionError) }}</label>
           <VirtualList id="configItems" class="column" estimated-height="140px"><div v-for="g in matchingBlocks" :key="g.key" :id="'block-'+g.id" :class="'setting-card '+appearance">
             <label :id="'block-title-'+g.id" v-show="(g.fields.length>1||g.module) &amp;&amp; !g.primary" class="block-heading">{{ g.label }}</label>
             <!-- This Core UI version binds inner loops through a conditional

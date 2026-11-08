@@ -1,5 +1,4 @@
 import sunpack.runtime.entrypoint as entrypoint
-import pytest
 import sunpack.core.support.resources as resources
 from sunpack.core.support import runtime_identity
 
@@ -27,44 +26,6 @@ def test_entrypoint_consumes_private_runtime_identity_before_cli(monkeypatch):
     monkeypatch.setattr(cli, "main", fake_main)
 
     assert entrypoint.main() == 19
-
-
-@pytest.mark.parametrize("installed", [False, True])
-def test_entrypoint_launches_watch_unelevated_for_installer(tmp_path, monkeypatch, installed):
-    runtime = tmp_path / "sunpack-runtime.exe"
-    launcher = (tmp_path / "bin" if installed else tmp_path) / "sunpack.exe"
-    launcher.parent.mkdir(exist_ok=True)
-    launcher.touch()
-    captured = {}
-
-    class FakeProcess:
-        def wait(self, timeout=None):
-            captured["timeout"] = timeout
-            return 0
-
-        def close(self):
-            captured["closed"] = True
-
-    import sunpack.core.platform.windows.process_launch as process_launch
-    import sunpack.core.support.process_executable as process_executable
-
-    monkeypatch.setattr(entrypoint.sys, "argv", [str(runtime), "--launch-watch-unelevated"])
-    monkeypatch.setattr(process_executable, "current_process_executable", lambda: runtime)
-
-    def fake_launch(argv, *, cwd=None, env=None):
-        captured["argv"] = argv
-        captured["cwd"] = cwd
-        return FakeProcess()
-
-    monkeypatch.setattr(process_launch, "launch_unelevated", fake_launch)
-
-    assert entrypoint.main() == 0
-    assert captured == {
-        "argv": [str(launcher), "watch", "start"],
-        "cwd": str(tmp_path),
-        "timeout": None,
-        "closed": True,
-    }
 
 
 def test_shared_runtime_uses_cli_lifecycle(monkeypatch):

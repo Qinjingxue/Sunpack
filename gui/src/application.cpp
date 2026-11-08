@@ -44,7 +44,7 @@ void update_tags(TagCollection& tags,const Json& field,const Json& drafts) {
 }
 // Keep host messages outside Core UI's startup/render message range.
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403, TaskRange = WM_APP + 0x404;
-constexpr unsigned Config = 1, Passwords = 2, Roots = 4, Log = 8, Startup = 16;
+constexpr unsigned Config = 1, Passwords = 2, Roots = 4, Log = 8, Startup = 16, ContextMenu = 32;
 using Clock=std::chrono::steady_clock;
 using motion::VisualBatch;
 struct ReadRetry {
@@ -457,7 +457,7 @@ void Application::apply_pending() {
             if(!task_snapshot.is_null()) find_->Refresh("task");
             if(patch.contains("rootRows")) find_->Refresh("root");
             if(!password_snapshot.is_null() || !password_delta_patch.is_null()) find_->Refresh("password");
-            if(patch.contains("startupEnabled") || patch.contains("themeChoice")) find_->Refresh("config");
+            if(patch.contains("startupEnabled") || patch.contains("themeChoice") || patch.contains("contextMenuEnabled")) find_->Refresh("config");
         }
     }
 }
@@ -485,6 +485,7 @@ void Application::navigate(const std::string& tab) {
     // schedules layout. Avoid forcing an extra full-tree layout on every switch.
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
     if(tab=="tasks") schedule_task_range();
+    if(tab=="config") changed(ContextMenu);
 }
 void Application::sync_toggles() {
     auto drafts=page_value(page_,"toggleDrafts");
@@ -869,7 +870,7 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
             if(page_value(self->page_,"ready")==true) self->reveal();
             return 0;
         }
-        if(message==WM_ACTIVATE && LOWORD(wparam)!=WA_INACTIVE) { self->changed(Startup); SetEvent(self->service_refresh_); }
+        if(message==WM_ACTIVATE && LOWORD(wparam)!=WA_INACTIVE) { self->changed(Startup|ContextMenu); SetEvent(self->service_refresh_); }
         if(message==WM_SETTINGCHANGE && page_value(self->page_,"theme")=="system") apply_theme(self->page_,system_theme(),self->hwnd_);
     } catch(const std::exception& e) {
         self->set_error("actionError",e.what());
@@ -1138,6 +1139,11 @@ void Application::work() {
                             edit_feedback["saveAck"]["passwordRebases"]=std::move(saved_passwords.rebases);
                         }
                         if(kind=="roots") edit_feedback["saveAck"]["passwordRebases"]=std::move(saved_passwords.rebases);
+                    } else if(op=="contextMenu") {
+                        flags|=ContextMenu;
+                        edit_feedback["busy"]=false;
+                        if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
+                        set_context_menu_enabled(options_.cli,p.at("enabled").get<bool>(),stop_);
                     } else if(op=="cli") {
                         if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                         auto action=p.value("action",std::string());
@@ -1160,6 +1166,7 @@ void Application::work() {
                 } catch(const std::exception& e) {
                     auto message=std::string(e.what());
                     if(op=="commit") edit_feedback["saveAck"]={{"job",p},{"ok",false},{"error",message}};
+                    else if(op=="contextMenu") edit_feedback["actionError"]=message;
                     else publish({{"busy",false},{"actionError",message}});
                 }
             }
@@ -1298,6 +1305,10 @@ void Application::work() {
             if(flags&Startup || !previous_patch.contains("startupEnabled")) {
                 try { patch["startupEnabled"]=startup_enabled(); errors.erase("startup"); }
                 catch(const std::exception& e){errors["startup"]=e.what();}
+            }
+            if(flags&ContextMenu || !previous_patch.contains("contextMenuEnabled")) {
+                try { patch["contextMenuEnabled"]=context_menu_enabled(); errors.erase("contextMenu"); }
+                catch(const std::exception& e) { patch["contextMenuEnabled"]=false; errors["contextMenu"]=e.what(); }
             }
             auto displayed_errors=Json::object();
             for(auto it=errors.begin();it!=errors.end();++it) displayed_errors[tr(it.key(),language)]=translated_error(it.value().get<std::string>(),language);

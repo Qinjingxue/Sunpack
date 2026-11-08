@@ -1,13 +1,17 @@
+param([switch]$Machine)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Setup uses -Machine to clear registrations from previous versions.
+$classesKey = if ($Machine) { "HKLM:\Software\Classes" } else { "HKCU:\Software\Classes" }
 $keys = @(
-    "HKLM:\Software\Classes\Directory\shell\SunPack",
-    "HKLM:\Software\Classes\Directory\Background\shell\SunPack",
-    "HKLM:\Software\Classes\*\shell\SunPack",
-    "HKLM:\Software\Classes\SunPack.FolderContextMenu",
-    "HKLM:\Software\Classes\SunPack.BackgroundContextMenu",
-    "HKLM:\Software\Classes\SunPack.FileContextMenu"
+    "$classesKey\Directory\shell\SunPack",
+    "$classesKey\Directory\Background\shell\SunPack",
+    "$classesKey\*\shell\SunPack",
+    "$classesKey\SunPack.FolderContextMenu",
+    "$classesKey\SunPack.BackgroundContextMenu",
+    "$classesKey\SunPack.FileContextMenu"
 )
 
 foreach ($key in $keys) {

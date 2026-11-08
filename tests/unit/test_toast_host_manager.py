@@ -1,7 +1,6 @@
 import os
 import threading
 import weakref
-from pathlib import Path
 
 import pytest
 
@@ -232,9 +231,14 @@ def test_restart_stays_idle_until_a_new_snapshot(monkeypatch):
 
 
 def test_cli_bootstrap_does_not_load_toast_library(monkeypatch):
+    from sunpack.runtime.cli import cli
+    from sunpack.runtime import entrypoint
+
     monkeypatch.setattr(module, '_load_library', lambda: pytest.fail('CLI loaded toast DLL'))
+    monkeypatch.setattr(cli, 'main', lambda: 0)
     for argv in ([], ['extract', 'archive.zip'], ['scan', '.'], ['watch', 'status']):
-        assert module.handle_toast_argv(argv) is None
+        monkeypatch.setattr(entrypoint.sys, 'argv', ['sunpack-runtime.exe', *argv])
+        assert entrypoint.main() == 0
 
 
 def test_native_wrapper_passes_snapshot_and_closes_once(monkeypatch):
@@ -301,30 +305,23 @@ def test_show_failure_discards_snapshot_and_only_new_publish_recreates_presenter
     assert len({e[1] for e in recorder.events}) == 1
 
 
-@pytest.mark.parametrize('argument, native_method', [
-    ('--register-toast', 'register'), ('--toast-activated', 'activate'),
-])
-def test_main_runtime_handles_toast_bootstrap_without_starting_engine(monkeypatch, argument, native_method):
+def test_main_runtime_handles_toast_activation_without_starting_engine(monkeypatch):
     import sys
     from types import SimpleNamespace
     import sunpack.runtime.entrypoint as entrypoint
     from sunpack.core.support import runtime_identity
 
     calls = []
-    library = SimpleNamespace(**{
-        'sunpack_toast_' + name: (lambda *args, name=name: calls.append((name, args)) or 0)
-        for name in ('register', 'unregister', 'activate', 'cancel_batch')
-    })
+    library = SimpleNamespace(
+        sunpack_toast_activate=lambda: calls.append(runtime_identity.runtime_id()) or 0,
+        sunpack_toast_cancel_batch=lambda *_: 0,
+    )
     monkeypatch.setattr(module, '_load_library', lambda: library)
     identity = 'v2-0123456789abcdef'
     monkeypatch.setattr(runtime_identity, '_runtime_id', None)
-    monkeypatch.setattr(module, '__compiled__', object(), raising=False)
-    monkeypatch.setattr(module, 'current_process_executable', lambda: Path('main.exe'))
-    monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', argument, runtime_identity.runtime_id_argument(identity)])
+    monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', '--toast-activated', runtime_identity.runtime_id_argument(identity)])
     assert entrypoint.main() == 0
-    assert runtime_identity.runtime_id() == identity
-    assert calls[0] == (native_method, ('main.exe', '--toast-activated ' + runtime_identity.runtime_id_argument(identity)) if native_method == 'register' else ())
-    assert [call[0] for call in calls[1:]] == (['cancel_batch'] if native_method == 'activate' else [])
+    assert calls == [identity]
 
 
 @pytest.mark.parametrize('response, expected_code', [
@@ -364,7 +361,7 @@ def test_stop_activation_requires_acknowledgement_and_reports_failure(monkeypatc
     monkeypatch.setattr(module, 'encode_snapshot', encode)
     recorder = Recorder()
     monkeypatch.setattr(module, '_NativeToastPresenter', recorder.factory)
-    assert module.handle_toast_argv(['--toast-activated']) == expected_code
+    assert module.activate_toast() == expected_code
     assert calls == [{'argv': ['--cancel-watch-batch', batch_id], 'cwd': os.getcwd()}]
     if expected_code:
         failure, = snapshots
@@ -375,132 +372,6 @@ def test_stop_activation_requires_acknowledgement_and_reports_failure(monkeypatc
         assert [event[0] for event in recorder.events] == ['create', 'show', 'close']
     else:
         assert not snapshots and not recorder.events
-
-
-def test_unregister_toast_unelevated_removes_current_user_identity_without_native(monkeypatch):
-    from sunpack.core.platform.windows import elevation
-
-    calls = []
-    monkeypatch.setattr(elevation, 'is_process_elevated', lambda: False)
-    monkeypatch.setattr(module, '_remove_current_user_toast_identity', lambda: calls.append('user'))
-    monkeypatch.setattr(module, '_load_library', lambda: pytest.fail('unelevated cleanup loaded native Toast DLL'))
-
-    assert module.handle_toast_argv(['--unregister-toast']) == 0
-    assert calls == ['user']
-
-
-def test_unregister_toast_elevated_removes_machine_registration_then_delegates_user_cleanup(
-    tmp_path, monkeypatch,
-):
-    from types import SimpleNamespace
-    from sunpack.core.platform.windows import elevation, process_launch
-
-    calls = []
-    library = SimpleNamespace(
-        sunpack_toast_unregister=lambda: calls.append('machine') or 0,
-    )
-
-    class Process:
-        def wait(self, timeout=None):
-            calls.append(('wait', timeout))
-            return 0
-
-        def close(self):
-            calls.append('close')
-
-    monkeypatch.setattr(elevation, 'is_process_elevated', lambda: True)
-    monkeypatch.setattr(module, '_load_library', lambda: library)
-    monkeypatch.setattr(module, '_runtime_argv', lambda argument: ['runtime.exe', argument])
-    monkeypatch.setattr(module, 'current_process_executable', lambda: tmp_path / 'runtime.exe')
-
-    def launch(argv, *, cwd=None, env=None):
-        calls.append(('launch', argv, cwd))
-        return Process()
-
-    monkeypatch.setattr(process_launch, 'launch_unelevated', launch)
-
-    assert module.handle_toast_argv(['--unregister-toast']) == 0
-    assert calls == [
-        'machine',
-        ('launch', ['runtime.exe', '--unregister-toast-current-user'], str(tmp_path)),
-        ('wait', None),
-        'close',
-    ]
-
-
-def test_unregister_toast_elevated_rejects_missing_helper_exit_status(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    from sunpack.core.platform.windows import elevation, process_launch
-
-    calls = []
-    library = SimpleNamespace(sunpack_toast_unregister=lambda: 0)
-
-    class Process:
-        def wait(self, timeout=None):
-            calls.append(('wait', timeout))
-            return None
-
-        def terminate(self):
-            calls.append('terminate')
-
-        def close(self):
-            calls.append('close')
-
-    monkeypatch.setattr(elevation, 'is_process_elevated', lambda: True)
-    monkeypatch.setattr(module, '_load_library', lambda: library)
-    monkeypatch.setattr(module, '_runtime_argv', lambda argument: ['runtime.exe', argument])
-    monkeypatch.setattr(module, 'current_process_executable', lambda: tmp_path / 'runtime.exe')
-    monkeypatch.setattr(process_launch, 'launch_unelevated', lambda *_args, **_kwargs: Process())
-
-    with pytest.raises(OSError, match='current-user Toast cleanup returned no exit status'):
-        module.handle_toast_argv(['--unregister-toast'])
-
-    assert calls == [('wait', None), 'close']
-
-
-def test_unregister_toast_current_user_helper_never_relaunches_when_still_elevated(monkeypatch):
-    from sunpack.core.platform.windows import elevation, process_launch
-
-    calls = []
-    monkeypatch.setattr(elevation, 'is_process_elevated', lambda: True)
-    monkeypatch.setattr(module, '_remove_current_user_toast_identity', lambda: calls.append('user'))
-    monkeypatch.setattr(process_launch, 'launch_unelevated', lambda *_args, **_kwargs: pytest.fail('helper relaunched itself'))
-    monkeypatch.setattr(module, '_load_library', lambda: pytest.fail('helper loaded native Toast DLL'))
-
-    assert module.handle_toast_argv(['--unregister-toast-current-user']) == 0
-    assert calls == ['user']
-
-
-def test_unregister_toast_current_user_helper_is_dispatched_before_normal_runtime(monkeypatch):
-    import sys
-    import sunpack.runtime.entrypoint as entrypoint
-    from sunpack.core.support import runtime_identity
-
-    calls = []
-    monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', '--unregister-toast-current-user'])
-    monkeypatch.setattr(module, '_remove_current_user_toast_identity', lambda: calls.append('user'))
-    monkeypatch.setattr(runtime_identity, '_runtime_id', None)
-
-    assert entrypoint.main() == 0
-    assert calls == ['user']
-
-
-def test_current_user_toast_identity_cleanup_targets_hkcu(monkeypatch):
-    import sys
-    from types import SimpleNamespace
-
-    calls = []
-    fake_winreg = SimpleNamespace(
-        HKEY_CURRENT_USER=object(),
-        DeleteKey=lambda root, path: calls.append((root, path)),
-    )
-    monkeypatch.setitem(sys.modules, 'winreg', fake_winreg)
-
-    module._remove_current_user_toast_identity()
-
-    assert calls == [
-        (fake_winreg.HKEY_CURRENT_USER, r'Software\Classes\AppUserModelId\SunPack.Watch.Toast'),
-    ]
 
 
 def test_resource_lookup_selects_current_architecture(tmp_path, monkeypatch):

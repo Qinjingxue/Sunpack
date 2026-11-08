@@ -658,12 +658,11 @@ int wmain(int argc, wchar_t** argv) {
     const InstallContext context = install_context();
     const std::wstring& launcher_cwd = context.directory;
     if (!launcher_cwd.empty()) SetCurrentDirectoryW(launcher_cwd.c_str());
-    // Registration runs in the installer token and belongs to this install.
-    // Bypass the resident server while reusing the launcher's sole identity
-    // calculation and private-argument forwarding.
-    if (argc == 2 && wcscmp(argv[1], L"--register-toast") == 0) {
+    // COM activation needs this install's identity before it registers the
+    // callback, so it runs outside the resident Watch server.
+    if (argc >= 2 && wcscmp(argv[1], L"--toast-activated") == 0) {
         DWORD exit_code = 1;
-        if (!spawn_runtime(context, {L"--register-toast"}, false, &exit_code)) return 1;
+        if (!spawn_runtime(context, {L"--toast-activated"}, false, &exit_code)) return 1;
         return static_cast<int>(exit_code);
     }
     const bool shutdown_request = argc >= 2 && wcscmp(argv[1], L"--persistent-shutdown") == 0;

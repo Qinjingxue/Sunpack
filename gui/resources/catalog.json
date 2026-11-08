@@ -268,6 +268,18 @@
       "zh": "界面主题",
       "en": "App theme"
     },
+    "contextMenu": {
+      "zh": "资源管理器右键菜单",
+      "en": "Explorer context menu"
+    },
+    "contextMenuOn": {
+      "zh": "开启右键菜单",
+      "en": "Enable context menu"
+    },
+    "contextMenuOff": {
+      "zh": "关闭右键菜单",
+      "en": "Disable context menu"
+    },
     "system": {
       "zh": "跟随系统",
       "en": "Use system setting"
@@ -727,6 +739,22 @@
     "opReadStartupValue": {
       "zh": "读取启动项",
       "en": "Read startup entry"
+    },
+    "opReadContextMenu": {
+      "zh": "读取右键菜单状态",
+      "en": "Read context menu registration"
+    },
+    "opChangeContextMenu": {
+      "zh": "更改右键菜单",
+      "en": "Change context menu registration"
+    },
+    "contextMenuScriptMissing": {
+      "zh": "SunPack 的右键菜单脚本缺失。",
+      "en": "The SunPack context menu script is missing."
+    },
+    "contextMenuScriptFailed": {
+      "zh": "右键菜单脚本执行失败（退出码 {code}）。",
+      "en": "The context menu script failed (exit code {code})."
     },
     "opSubscribeService": {
       "zh": "订阅服务状态",

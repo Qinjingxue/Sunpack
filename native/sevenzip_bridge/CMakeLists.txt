@@ -587,15 +587,15 @@ target_compile_definitions(sunpack_sevenzip_volume_attempt_replay PRIVATE WIN32_
 sup7z_attach_bundled_7z(sunpack_sevenzip_volume_attempt_replay)
 add_test(NAME sunpack_sevenzip_volume_attempt_replay COMMAND sunpack_sevenzip_volume_attempt_replay)
 if(WIN32)
-    add_executable(sunpack_toast_registration_runtime tests/toast_registration_runtime.cpp)
-    apply_release_optimizations(sunpack_toast_registration_runtime)
-    apply_source_charset(sunpack_toast_registration_runtime)
-    add_test(NAME sunpack_launcher_toast_registration COMMAND ${CMAKE_COMMAND}
+    add_executable(sunpack_toast_activation_runtime tests/toast_activation_runtime.cpp)
+    apply_release_optimizations(sunpack_toast_activation_runtime)
+    apply_source_charset(sunpack_toast_activation_runtime)
+    add_test(NAME sunpack_launcher_toast_activation COMMAND ${CMAKE_COMMAND}
         "-DLAUNCHER=$<TARGET_FILE:sunpack_launcher>"
-        "-DRUNTIME=$<TARGET_FILE:sunpack_toast_registration_runtime>"
+        "-DRUNTIME=$<TARGET_FILE:sunpack_toast_activation_runtime>"
         "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/toast_registration.cmake")
-    set_tests_properties(sunpack_launcher_toast_registration PROPERTIES TIMEOUT 15)
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/toast_activation.cmake")
+    set_tests_properties(sunpack_launcher_toast_activation PROPERTIES TIMEOUT 15)
 endif()
 add_executable(sunpack_sevenzip_memory_replay tests/memory_replay.cpp)
 apply_release_optimizations(sunpack_sevenzip_memory_replay)

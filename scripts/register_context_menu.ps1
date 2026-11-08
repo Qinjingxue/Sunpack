@@ -217,7 +217,7 @@ function Set-ContextMenuParent {
     # Rebuild our menus so re-registration cannot retain removed commands.
     foreach ($shellKey in @(
         (Join-Path $KeyPath "shell"),
-        "HKLM:\Software\Classes\$SubCommandsKey\shell"
+        "$classesKey\$SubCommandsKey\shell"
     )) {
         if (Test-Path -LiteralPath $shellKey) {
             Remove-Item -LiteralPath $shellKey -Recurse -Force
@@ -316,15 +316,16 @@ $resolvedIconPath = if ($IconPath) { (Resolve-Path -LiteralPath $IconPath).Path 
 $menuLanguage = Get-MenuLanguage -RepoRoot $repoRoot
 $resolvedMenuText = if ($MenuText) { $MenuText } else { "sunpack" }
 
-$folderKey = "HKLM:\Software\Classes\Directory\shell\SunPack"
-$backgroundKey = "HKLM:\Software\Classes\Directory\Background\shell\SunPack"
-$fileKey = "HKLM:\Software\Classes\*\shell\SunPack"
+$classesKey = "HKCU:\Software\Classes"
+$folderKey = "$classesKey\Directory\shell\SunPack"
+$backgroundKey = "$classesKey\Directory\Background\shell\SunPack"
+$fileKey = "$classesKey\*\shell\SunPack"
 $folderSubCommandsName = "SunPack.FolderContextMenu"
 $backgroundSubCommandsName = "SunPack.BackgroundContextMenu"
 $fileSubCommandsName = "SunPack.FileContextMenu"
-$folderSubCommandsKey = "HKLM:\Software\Classes\$folderSubCommandsName"
-$backgroundSubCommandsKey = "HKLM:\Software\Classes\$backgroundSubCommandsName"
-$fileSubCommandsKey = "HKLM:\Software\Classes\$fileSubCommandsName"
+$folderSubCommandsKey = "$classesKey\$folderSubCommandsName"
+$backgroundSubCommandsKey = "$classesKey\$backgroundSubCommandsName"
+$fileSubCommandsKey = "$classesKey\$fileSubCommandsName"
 $folderMenuTexts = Get-SubMenuTexts -Language $menuLanguage -Context "folder"
 $backgroundMenuTexts = Get-SubMenuTexts -Language $menuLanguage -Context "background"
 $fileMenuTexts = Get-SubMenuTexts -Language $menuLanguage -Context "file"

@@ -4,10 +4,8 @@ import asyncio
 import secrets
 import subprocess
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
-from sunpack.core.platform.windows import toast_host
 from sunpack.core.platform.windows.secure_pipe import start_serving_current_user_pipe
 from sunpack.core.support import runtime_identity
 from sunpack.pipeline.coordinator.async_work import CancellationToken
@@ -28,11 +26,6 @@ def test_activation_helper_routes_registered_identity_and_acknowledges_completio
     identity = "v2-0123456789abcdef"
     monkeypatch.setattr(runtime_identity, "_runtime_id", identity)
     monkeypatch.setattr(persistent_process, "writable_data_dir", lambda: tmp_path)
-    monkeypatch.setattr(toast_host, "__compiled__", object(), raising=False)
-    monkeypatch.setattr(toast_host, "current_process_executable", lambda: Path(sys.executable))
-    executable, arguments = toast_host._activation_command()
-    # The compiled helper command consists only of these whitespace-free flags.
-    assert arguments == "--toast-activated " + runtime_identity.runtime_id_argument(identity)
     child_source = r'''
 import sys
 from pathlib import Path
@@ -90,8 +83,8 @@ raise SystemExit(main())
 
         async def click(batch):
             child = await asyncio.create_subprocess_exec(
-                executable, "-c", child_source, str(tmp_path), batch,
-                *arguments.split(), "-Embedding",
+                sys.executable, "-c", child_source, str(tmp_path), batch,
+                "--toast-activated", runtime_identity.runtime_id_argument(identity),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )

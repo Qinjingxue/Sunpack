@@ -648,6 +648,10 @@ void localized_config_search(Application& app) {
         assert(state(app.page(),"showThemeSetting")==true);
         search_config(app,wide(texts["startup"].get<std::string>()).c_str());
         assert(state(app.page(),"showStartupSetting")==true);
+        search_config(app,wide(texts["contextMenu"].get<std::string>()).c_str());
+        auto* menu_title=ui::GetContext().GetWindow(app.window())->Root()->FindById("context-menu-title");
+        assert(menu_title && !menu_title->textHighlights.empty());
+        assert(state(app.page(),"contextMenuEnabled").is_boolean());
         // Empty editor hints must neither retain rows nor become find targets.
         for(const auto& hint:{texts["tagInputPlaceholder"].get<std::string>(),std::string("YYYY-MM-DD HH:mm")}) {
             search_config(app,wide(hint).c_str());

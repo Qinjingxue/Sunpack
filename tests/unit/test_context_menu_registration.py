@@ -200,21 +200,24 @@ def test_context_menu_registration_survives_rebuild_and_uninstalls(tmp_path, lau
 param([string]$Scripts, [string]$LauncherMode, [string]$PythonPath)
 $ErrorActionPreference = "Stop"
 $testRootName = "SunPack.ContextMenuTest_" + [guid]::NewGuid().ToString("N")
-$testRoot = "HKCU:\Software\$testRootName"
-$null = New-Item -Path $testRoot -Force
+$testRoot = "Registry::HKEY_CURRENT_USER\Software\$testRootName"
+$null = New-Item -Path "$testRoot\User", "$testRoot\Machine" -Force
 try {
-    # Redirect only this process's HKLM drive to an isolated user registry key.
-    Remove-PSDrive -Name HKLM
-    $null = New-PSDrive -Name HKLM -PSProvider Registry -Root "HKEY_CURRENT_USER\Software\$testRootName"
+    # Isolate both drives so a hive mix-up cannot change a real menu.
+    Remove-PSDrive -Name HKCU, HKLM
+    $null = New-PSDrive -Name HKCU -PSProvider Registry -Root "HKEY_CURRENT_USER\Software\$testRootName\User"
+    $null = New-PSDrive -Name HKLM -PSProvider Registry -Root "HKEY_CURRENT_USER\Software\$testRootName\Machine"
+    $legacyKey = "HKLM:\Software\Classes\Directory\shell\SunPack"
+    $null = New-Item -Path $legacyKey -Force
     $registrationArgs = if ($LauncherMode -eq "app") { @{ AppPath = $env:COMSPEC } } else { @{ PythonPath = $PythonPath } }
     $snapshots = @()
     foreach ($pass in 1..2) {
-        $null = New-Item -Path "HKLM:\Software\Classes\SunPack.BackgroundContextMenu\shell\Obsolete" -Force
-        $null = New-Item -Path "HKLM:\Software\Classes\Directory\Background\shell\SunPack\shell\Obsolete" -Force
+        $null = New-Item -Path "HKCU:\Software\Classes\SunPack.BackgroundContextMenu\shell\Obsolete" -Force
+        $null = New-Item -Path "HKCU:\Software\Classes\Directory\Background\shell\SunPack\shell\Obsolete" -Force
         & (Join-Path $Scripts "register_context_menu.ps1") @registrationArgs | Out-Null
         $snapshot = @{}
         foreach ($surface in @("Folder", "Background", "File")) {
-            $shell = "HKLM:\Software\Classes\SunPack.${surface}ContextMenu\shell"
+            $shell = "HKCU:\Software\Classes\SunPack.${surface}ContextMenu\shell"
             $snapshot[$surface] = @(Get-ChildItem -LiteralPath $shell | ForEach-Object {
                 [pscustomobject]@{
                     name = $_.PSChildName
@@ -223,7 +226,7 @@ try {
                 }
             })
         }
-        if (Test-Path -LiteralPath "HKLM:\Software\Classes\Directory\Background\shell\SunPack\shell") {
+        if (Test-Path -LiteralPath "HKCU:\Software\Classes\Directory\Background\shell\SunPack\shell") {
             throw "Legacy inline submenu survived registration"
         }
         $snapshots += $snapshot
@@ -232,7 +235,10 @@ try {
     $remaining = @(@(
         "Directory\shell\SunPack", "Directory\Background\shell\SunPack", "*\shell\SunPack",
         "SunPack.FolderContextMenu", "SunPack.BackgroundContextMenu", "SunPack.FileContextMenu"
-    ) | Where-Object { Test-Path -LiteralPath "HKLM:\Software\Classes\$_" })
+    ) | Where-Object { Test-Path -LiteralPath "HKCU:\Software\Classes\$_" })
+    if (-not (Test-Path -LiteralPath $legacyKey)) { throw "User cleanup removed the machine menu" }
+    & (Join-Path $Scripts "unregister_context_menu.ps1") -Machine | Out-Null
+    if (Test-Path -LiteralPath $legacyKey) { throw "Machine cleanup retained the legacy menu" }
     $result = @{ snapshots = $snapshots; remaining = $remaining } | ConvertTo-Json -Depth 8 -Compress
     $result = [regex]::Replace($result, '[^\x00-\x7F]', [System.Text.RegularExpressions.MatchEvaluator]{
         param($match)
@@ -240,7 +246,7 @@ try {
     })
     Write-Output $result
 } finally {
-    Remove-PSDrive -Name HKLM -ErrorAction SilentlyContinue
+    Remove-PSDrive -Name HKCU, HKLM -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $testRoot -Recurse -Force
 }
 ''', encoding="ascii")

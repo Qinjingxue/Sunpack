@@ -1,54 +1,7 @@
 import sys
 
 
-def _launch_unelevated_launcher(arguments: list[str]) -> int:
-    from sunpack.core.platform.windows.process_launch import launch_unelevated
-    from sunpack.core.support.process_executable import current_process_executable
-    from sunpack.runtime.watch.launcher import packaged_runtime_executable
-
-    executable = current_process_executable()
-    launcher = packaged_runtime_executable(executable)
-    if launcher is None:
-        return 1
-    process = launch_unelevated(
-        [str(launcher), *arguments],
-        cwd=str(executable.parent),
-    )
-    try:
-        # A slow unelevated launcher must not be mistaken for a failed launch.
-        return int(process.wait())
-    finally:
-        close = getattr(process, "close", None)
-        if callable(close):
-            close()
-
-
-def _launch_watch_unelevated() -> int:
-    """Installer-only bridge that restores Watch with the interactive shell token."""
-
-    return _launch_unelevated_launcher(["watch", "start"])
-
-
-def _configure_startup_current_user(action: str) -> int:
-    """Apply the installer-selected startup state to the interactive user's HKCU."""
-
-    if action not in {"enable", "disable"}:
-        return 2
-    return _launch_unelevated_launcher(["watch", "startup", action])
-
-
 def main() -> int:
-    # Installer recovery must be handled by the new runtime itself so it can
-    # deliberately cross from an elevated setup process back to the
-    # interactive shell's medium-integrity token.
-    if sys.argv[1:2] == ["--launch-watch-unelevated"]:
-        return _launch_watch_unelevated()
-
-    if sys.argv[1:2] == ["--configure-startup-current-user"]:
-        if len(sys.argv) != 3:
-            return 2
-        return _configure_startup_current_user(sys.argv[2])
-
     from sunpack.core.support.runtime_identity import consume_runtime_id
 
     try:
@@ -64,17 +17,11 @@ def main() -> int:
     # process-local private bootstrap arguments before either is entered.
     sys.argv[:] = [sys.argv[0], *public_argv]
 
-    # Toast helpers need the same namespace as Watch, but must not start an
-    # extraction engine or a persistent server. COM may append -Embedding.
-    if sys.argv[1:2] and sys.argv[1] in {
-        "--register-toast",
-        "--unregister-toast",
-        "--unregister-toast-current-user",
-        "--toast-activated",
-    }:
-        from sunpack.core.platform.windows.toast_host import handle_toast_argv
+    # Toast activation shares the Watch namespace without starting a server.
+    if sys.argv[1:2] == ["--toast-activated"]:
+        from sunpack.core.platform.windows.toast_host import activate_toast
 
-        return handle_toast_argv(sys.argv[1:])
+        return activate_toast()
 
     from sunpack.runtime.cli.persistent_process import handle_early_argv
 

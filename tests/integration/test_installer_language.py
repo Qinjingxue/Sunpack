@@ -68,4 +68,4 @@ def test_installer_initializes_language_before_context_menu_registration(repo_ro
     post_install = installer.split("procedure CurStepChanged(CurStep: TSetupStep);", 1)[1]
     assert post_install.index("UpgradeConfigurationFields;") < post_install.index(
         "InitializeInstalledLanguage;"
-    ) < post_install.index("RunContextMenuScript(True)")
+    ) < post_install.index("ApplySelectedContextMenuState;")

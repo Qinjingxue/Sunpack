@@ -14,8 +14,6 @@ SUNPACK_TOAST_API HRESULT sunpack_toast_create_presenter(const wchar_t*, const w
 SUNPACK_TOAST_API HRESULT sunpack_toast_show(void*, const std::uint8_t*, std::uint32_t, std::uint64_t) noexcept;
 SUNPACK_TOAST_API HRESULT sunpack_toast_clear(void*) noexcept;
 SUNPACK_TOAST_API HRESULT sunpack_toast_destroy(void*) noexcept;
-SUNPACK_TOAST_API HRESULT sunpack_toast_register(const wchar_t*, const wchar_t*) noexcept;
-SUNPACK_TOAST_API HRESULT sunpack_toast_unregister() noexcept;
 SUNPACK_TOAST_API HRESULT sunpack_toast_activate() noexcept;
 SUNPACK_TOAST_API HRESULT sunpack_toast_cancel_batch(wchar_t*, std::uint32_t) noexcept;
 SUNPACK_TOAST_API HRESULT sunpack_toast_self_test() noexcept;

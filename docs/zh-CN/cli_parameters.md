@@ -296,7 +296,7 @@ python sunpack.py version
 
 ## Windows 右键菜单
 
-机器级右键菜单脚本（需要管理员权限的终端）：
+在普通 PowerShell 会话中运行以下脚本，管理当前用户的右键菜单。
 
 ```powershell
 .\scripts\register_context_menu.ps1
