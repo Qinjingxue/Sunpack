@@ -1,23 +1,15 @@
-from sunpack_native import encode_worker_frame, parse_worker_event
-
-from sunpack_native import worker_manifest_from_rows
-
-from sunpack_native import parse_worker_event
-from tests.helpers.worker_events import worker_trace_item
 from sunpack.pipeline.extraction.progress import (
     build_extraction_progress_manifest,
     iter_progress_files,
 )
+from tests.helpers.worker_events import worker_result, worker_trace_item
 
 
 def _trace_result(items, **fields):
-    return parse_worker_event(encode_worker_frame({
-        "type": "result",
+    return worker_result(
+        trace_items=[worker_trace_item(**item) for item in items],
         **fields,
-        "diagnostics": {
-            "output_trace": {"items": [worker_trace_item(**item) for item in items]}
-        },
-    }))
+    )
 
 
 def test_progress_manifest_preserves_archive_path_and_numbered_output_path(tmp_path):
@@ -67,17 +59,18 @@ def test_progress_manifest_classifies_trace_items_and_skips_directories(tmp_path
 
 
 def test_progress_manifest_from_worker_rows_keeps_complete_bytes_written(tmp_path):
-    rows = worker_manifest_from_rows(
-        [
-            [0, "done.bin", "", 5, 5, 1, 7, 1, 7, 1, 1, 0, 0, ""],
-            [1, "cut.bin", "", 9, 4, 1, 7, 0, 0, 0, 2, 0, 0, ""],
+    result = worker_result(
+        status="failed",
+        manifest_rows=[
+            [0, "done.bin", "", 5, 5, 1, 7, 1, 7, 1, 1, 0, 0, b""],
+            [1, "cut.bin", "", 9, 4, 1, 7, 0, 0, 0, 2, 0, 0, b""],
         ],
-        False, 2, 0, 14, True,
+        verified_manifest={"inventory": [0, 2, 0, 14, 1]},
     )
     manifest = build_extraction_progress_manifest(
         archive=str(tmp_path / "source.zip"),
         out_dir=str(tmp_path / "out"),
-        diagnostics={"result": {"status": "failed", "verified_manifest": {"native_rows": rows}}},
+        diagnostics={"result": result},
     )
 
     by_archive_path = {item["archive_path"]: item for item in iter_progress_files(manifest)}
@@ -113,19 +106,15 @@ def test_progress_manifest_adds_untraced_output_files(tmp_path):
 
 
 def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):
-    result = parse_worker_event(encode_worker_frame({
-        "type": "result",
-        "status": "ok",
-        "bytes_written": 6,
-        "verified_manifest": {
-            "validated": True,
-            "inventory": [1, 2, 0, 6, 1],
-            "rows": [
-                [0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, b''],
-                [1, "b.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, b''],
-            ],
-        },
-    }))
+    result = worker_result(
+        status="ok",
+        bytes_written=6,
+        manifest_rows=[
+            [0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, b""],
+            [1, "b.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, b""],
+        ],
+        verified_manifest={"validated": True, "inventory": [1, 2, 0, 6, 1]},
+    )
 
     manifest = build_extraction_progress_manifest(
         archive="a.zip",

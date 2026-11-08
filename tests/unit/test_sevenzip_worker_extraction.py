@@ -20,7 +20,7 @@ import pytest
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
-from tests.helpers.worker_events import worker_trace_item
+from tests.helpers.worker_events import worker_result as build_worker_result, worker_trace_item
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _NativeWorkerProcess,
@@ -1058,14 +1058,20 @@ def test_native_worker_reports_cpu_credit_sizing_plan(credits, reserve):
     assert int(handshake["memory_reserve_bytes"]) == ((128 + 16 * capacity) * 1024**2)
 
 
-def test_worker_event_rejects_non_objects_and_malformed_rows():
+def test_worker_event_rejects_malformed_frames_and_chunks():
     for event in [
-        {"type": "result", "verified_manifest": {"rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b"abc"]]}},
-        {"type": "result", "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}]}}},
-        {"type": "result", "verified_manifest": {"inventory": [1,1,0,3,1], "rows": [[0,"a.txt"]]}},
+        {"type": "manifest_chunk", "job_id": "job", "seq": 0, "rows": [[0, "a.txt"]]},
+        {"type": "trace_chunk", "job_id": "job", "seq": 0, "items": [{"path": "a.txt"}]},
+        {"type": "result", "job_id": "job", "verified_manifest": {"inventory": [1, 1, 0, 3]}},
     ]:
         with pytest.raises(ValueError):
             parse_worker_event(encode_worker_frame(event))
+    for fields in [
+        {"verified_manifest": {"inventory": [1, 0, 0, 0, 1], "rows": [], "chunk_count": 0, "file_count": 0}},
+        {"diagnostics": {"output_trace": {"items": [], "chunk_count": 0, "item_count": 0}}},
+    ]:
+        with pytest.raises(ValueError, match="details must arrive in chunks"):
+            parse_worker_event(encode_worker_frame({"type": "result", "job_id": "job", **fields}))
     frame = encode_worker_frame({"type": "progress", "completed_bytes": 5})
     for malformed in [b"not a frame", frame[:-1], frame + b"trailing"]:
         with pytest.raises(ValueError):
@@ -1079,15 +1085,14 @@ def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
         native_worker_manifest,
     )
 
-    result_payload = parse_worker_event(encode_worker_frame({
-        "type": "result",
-        "status": "ok",
-        "verified_manifest": {
+    result_payload = build_worker_result(
+        status="ok",
+        manifest_rows=[[0, "source.txt", "output.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b"abc"]],
+        verified_manifest={
             "validated": True,
-            "rows": [[0, "source.txt", "output.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b'abc']],
             "inventory": [1, 1, 0, 3, 0],
         },
-    }))
+    )
     diagnostics = build_worker_diagnostics(
         stdout="x" * 100_000,
         stderr="",
@@ -1110,20 +1115,15 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
         compact_success_worker_diagnostics,
     )
 
-    result = parse_worker_event(encode_worker_frame({
-        "status": "ok",
-        "verified_manifest": {
+    result = build_worker_result(
+        status="ok",
+        manifest_rows=[[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b"abc"]],
+        trace_items=[worker_trace_item(path="a.txt")],
+        verified_manifest={
             "validated": True,
             "inventory": [1, 1, 0, 3, 1],
-            "rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b'abc']],
         },
-        "diagnostics": {
-            "output_trace": {
-                "items": [worker_trace_item(path="a.txt")],
-                "files_written": 1,
-            }
-        },
-    }))
+    )
     diagnostics = build_worker_diagnostics(stdout="", stderr="", returncode=0, result_payload=result)
     assert "native_items" in result["diagnostics"]["output_trace"]
 
@@ -1553,24 +1553,23 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
     assert coverage["matched_files"] == len(entries)
 
 
-def test_worker_manifest_protocol(subtests):
+def test_worker_manifest_protocol():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         native_worker_manifest,
     )
     path = '目录/"quoted"\\name.txt'
-    fields = [("rows", [[0, path, "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, b'abc']]),
-              ("inventory", [1, 1, 0, 3, 1])]
-    for order in (fields, fields[::-1]):
-        with subtests.test(rows_first=order[0][0] == "rows"):
-            result = parse_worker_event(encode_worker_frame({"type": "result", "verified_manifest": dict(order)}))
-            manifest = result["verified_manifest"]
-            assert "rows" not in manifest and "files" not in manifest
-            assert manifest["inventory"]["complete"] and manifest["inventory"]["identity_paths"]
-            native = native_worker_manifest(result)
-            assert len(native) == 1 and native.complete
-            row = native.file_page(0, 1)[0]
-            assert row["path"] == path and row["magic"] == b"abc" and row["mtime_ns"] == 123
-            assert row["status"] == "complete" and "output_path" not in row
+    result = build_worker_result(
+        manifest_rows=[[0, path, "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, b"abc"]],
+        verified_manifest={"inventory": [1, 1, 0, 3, 1]},
+    )
+    manifest = result["verified_manifest"]
+    assert "rows" not in manifest and "files" not in manifest
+    assert manifest["inventory"]["complete"] and manifest["inventory"]["identity_paths"]
+    native = native_worker_manifest(result)
+    assert len(native) == 1 and native.complete
+    row = native.file_page(0, 1)[0]
+    assert row["path"] == path and row["magic"] == b"abc" and row["mtime_ns"] == 123
+    assert row["status"] == "complete" and "output_path" not in row
 
 
 @pytest.mark.parametrize("layout", ["file", "carrier", "concat_ranges"])

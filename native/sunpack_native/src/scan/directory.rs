@@ -1777,66 +1777,6 @@ pub(crate) fn output_inventory_from_serialized(
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (rows, complete, file_count, dir_count, total_size, identity_paths=false))]
-pub(crate) fn worker_manifest_from_rows(
-    py: Python<'_>,
-    rows: Vec<Py<PyList>>,
-    complete: bool,
-    file_count: usize,
-    dir_count: usize,
-    total_size: u64,
-    identity_paths: bool,
-) -> PyResult<NativeWorkerManifest> {
-    let mut files = Vec::with_capacity(rows.len());
-    for row in rows {
-        let row = row.bind(py);
-        if row.len() != 14 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "worker manifest row must contain 14 columns",
-            ));
-        }
-        let path = row.get_item(1)?.extract::<String>()?;
-        let raw_output_path = row.get_item(2)?.extract::<String>()?;
-        let has_crc = row.get_item(5)?.extract::<u8>()? != 0;
-        let has_output_crc = row.get_item(7)?.extract::<u8>()? != 0;
-        let status = row.get_item(10)?.extract::<u8>()?;
-        files.push(OutputFileRecord {
-            index: row.get_item(0)?.extract::<u32>()?,
-            output_path: (!raw_output_path.is_empty() && raw_output_path != path)
-                .then_some(raw_output_path),
-            path,
-            abs_path: None,
-            size: row.get_item(3)?.extract::<u64>()?,
-            bytes_written: row.get_item(4)?.extract::<u64>()?,
-            crc32: has_crc
-                .then(|| row.get_item(6).and_then(|item| item.extract::<u32>()))
-                .transpose()?,
-            output_crc32: has_output_crc
-                .then(|| row.get_item(8).and_then(|item| item.extract::<u32>()))
-                .transpose()?,
-            crc_ok: Some(row.get_item(9)?.extract::<u8>()? != 0),
-            status,
-            mtime_ns: if row.get_item(11)?.extract::<u8>()? != 0 {
-                Some(row.get_item(12)?.extract::<u64>()?)
-            } else {
-                None
-            },
-            magic: decode_hex_bytes(&row.get_item(13)?.extract::<String>()?)?,
-        });
-    }
-    NativeWorkerManifest::from_parts(
-        files,
-        [
-            u64::from(complete),
-            file_count as u64,
-            dir_count as u64,
-            total_size,
-            u64::from(identity_paths),
-        ],
-    )
-}
-
 pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {
     let root = PathBuf::from(output_dir);
     let exists = root.exists();
@@ -1868,26 +1808,6 @@ fn py_dict_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String
         return Ok(None);
     }
     Ok(Some(value.str()?.to_string_lossy().into_owned()))
-}
-
-pub(crate) fn decode_hex_bytes(value: &str) -> PyResult<Vec<u8>> {
-    if value.len() % 2 != 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "worker manifest magic must contain complete hex bytes",
-        ));
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let text = std::str::from_utf8(pair).map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err("worker manifest magic is not ASCII hex")
-            })?;
-            u8::from_str_radix(text, 16).map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err("worker manifest magic is not valid hex")
-            })
-        })
-        .collect()
 }
 
 fn py_dict_u64(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {

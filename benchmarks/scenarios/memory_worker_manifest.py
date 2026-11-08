@@ -18,7 +18,7 @@ import psutil
 from benchmarks.harness import render_report, report_from_payload
 
 
-def compact_rows(count: int) -> list[list[object]]:
+def compact_rows(start: int, stop: int) -> list[list[object]]:
     return [
         [
             index,
@@ -34,13 +34,15 @@ def compact_rows(count: int) -> list[list[object]]:
             1,
             1,
             index + 1,
-            "00",
+            b"\x00",
         ]
-        for index in range(count)
+        for index in range(start, stop)
     ]
 
 
 def run_native(count: int) -> dict[str, object]:
+    from sunpack_native import NativeWorkerResultAccumulator, encode_worker_frame, parse_worker_event
+
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         compact_success_worker_diagnostics,
@@ -49,27 +51,50 @@ def run_native(count: int) -> dict[str, object]:
 
     process = psutil.Process()
     initial_rss = process.memory_info().rss
-    payload = {
+    rows_rss = initial_rss
+    parsed_rss = initial_rss
+    job_id = "benchmark"
+    accumulator = NativeWorkerResultAccumulator(job_id)
+    chunk_size = 1_000
+    chunk_count = 0
+    elapsed = 0.0
+    for start in range(0, count, chunk_size):
+        rows = compact_rows(start, min(count, start + chunk_size))
+        rows_rss = max(rows_rss, process.memory_info().rss)
+        frame = encode_worker_frame({
+            "type": "manifest_chunk", "job_id": job_id, "seq": chunk_count, "rows": rows,
+        })
+        del rows
+        started = time.perf_counter()
+        accumulator.accept(parse_worker_event(frame))
+        elapsed += time.perf_counter() - started
+        parsed_rss = max(parsed_rss, process.memory_info().rss)
+        del frame
+        chunk_count += 1
+
+    result_frame = encode_worker_frame({
         "type": "result",
+        "job_id": job_id,
         "status": "ok",
         "verified_manifest": {
             "validated": True,
             "file_count": count,
             "inventory": [1, count, max(1, count // 1000), count * (count + 1) // 2, 0],
-            "rows": compact_rows(count),
+            "chunk_count": chunk_count,
         },
-    }
-    rows_rss = process.memory_info().rss
+    })
     started = time.perf_counter()
+    payload = parse_worker_event(result_frame)
+    accumulator.accept(payload)
     diagnostics = build_worker_diagnostics(
         stdout="", stderr="", returncode=0, result_payload=payload
     )
-    parsed_rss = process.memory_info().rss
+    parsed_rss = max(parsed_rss, process.memory_info().rss)
     inventory = collect_output_inventory("C:/benchmark-output", payload)
     inventory_rss = process.memory_info().rss
     compact_success_worker_diagnostics(diagnostics)
     gc.collect()
-    elapsed = time.perf_counter() - started
+    elapsed += time.perf_counter() - started
     steady_rss = process.memory_info().rss
 
     assert inventory.stats.file_count == count

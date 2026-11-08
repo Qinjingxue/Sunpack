@@ -14,7 +14,7 @@ use serde::Deserialize;
 use std::fmt;
 use std::sync::Arc;
 
-/// One `diagnostics.output_trace.items` entry, as emitted by the worker.
+/// One item from a worker trace chunk.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OutputTraceItem {
@@ -40,7 +40,7 @@ pub(crate) struct OutputTraceItem {
     pub(crate) failed: bool,
 }
 
-/// Rust-owned `output_trace.items` table of one worker result.
+/// Rust-owned output trace table of one worker result.
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeOutputTrace {
     items: Arc<Vec<OutputTraceItem>>,
@@ -216,47 +216,27 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let py = self.py;
         let dict = PyDict::new(py);
-        let mut inventory = None::<[u64; 5]>;
-        let mut rows = None::<Vec<OutputFileRecord>>;
         while let Some(key) = map.next_key::<String>()? {
             match (self.scope, key.as_str()) {
-                (Scope::Manifest, "rows") => {
-                    rows = Some(map.next_value::<WorkerRows>()?.0);
-                    continue;
+                (Scope::Manifest, "rows") | (Scope::OutputTrace, "items") => {
+                    return Err(de::Error::custom(
+                        "worker result details must arrive in chunks",
+                    ));
                 }
                 (Scope::Manifest, "inventory") => {
-                    let columns = map.next_value::<[u64; 5]>()?;
+                    let [complete, files, dirs, size, identity_paths] =
+                        map.next_value::<[u64; 5]>()?;
                     let summary = PyDict::new(py);
-                    let entries: [(&str, Py<PyAny>); 5] = [
-                        (
-                            "complete",
-                            (columns[0] != 0).into_py_any(py).map_err(py_error)?,
-                        ),
-                        ("file_count", columns[1].into_py_any(py).map_err(py_error)?),
-                        ("dir_count", columns[2].into_py_any(py).map_err(py_error)?),
-                        ("total_size", columns[3].into_py_any(py).map_err(py_error)?),
-                        (
-                            "identity_paths",
-                            (columns[4] != 0).into_py_any(py).map_err(py_error)?,
-                        ),
-                    ];
-                    for (name, value) in entries {
-                        summary.set_item(name, value).map_err(py_error)?;
-                    }
+                    summary
+                        .set_item("complete", complete != 0)
+                        .map_err(py_error)?;
+                    summary.set_item("file_count", files).map_err(py_error)?;
+                    summary.set_item("dir_count", dirs).map_err(py_error)?;
+                    summary.set_item("total_size", size).map_err(py_error)?;
+                    summary
+                        .set_item("identity_paths", identity_paths != 0)
+                        .map_err(py_error)?;
                     dict.set_item("inventory", summary).map_err(py_error)?;
-                    inventory = Some(columns);
-                    continue;
-                }
-                (Scope::OutputTrace, "items") => {
-                    let items = map.next_value::<Vec<OutputTraceItem>>()?;
-                    let native = Py::new(
-                        py,
-                        NativeOutputTrace {
-                            items: Arc::new(items),
-                        },
-                    )
-                    .map_err(py_error)?;
-                    dict.set_item("native_items", native).map_err(py_error)?;
                     continue;
                 }
                 (Scope::Root, "rows") => {
@@ -285,12 +265,6 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
             };
             let value = map.next_value_seed(PySeed { py, scope: child })?;
             dict.set_item(key, value).map_err(py_error)?;
-        }
-        if let Some(files) = rows {
-            let columns = inventory.ok_or_else(|| de::Error::missing_field("inventory"))?;
-            let manifest = NativeWorkerManifest::from_parts(files, columns).map_err(py_error)?;
-            dict.set_item("native_rows", Py::new(py, manifest).map_err(py_error)?)
-                .map_err(py_error)?;
         }
         Ok(dict.into_any().unbind())
     }

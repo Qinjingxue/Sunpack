@@ -3,8 +3,6 @@ from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 import pytest
 
-from sunpack_native import worker_manifest_from_rows
-
 from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.contracts.filesystem import DirectorySnapshot
 from sunpack.pipeline.coordinator.output_scan_policy import (
@@ -15,6 +13,7 @@ from sunpack.pipeline.extraction.output_inventory import collect_output_inventor
 from tests.helpers.config_factory import make_config
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_minimal_7z
+from tests.helpers.worker_events import worker_result
 
 
 def _config():
@@ -145,25 +144,18 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
     payload = make_minimal_7z()
     archive.write_bytes(payload)
     stat = archive.stat()
-    worker_result = {
-        "status": "ok",
-        "verified_manifest": {
+    result = worker_result(
+        status="ok",
+        manifest_rows=[
+            [0, archive.name, "", len(payload), len(payload), 0, 0, 0, 0, 1, 1,
+             1, stat.st_mtime_ns, payload],
+        ],
+        verified_manifest={
             "validated": True,
-            "inventory": {
-                "complete": True,
-                "file_count": 1,
-                "dir_count": 0,
-                "total_size": len(payload),
-                "identity_paths": True,
-            },
-            "native_rows": worker_manifest_from_rows(
-                [[0, archive.name, "", len(payload), len(payload), 0, 0, 0, 0, 1, 1,
-                  1, stat.st_mtime_ns, payload.hex()]],
-                True, 1, 0, len(payload), True,
-            ),
+            "inventory": [1, 1, 0, len(payload), 1],
         },
-    }
-    inventory = collect_output_inventory(str(tmp_path), worker_result)
+    )
+    inventory = collect_output_inventory(str(tmp_path), result)
     monkeypatch.setattr(
         "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.inventory_file_indices",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python inventory filtering must be bypassed")),
@@ -201,32 +193,24 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
     stat = allowed.stat()
     rows = [
         [0, allowed.name, "", stat.st_size, stat.st_size, 0, 0, 0, 0, 1, 1,
-         1, stat.st_mtime_ns, b"PK\x03\x04payload".hex()],
+         1, stat.st_mtime_ns, b"PK\x03\x04payload"],
         [1, "ignored.tmp", "", 4, 4, 0, 0, 0, 0, 1, 1,
-         1, stat.st_mtime_ns, b"temp".hex()],
+         1, stat.st_mtime_ns, b"temp"],
         [2, "escape.bin", "../escape.bin", 4, 4, 0, 0, 0, 0, 1, 1,
-         1, stat.st_mtime_ns, b"evil".hex()],
+         1, stat.st_mtime_ns, b"evil"],
         [3, "alias.bin", allowed.name, 4, 4, 0, 0, 0, 0, 1, 1,
-         1, stat.st_mtime_ns, b"last".hex()],
+         1, stat.st_mtime_ns, b"last"],
     ]
     allowed.write_bytes(b"last")
-    worker_result = {
-        "status": "ok",
-        "verified_manifest": {
+    result = worker_result(
+        status="ok",
+        manifest_rows=rows,
+        verified_manifest={
             "validated": True,
-            "inventory": {
-                "complete": True,
-                "file_count": 4,
-                "dir_count": 0,
-                "total_size": stat.st_size + 12,
-                "identity_paths": False,
-            },
-            "native_rows": worker_manifest_from_rows(
-                rows, True, 4, 0, stat.st_size + 12, False,
-            ),
+            "inventory": [1, 4, 0, stat.st_size + 12, 0],
         },
-    }
-    inventory = collect_output_inventory(str(tmp_path), worker_result)
+    )
+    inventory = collect_output_inventory(str(tmp_path), result)
     config = make_config(with_detection_pipeline(precheck=[{'name': 'blacklist', 'enabled': True, 'extensions': [{'value': 'tmp', 'regex': False}]}]))
     policy = OutputScanPolicy(config)
 
@@ -261,24 +245,18 @@ def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projectio
     new_file.write_bytes(b"new")
     cutoff_ns = 60_000_000_000
     rows = [
-        [0, "old/old.zip", "", 3, 3, 0, 0, 0, 0, 1, 1, 1, cutoff_ns - 1, b"old".hex()],
-        [1, "new/new.zip", "", 3, 3, 0, 0, 0, 0, 1, 1, 1, cutoff_ns, b"new".hex()],
+        [0, "old/old.zip", "", 3, 3, 0, 0, 0, 0, 1, 1, 1, cutoff_ns - 1, b"old"],
+        [1, "new/new.zip", "", 3, 3, 0, 0, 0, 0, 1, 1, 1, cutoff_ns, b"new"],
     ]
-    worker_result = {
-        "status": "ok",
-        "verified_manifest": {
+    result = worker_result(
+        status="ok",
+        manifest_rows=rows,
+        verified_manifest={
             "validated": True,
-            "inventory": {
-                "complete": True,
-                "file_count": 2,
-                "dir_count": 2,
-                "total_size": 6,
-                "identity_paths": True,
-            },
-            "native_rows": worker_manifest_from_rows(rows, True, 2, 2, 6, True),
+            "inventory": [1, 2, 2, 6, 1],
         },
-    }
-    inventory = collect_output_inventory(str(tmp_path), worker_result)
+    )
+    inventory = collect_output_inventory(str(tmp_path), result)
     config = make_config({
         "filesystem": {
             "scan_filters": [

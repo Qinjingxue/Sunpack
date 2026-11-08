@@ -6,6 +6,7 @@ import pytest
 from sunpack_native import output_inventory_from_serialized
 
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
+from tests.helpers.worker_events import worker_result
 
 
 @pytest.mark.parametrize("statuses, declared_complete, declared_count, complete", [
@@ -21,18 +22,21 @@ def test_worker_inventory_completeness_controls_scan_reuse(
 ):
     # Paging/CRC tests construct inventories directly. They cannot detect a
     # summary incorrectly bypassing the output scan with incomplete rows.
-    from sunpack_native import worker_manifest_from_rows
     from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 
     (tmp_path / "actual.txt").write_text("actual", encoding="utf-8")
-    native = worker_manifest_from_rows([
-        [index, f"reported-{index}.txt", "", 3, 3, 0, 0, 0, 0, 0, status, 0, 0, ""]
-        for index, status in enumerate(statuses)
-    ], declared_complete, declared_count, 0, len(statuses) * 3)
-    result = {"status": "ok", "verified_manifest": {
-        "validated": True, "native_rows": native,
-        "inventory": {"complete": declared_complete, "file_count": declared_count},
-    }}
+    result = worker_result(
+        status="ok",
+        manifest_rows=[
+            [index, f"reported-{index}.txt", "", 3, 3, 0, 0, 0, 0, 0, status, 0, 0, b""]
+            for index, status in enumerate(statuses)
+        ],
+        verified_manifest={
+            "validated": True,
+            "inventory": [int(declared_complete), declared_count, 0, len(statuses) * 3, 0],
+        },
+    )
+    native = result["verified_manifest"]["native_rows"]
 
     inventory = collect_output_inventory(str(tmp_path), result)
     assert native.complete is complete

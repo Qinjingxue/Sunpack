@@ -1,4 +1,3 @@
-from sunpack_native import encode_worker_frame, parse_worker_event
 import json
 import zipfile
 
@@ -13,8 +12,7 @@ from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
-from tests.helpers.worker_events import worker_trace_item
-from sunpack_native import parse_worker_event
+from tests.helpers.worker_events import worker_result, worker_trace_item
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest
 
 
@@ -259,37 +257,33 @@ def test_output_presence_uses_worker_manifest_progress_as_completeness(tmp_path)
         archive=str(archive),
         out_dir=str(out_dir),
         diagnostics={
-            "result": parse_worker_event(encode_worker_frame({
-                "status": "failed",
-                "failure_stage": "item_extract",
-                "failure_kind": "checksum_error",
-                "files_written": 2,
-                "bytes_written": 7,
-                "diagnostics": {
-                    "output_trace": {
-                        "items": [
-                            worker_trace_item(
-                                path="complete.txt",
-                                output_path=str(complete),
-                                bytes_written=2,
-                                expected_size=2,
-                            ),
-                            worker_trace_item(
-                                path="partial.bin",
-                                output_path=str(partial),
-                                failed=True,
-                                bytes_written=5,
-                                expected_size=10,
-                            ),
-                            worker_trace_item(
-                                path="missing.bin",
-                                failed=True,
-                                expected_size=10,
-                            ),
-                        ]
-                    }
-                },
-            }))
+            "result": worker_result(
+                status="failed",
+                failure_stage="item_extract",
+                failure_kind="checksum_error",
+                files_written=2,
+                bytes_written=7,
+                trace_items=[
+                    worker_trace_item(
+                        path="complete.txt",
+                        output_path=str(complete),
+                        bytes_written=2,
+                        expected_size=2,
+                    ),
+                    worker_trace_item(
+                        path="partial.bin",
+                        output_path=str(partial),
+                        failed=True,
+                        bytes_written=5,
+                        expected_size=10,
+                    ),
+                    worker_trace_item(
+                        path="missing.bin",
+                        failed=True,
+                        expected_size=10,
+                    ),
+                ],
+            )
         },
     )
     task = _task(tmp_path)

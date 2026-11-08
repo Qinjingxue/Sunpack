@@ -1,6 +1,41 @@
 """Current worker wire data shared by parser-focused fixtures."""
 
 
+def worker_result(*, manifest_rows=None, trace_items=None, **fields):
+    """Build a fixture result through the binary parser and job accumulator."""
+    from sunpack_native import NativeWorkerResultAccumulator, encode_worker_frame, parse_worker_event
+
+    job_id = "fixture"
+    accumulator = NativeWorkerResultAccumulator(job_id)
+
+    def accept(kind, **payload):
+        event = parse_worker_event(encode_worker_frame({"type": kind, "job_id": job_id, **payload}))
+        accumulator.accept(event)
+        return event
+
+    if manifest_rows is not None:
+        if manifest_rows:
+            accept("manifest_chunk", seq=0, rows=manifest_rows)
+        fields["verified_manifest"] = {
+            **fields["verified_manifest"],
+            "chunk_count": int(bool(manifest_rows)),
+            "file_count": len(manifest_rows),
+        }
+    if trace_items is not None:
+        if trace_items:
+            accept("trace_chunk", seq=0, items=trace_items)
+        diagnostics = fields.get("diagnostics", {})
+        fields["diagnostics"] = {
+            **diagnostics,
+            "output_trace": {
+                **diagnostics.get("output_trace", {}),
+                "chunk_count": int(bool(trace_items)),
+                "item_count": len(trace_items),
+            },
+        }
+    return accept("result", **fields)
+
+
 def worker_trace_item(**overrides):
     item = {
         "index": 0,

@@ -43,7 +43,10 @@ fn native_available() -> bool {
 
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(io::archive_state::archive_input_slices, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        io::archive_state::archive_input_slices,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::append_failure_report, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::publish_failure_report, m)?)?;
@@ -231,19 +234,15 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         scan::directory::output_inventory_from_serialized,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::worker_manifest_from_rows,
-        m
-    )?)?;
     m.add_class::<scan::worker_event::NativeOutputTrace>()?;
     m.add_class::<scan::worker_wire::NativeWorkerFrameDecoder>()?;
     m.add_class::<scan::worker_event::NativeWorkerResultAccumulator>()?;
+    m.add_function(wrap_pyfunction!(scan::worker_wire::encode_worker_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_event, m)?)?;
     m.add_function(wrap_pyfunction!(
-        scan::worker_wire::encode_worker_frame,
+        scan::worker_event::parse_worker_transport_event,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_event, m)?)?;
-    m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_transport_event, m)?)?;
     m.add_class::<scan::progress_manifest::NativeProgressManifest>()?;
     m.add_function(wrap_pyfunction!(
         scan::progress_manifest::build_progress_manifest,

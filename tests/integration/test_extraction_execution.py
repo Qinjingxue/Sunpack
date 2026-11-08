@@ -1,4 +1,3 @@
-from sunpack_native import encode_worker_frame, parse_worker_event
 import subprocess
 import tempfile
 import unittest
@@ -18,7 +17,7 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
-from tests.helpers.worker_events import worker_trace_item
+from tests.helpers.worker_events import worker_result, worker_trace_item
 
 
 def _completed(*, returncode, stdout, stderr, worker_diagnostics=None, result_payload=None):
@@ -218,43 +217,37 @@ class ExtractionExecutionTests(unittest.TestCase):
                     "returncode": 2,
                     "failure_stage": "item_extract",
                     "failure_kind": "checksum_error",
-                    "result": {
-                        "type": "result",
-                        "status": "failed",
-                        "native_status": "damaged",
-                        "failure_stage": "item_extract",
-                        "failure_kind": "checksum_error",
-                        "checksum_error": True,
-                        "files_written": 2,
-                        "bytes_written": 8,
-                        "diagnostics": {
-                            "output_trace": {
-                                "items": [
-                                    worker_trace_item(
-                                        path="good.txt",
-                                        output_path=str(good_path),
-                                        bytes_written=4,
-                                        expected_size=4,
-                                        source_crc32=1,
-                                        has_source_crc32=True,
-                                        crc_verified=True,
-                                    ),
-                                    worker_trace_item(
-                                        path="bad.bin",
-                                        output_path=str(partial_path),
-                                        failed=True,
-                                        bytes_written=4,
-                                        expected_size=8,
-                                        source_crc32=1,
-                                        has_source_crc32=True,
-                                    ),
-                                ],
-                                "total_bytes_written": 8,
-                            }
-                        },
-                    },
+                    "result": worker_result(
+                        status="failed",
+                        native_status="damaged",
+                        failure_stage="item_extract",
+                        failure_kind="checksum_error",
+                        checksum_error=True,
+                        files_written=2,
+                        bytes_written=8,
+                        diagnostics={"output_trace": {"total_bytes_written": 8}},
+                        trace_items=[
+                            worker_trace_item(
+                                path="good.txt",
+                                output_path=str(good_path),
+                                bytes_written=4,
+                                expected_size=4,
+                                source_crc32=1,
+                                has_source_crc32=True,
+                                crc_verified=True,
+                            ),
+                            worker_trace_item(
+                                path="bad.bin",
+                                output_path=str(partial_path),
+                                failed=True,
+                                bytes_written=4,
+                                expected_size=8,
+                                source_crc32=1,
+                                has_source_crc32=True,
+                            ),
+                        ],
+                    ),
                 }
-                diagnostics["result"] = parse_worker_event(encode_worker_frame(diagnostics["result"]))
                 return _completed(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             task = make_archive_task(archive_path)

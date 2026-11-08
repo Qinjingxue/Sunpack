@@ -2,8 +2,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack_native import worker_manifest_from_rows
-
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.verification import ASSESSMENT_COMPLETE, CONTENT_INTEGRITY_VERIFIED_COMPLETE, DECISION_ACCEPT
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
@@ -25,6 +23,7 @@ from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor impo
 from sunpack.pipeline.verification.scheduler import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
+from tests.helpers.worker_events import worker_result
 
 
 class _FakePasswordStore:
@@ -85,27 +84,17 @@ class _FakeSevenZipRunner:
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, f"{name}.txt"), "wb") as handle:
             handle.write(b"ok")
-        result = {
-            "status": "ok",
-            "item_count": 1 if self.include_output_counts else 0,
-            "archive_type": name,
-            "verified_manifest": {
+        result = worker_result(
+            status="ok",
+            item_count=1 if self.include_output_counts else 0,
+            archive_type=name,
+            manifest_rows=[[0, f"{name}.txt", "", 2, 2, 0, 0, 0, 0, 1, 1, 1, 1, b"ok"]],
+            verified_manifest={
                 "validated": True,
-                "file_count": 1,
                 "item_count": 1,
-                "inventory": {
-                    "complete": True,
-                    "file_count": 1,
-                    "dir_count": 0,
-                    "total_size": 2,
-                    "identity_paths": True,
-                },
-                "native_rows": worker_manifest_from_rows(
-                    [[0, f"{name}.txt", "", 2, 2, 0, 0, 0, 0, 1, 1, 1, 1, "6f6b"]],
-                    True, 1, 0, 2, True,
-                ),
+                "inventory": [1, 1, 0, 2, 1],
             },
-        }
+        )
         if self.include_output_counts:
             result.update({
                 "files_written": 1,

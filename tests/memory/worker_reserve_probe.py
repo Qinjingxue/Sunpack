@@ -11,7 +11,7 @@ from pathlib import Path
 import psutil
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from sunpack_native import encode_worker_frame
+from sunpack_native import NativeWorkerResultAccumulator, encode_worker_frame
 from tests.helpers.worker_events import read_worker_events
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.platform.windows.process_job import (
@@ -65,6 +65,7 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
         creationflags=subprocess.CREATE_NO_WINDOW, env=env)
     box.assign(p)
     events, results, edits = [], [], []
+    accumulators = {str(i): NativeWorkerResultAccumulator(str(i)) for i in range(jobs)}
     q = queue.Queue()
     started = time.monotonic()
     def reader():
@@ -109,7 +110,14 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
                     set_limit(reserve+160); shrunk=True; shrink_time=time.monotonic()
                 if shrunk and not restored and time.monotonic()-shrink_time>.5:
                     set_limit(reserve+512); restored=True
-            if event.get('type') == 'result': results.append(event)
+            kind = event.get('type')
+            if kind == 'protocol_error':
+                raise RuntimeError(event)
+            if kind in {'manifest_chunk', 'trace_chunk', 'result'}:
+                if accumulators[event['job_id']].accept(event):
+                    del event['native_chunk']
+                else:
+                    results.append(event)
         if len(results) != jobs: raise RuntimeError((label, len(results), p.poll(), events[-6:]))
         if dynamic: assert expanded and shrunk and restored, ('pressure cycle not exercised', label, edits)
         worker_seconds = time.monotonic() - decode_started
@@ -130,8 +138,13 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
                 result = next(e for e in results if e['job_id'] == str(index))
                 manifest = file_inventory(OUT / 'outputs' / label / str(index))
                 assert len(manifest) == result['files_written'], manifest
-                expected = sorted((r[3], r[6]) for e in events if e.get('type') == 'manifest_chunk'
-                    and e.get('job_id') == str(index) for r in e['rows'] if r[5])
+                native = result['verified_manifest']['native_rows']
+                expected = sorted(
+                    (row['size'], row['crc32'])
+                    for offset in range(0, len(native), 128)
+                    for row in native.file_page(offset)
+                    if row.get('has_crc')
+                )
                 actual = sorted((r['size'], r['crc32']) for r in manifest.values())
                 if len(expected) == len(actual): assert expected == actual, (expected, actual)
                 reference = workloads[index % len(workloads)].get('expected') if workloads else expected_output
