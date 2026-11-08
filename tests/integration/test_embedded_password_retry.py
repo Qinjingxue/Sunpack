@@ -19,6 +19,7 @@ from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.commands import extract
 from sunpack.runtime.watch import scheduler as scheduler_module
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from tests.helpers.config_factory import make_config
 from tests.helpers.native_fixture import assemble_carrier
@@ -125,8 +126,7 @@ def test_watch_restart_retries_promoted_carrier_without_replaying_siblings(
         async with PipelineEngine(case.config) as engine:
             def scheduler():
                 return WatchScheduler(
-                    case.config, [str(case.watch)],
-                    output_roots={str(case.watch): str(tmp_path / "out")},
+                    case.config, [WatchRootEntry(str(case.watch), str(tmp_path / "out"))],
                     state_path=str(tmp_path / "state.snapshot"),
                     pipeline_engine=engine,
                 )

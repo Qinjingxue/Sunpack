@@ -419,17 +419,7 @@ class WatchService:
 
     @property
     def roots(self) -> list[str]:
-        return _normalize_scan_roots([entry.input_root for entry in self.service_config["root_entries"]])
-
-    @property
-    def root_outputs(self) -> dict[str, str]:
-        """Output root of every existing watch root, keyed by the input root."""
-        roots = {path_key(root) for root in self.roots}
-        return {
-            path_key(entry.input_root): entry.output_root
-            for entry in self.service_config["root_entries"]
-            if path_key(entry.input_root) in roots and entry.output_root
-        }
+        return [entry.input_root for entry in self.service_config["root_entries"]]
 
     async def run(
         self,
@@ -670,8 +660,8 @@ class WatchService:
 
     async def _start_scheduler(self) -> None:
         await self._stop_scheduler()
-        roots = self.roots
-        if not roots:
+        entries = self.service_config["root_entries"]
+        if not entries:
             await asyncio.to_thread(self._retire_unwatched_state)
             self.log.recover()
             self._stop_toast_host()
@@ -698,9 +688,7 @@ class WatchService:
                 pipeline_engine.reconfigure_request(run_config)
             scheduler = WatchScheduler(
                 run_config,
-                roots,
-                output_roots=self.root_outputs,
-                root_entries=self.service_config["root_entries"],
+                entries,
                 state_path=state_path,
                 pipeline_engine=pipeline_engine,
                 notification_sink=toast_coordinator,
@@ -729,8 +717,7 @@ class WatchService:
         await self._scan_pending_roots()
         self.log.write(
             "scheduler_attached",
-            roots=roots,
-            root_outputs=self.root_outputs,
+            roots=[entry.input_root for entry in entries],
             state_path=state_path,
         )
 
@@ -1096,10 +1083,6 @@ class WatchService:
             for entry in self.service_config["root_entries"]
             if not entry.initial_scanned
         }
-        if not pending:
-            return
-        existing = {path_key(root) for root in self.roots}
-        pending = {key: entry for key, entry in pending.items() if key in existing}
         if not pending:
             return
         completed = await self.scheduler.scan_initial_roots([entry.input_root for entry in pending.values()])

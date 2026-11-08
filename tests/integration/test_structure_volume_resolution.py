@@ -63,12 +63,11 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
         resolved = detect_archive_hits(Path(group.entry_path))
         assert len(resolved) == 1
         task = resolved[0]
-        planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(task)
-        assert len(planned) == 1
+        ArchiveInputPlanningStage(load_config()).plan_task(task)
         extractor = ExtractionScheduler()
         out_dir = tmp_path / "direct_outputs" / archive_format
         try:
-            result = extractor.extract(planned[0], str(out_dir))
+            result = extractor.extract(task, str(out_dir))
         finally:
             extractor.close()
 
@@ -167,12 +166,11 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     ]
     resolved = detect_archive_hits(Path(group.entry_path))
     assert len(resolved) == 1
-    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
-    assert len(planned) == 1
+    ArchiveInputPlanningStage(load_config()).plan_task(resolved[0])
     output = tmp_path / "output"
     extractor = ExtractionScheduler()
     try:
-        result = extractor.extract(planned[0], str(output))
+        result = extractor.extract(resolved[0], str(output))
     finally:
         extractor.close()
     assert result.success is True, result.error
@@ -215,12 +213,11 @@ def test_context_free_numbers_preserve_encrypted_sfx_launcher_ownership(tmp_path
     assert set(group.owned_paths) == set(paths + [str(launcher)])
     tasks = detect_archive_hits(Path(group.entry_path))
     assert len(tasks) == 1
-    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
-    assert len(planned) == 1
+    ArchiveInputPlanningStage(load_config()).plan_task(tasks[0])
     extractor = ExtractionScheduler(cli_passwords=["wrong", password], builtin_passwords=[])
     output = tmp_path / "output"
     try:
-        result = extractor.extract(planned[0], str(output))
+        result = extractor.extract(tasks[0], str(output))
     finally:
         extractor.close()
     assert result.success is True, result.error
@@ -249,12 +246,11 @@ def test_context_free_numeric_noise_does_not_create_a_missing_7z_volume(tmp_path
     assert set(group.owned_paths) == set(paths)
     resolved = detect_archive_hits(Path(group.entry_path))
     assert len(resolved) == 1
-    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
-    assert len(planned) == 1
+    ArchiveInputPlanningStage(load_config()).plan_task(resolved[0])
     output = tmp_path / "output"
     extractor = ExtractionScheduler()
     try:
-        result = extractor.extract(planned[0], str(output))
+        result = extractor.extract(resolved[0], str(output))
     finally:
         extractor.close()
     assert result.success is True, result.error
@@ -343,12 +339,11 @@ def test_competing_heads_keep_direct_schemes_and_partition_declared_formats(tmp_
         logical_names.add(group.logical_name)
         tasks = detect_archive_hits(Path(group.entry_path))
         assert len(tasks) == 1
-        planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
-        assert len(planned) == 1
+        ArchiveInputPlanningStage(load_config()).plan_task(tasks[0])
         output = tmp_path / "outputs" / case.case_id
         extractor = ExtractionScheduler()
         try:
-            result = extractor.extract(planned[0], str(output))
+            result = extractor.extract(tasks[0], str(output))
         finally:
             extractor.close()
         assert result.success is True, result.error
@@ -390,12 +385,11 @@ def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, mar
     assert all(part.source == "structure" for part in group.split_volumes)
     tasks = detect_archive_hits(Path(group.entry_path))
     assert len(tasks) == 1
-    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
-    assert len(planned) == 1
+    ArchiveInputPlanningStage(load_config()).plan_task(tasks[0])
     output = tmp_path / "output"
     extractor = ExtractionScheduler()
     try:
-        result = extractor.extract(planned[0], str(output))
+        result = extractor.extract(tasks[0], str(output))
     finally:
         extractor.close()
     assert result.success is True, result.error
@@ -436,13 +430,12 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
     ])
     tasks = detect_archive_hits(Path(group.entry_path), config)
     assert len(tasks) == 1
-    planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
-    assert len(planned) == 1
-    PasswordScopeContext().annotate(planned)
+    ArchiveInputPlanningStage(config).plan_task(tasks[0])
+    PasswordScopeContext().annotate(tasks)
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "output"
     try:
-        result = extractor.extract(planned[0], str(output))
+        result = extractor.extract(tasks[0], str(output))
     finally:
         extractor.close()
     assert result.success is True, result.error
@@ -1077,10 +1070,8 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
         task_by_variant[variant] = matches[0]
 
     planner = ArchiveInputPlanningStage(config)
-    for variant in list(task_by_variant):
-        planned = planner.plan_task_to_tasks(task_by_variant[variant])
-        assert len(planned) == 1
-        task_by_variant[variant] = planned[0]
+    for task in task_by_variant.values():
+        planner.plan_task(task)
 
     planned_tasks = list(task_by_variant.values())
     PasswordScopeContext().annotate(planned_tasks)

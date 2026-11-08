@@ -116,9 +116,7 @@ async def watch_scenario(root, mode):
     sunpack_native.watch_broker_acquire()
     try:
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, input_roots,
-                output_roots=output_roots,
-                root_entries=[WatchRootEntry(path, output_roots[path], True) for path in input_roots],
+            watcher = WatchScheduler(config, [WatchRootEntry(path, output_roots[path], True) for path in input_roots],
                 state_path=str(root / "state.snapshot"),
                 pipeline_engine=engine)
             original = watcher._handle_pipeline_progress

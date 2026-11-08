@@ -24,6 +24,7 @@ from benchmarks.scenarios.extraction_large_archive import (
 )
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 
 
@@ -129,7 +130,7 @@ async def _run_once(
         await engine.__aenter__()
         watcher = WatchScheduler(
             config,
-            [str(root)],
+            [WatchRootEntry(str(root))],
             # A relative dot is resolved against the watched root, so the
             # result lands in the watch directory itself.
             state_path=str(state_path),

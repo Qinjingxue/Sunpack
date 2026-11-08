@@ -184,7 +184,7 @@ class PipelineTimingProbe:
 
         self._wrap(scanner, "scan_targets", "pipeline_scan")
         self._wrap(scanner, "direct_file_tasks", "pipeline_direct_scan")
-        self._wrap(planning, "plan_task_to_tasks", "input_planning")
+        self._wrap(planning, "plan_task", "input_planning")
         self._wrap(job, "collect_result", "job_collect_result")
         self._wrap(job, "_report_task_started", "job_report_task_started")
         self._wrap(job, "_report_task_finished", "job_report_task_finished")

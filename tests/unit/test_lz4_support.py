@@ -168,8 +168,8 @@ def test_skippable_only_needs_explicit_format_context(fixtures, tmp_path):
 
 def test_confirmed_lz4_planning_does_not_scan_a_gigabyte_skippable_payload(fixtures):
     task = make_archive_task(fixtures / "large_skip.tar.lz4", format_hint="lz4", discovery_source="detection")
-    report = ArchiveInputPlanningStage({}).plan_task(task)
-    assert report and report.read_bytes < 5 * 1024 * 1024
+    ArchiveInputPlanningStage({}).plan_task(task)
+    assert task.knowledge().get("input_planning.read_bytes") < 5 * 1024 * 1024
     assert task.archive_input().analysis["stream_plan"]["input_bytes"] > 1024 * 1024 * 1024
 
 
@@ -268,13 +268,13 @@ def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures,
 def test_prefix_carrier_is_a_strict_subrange_at_zero(fixtures, tmp_path):
     path = fixtures / "prefix_carrier.dat"
     task = make_archive_task(path, format_hint="lz4")
-    report = ArchiveInputPlanningStage({}).plan_task(task)
-    assert len(report.extractable_segments) == 1
-    _, segment = report.extractable_segments[0]
-    assert segment.start_offset == 0 and segment.end_offset == path.stat().st_size - 29
-    descriptor = task.inputs[0].descriptor
+    ArchiveInputPlanningStage({}).plan_task(task)
+    node, = task.inputs
+    descriptor = node.descriptor
     assert descriptor.open_mode == "file_range"
+    extent = descriptor.primary_extent
+    assert extent.start == 0 and extent.end == path.stat().st_size - 29
     result = worker(descriptor, tmp_path / "prefix")
     assert result["status"] == "ok"
-    assert result["stream_receipt"]["input_bytes"] == segment.end_offset
+    assert result["stream_receipt"]["input_bytes"] == extent.end
     assert fingerprints(fixtures / "expected_standard") == fingerprints(tmp_path / "prefix")

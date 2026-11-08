@@ -248,49 +248,28 @@ struct ExtractInputRange {
 
 bool is_backend_available();
 
-PasswordTestResult test_passwords_with_parts(
+PasswordTestResult test_password_batch(
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
-    const wchar_t* const* passwords,
-    int password_count,
-    const std::vector<std::wstring>& canonical_names = {},
-    const std::wstring& format_hint = L"",
-    const std::vector<ExtractInputRange>& part_ranges = {}
-);
-
-PasswordTestResult test_passwords_with_ranges(
-    const std::wstring& archive_path,
-    const std::vector<ExtractInputRange>& ranges,
+    const std::vector<ExtractInputRange>& input_ranges,
     const std::wstring& format_hint,
-    const wchar_t* const* passwords,
-    int password_count
+    const std::wstring* candidates,
+    std::size_t candidate_count,
+    const std::vector<std::wstring>& canonical_names
 );
 
-ExtractArchiveResult extract_archive_with_parts(
+ExtractArchiveResult extract_archive(
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
-    const std::wstring& format_hint,
-    const std::wstring& password,
-    const std::wstring& output_dir,
-    const std::wstring& codepage,
-    ExtractProgressCallback progress = nullptr,
-    bool dry_run = false,
-    const std::vector<std::wstring>& canonical_names = {},
-    bool native_volume_input = false,
-    std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
-    const std::vector<ExtractInputRange>& part_ranges = {}
-);
-
-ExtractArchiveResult extract_archive_with_ranges(
-    const std::wstring& archive_path,
-    const std::vector<ExtractInputRange>& ranges,
+    const std::vector<ExtractInputRange>& input_ranges,
     const std::wstring& format_hint,
     const std::wstring& password,
     const std::wstring& output_dir,
     const std::wstring& codepage,
     ExtractProgressCallback progress = {},
     bool dry_run = false,
+    const std::vector<std::wstring>& canonical_names = {},
+    bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
 );

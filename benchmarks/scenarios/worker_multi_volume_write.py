@@ -236,7 +236,7 @@ def _wait_for_jobs(
             f"job {item.job_id} did not succeed: status={result.get('status')!r} "
             f"failure_stage={result.get('failure_stage')!r} "
             f"failure_kind={result.get('failure_kind')!r} "
-            f"hresult_hex={result.get('hresult_hex')!r} "
+            f"hresult={result.get('hresult')!r} "
             f"message={result.get('message')!r}"
         )
 

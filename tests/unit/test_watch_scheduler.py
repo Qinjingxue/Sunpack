@@ -48,13 +48,15 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
     return RuntimeWatchScheduler(*args, pipeline_engine=pipeline_engine, **kwargs)
 
 
-def _watcher(tmp_path, *, config=None, roots=None, **overrides):
-    options = dict(output_roots={str(root): str(tmp_path / "out") for root in (roots if roots is not None else [tmp_path])},
-                   state_path=str(tmp_path / "state.snapshot"))
+def _watcher(tmp_path, *, config=None, roots=None, root_entries=None, **overrides):
+    if root_entries is None:
+        root_entries = [WatchRootEntry(str(root), str(tmp_path / "out"))
+                        for root in (roots if roots is not None else [tmp_path])]
+    options = dict(state_path=str(tmp_path / "state.snapshot"))
     options.update(overrides)
     return WatchScheduler(
         config if config is not None else make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        roots if roots is not None else [str(tmp_path)], **options,
+        root_entries, **options,
     )
 
 
@@ -309,6 +311,7 @@ def test_watch_guards_follow_the_nearest_existing_parent_and_filter_siblings(tmp
     waits or a live filesystem observer.
     """
     parent = tmp_path / "parent"
+    from watchdog.events import DirDeletedEvent
     monkeypatch.setattr("sunpack.runtime.cli.runtime_state.server_runtime_active", lambda: True)
     root = parent / "root"
     root.mkdir(parents=True)
@@ -322,7 +325,7 @@ def test_watch_guards_follow_the_nearest_existing_parent_and_filter_siblings(tmp
         watcher._watch_handler._handle_path(str(parent / "unrelated.zip"), event_type="created")
         root.rmdir()
         parent.rmdir()
-        watcher._watch_handler._handle_departure_path(str(parent), is_directory=True)
+        watcher._watch_handler.dispatch(DirDeletedEvent(str(parent)))
         assert str(parent) in watcher._watch_rearm
         watcher._refresh_directory_watches([str(parent)])
         assert set(watcher._observed_watches) == {(str(tmp_path), False)}
@@ -443,7 +446,7 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
 
     watcher = WatchScheduler(
         make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
+        [WatchRootEntry(str(watch_root))],
         state_path=str(state_path),
     )
 
@@ -529,7 +532,7 @@ def test_scoped_catalog_updates_preserve_output_identity_and_sibling_inputs(tmp_
         assert not options.catalog_update(catalog, scope.native)
 
         def paths():
-            return {item["path"] for item in options.catalog_candidates(catalog, scope.native)}
+            return set(catalog.candidate_paths(scope.native))
 
         assert paths() == {str(source), str(peer)}
         assert not options.catalog_update(catalog, scope.native, str(branch))
@@ -572,8 +575,8 @@ def test_unavailable_root_preserves_state_across_restart_and_event_recovery(tmp_
     scope = DiscoveryScope(str(root), recursive=True)
 
     def create():
-        return _watcher(tmp_path, roots=[str(root)], state_path=state_path,
-                        root_entries=[WatchRootEntry(str(root), recursive=True)])
+        return _watcher(tmp_path, state_path=state_path,
+                        root_entries=[WatchRootEntry(str(root), str(tmp_path / "out"), recursive=True)])
 
     first = create()
     output = root / "result"
@@ -663,6 +666,7 @@ def _indexed_scheduler_for_test():
     watcher = object.__new__(RuntimeWatchScheduler)
     watcher.pipeline_engine = _DeferredPipelineEngine()
     watcher._lock = threading.Lock()
+    watcher._tick_lock = asyncio.Lock()
     watcher._directory_pending = set()
     watcher._watch_rearm = set()
     watcher._usn_checkpoint_pending = False
@@ -2027,6 +2031,46 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
     assert _await(watcher.run_once()).processed == 1
 
 
+def test_watch_close_waits_for_prepared_admission(tmp_path, monkeypatch):
+    # Other shutdown tests start with a registered task. Pause this tick after
+    # durable admission, when a drain alone would incorrectly see no work.
+    async def scenario():
+        watcher = _watcher(tmp_path)
+        archive = tmp_path / "sample.zip"
+        _write_zip(archive)
+        watcher.enqueue(str(archive))
+        entered, resume = asyncio.Event(), asyncio.Event()
+        broker = watcher.pipeline_engine.work_broker
+        run = broker.run
+        stages = []
+
+        async def pause_admission(stage, *args, **kwargs):
+            stages.append(stage)
+            result = await run(stage, *args, **kwargs)
+            if stage == "watch_admission":
+                assert result
+                entered.set()
+                await resume.wait()
+            return result
+
+        monkeypatch.setattr(broker, "run", pause_admission)
+        tick = asyncio.create_task(watcher.run_once())
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            closing = asyncio.create_task(watcher.aclose())
+            loop = asyncio.get_running_loop()
+            # Let aclose schedule its owned task before releasing admission.
+            loop.call_soon(loop.call_soon, resume.set)
+            await asyncio.gather(tick, closing)
+            assert stages.index("catalog_commit") < stages.index("watch_close")
+        finally:
+            resume.set()
+            await asyncio.gather(tick, return_exceptions=True)
+            await watcher.aclose()
+
+    _await(scenario())
+
+
 def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monkeypatch):
     FakeObserver.started_count = 0
     FakeObserver.stopped_count = 0
@@ -2046,14 +2090,51 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
     )
 
     _await(watcher.start())
+    disappeared = watch_root / "disappeared.zip"
+    _write_zip(disappeared)
+    scan = watcher._scan_candidate_paths
+
+    def remove_after_scan(root, scope):
+        paths, errors = scan(root, scope)
+        assert str(disappeared) in paths
+        disappeared.unlink()
+        return paths, errors
+
+    monkeypatch.setattr(watcher, "_scan_candidate_paths", remove_after_scan)
     _await(watcher.scan_initial_roots([str(watch_root)]))
 
     assert watcher.pending_count == 1
+    assert watcher.state.pending_work_for_path(str(disappeared)) is None
     assert FakeObserver.started_count == 1
     assert not (watch_root / "sunpack-passwords.txt").exists()
 
     _await(watcher.stop())
     assert FakeObserver.stopped_count == 1
+
+
+@pytest.mark.parametrize("phase", ["observer", "password"])
+def test_watch_start_failure_releases_observer_resources(tmp_path, monkeypatch, phase):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    watcher = _watcher(tmp_path)
+    observer_stopped = FakeObserver.stopped_count
+    observer_joins = len(FakeObserver.join_timeouts)
+
+    def fail_startup(**kwargs):
+        raise OSError("watch startup failed")
+
+    if phase == "observer":
+        monkeypatch.setattr(watcher._observer, "start", fail_startup)
+    else:
+        monkeypatch.setattr(watcher, "_publish_password_update", fail_startup)
+    try:
+        with pytest.raises(OSError, match="watch startup failed"):
+            _await(watcher.start())
+    finally:
+        _await(watcher.aclose())
+
+    assert FakeObserver.stopped_count == observer_stopped + 1
+    assert len(FakeObserver.join_timeouts) == observer_joins + (phase == "password")
+    assert watcher._observer_resource is None
 
 
 def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monkeypatch):
@@ -2130,8 +2211,7 @@ def test_watch_scheduler_uses_each_roots_recursive_flag(tmp_path, monkeypatch, r
     watcher = _watcher(
         tmp_path,
         config=make_config({"filesystem": {"scan_filters": []}}),
-        root_entries=[scheduler_module.WatchRootEntry(str(watch_root), recursive=recursive)],
-        roots=[str(watch_root)],
+        root_entries=[WatchRootEntry(str(watch_root), str(tmp_path / "out"), recursive=recursive)],
     )
 
     _await(watcher.start())
@@ -2307,9 +2387,7 @@ def test_watch_scheduler_empty_root_output_uses_pipeline_default(tmp_path, monke
     watcher = _watcher(
         tmp_path,
         config=make_config({}),
-        roots=[str(watch_root)],
-        output_roots={},
-        root_entries=[WatchRootEntry(str(watch_root), None)],
+        root_entries=[WatchRootEntry(str(watch_root))],
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2526,7 +2604,7 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
 
     watcher = _watcher(
         tmp_path,
-        output_roots={root: str(tmp_path) for root in [str(tmp_path)]},
+        root_entries=[WatchRootEntry(str(tmp_path), str(tmp_path))],
         state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -2631,11 +2709,8 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
 
     watcher = _watcher(
         tmp_path,
-        roots=[str(first_root), str(second_root)],
-        output_roots={
-            str(first_root): str(first_out),
-            str(second_root): str(second_out),
-        },
+        root_entries=[WatchRootEntry(str(first_root), str(first_out)),
+                      WatchRootEntry(str(second_root), str(second_out))],
         state_path=str(first_root / ".sunpack_watch" / "state.snapshot"),
         pipeline_engine=FakePipelineEngine(SuccessRunner),
     )
@@ -2659,11 +2734,8 @@ def test_watch_scheduler_rejects_nested_output_roots(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="must not contain one another"):
         _watcher(
             tmp_path,
-            roots=[str(first_root), str(second_root)],
-            output_roots={
-                str(first_root): str(tmp_path / "output"),
-                str(second_root): str(tmp_path / "output" / "nested"),
-            },
+            root_entries=[WatchRootEntry(str(first_root), str(tmp_path / "output")),
+                          WatchRootEntry(str(second_root), str(tmp_path / "output" / "nested"))],
         )
 
 
@@ -2677,11 +2749,8 @@ def test_watch_scheduler_allows_shared_output_root(tmp_path, monkeypatch):
 
     watcher = _watcher(
         tmp_path,
-        roots=[str(first_root), str(second_root)],
-        output_roots={
-            str(first_root): str(output_root),
-            str(second_root): str(output_root),
-        },
+        root_entries=[WatchRootEntry(str(first_root), str(output_root)),
+                      WatchRootEntry(str(second_root), str(output_root))],
     )
 
     assert watcher._output_root_for(str(first_root / "first.7z")) == str(output_root.resolve())
@@ -2696,19 +2765,16 @@ def test_watch_root_without_explicit_output_uses_archive_folder_default(tmp_path
     archive_path.parent.mkdir()
     _write_zip(archive_path)
 
-    def output_root_for(output_roots, root_entries=None):
+    def output_root_for(output_root=None):
         watcher = _watcher(
             tmp_path,
             config=make_config({}),
-            roots=[str(watch_root)],
-            output_roots=output_roots,
-            root_entries=root_entries,
+            root_entries=[WatchRootEntry(str(watch_root), output_root)],
         )
         return watcher._output_root_for(str(archive_path))
 
-    assert output_root_for({}) is None
-    assert output_root_for({}, root_entries=[WatchRootEntry(str(watch_root), None)]) is None
-    assert output_root_for({str(watch_root): str(tmp_path / "per-root")}) == str(
+    assert output_root_for() is None
+    assert output_root_for(str(tmp_path / "per-root")) == str(
         (tmp_path / "per-root").resolve()
     )
 

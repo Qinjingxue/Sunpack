@@ -14,6 +14,7 @@ import sunpack.core.passwords.internal.builtin as builtin
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from tests.helpers.tool_config import get_test_tools
 
@@ -75,7 +76,7 @@ def test_concurrent_header_encrypted_rar_retry_cleans_single_and_disguised_volum
                 return response
             monkeypatch.setattr(engine, 'run', run)
             watcher = WatchScheduler(
-                config, [str(root)],  state_path=str(tmp_path / '.sunpack_watch' / 'state.snapshot'),
+                config, [WatchRootEntry(str(root))],  state_path=str(tmp_path / '.sunpack_watch' / 'state.snapshot'),
                 pipeline_engine=engine,
             )
             await watcher.start()

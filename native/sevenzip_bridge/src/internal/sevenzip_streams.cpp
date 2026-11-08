@@ -17,11 +17,15 @@ namespace sunpack::sevenzip
 
         bool structured_order,
 
-        InputPrefetchConfig prefetch_config
-
-    )
+        InputPrefetchConfig prefetch_config,
+        const std::vector<ExtractInputRange> &input_ranges)
     {
-
+        if (!input_ranges.empty())
+        {
+            auto *stream = new MultiRangeInStream(input_ranges, trace, prefetch_config);
+            opened = stream->is_open();
+            return CMyComPtr<IInStream>(stream);
+        }
         opened = false;
 
         if (is_sfx_path(archive_path))

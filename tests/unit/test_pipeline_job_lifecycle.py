@@ -10,14 +10,10 @@ from sunpack.pipeline.coordinator.engine import _RequestRuntime
 @pytest.mark.parametrize("failure_stage", ["cleanup", "shell", "progress", "close"])
 def test_request_finalization_releases_owners_after_cleanup_failure(monkeypatch, tmp_path, failure_stage):
     # Successful-close coverage misses failures in the finalizer itself. Keep
-    # the failed runtime alive, like a retained traceback, and prove its cache
-    # payload and progress callback are released without waiting for GC.
-    import weakref
+    # the failed runtime alive, like a retained traceback, and verify that
+    # progress callbacks and request ownership have already been released.
     import sunpack.pipeline.coordinator.engine as engine_module
     from tests.helpers.config_factory import make_config
-
-    class Payload:
-        pass
 
     async def no_worker(*args):
         pass
@@ -32,9 +28,7 @@ def test_request_finalization_releases_owners_after_cleanup_failure(monkeypatch,
 
             def configured(*args):
                 runtime = factory(*args)
-                payload = Payload()
-                captured.append((runtime, weakref.ref(payload)))
-                runtime.input_planning_stage._report_cache[("test",)] = payload
+                captured.append(runtime)
 
                 def fail():
                     raise RuntimeError("finalization failure")
@@ -57,9 +51,8 @@ def test_request_finalization_releases_owners_after_cleanup_failure(monkeypatch,
             engine._request_runtime_factory = configured
             with pytest.raises(RuntimeError, match="finalization failure"):
                 await engine.run([str(tmp_path)])
-            runtime, payload = captured.pop()
+            runtime = captured.pop()
             assert runtime.extractor.sevenzip_runner.progress_callback is None
-            assert payload() is None
             assert engine.is_idle()
 
     asyncio.run(scenario())

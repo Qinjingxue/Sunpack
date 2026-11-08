@@ -14,9 +14,6 @@ def set_inputs(task, segments):
                                             position=index)
                           for index, row in enumerate(segments, start=1)))
 
-from sunpack.pipeline.extraction.internal.sevenzip.metadata import (
-    ArchiveMetadataScanner,
-)
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
     SingleArchiveExtractor,
 )
@@ -125,7 +122,6 @@ def test_unknown_input_without_passwords_uses_unconfirmed_empty_candidate(tmp_pa
     extractor = SingleArchiveExtractor(
         password_store=_FakePasswordStore(),
         password_resolver=Resolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -162,7 +158,6 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     extractor = SingleArchiveExtractor(
         password_store=_CandidatePasswordStore(),
         password_resolver=resolver,
-        metadata_scanner=ArchiveMetadataScanner(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -211,7 +206,6 @@ def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
     extractor = SingleArchiveExtractor(
         password_store=_CandidatePasswordStore(),
         password_resolver=_NeverPasswordResolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -244,7 +238,6 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
     extractor = SingleArchiveExtractor(
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -275,7 +268,6 @@ def test_multiple_embedded_failures_keep_aggregate_diagnosis(count):
     extractor = SingleArchiveExtractor(
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -312,7 +304,6 @@ def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
     extractor = SingleArchiveExtractor(
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
         sevenzip_runner=runner,
         best_effort=True,
     )

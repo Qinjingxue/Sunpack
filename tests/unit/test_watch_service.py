@@ -78,8 +78,8 @@ def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypat
     dialogs_ready = threading.Event()
 
     class Scheduler(_SchedulerLifecycle):
-        def __init__(self, _config, roots, **kwargs):
-            starts.append(list(roots))
+        def __init__(self, _config, entries, **kwargs):
+            starts.append([entry.input_root for entry in entries])
 
         async def run_once(self):
             pass
@@ -1038,9 +1038,8 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     captured = {}
 
     class FakeScheduler(_SchedulerLifecycle):
-        def __init__(self, config, roots, **kwargs):
-            captured["roots"] = roots
-            captured["kwargs"] = kwargs
+        def __init__(self, config, entries, **kwargs):
+            captured["entries"] = entries
 
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(
@@ -1053,10 +1052,7 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
     _await(service._start_scheduler())
 
-    assert captured["roots"] == [str(watch_root.resolve())]
-    assert captured["kwargs"]["output_roots"] == {
-        service_module.path_key(str(watch_root.resolve())): "D:\\Extracted"
-    }
+    assert captured["entries"] == [service_module.WatchRootEntry(str(watch_root.resolve()), "D:\\Extracted")]
 
 
 def test_watch_service_leaves_empty_root_output_for_pipeline_default(tmp_path, monkeypatch):
@@ -1067,9 +1063,8 @@ def test_watch_service_leaves_empty_root_output_for_pipeline_default(tmp_path, m
     captured = {}
 
     class FakeScheduler(_SchedulerLifecycle):
-        def __init__(self, config, roots, **kwargs):
-            captured["roots"] = roots
-            captured["kwargs"] = kwargs
+        def __init__(self, config, entries, **kwargs):
+            captured["entries"] = entries
 
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(
@@ -1082,11 +1077,7 @@ def test_watch_service_leaves_empty_root_output_for_pipeline_default(tmp_path, m
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
     _await(service._start_scheduler())
 
-    assert captured["roots"] == [str(watch_root.resolve())]
-    assert captured["kwargs"]["output_roots"] == {}
-    assert captured["kwargs"]["root_entries"] == [
-        service_module.WatchRootEntry(str(watch_root.resolve()), None)
-    ]
+    assert captured["entries"] == [service_module.WatchRootEntry(str(watch_root.resolve()))]
 
 
 def test_output_registration_and_state_admission_do_not_deadlock(tmp_path, monkeypatch):
@@ -1236,8 +1227,8 @@ def test_default_watch_state_uses_program_directory_and_per_root_outputs(tmp_pat
     captured = {}
 
     class FakeScheduler(_SchedulerLifecycle):
-        def __init__(self, config, roots, **kwargs):
-            captured["output_roots"] = kwargs["output_roots"]
+        def __init__(self, config, entries, **kwargs):
+            captured["entries"] = entries
             captured["state_path"] = kwargs["state_path"]
 
     monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
@@ -1246,7 +1237,7 @@ def test_default_watch_state_uses_program_directory_and_per_root_outputs(tmp_pat
     _await(service._start_scheduler())
 
     assert service.state_dir == str((program_dir / ".sunpack_watch").resolve())
-    assert captured["output_roots"] == {}
+    assert captured["entries"] == [service_module.WatchRootEntry(str(watch_root))]
     # Resolving an absent leaf can retain \\?\ when the log thread creates
     # its parent between Python's ERROR_PATH_NOT_FOUND/FILE_NOT_FOUND probes.
     assert captured["state_path"] == str(program_dir.resolve() / ".sunpack_watch" / "state.snapshot")

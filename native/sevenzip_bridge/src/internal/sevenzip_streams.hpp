@@ -1314,9 +1314,8 @@ namespace sunpack::sevenzip
 
         bool structured_order = false,
 
-        InputPrefetchConfig prefetch_config = input_prefetch_config()
-
-    );
+        InputPrefetchConfig prefetch_config = input_prefetch_config(),
+        const std::vector<ExtractInputRange> &input_ranges = {});
 
     std::wstring callback_archive_path(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths);
 

@@ -9,7 +9,6 @@ import stat
 import time
 import uuid
 from collections import OrderedDict
-from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, TextIO
@@ -1210,10 +1209,7 @@ class _RequestRuntime:
             ]
         if replacement is None:
             return None
-        planned = self.input_planning_stage.plan_task_to_tasks(replacement)
-        if len(planned) != 1:
-            return None
-        replacement = planned[0]
+        self.input_planning_stage.plan_task(replacement)
         return replacement
 
     async def execute_async(
@@ -1286,12 +1282,7 @@ class _RequestRuntime:
             )
             return replace(response, interrupted=True, interruption_cleanup_errors=errors)
         finally:
-            # Even a retained cleanup traceback must not pin analysis reports
-            # or the runner's bound callback back to this request.
-            with ExitStack() as releases:
-                releases.callback(self.input_planning_stage.clear_report_cache)
-                # Fork close performs no I/O; the engine owns shared workers.
-                releases.callback(self.extractor.close)
+            try:
                 try:
                     for request in self.source_cleanup.sweep_requests():
                         self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
@@ -1300,6 +1291,9 @@ class _RequestRuntime:
                 finally:
                     self.extractor.set_progress_callback(None)
                     await self.reporter.drain_progress()
+            finally:
+                # Fork close performs no I/O; the engine owns shared workers.
+                self.extractor.close()
 
     async def _discover_and_run(
         self,
@@ -1478,7 +1472,7 @@ class _RequestRuntime:
         claimed = []
         resolved_paths = {}
         with self.context.lock:
-            processed = set(self.context.processed_keys)
+            processed = self.context.processed_keys
             for task in tasks:
                 key = str(task.key or task.main_path)
                 if key in processed or key in self._active_task_keys:
@@ -1519,18 +1513,13 @@ class _RequestRuntime:
             # after the previous owner's cleanup has relinquished its lease.
             await self._ensure_task_lease(task, depth=depth, cancellation=cancellation)
             if self.input_planning_stage.requires_analysis(task):
-                planned = await broker.run(
-                    "plan", task_key, self._plan_task_isolated, task,
+                await broker.run(
+                    "plan", task_key, self.input_planning_stage.plan_task, task,
                     request_id=self.submission.request_id,
                     cancellation=cancellation,
                 )
             else:
                 cancellation.raise_if_cancelled()
-                planned = [task]
-            if len(planned) != 1 or planned[0] is not task:
-                raise RuntimeError(
-                    "Archive input planning must preserve its physical ownership task"
-                )
 
             retry_failure = self.config.get("password_retry_failures", {}).get(path_key(task.main_path))
             if retry_failure is not None:
@@ -2011,13 +2000,6 @@ class _RequestRuntime:
                 "source_paths": tuple(task.cleanup_parts or paths),
                 "groups": [_task_source_group(task)],
             })
-
-    def _plan_task_isolated(self, task):
-        stage = ArchiveInputPlanningStage(self.config)
-        try:
-            return stage.plan_task_to_tasks(task)
-        finally:
-            stage.clear_report_cache()
 
     def _new_recursion(self) -> RecursionController:
         config = self.config.get("recursive_extract", {"mode": "fixed", "max_rounds": 1})

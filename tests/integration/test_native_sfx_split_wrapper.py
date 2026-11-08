@@ -50,7 +50,8 @@ def test_discovered_sfx_reuses_native_range_for_rust_password_verifier(tmp_path,
 
     # Relations owns SFX identity and has already established the logical range.
     # Planning consumes that fact instead of rediscovering an embedded archive.
-    assert ArchiveInputPlanningStage(config).plan_task(task) is None
+    ArchiveInputPlanningStage(config).plan_task(task)
+    assert task.knowledge().get("input_planning") is None
     descriptor = task.password_probe_input or task.archive_input()
     assert descriptor.primary_extent.start > 0
     probe_input = descriptor.to_dict()

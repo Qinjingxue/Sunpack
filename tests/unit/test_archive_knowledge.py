@@ -83,9 +83,6 @@ def test_archive_knowledge_commit_revision_and_current_projections(tmp_path):
     task = make_archive_task(archive_path, format_hint="zip")
 
     first_revision = int(task.knowledge().get("_meta.revision", 0) or 0)
-    first = knowledge_view.source_fingerprint(task)
-    second = knowledge_view.source_fingerprint(task)
-    assert first == second
 
     knowledge = task.knowledge()
     knowledge.set("format.zip.structure.has_data_descriptor", True, source_layer="test")

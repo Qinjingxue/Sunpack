@@ -9,6 +9,7 @@ import pytest
 
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchRunResult, WatchScheduler
 from tests.helpers.marker_utils import marker_present
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
@@ -85,17 +86,11 @@ def test_watch_routes_each_root_to_its_output_root_without_input_tree_outputs(tm
         directory.mkdir(parents=True)
 
     config = _watch_config()
-    output_roots = {
-        str(first_root): str(first_out),
-        str(second_root): str(second_out),
-    }
-
     async def scenario():
         async with PipelineEngine(config) as delegate:
             watcher = WatchScheduler(
                 config,
-                [str(first_root), str(second_root)],
-                output_roots=output_roots,
+                [WatchRootEntry(str(first_root), str(first_out)), WatchRootEntry(str(second_root), str(second_out))],
                 state_path=str(tmp_path / "state.snapshot"),
                 pipeline_engine=delegate,
             )

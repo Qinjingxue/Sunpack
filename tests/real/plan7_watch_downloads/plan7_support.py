@@ -529,15 +529,10 @@ def start_watch(
     with timer.measure("watch_scheduler_init"):
         watcher = WatchScheduler(
             config,
-            [str(watch_root)],
-            output_roots={str(watch_root): str(output_root)},
+            [WatchRootEntry(str(watch_root), str(output_root), recursive=recursive)],
             state_path=str(state_path or (tmp_path / label / "state.snapshot")),
             pipeline_engine=engine,
             notification_sink=notification_sink,
-            root_entries=(
-                [WatchRootEntry(str(watch_root), str(output_root), recursive=True)]
-                if recursive else None
-            ),
         )
     async_run_once = watcher.run_once
     async_start = watcher.start

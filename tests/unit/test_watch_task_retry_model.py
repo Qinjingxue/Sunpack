@@ -66,9 +66,7 @@ def _watcher(tmp_path, monkeypatch, *, deep_detect=False, recursive=False):
     sink = _Sink()
     watcher = WatchScheduler(
         make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(root)],
-        output_roots={str(root): str(output)},
-        root_entries=[WatchRootEntry(str(root), str(output), deep_detect, recursive=recursive)],
+        [WatchRootEntry(str(root), str(output), deep_detect, recursive=recursive)],
         state_path=str(tmp_path / "state.snapshot"),
         pipeline_engine=FakePipelineEngine(_Runner),
         notification_sink=sink,
@@ -147,8 +145,7 @@ def test_password_updates_retry_only_applicable_scopes(tmp_path, monkeypatch, ti
                 write_password_json(password_file, ["global-new" if change == "global" else "global-old"], scopes=scopes)
             if timing == "restart":
                 watcher = WatchScheduler(
-                    dict(watcher.config), [str(root)], output_roots={str(root): str(output)},
-                    root_entries=[WatchRootEntry(str(root), str(output), recursive=True)],
+                    dict(watcher.config), [WatchRootEntry(str(root), str(output), recursive=True)],
                     state_path=str(tmp_path / "state.snapshot"),
                     pipeline_engine=FakePipelineEngine(_Runner),
                 )
@@ -526,7 +523,6 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
         watcher, root, output, _sink = _watcher(tmp_path, monkeypatch, deep_detect=True)
         ordinary_root = tmp_path / "ordinary"
         ordinary_root.mkdir()
-        watcher.watch_roots.append(str(ordinary_root))
         from sunpack.core.contracts.discovery_scope import DiscoveryScope
         watcher.scopes[scheduler_module.path_key(str(ordinary_root))] = DiscoveryScope(str(ordinary_root))
         watcher.root_entries[scheduler_module.path_key(str(ordinary_root))] = WatchRootEntry(

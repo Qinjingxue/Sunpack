@@ -15,6 +15,7 @@ import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_mo
 import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from tests.helpers.tool_config import get_test_tools
 
@@ -106,7 +107,7 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
 
                 monkeypatch.setattr(engine, "run", delayed_result)
             watcher = WatchScheduler(
-                config, [str(watch_root)], output_roots={str(watch_root): str(output_root)},
+                config, [WatchRootEntry(str(watch_root), str(output_root))],
                 state_path=str(tmp_path / "state.snapshot"),
                 pipeline_engine=engine,
             )
@@ -142,7 +143,7 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
             if update_timing == "before_failure_restart":
                 watcher.state.flush()
                 watcher = WatchScheduler(
-                    config, [str(watch_root)], output_roots={str(watch_root): str(output_root)},
+                    config, [WatchRootEntry(str(watch_root), str(output_root))],
                     state_path=str(tmp_path / "state.snapshot"),
                     pipeline_engine=engine,
                 )
@@ -227,7 +228,7 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
     async def scenario():
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
-                config, [str(watch_root)], output_roots={str(watch_root): str(output_root)},
+                config, [WatchRootEntry(str(watch_root), str(output_root))],
                 state_path=str(tmp_path / "state.snapshot"),
                 pipeline_engine=engine,
             )

@@ -1,6 +1,6 @@
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -934,14 +934,13 @@ impl NativeDirectoryScanOptions {
         })
     }
 
-    #[pyo3(signature = (state, scope, changed=None, _subtree=false))]
+    #[pyo3(signature = (state, scope, changed=None))]
     fn catalog_update(
         &self,
         py: Python<'_>,
         state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope,
         changed: Option<&str>,
-        _subtree: bool,
     ) -> PyResult<Vec<DirectoryReadError>> {
         Ok(update_catalog(self, py, state, scope, changed, false)?.0)
     }
@@ -955,48 +954,6 @@ impl NativeDirectoryScanOptions {
         changed: Option<&str>,
     ) -> PyResult<(Vec<DirectoryReadError>, Vec<String>)> {
         update_catalog(self, py, state, scope, changed, true)
-    }
-
-    #[pyo3(signature = (state, scope, under=None))]
-    fn catalog_candidates(
-        &self,
-        py: Python<'_>,
-        state: &NativeWatchCatalog,
-        scope: &crate::scan::scope::NativeDiscoveryScope,
-        under: Option<&str>,
-    ) -> PyResult<Py<PyList>> {
-        let mut target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
-        target.truncate(target.trim_end_matches('\\').len());
-        let records: Vec<String> = state
-            .catalogs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&crate::path_keys::path_key(&scope.root))
-            .into_iter()
-            .flat_map(|catalog| {
-                catalog
-                    .rows
-                    .range::<str, _>((
-                        std::ops::Bound::Included(target.as_str()),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .take_while(|(key, _)| key.starts_with(&target))
-                    .filter(|(key, _)| {
-                        key.as_ref() == target || key[target.len()..].starts_with('\\')
-                    })
-                    .filter(|(_, row)| row.persistent() && !row.is_dir())
-                    .map(|(_, row)| row.path())
-            })
-            .collect();
-        let values = PyList::empty(py);
-        for path in &records {
-            if scope.contains(path) && !state.is_owned(path) {
-                if let Some(value) = crate::postprocess::watch_candidate_for_path(py, path, None)? {
-                    values.append(value)?;
-                }
-            }
-        }
-        Ok(values.unbind())
     }
 
     fn catalog_snapshot(
@@ -2512,6 +2469,44 @@ impl NativeWatchCatalog {
     #[getter]
     fn error(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
+    }
+
+    #[pyo3(signature = (scope, under=None))]
+    fn candidate_paths(
+        &self,
+        py: Python<'_>,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        under: Option<&str>,
+    ) -> Vec<String> {
+        py.detach(|| {
+            let mut target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
+            target.truncate(target.trim_end_matches('\\').len());
+            let mut paths: Vec<String> = self
+                .catalogs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&crate::path_keys::path_key(&scope.root))
+                .into_iter()
+                .flat_map(|catalog| {
+                    catalog
+                        .rows
+                        .range::<str, _>((
+                            std::ops::Bound::Included(target.as_str()),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .take_while(|(key, _)| key.starts_with(&target))
+                        .filter(|(key, _)| {
+                            key.as_ref() == target || key[target.len()..].starts_with('\\')
+                        })
+                        .filter(|(_, row)| row.persistent() && !row.is_dir())
+                        .map(|(_, row)| row.path())
+                })
+                .collect();
+            // Admission owns the fresh observation. The catalog supplies
+            // paths only, without opening each file before the actual probe.
+            paths.retain(|path| scope.contains(path) && !self.is_owned(path));
+            paths
+        })
     }
 
     fn observation(&self, py: Python<'_>, path: &str) -> Option<NativeWatchObservation> {

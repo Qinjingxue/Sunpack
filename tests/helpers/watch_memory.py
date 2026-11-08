@@ -29,6 +29,7 @@ import psutil
 from tests.display_history import iter_records, storage_bytes
 
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchRunResult, WatchScheduler
 
 
@@ -187,8 +188,7 @@ class WatchMemoryHarness:
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
                 config,
-                [str(watch_root)],
-                output_roots={str(watch_root): str(output_root)},
+                [WatchRootEntry(str(watch_root), str(output_root))],
                 state_path=str(state_path),
                 pipeline_engine=engine,
             )

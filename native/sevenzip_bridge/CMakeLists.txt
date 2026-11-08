@@ -403,7 +403,6 @@ endfunction()
 
 set(SUP7Z_INTERNAL_SOURCES
     src/internal/archive_extract.cpp
-    src/internal/archive_open_plan.cpp
     src/internal/password_testing.cpp
     src/internal/native_cpu_budget.cpp
     src/internal/native_memory.cpp

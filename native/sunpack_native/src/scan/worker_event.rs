@@ -34,7 +34,6 @@ pub(crate) struct OutputTraceItem {
     pub(crate) operation_result: i64,
     pub(crate) operation_result_name: String,
     pub(crate) hresult: i64,
-    pub(crate) hresult_hex: String,
     pub(crate) win32_error: i64,
     pub(crate) done: bool,
     pub(crate) failed: bool,
@@ -91,7 +90,6 @@ impl NativeOutputTrace {
                 row.set_item("operation_result", item.operation_result)?;
                 row.set_item("operation_result_name", &item.operation_result_name)?;
                 row.set_item("hresult", item.hresult)?;
-                row.set_item("hresult_hex", &item.hresult_hex)?;
                 row.set_item("win32_error", item.win32_error)?;
                 row.set_item("done", item.done)?;
                 row.set_item("failed", item.failed)?;

@@ -3,13 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sunpack.core.config.schema import normalize_config
 from sunpack.pipeline.coordinator.output_scan_policy import (
     NestedOutputScanPolicy as OutputScanPolicy,
-)
-from sunpack.pipeline.extraction.internal.sevenzip.metadata import (
-    ArchiveMetadataScanResult,
 )
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
     attach_worker_diagnostics,
@@ -55,47 +53,30 @@ class FakePasswordResolver:
         return SimpleNamespace(password="", test_result=None, error_text="")
 
 
-class FakeMetadataScanner:
-    def scan_for_task(self, task):
-        descriptor = task.archive_input()
-        return ArchiveMetadataScanResult(
-            archive_path=descriptor.entry_path,
-            archive_type=descriptor.format_hint or "unknown",
-            reasons=["test fixture keeps the default filename encoding"],
-        )
-
-
-class FakeFailingMetadataScanner:
-    def scan_for_task(self, task):
-        result = ArchiveMetadataScanResult(
-            archive_path=task.archive_input().entry_path,
-            archive_type="zip",
-            reasons=["ambiguous filename encoding"],
-        )
-        result.error = "ZIP 文件名编码置信度不足"
-        result.selected_codepage = "932"
-        return result
-
-
 class ExtractionExecutionTests(unittest.TestCase):
-    def test_metadata_detection_failure_falls_back_to_archive_backend(self):
+    @patch(
+        "sunpack.pipeline.extraction.internal.workflow.single_archive_extractor.analyze_zip_filename_encoding",
+        side_effect=OSError("ZIP filename scan failed"),
+    )
+    def test_metadata_detection_failure_falls_back_to_archive_backend(self, scan):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "ambiguous.zip"
             archive_path.write_bytes(b"zip")
             out_dir = Path(tmp) / "out"
             extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
-            extractor.metadata_scanner = FakeFailingMetadataScanner()
+
             calls = []
             extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
                 calls.append(kwargs) or _completed(returncode=0, stdout="", stderr="")
             )
-            task = make_archive_task(archive_path)
+            task = make_archive_task(archive_path, format_hint="zip")
 
             result = extractor.extract(task, str(out_dir))
 
+            scan.assert_called_once()
             self.assertTrue(result.success)
-            self.assertEqual(calls[0]["selected_codepage"], None)
+            self.assertIsNone(calls[0]["selected_codepage"])
 
     def test_extractor_success_reports_cleanup_parts_not_candidate_run_parts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,7 +90,6 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
-            extractor.metadata_scanner = FakeMetadataScanner()
 
             task = make_archive_task(archive_path)
             task.carrier_path = str(launcher_path)
@@ -133,7 +113,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                 archive_path.write_bytes(b"zip")
                 extractor = ExtractionScheduler()
                 extractor.password_resolver = FakePasswordResolver()
-                extractor.metadata_scanner = FakeMetadataScanner()
+
                 failed = _completed(returncode=returncode, stdout="", stderr=stderr)
                 calls = []
                 extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
@@ -152,7 +132,6 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
-            extractor.metadata_scanner = FakeMetadataScanner()
 
             # A genuine archive error has a structured native result. A bare
             # exit code and stderr with no result means the worker disappeared.
@@ -206,7 +185,6 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
-            extractor.metadata_scanner = FakeMetadataScanner()
 
             def fake_extract(**_kwargs):
                 good_path.parent.mkdir(parents=True, exist_ok=True)

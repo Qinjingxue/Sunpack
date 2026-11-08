@@ -103,20 +103,15 @@ def get_7z_path() -> str:
 
 
 def get_sevenzip_bridge_worker_path() -> str:
-    relatives = (
-        Path("native") / "sevenzip_bridge" / "build-x64" / "Release" / "sunpack_sevenzip_worker.exe",
-        Path("native") / "sevenzip_bridge" / "build-arm64" / "Release" / "sunpack_sevenzip_worker.exe",
-        Path("native") / "sevenzip_bridge" / "build" / "Release" / "sunpack_sevenzip_worker.exe",
-        Path("native") / "sevenzip_bridge" / "build" / "Debug" / "sunpack_sevenzip_worker.exe",
-        *tuple(tool_dir / "sunpack_sevenzip_worker.exe" for tool_dir in tool_dir_candidates()),
-        Path("sunpack_sevenzip_worker.exe"),
-    )
+    # Build scripts stage the worker alongside the matching runtime. A raw
+    # build directory may contain a different architecture or wire schema.
+    tool_dirs = tool_dir_candidates()
     for root in candidate_resource_roots():
-        for relative in relatives:
-            worker = root / relative
-            if worker.exists():
+        for tool_dir in tool_dirs:
+            worker = root / tool_dir / "sunpack_sevenzip_worker.exe"
+            if worker.is_file():
                 return str(worker)
-    raise FileNotFoundError("Required sunpack_sevenzip_worker.exe was not found under tools\\ or native\\sevenzip_bridge\\build.")
+    raise FileNotFoundError("Required sunpack_sevenzip_worker.exe was not staged under tools.")
 
 
 def get_toast_library_path() -> str:

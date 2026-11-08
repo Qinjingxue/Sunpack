@@ -10,18 +10,14 @@ from sunpack.core.passwords.relation_prober import (
     _shared_attempt_cache,
     clear_relation_probe_cache,
 )
-from sunpack.core.support.archive_knowledge_projection import (
-    source_fingerprint,
-)
-from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge
 from sunpack.core.support.runtime_cache_cleanup import (
     clear_all_runtime_caches,
     runtime_cache_stats,
 )
 from sunpack.runtime.cli.runtime_host import RuntimeHost
 from sunpack.runtime.watch.scanner import WatchCandidate
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
-from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
@@ -35,18 +31,11 @@ def _reset_process_caches():
     clear_relation_probe_cache()
 
 
-def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
+def test_clear_all_runtime_caches_clears_python_owned_caches():
     from sunpack_native import relations_logical_name
 
     # Existing cleanup checks miss process-wide native regex search pools.
     assert relations_logical_name("中文.part2.rar", True) == "中文"
-    archive_path = tmp_path / "archive.zip"
-    archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
-    task = make_archive_task(archive_path, format_hint="zip")
-    knowledge = task.knowledge()
-    knowledge.merge({"source": {"cache_probe": True}})
-    commit_task_knowledge(task, knowledge)
-    source_fingerprint(task)
     attempt_cache = _shared_attempt_cache()
     attempt_cache.remember_success("fingerprint", "password")
     attempt_cache.remember_negative("fingerprint", "wrong")
@@ -60,7 +49,6 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
 
     assert report["relation_probe_cache"] == {"successes": 1, "negative": 1}
     assert "inspection" not in report
-    assert source_fingerprint(task)
     assert report["errors"] == []
     assert report["archive_sessions"]["reader"]["relation_regexes"] > 0
     assert runtime_cache_stats()["reader"]["relation_regex_cache_entries"] == 0
@@ -134,8 +122,7 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
                 "runtime_cache_cleanup_idle_seconds": 10,
             }
         }),
-        [str(tmp_path)],
-        output_roots={str(tmp_path): str(tmp_path / "out")},
+        [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
         state_path=str(tmp_path / "state.snapshot"),
         pipeline_engine=engine,
     )
@@ -173,7 +160,7 @@ def test_ignored_log_history_expires_without_pipeline_activity(tmp_path, monkeyp
         watcher = WatchScheduler(
             make_config({"watch": {"clipboard_monitor_enabled": False,
                 "runtime_cache_cleanup_idle_seconds": 10}}),
-            [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
+            [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine, wake_callback=lambda: wakeups.append("wake"),
         )
@@ -222,7 +209,7 @@ def test_failed_wal_retirement_schedules_one_idle_retry(tmp_path, monkeypatch, s
         watcher = WatchScheduler(
             make_config({"watch": {"clipboard_monitor_enabled": False,
                 "runtime_cache_cleanup_idle_seconds": 10}}),
-            [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
+            [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=_CleanupOnlyEngine(), wake_callback=wake.set,
         )
@@ -268,7 +255,7 @@ def test_completed_family_cache_waits_for_watch_callbacks_and_foreground(tmp_pat
     async def scenario():
         config = make_config({"watch": {"clipboard_monitor_enabled": False}})
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
+            watcher = WatchScheduler(config, [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
                 state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine)
             parts = [tmp_path / "a.001", tmp_path / "a.002"]
             for part in parts:
@@ -310,7 +297,7 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
             "post_extract": {"archive_cleanup_mode": "k"},
         })
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, [str(root)], output_roots={str(root): str(tmp_path / "out")},
+            watcher = WatchScheduler(config, [WatchRootEntry(str(root), str(tmp_path / "out"))],
                 state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine)
             sources = []
             for batch in range(3):
@@ -365,8 +352,7 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
                 "runtime_cache_cleanup_idle_seconds": 10,
             }
         }),
-        [str(tmp_path)],
-        output_roots={str(tmp_path): str(tmp_path / "out")},
+        [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
         state_path=str(tmp_path / "state.snapshot"),
         pipeline_engine=_CleanupOnlyEngine(),
         wake_callback=lambda: wakeups.append("wake"),
@@ -394,8 +380,7 @@ def test_idle_maintenance_expires_cli_mode_and_clears_caches(tmp_path):
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
-            [str(tmp_path)],
-            output_roots={str(tmp_path): str(tmp_path / "out")},
+            [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine,
         )
@@ -442,8 +427,7 @@ def test_cleanup_gate_waits_for_foreground_activity(tmp_path):
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
-            [str(tmp_path)],
-            output_roots={str(tmp_path): str(tmp_path / "out")},
+            [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine,
         )
@@ -472,8 +456,7 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
-            [str(tmp_path)],
-            output_roots={str(tmp_path): str(tmp_path / "out")},
+            [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine,
         )
@@ -504,8 +487,7 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
-            [str(tmp_path)],
-            output_roots={str(tmp_path): str(tmp_path / "out")},
+            [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine,
         )
@@ -542,7 +524,7 @@ def test_disconnect_during_foreground_admission_restores_idle_cleanup(tmp_path, 
 
         def scheduler(name):
             return WatchScheduler(
-                config, [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
+                config, [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
                 state_path=str(tmp_path / name), pipeline_engine=engine,
             )
 
@@ -616,8 +598,7 @@ def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_p
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
-            [str(tmp_path)],
-            output_roots={str(tmp_path): str(tmp_path / "out")},
+            [WatchRootEntry(str(tmp_path), str(tmp_path / "out"))],
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine,
         )

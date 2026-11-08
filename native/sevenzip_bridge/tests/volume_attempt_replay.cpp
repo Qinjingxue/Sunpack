@@ -6,6 +6,7 @@
 #undef main
 #include <fstream>
 #include <future>
+#include <sstream>
 
 using namespace sunpack::sevenzip;
 namespace {

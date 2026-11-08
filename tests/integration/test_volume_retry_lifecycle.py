@@ -64,7 +64,7 @@ def test_real_split_archive_retry_updates_cleanup_and_avoids_lease_cycle(tmp_pat
             return original_inspect(task, out_dir, **kwargs)
 
         runtime.task_scanner.direct_file_tasks = lambda roots: [task_for(roots)]
-        runtime._plan_task_isolated = lambda task: [task]
+        runtime.input_planning_stage.plan_task = lambda task: None
         runtime._resolve_missing_volume_once = lambda *_args: task_for(parts)
         runtime.extractor.inspect = inspect
         return runtime

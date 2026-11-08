@@ -129,7 +129,7 @@ def _watcher(factory, metadata_root):
     watcher = object.__new__(scheduler.WatchScheduler)
     watcher._lock = threading.Lock()
     watcher._claim_gate = threading.RLock()
-    for name in ("_pending", "_pending_by_key", "_active_states", "_active_claims",
+    for name in ("_pending", "_pending_by_key", "_active_claims",
                  "_claims_by_owner", "_dirty_during_claim", "_source_probes",
                  "_inflight_path_counts", "_quiet_trackers"):
         setattr(watcher, name, {})
@@ -138,7 +138,7 @@ def _watcher(factory, metadata_root):
     watcher._ready_heap = []
     watcher._closed = False
     watcher._wake_callback = None
-    watcher.watch_roots = []
+    watcher.root_entries = {}
     watcher.state = _MemoryState()
     watcher._catalog = NativeWatchCatalog(watcher.state._native)
     # Persistent catalog rows are essential: transient observations are deleted

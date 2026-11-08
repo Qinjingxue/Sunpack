@@ -20,7 +20,6 @@ def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):
     extractor = SingleArchiveExtractor(
         password_store=SimpleNamespace(has_candidates=lambda **_kwargs: False),
         password_resolver=SimpleNamespace(password_tester=SimpleNamespace(passwords=[]), confirm_extraction=lambda *a, **k: None),
-        metadata_scanner=SimpleNamespace(scan_for_task=lambda *_args, **_kwargs: SimpleNamespace(selected_codepage=None, error=None)),
         sevenzip_runner=runner,
     )
     output.mkdir()
@@ -78,10 +77,6 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
     extractor = SingleArchiveExtractor(
         password_store=SimpleNamespace(has_candidates=lambda **_kwargs: True),
         password_resolver=Resolver(),
-        metadata_scanner=SimpleNamespace(scan_for_task=lambda *_args, **_kwargs: SimpleNamespace(
-            selected_codepage=None,
-            error=None,
-        )),
         sevenzip_runner=SimpleNamespace(
             extract_attempt=lambda **_kwargs: completed,
             emit_semantic_event=lambda *_args, **_kwargs: None,

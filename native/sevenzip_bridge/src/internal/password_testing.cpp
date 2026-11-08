@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <optional>
 
-#include "archive_open_plan.hpp"
-
 #include "password_probe_policy.hpp"
 
 #include "sevenzip_callbacks.hpp"
@@ -240,206 +238,160 @@ namespace sunpack::sevenzip
             cache.reset();
         }
 
-        PasswordTestResult fallback;
+        PasswordTestResult result;
 
-        fallback.backend_available = true;
+        result.backend_available = true;
 
-        bool has_fallback = false;
+        result.archive_offset = input_ranges.empty() ? 0 : input_ranges.front().start;
+        result.archive_type = format_hint;
 
-        const auto plans = password_test_open_plans(
-            formats,
-            input_ranges,
-            format_hint);
+        bool any_format_created = false;
 
-        for (const auto &plan : plans)
+        bool any_opened = false;
+
+        HRESULT last_hr = E_FAIL;
+
+        Int32 last_op_res = kOpOk;
+        bool last_encryption_evidence = false;
+
+        const UInt64 start_only = 0;
+        for (std::size_t attempt_index = 0; attempt_index < formats.size() * 2; ++attempt_index)
         {
+            if (native_job_cancelled()) {
+                result.status = PasswordTestStatus::Error;
+                result.message = "password probe cancelled";
+                return result;
+            }
+            const GUID &format = formats[attempt_index % formats.size()];
+            const UInt64 *search_limit = attempt_index < formats.size() ? &start_only : nullptr;
 
-            PasswordTestResult result;
+            CMyComPtr<IInArchive> archive;
 
-            result.backend_available = true;
+            HRESULT hr = create_in_archive(format, &archive);
 
-            apply_plan_metadata(result, plan);
-
-            bool any_format_created = false;
-
-            bool any_opened = false;
-
-            HRESULT last_hr = E_FAIL;
-
-            Int32 last_op_res = kOpOk;
-            bool last_encryption_evidence = false;
-
-            const UInt64 start_only = 0;
-            for (std::size_t attempt_index = 0; attempt_index < plan.formats.size() * 2; ++attempt_index)
+            if (hr != S_OK || !archive)
             {
-                if (native_job_cancelled()) {
-                    result.status = PasswordTestStatus::Error;
-                    result.message = "password probe cancelled";
-                    return result;
-                }
-                const GUID &format = plan.formats[attempt_index % plan.formats.size()];
-                const UInt64 *search_limit = attempt_index < plan.formats.size() ? &start_only : nullptr;
 
-                CMyComPtr<IInArchive> archive;
-
-                HRESULT hr = create_in_archive(format, &archive);
-
-                if (hr != S_OK || !archive)
-                {
-
-                    last_hr = hr;
-
-                    continue;
-                }
-
-                any_format_created = true;
-
-                bool stream_opened = false;
-
-                CMyComPtr<IInStream> stream = open_stream_for_plan(plan, archive_path, part_paths, stream_opened, !canonical_names.empty());
-
-                if (!stream_opened)
-                {
-
-                    if (is_sfx_path(archive_path) && !sorted_data_volume_paths(part_paths).empty())
-                    {
-                        result.status = PasswordTestStatus::NeedsVolumeOrTailDamaged;
-                        result.is_archive = true;
-                        result.damaged = true;
-                        result.missing_stub = true;
-                        result.missing_volume_evidence = "sfx_stub_not_found";
-                        result.message = "split self-extracting archive stub is missing";
-                        return result;
-                    }
-
-                    result.status = PasswordTestStatus::Error;
-
-                    result.message = "archive file could not be opened";
-
-                    return result;
-                }
-
-                const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
-                auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names, InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges);
-                CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
-
-                hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
-                // A later handler/search attempt cannot erase an earlier
-                // encrypted-header callback from this candidate's Open.
-                last_encryption_evidence = last_encryption_evidence || raw_open_callback->password_requested();
-
-                if (raw_open_callback->missing_volume_requested())
-                {
-                    auto missing = needs_volume_or_tail_damaged_result(
-                        "open_volume_callback_not_found",
-                        raw_open_callback->missing_volume_name());
-                    apply_plan_metadata(missing, plan);
-                    return missing;
-                }
-
-                if (raw_open_callback->volume_open_failed())
-                {
-                    result.status = PasswordTestStatus::Error;
-                    result.is_archive = true;
-                    result.volume_open_failed = true;
-                    result.missing_volume_name = raw_open_callback->failed_volume_name();
-                    result.missing_volume_evidence = "open_volume_callback_open_failed";
-                    result.message = "archive split volume could not be opened";
-                    return result;
-                }
-
-                if (hr != S_OK)
-                {
-
-                    last_hr = hr;
-
-                    continue;
-                }
-
-                any_opened = true;
-                result.archive_type = canonical_archive_type_for_guid(format);
-                result.is_archive = true;
-                auto selection = bounded_password_probe_selection(archive);
-                if (selection.item_count_known && rar4_rejected_empty_encrypted_headers(
-                        archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
-                {
-                    result.status = PasswordTestStatus::WrongPassword;
-                    result.encrypted = result.password_required = result.wrong_password = true;
-                    result.operation_result = kOpWrongPassword;
-                    result.message = "RAR4 encrypted headers could not be decoded";
-                    archive->Close();
-                    return result;
-                }
-                last_encryption_evidence = last_encryption_evidence || selection.encrypted;
-                result.encrypted = result.encrypted || last_encryption_evidence;
-                result.password_required = result.password_required || last_encryption_evidence;
-                const bool tested = probe_opened_archive(archive, selection, password,
-                    last_encryption_evidence, hr, last_op_res);
-                result.operation_result = last_op_res;
                 last_hr = hr;
-                if (!tested)
+
+                continue;
+            }
+
+            any_format_created = true;
+
+            bool stream_opened = false;
+
+            CMyComPtr<IInStream> stream = open_archive_stream(archive_path, part_paths, stream_opened,
+                nullptr, !canonical_names.empty(), InputPrefetchConfig{false}, input_ranges);
+
+            if (!stream_opened)
+            {
+
+                if (is_sfx_path(archive_path) && !sorted_data_volume_paths(part_paths).empty())
                 {
-                    archive->Close();
-                    continue;
-                }
-                if (!raw_open_callback->password_requested() &&
-                    looks_wrong_password(hr, last_op_res, last_encryption_evidence))
-                {
-                    cache.reset();
-                    cache.archive = archive;
-                    cache.callback = open_callback;
-                    cache.callback_state = raw_open_callback;
-                    cache.selection = std::move(selection);
-                    cache.evidence = result;
-                }
-                else archive->Close();
-
-                if (hr == S_OK && last_op_res == kOpOk)
-                {
-
-                    result.status = PasswordTestStatus::Ok;
-
-                    result.message = "password accepted";
-
+                    result.status = PasswordTestStatus::NeedsVolumeOrTailDamaged;
+                    result.is_archive = true;
+                    result.damaged = true;
+                    result.missing_stub = true;
+                    result.missing_volume_evidence = "sfx_stub_not_found";
+                    result.message = "split self-extracting archive stub is missing";
                     return result;
                 }
 
-                if (looks_wrong_password(hr, last_op_res, last_encryption_evidence))
-                {
+                result.status = PasswordTestStatus::Error;
 
-                    result.status = PasswordTestStatus::WrongPassword;
-                    result.is_archive = true;
-                    result.encrypted = true;
-                    result.password_required = true;
-                    result.wrong_password = true;
+                result.message = "archive file could not be opened";
 
-                    result.message = "wrong password";
-
-                    break;
-                }
-
-                if (looks_damaged(last_op_res))
-                {
-
-                    result.status = PasswordTestStatus::Damaged;
-
-                    result.message = std::string("archive appears damaged [operation_result=") +
-                                     operation_result_name(last_op_res) + "]";
-
-                    break;
-                }
+                return result;
             }
 
-            if (!any_format_created)
+            const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
+            auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names, InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges);
+            CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
+
+            hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
+            // A later handler/search attempt cannot erase an earlier
+            // encrypted-header callback from this candidate's Open.
+            last_encryption_evidence = last_encryption_evidence || raw_open_callback->password_requested();
+
+            if (raw_open_callback->missing_volume_requested())
+            {
+                auto missing = needs_volume_or_tail_damaged_result(
+                    "open_volume_callback_not_found",
+                    raw_open_callback->missing_volume_name());
+                missing.archive_offset = result.archive_offset;
+                if (!format_hint.empty()) missing.archive_type = format_hint;
+                return missing;
+            }
+
+            if (raw_open_callback->volume_open_failed())
+            {
+                result.status = PasswordTestStatus::Error;
+                result.is_archive = true;
+                result.volume_open_failed = true;
+                result.missing_volume_name = raw_open_callback->failed_volume_name();
+                result.missing_volume_evidence = "open_volume_callback_open_failed";
+                result.message = "archive split volume could not be opened";
+                return result;
+            }
+
+            if (hr != S_OK)
             {
 
-                result.status = PasswordTestStatus::Unsupported;
+                last_hr = hr;
 
-                result.message = "the embedded 7-Zip backend did not create a supported archive handler";
+                continue;
             }
-            else if (!any_opened &&
-                     (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence) ||
-                      (plan.uses_ranges() && encrypted_header_range_probe_candidate(plan.format_hint))))
+
+            any_opened = true;
+            result.archive_type = canonical_archive_type_for_guid(format);
+            result.is_archive = true;
+            auto selection = bounded_password_probe_selection(archive);
+            if (selection.item_count_known && rar4_rejected_empty_encrypted_headers(
+                    archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
+            {
+                result.status = PasswordTestStatus::WrongPassword;
+                result.encrypted = result.password_required = result.wrong_password = true;
+                result.operation_result = kOpWrongPassword;
+                result.message = "RAR4 encrypted headers could not be decoded";
+                archive->Close();
+                return result;
+            }
+            last_encryption_evidence = last_encryption_evidence || selection.encrypted;
+            result.encrypted = result.encrypted || last_encryption_evidence;
+            result.password_required = result.password_required || last_encryption_evidence;
+            const bool tested = probe_opened_archive(archive, selection, password,
+                last_encryption_evidence, hr, last_op_res);
+            result.operation_result = last_op_res;
+            last_hr = hr;
+            if (!tested)
+            {
+                archive->Close();
+                continue;
+            }
+            if (!raw_open_callback->password_requested() &&
+                looks_wrong_password(hr, last_op_res, last_encryption_evidence))
+            {
+                cache.reset();
+                cache.archive = archive;
+                cache.callback = open_callback;
+                cache.callback_state = raw_open_callback;
+                cache.selection = std::move(selection);
+                cache.evidence = result;
+            }
+            else archive->Close();
+
+            if (hr == S_OK && last_op_res == kOpOk)
+            {
+
+                result.status = PasswordTestStatus::Ok;
+
+                result.message = "password accepted";
+
+                return result;
+            }
+
+            if (looks_wrong_password(hr, last_op_res, last_encryption_evidence))
             {
 
                 result.status = PasswordTestStatus::WrongPassword;
@@ -449,90 +401,106 @@ namespace sunpack::sevenzip
                 result.wrong_password = true;
 
                 result.message = "wrong password";
-            }
-            else if (!any_opened)
-            {
 
-                result.status = PasswordTestStatus::Unsupported;
-
-                result.message = "archive could not be opened by supported handlers";
+                break;
             }
-            else if (looks_damaged(last_op_res))
+
+            if (looks_damaged(last_op_res))
             {
 
                 result.status = PasswordTestStatus::Damaged;
 
                 result.message = std::string("archive appears damaged [operation_result=") +
                                  operation_result_name(last_op_res) + "]";
-            }
-            else if (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence))
-            {
 
-                result.status = PasswordTestStatus::WrongPassword;
-                result.is_archive = true;
-                result.encrypted = true;
-                result.password_required = true;
-                result.wrong_password = true;
-
-                result.message = "wrong password";
-            }
-            else
-            {
-
-                result.status = PasswordTestStatus::Error;
-
-                result.message = "archive test failed";
-            }
-
-            if (
-                !has_fallback ||
-                fallback.status == PasswordTestStatus::Unsupported ||
-                fallback.status == PasswordTestStatus::Error ||
-                result.status == PasswordTestStatus::WrongPassword)
-            {
-                fallback = result;
-                has_fallback = true;
+                break;
             }
         }
 
-        if (has_fallback)
+        if (!any_format_created)
         {
 
-            return fallback;
+            result.status = PasswordTestStatus::Unsupported;
+
+            result.message = "the embedded 7-Zip backend did not create a supported archive handler";
         }
+        else if (!any_opened &&
+                 (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence) ||
+                  (!input_ranges.empty() && encrypted_header_range_probe_candidate(format_hint))))
+        {
 
-        PasswordTestResult result;
+            result.status = PasswordTestStatus::WrongPassword;
+            result.is_archive = true;
+            result.encrypted = true;
+            result.password_required = true;
+            result.wrong_password = true;
 
-        result.backend_available = true;
+            result.message = "wrong password";
+        }
+        else if (!any_opened)
+        {
 
-        result.status = PasswordTestStatus::Unsupported;
+            result.status = PasswordTestStatus::Unsupported;
 
-        result.message = "archive could not be opened by supported handlers";
+            result.message = "archive could not be opened by supported handlers";
+        }
+        else if (looks_damaged(last_op_res))
+        {
+
+            result.status = PasswordTestStatus::Damaged;
+
+            result.message = std::string("archive appears damaged [operation_result=") +
+                             operation_result_name(last_op_res) + "]";
+        }
+        else if (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence))
+        {
+
+            result.status = PasswordTestStatus::WrongPassword;
+            result.is_archive = true;
+            result.encrypted = true;
+            result.password_required = true;
+            result.wrong_password = true;
+
+            result.message = "wrong password";
+        }
+        else
+        {
+
+            result.status = PasswordTestStatus::Error;
+
+            result.message = "archive test failed";
+        }
 
         return result;
     }
 
+#endif
+
     PasswordTestResult test_password_batch(
-        const std::wstring &archive_path, const std::vector<std::wstring> &part_paths,
-        const std::vector<ExtractInputRange> &ranges, const std::wstring &format_hint,
-        const wchar_t *const *passwords, int password_count,
+        const std::wstring &archive_path,
+        const std::vector<std::wstring> &part_paths,
+        const std::vector<ExtractInputRange> &input_ranges,
+        const std::wstring &format_hint,
+        const std::wstring *candidates,
+        std::size_t candidate_count,
         const std::vector<std::wstring> &canonical_names)
     {
+#ifdef _WIN32
         PasswordProbeCache cache;
         const auto formats = extraction_formats_for_hint(format_hint);
-        const wchar_t *empty = L"";
-        if (password_count <= 0) { passwords = &empty; password_count = 1; }
+        const std::wstring empty;
+        const auto count = (std::max)(candidate_count, std::size_t{1});
         PasswordTestResult last;
-        for (int index = 0; index < password_count; ++index)
+        for (std::size_t index = 0; index < count; ++index)
         {
             if (native_job_cancelled()) {
                 last.status = PasswordTestStatus::Error;
                 last.message = "password probe cancelled";
                 return last;
             }
-            auto current = test_one_password(archive_path, passwords[index] ? passwords[index] : L"",
-                part_paths, formats, ranges, canonical_names, format_hint, cache);
-            current.attempts = index + 1;
+            auto current = test_one_password(archive_path, candidate_count == 0 ? empty : candidates[index],
+                part_paths, formats, input_ranges, canonical_names, format_hint, cache);
+            current.attempts = static_cast<int>(index + 1);
             if (native_job_cancelled()) {
                 current.status = PasswordTestStatus::Error;
                 current.message = "password probe cancelled";
@@ -540,7 +508,7 @@ namespace sunpack::sevenzip
             }
             if (current.status == PasswordTestStatus::Ok)
             {
-                current.matched_index = index;
+                current.matched_index = static_cast<int>(index);
                 return current;
             }
             if (current.status != PasswordTestStatus::WrongPassword &&
@@ -550,102 +518,14 @@ namespace sunpack::sevenzip
         }
         last.status = PasswordTestStatus::WrongPassword;
         last.matched_index = -1;
-        last.attempts = password_count;
+        last.attempts = static_cast<int>(count);
         last.message = "wrong password";
         return last;
-    }
-
-#endif
-
-    PasswordTestResult test_passwords_with_parts(
-
-    
-        const std::wstring &archive_path,
-
-        const std::vector<std::wstring> &part_paths,
-
-        const wchar_t *const *passwords,
-
-        int password_count,
-
-        const std::vector<std::wstring> &canonical_names,
-
-        const std::wstring &format_hint,
-        const std::vector<ExtractInputRange> &part_ranges
-
-    )
-    {
-
-#ifdef _WIN32
-
-        std::vector<std::wstring> fallback_paths;
-        if (part_paths.empty()) fallback_paths.push_back(archive_path);
-        return test_password_batch(archive_path,
-            part_paths.empty() ? fallback_paths : part_paths,
-            part_ranges, format_hint, passwords, password_count, canonical_names);
-
 #else
-
-    
-        (void)archive_path;
-
-        (void)passwords;
-
-        (void)password_count;
-
         PasswordTestResult result;
-
         result.status = PasswordTestStatus::BackendUnavailable;
-
         result.message = "native password testing is only implemented on Windows";
-
         return result;
-
-#endif
-    }
-
-    PasswordTestResult test_passwords_with_ranges(
-
-    
-        const std::wstring &archive_path,
-
-        const std::vector<ExtractInputRange> &ranges,
-
-        const std::wstring &format_hint,
-
-        const wchar_t *const *passwords,
-
-        int password_count
-
-    )
-    {
-
-#ifdef _WIN32
-
-        return test_password_batch(archive_path, {archive_path}, ranges, format_hint,
-            passwords, password_count, {});
-
-#else
-
-    
-        (void)archive_path;
-
-        (void)ranges;
-
-        (void)format_hint;
-
-        (void)passwords;
-
-        (void)password_count;
-
-        PasswordTestResult result;
-
-        result.status = PasswordTestStatus::BackendUnavailable;
-
-        result.message = "native password testing is only implemented on Windows";
-
-        return result;
-
 #endif
     }
 

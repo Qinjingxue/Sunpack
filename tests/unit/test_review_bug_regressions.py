@@ -36,7 +36,6 @@ def test_async_worker_failure_reaches_failed_process_fallback():
     extractor = SingleArchiveExtractor(
         password_store=None,
         password_resolver=None,
-        metadata_scanner=None,
         sevenzip_runner=runner,
     )
 
@@ -93,7 +92,6 @@ def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
     extractor = SingleArchiveExtractor(
         password_store=None,
         password_resolver=None,
-        metadata_scanner=None,
         sevenzip_runner=_Runner(),
     )
 

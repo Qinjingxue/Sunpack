@@ -1,7 +1,25 @@
 """Test native artifact selection without relying on a local release build."""
 import pytest
 
+from sunpack.core.support import resources
 from tests.helpers import native_build
+
+
+def test_runtime_worker_uses_the_staged_binary(monkeypatch, tmp_path):
+    monkeypatch.setattr(resources, "candidate_resource_roots", lambda: [tmp_path])
+    monkeypatch.setattr(resources.platform, "machine", lambda: "AMD64")
+    filename = "sunpack_sevenzip_worker.exe"
+    stale = tmp_path / "native/sevenzip_bridge/build-x64/Release" / filename
+    stale.parent.mkdir(parents=True)
+    stale.touch()
+    staged = tmp_path / "tools" / filename
+    staged.parent.mkdir()
+    staged.touch()
+
+    assert resources.get_sevenzip_bridge_worker_path() == str(staged)
+    staged.unlink()
+    with pytest.raises(FileNotFoundError):
+        resources.get_sevenzip_bridge_worker_path()
 
 
 @pytest.mark.parametrize("arch", ["x64", "arm64"])

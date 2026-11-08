@@ -1,8 +1,5 @@
-import threading
-from collections import OrderedDict
-from contextlib import nullcontext
 from dataclasses import replace
-from typing import Any, Callable
+from typing import Any
 from sunpack_native import archive_input_slices
 
 from sunpack.core.analysis import ArchiveAnalysisReport, ArchiveAnalyzer
@@ -27,40 +24,23 @@ from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 
 
-_REPORT_CACHE_LIMIT = 512
-
-
 class ArchiveInputPlanningStage:
     """Turn neutral Analysis reports into main-flow archive inputs."""
     def __init__(
         self,
         config: dict[str, Any] | None = None,
     ):
-        self._report_cache: OrderedDict[tuple, ArchiveAnalysisReport] = OrderedDict()
-        self._report_cache_lock = threading.Lock()
         self.analyzer = ArchiveAnalyzer(config or {})
 
-    def _remember_report(self, cache_key: tuple, report: ArchiveAnalysisReport) -> None:
-        with self._report_cache_lock:
-            self._report_cache[cache_key] = report
-            if len(self._report_cache) > _REPORT_CACHE_LIMIT:
-                self._report_cache.popitem(last=False)
-
-    def clear_report_cache(self) -> None:
-        """Release archive-specific reports after a completed request group."""
-        with self._report_cache_lock:
-            self._report_cache.clear()
-
-    def _report_cache_key(self, task: ArchiveTask) -> tuple:
-        return knowledge_view.source_fingerprint(task), _discovery_confirmed(task)
-
-    def plan_task(self, task: ArchiveTask) -> ArchiveAnalysisReport | None:
-        report, _ = self._plan_task_to_tasks(task)
-        return report
-
-    def plan_task_to_tasks(self, task: ArchiveTask) -> list[ArchiveTask]:
-        _, tasks = self._plan_task_to_tasks(task)
-        return tasks
+    def plan_task(self, task: ArchiveTask) -> None:
+        if not self.requires_analysis(task):
+            return
+        try:
+            report = self._analyze_task(task)
+        except Exception as exc:
+            _write_plan_error(task, str(exc))
+            return
+        self._apply_report(task, report)
 
     def requires_analysis(self, task: ArchiveTask) -> bool:
         if task.discovery_failure is not None:
@@ -71,31 +51,6 @@ class ArchiveInputPlanningStage:
         if descriptor.format_hint == "lz4":
             return not descriptor.analysis.get("stream_plan")
         return not _discovery_confirmed(task)
-
-    def _plan_task_to_tasks(self, task: ArchiveTask) -> tuple[ArchiveAnalysisReport | None, list[ArchiveTask]]:
-        if not self.requires_analysis(task):
-            return None, [task]
-        try:
-            report = self._get_or_create_report(task)
-        except Exception as exc:
-            _write_plan_error(task, str(exc))
-            return None, [task]
-
-        return report, self._tasks_from_report(task, report)
-
-    def _get_or_create_report(self, task: ArchiveTask, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "input_planning") -> ArchiveAnalysisReport:
-        with _phase(phase_timer, f"{phase_prefix}_cache_key"):
-            cache_key = self._report_cache_key(task)
-        with _phase(phase_timer, f"{phase_prefix}_cache_lookup"):
-            with self._report_cache_lock:
-                report = self._report_cache.get(cache_key)
-        if report is None:
-            with _phase(phase_timer, f"{phase_prefix}_analyze_source"):
-                report = self._analyze_task(task)
-            with _phase(phase_timer, f"{phase_prefix}_remember_report"):
-                self._remember_report(cache_key, report)
-            return report
-        return replace(report, cache_hits=report.cache_hits + 1)
 
     def _analyze_task(self, task: ArchiveTask) -> ArchiveAnalysisReport:
         descriptor = task.archive_input()
@@ -119,27 +74,22 @@ class ArchiveInputPlanningStage:
             ),
         )
 
-    def _tasks_from_report(self, task: ArchiveTask, report: ArchiveAnalysisReport, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "input_planning") -> list[ArchiveTask]:
-        with _phase(phase_timer, f"{phase_prefix}_extractable_segments"):
-            candidates = self._extractable_segments(report)
+    def _apply_report(self, task: ArchiveTask, report: ArchiveAnalysisReport) -> None:
+        candidates = self._extractable_segments(report)
         if not candidates:
             password_candidate = self._password_required_embedded_segment(report)
             if password_candidate is not None:
                 candidates = [password_candidate]
         selected_segment = candidates[0] if candidates else None
-        with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
-            segment_payloads, password_probe_input = self._project_segments(task.archive_input(), candidates)
-        with _phase(phase_timer, f"{phase_prefix}_batched_write"):
-            _write_plan_knowledge(
-                task,
-                report,
-                segment_payloads,
-                selected_segment,
-                password_probe_input,
-            )
-        with _phase(phase_timer, f"{phase_prefix}_state_update"):
-            self._record_planning_input(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
-        return [task]
+        segment_payloads, password_probe_input = self._project_segments(task.archive_input(), candidates)
+        _write_plan_knowledge(
+            task,
+            report,
+            segment_payloads,
+            selected_segment,
+            password_probe_input,
+        )
+        self._record_planning_input(task, report)
 
     @staticmethod
     def _execution_analysis_for_report(
@@ -162,30 +112,24 @@ class ArchiveInputPlanningStage:
         self,
         task: ArchiveTask,
         report: ArchiveAnalysisReport,
-        *,
-        phase_timer: Callable[..., Any] | None = None,
-        phase_prefix: str = "input_planning",
     ) -> None:
-        with _phase(phase_timer, f"{phase_prefix}_record_input_get"):
-            descriptor = task.archive_input()
-        with _phase(phase_timer, f"{phase_prefix}_record_input_build"):
-            selected = report.best_selected
-            analysis = dict(descriptor.analysis)
-            analysis.pop("execution", None)
-            execution_analysis = self._execution_analysis_for_report(descriptor, report)
-            if execution_analysis:
-                analysis["execution"] = execution_analysis
-            selected_format = str(getattr(selected, "format", "") or "")
-            analysis.update(_stream_execution_analysis(selected, 0))
-            analysis.update(_zip_password_analysis(selected, 0))
-            updated = replace(
-                descriptor,
-                format_hint=selected_format or descriptor.format_hint,
-                analysis=analysis,
-            )
-        with _phase(phase_timer, f"{phase_prefix}_record_input_set"):
-            if updated != descriptor:
-                task.set_archive_input(updated)
+        descriptor = task.archive_input()
+        selected = report.best_selected
+        analysis = dict(descriptor.analysis)
+        analysis.pop("execution", None)
+        execution_analysis = self._execution_analysis_for_report(descriptor, report)
+        if execution_analysis:
+            analysis["execution"] = execution_analysis
+        selected_format = str(getattr(selected, "format", "") or "")
+        analysis.update(_stream_execution_analysis(selected, 0))
+        analysis.update(_zip_password_analysis(selected, 0))
+        updated = replace(
+            descriptor,
+            format_hint=selected_format or descriptor.format_hint,
+            analysis=analysis,
+        )
+        if updated != descriptor:
+            task.set_archive_input(updated)
 
     @staticmethod
     def _extractable_segments(report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
@@ -239,12 +183,6 @@ class ArchiveInputPlanningStage:
             return None
         evidence, segment = report.password_segment
         return evidence, segment, 0
-
-
-def _phase(timer: Callable[..., Any] | None, name: str):
-    if timer is None:
-        return nullcontext()
-    return timer(name)
 
 
 def _write_plan_knowledge(

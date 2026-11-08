@@ -1,6 +1,5 @@
 from typing import Any, Callable
 
-from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.core.support.output_paths import default_output_dir_for_task
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
@@ -31,7 +30,6 @@ class ExtractionScheduler:
         self.password_tester = ArchivePasswordTester(password_store=self.password_store)
         self.password_resolver = PasswordResolver(self.password_tester, self.password_session)
         extraction_config = extraction_config if isinstance(extraction_config, dict) else {}
-        self.metadata_scanner = ArchiveMetadataScanner(language=str(extraction_config.get("language") or "en"))
         self.output_config = output_config if isinstance(output_config, dict) else None
         self.extraction_config = extraction_config
         self.process_config = {
@@ -131,7 +129,6 @@ class ExtractionScheduler:
         return SingleArchiveExtractor(
             password_store=self.password_store,
             password_resolver=self.password_resolver,
-            metadata_scanner=self.metadata_scanner,
             sevenzip_runner=self.sevenzip_runner,
             best_effort=True,
             quiet=bool(self.extraction_config.get("quiet", False)),

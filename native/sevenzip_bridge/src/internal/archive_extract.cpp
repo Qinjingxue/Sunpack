@@ -208,38 +208,24 @@ namespace sunpack::sevenzip
 
     } // namespace
 
-    ExtractArchiveResult extract_archive_internal(
+#endif
 
-
+    ExtractArchiveResult extract_archive(
         const std::wstring &archive_path,
-
-        const std::wstring &password,
-
         const std::vector<std::wstring> &part_paths,
-
         const std::vector<ExtractInputRange> &input_ranges,
-
         const std::wstring &format_hint,
-
+        const std::wstring &password,
         const std::wstring &output_dir,
-
         const std::wstring &codepage,
-
         ExtractProgressCallback progress,
-
-        bool dry_run = false,
-
-        const std::vector<std::wstring> &canonical_names = {},
-
-        bool native_volume_input = false,
-
-        std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
-
-        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
-
-    )
+        bool dry_run,
+        const std::vector<std::wstring> &canonical_names,
+        bool native_volume_input,
+        std::shared_ptr<AsyncFileWriter> shared_writer,
+        std::shared_ptr<std::atomic<bool>> cancel_token)
     {
-
+#ifdef _WIN32
         ExtractArchiveResult result;
 
         result.backend_available = true;
@@ -419,58 +405,13 @@ namespace sunpack::sevenzip
             }
 
             bool stream_opened = false;
-
+            auto stream = [&] {
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-            CMyComPtr<IInStream> stream;
-            {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::StreamOpen);
-                stream = [&]() -> CMyComPtr<IInStream>
-                {
-                    if (!input_ranges.empty())
-                    {
-
-                        auto *range_stream = new MultiRangeInStream(input_ranges, &result.input_trace, prefetch_config);
-
-                        stream_opened = range_stream->is_open();
-
-                        // CMyComPtr's raw-pointer constructor performs the AddRef
-                        // that gives the object its first reference.
-                        return CMyComPtr<IInStream>(range_stream);
-                    }
-
-                    return open_archive_stream(
-                        archive_path,
-                        part_paths,
-                        stream_opened,
-                        &result.input_trace,
-                        !canonical_names.empty(),
-                        prefetch_config);
-                }();
-            }
-#else
-            CMyComPtr<IInStream> stream = [&]() -> CMyComPtr<IInStream>
-            {
-                if (!input_ranges.empty())
-                {
-
-                    auto *range_stream = new MultiRangeInStream(input_ranges, &result.input_trace, prefetch_config);
-
-                    stream_opened = range_stream->is_open();
-
-                    // CMyComPtr's raw-pointer constructor performs the AddRef
-                    // that gives the object its first reference.
-                    return CMyComPtr<IInStream>(range_stream);
-                }
-
-                return open_archive_stream(
-                    archive_path,
-                    part_paths,
-                    stream_opened,
-                    &result.input_trace,
-                    !canonical_names.empty(),
-                    prefetch_config);
-            }();
 #endif
+                return open_archive_stream(archive_path, part_paths, stream_opened, &result.input_trace,
+                    !canonical_names.empty(), prefetch_config, input_ranges);
+            }();
 
             if (!stream_opened)
             {
@@ -496,22 +437,16 @@ namespace sunpack::sevenzip
                 return result;
             }
 
+            auto *raw_open_callback = [&] {
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-            CMyComPtr<IArchiveOpenCallback> open_callback;
-            OpenCallback *raw_open_callback = nullptr;
-            {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
-                const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
-                raw_open_callback = new OpenCallback(
-                    password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
-                open_callback = CMyComPtr<IArchiveOpenCallback>(raw_open_callback);
-            }
-#else
-            const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
-            auto *raw_open_callback = new OpenCallback(
-                password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
-            CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 #endif
+                auto callback_path = canonical_names.empty()
+                    ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
+                return new OpenCallback(
+                    password, std::move(callback_path), part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
+            }();
+            CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             {
@@ -927,9 +862,15 @@ namespace sunpack::sevenzip
         }
 
         return result;
-    }
-
+#else
+        ExtractArchiveResult result;
+        result.status = PasswordTestStatus::BackendUnavailable;
+        result.failure_stage = "backend_load";
+        result.failure_kind = "backend_unavailable";
+        result.message = "native archive extraction is only implemented on Windows";
+        return result;
 #endif
+    }
 
     bool is_backend_available()
     {
@@ -944,195 +885,6 @@ namespace sunpack::sevenzip
 #else
 
         return false;
-
-#endif
-    }
-
-    ExtractArchiveResult extract_archive_with_parts(
-
-
-        const std::wstring &archive_path,
-
-        const std::vector<std::wstring> &part_paths,
-
-        const std::wstring &format_hint,
-
-        const std::wstring &password,
-
-        const std::wstring &output_dir,
-
-        const std::wstring &codepage,
-
-        ExtractProgressCallback progress,
-
-        bool dry_run,
-
-        const std::vector<std::wstring> &canonical_names,
-
-        bool native_volume_input,
-
-        std::shared_ptr<AsyncFileWriter> shared_writer,
-
-        std::shared_ptr<std::atomic<bool>> cancel_token,
-        const std::vector<ExtractInputRange> &part_ranges
-
-    )
-    {
-
-#ifdef _WIN32
-
-        
-        std::vector<std::wstring> fallback_paths;
-        if (part_paths.empty()) fallback_paths.push_back(archive_path);
-
-        return extract_archive_internal(
-
-
-            archive_path,
-
-            password,
-
-            part_paths.empty() ? fallback_paths : part_paths,
-
-            part_ranges,
-
-            format_hint,
-
-            output_dir,
-
-            codepage,
-
-
-            std::move(progress),
-
-            dry_run,
-
-            canonical_names,
-            native_volume_input,
-            std::move(shared_writer),
-            std::move(cancel_token));
-
-#else
-
-
-        (void)archive_path;
-
-        (void)part_paths;
-
-        (void)format_hint;
-
-        (void)password;
-
-        (void)output_dir;
-
-        (void)codepage;
-
-
-        (void)progress;
-
-        (void)dry_run;
-
-        ExtractArchiveResult result;
-
-        result.status = PasswordTestStatus::BackendUnavailable;
-
-        result.failure_stage = "backend_load";
-
-        result.failure_kind = "backend_unavailable";
-
-        result.message = "native archive extraction is only implemented on Windows";
-
-        return result;
-
-#endif
-    }
-
-    ExtractArchiveResult extract_archive_with_ranges(
-
-
-        const std::wstring &archive_path,
-
-        const std::vector<ExtractInputRange> &ranges,
-
-        const std::wstring &format_hint,
-
-        const std::wstring &password,
-
-        const std::wstring &output_dir,
-
-        const std::wstring &codepage,
-
-        ExtractProgressCallback progress,
-
-        bool dry_run,
-
-        std::shared_ptr<AsyncFileWriter> shared_writer,
-
-        std::shared_ptr<std::atomic<bool>> cancel_token
-
-    )
-    {
-
-#ifdef _WIN32
-
-        
-        return extract_archive_internal(
-
-
-            archive_path,
-
-            password,
-
-            {},
-
-            ranges,
-
-            format_hint,
-
-            output_dir,
-
-            codepage,
-
-
-            std::move(progress),
-
-            dry_run,
-            {},
-            false,
-            std::move(shared_writer),
-            std::move(cancel_token));
-
-#else
-
-
-        (void)archive_path;
-
-        (void)ranges;
-
-        (void)format_hint;
-
-        (void)password;
-
-        (void)output_dir;
-
-        (void)codepage;
-
-
-        (void)progress;
-
-        (void)dry_run;
-
-        ExtractArchiveResult result;
-
-        result.status = PasswordTestStatus::BackendUnavailable;
-
-        result.failure_stage = "backend_load";
-
-        result.failure_kind = "backend_unavailable";
-
-        result.message = "native archive range extraction is only implemented on Windows";
-
-        return result;
 
 #endif
     }

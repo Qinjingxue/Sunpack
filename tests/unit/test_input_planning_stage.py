@@ -1,5 +1,4 @@
 import zipfile
-from dataclasses import replace
 from io import BytesIO
 
 from sunpack.core.analysis.embedded.result import embedded_scan_prepass
@@ -15,10 +14,8 @@ from tests.helpers.archive_tasks import make_archive_task, make_task_from_descri
 class _FakeAnalyzer:
     def __init__(self, report):
         self.report = report
-        self.calls = 0
 
     def analyze(self, source, request):
-        self.calls += 1
         return self.report
 
 
@@ -69,69 +66,6 @@ def _multi_report(path, evidences, *, prepass=None, size=200, read_bytes=64):
         extractable_segments=carved,
         password_segment=password,
     )
-
-
-def test_input_planning_stage_reuses_report_for_equivalent_inputs(tmp_path):
-    archive = tmp_path / "same.zip"
-    archive.write_bytes(b"zip")
-    evidence = ArchiveFormatEvidence(
-        format="zip",
-        status="extractable",
-        segments=[ArchiveSegment(start_offset=0, end_offset=3)],
-    )
-    first = _task(archive)
-    second = _task(archive, logical_name="case_copy")
-    stage = ArchiveInputPlanningStage()
-    stage.analyzer = _FakeAnalyzer(_report(archive, evidence))
-
-    tasks = [*stage.plan_task_to_tasks(first), *stage.plan_task_to_tasks(second)]
-
-    assert tasks == [first, second]
-    assert stage.analyzer.calls == 1
-    assert first.archive_input().format_hint == "zip"
-    assert second.archive_input().format_hint == "zip"
-    assert knowledge_view.get(second, "input_planning.cache_hits") == 2
-
-
-def test_planning_cache_isolates_physical_layouts_and_invalidates_changed_sources(tmp_path, monkeypatch):
-    # Equivalent-input reuse does not catch collisions between carrier ranges,
-    # volume extents or descriptors without parts. One case checks all layouts
-    # and a changed peer without archive payload scans or timing assertions.
-    first, second = (str(tmp_path / name) for name in ("first", "second"))
-    (tmp_path / "first").write_bytes(b"a" * 32)
-    (tmp_path / "second").write_bytes(b"b" * 32)
-    plain = ArchiveInputDescriptor(first, format_hint="zip")
-    bounded = replace(plain, open_mode="file_range", parts=[ArchiveInputPart(InputExtent(first, 1, 10))])
-    concat = replace(plain, open_mode="concat_ranges", extents=[InputExtent(first, 1, 10), InputExtent(second, 2, 11)])
-    volumes = ArchiveInputDescriptor(first, open_mode="native_volumes", format_hint="rar", volume_style="rar_part", parts=[
-        ArchiveInputPart(InputExtent(first, 1, 10), volume_number=1, canonical_name="case.part1.rar"),
-        ArchiveInputPart(InputExtent(second, 2, 11), volume_number=2, canonical_name="case.part2.rar"),
-    ])
-    descriptors = [
-        plain, replace(plain, entry_path=second), bounded,
-        replace(bounded, parts=[ArchiveInputPart(InputExtent(first, 2, 10))]),
-        concat, replace(concat, extents=list(reversed(concat.extents))),
-        replace(concat, extents=[InputExtent(first, 1, 11), concat.extents[1]]),
-        volumes, replace(volumes, parts=[replace(volumes.parts[0], extent=InputExtent(first, 1, 11)), volumes.parts[1]]),
-    ]
-    stage = ArchiveInputPlanningStage({})
-    analyzed = []
-
-    def analyze(task):
-        analyzed.append(task.archive_input())
-        return _multi_report(first, [], size=32, read_bytes=len(analyzed))
-
-    monkeypatch.setattr(stage, "_analyze_task", analyze)
-    tasks = [make_task_from_descriptor(descriptor) for descriptor in descriptors]
-    copies = [make_task_from_descriptor(replace(descriptor, logical_name="display only")) for descriptor in descriptors]
-    for task in (*tasks, *copies):
-        stage.plan_task_to_tasks(task)
-    assert [knowledge_view.get(task, "input_planning.read_bytes") for task in tasks] == list(range(1, len(descriptors) + 1))
-    assert [knowledge_view.get(task, "input_planning.read_bytes") for task in copies] == list(range(1, len(descriptors) + 1))
-    assert len(analyzed) == len(descriptors)
-    (tmp_path / "second").write_bytes(b"changed peer")
-    stage.plan_task(copies[7])
-    assert len(analyzed) == len(descriptors) + 1
 
 
 def test_input_planning_preserves_structured_password_probe_for_split_segment_at_zero(tmp_path):

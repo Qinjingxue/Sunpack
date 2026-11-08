@@ -242,7 +242,6 @@ class RequestRuntimeProfiler:
         output_scan = runtime.output_scan_policy
 
         _wrap(runtime, "execute_async", timings, "pipeline_runtime_execute")
-        _wrap(runtime, "_plan_task_isolated", timings, "pipeline_plan_task_isolated")
         _wrap(_child(runtime, "recursive_authorization"), "authorize_batch", timings, "pipeline_nested_authorize")
         cleanup_scope = _child(runtime, "cleanup_scope")
         self._install_instance_method(cleanup_scope, "release_task", "source_cleanup_release")
@@ -251,13 +250,10 @@ class RequestRuntimeProfiler:
         _wrap(scanner, "direct_file_tasks", timings, "pipeline_direct_scan")
         _wrap(scanner, "scan_targets", timings, "pipeline_nested_scan")
 
-        _wrap(planning, "plan_task_to_tasks", timings, "input_planning")
+        _wrap(planning, "plan_task", timings, "input_planning")
         for name, label in (
-            ("_plan_task_to_tasks", "planning_plan_task"),
-            ("_report_cache_key", "planning_cache_key"),
-            ("_get_or_create_report", "planning_get_report"),
             ("_analyze_task", "planning_analyze_task"),
-            ("_tasks_from_report", "planning_tasks_from_report"),
+            ("_apply_report", "planning_apply_report"),
             ("_record_planning_input", "planning_record_input"),
         ):
             _wrap(planning, name, timings, label)
@@ -315,9 +311,6 @@ class RequestRuntimeProfiler:
         _wrap(_child(extractor, "password_resolver"), "resolve", timings, "password_resolver")
         password_tester = _child(extractor, "password_tester")
         _wrap(_child(password_tester, "password_scheduler"), "plan_for_extraction", timings, "password_bounded_verify")
-        metadata_scanner = _child(extractor, "metadata_scanner")
-        _wrap(metadata_scanner, "scan", timings, "filename_metadata")
-        _wrap(metadata_scanner, "scan_for_task", timings, "filename_metadata_for_task")
         sevenzip = _child(extractor, "sevenzip_runner")
         _wrap(sevenzip, "extract_attempt", timings, "sevenzip_worker_legacy", phase_timer=phase)
         _wrap(sevenzip, "submit_attempt_asyncio", timings, "sevenzip_worker", phase_timer=phase)
@@ -375,8 +368,8 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "output_snapshot_filter",
     ))
     planning_children = sum(total(label) for label in (
-        "planning_group_tasks",
-        "planning_plan_group",
+        "planning_analyze_task",
+        "planning_apply_report",
     ))
     worker_protocol_children = sum(total(label) for label in (
         "worker_protocol_json_decode",
@@ -385,14 +378,9 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "worker_protocol_progress_sample",
         "worker_protocol_emit_progress",
     ))
-    planning_probe_children = sum(
-        sum(values)
-        for label, values in timings.items()
-        if label.startswith("planning_")
-    )
     runtime_outside_job_children = sum(total(label) for label in (
         "pipeline_direct_scan",
-        "pipeline_plan_task_isolated",
+        "input_planning",
         "pipeline_nested_authorize",
         "output_scan",
         "pipeline_final_report",
@@ -414,10 +402,6 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "planning_parent_residual": round(total("input_planning") - planning_children, 6),
         "planning_analysis_residual": round(
             total("planning_analyzer_analyze") - total("planning_engine_analyze_path"),
-            6,
-        ),
-        "pipeline_plan_task_unattributed": round(
-            total("pipeline_plan_task_isolated") - planning_probe_children,
             6,
         ),
         "pipeline_runtime_outside_job": round(

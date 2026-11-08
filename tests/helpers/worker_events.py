@@ -54,7 +54,6 @@ def worker_trace_item(**overrides):
         "operation_result": 0,
         "operation_result_name": "",
         "hresult": 0,
-        "hresult_hex": "",
         "win32_error": 0,
         "done": True,
         "failed": False,

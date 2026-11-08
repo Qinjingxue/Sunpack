@@ -43,9 +43,8 @@ def test_plan5_planner_plans_header_encrypted_rar4_embedded_segment(tmp_path, pl
     tasks = provider.scan_targets([str(carrier_dir)])
     assert len(tasks) == 1, f"expected one scan task, got {tasks}"
 
-    planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
-    assert len(planned) == 1
-    segments = [node.projection() for node in planned[0].inputs]
+    ArchiveInputPlanningStage(config).plan_task(tasks[0])
+    segments = [node.projection() for node in tasks[0].inputs]
     assert segments, "no embedded segments were planned"
 
     rar_segments = [segment for segment in segments if segment["format"] == "rar"]

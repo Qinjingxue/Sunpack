@@ -350,7 +350,7 @@ void check_archive_open_start_and_carrier_fallback()
             output.write(reinterpret_cast<const char *>(rar.data()), rar.size());
             output.write(tail.data(), tail.size());
         }
-        const auto result = extract_archive_with_parts(path.wstring(), {path.wstring()}, L"rar", L"", root.wstring(), L"", {}, true);
+        const auto result = extract_archive(path.wstring(), {path.wstring()}, {}, L"rar", L"", root.wstring(), L"", {}, true);
         check(result.status == PasswordTestStatus::Ok, "RAR4 opens with a generic family hint, including carrier prefix fallback");
         if (!prefix) {
             check(result.handler_attempts.size() == 2 && result.handler_attempts.back().opened,
@@ -361,7 +361,7 @@ void check_archive_open_start_and_carrier_fallback()
             check(result.handler_attempts.size() == 4 && result.handler_attempts.back().opened,
                   "carrier prefix uses the existing signature search after the start-only pass");
             const std::vector<ExtractInputRange> ranges = {{path.wstring(), prefix, prefix + rar.size(), true}};
-            const auto carved = extract_archive_with_ranges(path.wstring(), ranges, L"rar", L"", root.wstring(), L"", {}, true);
+            const auto carved = extract_archive(path.wstring(), {}, ranges, L"rar", L"", root.wstring(), L"", {}, true);
             check(carved.status == PasswordTestStatus::Ok && carved.handler_attempts.size() == 2,
                   "canonical carrier range opens without searching the underlying prefix");
         }

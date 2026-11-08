@@ -999,7 +999,7 @@ impl ByteSource for BytesSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileIdentity {
     pub(crate) path: PathBuf,
     len: u64,
@@ -1095,6 +1095,40 @@ enum BlockLoadClaim {
 }
 
 impl FileSource {
+    fn read_cached_chunks(
+        &self,
+        offset: u64,
+        len: usize,
+        mut consume: impl FnMut(Arc<[u8]>, std::ops::Range<usize>),
+    ) -> io::Result<()> {
+        let request_end = offset + len as u64;
+        let first = offset / BLOCK_SIZE as u64;
+        let last = (request_end - 1) / BLOCK_SIZE as u64;
+        let manager = manager();
+        let mut produced = 0;
+        for index in first..=last {
+            let block = manager.read_block(self, index)?;
+            let block_start = index * BLOCK_SIZE as u64;
+            let start = offset.saturating_sub(block_start) as usize;
+            let end = ((request_end - block_start) as usize).min(block.len());
+            let short = block.len() < BLOCK_SIZE;
+            if start < end {
+                produced += end - start;
+                consume(block, start..end);
+            }
+            // A short block is the physical EOF observed now (the file shrank
+            // after open). Later blocks must not be appended after it.
+            if short {
+                break;
+            }
+        }
+        manager
+            .metrics
+            .logical_bytes
+            .fetch_add(produced as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn cache_identity(&self) -> FileIdentity {
         let mut identity = self.identity.clone();
         identity.reader_generation = self.cache_id;
@@ -1166,28 +1200,10 @@ impl ByteSource for FileSource {
             return Ok(data);
         }
 
-        let first = offset / BLOCK_SIZE as u64;
-        let last = (offset + len as u64 - 1) / BLOCK_SIZE as u64;
         let mut output = crate::io::resource_error::bytes_with_capacity(len)?;
-        for index in first..=last {
-            let block = manager().read_block(self, index)?;
-            let block_start = index * BLOCK_SIZE as u64;
-            let from = offset.saturating_sub(block_start) as usize;
-            let request_end = offset + len as u64;
-            let to = (request_end.min(block_start + block.len() as u64) - block_start) as usize;
-            if from < to && from < block.len() {
-                output.extend_from_slice(&block[from..to.min(block.len())]);
-            }
-            // A short block is the physical EOF observed now (the file shrank
-            // after open). Later blocks must not be appended after it.
-            if block.len() < BLOCK_SIZE {
-                break;
-            }
-        }
-        manager()
-            .metrics
-            .logical_bytes
-            .fetch_add(output.len() as u64, Ordering::Relaxed);
+        self.read_cached_chunks(offset, len, |block, range| {
+            output.extend_from_slice(&block[range]);
+        })?;
         Ok(output)
     }
 
@@ -1214,28 +1230,12 @@ impl ByteSource for FileSource {
             return Ok(count);
         }
 
-        let first = offset / BLOCK_SIZE as u64;
-        let last = (offset + len as u64 - 1) / BLOCK_SIZE as u64;
         let mut written = 0usize;
-        for index in first..=last {
-            let block = manager().read_block(self, index)?;
-            let block_start = index * BLOCK_SIZE as u64;
-            let from = offset.saturating_sub(block_start) as usize;
-            let request_end = offset + len as u64;
-            let to = (request_end.min(block_start + block.len() as u64) - block_start) as usize;
-            if from < to && from < block.len() {
-                let chunk = &block[from..to.min(block.len())];
-                buffer[written..written + chunk.len()].copy_from_slice(chunk);
-                written += chunk.len();
-            }
-            if block.len() < BLOCK_SIZE {
-                break;
-            }
-        }
-        manager()
-            .metrics
-            .logical_bytes
-            .fetch_add(written as u64, Ordering::Relaxed);
+        self.read_cached_chunks(offset, len, |block, range| {
+            let chunk = &block[range];
+            buffer[written..written + chunk.len()].copy_from_slice(chunk);
+            written += chunk.len();
+        })?;
         Ok(written)
     }
 
@@ -1250,29 +1250,11 @@ impl ByteSource for FileSource {
                 self.read_direct_at(offset, len)?,
             )]);
         }
-        let first = offset / BLOCK_SIZE as u64;
-        let last = (offset + len as u64 - 1) / BLOCK_SIZE as u64;
-        let request_end = offset + len as u64;
-        let mut slices = Vec::with_capacity((last - first + 1) as usize);
-        let mut produced = 0usize;
-        for index in first..=last {
-            let block = manager().read_block(self, index)?;
-            let block_start = index * BLOCK_SIZE as u64;
-            let start = offset.saturating_sub(block_start) as usize;
-            let end = (request_end.min(block_start + block.len() as u64) - block_start) as usize;
-            let short = block.len() < BLOCK_SIZE;
-            if start < end && start < block.len() {
-                produced += end - start;
-                slices.push(CachedSlice::from_shared(block, start, end));
-            }
-            if short {
-                break;
-            }
-        }
-        manager()
-            .metrics
-            .logical_bytes
-            .fetch_add(produced as u64, Ordering::Relaxed);
+        let blocks = (offset as usize % BLOCK_SIZE + len).div_ceil(BLOCK_SIZE);
+        let mut slices = Vec::with_capacity(blocks);
+        self.read_cached_chunks(offset, len, |block, range| {
+            slices.push(CachedSlice::from_shared(block, range.start, range.end));
+        })?;
         Ok(slices)
     }
 
@@ -1531,9 +1513,8 @@ struct HandleEntry {
 }
 
 struct HandlePool {
-    entries: HashMap<FileIdentity, HandleEntry>,
-    by_path: HashMap<PathBuf, FileIdentity>,
-    order: VecDeque<(FileIdentity, u64)>,
+    entries: HashMap<PathBuf, HandleEntry>,
+    order: VecDeque<(PathBuf, u64)>,
     generation: u64,
     capacity: usize,
 }
@@ -1682,10 +1663,7 @@ impl ReaderManager {
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
         let removed_handles = handles.entries.len();
         let entries = std::mem::take(&mut handles.entries);
-        let retired = (
-            std::mem::take(&mut handles.by_path),
-            std::mem::take(&mut handles.order),
-        );
+        let retired = std::mem::take(&mut handles.order);
         drop(handles);
         drop(retired);
         for entry in entries.into_values() {
@@ -1729,10 +1707,6 @@ impl ReaderManager {
         Ok((removed_handles, removed_entries, removed_bytes))
     }
 
-    fn release_handles_under(&self, root: &Path) -> io::Result<usize> {
-        self.release_handles_under_roots(&[root.to_path_buf()])
-    }
-
     fn release_handles_under_roots(&self, roots: &[PathBuf]) -> io::Result<usize> {
         if roots.is_empty() {
             return Ok(0);
@@ -1742,32 +1716,20 @@ impl ReaderManager {
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        let identities = handles
+        let sources = handles
             .entries
-            .keys()
-            .filter(|identity| path_is_under_roots(&identity.path, roots))
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut sources = Vec::with_capacity(identities.len());
-        for identity in &identities {
-            if let Some(entry) = handles.entries.remove(identity) {
-                sources.push(entry.source);
-            }
-            if handles.by_path.get(&identity.path) == Some(identity) {
-                handles.by_path.remove(&identity.path);
-            }
-        }
-        handles
-            .order
-            .retain(|(identity, _generation)| !identities.contains(identity));
+            .extract_if(|path, _| path_is_under_roots(path, roots))
+            .map(|(_, entry)| entry.source)
+            .collect::<Vec<_>>();
+        handles.discard_stale_order();
         crate::collections::trim_map(&mut handles.entries);
-        crate::collections::trim_map(&mut handles.by_path);
         crate::collections::trim_deque(&mut handles.order);
         drop(handles);
+        let removed = sources.len();
         for source in sources {
             source.close()?;
         }
-        Ok(identities.len())
+        Ok(removed)
     }
 
     fn open_file(&self, path: &Path) -> io::Result<Arc<FileSource>> {
@@ -1785,13 +1747,13 @@ impl ReaderManager {
             return Ok(existing);
         }
         let source = Arc::new(FileSource {
-            identity: identity.clone(),
+            identity,
             cache_id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
             file: RwLock::new(Some(file)),
             closed: AtomicBool::new(false),
             block_loads: Mutex::new(HashMap::new()),
         });
-        handles.insert(identity, Arc::clone(&source));
+        handles.insert(Arc::clone(&source));
         self.metrics.opens.fetch_add(1, Ordering::Relaxed);
         Ok(source)
     }
@@ -1946,40 +1908,37 @@ impl ReaderManager {
 
 impl HandlePool {
     fn touch(&mut self, identity: &FileIdentity) -> Option<Arc<FileSource>> {
-        let source = Arc::clone(&self.entries.get(identity)?.source);
+        let entry = self.entries.get_mut(&identity.path)?;
+        if entry.source.identity != *identity {
+            return None;
+        }
         self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        self.entries.get_mut(identity)?.generation = generation;
-        self.order.push_back((identity.clone(), generation));
+        entry.generation = self.generation;
+        let source = Arc::clone(&entry.source);
+        self.order
+            .push_back((identity.path.clone(), self.generation));
         self.compact_order();
         Some(source)
     }
 
-    fn insert(&mut self, identity: FileIdentity, source: Arc<FileSource>) {
+    fn insert(&mut self, source: Arc<FileSource>) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        if let Some(previous) = self.by_path.insert(identity.path.clone(), identity.clone()) {
-            // Only the current source belongs in the pool. Active requests keep
-            // their own Arc; obsolete handles need not wait for LRU eviction.
-            self.entries.remove(&previous);
-        }
+        let path = source.identity.path.clone();
+        // Replace the pooled source for this path. Active readers retain
+        // their own Arc and continue reading the old generation independently.
         self.entries
-            .insert(identity.clone(), HandleEntry { source, generation });
-        self.order.push_back((identity, generation));
+            .insert(path.clone(), HandleEntry { source, generation });
+        self.order.push_back((path, generation));
         while self.entries.len() > self.capacity {
-            let Some((old_identity, old_generation)) = self.order.pop_front() else {
+            let Some((old_path, old_generation)) = self.order.pop_front() else {
                 break;
             };
-            let current = self
-                .entries
-                .get(&old_identity)
-                .map(|entry| entry.generation);
-            if current != Some(old_generation) {
-                continue;
-            }
-            self.entries.remove(&old_identity);
-            if self.by_path.get(&old_identity.path) == Some(&old_identity) {
-                self.by_path.remove(&old_identity.path);
+            if let std::collections::hash_map::Entry::Occupied(entry) = self.entries.entry(old_path)
+            {
+                if entry.get().generation == old_generation {
+                    entry.remove();
+                }
             }
         }
         self.compact_order();
@@ -1989,13 +1948,17 @@ impl HandlePool {
         // Cache hits create stale history too, even when no eviction occurs.
         // Amortize compaction while keeping one current row per live handle.
         if self.order.len() > self.capacity.max(self.entries.len()).saturating_mul(2) {
-            let entries = &self.entries;
-            self.order.retain(|(identity, generation)| {
-                entries
-                    .get(identity)
-                    .is_some_and(|entry| entry.generation == *generation)
-            });
+            self.discard_stale_order();
         }
+    }
+
+    fn discard_stale_order(&mut self) {
+        let entries = &self.entries;
+        self.order.retain(|(path, generation)| {
+            entries
+                .get(path)
+                .is_some_and(|entry| entry.generation == *generation)
+        });
     }
 }
 
@@ -2039,8 +2002,7 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        capacity +=
-            handles.entries.capacity() + handles.by_path.capacity() + handles.order.capacity();
+        capacity += handles.entries.capacity() + handles.order.capacity();
         handles.entries.len()
     };
     let dict = PyDict::new(py);
@@ -2113,7 +2075,7 @@ pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
 #[pyfunction]
 pub(crate) fn release_reader_handles_under(path: &str) -> PyResult<usize> {
     let root = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-    Ok(manager().release_handles_under(&root)?)
+    Ok(manager().release_handles_under_roots(std::slice::from_ref(&root))?)
 }
 
 #[pyfunction]
@@ -2140,10 +2102,9 @@ pub(crate) fn invalidate_reader_path(path: &Path) {
     let Some(manager) = MANAGER.get() else { return };
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut handles = manager.handles.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(identity) = handles.by_path.remove(&path) {
+    if handles.entries.remove(&path).is_some() {
         // Do not close a source used by an older request. Its late block loads
         // carry its source id and cannot repopulate the new source's cache.
-        handles.entries.remove(&identity);
         handles.compact_order();
     }
 }
@@ -2159,7 +2120,6 @@ fn manager() -> &'static ReaderManager {
         ReaderManager {
             handles: Mutex::new(HandlePool {
                 entries: HashMap::new(),
-                by_path: HashMap::new(),
                 order: VecDeque::new(),
                 generation: 0,
                 capacity: DEFAULT_HANDLE_CAPACITY,
@@ -2184,7 +2144,7 @@ pub(crate) fn file_identity(path: PathBuf, file: &File) -> io::Result<FileIdenti
 }
 
 #[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct WindowsFileGeneration {
     volume: u64,
     file_id: [u8; 16],
@@ -2975,6 +2935,8 @@ mod tests {
         assert_eq!(handles, 2);
         assert_eq!(entries, 2);
         assert_eq!(bytes, 16);
+        assert!(first.closed.load(Ordering::Acquire));
+        assert!(second.closed.load(Ordering::Acquire));
         assert!(!manager().contains_block(&first_key).unwrap());
         assert!(!manager().contains_block(&second_key).unwrap());
         assert!(manager().contains_block(&other_key).unwrap());
@@ -3130,13 +3092,12 @@ mod tests {
         let third = manager().open_file(&other).unwrap();
         let mut pool = HandlePool {
             entries: HashMap::new(),
-            by_path: HashMap::new(),
             order: VecDeque::new(),
             generation: 0,
             capacity: 2,
         };
-        pool.insert(second.identity.clone(), Arc::clone(&second));
-        pool.insert(third.identity.clone(), Arc::clone(&third));
+        pool.insert(Arc::clone(&second));
+        pool.insert(Arc::clone(&third));
         for _ in 0..2000 {
             assert_eq!(
                 Arc::as_ptr(&pool.touch(&second.identity).unwrap()),
@@ -3145,33 +3106,11 @@ mod tests {
         }
         assert!(pool.order.len() <= pool.capacity * 2);
         pool.capacity = 1;
-        pool.insert(second.identity.clone(), Arc::clone(&second));
-        assert!(pool.entries.contains_key(&second.identity));
-        assert!(!pool.entries.contains_key(&third.identity));
+        pool.insert(Arc::clone(&second));
+        assert!(pool.entries.contains_key(&second.identity.path));
+        assert!(!pool.entries.contains_key(&third.identity.path));
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(other);
-    }
-
-    #[test]
-    fn batched_handle_release_includes_entries_missing_from_current_path_index() {
-        let path = temp_file("managed_reader_stale_handle_path", b"abcdefgh");
-        let source = manager().open_file(&path).unwrap();
-        let canonical = source.identity.path.clone();
-
-        {
-            let mut handles = manager().handles.lock().unwrap();
-            assert_eq!(
-                handles.by_path.remove(&canonical),
-                Some(source.identity.clone())
-            );
-            assert!(handles.entries.contains_key(&source.identity));
-        }
-
-        let released = manager().release_handles_under_roots(&[canonical]).unwrap();
-
-        assert_eq!(released, 1);
-        assert!(source.closed.load(Ordering::Acquire));
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

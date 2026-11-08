@@ -737,9 +737,8 @@ def test_split_arrivals_publish_only_confirmed_cards(tmp_path, monkeypatch):
 
     async def scenario():
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, [str(root)], pipeline_engine=engine,
-                state_path=str(tmp_path / "state.snapshot"), root_entries=[
-                    WatchRootEntry(str(root), str(tmp_path / "output"))])
+            watcher = WatchScheduler(config, [WatchRootEntry(str(root), str(tmp_path / "output"))], pipeline_engine=engine,
+                state_path=str(tmp_path / "state.snapshot"))
             try:
                 watcher.log.recover()
                 previous = []
@@ -804,9 +803,8 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
 
     async def scenario():
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, [str(root)], pipeline_engine=engine,
-                state_path=str(tmp_path / "state.snapshot"), root_entries=[
-                    WatchRootEntry(str(root), str(tmp_path / "output"), deep_detect=True)])
+            watcher = WatchScheduler(config, [WatchRootEntry(str(root), str(tmp_path / "output"), deep_detect=True)], pipeline_engine=engine,
+                state_path=str(tmp_path / "state.snapshot"))
             try:
                 watcher.log.recover()
                 first_id = None

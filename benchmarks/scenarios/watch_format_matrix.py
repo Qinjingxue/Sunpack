@@ -53,6 +53,7 @@ from benchmarks.scenarios.extraction_format_matrix import (
 from benchmarks.scenarios.extraction_large_archive import RequestRuntimeProfiler, _timing_totals
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 
 
@@ -87,7 +88,6 @@ HEADLINE_STAGES = (
     "pipeline_nested_scan",
     "pipeline_direct_scan",
     "input_planning",
-    "pipeline_plan_task_isolated",
     "batch_execute",
     "extract_total",
     "sevenzip_worker",
@@ -437,7 +437,7 @@ async def _run_case(
         timings["engine_ready"] = _now()
         watcher = WatchScheduler(
             config,
-            [str(root)],
+            [WatchRootEntry(str(root))],
             # A relative dot is resolved against the watched root, so outputs
             # land in the watch directory itself, exactly like production watch.
             state_path=str(state_path),

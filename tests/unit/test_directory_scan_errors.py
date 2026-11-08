@@ -63,7 +63,6 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
     notifications = []
     log_events = []
     scheduler = object.__new__(WatchScheduler)
-    scheduler.watch_roots = [str(root)]
     scheduler.scopes = {path_key(root): DiscoveryScope(str(root), recursive=True)}
     scheduler.root_entries = {path_key(root): WatchRootEntry(str(root), recursive=True)}
     scheduler._scan_options = DirectoryScanner.compile_scan_options(config)
@@ -104,8 +103,8 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
         nested = NestedOutputScanPolicy(config).prepare_scan([str(blocked)])
         assert not nested.roots and nested.session is not None
         assert len(nested.session.take_scan_errors()) == 1
-        candidates, _errors = scheduler._scan_candidates([str(root)], recursive=True)
-        assert len(candidates) == 1 and candidates[0].path == str(root / "good.blob")
+        candidates, _errors = scheduler._scan_candidate_paths(str(root), scheduler.scopes[path_key(root)])
+        assert candidates == [str(root / "good.blob")]
         assert not notifications
         assert log_events[-1][0] == "filesystem_scan_failed"
         assert str(blocked) in log_events[-1][1]["errors"][0]

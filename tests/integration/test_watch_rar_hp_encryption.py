@@ -12,6 +12,7 @@ import pytest
 
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import BLOCKER_PASSWORD, WatchRunResult, WatchScheduler
 from tests.helpers.marker_utils import marker_present
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
@@ -114,7 +115,7 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path,
     async def scenario():
         async with PipelineEngine(config) as delegate:
             watcher = WatchScheduler(
-                config, [str(watch_root)], output_roots={str(watch_root): str(output_root)},
+                config, [WatchRootEntry(str(watch_root), str(output_root))],
                 state_path=str(tmp_path / "state.snapshot"),
                 pipeline_engine=delegate,
             )

@@ -97,29 +97,11 @@ Return value:
 
 An empty `candidates` list means no reliable embedded identity was found.
 
-`analyze_zip_filename_encoding(archive_input, max_samples, max_filename_bytes)`
-consumes the canonical serialized archive-input descriptor, reads the logical ZIP
-central directory across file ranges or multipart inputs, and performs filename
-codepage scoring entirely in Rust. Heavy work runs without the Python GIL.
-Python receives only the selected codepage and compact score evidence; item
-names never cross the Rust/Python boundary. Extraction applies the selected
-codepage directly to the embedded 7-Zip ZIP handler. ZIP64 central-directory
-parsing is intentionally not handled here.
-
-Return value:
-
-```python
-{
-    "status": "ok",
-    "sample_count": 12,
-    "selected_codepage": "932",
-    "selected_label": "Shift-JIS/CP932",
-    "confidence": 0.833,
-    "evidence": {"best_score": 42, "second_score": 18, "lead": 24},
-    "truncated": False,
-}
-```
-
+`analyze_zip_filename_encoding(archive_input)` consumes the canonical serialized
+archive-input descriptor. It reads the logical ZIP central directory across file
+ranges or multipart inputs and scores filename codepages in Rust without the
+Python GIL. It returns a codepage string such as `"932"` or `None` when extraction
+can use the ZIP handler's default filename decoding.
 
 The module also exposes lightweight structure inspectors used by the detection
 pipeline:

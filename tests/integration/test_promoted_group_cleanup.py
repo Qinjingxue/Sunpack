@@ -5,6 +5,7 @@ import pytest
 
 import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.runtime.watch.state import WatchStateStore
 from tests.helpers.config_factory import make_config
@@ -51,7 +52,7 @@ def test_watch_promoted_sibling_controls_verified_group_cleanup(tmp_path, monkey
     async def scenario():
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
-                config, [str(case.archive_dir)], output_roots={str(case.archive_dir): str(output)},
+                config, [WatchRootEntry(str(case.archive_dir), str(output))],
                 state_path=state_path, pipeline_engine=engine,
             )
             try:

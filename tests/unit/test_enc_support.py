@@ -123,7 +123,8 @@ def test_discovery_is_extension_independent_and_planning_does_not_reanalyse():
     assert not ArchiveAnalyzer.confirm_format_identity(str(DATA / "expected.zip"), "enc")
     task = make_archive_task(DATA / "algorithm_0.mov", format_hint="enc", discovery_source="detection")
     assert archive_structure_password_state(task) == "required"
-    assert ArchiveInputPlanningStage(config).plan_task(task) is None
+    ArchiveInputPlanningStage(config).plan_task(task)
+    assert task.knowledge().get("input_planning") is None
     assert task.archive_input().open_mode == "file" and not task.archive_input().parts
 
 

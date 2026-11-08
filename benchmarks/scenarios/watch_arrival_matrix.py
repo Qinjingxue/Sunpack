@@ -21,6 +21,7 @@ from benchmarks.watch_broker import watch_broker_lease
 from benchmarks.scenarios.extraction_large_archive import RequestRuntimeProfiler, _timing_totals
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 
 
@@ -276,7 +277,7 @@ async def _run_case(
         await engine.__aenter__()
         watcher = WatchScheduler(
             config,
-            [str(root)],
+            [WatchRootEntry(str(root))],
             state_path=str(state_path),
             pipeline_engine=engine,
         )

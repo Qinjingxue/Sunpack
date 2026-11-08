@@ -47,7 +47,9 @@ def test_watch_sibling_trigger_survives_encrypted_head_rename(tmp_path, monkeypa
         try:
             # The copies bypass arrival events. Index them without submitting
             # the head so the sibling remains the sole trigger for this race.
-            harness.watcher._scan_candidates([str(harness.watch_root)], recursive=False)
+            watcher = harness.watcher
+            scope = next(iter(watcher.scopes.values()))
+            assert not watcher._scan_options_for(scope).catalog_update(watcher._catalog, scope.native)
             harness.watcher.enqueue(str(seed))
             await WatchScheduler.run_once(harness.watcher)
             await asyncio.wait_for(entered.wait(), 15)

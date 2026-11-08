@@ -82,7 +82,7 @@ def _watch_scheduler_shell(scheduler_module):
     scheduler._outputs = SimpleNamespace(protected=lambda path: False, reconcile=lambda *a, **k: None)
     scheduler._reservations = None
     scheduler._source_probes = {}
-    scheduler.watch_roots = []
+    scheduler.root_entries = {}
     scheduler.scopes = {}
     scheduler._scan_options_for = lambda scope: SimpleNamespace(catalog_update=lambda *a, **k: [])
     from sunpack_native import NativeWatchCatalog, NativeWatchState
@@ -264,9 +264,10 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler._wake_callback = None
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
-    scheduler.watch_roots = [str(tmp_path)]
     from sunpack.core.support.path_keys import path_key
-    scheduler.scopes[path_key(str(tmp_path))] = SimpleNamespace(native=None, contains=lambda path: True)
+    key = path_key(str(tmp_path))
+    scheduler.root_entries[key] = scheduler_module.WatchRootEntry(str(tmp_path))
+    scheduler.scopes[key] = SimpleNamespace(native=None, contains=lambda path: True)
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
@@ -458,9 +459,10 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler._wake_callback = None
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
-    scheduler.watch_roots = [str(tmp_path)]
     from sunpack.core.support.path_keys import path_key
-    scheduler.scopes[path_key(str(tmp_path))] = SimpleNamespace(native=None, contains=lambda path: True)
+    key = path_key(str(tmp_path))
+    scheduler.root_entries[key] = scheduler_module.WatchRootEntry(str(tmp_path))
+    scheduler.scopes[key] = SimpleNamespace(native=None, contains=lambda path: True)
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate

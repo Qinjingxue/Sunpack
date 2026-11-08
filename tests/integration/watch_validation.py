@@ -33,6 +33,7 @@ if str(_REPO_ROOT) not in sys.path:
 import psutil
 
 import sunpack.runtime.watch.scheduler as scheduler_module
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.core.platform.windows.elevation import is_process_elevated
 
@@ -336,8 +337,7 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
     scheduler_module._candidate_for_event_path = measured_observer
     watcher = WatchScheduler(
         _watch_config(),
-        [str(scenario_root)],
-        output_roots={str(scenario_root): str(base / scenario.name / "out")},
+        [WatchRootEntry(str(scenario_root), str(base / scenario.name / "out"))],
         state_path=str(state_path),
         pipeline_engine=object(),
     )

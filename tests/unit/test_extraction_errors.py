@@ -42,7 +42,6 @@ def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encry
     extractor = SingleArchiveExtractor(
         password_store=None,
         password_resolver=SimpleNamespace(reject_extraction_candidates=rejected.append),
-        metadata_scanner=SimpleNamespace(scan_for_task=lambda *a, **k: SimpleNamespace(selected_codepage=None, error="")),
         sevenzip_runner=SimpleNamespace(
             emit_semantic_event=lambda *a, **k: None,
             extract_attempt=lambda **k: _worker_completed({

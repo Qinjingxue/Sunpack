@@ -5,14 +5,16 @@ import subprocess
 from contextlib import nullcontext
 from typing import Any, Callable
 
+from sunpack_native import analyze_zip_filename_encoding
+
 from sunpack.core.support.output_paths import OutputPathAllocator
 from sunpack.core.support.path_keys import resolved_path_key
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
-from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import compact_success_worker_diagnostics, worker_result_payload
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, recoverable_partial_inventory
@@ -24,6 +26,26 @@ from sunpack.core.support.archive_input_projection import write_source_password_
 from sunpack.pipeline.extraction.output_inventory import OutputInventory, collect_output_inventory
 from sunpack.core.i18n import I18nContext
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
+
+
+def _zip_filename_codepage(task: ArchiveTask, descriptor: ArchiveInputDescriptor) -> str | None:
+    if descriptor.format_hint != "zip" or descriptor.volume_attempts is not None:
+        # A speculative volume family cannot supply an archive-wide override.
+        return None
+
+    generation = task.runtime.get("input_generation")
+    cached = task.runtime.get("zip_filename_codepage")
+    if cached is not None and cached[0] == generation and cached[1] is descriptor:
+        return cached[2]
+
+    try:
+        codepage = analyze_zip_filename_encoding(descriptor.to_dict())
+    except Exception:
+        # Filename encoding is optional. The backend can still use ZIP flags
+        # and Unicode extra fields when inspection fails.
+        codepage = None
+    task.runtime["zip_filename_codepage"] = (generation, descriptor, codepage)
+    return codepage
 
 
 def _advance_state(state, sent, *, first: bool, runner: SevenZipRunner, cancellation_token):
@@ -51,7 +73,6 @@ class SingleArchiveExtractor:
         self,
         password_store,
         password_resolver,
-        metadata_scanner: ArchiveMetadataScanner,
         sevenzip_runner: SevenZipRunner | None = None,
         best_effort: bool = True,
         quiet: bool = False,
@@ -60,7 +81,6 @@ class SingleArchiveExtractor:
     ):
         self.password_store = password_store
         self.password_resolver = password_resolver
-        self.metadata_scanner = metadata_scanner
         self.sevenzip_runner = sevenzip_runner
         self.best_effort = bool(best_effort)
         self.quiet = bool(quiet)
@@ -199,7 +219,6 @@ class SingleArchiveExtractor:
         run_result = None
         err = ""
         correct_pwd = None
-        selected_codepage = None
 
         with _phase(phase_timer, f"{phase_prefix}_resolve_password"):
             resolution = self._resolve_password(task, run_archive, run_parts)
@@ -219,21 +238,11 @@ class SingleArchiveExtractor:
             )
         correct_pwd = resolution.password
         test_err = resolution.error_text
-        with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
-            filename_encoding = self.metadata_scanner.scan_for_task(task)
-            selected_codepage = filename_encoding.selected_codepage
-            if filename_encoding.error:
-                # Filename detection is an optional override.  Failure or
-                # ambiguity must not prevent the archive backend from
-                # using UTF-8 flags / Unicode extra fields itself.
-                self._log(
-                    self.i18n.t("extract.log.metadata_override_not_used", error=filename_encoding.error)
-                )
-                selected_codepage = None
-
         if correct_pwd is None:
             err = test_err
         else:
+            with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
+                selected_codepage = _zip_filename_codepage(task, descriptor)
             self.sevenzip_runner.emit_semantic_event(
                 task,
                 "extract_ready",
@@ -261,7 +270,6 @@ class SingleArchiveExtractor:
                     if not isinstance(selection, dict):
                         raise ValueError("worker omitted the successful volume composition")
                     task.select_volumes(node, descriptor.select_volumes(selection))
-                    task.runtime.pop(self.metadata_scanner.TASK_CACHE_KEY, None)
                 selected_password = self._worker_selected_password(resolution, run_result)
                 if selected_password is not None:
                     correct_pwd = selected_password

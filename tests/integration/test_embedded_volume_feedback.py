@@ -1,3 +1,4 @@
+from sunpack.runtime.watch.roots import WatchRootEntry
 import asyncio
 import io
 import zipfile
@@ -111,12 +112,11 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
         assert extent.start < extent.end <= bounded_end
     assert all(part.extent.start == 0 for part in descriptor.parts[1:-1])
     assert not (found.claimed_paths & found.blocked_paths)
-    planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(task)
-    assert len(planned) == 1
+    ArchiveInputPlanningStage(config).plan_task(task)
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "out"
     try:
-        extracted = extractor.extract(planned[0], str(output))
+        extracted = extractor.extract(task, str(output))
     finally:
         extractor.close()
     assert extracted.success, extracted.error
@@ -239,11 +239,11 @@ def test_encrypted_standalone_carrier_keeps_boundary_and_password_failures(tmp_p
     config, task = discover(["wrong", password])
     assert task.discovery_failure is None
     assert task.discovery_source == "embedded"
-    planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(task)
+    ArchiveInputPlanningStage(config).plan_task(task)
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "out"
     try:
-        extracted = extractor.extract(planned[0], str(output))
+        extracted = extractor.extract(task, str(output))
     finally:
         extractor.close()
     assert extracted.success, extracted.error
@@ -345,7 +345,7 @@ def test_watch_waits_for_carrier_volume_then_extracts_on_arrival(tmp_path, monke
 
             engine._request_runtime_factory = runtime_for
             watcher = watch_module.WatchScheduler(
-                config, [str(case.archive_dir)], output_roots={str(case.archive_dir): str(output)},
+                config, [WatchRootEntry(str(case.archive_dir), str(output))],
                 state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine,
             )
             try:
@@ -363,7 +363,7 @@ def test_watch_waits_for_carrier_volume_then_extracts_on_arrival(tmp_path, monke
                 if restart:
                     await watcher.aclose()
                     watcher = watch_module.WatchScheduler(
-                        config, [str(case.archive_dir)], output_roots={str(case.archive_dir): str(output)},
+                        config, [WatchRootEntry(str(case.archive_dir), str(output))],
                         state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine,
                     )
                     scope = next(iter(watcher.scopes.values()))

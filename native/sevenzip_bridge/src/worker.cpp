@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <new>
@@ -19,7 +18,6 @@
 #include <deque>
 #include <limits>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -105,33 +103,6 @@ struct WorkerArchiveInput {
     std::string validation_error;
     std::vector<sunpack::sevenzip::ExtractInputRange> ranges;
 };
-
-sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
-    const WorkerArchiveInput& archive_input,
-    const std::vector<std::wstring>& candidates
-) {
-    using namespace sunpack::sevenzip;
-    std::vector<const wchar_t*> password_ptrs;
-    password_ptrs.reserve(candidates.size());
-    for (const auto& password : candidates) {
-        password_ptrs.push_back(password.c_str());
-    }
-    if (!archive_input.ranges.empty() && archive_input.canonical_names.empty()) {
-        return test_passwords_with_ranges(
-            archive_input.archive_path,
-            archive_input.ranges,
-            archive_input.format_hint,
-            password_ptrs.data(),
-            static_cast<int>(password_ptrs.size()));
-    }
-    return test_passwords_with_parts(
-        archive_input.archive_path,
-        archive_input.part_paths,
-        password_ptrs.data(),
-        static_cast<int>(password_ptrs.size()),
-        archive_input.canonical_names,
-        archive_input.format_hint, archive_input.ranges);
-}
 
 sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
     const sunpack::sevenzip::PasswordTestResult& probe,
@@ -297,6 +268,11 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         unsigned long long end = 0;
         bool has_end = false;
     };
+    if (mode == "concat_ranges") {
+        input.ranges = parse_ranges_from_objects(descriptor.array_field("ranges"), entry_path);
+        if (input.ranges.empty()) input.validation_error = "concat_ranges descriptor requires ranges";
+        return input;
+    }
     const auto part_objects = descriptor.array_field("parts");
     if (mode == "file_range") {
         input.ranges = parse_ranges_from_objects(part_objects, entry_path);
@@ -360,11 +336,6 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         }
     }
 
-    if (mode == "concat_ranges") {
-        const auto range_objects = descriptor.array_field("ranges");
-        input.ranges = parse_ranges_from_objects(range_objects, entry_path);
-        if (input.ranges.empty()) input.validation_error = "concat_ranges descriptor requires ranges";
-    }
     return input;
 }
 
@@ -436,13 +407,6 @@ std::string status_to_string(sunpack::sevenzip::PasswordTestStatus status) {
     return sunpack::sevenzip::status_name(status);
 }
 
-std::string hresult_hex(int value) {
-    std::ostringstream stream;
-    stream << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
-           << static_cast<unsigned int>(value);
-    return stream.str();
-}
-
 std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace) {
     return wire::object() +
         wire::key("mode") + wire::text(wide_to_utf8(trace.mode)) +
@@ -468,7 +432,6 @@ std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace) 
         wire::key("prefetch_consumer_wait_ns") + wire::number(trace.prefetch_consumer_wait_ns) +
         wire::key("read_error") + wire::boolean(trace.read_error) +
         wire::key("last_hresult") + wire::number(trace.last_hresult) +
-        wire::key("last_hresult_hex") + wire::text(hresult_hex(trace.last_hresult)) +
         wire::key("last_win32_error") + wire::number(trace.last_win32_error) +
         (wire::key("last_read") + wire::object() + wire::key("virtual_offset")) + wire::number(trace.last_read_virtual_offset) +
         wire::key("source_path") + wire::text(wide_to_utf8(trace.last_source_path)) +
@@ -488,9 +451,7 @@ class WorkerChunks {
 public:
     WorkerChunks(const std::string& job_id, const char* type, const char* field)
         : prefix_((wire::object() + wire::key("type")) + wire::text(type) + wire::key("job_id") + wire::text(job_id) + wire::key("seq")),
-          field_(field) {
-        buffer_.reserve(kChunkBytes);
-    }
+          field_(field) {}
 
     void append(const std::string& row) {
         // A single large row is its own frame; chunk size is a batching target.
@@ -524,7 +485,7 @@ private:
 
     static constexpr std::size_t kChunkBytes = 512 * 1024;
     std::string prefix_;
-    std::string field_;
+    std::string_view field_;
     std::string buffer_;
     std::size_t seq_ = 0;
     std::size_t count_ = 0;
@@ -549,7 +510,6 @@ void append_output_item_trace(std::string& row, const sunpack::sevenzip::Extract
     wire::append_number(row, item.operation_result);
     wire::append_text(row, sunpack::sevenzip::operation_result_name(item.operation_result));
     wire::append_number(row, item.hresult);
-    wire::append_text(row, hresult_hex(item.hresult));
     wire::append_number(row, item.win32_error);
     row.push_back(item.done ? wire::kTrue : wire::kFalse);
     row.push_back(item.failed ? wire::kTrue : wire::kFalse);
@@ -575,7 +535,6 @@ std::string output_trace_wire(const sunpack::sevenzip::ExtractOutputTrace& trace
         wire::key("current_item_bytes_written") + wire::number(trace.current_item_bytes_written) +
         wire::key("last_write_size") + wire::number(trace.last_write_size) +
         wire::key("last_hresult") + wire::number(trace.last_hresult) +
-        wire::key("last_hresult_hex") + wire::text(hresult_hex(trace.last_hresult)) +
         wire::key("last_win32_error") + wire::number(trace.last_win32_error) +
         wire::key("item_count") + wire::number(trace.items.size()) +
         wire::key("chunk_count") + wire::number(chunk_count) +
@@ -675,9 +634,7 @@ std::string handler_attempts_wire(const std::vector<sunpack::sevenzip::ExtractHa
             wire::key("created") + wire::boolean(attempt.created) +
             wire::key("opened") + wire::boolean(attempt.opened) +
             wire::key("create_hresult") + wire::number(attempt.create_hresult) +
-            wire::key("create_hresult_hex") + wire::text(hresult_hex(attempt.create_hresult)) +
-            wire::key("open_hresult") + wire::number(attempt.open_hresult) +
-            wire::key("open_hresult_hex") + wire::text(hresult_hex(attempt.open_hresult)) + wire::end();
+            wire::key("open_hresult") + wire::number(attempt.open_hresult) + wire::end();
     }
     out += wire::end();
     return out;
@@ -698,7 +655,6 @@ std::string diagnostics_wire(const sunpack::sevenzip::ExtractArchiveResult& resu
         wire::key("failure_stage") + wire::text(result.failure_stage) +
         wire::key("failure_kind") + wire::text(result.failure_kind) +
         wire::key("hresult") + wire::number(result.hresult) +
-        wire::key("hresult_hex") + wire::text(hresult_hex(result.hresult)) +
         wire::key("operation_result") + wire::number(result.operation_result) +
         wire::key("operation_result_name") + wire::text(sunpack::sevenzip::operation_result_name(result.operation_result)) +
         wire::key("missing_volume_suspected") + wire::boolean(result.missing_volume_suspected) +
@@ -960,9 +916,9 @@ int run_request(
     }
     const auto& archive_input = volume_trials ? selected_input : request.archive_input;
     auto extract_with_password = [&](const std::wstring& selected_password) {
-        return archive_input.ranges.empty() || !archive_input.canonical_names.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, cancel_token, archive_input.ranges)
-            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, shared_writer, cancel_token);
+        return extract_archive(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
+            archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run,
+            archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, cancel_token);
     };
 
     ExtractArchiveResult result;
@@ -1050,7 +1006,8 @@ int run_request(
             const bool direct_candidates = password_candidates.size() == 1 ||
                 (replay && replay->candidate_output_owned);
             if (!direct_candidates) {
-                const auto probe = run_password_candidate_probe(archive_input, password_candidates);
+                const auto probe = test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
+                    archive_input.format_hint, password_candidates.data(), password_candidates.size(), archive_input.canonical_names);
                 if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
                     static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
                     result = password_candidate_failure(probe, password_candidates.size());
@@ -1096,7 +1053,8 @@ int run_request(
                         !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
                         !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
                         if (extraction_rejects_password(result) ||
-                            run_password_candidate_probe(archive_input, {password_candidates[index]}).status == PasswordTestStatus::WrongPassword) {
+                            test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
+                                archive_input.format_hint, &password_candidates[index], 1, archive_input.canonical_names).status == PasswordTestStatus::WrongPassword) {
                             result.status = PasswordTestStatus::WrongPassword;
                             result.encrypted = true;
                             result.wrong_password = true;
@@ -1211,8 +1169,7 @@ int run_request(
     const std::string failure_fields = ok ? "" :
         wire::key("failure_stage") + wire::text(result.failure_stage) +
         wire::key("failure_kind") + wire::text(result.failure_kind) +
-        wire::key("hresult") + wire::number(result.hresult) +
-        wire::key("hresult_hex") + wire::text(hresult_hex(result.hresult));
+        wire::key("hresult") + wire::number(result.hresult);
     const std::string diagnostic_fields = (!ok || dry_run) ?
         wire::key("diagnostics") + diagnostics_wire(result, trace_chunks) : "";
     const auto &sr = result.stream_receipt;
@@ -1445,10 +1402,6 @@ public:
             // Locked only for this call: the token carries the cancel, the writer is just the thing to wake.
             writer_to_wake = found->second.writer.lock();
         }
-        if (!token) {
-            return false;
-        }
-        token->store(true, std::memory_order_release);
         memory_.changed();
         // Cancellation is rare: withdraw queued jobs here rather than making
         // them wait for a CPU credit just to acknowledge their terminal state.
@@ -1559,8 +1512,8 @@ public:
 private:
     struct JobMetadata {
         // WorkerRequest owns identity and routing; retain only encoded events.
-        // Lifecycle events reuse these fields four times per job. Escaping them
-        // once at submission avoids repeated allocations/string walks on the
+        // Lifecycle events reuse these fields four times per job. Encoding them
+        // once at submission avoids repeated allocations on the
         // admission and completion hot paths.
         std::string encoded_job_id;
         std::string lifecycle_context_wire;

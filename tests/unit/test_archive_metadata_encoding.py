@@ -3,13 +3,19 @@ import struct
 from types import SimpleNamespace
 
 import pytest
+from sunpack_native import analyze_zip_filename_encoding
 
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
     InputExtent,
 )
-from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
+from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import _zip_filename_codepage
+
+
+def _scan_zip(path):
+    descriptor = ArchiveInputDescriptor.from_parts(archive_path=str(path), format_hint="zip")
+    return analyze_zip_filename_encoding(descriptor.to_dict())
 
 
 @pytest.mark.parametrize(
@@ -29,13 +35,7 @@ def test_native_codepage_selection_preserves_known_unicode_families(
     archive = tmp_path / f"sample-{expected_codepage}.data"
     _write_stored_zip(archive, name.encode(encoding), b"payload")
 
-    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
-
-    assert result.selected_codepage == expected_codepage
-    assert result.confidence > 0.0
-    if name == "日本語/説明.txt" and encoding == "cp932":
-        assert result.confidence > 0.5
-    assert result.archive_type == "zip"
+    assert _scan_zip(archive) == expected_codepage
     assert archive.is_file()
     assert not archive.with_suffix(".zip").exists()
 
@@ -45,10 +45,7 @@ def test_shift_jis_kanji_only_zip_scan_uses_cp932(tmp_path):
     expected_name = "Warrior Girl ver2.01/更新履歴.txt"
     _write_stored_zip(archive, expected_name.encode("cp932"), b"payload")
 
-    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
-
-    assert result.selected_codepage == "932"
-    assert result.confidence > 0.5
+    assert _scan_zip(archive) == "932"
 
 
 def test_sfx_prefix_uses_physical_central_directory(tmp_path):
@@ -57,9 +54,7 @@ def test_sfx_prefix_uses_physical_central_directory(tmp_path):
     sfx = tmp_path / "self-extracting.exe"
     sfx.write_bytes(b"MZ" + b"stub" * 97 + archive_bytes)
 
-    result = ArchiveMetadataScanner().scan(str(sfx), format_hint="zip")
-
-    assert result.selected_codepage == "932"
+    assert _scan_zip(sfx) == "932"
 
 
 def test_carrier_range_uses_canonical_archive_input(tmp_path):
@@ -86,13 +81,7 @@ def test_carrier_range_uses_canonical_archive_input(tmp_path):
         ],
     )
 
-    result = ArchiveMetadataScanner().scan(
-        str(carrier),
-        format_hint="zip",
-        archive_input=descriptor,
-    )
-
-    assert result.selected_codepage == "932"
+    assert analyze_zip_filename_encoding(descriptor.to_dict()) == "932"
 
 
 def test_raw_multivolume_zip_uses_one_logical_input(tmp_path):
@@ -125,13 +114,7 @@ def test_raw_multivolume_zip_uses_one_logical_input(tmp_path):
         ],
     )
 
-    result = ArchiveMetadataScanner().scan(
-        str(first),
-        format_hint="zip",
-        archive_input=descriptor,
-    )
-
-    assert result.selected_codepage == "936"
+    assert analyze_zip_filename_encoding(descriptor.to_dict()) == "936"
 
 
 def test_spanned_zip_uses_disk_relative_central_directory_offset(tmp_path):
@@ -210,50 +193,37 @@ def test_spanned_zip_uses_disk_relative_central_directory_offset(tmp_path):
         ],
     )
 
-    result = ArchiveMetadataScanner().scan(
-        str(first),
-        format_hint="zip",
-        archive_input=descriptor,
-    )
-
-    assert result.selected_codepage == "932"
+    assert analyze_zip_filename_encoding(descriptor.to_dict()) == "932"
 
 
 def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
-    scanner = ArchiveMetadataScanner()
-
+    task = SimpleNamespace(runtime={})
     for archive_type in ("7z", "rar"):
-        result = scanner.scan(f"unused.{archive_type}", format_hint=archive_type)
-
-        assert result.archive_type == archive_type
-        assert result.selected_codepage is None
-        assert result.warnings == []
+        descriptor = ArchiveInputDescriptor(f"unused.{archive_type}", format_hint=archive_type)
+        assert _zip_filename_codepage(task, descriptor) is None
+    assert not task.runtime
 
 
-def test_task_metadata_cache_survives_scanner_instance_change(tmp_path, monkeypatch):
-    archive = tmp_path / "cached.zip"
-    _write_stored_zip(archive, b"plain.txt", b"payload")
-    descriptor = ArchiveInputDescriptor.from_parts(
-        archive_path=str(archive),
-        format_hint="zip",
-    )
-    task = SimpleNamespace(runtime={}, archive_input=lambda: descriptor)
+def test_task_codepage_cache_reuses_only_the_same_input_generation(monkeypatch):
+    descriptor = ArchiveInputDescriptor("cached.zip", format_hint="zip")
+    task = SimpleNamespace(runtime={})
+    calls = []
 
-    first = ArchiveMetadataScanner().scan_for_task(task)
-
-    def unexpected_stat(*_args, **_kwargs):
-        pytest.fail("metadata cache hit re-statted archive parts")
+    def scan(payload):
+        calls.append(payload["entry_path"])
+        return {1: None, 2: "932", 3: "950"}[len(calls)]
 
     monkeypatch.setattr(
-        "sunpack.pipeline.extraction.internal.sevenzip.metadata.os.stat",
-        unexpected_stat,
+        "sunpack.pipeline.extraction.internal.workflow.single_archive_extractor.analyze_zip_filename_encoding",
+        scan,
     )
-    second_scanner = ArchiveMetadataScanner()
-    second_scanner._scan_descriptor = lambda *_args, **_kwargs: pytest.fail(
-        "metadata was rescanned"
-    )
-    second = second_scanner.scan_for_task(task)
-    assert second.sample_count == first.sample_count
+    assert _zip_filename_codepage(task, descriptor) is None
+    assert _zip_filename_codepage(task, descriptor) is None
+    assert len(calls) == 1
+    task.runtime["input_generation"] = ("new file",)
+    assert _zip_filename_codepage(task, descriptor) == "932"
+    replacement = ArchiveInputDescriptor("different.zip", format_hint="zip")
+    assert _zip_filename_codepage(task, replacement) == "950"
 
 
 def test_unicode_path_extra_field_needs_no_python_name_copy(tmp_path):
@@ -262,24 +232,13 @@ def test_unicode_path_extra_field_needs_no_python_name_copy(tmp_path):
     expected_name = "【サンプル】テスト素材.psd"
     _write_stored_zip(archive, raw_name, b"payload", unicode_name=expected_name)
 
-    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
-
-    assert result.error is None
-    assert result.selected_codepage is None
-    assert result.confidence == 1.0
-    assert any("0x7075" in reason for reason in result.reasons)
+    assert _scan_zip(archive) is None
 
 
 def test_cp437_default_is_explicit_even_without_high_confidence(tmp_path):
     archive = tmp_path / "ambiguous.zip"
     _write_stored_zip(archive, b"\x82.txt", b"payload")
-
-    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
-
-    assert result.error is None
-    assert result.selected_codepage == "437"
-    assert result.confidence < 0.5
-    assert not result.warnings
+    assert _scan_zip(archive) == "437"
 
 
 def _write_stored_zip(

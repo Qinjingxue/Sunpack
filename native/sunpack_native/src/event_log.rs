@@ -725,25 +725,28 @@ impl Projection {
     ) -> (Vec<(String, Option<(Record, Option<Arc<Value>>)>)>, bool) {
         reset |= std::mem::take(&mut self.full_dirty);
         self.dirty_bytes = 0;
-        let ids = if reset {
-            self.dirty.clear();
-            self.tasks.keys().cloned().collect::<Vec<_>>()
-        } else {
-            std::mem::take(&mut self.dirty).into_iter().collect()
+        let dirty = std::mem::take(&mut self.dirty);
+        let project_status = |task: &Task| {
+            task.status
+                .as_ref()
+                .map(|status| (status.clone(), task.group.clone()))
         };
-        (
-            ids.into_iter()
+        let rows = if reset {
+            drop(dirty);
+            self.tasks
+                .iter()
+                .map(|(id, task)| (id.clone(), project_status(task)))
+                .collect()
+        } else {
+            dirty
+                .into_iter()
                 .map(|id| {
-                    let row = self.tasks.get(&id).and_then(|task| {
-                        task.status
-                            .as_ref()
-                            .map(|status| (status.clone(), task.group.clone()))
-                    });
+                    let row = self.tasks.get(&id).and_then(project_status);
                     (id, row)
                 })
-                .collect(),
-            reset,
-        )
+                .collect()
+        };
+        (rows, reset)
     }
 }
 

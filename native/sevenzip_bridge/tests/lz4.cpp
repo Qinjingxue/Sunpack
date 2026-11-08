@@ -310,7 +310,7 @@ int wmain(int argc,wchar_t **argv) {
         check(WriteFile(sparse,tar_frame.data(),static_cast<DWORD>(tar_frame.size()),&processed,nullptr)&&processed==tar_frame.size(),"sparse frame");CloseHandle(sparse);
         save(root/L"nested.lz4",frame(standard,4,true,true,true,true));
         Bytes carrier(1031,0x89);carrier.insert(carrier.end(),concatenated.begin(),concatenated.end());carrier.resize(carrier.size()+29,0x88);save(root/L"carrier.dat",carrier);
-        auto extracted=sunpack::sevenzip::extract_archive_with_parts((root/L"frame_7_15.lz4").wstring(),{},L"lz4",L"",(root/L"worker_output").wstring(),L"",nullptr,false);
+        auto extracted=sunpack::sevenzip::extract_archive((root/L"frame_7_15.lz4").wstring(),{},{},L"lz4",L"",(root/L"worker_output").wstring(),L"",nullptr,false);
         if (!extracted.command_ok) std::cerr<<"worker: "<<extracted.message<<" kind="<<extracted.failure_kind<<" hr="<<extracted.hresult<<" op="<<extracted.operation_result<<"\n";
         check(extracted.command_ok&&extracted.has_stream_receipt&&extracted.stream_receipt.content_checked_frames==1,"worker extraction");
         check(extracted.output_trace.items.size()==1&&!extracted.output_trace.items[0].crc_verified,"no fake CRC32");

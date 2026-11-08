@@ -386,7 +386,7 @@ def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(
     catalog = NativeWatchCatalog(state._native)
     try:
         for target in (str(root / "child"), str(root / "skip"), str(paths[-1])):
-            errors = options.catalog_update(catalog, scope.native, target, True)
+            errors = options.catalog_update(catalog, scope.native, target)
             assert not errors
         errors = options.catalog_update(catalog, scope.native, str(paths[0]))
         assert not errors
@@ -425,12 +425,12 @@ def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_pat
     config = make_config({"filesystem": {"scan_filters": [
         {'name': 'blacklist', 'enabled': True, 'extensions': [{'value': 'bin', 'regex': False}]}]},
         "watch": {"clipboard_monitor_enabled": False}})
-    watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
-        root_entries=[WatchRootEntry(str(root), str(output), deep_detect=True)], pipeline_engine=Engine())
+    watcher = module.WatchScheduler(config, [WatchRootEntry(str(root), str(output), deep_detect=True)], state_path=str(tmp_path / "state.snapshot"),
+        pipeline_engine=Engine())
     try:
-        candidates, errors = watcher._scan_candidates([str(root)], recursive=False)
-        assert not errors and [candidate.path for candidate in candidates] == [str(archive)]
         scope = watcher.scopes[next(iter(watcher.scopes))]
+        candidates, errors = watcher._scan_candidate_paths(str(root), scope)
+        assert not errors and candidates == [str(archive)]
         filtered, _ = watcher._scan_options_for(scope).catalog_snapshot(watcher._catalog, scope.native, str(archive))
         assert filtered.file_columns()[0] == [str(archive)]
         candidate = WatchCandidate(str(nested), nested.stat().st_size, nested.stat().st_mtime)
@@ -593,8 +593,7 @@ def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion
 
     async def execute():
         async with PipelineEngine(config) as engine:
-            scheduler = WatchScheduler(config, [str(watched)],
-                root_entries=[WatchRootEntry(str(watched), recursive=True)],
+            scheduler = WatchScheduler(config, [WatchRootEntry(str(watched), recursive=True)],
                 pipeline_engine=engine, state_path=state_path)
             try:
                 response = await engine.run([str(archive)], origin=origin,
@@ -910,8 +909,7 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
         path.write_bytes(b"old")
     config = make_config({"watch": {"clipboard_monitor_enabled": False}})
     def watcher():
-        return module.WatchScheduler(config, [str(root), str(other)], state_path=str(tmp_path / "state.snapshot"),
-            root_entries=[WatchRootEntry(str(path), initial_scanned=True, recursive=True) for path in (root, other)],
+        return module.WatchScheduler(config, [WatchRootEntry(str(path), initial_scanned=True, recursive=True) for path in (root, other)], state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=FakePipelineEngine(lambda config: None))
     async def cycle():
         first = watcher()
@@ -1076,8 +1074,8 @@ def test_watch_filters_reserved_flatten_work_and_persists_final_identity(tmp_pat
     checked = []
     async def execute():
         async with PipelineEngine(config) as engine:
-            watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
-                root_entries=[WatchRootEntry(str(root), recursive=True)], pipeline_engine=engine)
+            watcher = module.WatchScheduler(config, [WatchRootEntry(str(root), recursive=True)], state_path=str(tmp_path / "state.snapshot"),
+                pipeline_engine=engine)
             def protected_flatten(path, *, work_path=None, **kwargs):
                 assert work_path is not None
                 assert watcher.should_ignore_event_path(str(Path(work_path) / "nested.zip"))
@@ -1114,8 +1112,8 @@ def test_watch_volume_deletion_and_arrival_retry_the_existing_blocker(tmp_path, 
         "watch": {"clipboard_monitor_enabled": False}})
     async def execute():
         async with PipelineEngine(config) as engine:
-            watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
-                root_entries=[WatchRootEntry(str(root), recursive=True)], pipeline_engine=engine)
+            watcher = module.WatchScheduler(config, [WatchRootEntry(str(root), recursive=True)], state_path=str(tmp_path / "state.snapshot"),
+                pipeline_engine=engine)
             try:
                 scope = next(iter(watcher.scopes.values()))
                 watcher._scan_options.catalog_update(watcher._catalog, scope.native)

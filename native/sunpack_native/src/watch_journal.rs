@@ -400,9 +400,13 @@ impl JournalRuntime {
         ))
     }
 
-    fn seed(&self, stream: String, seq: u64) -> Result<(), String> {
+    fn seed(&self, stream: &str, seq: u64) -> Result<(), String> {
         let mut state = lock_state(&self.shared);
-        let stream_state = state.streams.entry(stream).or_default();
+        let stream_state = state
+            .streams
+            .get_mut(stream)
+            .filter(|stream| !stream.closing)
+            .ok_or("Watch journal stream is unavailable")?;
         if stream_state.write_count == 0 && stream_state.segments.is_empty() {
             stream_state.written_seq = stream_state.written_seq.max(seq);
             stream_state.durable_seq = stream_state.durable_seq.max(seq);
@@ -820,19 +824,16 @@ struct FlushWork {
 }
 
 fn close_ready_segments(stream: &mut StreamState) {
-    let ready: Vec<(u64, u64)> = stream
-        .segments
-        .iter()
-        .filter_map(|(start, segment)| {
-            let boundary = segment.sealed_end?;
-            (boundary <= stream.durable_seq && segment.flushed_epoch >= segment.write_epoch)
-                .then_some((*start, boundary))
-        })
-        .collect();
-    for (start, boundary) in ready {
-        stream.segments.remove(&start);
-        stream.sealed_seq = stream.sealed_seq.max(boundary);
-    }
+    stream.segments.retain(|_, segment| {
+        let ready = segment.sealed_end.filter(|&boundary| {
+            boundary <= stream.durable_seq && segment.flushed_epoch >= segment.write_epoch
+        });
+        if let Some(boundary) = ready {
+            stream.sealed_seq = stream.sealed_seq.max(boundary);
+            return false;
+        }
+        true
+    });
 }
 
 fn adaptive_coalesce_window(activity_during_probe: bool, last_flush_micros: u64) -> u64 {
@@ -1045,7 +1046,7 @@ pub(crate) fn watch_journal_request_flush(
 }
 
 #[pyfunction]
-pub(crate) fn watch_journal_seed(stream: String, seq: u64) -> PyResult<()> {
+pub(crate) fn watch_journal_seed(stream: &str, seq: u64) -> PyResult<()> {
     runtime().seed(stream, seq).map_err(PyRuntimeError::new_err)
 }
 
@@ -1110,15 +1111,16 @@ mod tests {
     }
 
     #[test]
-    fn flush_request_retains_its_stream_outcome_without_reviving_closed_streams() {
+    fn journal_frontiers_do_not_revive_closed_streams() {
         let runtime = runtime();
         let stream = unique_path("flush_retire").to_string_lossy().into_owned();
         let mut owner = runtime.open(stream.clone()).unwrap();
-        runtime.seed(stream.clone(), 1).unwrap();
+        runtime.seed(&stream, 1).unwrap();
         let ticket = runtime.request_flush(stream.clone(), 1).unwrap();
         runtime.release(owner.stream.take().unwrap()).unwrap();
 
         assert!(runtime.request_flush(stream.clone(), 1).is_err());
+        assert!(runtime.seed(&stream, 1).is_err());
         assert!(!lock_state(&runtime.shared).streams.contains_key(&stream));
         ticket.wait_for(TicketGoal::Durable).unwrap();
     }
@@ -1192,7 +1194,7 @@ mod tests {
         let runtime = runtime();
         let path = unique_path("clean_flush");
         let stream = path.to_string_lossy().to_string();
-        runtime.seed(stream.clone(), 0).unwrap();
+        let mut owner = runtime.open(stream.clone()).unwrap();
         let ticket = runtime
             .submit_append(
                 stream.clone(),
@@ -1223,6 +1225,7 @@ mod tests {
             state.streams.get(&stream).unwrap().flush_calls
         };
         assert_eq!(first, second);
+        runtime.release(owner.stream.take().unwrap()).unwrap();
         let _ = fs::remove_file(path);
     }
 
@@ -1231,7 +1234,7 @@ mod tests {
         let runtime = runtime();
         let path = unique_path("seal");
         let stream = path.to_string_lossy().to_string();
-        runtime.seed(stream.clone(), 0).unwrap();
+        let mut owner = runtime.open(stream.clone()).unwrap();
         let append = runtime
             .submit_append(
                 stream.clone(),
@@ -1253,6 +1256,7 @@ mod tests {
         assert!(stream_state.sealed_seq >= 1);
         assert!(!stream_state.segments.contains_key(&1));
         drop(state);
+        runtime.release(owner.stream.take().unwrap()).unwrap();
         let _ = fs::remove_file(path);
     }
 
@@ -1306,7 +1310,7 @@ mod tests {
 // Catalog cache uses the same ordered writer, on its own stream and files.
 pub(crate) fn open_cache(stream: String, seq: u64) -> Result<NativeJournalStream, String> {
     let handle = runtime().open(stream.clone())?;
-    runtime().seed(stream, seq)?;
+    runtime().seed(&stream, seq)?;
     Ok(handle)
 }
 pub(crate) fn append_cache(

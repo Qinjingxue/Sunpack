@@ -17,6 +17,7 @@ from sunpack.core.support.runtime_identity import SOURCE_RUNTIME_ID
 from tests.helpers.passwords import write_password_json
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from tests.helpers.failure_assertions import assert_failure_kind
 from tests.helpers.marker_utils import marker_was_extracted
@@ -229,7 +230,7 @@ def test_watch_nested_split_groups_persist_distinct_blockers(tmp_path, monkeypat
     async def exercise():
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
-                config, [str(outer.parent)], output_roots={str(outer.parent): str(output)},
+                config, [WatchRootEntry(str(outer.parent), str(output))],
                 state_path=str(tmp_path / "state.snapshot"),
                 pipeline_engine=engine,
             )
@@ -305,7 +306,7 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
     async def exercise():
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
-                config, [str(case.archive_dir)], output_roots={str(case.archive_dir): str(output)},
+                config, [WatchRootEntry(str(case.archive_dir), str(output))],
                 state_path=str(tmp_path / "state.snapshot"),
                 pipeline_engine=engine,
             )
@@ -347,7 +348,8 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
             try:
                 # This fixture bypasses Watch startup; index the existing parts
                 # before submitting the single seed, as startup enumeration does.
-                watcher._scan_candidates([str(case.archive_dir)], recursive=False)
+                scope = next(iter(watcher.scopes.values()))
+                assert not watcher._scan_options_for(scope).catalog_update(watcher._catalog, scope.native)
                 watcher.enqueue(str(case.entry_path))
                 assert await settle() == 0
                 remaining = {FailureKind.WRONG_PASSWORD, FailureKind.MISSING_VOLUME}

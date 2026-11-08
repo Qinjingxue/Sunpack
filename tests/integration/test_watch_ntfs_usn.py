@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import sunpack_native
 
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.runtime.watch.scanner import watch_candidate_for_path
 from tests.helpers.config_factory import make_config
@@ -37,8 +38,7 @@ def _watcher(root: Path) -> WatchScheduler:
                 "clipboard_monitor_enabled": False,
             }
         }),
-        [str(root)],
-        output_roots={str(root): str(root / "out")},
+        [WatchRootEntry(str(root), str(root / "out"))],
         state_path=str(root / ".watch-state" / "state.snapshot"),
         pipeline_engine=FakePipelineEngine(lambda _config: None),
     )
@@ -118,8 +118,8 @@ def test_catalog_recovery_reuses_ids_without_losing_renamed_or_replaced_subtrees
                     errors, _ = options.catalog_refresh(catalog, scope.native, str(path))
                     assert not errors
                     covered.append(path)
-            candidates = options.catalog_candidates(catalog, scope.native)
-            assert {Path(row["path"]) for row in candidates} == {p for p in root.rglob("*") if p.is_file()}
+            candidates = catalog.candidate_paths(scope.native)
+            assert set(map(Path, candidates)) == {p for p in root.rglob("*") if p.is_file()}
             start = end
 
         for i in range(2):

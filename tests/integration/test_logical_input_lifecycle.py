@@ -12,6 +12,7 @@ from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
 from sunpack.runtime.watch import scheduler as watch_module
+from sunpack.runtime.watch.roots import WatchRootEntry
 from tests.helpers.config_factory import make_config
 from tests.helpers.passwords import write_password_json
 from tests.helpers.real_archives import ArchiveFixtureFactory, create_encrypted_rar_archive, create_rar4_archive
@@ -71,7 +72,7 @@ def test_mixed_blockers_resume_only_the_affected_input_across_restart(tmp_path, 
 
             def open_watcher():
                 watcher = watch_module.WatchScheduler(
-                    config, [str(case.archive_dir)], output_roots={str(case.archive_dir): str(output)},
+                    config, [WatchRootEntry(str(case.archive_dir), str(output))],
                     state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine,
                 )
                 scope = next(iter(watcher.scopes.values()))
