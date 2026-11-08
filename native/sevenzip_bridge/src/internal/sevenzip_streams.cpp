@@ -50,7 +50,7 @@ namespace sunpack::sevenzip
             if (volumes.size() > 1)
             {
 
-                auto *stream = new MultiFileInStream(std::move(volumes), trace, prefetch_config);
+                auto *stream = new MultiRangeInStream(std::move(volumes), trace, prefetch_config);
 
                 opened = stream->is_open();
 
@@ -97,7 +97,7 @@ namespace sunpack::sevenzip
         if (paths.size() > 1)
         {
 
-            auto *stream = new MultiFileInStream(std::move(paths), trace, prefetch_config);
+            auto *stream = new MultiRangeInStream(std::move(paths), trace, prefetch_config);
 
             opened = stream->is_open();
 

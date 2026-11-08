@@ -817,15 +817,14 @@ int wmain(int argc,wchar_t** argv) {
         EventLog backend_log; backend_log.set_path(dir/".sunpack_watch"/"events.json");
         measure("model_log_refresh",[&]{
             ensure(backend_log.refresh(true),"event log refresh failed");
-            ensure(backend_log.tasks.empty(),"history must stay on disk");
         });
         View backend_view;
         Json first_page;
-        measure("model_task_rows",[&]{ first_page=task_rows(backend_log,backend_roots,backend_view,"en"); });
-        measure("model_task_rows_warm",[&]{ (void)task_rows(backend_log,backend_roots,backend_view,"en"); });
+        measure("model_task_rows",[&]{ first_page=backend_log.query(backend_roots,backend_view,"en"); });
+        measure("model_task_rows_warm",[&]{ (void)backend_log.query(backend_roots,backend_view,"en"); });
         if(first_page.value("hasMore",false)) {
             backend_view.task_cursor=first_page["next"].get<std::string>();
-            measure("model_task_rows_next_page",[&]{ (void)task_rows(backend_log,backend_roots,backend_view,"en"); });
+            measure("model_task_rows_next_page",[&]{ (void)backend_log.query(backend_roots,backend_view,"en"); });
             backend_view.task_cursor.clear();
         }
         report["task_display_cache_bytes"]=0; // No resident all-history model.

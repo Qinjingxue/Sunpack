@@ -41,23 +41,6 @@ struct SevenZipUnpackInfoAst {
     folders: Vec<SevenZipFolderAst>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-struct SevenZipSubStreamsInfoAst {
-    num_unpack_streams: Vec<usize>,
-    unpack_size_values: Vec<u64>,
-    crc_values: Vec<Option<SevenZipCrcSpan>>,
-}
-
-// These detailed stream fields are consumed by parser unit tests; production
-// encryption detection only reads `unpack_info` from the surrounding AST.
-#[cfg_attr(not(test), allow(dead_code))]
-struct SevenZipStreamsInfoAst {
-    pack_info: Option<SevenZipPackInfoAst>,
-    unpack_info: Option<SevenZipUnpackInfoAst>,
-    substreams_info: Option<SevenZipSubStreamsInfoAst>,
-    diagnostics: Vec<String>,
-}
-
 struct SevenZipHeaderAst {
     unpack_info: Option<SevenZipUnpackInfoAst>,
     diagnostics: Vec<String>,

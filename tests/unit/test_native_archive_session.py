@@ -242,7 +242,7 @@ def test_native_registry_wait_is_notified_when_reader_is_released(tmp_path):
     def wait_for_release() -> None:
         waiting.set()
         # Legacy positive deadlines no longer turn a live reader into failure.
-        result.extend(native_wait_for_resources([os.fspath(tmp_path)], 0.001))
+        result.extend(native_wait_for_resources([os.fspath(tmp_path)], False))
         completed.set()
 
     worker = threading.Thread(target=wait_for_release)

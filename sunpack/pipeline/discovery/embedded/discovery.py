@@ -8,7 +8,7 @@ import os
 from typing import Any
 
 from sunpack.core.support.path_keys import case_key, path_key
-from sunpack_native import NativeEmbeddedBatch, relations_logical_name
+from sunpack_native import NativeEmbeddedBatch, relations_logical_name, resolve_embedded_rar_boundaries
 
 from sunpack.core.config.fields.embedded import DEFAULT_EMBEDDED_SCAN
 from sunpack.core.contracts.archive_input import (
@@ -25,7 +25,6 @@ from sunpack.core.contracts.discovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
-from sunpack.core.analysis.embedded import resolve_encrypted_rar_boundaries
 from sunpack.core.analysis.embedded.result import (
     embedded_candidate_requires_password,
     embedded_scan_prepass,
@@ -212,7 +211,7 @@ class EmbeddedDiscovery:
         if encrypted_offsets:
             passwords = self._password_candidates(path)
             try:
-                boundary = resolve_encrypted_rar_boundaries(
+                boundary = resolve_embedded_rar_boundaries(
                     path,
                     encrypted_offsets,
                     passwords,

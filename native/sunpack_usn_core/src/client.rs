@@ -69,10 +69,7 @@ impl BrokerConnection {
         query: &[u8],
     ) -> io::Result<(Response, Vec<u8>)> {
         let request_id = request.request_id;
-        let payload_response = matches!(
-            request.opcode,
-            Opcode::ReadRootChanges | Opcode::ReadDirectoriesChanges
-        );
+        let payload_response = request.opcode == Opcode::ReadDirectoriesChanges;
         let request = request.encode()?;
         write_exact(self.0, &request)?;
         if !query.is_empty() {

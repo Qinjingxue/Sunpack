@@ -35,5 +35,5 @@ CPU credit 扩展使用测试程序专有的处理器查询注入，不修改生
 - `SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_IDLE_SECONDS`（默认 10）
 - `SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_WAIT_SECONDS`（默认 12；设为 0 可关闭等待）
 
-每次运行会在 pytest 的临时目录生成 `watch-memory-report.json`。报告包含每个批次的 RSS、worker RSS、watch 状态规模、队列计数，以及全局缓存、reader cache、projection cache、archive session、关系探测密码缓存、修复检查缓存和持久 worker pool 的快照。
+每次运行会在 pytest 的临时目录生成 `watch-memory-report.json`。报告包含每个批次的 RSS、worker RSS、watch 状态规模、队列计数，以及 reader cache、projection cache、archive session、关系探测密码缓存、修复检查缓存和持久 worker pool 的快照。
 如果启用 cleanup 等待，还会记录 `cache_cleanup_scheduled/started/finished` 次数，以及 Native 7z 和 NTFS volume context 的条目数。

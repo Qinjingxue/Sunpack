@@ -2,7 +2,8 @@ import struct
 from binascii import crc32
 
 from sunpack.core.analysis import AnalysisRequest, ArchiveAnalyzer
-from sunpack.core.analysis.embedded import scan_embedded_archives
+from sunpack.core.analysis.embedded.result import embedded_scan_prepass
+from sunpack_native import scan_embedded_archives
 
 
 def _seven_zip_bytes(*, version_major=0, next_header=b"\x01", declared_size=None):
@@ -63,7 +64,7 @@ def test_damaged_seven_zip_never_reuses_guessed_embedded_end(tmp_path):
     path.write_bytes(b"c" * start + _seven_zip_bytes(declared_size=8192))
 
     # Analysis consumes discovered roots; it must not search the carrier again.
-    prepass = scan_embedded_archives(str(path)).to_prepass()
+    prepass = embedded_scan_prepass(scan_embedded_archives(str(path)))
     report, evidence = _seven_zip_evidence(path, AnalysisRequest(initial_prepass=prepass))
 
     assert evidence.status != "extractable"
@@ -79,7 +80,7 @@ def test_exact_embedded_seven_zip_boundary_skips_next_header_revalidation(tmp_pa
     payload = _seven_zip_bytes()
     end = 128 + len(payload)
     path.write_bytes(b"\x00" * 128 + payload + b"carrier tail")
-    prepass = scan_embedded_archives(str(path)).to_prepass()
+    prepass = embedded_scan_prepass(scan_embedded_archives(str(path)))
 
     report, evidence = _seven_zip_evidence(path, AnalysisRequest(initial_prepass=prepass))
 

@@ -4,8 +4,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::io;
 use std::ptr::{null, null_mut};
-use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+use std::sync::Arc;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -25,8 +27,6 @@ pub struct DirectoryChangesPage {
     pub next_usn: i64,
     pub journal_id: u64,
 }
-const MAX_CACHED_VOLUME_CONTEXTS: usize = 64;
-const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const ERROR_INVALID_HANDLE: i32 = 6;
 const ERROR_NOT_READY: i32 = 21;
 const ERROR_DEVICE_NOT_CONNECTED: i32 = 1167;
@@ -71,34 +71,24 @@ impl Drop for OwnedHandle {
     }
 }
 
-struct VolumeContext {
-    handle: OwnedHandle,
-    last_used: Instant,
-}
-
 pub struct JournalReader {
-    entries: HashMap<String, VolumeContext>,
-}
-
-impl Default for JournalReader {
-    fn default() -> Self {
-        Self::new()
-    }
+    volume_guid: Arc<str>,
+    handle: Option<OwnedHandle>,
 }
 
 impl JournalReader {
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+    pub fn new(volume_guid: Arc<str>) -> io::Result<Self> {
+        validate_volume_guid(&volume_guid)?;
+        Ok(Self {
+            volume_guid,
+            handle: None,
+        })
     }
 
-    pub fn probe_volume(&mut self, volume_guid: &str) -> io::Result<(u64, i64)> {
-        self.with_volume(volume_guid, |volume| {
-            let (journal_id, next_usn) = query_or_create_journal(
-                || query_journal(volume),
-                || create_journal(volume_guid),
-            )?;
+    pub fn probe_volume(&mut self) -> io::Result<(u64, i64)> {
+        self.with_volume(|volume, volume_guid| {
+            let (journal_id, next_usn) =
+                query_or_create_journal(|| query_journal(volume), || create_journal(volume_guid))?;
             let request = read_usn_journal_request(next_usn, journal_id);
             let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
             let bytes_returned = device_io_control(
@@ -120,7 +110,6 @@ impl JournalReader {
 
     pub fn read_change_reasons(
         &mut self,
-        volume_guid: &str,
         expected_file_id: &[u8; FILE_ID_BYTES],
         expected_file_id_len: u8,
         previous_usn: i64,
@@ -135,7 +124,7 @@ impl JournalReader {
                 "invalid USN reason query",
             ));
         }
-        self.with_volume(volume_guid, |volume| {
+        self.with_volume(|volume, _| {
             let (journal_id, _) = query_journal(volume)?;
             let reasons = read_change_reasons_from_volume(
                 volume,
@@ -149,29 +138,9 @@ impl JournalReader {
         })
     }
 
-    pub fn read_root_changes(
-        &mut self,
-        volume_guid: &str,
-        root_file_id: &[u8; FILE_ID_BYTES],
-        root_file_id_len: u8,
-        start_usn: i64,
-        end_usn: i64,
-    ) -> io::Result<DirectoryChangesPage> {
-        if start_usn <= 0 || end_usn <= start_usn || !matches!(root_file_id_len, 8 | 16) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid root recovery query",
-            ));
-        }
-        let mut id = *root_file_id;
-        id[root_file_id_len as usize..].fill(0);
-        self.read_directories_changes(volume_guid, None, &[id], start_usn, end_usn)
-    }
-
     pub fn read_directories_changes(
         &mut self,
-        volume_guid: &str,
-        expected_journal: Option<u64>,
+        expected_journal: u64,
         directories: &[[u8; FILE_ID_BYTES]],
         start_usn: i64,
         end_usn: i64,
@@ -182,11 +151,9 @@ impl JournalReader {
                 "invalid directory recovery query",
             ));
         }
-        self.with_volume(volume_guid, |volume| {
+        self.with_volume(|volume, _| {
             let (journal_id, first_usn, next_usn) = query_journal_bounds(volume)?;
-            if expected_journal.is_some_and(|expected| expected != journal_id)
-                || start_usn < first_usn
-            {
+            if expected_journal != journal_id || start_usn < first_usn {
                 return Err(io::Error::from_raw_os_error(1178));
             }
             if end_usn > next_usn {
@@ -205,51 +172,25 @@ impl JournalReader {
         })
     }
 
-    pub fn context_count(&self) -> usize {
-        self.entries.len()
-    }
-
     fn with_volume<T>(
         &mut self,
-        volume_guid: &str,
-        operation: impl FnOnce(HANDLE) -> io::Result<T>,
+        operation: impl FnOnce(HANDLE, &str) -> io::Result<T>,
     ) -> io::Result<T> {
-        validate_volume_guid(volume_guid)?;
-        let key = volume_guid.to_ascii_lowercase();
-        let now = Instant::now();
-        self.entries.retain(|_, context| {
-            now.saturating_duration_since(context.last_used) < VOLUME_CONTEXT_IDLE_TTL
-        });
-        if !self.entries.contains_key(&key) {
-            if self.entries.len() >= MAX_CACHED_VOLUME_CONTEXTS {
-                if let Some(lru) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, context)| context.last_used)
-                    .map(|(key, _)| key.clone())
-                {
-                    self.entries.remove(&lru);
-                }
-            }
-            self.entries.insert(
-                key.clone(),
-                VolumeContext {
-                    handle: open_volume(volume_guid, GENERIC_READ)?,
-                    last_used: now,
-                },
-            );
-        }
-        let context = self.entries.get_mut(&key).expect("volume context inserted");
-        context.last_used = now;
-        let result = operation(context.handle.raw());
+        let handle = match &self.handle {
+            Some(handle) => handle,
+            None => self
+                .handle
+                .insert(open_volume(&self.volume_guid, GENERIC_READ)?),
+        };
+        let result = operation(handle.raw(), &self.volume_guid);
         if result.as_ref().err().is_some_and(stale_volume_handle_error) {
-            self.entries.remove(&key);
+            self.handle = None;
         }
         result
     }
 }
 
-pub fn validate_volume_guid(value: &str) -> io::Result<()> {
+fn validate_volume_guid(value: &str) -> io::Result<()> {
     let bytes = value.as_bytes();
     let valid = bytes.len() == 48
         && value
@@ -427,7 +368,12 @@ fn scan_directories_page(
             }
             let record = &output[offset..offset + length];
             record_directory_changes(
-                record, &parents, cursor, end_usn, &mut changes, &mut name_units,
+                record,
+                &parents,
+                cursor,
+                end_usn,
+                &mut changes,
+                &mut name_units,
             )?;
             let added: usize = changes
                 .iter()
@@ -545,9 +491,11 @@ fn record_directory_changes(
             ));
         }
         name_units.clear();
-        name_units.extend(record[offset..offset + length]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])));
+        name_units.extend(
+            record[offset..offset + length]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+        );
         let name = String::from_utf16(name_units)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid USN UTF-16"))?;
         if name.contains(['/', '\\']) || name == "." || name == ".." || name.contains('\0') {
@@ -859,21 +807,55 @@ mod tests {
                 row[length_offset + 2..length_offset + 4]
                     .copy_from_slice(&(base as u16).to_le_bytes());
                 row.extend_from_slice(&encoded);
-                record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units).unwrap();
+                record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units)
+                    .unwrap();
                 assert_eq!(changes, vec![(1, String::new()), (0, name.to_owned())]);
-                record_directory_changes(&row, &parents, 99, 100, &mut changes, &mut name_units).unwrap();
+                record_directory_changes(&row, &parents, 99, 100, &mut changes, &mut name_units)
+                    .unwrap();
                 assert!(changes.is_empty());
                 row[base..base + 2].copy_from_slice(&0xdc00u16.to_le_bytes());
-                assert!(record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units).is_err());
+                assert!(record_directory_changes(
+                    &row,
+                    &parents,
+                    100,
+                    101,
+                    &mut changes,
+                    &mut name_units
+                )
+                .is_err());
                 row[length_offset..length_offset + 2].copy_from_slice(&1u16.to_le_bytes());
-                assert!(record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units).is_err());
+                assert!(record_directory_changes(
+                    &row,
+                    &parents,
+                    100,
+                    101,
+                    &mut changes,
+                    &mut name_units
+                )
+                .is_err());
             }
         }
         let mut nameless = record(4, 33, 100, 1);
         nameless[24..40].copy_from_slice(&11u128.to_le_bytes());
-        assert!(record_directory_changes(&nameless, &parents, 100, 101, &mut changes, &mut name_units).is_err());
+        assert!(record_directory_changes(
+            &nameless,
+            &parents,
+            100,
+            101,
+            &mut changes,
+            &mut name_units
+        )
+        .is_err());
         nameless[4..6].copy_from_slice(&5u16.to_le_bytes());
-        assert!(record_directory_changes(&nameless, &parents, 100, 101, &mut changes, &mut name_units).is_err());
+        assert!(record_directory_changes(
+            &nameless,
+            &parents,
+            100,
+            101,
+            &mut changes,
+            &mut name_units
+        )
+        .is_err());
     }
 
     #[test]
@@ -903,12 +885,17 @@ mod tests {
         let mut pages = 0;
         while cursor < end_usn {
             let page = scan_directories_page(
-                42, &[11u128.to_le_bytes(), 22u128.to_le_bytes()], cursor, end_usn,
+                42,
+                &[11u128.to_le_bytes(), 22u128.to_le_bytes()],
+                cursor,
+                end_usn,
                 |start, output| {
                     let mut index = (start - 1) as usize;
                     let mut used = 8;
                     while let Some(row) = records.get(index) {
-                        if used + row.len() > output.len() { break; }
+                        if used + row.len() > output.len() {
+                            break;
+                        }
                         output[used..used + row.len()].copy_from_slice(row);
                         used += row.len();
                         index += 1;
@@ -916,10 +903,17 @@ mod tests {
                     output[..8].copy_from_slice(&(index as i64 + 1).to_le_bytes());
                     Ok(used)
                 },
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(page.journal_id, 42);
             assert!(page.next_usn > cursor && page.next_usn <= end_usn);
-            assert!(page.changes.iter().map(|(_, name)| 8 + name.len()).sum::<usize>() <= RECOVERY_PAGE_BYTES);
+            assert!(
+                page.changes
+                    .iter()
+                    .map(|(_, name)| 8 + name.len())
+                    .sum::<usize>()
+                    <= RECOVERY_PAGE_BYTES
+            );
             actual.extend(page.changes);
             cursor = page.next_usn;
             pages += 1;

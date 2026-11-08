@@ -182,7 +182,7 @@ def test_config_directory_handle_is_tracked_without_blocking_promotion(tmp_path)
             item["kind"] == "config_directory" and item["promotion_blocking"] is False
             for item in resources
         )
-        assert list(native_wait_for_resources([str(archive)], 0.0)) == []
+        assert list(native_wait_for_resources([str(archive)], True)) == []
 
         # A passive listener can be opened while an archive's promotion gate
         # is held; neither the existing nor the new listener blocks it.
@@ -197,7 +197,7 @@ def test_config_directory_handle_is_tracked_without_blocking_promotion(tmp_path)
         # Ordinary file handles still participate in the promotion barrier.
         session = NativeArchiveSession(str(archive))
         try:
-            blockers = [dict(item) for item in native_wait_for_resources([str(archive)], 0.0)]
+            blockers = [dict(item) for item in native_wait_for_resources([str(archive)], True)]
             assert any(
                 item["kind"] == "reader_file" and item["promotion_blocking"] is True
                 for item in blockers

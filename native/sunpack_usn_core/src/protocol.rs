@@ -17,7 +17,6 @@ pub enum Opcode {
     ReadChangeReasons = 3,
     Ping = 4,
     Release = 5,
-    ReadRootChanges = 6,
     ReadDirectoriesChanges = 7,
 }
 
@@ -31,7 +30,6 @@ impl TryFrom<u16> for Opcode {
             3 => Ok(Self::ReadChangeReasons),
             4 => Ok(Self::Ping),
             5 => Ok(Self::Release),
-            6 => Ok(Self::ReadRootChanges),
             7 => Ok(Self::ReadDirectoriesChanges),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

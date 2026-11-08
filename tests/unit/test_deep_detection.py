@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack.core.analysis.embedded.result import EmbeddedCandidate, EmbeddedScanResult
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate, StageResult
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
@@ -98,7 +97,7 @@ def _candidate(path):
 
 def _project_scan(candidate, scan):
     result = StageResult()
-    EmbeddedDiscovery({})._discover_into(result, candidate, scan.to_dict())
+    EmbeddedDiscovery({})._discover_into(result, candidate, scan)
     result.validate()
     return result
 
@@ -133,9 +132,9 @@ def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_p
         route=candidate.route,
         size=32,
     )
-    scan = EmbeddedScanResult(
+    scan = dict(
         complete=True,
-        candidates=(EmbeddedCandidate(
+        candidates=(dict(
             format="gzip", offset=0, end_offset=40,
             validation="gzip_stream", candidate_kind="logical_archive",
             boundary_kind="exact", extractable=True,
@@ -152,10 +151,10 @@ def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_p
 def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"x" * 128)
-    scan = EmbeddedScanResult(
+    scan = dict(
         complete=True,
         candidates=(
-            EmbeddedCandidate(
+            dict(
                 format="7z",
                 offset=16,
                 end_offset=None,
@@ -193,10 +192,10 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path):
 def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path):
     path = tmp_path / "archive.7z.001"
     path.write_bytes(b"x" * 128)
-    scan = EmbeddedScanResult(
+    scan = dict(
         complete=True,
         candidates=(
-            EmbeddedCandidate(
+            dict(
                 format="7z",
                 offset=0,
                 end_offset=None,
@@ -235,10 +234,10 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path):
 def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monkeypatch, status):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"x" * 160)
-    scan = EmbeddedScanResult(
+    scan = dict(
         complete=True,
         candidates=(
-            EmbeddedCandidate(
+            dict(
                 format="zip",
                 offset=8,
                 end_offset=32,
@@ -247,7 +246,7 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
                 boundary_kind="exact",
                 extractable=True,
             ),
-            EmbeddedCandidate(
+            dict(
                 format="rar",
                 offset=40,
                 end_offset=None,
@@ -256,7 +255,7 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
                 boundary_kind="unresolved",
                 extractable=False,
             ),
-            EmbeddedCandidate(
+            dict(
                 format="7z",
                 offset=96,
                 end_offset=144,
@@ -274,7 +273,7 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
         budget_exhausted=False,
     )
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
+        "sunpack.pipeline.discovery.embedded.discovery.resolve_embedded_rar_boundaries",
         lambda _path, _offsets, _passwords: {
             "status": status,
             "failed_offset": 40,

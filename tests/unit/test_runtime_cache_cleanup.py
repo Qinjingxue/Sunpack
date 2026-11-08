@@ -14,7 +14,6 @@ from sunpack.core.support.archive_knowledge_projection import (
     source_fingerprint,
 )
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge
-from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
 from sunpack.core.support.runtime_cache_cleanup import (
     clear_all_runtime_caches,
     runtime_cache_stats,
@@ -30,10 +29,8 @@ _TEST_LOOP = asyncio.new_event_loop()
 
 @pytest.fixture(autouse=True)
 def _reset_process_caches():
-    GLOBAL_CACHE.clear_all()
     clear_relation_probe_cache()
     yield
-    GLOBAL_CACHE.clear_all()
     clear_relation_probe_cache()
 
 
@@ -42,7 +39,6 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
 
     # Existing cleanup checks miss process-wide native regex search pools.
     assert relations_logical_name("中文.part2.rar", True) == "中文"
-    GLOBAL_CACHE.set("runtime-cache-test", ("key",), {"payload": "value"})
     archive_path = tmp_path / "archive.zip"
     archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
     task = make_archive_task(archive_path, format_hint="zip")
@@ -55,17 +51,14 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
     attempt_cache.remember_negative("fingerprint", "wrong")
 
     stats = runtime_cache_stats()
-    assert stats["global_cache"]["entries"] >= 1
     assert stats["relation_probe_cache"] == {"successes": 1, "negative": 1}
     assert "inspection" not in stats
     assert stats["reader"]["relation_regex_cache_entries"] > 0
 
     report = clear_all_runtime_caches()
 
-    assert report["global_cache"]["entries"] >= 1
     assert report["relation_probe_cache"] == {"successes": 1, "negative": 1}
     assert "inspection" not in report
-    assert GLOBAL_CACHE.stats()["entries"] == 0
     assert source_fingerprint(task)
     assert report["errors"] == []
     assert report["archive_sessions"]["reader"]["relation_regexes"] > 0
@@ -515,8 +508,8 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
         host._watch_task = SimpleNamespace(done=lambda: False)
 
         await host.foreground_started()
-        GLOBAL_CACHE.set("foreground-lifecycle", ("key",), {"payload": "value"})
-        assert runtime_cache_stats()["global_cache"]["entries"] >= 1
+        _shared_attempt_cache().remember_success("fingerprint", "password")
+        assert runtime_cache_stats()["relation_probe_cache"]["successes"] == 1
 
         await host.foreground_finished()
         assert watcher._cache_cleanup_deadline is not None
@@ -527,7 +520,6 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
 
         stats = runtime_cache_stats()
         assert engine.clear_calls == 1
-        assert stats["global_cache"]["entries"] == 0
         assert stats["relation_probe_cache"] == {"successes": 0, "negative": 0}
 
     asyncio.run(scenario())

@@ -31,8 +31,8 @@ void projection(Fixture& f) {
     EventLog log; log.set_path(p); assert(log.refresh()); assert(!log.refresh());
     View view; std::unordered_set<std::string> ids; size_t pages=0;
     for(;;) {
-        auto result=task_rows(log,{},view);
-        assert(result["rows"].size()<=100 && log.tasks.empty());
+        auto result=log.query({},view);
+        assert(result["rows"].size()<=100);
         for(auto& row:result["rows"]) assert(ids.insert(row["id"].get<std::string>()).second);
         ++pages;
         if(!result["hasMore"].get<bool>()) break;
@@ -40,9 +40,9 @@ void projection(Fixture& f) {
     }
     assert(ids.size()==350 && pages==4);
     view.task_cursor.clear(); view.task_query="carrier-349";
-    assert(task_rows(log,{},view)["total"]==1);
+    assert(log.query({},view)["total"]==1);
     log.cancelled=[]{return true;}; view.task_query="not-present";
-    assert(task_rows(log,{},view).is_null()); log.cancelled={};
+    assert(log.query({},view).is_null()); log.cancelled={};
     // A background rebuild can reuse both counters. Ordinary appends cannot
     // detect stale cards in that case; reuse this disk fixture at negligible cost.
     auto before=log.manifest;
@@ -52,20 +52,20 @@ void projection(Fixture& f) {
     atomic_write(p,replaced.dump());
     assert(log.refresh());
     view.task_query.clear();
-    assert(task_rows(log,{},view)["rows"][0]["name"]==utf8(source.filename().wstring()));
+    assert(log.query({},view)["rows"][0]["name"]==utf8(source.filename().wstring()));
     // Live storage replacement has the same contract even when runs stay fixed.
     replaced["live"]=replaced["runs"][0]; replaced["runs"]=Json::array();
     atomic_write(p,replaced.dump()); assert(log.refresh());
     publish_events(p,"");
     auto empty=read_json(p); replaced["live"]=empty["runs"][0];
     atomic_write(p,replaced.dump()); assert(log.refresh());
-    assert(task_rows(log,{},view)["rows"].empty());
+    assert(log.query({},view)["rows"].empty());
     // A writer starting after the initial read used to produce an apparently
     // valid empty/partial page. Pre-read conflict tests cannot catch removal
     // of the final revision check; reuse this single-row disk fixture.
     publish_events(p,event("failed_password",source,1),Json::array(),true);
     assert(log.refresh());
-    auto stable=task_rows(log,{},view);
+    auto stable=log.query({},view);
     auto revision=log.manifest["task_revision"].get<uint64_t>();
     auto index=p.parent_path()/(p.filename().wstring()+L".store")/(log.manifest["live"]["name"].get<std::string>()+".index");
     auto mark=[&](uint64_t value) { std::fstream file(index,std::ios::binary|std::ios::in|std::ios::out); file.write(reinterpret_cast<const char*>(&value),sizeof(value)); assert(file); };
@@ -73,31 +73,31 @@ void projection(Fixture& f) {
         view.task_query=query;
         log.cancelled=[&]{mark(0); return false;};
         bool conflict=false;
-        try { task_rows(log,{},view); }
+        try { log.query({},view); }
         catch(const WinError& error) { conflict=error.code==ERROR_SHARING_VIOLATION; }
         assert(conflict);
         log.cancelled={}; mark(revision);
     }
-    view.task_query.clear(); assert(task_rows(log,{},view)==stable);
+    view.task_query.clear(); assert(log.query({},view)==stable);
     fs::remove(p); fails([&]{log.refresh();}); log.refresh(true); assert(log.manifest.is_null());
     // Numeric UTC epochs display in local wall time. TZ is process-only.
-    EventLog timestamps;
+    auto publish=[&](const Json& value) { publish_events(p,value.dump()+"\n"); assert(log.refresh()); };
     char* previous=nullptr; size_t count=0; _dupenv_s(&previous,&count,"TZ");
     std::string old_zone=previous?previous:""; std::free(previous);
     _putenv_s("TZ","UTC-8"); _tzset();
-    timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",1792401342.731112}});
-    auto time_row=task_rows(timestamps,{},{}).at("rows").at(0);
+    publish(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",1792401342.731112}});
+    auto time_row=log.query({},{}).at("rows").at(0);
     assert(time_row["time"]=="2026-10-19 17:15:42");
     View time_view;time_view.task_query="2026-10-19 17:15";
-    assert(task_rows(timestamps,{},time_view)["rows"].size()==1);
+    assert(log.query({},time_view)["rows"].size()==1);
     assert(!time_row.contains("details"));
     for(auto value:{Json(),Json("invalid"),Json(std::numeric_limits<double>::infinity())}) {
-        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",value}});
-        assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")=="");
-        assert(task_rows(timestamps,{},time_view)["rows"].empty());
+        publish(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",value}});
+        assert(log.query({},{}).at("rows").at(0).at("time")=="");
+        assert(log.query({},time_view)["rows"].empty());
     }
-    timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",0}});
-    assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")=="1970-01-01 08:00:00");
+    publish(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",0}});
+    assert(log.query({},{}).at("rows").at(0).at("time")=="1970-01-01 08:00:00");
     _putenv_s("TZ",old_zone.c_str()); _tzset();
 
     // Resolve navigation from the same projected row at activation, including
@@ -105,20 +105,19 @@ void projection(Fixture& f) {
     auto monitor=f.dir/L"监控", nested=monitor/L"子目录", output=f.dir/L"输出";
     fs::create_directories(nested); fs::create_directory(output);
     auto file=nested/L"已删除的载体.001";
-    EventLog navigation; // Direct model events exercise navigation separately from file trust.
     WatchRoots roots; roots.entries={{f.dir,"",false},{monitor,"",false}};
-    navigation.accept(Json{{"event","done"},{"path",utf8(file.wstring())},{"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}});
-    auto row=task_rows(navigation,roots,{}).at("rows").at(0);
+    publish(Json{{"event","done"},{"path",utf8(file.wstring())},{"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}});
+    auto row=log.query(roots,{}).at("rows").at(0);
     assert(row["root"]==utf8(monitor.wstring()));
     assert(row["directory"]==utf8(nested.wstring()));
     assert(task_directory(row)==output);
     fs::remove(output);
     assert(task_directory(row)==monitor);
-    auto old_root=task_rows(navigation,{},{}).at("rows").at(0);
+    auto old_root=log.query({},{}).at("rows").at(0);
     assert(old_root["directory"]==row["directory"]);
     assert(task_directory(old_root)==nested);
-    navigation.accept(Json{{"event","failed_password"},{"path",utf8(file.wstring())}});
-    assert(task_directory(task_rows(navigation,roots,{}).at("rows").at(0))==monitor);
+    publish(Json{{"event","failed_password"},{"path",utf8(file.wstring())}});
+    assert(task_directory(log.query(roots,{}).at("rows").at(0))==monitor);
     fs::remove(nested); fs::remove(monitor);
     fails([&]{task_directory(row);});
 }
@@ -345,47 +344,8 @@ void roots(Fixture& f) {
     assert(path_key(L"C:/İ/中文/../A")==path_key(L"c:\\İ\\a"));
     assert(path_key(L"C:/Data/")==path_key(L"c:\\data"));
     assert(!is_under(path_key(L"C:/Data2/a"),path_key(L"C:/Data")));
-    View view;
-    EventLog log;
-    for(int i=0;i<501;++i) {
-        all.entries.push_back({f.dir/std::to_wstring(i),"",false});
-        log.accept(Json({{"event","done"},{"path",utf8((f.dir/std::to_wstring(i)/"file").wstring())},{"ts",i}}));
-    }
-    auto rows=task_rows(log,all,view); assert(rows["total"]==501 && rows["rows"].size()==501 && !rows.contains("pages"));
-    // Identical membership and ordering may reuse the previous UI state,
-    // without keeping a second JSON copy. A narrower filter must rebuild.
-    std::vector<std::wstring> first_ids, second_ids;
-    TaskProjectionStats phases;
-    auto first=task_rows(log,all,view,"zh",&first_ids,nullptr,&phases);
-    assert(first==rows && first_ids.size()==501 && phases.selected==501 && !phases.reused);
-    assert(task_rows(log,all,view,"zh",&second_ids,&first_ids,&phases).is_null());
-    assert(phases.reused && first_ids==second_ids);
-    view.task_query="file-no-match";
-    assert(task_rows(log,all,view,"zh",&second_ids,&first_ids,&phases)["total"]==0);
-    assert(!phases.reused);
-    view.task_query.clear();
+    for(int i=0;i<501;++i) all.entries.push_back({f.dir/std::to_wstring(i),"",false});
     assert(directory_rows(all,Json::object()).size()==503);
-    auto changed_path=utf8((f.dir/L"0"/L"file").wstring());
-    log.accept(Json{{"event","failed_terminal"},{"path",changed_path},{"ts",99999}});
-    // Cached formatting must follow actual task modifications even when the
-    // task's ordering sequence is not changed (regrouping is such a case).
-    auto cached_first=task_rows(log,all,view);
-    auto& changed=log.tasks.at(path_key(wide(changed_path)));
-    auto original_path=changed.path;
-    const auto original_timestamp=changed.timestamp;
-    changed.path=utf8((f.dir/L"新名字"/"patched.zip").wstring());
-    changed.timestamp=1234;
-    auto cached_second=task_rows(log,all,view);
-    assert(cached_second["rows"][0]["directory"]==utf8((f.dir/L"新名字").wstring()));
-    assert(cached_second["rows"][0]["time"]!=cached_first["rows"][0]["time"]);
-    // Restore both source values before comparing with the earlier delta.
-    changed.path=original_path;
-    changed.timestamp=original_timestamp;
-    auto latest=task_rows(log,all,view);
-    assert(latest["rows"][0]["status"]=="taskFailed");
-    view.task_status="taskSucceeded";
-    auto filtered=task_rows(log,all,view);
-    assert(std::none_of(filtered["rows"].begin(),filtered["rows"].end(),[&](const auto& row){return row["path"]==changed_path;}));
 }
 void batch_editing(Fixture& fixture) {
     auto dir=fixture.dir/"batch"; fs::create_directory(dir);
@@ -500,7 +460,7 @@ int wmain(int argc,wchar_t** argv) {
             WatchRoots roots;
             if(argc>5 && *argv[5]) { view.task_root=utf8(argv[5]); roots.entries.push_back({fs::path(argv[5]),"",false}); }
             if(argc>6) view.task_status=utf8(argv[6]);
-            std::cout<<Json{{"tasks",task_rows(log,roots,view)}}.dump(); return 0;
+            std::cout<<Json{{"tasks",log.query(roots,view)}}.dump(); return 0;
         } catch(const WinError& error) { std::cerr<<error.what()<<"\n"; return int(error.code); }
     }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }

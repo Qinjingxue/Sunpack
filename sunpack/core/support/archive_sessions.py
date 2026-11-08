@@ -31,7 +31,8 @@ _CHANGED = threading.Condition(_LOCK)
 
 @dataclass
 class _SessionEntry:
-    key: tuple[str, str]
+    path: str
+    generation: str
     session: NativeArchiveSession
     borrowers: set[str] = field(default_factory=set)
     process_lease: ResourceLease | None = None
@@ -39,7 +40,7 @@ class _SessionEntry:
     closed: bool = False
 
 
-_SESSIONS: OrderedDict[tuple[str, str], _SessionEntry] = OrderedDict()
+_SESSIONS: OrderedDict[str, _SessionEntry] = OrderedDict()
 _CURRENT_SESSIONS: contextvars.ContextVar[weakref.WeakValueDictionary[str, _SessionEntry] | None] = (
     contextvars.ContextVar("sunpack_archive_session_scope", default=None)
 )
@@ -63,12 +64,6 @@ def archive_session_scope():
         _CURRENT_SESSIONS.reset(token)
 
 
-def _native_close(owner: Any) -> None:
-    close = getattr(owner, "close", None)
-    if close is not None:
-        close()
-
-
 def _release_borrow(entry: _SessionEntry, task_id: str) -> None:
     with _CHANGED:
         entry.borrowers.discard(task_id)
@@ -85,7 +80,7 @@ def _attach_task_borrow_locked(entry: _SessionEntry) -> None:
     task_id = scope.task_id
     scope.register(
         entry.session,
-        (entry.key[0],),
+        (entry.path,),
         lambda entry=entry, task_id=task_id: _release_borrow(entry, task_id),
         kind=ResourceKind.ARCHIVE_SESSION_BORROW,
         registration_held=True,
@@ -101,7 +96,7 @@ def _close_entry(entry: _SessionEntry) -> None:
             _CHANGED.wait()
         if entry.closed:
             return
-    _native_close(entry.session)
+    entry.session.close()
     with _CHANGED:
         entry.closed = True
         _CHANGED.notify_all()
@@ -142,56 +137,55 @@ def _get_archive_session(
 ) -> NativeArchiveSession:
     normalized = os.path.abspath(os.path.normpath(path))
     stale_entries: list[_SessionEntry] = []
-    duplicate: NativeArchiveSession | None = None
-    with lifecycle_registration((normalized,)):
-        operation_sessions = _CURRENT_SESSIONS.get()
-        operation_key = absolute_path_key(normalized)
-        if operation_sessions is not None:
-            with _CHANGED:
-                entry = operation_sessions.get(operation_key)
-                if (
-                    entry is not None and not entry.retired and not entry.closed
-                    and _SESSIONS.get(entry.key) is entry
-                ):
-                    _SESSIONS.move_to_end(entry.key)
-                    _attach_borrow_locked(entry, borrow_token, leases)
-                    return entry.session
-        # Rust validates the current path against an opened physical file and
-        # retains the pooled reader/cache only for the same generation.
-        session = NativeArchiveSession(normalized)
-        key = (normalized, session.generation_token)
-        with _CHANGED:
-            existing = _SESSIONS.get(key)
-            if existing is not None and not existing.retired:
-                entry = existing
-                duplicate = session
-                _SESSIONS.move_to_end(key)
-                _attach_borrow_locked(existing, borrow_token, leases)
-                result = existing.session
-            else:
-                stale_keys = [item for item in _SESSIONS if item[0] == key[0] and item != key]
-                stale_entries.extend(_SESSIONS.pop(item) for item in stale_keys)
-                entry = _SessionEntry(key=key, session=session)
-                entry.process_lease = register_process_cache_resource(
-                    session,
-                    (key[0],),
-                    lambda entry=entry: _close_entry(entry),
-                    kind=ResourceKind.NATIVE_ARCHIVE_SESSION,
-                    registration_held=True,
-                )
-                _SESSIONS[key] = entry
-                _attach_borrow_locked(entry, borrow_token, leases)
-                while len(_SESSIONS) > _MAX_SESSIONS:
-                    _old_key, old_entry = _SESSIONS.popitem(last=False)
-                    stale_entries.append(old_entry)
-                result = session
+    unowned: NativeArchiveSession | None = None
+    try:
+        with lifecycle_registration((normalized,)):
+            operation_sessions = _CURRENT_SESSIONS.get()
             if operation_sessions is not None:
-                operation_sessions[operation_key] = entry
-
-    if duplicate is not None:
-        _native_close(duplicate)
-    _retire_entries(stale_entries)
-    return result
+                operation_key = absolute_path_key(normalized)
+                with _CHANGED:
+                    entry = operation_sessions.get(operation_key)
+                    if (
+                        entry is not None and not entry.retired and not entry.closed
+                        and _SESSIONS.get(entry.path) is entry
+                    ):
+                        _SESSIONS.move_to_end(entry.path)
+                        _attach_borrow_locked(entry, borrow_token, leases)
+                        return entry.session
+            # Rust validates the current path against an opened physical file and
+            # retains the pooled reader/cache only for the same generation.
+            session = unowned = NativeArchiveSession(normalized)
+            generation = session.generation_token
+            with _CHANGED:
+                existing = _SESSIONS.get(normalized)
+                if existing is not None and existing.generation == generation and not existing.retired:
+                    entry = existing
+                else:
+                    entry = _SessionEntry(path=normalized, generation=generation, session=session)
+                    entry.process_lease = register_process_cache_resource(
+                        session,
+                        (normalized,),
+                        lambda entry=entry: _close_entry(entry),
+                        kind=ResourceKind.NATIVE_ARCHIVE_SESSION,
+                        registration_held=True,
+                    )
+                    unowned = None
+                    if existing is not None:
+                        stale_entries.append(existing)
+                    _SESSIONS[normalized] = entry
+                _SESSIONS.move_to_end(normalized)
+                while len(_SESSIONS) > _MAX_SESSIONS:
+                    _old_path, old_entry = _SESSIONS.popitem(last=False)
+                    stale_entries.append(old_entry)
+                _attach_borrow_locked(entry, borrow_token, leases)
+                if operation_sessions is not None:
+                    operation_sessions[operation_key] = entry
+                return entry.session
+    finally:
+        if unowned is not None:
+            unowned.close()
+        if stale_entries:
+            _retire_entries(stale_entries)
 
 
 def _attach_borrow_locked(
@@ -206,7 +200,7 @@ def _attach_borrow_locked(
     scope = current_task_resource_scope()
     lease = register_resource(
         entry.session,
-        (entry.key[0],),
+        (entry.path,),
         lambda: _release_borrow(entry, borrow_token),
         kind=ResourceKind.ARCHIVE_SESSION_BORROW,
         task_id=scope.task_id if scope is not None else borrow_token,
@@ -274,12 +268,12 @@ def release_archive_sessions_under_roots(
         # The session pool is bounded. Normalize each session once and let the
         # builtin prefix check compare its key without repeated native crossings.
         stale = [
-            key
-            for key in _SESSIONS
-            if (normalized := absolute_path_key(key[0])) in root_keys
+            path
+            for path in _SESSIONS
+            if (normalized := absolute_path_key(path)) in root_keys
             or normalized.startswith(prefixes)
         ]
-        entries = [_SESSIONS.pop(key) for key in stale]
+        entries = [_SESSIONS.pop(path) for path in stale]
     sessions = _close_entries(entries)
     reader = dict(sunpack_native.release_reader_resources_under_roots(list(roots)))
     return {"sessions": sessions, "reader": reader}

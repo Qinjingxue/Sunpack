@@ -1,10 +1,14 @@
 #include "model.hpp"
+#include "presentation.hpp"
 #include "lz4.h"
 #include <array>
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <tuple>
 #include <streambuf>
 #include <istream>
@@ -12,11 +16,37 @@ extern "C" NTSYSAPI WCHAR NTAPI RtlDowncaseUnicodeChar(WCHAR);
 
 namespace spg {
 namespace {
+// Longest directory-prefix match by walking up the task path, not by scanning
+// every watch root for every task. Normalized keys retain the existing NT
+// case-folding/UNC rules; trimming the final separator also handles C:\\ roots.
+using RootIndex=std::unordered_map<std::wstring,std::string>;
+RootIndex index_roots(const WatchRoots& roots) {
+    RootIndex index; index.reserve(roots.entries.size());
+    for(const auto& root:roots.entries) {
+        auto key=path_key(root.input);
+        while(!key.empty() && (key.back()==L'\\' || key.back()==L'/')) key.pop_back();
+        index.emplace(std::move(key),utf8(root.input.wstring()));
+    }
+    return index;
+}
+std::string indexed_root(const std::wstring& key,const RootIndex& index) {
+    std::wstring current=key;
+    while(!current.empty() && (current.back()==L'\\' || current.back()==L'/')) current.pop_back();
+    while(!current.empty()) {
+        auto found=index.find(current);
+        if(found!=index.end()) return found->second;
+        auto separator=current.find_last_of(L"\\/");
+        if(separator==std::wstring::npos) break;
+        current.resize(separator);
+    }
+    return "@other";
+}
 // See io/display_store.rs. Little-endian, 64 bytes per entry; no archive I/O.
 constexpr size_t EntryBytes=64, PageRows=100, PageBytes=8*1024*1024;
 struct Entry { int64_t time; uint64_t offset; uint32_t compressed,raw,kind,reserved; uint64_t bits[4]; };
 static_assert(sizeof(Entry)==EntryBytes);
-using Cursor=std::tuple<int64_t,std::string,uint64_t>;
+// Run names are immutable and owned by the readers for the whole query.
+using Cursor=std::tuple<int64_t,std::string_view,uint64_t>;
 std::wstring folded(const std::string& value) {
     auto text=wide(value); for(auto& ch:text) ch=RtlDowncaseUnicodeChar(ch); return text;
 }
@@ -86,7 +116,7 @@ struct RunReader {
     Entry current{};
     std::vector<Entry> cache;
     bool unordered=false, filtered=false;
-    std::vector<std::pair<Cursor,Entry>> selected;
+    std::vector<Entry> selected;
     uint64_t cache_start=0;
     RunReader(const fs::path& folder,const Json& run,const std::optional<Cursor>& before,uint64_t revision):name(run_name(run)),
         data_path(folder/(name+".data")),index(open_reader(folder/(name+".index"))),revision(revision) {
@@ -121,8 +151,8 @@ struct RunReader {
         }
         return cache[size_t(pos-cache_start)];
     }
-    Cursor key() const { if(filtered) return selected[size_t(position)].first; return {current.time,name,unordered?current.offset:uint64_t(position)}; }
-    void previous() { if(position<=int64_t(filtered?0:head)) position=-1; else { --position; current=filtered?selected[size_t(position)].second:at(uint64_t(position)); } }
+    Cursor key() const { return {current.time,name,unordered?current.offset:uint64_t(position)}; }
+    void previous() { if(position<=int64_t(filtered?0:head)) position=-1; else { --position; current=filtered?selected[size_t(position)]:at(uint64_t(position)); } }
     Json value(std::vector<char>& packed,std::vector<char>& raw) {
         try { return decode_value(packed,raw); }
         catch(...) {
@@ -159,7 +189,8 @@ struct RunReader {
 bool matches(const Json& value,const std::wstring& query,const std::string& time_query) {
     if(query.empty()) return true;
     auto contains=[&](const Json& v) { return v.is_string() && folded(v.get_ref<const std::string&>()).find(query)!=std::wstring::npos; };
-    if(contains(value.value("path",Json()))) return true;
+    auto path=value.find("path");
+    if(path!=value.end() && contains(*path)) return true;
     auto ts=value.find("ts");
     if(!time_query.empty() && ts!=value.end() && ts->is_number() && task_time(ts->get<double>()).find(time_query)!=std::string::npos) return true;
     if(value.contains("group")) {
@@ -172,11 +203,89 @@ bool matches(const Json& value,const std::wstring& query,const std::string& time
     }
     return false;
 }
+Json project_task(const Json& value,const RootIndex& roots,const std::string& language,
+    std::unordered_map<std::string,std::string>& labels,size_t sequence) {
+    auto input=value.find("path"), event_name=value.find("event");
+    if(input==value.end() || !input->is_string() || event_name==value.end() || !event_name->is_string()) return Json();
+    const auto& path=input->get_ref<const std::string&>();
+    if(path.empty()) return Json();
+    const auto& event=event_name->get_ref<const std::string&>();
+    const char* status;
+    const char* tone;
+    const char* label;
+    if(event=="processing_started") {
+        label=status="taskProcessing"; tone="info";
+    } else if(event=="failed_password" || event=="suspended_missing_volume") {
+        status="taskWaiting"; tone="waiting";
+        label=event=="failed_password"?"taskWaitingPassword":"taskWaitingVolumes";
+    } else if(event=="done") {
+        label=status="taskSucceeded"; tone="success";
+    } else if(event=="failed_terminal" || event=="partial_rejected") {
+        label=status="taskFailed"; tone="failure";
+    } else return Json();
+    auto translate=[&](const std::string& key) -> const std::string& {
+        auto [at,inserted]=labels.try_emplace(key);
+        if(inserted) at->second=tr(key,language);
+        return at->second;
+    };
+
+    const auto group=value.find("group");
+    const bool grouped=group!=value.end() && group->is_object();
+    auto display_path=grouped?group->value("path",path):path;
+    const fs::path source=wide(display_path);
+    auto id=value.value("task_id",std::string());
+    if(id.empty()) id=utf8(path_key(wide(path)));
+    auto parts=Json::array();
+    if(grouped && group->contains("members") && (*group)["members"].is_array()) {
+        std::unordered_set<std::wstring> seen;
+        for(const auto& member:(*group)["members"]) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
+            const fs::path part=wide(member.get_ref<const std::string&>());
+            if(seen.insert(path_key(part)).second) parts.push_back(utf8(part.filename().wstring()));
+        }
+    }
+    if((grouped && group->value("multipart",false)) || parts.size()>1 || event=="suspended_missing_volume") {
+        if(parts.empty()) parts.push_back(utf8(fs::path(wide(path)).filename().wstring()));
+    } else parts.clear();
+
+    std::string error,error_type;
+    if(status==std::string_view("taskFailed")) {
+        auto text=value.find("error"), kind=value.find("error_kind");
+        if(text!=value.end() && text->is_string()) error=text->get<std::string>();
+        if(kind!=value.end() && kind->is_string()) error_type=kind->get<std::string>();
+        if(!error.empty() || !error_type.empty()) {
+            const auto key="taskError_"+(error_type.empty()?std::string("unknown"):error_type);
+            const auto& translated=translate(key);
+            error_type=translated==key?translate("taskError_unknown"):translated;
+        }
+    }
+    auto outputs=Json::array();
+    if(value.contains("output_dirs") && value["output_dirs"].is_array())
+        for(const auto& output:value["output_dirs"])
+            if(output.is_string() && !output.get_ref<const std::string&>().empty()) outputs.push_back(output);
+    const auto ts=value.find("ts");
+    const auto timestamp=ts!=value.end() && ts->is_number()?ts->get<double>():std::numeric_limits<double>::quiet_NaN();
+    return {{"id",std::move(id)},{"name",utf8(source.filename().wstring())},{"directory",utf8(source.parent_path().wstring())},
+        {"path",std::move(display_path)},{"root",indexed_root(path_key(source),roots)},{"status",status},
+        {"statusText",translate(label)},{"time",task_time(timestamp)},{"statusTone",tone},{"parts",std::move(parts)},
+        {"error",std::move(error)},{"errorType",std::move(error_type)},{"outputs",std::move(outputs)},
+        {"sortTimestamp",std::isfinite(timestamp)?timestamp:0.0},{"sortSequence",sequence}};
+}
+
+}
+std::string root_for(const fs::path& path,const WatchRoots& roots) {
+    return indexed_root(path_key(path),index_roots(roots));
 }
 Json EventLog::query(const WatchRoots& roots,const View& view,const std::string& language) const {
+    if(manifest.is_null()) return {{"rows",Json::array()},{"total",0},{"hasMore",false},{"dropped",0},{"next",""}};
+    const auto root_index=index_roots(roots);
     auto folder=path().parent_path()/(path().filename().wstring()+L".store");
+    std::string before_name;
     std::optional<Cursor> before;
-    if(!view.task_cursor.empty()) { auto c=Json::parse(view.task_cursor); before=Cursor{c.at(0).get<int64_t>(),c.at(1).get<std::string>(),c.at(2).get<uint64_t>()}; }
+    if(!view.task_cursor.empty()) {
+        auto cursor=Json::parse(view.task_cursor);
+        before_name=cursor.at(1).get<std::string>();
+        before=Cursor{cursor.at(0).get<int64_t>(),before_name,cursor.at(2).get<uint64_t>()};
+    }
     std::vector<std::unique_ptr<RunReader>> runs;
     auto revision=manifest.value("task_revision",uint64_t(0));
     for(const auto& run:manifest.at("runs")) runs.push_back(std::make_unique<RunReader>(folder,run,before,revision));
@@ -195,7 +304,16 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         return time_match;
     };
     auto root_text=folded(view.task_root); std::replace(root_text.begin(),root_text.end(),L'/',L'\\'); auto root_bits=filter(root_text);
-    EventLog page;
+    Json rows=Json::array();
+    auto& projected=rows.get_ref<Json::array_t&>();
+    projected.reserve(PageRows);
+    std::unordered_set<std::string> ids;
+    std::unordered_map<std::string,std::string> labels;
+    double previous_timestamp=std::numeric_limits<double>::infinity();
+    bool needs_sort=false;
+    auto matches_root=[&](const Json& value) {
+        return view.task_root.empty() || indexed_root(path_key(wide(value.value("path",std::string()))),root_index)==view.task_root;
+    };
     std::optional<Cursor> last;
     std::vector<char> packed,raw;
     size_t bytes=0,scanned=0;
@@ -206,23 +324,24 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         if(live->unordered) {
             // Live slots are mutable. Scan only their compact metadata, keeping
             // at most one page of candidates; historical runs remain seekable.
+            auto earlier=[](const Entry& a,const Entry& b) { return std::tie(a.time,a.offset)<std::tie(b.time,b.offset); };
             while(live->position>=0) {
                 if((++scanned&63)==0 && cancelled && cancelled()) return Json();
                 auto key=live->key(); auto row=live->current;
                 bool possible=row.kind && (!before || key<*before) && (!desired || row.kind==desired) &&
                     (view.task_status!="taskWaiting" || row.kind==2 || row.kind==3) && includes(row,root_bits) && (includes(row,bits) || matches_time(row));
-                if(possible && (live->selected.size()<PageRows+1 || key>live->selected.front().first)) {
+                if(possible && (live->selected.size()<PageRows+1 || earlier(live->selected.front(),row))) {
                     auto value=live->value(packed,raw);
-                    if(matches(value,query,time_query) && (view.task_root.empty() || root_for(wide(value.value("path",std::string())),roots)==view.task_root)) {
-                        auto at=std::lower_bound(live->selected.begin(),live->selected.end(),key,[](const auto& item,const Cursor& key){return item.first<key;});
-                        live->selected.insert(at,{key,row});
+                    if(matches(value,query,time_query) && matches_root(value)) {
+                        auto at=std::lower_bound(live->selected.begin(),live->selected.end(),row,earlier);
+                        live->selected.insert(at,row);
                         if(live->selected.size()>PageRows+1) live->selected.erase(live->selected.begin());
                     }
                 }
                 live->previous();
             }
             live->filtered=true; live->position=int64_t(live->selected.size())-1;
-            if(live->position>=0) live->current=live->selected.back().second;
+            if(live->position>=0) live->current=live->selected.back();
         }
         runs.push_back(std::move(live));
     }
@@ -235,14 +354,15 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         if(!record.kind || (desired && record.kind!=desired) ||
            (view.task_status=="taskWaiting" && record.kind!=2 && record.kind!=3) || !includes(record,root_bits) || (!includes(record,bits) && !matches_time(record))) { selected->previous(); continue; }
         auto value=selected->value(packed,raw);
-        if(!matches(value,query,time_query) || (!view.task_root.empty() && root_for(wide(value.value("path",std::string())),roots)!=view.task_root)) { selected->previous(); continue; }
-        if(page.tasks.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !page.tasks.empty())) { more=true; break; }
-        // These are independent snapshots, not events to merge across owners.
-        // An older family's descriptor must never absorb a current retry card.
-        EventLog item; item.accept(value);
-        for(auto& pair:item.tasks) {
-            pair.second.sequence=PageRows-page.tasks.size();
-            page.tasks.emplace(pair.first,std::move(pair.second));
+        if(!matches(value,query,time_query) || !matches_root(value)) { selected->previous(); continue; }
+        if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
+        // These are independent snapshots. Keep the first card for each ID.
+        auto row=project_task(value,root_index,language,labels,PageRows-projected.size());
+        if(!row.is_null() && ids.insert(row.at("id").get_ref<const std::string&>()).second) {
+            const auto timestamp=row.at("sortTimestamp").get<double>();
+            needs_sort|=timestamp>previous_timestamp;
+            previous_timestamp=timestamp;
+            projected.push_back(std::move(row));
         }
         bytes+=record.raw?record.raw:PageBytes; last=std::move(cursor); selected->previous();
     }
@@ -250,10 +370,13 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     // Even an empty/filtered page can have crossed a live-slot mutation.
     // Reuse the GUI's existing observed-conflict retry, retaining its last page.
     for(const auto& run:runs) run->validate();
-    View selected_view; // Already filtered using complete on-disk member lists.
-    auto result=task_rows(page,roots,selected_view,language);
-    result["hasMore"]=more; result["dropped"]=manifest.value("dropped",uint64_t(0));
-    result["next"]=more && last?Json({std::get<0>(*last),std::get<1>(*last),std::get<2>(*last)}).dump():std::string();
-    return result;
+    // The disk index already orders by microseconds. Distinct display
+    // timestamps in the same index tick can still require a page-local sort.
+    if(needs_sort) std::sort(projected.begin(),projected.end(),[](const Json& a,const Json& b) {
+        return a["sortTimestamp"]!=b["sortTimestamp"]?a["sortTimestamp"]>b["sortTimestamp"]:a["sortSequence"]>b["sortSequence"];
+    });
+    const auto count=projected.size();
+    return {{"rows",std::move(rows)},{"total",count},{"hasMore",more},{"dropped",manifest.value("dropped",uint64_t(0))},
+        {"next",more && last?Json({std::get<0>(*last),std::get<1>(*last),std::get<2>(*last)}).dump():std::string()}};
 }
 }

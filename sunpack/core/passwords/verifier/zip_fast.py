@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sunpack.core.passwords.verifier.base import PasswordBatchVerification, normalize_verifier_status
+from sunpack.core.passwords.verifier.base import PasswordBatchVerification
 from sunpack.core.passwords.verifier.input import PasswordProbeInput, prepare_password_input
 from sunpack_native import zip_fast_verify_passwords_from_ranges, zip_fast_verify_passwords_from_volumes
 
@@ -24,7 +24,7 @@ class ZipFastVerifier:
         if prepared.volumes is not None and prepared.volume_style == "zip_spanned":
             with prepared.borrow_sessions() as sessions:
                 outcome = zip_fast_verify_passwords_from_volumes(prepared.volumes, normalized_passwords, eocd_offset, sessions=sessions)
-            return self._from_outcome(outcome)
+            return PasswordBatchVerification.from_native(outcome, always_confirm=True)
         if prepared.volume_aware:
             return PasswordBatchVerification(
                 ok=False,
@@ -40,25 +40,4 @@ class ZipFastVerifier:
                 else sessions[0].zip_fast_verify_passwords(normalized_passwords, eocd_offset)
             )
 
-        return self._from_outcome(outcome)
-
-    @staticmethod
-    def _from_outcome(outcome: dict) -> PasswordBatchVerification:
-        status = normalize_verifier_status(outcome.get("status"))
-        matched_index = int(outcome.get("matched_index", -1))
-        matched_indices = tuple(int(index) for index in outcome.get("matched_indices") or ())
-        attempts = int(outcome.get("attempts", 0))
-        message = str(outcome.get("message") or "")
-        match_evidence = str(outcome.get("match_evidence") or "")
-        return PasswordBatchVerification(
-            ok=(status == "match" and matched_index >= 0) or status == "not_required",
-            status=status,
-            matched_index=matched_index,
-            matched_indices=matched_indices,
-            attempts=attempts,
-            test_result=outcome,
-            error_text=message.lower(),
-            terminal=status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"},
-            final_confirmation_required=False if status == "not_required" else True,
-            match_evidence=match_evidence,
-        )
+        return PasswordBatchVerification.from_native(outcome, always_confirm=True)

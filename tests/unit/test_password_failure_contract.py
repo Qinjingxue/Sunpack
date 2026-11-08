@@ -14,7 +14,6 @@ from sunpack.core.passwords.verifier import PasswordBatchVerification
 from sunpack.core.passwords.verifier.base import (
     normalize_verifier_status,
 )
-from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
@@ -71,7 +70,7 @@ def test_scheduler_stops_password_batch_on_unavailable_tail_without_negative_res
     assert result.attempts == 0
 
 
-def test_fast_verifier_preserves_native_field_read_diagnostics():
+def test_native_verification_preserves_field_read_diagnostics():
     outcome = {
         "status": "needs_volume_or_tail_damaged",
         "attempts": 0,
@@ -83,7 +82,7 @@ def test_fast_verifier_preserves_native_field_read_diagnostics():
         },
     }
 
-    verification = ZipFastVerifier._from_outcome(outcome)
+    verification = PasswordBatchVerification.from_native(outcome, always_confirm=True)
 
     assert verification.test_result is outcome
     assert verification.test_result["read_error"]["field"] == "zip.eocd"

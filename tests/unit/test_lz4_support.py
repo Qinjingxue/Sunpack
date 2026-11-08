@@ -11,7 +11,8 @@ from sunpack_native import (
     inspect_compression_stream_identity, parse_worker_transport_event,
 )
 from sunpack.core.analysis.engine import AnalysisEngine
-from sunpack.core.analysis.embedded.scanner import scan_embedded_archives
+from sunpack.core.analysis.embedded.result import embedded_scan_prepass
+from sunpack_native import scan_embedded_archives
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
@@ -121,14 +122,14 @@ def test_skippable_prefix_disguised_identity_and_exact_carrier(fixtures, tmp_pat
     assert inspect_compression_stream_identity(str(fixtures / "concat.bin"))["identity_strong"]
     path = fixtures / "carrier.dat"
     scan = scan_embedded_archives(str(path))
-    assert len(scan.candidates) == 1
-    item = scan.candidates[0]
-    assert item.offset == 1031 and item.end_offset == path.stat().st_size - 29
+    assert len(scan["candidates"]) == 1
+    item = scan["candidates"][0]
+    assert item["offset"] == 1031 and item["end_offset"] == path.stat().st_size - 29
     descriptor = ArchiveInputDescriptor(entry_path=str(path), open_mode="file_range", format_hint="lz4",
-        parts=[ArchiveInputPart(InputExtent(str(path), item.offset, item.end_offset))], analysis={"stream_plan": item.stream_plan})
+        parts=[ArchiveInputPart(InputExtent(str(path), item["offset"], item["end_offset"]))], analysis={"stream_plan": item["stream_plan"]})
     result = worker(descriptor, tmp_path / "carrier")
     assert result["status"] == "ok"
-    assert result["stream_receipt"]["input_bytes"] == item.end_offset - item.offset
+    assert result["stream_receipt"]["input_bytes"] == item["end_offset"] - item["offset"]
 
 
 @pytest.mark.parametrize("name,kind", [("bad_content.lz4", "checksum_error"), ("bad_header.lz4", "checksum_error"),
@@ -180,8 +181,8 @@ def test_shared_skippable_magic_does_not_claim_a_zstandard_stream_as_lz4(fixture
     identity = inspect_compression_stream_identity(str(path))
     assert identity["format"] != "lz4"
     scan = scan_embedded_archives(str(path))
-    assert [c.format for c in scan.candidates] == ["zstd"]
-    report = AnalysisEngine().analyze_path(str(path), initial_prepass=scan.to_prepass())
+    assert [c["format"] for c in scan["candidates"]] == ["zstd"]
+    report = AnalysisEngine().analyze_path(str(path), initial_prepass=embedded_scan_prepass(scan))
     assert report.best_selected.format == "zstd"
     assert not any(e.format == "lz4" and e.status != "not_found" for e in report.evidences)
 
@@ -190,7 +191,7 @@ def test_shared_skippable_magic_does_not_claim_a_zstandard_stream_as_lz4(fixture
 def test_legacy_is_not_identified_by_analysis_or_embedded_scan(fixtures, name):
     path = fixtures / name
     assert not inspect_compression_stream_identity(str(path))["identity_strong"]
-    assert not any(c.format == "lz4" for c in scan_embedded_archives(str(path)).candidates)
+    assert not any(c["format"] == "lz4" for c in scan_embedded_archives(str(path))["candidates"])
     report = AnalysisEngine().analyze_path(str(path))
     assert not any(e.format in {"lz4", "tar.lz4"} and e.status != "not_found" for e in report.evidences)
 

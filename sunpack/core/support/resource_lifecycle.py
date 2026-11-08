@@ -14,7 +14,6 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from sunpack.core.support.path_keys import case_key, path_key_is_under
@@ -975,7 +974,7 @@ def _wait_for_native_resources(
             dict(item)
             for item in sunpack_native.native_wait_for_resources(
                 [item.path for item in roots],
-                0.0 if nonblocking else 1.0,
+                nonblocking,
             )
         )
     except Exception as exc:
@@ -1317,21 +1316,20 @@ def task_walk(
     followlinks: bool = False,
 ) -> Iterator[tuple[str, list[str], list[str]]]:
     top_path = os.fspath(top)
+    directories: list[str] = []
+    files: list[str] = []
     try:
         with task_scandir(top_path) as entries:
-            materialized = list(entries)
+            for entry in entries:
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    is_dir = False
+                (directories if is_dir else files).append(entry.name)
     except OSError as exc:
         if onerror is not None:
             onerror(exc)
         return
-    directories: list[str] = []
-    files: list[str] = []
-    for entry in materialized:
-        try:
-            is_dir = entry.is_dir()
-        except OSError:
-            is_dir = False
-        (directories if is_dir else files).append(entry.name)
     if topdown:
         yield top_path, directories, files
     for name in directories:
@@ -1340,11 +1338,6 @@ def task_walk(
             yield from task_walk(child, topdown=topdown, onerror=onerror, followlinks=followlinks)
     if not topdown:
         yield top_path, directories, files
-
-
-def write_task_bytes(path: os.PathLike[str] | str, data: bytes) -> int:
-    with open_task_file(path, "wb") as handle:
-        return int(handle.write(data))
 
 
 def read_task_text(
@@ -1372,28 +1365,6 @@ def write_task_text(
         kwargs["errors"] = errors
     with open_task_file(path, "w", **kwargs) as handle:
         return int(handle.write(data))
-
-
-def task_glob(path: os.PathLike[str] | str, pattern: str) -> list[Path]:
-    root = Path(path)
-    with task_scandir(root) as iterator:
-        return [root / entry.name for entry in iterator if Path(entry.name).match(pattern)]
-
-
-def task_rglob(path: os.PathLike[str] | str, pattern: str) -> list[Path]:
-    root = Path(path)
-    matches: list[Path] = []
-    for current, directories, files in task_walk(root):
-        current_path = Path(current)
-        for name in (*directories, *files):
-            candidate = current_path / name
-            try:
-                relative = candidate.relative_to(root)
-            except ValueError:
-                continue
-            if relative.match(pattern):
-                matches.append(candidate)
-    return matches
 
 
 def reset_resource_lifecycle_for_tests() -> None:

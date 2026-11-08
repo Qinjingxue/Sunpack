@@ -502,7 +502,7 @@ pub(crate) fn native_resource_snapshot(py: Python<'_>, roots: Vec<String>) -> Py
 pub(crate) fn native_wait_for_resources(
     py: Python<'_>,
     roots: Vec<String>,
-    timeout_seconds: f64,
+    nonblocking: bool,
 ) -> PyResult<Py<PyList>> {
     let roots = roots
         .into_iter()
@@ -516,12 +516,10 @@ pub(crate) fn native_wait_for_resources(
                 .registry
                 .lock()
                 .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-            // Zero is an explicit non-blocking probe, not an elapsed-time failure.
-            // Positive values are accepted for API compatibility, but wait for release.
-            if timeout_seconds <= 0.0 {
+            if nonblocking {
                 return Ok::<_, io::Error>(matching_resources(&registry, &roots, true));
             }
-            let registry = state
+            let _registry = state
                 .changed
                 .wait_while(registry, |registry| {
                     registry.resources.values().any(|record| {
@@ -529,7 +527,7 @@ pub(crate) fn native_wait_for_resources(
                     })
                 })
                 .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-            Ok::<_, io::Error>(matching_resources(&registry, &roots, true))
+            Ok::<_, io::Error>(Vec::new())
         })
         .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
     resource_snapshot_to_python(py, records)

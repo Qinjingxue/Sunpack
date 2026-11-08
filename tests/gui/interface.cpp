@@ -159,7 +159,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
         try {
             Json cursors=Json::array(); for(auto& page:state(app.page(),"taskPages")) cursors.push_back(page["cursor"]);
             EventLog disk; disk.set_path(wide(state(app.page(),"logPath").get<std::string>())); disk.refresh();
-            auto fresh=task_rows(disk,{},{});
+            auto fresh=disk.query({},{});
             std::cerr<<" windowCursors="<<cursors<<" diskRows="<<fresh["rows"].size()<<" diskFirst="<<(fresh["rows"].empty()?Json():fresh["rows"][0]["name"]);
         } catch(...) {}
         std::cerr<<'\n';

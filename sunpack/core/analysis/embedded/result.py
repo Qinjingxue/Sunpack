@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 
@@ -41,88 +40,3 @@ def embedded_candidate_requires_password(format_hint: str, validation: str) -> b
         "rar4_header_encrypted_main_header_crc",
         "rar5_encryption_header_crc",
     ))
-
-
-@dataclass(frozen=True, slots=True)
-class EmbeddedCandidate:
-    format: str
-    offset: int
-    end_offset: int | None
-    validation: str
-    candidate_kind: str
-    boundary_kind: str
-    extractable: bool
-    stream_plan: dict[str, Any] | None = None
-    volume_candidate: bool = False
-
-    @property
-    def password_required(self) -> bool:
-        return embedded_candidate_requires_password(self.format, self.validation)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "format": self.format,
-            "offset": self.offset,
-            "end_offset": self.end_offset,
-            "validation": self.validation,
-            "candidate_kind": self.candidate_kind,
-            "boundary_kind": self.boundary_kind,
-            "extractable": self.extractable,
-            "volume_candidate": self.volume_candidate,
-            **({"stream_plan": self.stream_plan} if self.stream_plan else {}),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class SignatureHit:
-    name: str
-    offset: int
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "offset": self.offset, "source": "embedded_scan"}
-
-
-@dataclass(frozen=True, slots=True)
-class EmbeddedScanResult:
-    complete: bool
-    candidates: tuple[EmbeddedCandidate, ...]
-    hits: tuple[SignatureHit, ...]
-    read_bytes: int
-    file_size: int
-    logical_resolution_complete: bool
-    raw_hit_count: int
-    budget_exhausted: bool
-
-    @property
-    def found(self) -> bool:
-        return bool(self.candidates)
-
-    @classmethod
-    def empty(cls, *, complete: bool = False) -> "EmbeddedScanResult":
-        return cls(
-            complete=complete,
-            candidates=(),
-            hits=(),
-            read_bytes=0,
-            file_size=0,
-            logical_resolution_complete=complete,
-            raw_hit_count=0,
-            budget_exhausted=False,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "found": self.found,
-            "complete": self.complete,
-            "candidates": [item.to_dict() for item in self.candidates],
-            "hits": [item.to_dict() for item in self.hits],
-            "read_bytes": self.read_bytes,
-            "file_size": self.file_size,
-            "signature_scan_complete": self.complete,
-            "logical_resolution_complete": self.logical_resolution_complete,
-            "raw_hit_count": self.raw_hit_count,
-            "budget_exhausted": self.budget_exhausted,
-        }
-
-    def to_prepass(self) -> dict[str, Any]:
-        return embedded_scan_prepass(self.to_dict())

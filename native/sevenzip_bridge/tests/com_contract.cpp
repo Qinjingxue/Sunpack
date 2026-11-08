@@ -392,9 +392,9 @@ void check_prefetch_lifetime_and_seek()
                 source = PrefetchSource{&pipe_name, offset, 1024 - offset};
                 return true;
             });
-        prefetch.after_sync_read(1);
+        prefetch.after_read(1);
         prefetch.invalidate(400, nullptr);
-        prefetch.after_sync_read(400);
+        prefetch.after_read(400);
         unsigned char expected[64];
         std::memset(expected, 400 % 251, sizeof(expected));
         bool written = true;
@@ -405,7 +405,7 @@ void check_prefetch_lifetime_and_seek()
         }
         check(written && prefetch.consume(400, bytes, 64, nullptr) && !std::memcmp(bytes, expected, sizeof(bytes)),
               "seek cancels pending reads before reusing their buffers and OVERLAPPED structures");
-        prefetch.after_cached_read(464); // Leave a real pending read for destruction.
+        prefetch.after_read(464); // Leave a real pending read for destruction.
     }
     GetProcessHandleCount(GetCurrentProcess(), &handles_after);
     check(handles_before == handles_after, "prefetch destruction drains requests and releases file/event handles");
@@ -486,12 +486,15 @@ void check_prefetch_virtual_inputs()
                 source = PrefetchSource{&path, offset, 321 - offset};
                 return true;
             });
-        short_read.after_sync_read(240);
+        short_read.after_read(240);
         check(!short_read.consume(240, bytes, 64, nullptr),
               "short OVERLAPPED completion falls back without publishing a partial window");
     }
     {
-        auto *raw = new MultiFileInStream({first.wstring(), second.wstring()}, nullptr, {true, 64});
+        const auto empty = root / L"empty.bin";
+        std::ofstream(empty, std::ios::binary).close();
+        ExtractInputTrace trace;
+        auto *raw = new MultiRangeInStream(std::vector<std::wstring>{first.wstring(), empty.wstring(), second.wstring()}, &trace, {true, 64});
         CMyComPtr<IInStream> stream(raw);
         unsigned char bytes[513]{};
         bool correct = true;
@@ -506,7 +509,8 @@ void check_prefetch_virtual_inputs()
         UInt64 position = 0;
         stream->Seek(-33, FILE_END, &position);
         correct = position == 480 && stream->Read(bytes, 33, &read) == S_OK && read == 33;
-        check(correct && !std::memcmp(bytes, payload + 480, 33), "volume seek discards prior prefetched windows");
+        check(correct && !std::memcmp(bytes, payload + 480, 33) && trace.last_range_index == 2,
+              "volume seek discards prefetched windows and retains physical indices across an empty part");
     }
     {
         // Same physical inputs represent an embedded payload whose prefix and

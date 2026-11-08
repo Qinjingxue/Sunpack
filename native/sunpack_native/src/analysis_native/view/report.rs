@@ -687,9 +687,9 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             }
             let archive_offset = u64_of(&native, "archive_offset")?;
             if archive_offset != 0
-                && !hits.iter().any(|hit| {
-                    hit.kind == ReportHitKind::ZipLocal && hit.offset == archive_offset
-                })
+                && !hits
+                    .iter()
+                    .any(|hit| hit.kind == ReportHitKind::ZipLocal && hit.offset == archive_offset)
             {
                 // A terminal record may belong to a ZIP inside a damaged
                 // leading input. Reuse the parser's origin fact; discovering
@@ -1936,14 +1936,14 @@ fn stream_structure_cached<'py>(
             let mut entries = stream_structure_cache()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            entries.retain(|(key, _)| key.path != identity.path || *key == identity);
-            let slot = entries
-                .iter()
-                .position(|(key, _)| *key == identity)
-                .and_then(|index| entries.remove(index))
-                .map(|(_, slot)| slot)
-                .unwrap_or_else(|| Arc::new(StreamStructureSlot::default()));
-            entries.push_back((identity.clone(), Arc::clone(&slot)));
+            let entry = if let Some(index) = entries.iter().position(|(key, _)| *key == identity) {
+                entries.remove(index).unwrap()
+            } else {
+                entries.retain(|(key, _)| key.path != identity.path);
+                (identity.clone(), Arc::new(StreamStructureSlot::default()))
+            };
+            let slot = Arc::clone(&entry.1);
+            entries.push_back(entry);
             slot
         };
         // Waiting for another initializer must release the GIL: its final Python
@@ -1969,16 +1969,21 @@ fn stream_structure_cached<'py>(
         }
         cancellation.check()?;
     };
-    cancellation.check()?;
     let result = slot.get().expect("completed stream structure");
+    let invalid = result.is_err();
+    let result = cancellation.check().and_then(|()| match result {
+        Ok(value) => Ok(value.clone_ref(py).into_bound(py)),
+        Err(error) => Err(error.clone_ref(py)),
+    });
     let mut entries = stream_structure_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if result.is_err() {
-        entries.retain(|(key, current)| *key != identity || !Arc::ptr_eq(current, &slot));
+    if invalid {
+        entries.retain(|(_, current)| !Arc::ptr_eq(current, &slot));
     }
     // Active slots stay discoverable, including under cache pressure. Once
     // their users finish, the existing bounded cache can evict them normally.
+    drop(slot);
     while entries.len() > STREAM_STRUCTURE_CACHE_ENTRIES {
         let Some(index) = entries
             .iter()
@@ -1989,11 +1994,7 @@ fn stream_structure_cached<'py>(
         entries.remove(index);
     }
     crate::collections::trim_deque(&mut entries);
-    drop(entries);
-    match result {
-        Ok(value) => Ok(value.clone_ref(py).into_bound(py)),
-        Err(error) => Err(error.clone_ref(py)),
-    }
+    result
 }
 
 pub(crate) fn clear_stream_structure_cache() -> usize {

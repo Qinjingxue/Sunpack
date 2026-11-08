@@ -2,7 +2,6 @@
 #include "range_editor.hpp"
 #include "presentation.hpp"
 #include <algorithm>
-#include <chrono>
 #include <set>
 #include <map>
 #include <sstream>
@@ -112,39 +111,6 @@ struct JsonTokens {
     explicit JsonTokens(const std::string& text):source(text) { if(text.rfind("\xef\xbb\xbf",0)==0) at=3; value(""); }
     std::string token(const std::string& path) const { auto r=ranges.at(path); return source.substr(r.first,r.second); }
 };
-// Longest directory-prefix match by walking up the task path, not by scanning
-// every watch root for every task. Normalized keys retain the existing NT
-// case-folding/UNC rules; trimming the final separator also handles C:\\ roots.
-using RootIndex=std::unordered_map<std::wstring,std::string>;
-RootIndex index_roots(const WatchRoots& roots) {
-    RootIndex index; index.reserve(roots.entries.size());
-    for(const auto& root:roots.entries) {
-        auto key=path_key(root.input);
-        while(!key.empty() && (key.back()==L'\\' || key.back()==L'/')) key.pop_back();
-        index.emplace(std::move(key),utf8(root.input.wstring()));
-    }
-    return index;
-}
-std::string indexed_root(const std::wstring& key,const RootIndex& index) {
-    std::wstring current=key;
-    while(!current.empty() && (current.back()==L'\\' || current.back()==L'/')) current.pop_back();
-    while(!current.empty()) {
-        auto found=index.find(current);
-        if(found!=index.end()) return found->second;
-        auto separator=current.find_last_of(L"\\/");
-        if(separator==std::wstring::npos) break;
-        current.resize(separator);
-    }
-    return "@other";
-}
-const std::string& cached_task_time(const Task& task) {
-    auto& cache=task.display;
-    if(!cache.time_valid || cache.timestamp!=task.timestamp || cache.has_timestamp!=task.has_timestamp) {
-        cache.time=task.has_timestamp?task_time(task.timestamp):std::string();
-        cache.timestamp=task.timestamp; cache.has_timestamp=task.has_timestamp; cache.time_valid=true;
-    }
-    return cache.time;
-}
 }
 bool password_matches_scope(const Json& record,const std::string& scope) {
     return password_matches_scope_key(record,scope.empty() || scope=="@all"?std::wstring():scope_key(wide(scope)));
@@ -594,57 +560,10 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
     catch(const std::exception& error) { result["error"]=error.what(); result["section"]=section; }
     return result;
 }
-std::string root_for(const fs::path& path,const WatchRoots& roots) {
-    return indexed_root(path_key(path),index_roots(roots));
-}
 void EventLog::set_path(const fs::path& p) {
     if (path_==p) return;
     manifest=Json();
-    path_=p; sequence_=0; tasks.clear();
-}
-void EventLog::accept(const Json& j) {
-    if(!j.is_object() || !j.contains("event") || !j["event"].is_string() ||
-       !j.contains("path") || !j["path"].is_string()) return;
-    auto path=j["path"].get<std::string>();
-    if(path.empty()) return;
-    auto event=j["event"].get<std::string>();
-    Task task;
-    if(event=="processing_started") task.status="taskProcessing";
-    else if(event=="failed_password" || event=="suspended_missing_volume") {
-        task.status="taskWaiting"; task.waiting_reason=event=="failed_password"?"taskWaitingPassword":"taskWaitingVolumes";
-    } else if(event=="done") task.status="taskSucceeded";
-    else if(event=="failed_terminal" || event=="partial_rejected") task.status="taskFailed";
-    else return;
-    task.path=path;
-    if(j.contains("group") && j["group"].is_object()) {
-        const auto& group=j["group"];
-        task.path=group.value("path",path);
-        task.name=group.value("name",std::string());
-        task.multipart=group.value("multipart",false);
-        std::unordered_set<std::wstring> seen;
-        if(group.contains("members") && group["members"].is_array())
-            for(const auto& member:group["members"]) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
-                fs::path source=wide(member.get_ref<const std::string&>());
-                auto key=path_key(source);
-                if(seen.insert(key).second) task.members.push_back({std::move(key),utf8(source.filename().wstring())});
-            }
-    }
-    if(task.members.empty()) task.members.push_back({path_key(wide(path)),utf8(fs::path(wide(path)).filename().wstring())});
-    task.multipart|=task.members.size()>1 || event=="suspended_missing_volume";
-    if(task.status=="taskFailed") {
-        if(j.contains("error") && j["error"].is_string()) task.error=j["error"].get<std::string>();
-        if(j.contains("error_kind") && j["error_kind"].is_string()) task.error_kind=j["error_kind"].get<std::string>();
-    }
-    if(j.contains("output_dirs") && j["output_dirs"].is_array())
-        for(auto& output:j["output_dirs"]) if(output.is_string() && !output.get_ref<const std::string&>().empty()) task.outputs.push_back(output.get<std::string>());
-    if(j.contains("ts") && j["ts"].is_number()) {
-        task.timestamp=j["ts"].get<double>(); task.has_timestamp=std::isfinite(task.timestamp);
-        if(!task.has_timestamp) task.timestamp=0;
-    }
-    auto explicit_id=j.value("task_id",std::string());
-    auto key=explicit_id.empty()?path_key(wide(path)):wide(explicit_id);
-    task.sequence=++sequence_;
-    tasks[key]=std::move(task);
+    path_=p;
 }
 bool EventLog::refresh(bool missing_is_final) {
     try {
@@ -660,108 +579,15 @@ bool EventLog::refresh(bool missing_is_final) {
             !std::equal(next.at("runs").begin(),next.at("runs").end(),manifest.at("runs").begin(),manifest.at("runs").end(),same_run) ||
             !same_run(next.at("live"),manifest.at("live"));
         manifest=std::move(next);
-        if(changed) { tasks.clear(); }
         return changed;
     } catch(const WinError& error) {
         if(missing_is_final && (error.code==ERROR_FILE_NOT_FOUND || error.code==ERROR_PATH_NOT_FOUND)) {
-            bool changed=!manifest.is_null() || !tasks.empty(); manifest=Json(); tasks.clear(); return changed;
+            bool changed=!manifest.is_null(); manifest=Json(); return changed;
         }
         throw;
     }
 }
 
-namespace {
-// Project the task snapshots selected for this page.
-Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
-    const std::string& language,std::unordered_map<std::string,std::string>& translated_statuses) {
-    auto& cache=t.display;
-    if(cache.path!=t.path) {
-        const fs::path path=wide(t.path);
-        cache.directory=utf8(path.parent_path().wstring());
-        cache.filename=utf8(path.filename().wstring());
-        cache.path=t.path;
-    }
-    cached_task_time(t);
-    const auto& status=t.status;
-    const char* tone=status=="taskSucceeded"?"success":status=="taskFailed"?"failure":
-        status=="taskWaiting"?"waiting":"info";
-    const auto& label=t.waiting_reason.empty()?t.status:t.waiting_reason;
-    auto found=translated_statuses.find(label);
-    if(found==translated_statuses.end()) found=translated_statuses.emplace(label,tr(label,language)).first;
-    const auto& status_text=found->second; // References survive error-type cache rehashes below.
-    Json parts=Json::array();
-    if(t.multipart) {
-        parts.get_ref<Json::array_t&>().reserve(t.members.size());
-        for(auto& member:t.members) parts.push_back(member.filename);
-    }
-    std::string error_type;
-    if(!t.error.empty() || !t.error_kind.empty()) {
-        auto key="taskError_"+(t.error_kind.empty()?std::string("unknown"):t.error_kind);
-        auto type=translated_statuses.find(key);
-        if(type==translated_statuses.end()) {
-            auto text=tr(key,language);
-            type=translated_statuses.emplace(key,text==key?tr("taskError_unknown",language):std::move(text)).first;
-        }
-        error_type=type->second;
-    }
-    // The logical archive name can omit suffixes; display the original filename.
-    return {{"id",utf8(key)},{"name",cache.filename},{"directory",cache.directory},
-        {"path",t.path},{"root",indexed_root(path_key(wide(t.path)),roots)},{"status",status},{"statusText",status_text},{"time",cache.time},
-        {"statusTone",tone},{"parts",std::move(parts)},{"error",t.error},{"errorType",std::move(error_type)},
-        {"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
-}
-bool task_matches(const Task& t,const RootIndex& roots,const View& v,
-    const std::wstring& folded_query,const std::string& time_query) {
-    if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
-        (!v.task_root.empty() && indexed_root(path_key(wide(t.path)),roots)!=v.task_root)) return false;
-    if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
-    if(!time_query.empty() && cached_task_time(t).find(time_query)!=std::string::npos) return true;
-    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member.key),folded_query);});
-}
-}
-Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language,
-    std::vector<std::wstring>* selected_ids,const std::vector<std::wstring>* previous_ids,
-    TaskProjectionStats* stats) {
-    using Clock=std::chrono::steady_clock;
-    const auto started=stats?Clock::now():Clock::time_point{};
-    if(!log.manifest.is_null()) return log.query(roots,v,language);
-    const auto root_index=index_roots(roots);
-    const auto query=fold_search(v.task_query);
-    const auto time_query=task_time_query(query);
-    using TaskEntry=decltype(log.tasks)::value_type;
-    std::vector<const TaskEntry*> rows;
-    rows.reserve(log.tasks.size());
-    for(auto& pair:log.tasks) if(task_matches(pair.second,root_index,v,query,time_query)) rows.push_back(&pair);
-    const auto filtered=stats?Clock::now():Clock::time_point{};
-    std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
-        if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
-        return a->second.sequence>b->second.sequence;
-    });
-    const auto sorted=stats?Clock::now():Clock::time_point{};
-    if(selected_ids) {
-        selected_ids->clear();
-        selected_ids->reserve(rows.size());
-        for(const auto* task:rows) selected_ids->push_back(task->first);
-    }
-    const bool unchanged=previous_ids && selected_ids && *selected_ids==*previous_ids;
-    Json result;
-    if(!unchanged) {
-        result={{"rows",Json::array()},{"total",rows.size()}};
-        auto& projected=result["rows"];
-        std::unordered_map<std::string,std::string> labels;
-        for(auto* task:rows) projected.push_back(project_task(task->first,task->second,root_index,language,labels));
-    }
-    if(stats) {
-        const auto finished=Clock::now();
-        auto millis=[](Clock::duration d){return std::chrono::duration<double,std::milli>(d).count();};
-        stats->filter_ms=millis(filtered-started);
-        stats->sort_ms=millis(sorted-filtered);
-        stats->project_ms=millis(finished-sorted);
-        stats->selected=rows.size();
-        stats->reused=unchanged;
-    }
-    return result;
-}
 fs::path task_directory(const Json& row) {
     auto root=row.value("root",std::string());
     auto input=fs::path(wide(row.value("path",std::string())));

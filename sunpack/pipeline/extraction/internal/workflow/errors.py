@@ -7,7 +7,6 @@ from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
 from sunpack.core.i18n import I18nContext
 from sunpack.core.support.archive_error_signals import (
-    has_archive_damage_signals,
     looks_like_split_archive_name,
     normalize_error_text,
 )

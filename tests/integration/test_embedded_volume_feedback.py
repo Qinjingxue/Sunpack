@@ -185,7 +185,7 @@ def test_multiple_encrypted_standalone_inputs_share_one_scan_projection(tmp_path
 
     monkeypatch.setattr(EmbeddedDiscovery, "_discover_into", record)
     if not rar4:
-        monkeypatch.setattr(embedded_module, "resolve_encrypted_rar_boundaries",
+        monkeypatch.setattr(embedded_module, "resolve_embedded_rar_boundaries",
                             lambda *args: pytest.fail("already-resolved native headers were probed again"))
     for known in ([], secrets[:1], secrets):
         projections.clear()

@@ -15,6 +15,7 @@ from sunpack.core.support import archive_knowledge_projection as knowledge_view
 
 if TYPE_CHECKING:
     from sunpack.pipeline.extraction.output_inventory import OutputInventory
+    from sunpack.pipeline.verification.archive_input_manifest import ArchiveInputManifest
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,7 @@ class VerificationEvidence:
     progress_manifest: NativeProgressManifest | None = None
     _output_inventory_cache: OutputInventory | None = field(default=None, init=False, repr=False, compare=False)
     _file_observation_owner: str = field(default="", init=False, repr=False, compare=False)
-    _archive_input_manifest_full_cache: dict[str, Any] | None = field(default=None, init=False, repr=False, compare=False)
+    _archive_input_manifest_cache: ArchiveInputManifest | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def archive_path(self) -> str:

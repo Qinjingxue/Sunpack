@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
     Opcode, Request, Response, Status, REQUEST_BYTES, RESPONSE_BYTES,
 };
-use sunpack_usn_core::{validate_volume_guid, JournalReader, PIPE_NAME, SERVICE_NAME};
+use sunpack_usn_core::{JournalReader, PIPE_NAME, SERVICE_NAME};
 use windows_service::{
     define_windows_service,
     service::{
@@ -25,6 +25,7 @@ use windows_service::{
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA,
     ERROR_NO_DATA, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -136,11 +137,11 @@ fn run_service() -> windows_service::Result<()> {
 }
 
 fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
-    let journals = Arc::new(JournalDispatcher::default());
+    let journals = Arc::new(JournalDispatcher::new()?);
     let active_leases = Arc::new(AtomicUsize::new(0));
     let connected_clients = Arc::new(AtomicUsize::new(0));
     let ever_had_lease = Arc::new(AtomicBool::new(false));
-    let state_changed = OwnedHandle::auto_reset_event()?;
+    let state_changed = &journals.state_changed;
     let mut workers = Vec::new();
     let mut first_instance = true;
     let mut pending_accept: Option<PendingPipeAccept> = None;
@@ -158,15 +159,25 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
             if clients < MAX_CONNECTED_CLIENTS as usize && pending_accept.is_none() {
                 pending_accept = Some(PendingPipeAccept::start(first_instance)?);
             }
+            let timeout = journals
+                .reap_idle(Instant::now())?
+                .map_or(INFINITE, |deadline| {
+                    // Wait accepts whole milliseconds. Round up to avoid waking
+                    // repeatedly before the expiry can be observed.
+                    (deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        + 1) as u32
+                });
             let wait = if let Some(accept) = pending_accept.as_ref() {
                 let handles = [stop_event, accept.event(), state_changed.raw()];
                 unsafe {
-                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE)
+                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
                 }
             } else {
                 let handles = [stop_event, state_changed.raw()];
                 unsafe {
-                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE)
+                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
                 }
             };
             if wait == WAIT_OBJECT_0 {
@@ -174,6 +185,9 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
             }
             if wait == WAIT_FAILED {
                 return Err(io::Error::last_os_error());
+            }
+            if wait == WAIT_TIMEOUT {
+                continue;
             }
             if pending_accept.is_some() && wait == WAIT_OBJECT_0 + 1 {
                 let pipe = pending_accept.take().unwrap().finish()?;
@@ -342,12 +356,6 @@ fn request_shape_is_valid(request: &Request) -> bool {
                 && request.previous_usn > 0
                 && request.current_usn > request.previous_usn
         }
-        Opcode::ReadRootChanges => {
-            !request.volume_guid.is_empty()
-                && matches!(request.file_id_len, 8 | 16)
-                && request.previous_usn > 0
-                && request.current_usn > request.previous_usn
-        }
     }
 }
 
@@ -391,69 +399,91 @@ impl Drop for LeaseGuard<'_> {
     }
 }
 
-#[derive(Default)]
 struct JournalDispatcher {
     entries: Mutex<VolumeTable>,
+    state_changed: OwnedHandle,
 }
 
 type SharedJournalReader = Arc<Mutex<JournalReader>>;
-type VolumeTable = HashMap<String, (SharedJournalReader, Instant)>;
+type VolumeTable = HashMap<Arc<str>, (SharedJournalReader, Instant)>;
 
 impl JournalDispatcher {
-    fn reap_idle_locked(entries: &mut VolumeTable, now: Instant) {
-        entries.retain(|_, (reader, last_used)| {
-            Arc::strong_count(reader) > 1
-                || now.saturating_duration_since(*last_used) < VOLUME_CONTEXT_IDLE_TTL
-        });
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            entries: Mutex::default(),
+            state_changed: OwnedHandle::auto_reset_event()?,
+        })
     }
 
-    fn reader_for(&self, volume_guid: &str) -> io::Result<Arc<Mutex<JournalReader>>> {
-        validate_volume_guid(volume_guid)?;
-        let key = volume_guid.to_ascii_lowercase();
-        let now = Instant::now();
+    fn reap_idle(&self, now: Instant) -> io::Result<Option<Instant>> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
-        Self::reap_idle_locked(&mut entries, now);
-        if let Some((reader, last_used)) = entries.get_mut(&key) {
-            *last_used = now;
+        let mut next_deadline: Option<Instant> = None;
+        entries.retain(|_, (reader, deadline)| {
+            if *deadline <= now {
+                return Arc::strong_count(reader) > 1;
+            }
+            next_deadline = Some(next_deadline.map_or(*deadline, |next| next.min(*deadline)));
+            true
+        });
+        Ok(next_deadline)
+    }
+
+    fn reader_for(
+        &self,
+        mut volume_guid: String,
+        deadline: Instant,
+    ) -> io::Result<SharedJournalReader> {
+        volume_guid.make_ascii_lowercase();
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| io::Error::other("volume table poisoned"))?;
+        if let Some((reader, previous_deadline)) = entries.get_mut(volume_guid.as_str()) {
+            *previous_deadline = (*previous_deadline).max(deadline);
             return Ok(Arc::clone(reader));
         }
+        let key: Arc<str> = volume_guid.into();
+        let reader = Arc::new(Mutex::new(JournalReader::new(Arc::clone(&key))?));
         if entries.len() >= MAX_VOLUME_CONTEXTS {
             let lru = entries
                 .iter()
                 .filter(|(_, (reader, _))| Arc::strong_count(reader) == 1)
-                .min_by_key(|(_, (_, last_used))| *last_used)
-                .map(|(key, _)| key.clone());
+                .min_by_key(|(_, (_, deadline))| *deadline)
+                .map(|(key, _)| Arc::clone(key));
             if let Some(lru) = lru {
                 entries.remove(&lru);
             } else {
-                return Ok(Arc::new(Mutex::new(JournalReader::new())));
+                return Ok(reader);
             }
         }
-        let reader = Arc::new(Mutex::new(JournalReader::new()));
-        entries.insert(key, (Arc::clone(&reader), now));
+        entries.insert(key, (Arc::clone(&reader), deadline));
+        drop(entries);
+        self.state_changed.signal();
         Ok(reader)
     }
-}
 
-fn encode_path_payload<'a>(paths: impl Iterator<Item = &'a str>) -> io::Result<Vec<u8>> {
-    let mut payload = Vec::new();
-    for path in paths {
-        let bytes = path.as_bytes();
-        let length = u32::try_from(bytes.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "root recovery path is too long")
-        })?;
-        payload.extend_from_slice(&length.to_le_bytes());
-        payload.extend_from_slice(bytes);
+    fn with_reader<T>(
+        &self,
+        volume_guid: String,
+        operation: impl FnOnce(&mut JournalReader) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
+        let reader = self.reader_for(volume_guid, deadline)?;
+        let result = reader
+            .lock()
+            .map_err(|_| io::Error::other("journal state poisoned"))
+            .and_then(|mut reader| operation(&mut reader));
+        drop(reader);
+        // An expired entry can stay pinned by a slow journal operation. Wake
+        // the accept loop after releasing the pin so it can reap without polling.
+        if Instant::now() >= deadline {
+            self.state_changed.signal();
+        }
+        result
     }
-    if payload.len() > 64 * 1024 {
-        return Err(io::Error::other(
-            "USN root recovery exceeded payload budget",
-        ));
-    }
-    Ok(payload)
 }
 
 fn handle_request(
@@ -466,101 +496,53 @@ fn handle_request(
     let result: io::Result<(u64, i64, sunpack_usn_core::ChangeReasons)> = match request.opcode {
         Opcode::Hello | Opcode::Ping | Opcode::Release => Ok((0, 0, Default::default())),
         Opcode::ProbeVolume => journals
-            .reader_for(&request.volume_guid)
-            .and_then(|journal| {
-                journal
-                    .lock()
-                    .map_err(|_| io::Error::other("journal state poisoned"))?
-                    .probe_volume(&request.volume_guid)
-            })
+            .with_reader(request.volume_guid, JournalReader::probe_volume)
             .map(|(journal_id, next_usn)| (journal_id, next_usn, Default::default())),
         Opcode::ReadChangeReasons => journals
-            .reader_for(&request.volume_guid)
-            .and_then(|journal| {
-                journal
-                    .lock()
-                    .map_err(|_| io::Error::other("journal state poisoned"))?
-                    .read_change_reasons(
-                        &request.volume_guid,
-                        &request.file_id,
-                        request.file_id_len,
-                        request.previous_usn,
-                        request.current_usn,
-                    )
+            .with_reader(request.volume_guid, |journal| {
+                journal.read_change_reasons(
+                    &request.file_id,
+                    request.file_id_len,
+                    request.previous_usn,
+                    request.current_usn,
+                )
             })
             .map(|(journal_id, reasons)| (journal_id, 0, reasons)),
-        Opcode::ReadDirectoriesChanges => journals
-            .reader_for(&request.volume_guid)
-            .and_then(|journal| {
-                if query.len() < 24 || (query.len() - 8) % 16 != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid directory query",
-                    ));
-                }
-                let expected = u64::from_le_bytes(query[..8].try_into().unwrap());
-                let ids: Vec<[u8; 16]> = query[8..]
-                    .chunks_exact(16)
-                    .map(|id| id.try_into().unwrap())
-                    .collect();
-                journal
-                    .lock()
-                    .map_err(|_| io::Error::other("journal state poisoned"))?
-                    .read_directories_changes(
-                        &request.volume_guid,
-                        Some(expected),
+        Opcode::ReadDirectoriesChanges => {
+            // serve_client validates the query frame before reading these bytes.
+            let expected = u64::from_le_bytes(query[..8].try_into().unwrap());
+            let ids: Vec<[u8; 16]> = query[8..]
+                .chunks_exact(16)
+                .map(|id| id.try_into().unwrap())
+                .collect();
+            journals
+                .with_reader(request.volume_guid, |journal| {
+                    journal.read_directories_changes(
+                        expected,
                         &ids,
                         request.previous_usn,
                         request.current_usn,
                     )
-            })
-            .and_then(|page| {
-                for (index, name) in &page.changes {
-                    payload.extend_from_slice(&index.to_le_bytes());
-                    payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                    payload.extend_from_slice(name.as_bytes());
-                }
-                if payload.len() > 64 * 1024 {
-                    return Err(io::Error::other("USN recovery exceeded payload budget"));
-                }
-                Ok((
-                    page.journal_id,
-                    page.next_usn,
-                    sunpack_usn_core::ChangeReasons {
-                        all: payload.len() as u32,
-                        without_close: page.changes.len() as u32,
-                    },
-                ))
-            }),
-        Opcode::ReadRootChanges => journals
-            .reader_for(&request.volume_guid)
-            .and_then(|journal| {
-                journal
-                    .lock()
-                    .map_err(|_| io::Error::other("journal state poisoned"))?
-                    .read_root_changes(
-                        &request.volume_guid,
-                        &request.file_id,
-                        request.file_id_len,
-                        request.previous_usn,
-                        request.current_usn,
-                    )
-            })
-            .and_then(|page| {
-                payload = encode_path_payload(page.changes.iter().map(|(_, name)| name.as_str()))?;
-                let bytes = u32::try_from(payload.len())
-                    .map_err(|_| io::Error::other("USN root recovery payload is too large"))?;
-                let count = u32::try_from(page.changes.len())
-                    .map_err(|_| io::Error::other("too many USN root changes"))?;
-                Ok((
-                    page.journal_id,
-                    page.next_usn,
-                    sunpack_usn_core::ChangeReasons {
-                        all: bytes,
-                        without_close: count,
-                    },
-                ))
-            }),
+                })
+                .and_then(|page| {
+                    for (index, name) in &page.changes {
+                        payload.extend_from_slice(&index.to_le_bytes());
+                        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(name.as_bytes());
+                    }
+                    if payload.len() > 64 * 1024 {
+                        return Err(io::Error::other("USN recovery exceeded payload budget"));
+                    }
+                    Ok((
+                        page.journal_id,
+                        page.next_usn,
+                        sunpack_usn_core::ChangeReasons {
+                            all: payload.len() as u32,
+                            without_close: page.changes.len() as u32,
+                        },
+                    ))
+                })
+        }
     };
     match result {
         Ok((journal_id, next_usn, reasons)) => {
@@ -1124,40 +1106,46 @@ mod tests {
 
     #[test]
     fn dispatcher_serializes_per_volume_but_keeps_volumes_independent() {
-        let dispatcher = JournalDispatcher::default();
+        let dispatcher = JournalDispatcher::new().unwrap();
+        let deadline = Instant::now() + VOLUME_CONTEXT_IDLE_TTL;
         let first = dispatcher
-            .reader_for(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}")
+            .reader_for(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned(),
+                deadline,
+            )
             .unwrap();
         let same = dispatcher
-            .reader_for(r"\\?\VOLUME{01234567-89AB-CDEF-0123-456789ABCDEF}")
+            .reader_for(
+                r"\\?\VOLUME{01234567-89AB-CDEF-0123-456789ABCDEF}".to_owned(),
+                deadline,
+            )
             .unwrap();
         let other = dispatcher
-            .reader_for(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}")
+            .reader_for(
+                r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}".to_owned(),
+                deadline,
+            )
             .unwrap();
         assert!(Arc::ptr_eq(&first, &same));
         assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[test]
-    fn dispatcher_lazily_reaps_idle_volume_on_next_request() {
-        let dispatcher = JournalDispatcher::default();
+    fn dispatcher_schedules_expiry_and_preserves_in_use_readers() {
+        let dispatcher = JournalDispatcher::new().unwrap();
+        let now = Instant::now();
+        let deadline = now + VOLUME_CONTEXT_IDLE_TTL;
         let reader = dispatcher
-            .reader_for(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}")
+            .reader_for(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned(),
+                deadline,
+            )
             .unwrap();
+        assert_eq!(dispatcher.reap_idle(now).unwrap(), Some(deadline));
+        assert_eq!(dispatcher.reap_idle(deadline).unwrap(), None);
+        assert_eq!(dispatcher.entries.lock().unwrap().len(), 1);
         drop(reader);
-        {
-            let mut entries = dispatcher.entries.lock().unwrap();
-            let (_, last_used) = entries
-                .get_mut(r"\\?\volume{01234567-89ab-cdef-0123-456789abcdef}")
-                .unwrap();
-            *last_used = Instant::now() - VOLUME_CONTEXT_IDLE_TTL - Duration::from_secs(1);
-        }
-        let next = dispatcher
-            .reader_for(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}")
-            .unwrap();
-        drop(next);
-        let entries = dispatcher.entries.lock().unwrap();
-        assert!(!entries.contains_key(r"\\?\volume{01234567-89ab-cdef-0123-456789abcdef}"));
-        assert!(entries.contains_key(r"\\?\volume{fedcba98-7654-3210-fedc-ba9876543210}"));
+        assert_eq!(dispatcher.reap_idle(deadline).unwrap(), None);
+        assert!(dispatcher.entries.lock().unwrap().is_empty());
     }
 }

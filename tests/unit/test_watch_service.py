@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -1169,7 +1170,6 @@ def test_output_registration_and_state_admission_do_not_deadlock(tmp_path, monke
 def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path, monkeypatch):
     # Scheduler-only retention never runs when the last configured root is
     # removed. Exercise the service branch against real native state/cache files.
-    import json
     from sunpack.core.contracts.discovery_scope import DiscoveryScope
     from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
     from sunpack.runtime.watch.state import WatchStateStore
@@ -1322,8 +1322,15 @@ def test_watch_service_waits_indefinitely_when_scheduler_is_idle(tmp_path, monke
     monkeypatch.setattr(service, "_stop_scheduler", stop_scheduler)
     monkeypatch.setattr(service, "_start_tray", lambda: None)
     monkeypatch.setattr(service, "_stop_tray", lambda: None)
-    service._control_queue = asyncio.Queue()
-    service._control_queue.put_nowait(CONTROL_STOP)
+
+    class RetireSchedulerOnIdle(asyncio.Queue):
+        async def get(self):
+            retired = weakref.ref(service.scheduler)
+            await service._stop_scheduler()
+            assert retired() is None
+            return CONTROL_STOP
+
+    service._control_queue = RetireSchedulerOnIdle()
     assert _await(service.run()) == 0
     assert len(scheduler_runs) == 1
 

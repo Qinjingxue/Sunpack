@@ -14,7 +14,7 @@ pub use client::{
     broker_read_root_changes, broker_release, broker_volume_cursor,
 };
 #[cfg(feature = "journal")]
-pub use journal::{validate_volume_guid, JournalReader};
+pub use journal::JournalReader;
 pub use types::ChangeReasons;
 
 pub const SERVICE_NAME: &str = "SunPackWatchBroker";

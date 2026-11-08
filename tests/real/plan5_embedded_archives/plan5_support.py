@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sunpack.core.analysis.embedded import scan_embedded_archives
+from sunpack_native import scan_embedded_archives
 from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.failure_assertions import assert_failure_kind
 from tests.real.diagnostics import (
@@ -392,25 +392,25 @@ def assert_plan5_native_scan_coverage(
     error_info: dict[str, Any] | None = None,
 ) -> None:
     """native 全流扫描必须命中每个构造段（格式 + 起始偏移）。"""
-    result = scan_embedded_archives(str(case.file_path), expected_size=case.file_path.stat().st_size)
-    found = {(candidate.format, candidate.offset) for candidate in result.candidates}
+    result = scan_embedded_archives(str(case.file_path))
+    found = {(candidate["format"], candidate["offset"]) for candidate in result["candidates"]}
     expected = {(segment.archive_format, segment.offset) for segment in case.segments}
     missing = [segment for segment in case.segments if (segment.archive_format, segment.offset) not in found]
     extras = [
-        {"format": candidate.format, "offset": candidate.offset}
-        for candidate in result.candidates
-        if (candidate.format, candidate.offset) not in expected
+        {"format": candidate["format"], "offset": candidate["offset"]}
+        for candidate in result["candidates"]
+        if (candidate["format"], candidate["offset"]) not in expected
     ]
     if error_info is not None:
-        error_info["native_candidate_count"] = len(result.candidates)
+        error_info["native_candidate_count"] = len(result["candidates"])
         error_info["native_candidates"] = [
             {
-                "format": candidate.format,
-                "offset": candidate.offset,
-                "end_offset": candidate.end_offset,
-                "validation": candidate.validation,
+                "format": candidate["format"],
+                "offset": candidate["offset"],
+                "end_offset": candidate["end_offset"],
+                "validation": candidate["validation"],
             }
-            for candidate in result.candidates
+            for candidate in result["candidates"]
         ]
         error_info["missing_segments"] = [
             {"format": segment.archive_format, "variant": segment.variant, "offset": segment.offset}
@@ -472,22 +472,21 @@ def assert_plan5_success(
         try:
             native_scan = scan_embedded_archives(
                 str(case.file_path),
-                expected_size=case.file_path.stat().st_size,
             )
             expected = {
                 (segment.archive_format, segment.offset): segment.variant
                 for segment in case.segments
             }
             diagnostics["native_scan_before_pipeline"] = {
-                "candidate_count": len(native_scan.candidates),
+                "candidate_count": len(native_scan["candidates"]),
                 "candidates": [
                     {
-                        "format": candidate.format,
-                        "offset": candidate.offset,
-                        "end_offset": candidate.end_offset,
-                        "validation": candidate.validation,
+                        "format": candidate["format"],
+                        "offset": candidate["offset"],
+                        "end_offset": candidate["end_offset"],
+                        "validation": candidate["validation"],
                     }
-                    for candidate in native_scan.candidates
+                    for candidate in native_scan["candidates"]
                 ],
                 "expected_segments": [
                     {
@@ -505,9 +504,9 @@ def assert_plan5_success(
                     }
                     for (archive_format, offset), variant in expected.items()
                     if not any(
-                        candidate.format == archive_format
-                        and candidate.offset == offset
-                        for candidate in native_scan.candidates
+                        candidate["format"] == archive_format
+                        and candidate["offset"] == offset
+                        for candidate in native_scan["candidates"]
                     )
                 ],
             }

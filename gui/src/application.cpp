@@ -1253,7 +1253,7 @@ void Application::work() {
                     for(const auto& requested_cursor:cursors) {
                         const auto cursor=full?next_cursor:requested_cursor;
                         auto selected=view; selected.task_cursor=cursor;
-                        auto projected=task_rows(log,roots,selected,language);
+                        auto projected=log.query(roots,selected,language);
                         if(projected.is_null()) { pages=Json(); break; }
                         projected["cursor"]=cursor;
                         projected["query"]=view.task_query; projected["root"]=view.task_root; projected["status"]=view.task_status;
@@ -1276,7 +1276,7 @@ void Application::work() {
                 task_query_pending=true;
                 view.task_cursor.clear();
                 task_window={""}; task_window_reset=true;
-                log.manifest=Json(); log.tasks.clear();
+                log.manifest=Json();
                 try {
                     if(options_.allow_cli) run_cli(options_.cli,{L"watch",L"rebuild-log"},stop_);
                 } catch(...) {} // A later log operation can request recovery again.

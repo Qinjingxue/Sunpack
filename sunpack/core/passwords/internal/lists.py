@@ -1,8 +1,5 @@
 from typing import List
 
-from sunpack_native import read_password_file
-
-
 def parse_password_lines(text: str) -> List[str]:
     """Treat every non-empty line as a literal password.
 

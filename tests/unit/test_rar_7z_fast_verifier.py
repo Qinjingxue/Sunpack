@@ -8,6 +8,7 @@ import zlib
 import pytest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.passwords.verifier.base import PasswordBatchVerification
 from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.core.passwords.verifier.enc_fast import EncFastVerifier
 from sunpack.core.passwords.verifier.registry import PasswordVerifierChain
@@ -124,8 +125,8 @@ def _rar5_file_encryption_fixture(
     return prefix + _rar5_block(file_body)
 
 
-def test_rar_fast_verifier_preserves_multiple_match_indices_from_native():
-    outcome = RarFastVerifier._from_outcome({
+def test_native_verification_preserves_multiple_match_indices():
+    outcome = PasswordBatchVerification.from_native({
         "status": "match",
         "matched_index": 0,
         "matched_indices": [0, 2],

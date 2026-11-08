@@ -5,6 +5,7 @@ from sunpack.core.platform.windows.file_mutex import file_mutex, file_mutex_name
 import asyncio
 import os
 import threading
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -486,14 +487,15 @@ class WatchService:
                 return 0
             self._start_config_observer()
             next_scheduler_run: float | None = 0.0
-            active_scheduler = None
+            active_scheduler_ref = None
             while not self._stop_requested:
                 # Schedule against the event-loop clock so wall-clock changes
                 # cannot perturb pending work or asyncio timers.
                 now = self._loop.time()
                 if self.scheduler is not None:
-                    if self.scheduler is not active_scheduler:
-                        active_scheduler = self.scheduler
+                    if active_scheduler_ref is None or self.scheduler is not active_scheduler_ref():
+                        # An idle service can outlive its last scheduler.
+                        active_scheduler_ref = weakref.ref(self.scheduler)
                         next_scheduler_run = 0.0
                         self._last_idle_tick_signature = None
                     if next_scheduler_run is not None and now >= next_scheduler_run:

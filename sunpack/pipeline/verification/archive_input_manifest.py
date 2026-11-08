@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 STATUS_OK = 0
@@ -14,6 +15,9 @@ from sunpack_native import (
     archive_state_tar_manifest_native as _native_archive_state_tar_manifest,
     archive_state_zip_manifest_native as _native_archive_state_zip_manifest,
 )
+
+if TYPE_CHECKING:
+    from sunpack.pipeline.verification.evidence import VerificationEvidence
 
 
 @dataclass(frozen=True)
@@ -49,8 +53,7 @@ class ArchiveInputManifest:
     def retained_file_count(self) -> int:
         if self.entries is None:
             return 0
-        retained = len(self.entries)
-        return retained
+        return len(self.entries)
 
     @property
     def expected_names(self) -> list[str]:
@@ -59,29 +62,21 @@ class ArchiveInputManifest:
         return self.entries.expected_names()
 
 
-_EVIDENCE_CACHE_ATTRIBUTE = "_archive_input_manifest_full_cache"
-def archive_input_manifest_for_evidence(evidence) -> ArchiveInputManifest:
-    codepage = str(evidence.selected_codepage or "")
-    identity = _evidence_manifest_identity(evidence, codepage)
-    cached = evidence._archive_input_manifest_full_cache
-    if cached is None or cached["identity"] != identity:
-        hint = _format_hint(evidence.archive_input)
-        # TAR needs a source-side walk.  A worker manifest only proves that the
-        # range it was handed extracted successfully; it cannot prove that an
-        # incorrectly planned suffix range covered the source archive.
-        full_manifest = None if hint == "tar" else _worker_verified_manifest(evidence)
-        if full_manifest is None:
-            full_manifest = archive_input_manifest(
-                evidence.archive_input,
-                password=evidence.password,
-                codepage=codepage or None,
-            )
-        cached = {
-            "identity": identity,
-            "manifest": full_manifest,
-        }
-        object.__setattr__(evidence, _EVIDENCE_CACHE_ATTRIBUTE, cached)
-    return cached["manifest"]
+def archive_input_manifest_for_evidence(evidence: VerificationEvidence) -> ArchiveInputManifest:
+    cached = evidence._archive_input_manifest_cache
+    if cached is not None:
+        return cached
+    # TAR needs a source-side walk. A worker manifest only proves that the
+    # range it was handed extracted successfully.
+    manifest = None if _format_hint(evidence.archive_input) == "tar" else _worker_verified_manifest(evidence)
+    if manifest is None:
+        manifest = archive_input_manifest(
+            evidence.archive_input,
+            password=evidence.password,
+            codepage=evidence.selected_codepage or None,
+        )
+    object.__setattr__(evidence, "_archive_input_manifest_cache", manifest)
+    return manifest
 
 
 def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
@@ -115,15 +110,6 @@ def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
         archive_walk_complete=True,
         verified_item_count=item_count,
         total_unpacked_size=int(inventory.stats.total_size or 0),
-    )
-
-
-def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
-    source = evidence.archive_input
-    return (
-        repr(source.to_dict()),
-        str(evidence.password or ""),
-        codepage,
     )
 
 

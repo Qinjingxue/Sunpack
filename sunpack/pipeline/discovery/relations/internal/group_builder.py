@@ -3,10 +3,9 @@ from __future__ import annotations
 import os
 from typing import Iterable, List, Optional
 
-from sunpack.core.support.path_keys import case_key, path_key
+from sunpack.core.support.path_keys import path_key
 from sunpack_native import (
     NativeCandidateTable,
-    list_regular_files_in_directory as _native_list_regular_files_in_directory,
     relations_detect_split_role as _native_detect_split_role,
     relations_logical_name as _native_logical_name,
     relations_parse_numbered_volume as _native_parse_numbered_volume,

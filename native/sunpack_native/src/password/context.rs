@@ -199,35 +199,29 @@ pub(crate) fn verify_prepared(
         }
         cancellation.check()?;
     };
-    cancellation.check()?;
     let prepared = slot.value.get().expect("completed password material");
     if slot.retired.load(Ordering::Acquire) {
-        retire_slot(&key, &slot);
+        cancellation.check()?;
         return Err(input_changed());
     }
-    let result = match prepared {
+    let result = cancellation.check().and_then(|()| match prepared {
         Ok(context) => context.verify(py, candidates),
         Err(status) => status.to_python(py),
-    };
-    if slot.retired.load(Ordering::Acquire) {
-        retire_slot(&key, &slot);
-        return Err(input_changed());
-    }
+    });
     let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-    if slot.retired.load(Ordering::Acquire) {
-        return Err(input_changed());
-    }
+    let retired = slot.retired.load(Ordering::Acquire);
     // Physical failures may be transient; do not memoize them as archive facts.
-    if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error") {
-        entries.retain(|(old, current)| *old != key || !Arc::ptr_eq(current, &slot));
-    }
     // Oversized material is valid for this request but must not remain in the
     // background cache after its last active borrower returns.
-    if matches!(prepared, Ok(context) if context.retained_bytes()>MAX_CONTEXT_BYTES)
+    if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error")
+        || matches!(prepared, Ok(context) if context.retained_bytes() > MAX_CONTEXT_BYTES)
         || matches!(prepared, Err(PreparedStatus::Status(_,message)) if message.starts_with("resource_unavailable:"))
     {
-        entries.retain(|(old, current)| *old != key || !Arc::ptr_eq(current, &slot));
+        entries.retain(|(_, current)| !Arc::ptr_eq(current, &slot));
     }
+    // A finished borrower must be invisible to eviction before another
+    // borrower can acquire the lock and check the cache limits.
+    drop(slot);
     let mut bytes: usize = entries
         .iter()
         .filter_map(|(_, slot)| slot.value.get())
@@ -250,6 +244,9 @@ pub(crate) fn verify_prepared(
         );
     }
     crate::collections::trim_deque(&mut entries);
+    if retired {
+        return Err(input_changed());
+    }
     cancellation.check()?;
     result
 }
@@ -276,13 +273,6 @@ pub(crate) fn release_under_roots(roots: &[PathBuf]) {
         })
     });
     crate::collections::trim_deque(&mut entries);
-}
-
-fn retire_slot(key: &InputKey, slot: &Arc<PreparedSlot>) {
-    retain(
-        &mut cache().lock().unwrap_or_else(|error| error.into_inner()),
-        |old, current| old != key || !Arc::ptr_eq(current, slot),
-    );
 }
 
 fn retain(

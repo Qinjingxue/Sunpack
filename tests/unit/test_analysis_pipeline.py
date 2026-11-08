@@ -10,8 +10,8 @@ from io import BytesIO
 
 import pytest
 
-from sunpack_native import AnalysisBinaryView, inspect_rar_structure, probe_rar_bytes
-from sunpack.core.analysis.embedded import scan_embedded_archives
+from sunpack_native import inspect_rar_structure, probe_rar_bytes, scan_embedded_archives
+from sunpack.core.analysis.embedded.result import embedded_scan_prepass
 from sunpack.core.analysis.engine import AnalysisEngine
 from sunpack.core.analysis.view import SharedBinaryView
 
@@ -224,7 +224,7 @@ def test_analysis_reuses_embedded_roots_without_searching_for_them(tmp_path, rar
     engine = AnalysisEngine()
     assert engine.analyze_path(str(path)).selected == []
     scan = scan_embedded_archives(str(path))
-    report = engine.analyze_path(str(path), initial_prepass=scan.to_prepass())
+    report = engine.analyze_path(str(path), initial_prepass=embedded_scan_prepass(scan))
     actual = {(item.format, segment.start_offset, segment.end_offset)
               for item in report.evidences for segment in item.segments}
     assert set(expected) <= actual
@@ -264,8 +264,8 @@ def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_pa
     path = tmp_path / "payload.bin"
     payload = b"p" * (2 * 1024 * 1024) + _zip_bytes(tmp_path) + b"s" * (2 * 1024 * 1024)
     path.write_bytes(payload)
-    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
-    prepass = scan.to_prepass()
+    scan = scan_embedded_archives(str(path))
+    prepass = embedded_scan_prepass(scan)
     assert prepass["source"] == "embedded_scan"
 
     reused = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
@@ -352,12 +352,12 @@ def test_zip_embedded_boundary_defers_payload_integrity(tmp_path):
     prefix = b"carrier-prefix"
     path = _write_bytes(tmp_path / "crc_bad_carrier.bin", prefix + bytes(data))
 
-    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
+    scan = scan_embedded_archives(str(path))
     zip_evidence = {
         item.format: item
         for item in AnalysisEngine().analyze_path(
             str(path),
-            initial_prepass=scan.to_prepass(),
+            initial_prepass=embedded_scan_prepass(scan),
         ).evidences
     }["zip"]
 
@@ -418,19 +418,19 @@ def test_rar5_header_encrypted_candidate_never_uses_following_archive_as_end(tmp
     follower_start = carrier_size + len(encrypted) + 64
     path = _write_bytes(tmp_path / "two-archives.bin", body)
 
-    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
+    scan = scan_embedded_archives(str(path))
     first = next(
         candidate
-        for candidate in scan.candidates
-        if candidate.format == "rar" and candidate.offset == carrier_size
+        for candidate in scan["candidates"]
+        if candidate["format"] == "rar" and candidate["offset"] == carrier_size
     )
-    assert first.end_offset is None
-    assert first.boundary_kind == "unresolved"
-    assert first.extractable is False
+    assert first["end_offset"] is None
+    assert first["boundary_kind"] == "unresolved"
+    assert first["extractable"] is False
 
     report = AnalysisEngine().analyze_path(
         str(path),
-        initial_prepass=scan.to_prepass(),
+        initial_prepass=embedded_scan_prepass(scan),
     )
     segments = {
         (segment.start_offset, segment.end_offset)
@@ -464,16 +464,16 @@ def test_damaged_7z_next_header_never_becomes_exact_embedded_evidence(tmp_path):
     seven_data[32 + next_offset] ^= 0xFF
     path = _write_bytes(tmp_path / "next_crc_bad.7z", bytes(seven_data))
 
-    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
+    scan = scan_embedded_archives(str(path))
     seven = {
         item.format: item
         for item in AnalysisEngine().analyze_path(
             str(path),
-            initial_prepass=scan.to_prepass(),
+            initial_prepass=embedded_scan_prepass(scan),
         ).evidences
     }["7z"]
 
-    assert scan.candidates == ()
+    assert not scan["candidates"]
     assert seven.status != "extractable"
 
 @pytest.mark.parametrize(
@@ -553,7 +553,7 @@ def test_tar_is_recognized_only_at_the_logical_start_or_from_embedded_evidence(t
     ordinary = engine.analyze_path(str(carrier))
     assert next(item for item in ordinary.evidences if item.format == "tar").status == "not_found"
     scan = scan_embedded_archives(str(carrier))
-    embedded = engine.analyze_path(str(carrier), initial_prepass=scan.to_prepass())
+    embedded = engine.analyze_path(str(carrier), initial_prepass=embedded_scan_prepass(scan))
     assert embedded.best_selected.format == "tar"
     assert embedded.best_selected.segments[0].start_offset == len(b"carrier-prefix")
 

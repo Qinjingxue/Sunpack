@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sunpack.core.passwords.verifier.base import PasswordBatchVerification, normalize_verifier_status
+from sunpack.core.passwords.verifier.base import PasswordBatchVerification
 from sunpack.core.passwords.verifier.input import PasswordProbeInput, prepare_password_input
 from sunpack_native import rar_fast_verify_passwords_from_ranges, rar_fast_verify_passwords_from_volumes
 
@@ -27,7 +27,7 @@ class RarFastVerifier:
         }:
             with prepared.borrow_sessions() as sessions:
                 outcome = rar_fast_verify_passwords_from_volumes(prepared.volumes, normalized_passwords, sessions=sessions)
-            return self._from_outcome(outcome)
+            return PasswordBatchVerification.from_native(outcome)
         if prepared.volume_aware:
             return PasswordBatchVerification(
                 ok=False,
@@ -42,27 +42,4 @@ class RarFastVerifier:
                 if ranges
                 else sessions[0].rar_fast_verify_passwords(normalized_passwords)
             )
-        return self._from_outcome(outcome)
-
-    @staticmethod
-    def _from_outcome(outcome: dict) -> PasswordBatchVerification:
-        status = normalize_verifier_status(outcome.get("status"))
-        matched_index = int(outcome.get("matched_index", -1))
-        matched_indices = tuple(int(index) for index in outcome.get("matched_indices") or ())
-        attempts = int(outcome.get("attempts", 0))
-        message = str(outcome.get("message") or "")
-        final_confirmation_required = bool(
-            outcome.get("final_confirmation_required", status == "match")
-        )
-        return PasswordBatchVerification(
-            ok=(status == "match" and matched_index >= 0) or status == "not_required",
-            status=status,
-            matched_index=matched_index,
-            matched_indices=matched_indices,
-            attempts=attempts,
-            test_result=outcome,
-            error_text=message.lower(),
-            terminal=status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"},
-            final_confirmation_required=False if status == "not_required" else final_confirmation_required,
-            match_evidence=str(outcome.get("match_evidence") or ""),
-        )
+        return PasswordBatchVerification.from_native(outcome)

@@ -217,15 +217,6 @@ def _memory_info(process: psutil.Process) -> tuple[int, int]:
     return int(getattr(info, "rss", 0) or 0), int(getattr(info, "private", 0) or 0)
 
 
-def _cache_stats() -> dict[str, Any]:
-    try:
-        from sunpack.core.support.global_cache_manager import global_cache_stats
-
-        return global_cache_stats()
-    except (ImportError, AttributeError, TypeError):
-        return {}
-
-
 def _archive_session_count() -> int:
     try:
         from sunpack.core.support import archive_sessions
@@ -315,7 +306,6 @@ class WatchMemorySample:
     handles: int
     children: tuple[dict[str, Any], ...] = ()
     reader: dict[str, Any] = field(default_factory=dict)
-    global_cache: dict[str, Any] = field(default_factory=dict)
     archive_sessions: int = 0
     watch_state: dict[str, Any] = field(default_factory=dict)
     engine: dict[str, Any] = field(default_factory=dict)
@@ -419,7 +409,6 @@ class WatchMemorySampler:
             handles=int(handles),
             children=tuple(child_rows),
             reader=_reader_stats(),
-            global_cache=_cache_stats(),
             archive_sessions=_archive_session_count(),
             watch_state=state,
             engine=_engine_stats(self.engine),
@@ -559,8 +548,6 @@ def summarize_watch_memory(rows: list[WatchMemorySample]) -> dict[str, Any]:
             "completed_files": row.completed_files,
             "parent_rss_mib": row.parent_rss_mib,
             "worker_rss_mib": row.worker_rss_mib,
-            "global_cache_entries": row.global_cache.get("entries", 0),
-            "global_cache_namespaces": row.global_cache.get("namespaces", {}),
             "reader_cache_entries": row.reader.get("cache_entries", 0),
             "reader_cache_bytes": int(row.reader.get("hot_cache_bytes", 0) or 0)
             + int(row.reader.get("general_cache_bytes", 0) or 0),
@@ -609,7 +596,6 @@ def summarize_watch_memory(rows: list[WatchMemorySample]) -> dict[str, Any]:
             max(row.handles for row in rows),
         ],
         "reader_final": final.reader,
-        "global_cache_final": final.global_cache,
         "archive_sessions_final": final.archive_sessions,
         "checkpoint_series": [checkpoint_row(row) for row in checkpoints],
         "watch_state_final": final.watch_state,

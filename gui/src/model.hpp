@@ -35,58 +35,20 @@ struct PasswordSaveSnapshot { Json document; std::string file_text; Json record,
 Json save_changes(const fs::path& directory, const Json& fields, const Json& passwords,
     const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr);
 std::string root_for(const fs::path& path, const WatchRoots& roots);
-struct Task {
-    std::string path, name, status, waiting_reason;
-    // Backend order and original filename spelling; one contiguous collection
-    // serves alias retirement, search and display (no resident duplicate set).
-    struct Member { std::wstring key; std::string filename; };
-    std::vector<Member> members;
-    std::string error, error_kind;
-    bool multipart = false;
-    double timestamp = 0;
-    bool has_timestamp = false;
-    uint64_t sequence = 0;
-    std::vector<std::string> outputs;
-    // Lazy path/time display data: validated against source values on every
-    // projection, so regrouping and reused Task objects cannot show stale data.
-    struct DisplayCache {
-        std::string path, directory, filename;
-        std::string time;
-        double timestamp = 0;
-        bool has_timestamp = false, time_valid = false;
-    };
-    mutable DisplayCache display;
-};
 class EventLog {
     fs::path path_;
-    uint64_t sequence_ = 0;
 public:
     Json manifest;
     std::function<bool()> cancelled;
-    Json query(const WatchRoots& roots, const struct View& view, const std::string& language) const;
-    std::unordered_map<std::wstring, Task> tasks;
+    Json query(const WatchRoots& roots, const struct View& view, const std::string& language = "zh") const;
     void set_path(const fs::path& path);
     bool refresh(bool missing_is_final = false);
-    void accept(const Json& event);
     const fs::path& path() const { return path_; }
 };
 struct View {
     std::string task_query, task_root, task_status, password_query, password_scope = "@all";
     std::string task_cursor;
 };
-struct TaskProjectionStats {
-    double filter_ms = 0, sort_ms = 0, project_ms = 0;
-    size_t selected = 0;
-    bool reused = false;
-};
-// When previous_ids matches the newly selected and sorted IDs, returning null
-// means the caller can keep its existing full UI state; only use when the
-// underlying tasks, watch roots and language have NOT changed.
-Json task_rows(const EventLog& log, const WatchRoots& roots, const View& view,
-    const std::string& language = "zh",
-    std::vector<std::wstring>* selected_ids = nullptr,
-    const std::vector<std::wstring>* previous_ids = nullptr,
-    TaskProjectionStats* stats = nullptr);
 // Resolve only on activation so removed/moved output directories fall back then.
 fs::path task_directory(const Json& row);
 Json password_rows(const Json& passwords, const View& view, const std::string& language = "zh");

@@ -59,7 +59,7 @@ def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property
     ``SUNPACK_WATCH_MEMORY_TIMEOUT_SECONDS`` (default 90).
 
     The detailed JSON report includes RSS, private memory, child processes,
-    reader cache, global cache namespaces, archive sessions, inspection cache,
+    reader cache, archive sessions, inspection cache,
     watch state, engine queues, handles, and threads at every checkpoint.
     """
     from sunpack.runtime.watch import scheduler
@@ -98,6 +98,7 @@ async def _run_watch_memory_growth(tmp_path, record_property):
     corpus_root = tmp_path / "corpus"
 
     async with WatchMemoryHarness.create(tmp_path, _watch_memory_config()) as harness:
+        output_root = harness.output_root
         sampler = WatchMemorySampler(
             watcher=harness.watcher,
             engine=harness.engine,
@@ -130,12 +131,12 @@ async def _run_watch_memory_growth(tmp_path, record_property):
                 result = await drive_watch_until(
                     harness.watcher,
                     lambda expected=expected_outputs: count_output_files(
-                        harness.output_root, "payload-*.txt"
+                        output_root, "payload-*.txt"
                     ) >= expected,
                     timeout_seconds=timeout,
                 )
                 assert result.failed == 0, result.errors
-                completed = count_output_files(harness.output_root, "payload-*.txt")
+                completed = count_output_files(output_root, "payload-*.txt")
                 sampler.sample(
                     files_seen=published_count,
                     completed_files=completed,
@@ -160,7 +161,7 @@ async def _run_watch_memory_growth(tmp_path, record_property):
                     )
 
             assert published_count == total_files
-            assert count_output_files(harness.output_root, "payload-*.txt") == total_files
+            assert count_output_files(output_root, "payload-*.txt") == total_files
         finally:
             sampler.stop()
 

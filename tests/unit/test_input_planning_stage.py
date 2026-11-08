@@ -2,7 +2,8 @@ import zipfile
 from dataclasses import replace
 from io import BytesIO
 
-from sunpack.core.analysis.embedded import scan_embedded_archives
+from sunpack.core.analysis.embedded.result import embedded_scan_prepass
+from sunpack_native import scan_embedded_archives
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge, ensure_knowledge, write_payload
 from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
@@ -224,7 +225,7 @@ def test_input_planning_stage_plans_real_carrier_segments_in_offset_order(tmp_pa
     write_payload(
         knowledge,
         "inspection",
-        {"prepass": scan_embedded_archives(str(carrier)).to_prepass()},
+        {"prepass": embedded_scan_prepass(scan_embedded_archives(str(carrier)))},
         source_layer="tests",
         source_module="input_planning",
     )

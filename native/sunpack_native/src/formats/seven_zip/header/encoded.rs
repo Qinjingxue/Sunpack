@@ -169,7 +169,7 @@ fn parse_seven_zip_encoded_header_descriptor(
         pos += 1;
         match nid {
             SZ_END => break,
-            SZ_PACK_INFO => pack_info = Some(parse_seven_zip_pack_info(raw, &mut pos)?),
+            SZ_PACK_INFO => pack_info = Some(parse_seven_zip_pack_info(raw, &mut pos, true)?),
             SZ_UNPACK_INFO => {
                 let parsed = parse_seven_zip_unpack_info(raw, &mut pos)?;
                 if parsed.folders.len() != 1 {
@@ -529,11 +529,7 @@ fn decrypt_seven_zip_aes256_sha256(
     }
     output.finish().map_err(resource_error)
 }
-fn decode_lzma(
-    data: &[u8],
-    coder: &SevenZipCoderAst,
-    unpack_size: u64,
-) -> Result<Blob, String> {
+fn decode_lzma(data: &[u8], coder: &SevenZipCoderAst, unpack_size: u64) -> Result<Blob, String> {
     let compressed = Cursor::new(data);
     if coder.method_id.as_slice() == EncoderMethod::ID_LZMA {
         if coder.properties.len() < 5 {
@@ -658,9 +654,11 @@ pub(crate) fn seven_zip_kdf_cache_entries() -> usize {
 pub(crate) fn clear_seven_zip_kdf_cache() -> usize {
     // Idle cleanup owns the same boundary as reader/password-context cleanup.
     // Drop entries and their backing allocation outside the cache lock.
-    let entries = std::mem::take(&mut *seven_zip_kdf_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let entries = std::mem::take(
+        &mut *seven_zip_kdf_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
     entries.len()
 }
 

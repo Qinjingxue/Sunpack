@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sunpack.core.passwords.verifier.base import PasswordBatchVerification, normalize_verifier_status
+from sunpack.core.passwords.verifier.base import PasswordBatchVerification
 from sunpack.core.passwords.verifier.input import PasswordProbeInput, prepare_password_input
 from sunpack_native import seven_zip_fast_verify_passwords_from_ranges
 
@@ -33,20 +33,4 @@ class SevenZipFastVerifier:
                 if ranges
                 else sessions[0].seven_zip_fast_verify_passwords(normalized_passwords)
             )
-        status = normalize_verifier_status(outcome.get("status"))
-        matched_index = int(outcome.get("matched_index", -1))
-        attempts = int(outcome.get("attempts", 0))
-        message = str(outcome.get("message") or "")
-        return PasswordBatchVerification(
-            ok=(status == "match" and matched_index >= 0) or status == "not_required",
-            status=status,
-            matched_index=matched_index,
-            attempts=attempts,
-            test_result=outcome,
-            error_text=message.lower(),
-            terminal=status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"},
-            final_confirmation_required=bool(
-                outcome.get("final_confirmation_required", status == "match")
-            ) if status != "not_required" else False,
-            match_evidence=str(outcome.get("match_evidence") or ""),
-        )
+        return PasswordBatchVerification.from_native(outcome)

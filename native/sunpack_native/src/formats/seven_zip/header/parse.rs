@@ -84,11 +84,7 @@ fn parse_seven_zip_encoded_header_ast(
         return Err("7z EncodedHeader NID is missing".to_string());
     }
     pos += 1;
-    let streams = parse_seven_zip_streams_info(raw, &mut pos);
-    Ok(SevenZipHeaderAst {
-        unpack_info: streams.unpack_info,
-        diagnostics: streams.diagnostics,
-    })
+    Ok(parse_seven_zip_streams_info(raw, &mut pos))
 }
 
 pub(crate) struct SevenZipEncryptionFacts {
@@ -157,10 +153,8 @@ pub(crate) fn seven_zip_encryption_facts_from_next_header(raw: &[u8]) -> SevenZi
     }
 }
 
-fn parse_seven_zip_streams_info(data: &[u8], pos: &mut usize) -> SevenZipStreamsInfoAst {
-    let mut pack_info = None;
+fn parse_seven_zip_streams_info(data: &[u8], pos: &mut usize) -> SevenZipHeaderAst {
     let mut unpack_info = None;
-    let mut substreams_info = None;
     let mut diagnostics = Vec::new();
     loop {
         let Some(nid) = data.get(*pos).copied() else {
@@ -170,15 +164,12 @@ fn parse_seven_zip_streams_info(data: &[u8], pos: &mut usize) -> SevenZipStreams
         *pos += 1;
         let result = match nid {
             SZ_END => break,
-            SZ_PACK_INFO => {
-                parse_seven_zip_pack_info(data, pos).map(|value| pack_info = Some(value))
-            }
+            SZ_PACK_INFO => parse_seven_zip_pack_info(data, pos, false).map(|_| ()),
             SZ_UNPACK_INFO => {
                 parse_seven_zip_unpack_info(data, pos).map(|value| unpack_info = Some(value))
             }
             SZ_SUB_STREAMS_INFO => match unpack_info.as_ref() {
-                Some(unpack) => parse_seven_zip_substreams_info(data, pos, unpack)
-                    .map(|value| substreams_info = Some(value)),
+                Some(unpack) => parse_seven_zip_substreams_info(data, pos, unpack),
                 None => Err("substreams_info_requires_unpack_info".to_string()),
             },
             _ => Err(format!("unsupported_streams_info_nid_0x{nid:02x}")),
@@ -188,10 +179,8 @@ fn parse_seven_zip_streams_info(data: &[u8], pos: &mut usize) -> SevenZipStreams
             break;
         }
     }
-    SevenZipStreamsInfoAst {
-        pack_info,
+    SevenZipHeaderAst {
         unpack_info,
-        substreams_info,
         diagnostics,
     }
 }
@@ -204,7 +193,11 @@ fn seven_zip_vec<T>(count: usize) -> Result<Vec<T>, String> {
     Ok(values)
 }
 
-fn parse_seven_zip_pack_info(data: &[u8], pos: &mut usize) -> Result<SevenZipPackInfoAst, String> {
+fn parse_seven_zip_pack_info(
+    data: &[u8],
+    pos: &mut usize,
+    retain_sizes: bool,
+) -> Result<SevenZipPackInfoAst, String> {
     let pack_pos =
         read_sz_vint(data, pos).ok_or_else(|| "7z PackInfo PackPos is truncated".to_string())?;
     let num_streams_raw = read_sz_vint(data, pos)
@@ -223,23 +216,24 @@ fn parse_seven_zip_pack_info(data: &[u8], pos: &mut usize) -> Result<SevenZipPac
                 if num_streams > data.len().saturating_sub(*pos) {
                     return Err("7z PackInfo PackSizes is truncated".to_string());
                 }
-                sizes = seven_zip_vec(num_streams)?;
+                if retain_sizes {
+                    sizes = seven_zip_vec(num_streams)?;
+                }
                 for _ in 0..num_streams {
                     let span = read_sz_vint(data, pos)
                         .ok_or_else(|| "7z PackInfo PackSizes is truncated".to_string())?;
-                    sizes.push(span);
+                    if retain_sizes {
+                        sizes.push(span);
+                    }
                 }
             }
             SZ_CRC => {
-                let defined = parse_seven_zip_bool_vector(data, pos, num_streams)?;
-                for is_defined in defined {
-                    if is_defined {
-                        if *pos + 4 > data.len() {
-                            return Err("7z PackInfo CRC values are truncated".to_string());
-                        }
-                        *pos += 4;
-                    }
-                }
+                skip_seven_zip_crcs(
+                    data,
+                    pos,
+                    num_streams,
+                    "7z PackInfo CRC values are truncated",
+                )?;
             }
             _ => return Err(format!("unsupported 7z PackInfo NID 0x{nid:02x}")),
         }
@@ -309,9 +303,9 @@ fn parse_seven_zip_unpack_info(
     }
     if data.get(*pos).copied() == Some(SZ_CRC) {
         *pos += 1;
-        let defined = parse_seven_zip_bool_vector(data, pos, folders.len())?;
-        for (folder, is_defined) in folders.iter_mut().zip(defined) {
-            if is_defined {
+        let defined = parse_seven_zip_crc_flags(data, pos, folders.len())?;
+        for (index, folder) in folders.iter_mut().enumerate() {
+            if defined.contains(index) {
                 if pos.checked_add(4).is_none_or(|end| end > data.len()) {
                     return Err("unpack_info_folder_crc_truncated".to_string());
                 }
@@ -535,34 +529,43 @@ fn parse_seven_zip_substreams_info(
     data: &[u8],
     pos: &mut usize,
     unpack: &SevenZipUnpackInfoAst,
-) -> Result<SevenZipSubStreamsInfoAst, String> {
-    let mut counts = seven_zip_vec(unpack.folders.len())?;
-    counts.resize(unpack.folders.len(), 1usize);
+) -> Result<(), String> {
+    let mut counts = Vec::new();
     let mut nid = *data
         .get(*pos)
         .ok_or_else(|| "substreams_info_truncated".to_string())?;
     if nid == SZ_NUM_UNPACK_STREAM {
         *pos += 1;
-        for count in &mut counts {
-            *count = usize::try_from(
-                read_sz_vint(data, pos)
-                    .ok_or_else(|| "substreams_info_count_truncated".to_string())?
-                    .value,
-            )
-            .map_err(|_| "substreams_info_count_too_large".to_string())?;
+        counts = seven_zip_vec(unpack.folders.len())?;
+        for _ in &unpack.folders {
+            let count = read_sz_vint(data, pos)
+                .ok_or_else(|| "substreams_info_count_truncated".to_string())?
+                .value;
+            counts.push(
+                usize::try_from(count)
+                    .map_err(|_| "substreams_info_count_too_large".to_string())?,
+            );
         }
         nid = *data
             .get(*pos)
             .ok_or_else(|| "substreams_info_truncated_after_counts".to_string())?;
     }
-    let total_streams = counts
+    let folders = unpack
+        .folders
         .iter()
-        .try_fold(0usize, |sum, value| sum.checked_add(*value))
-        .ok_or_else(|| "substreams_info_total_count_overflow".to_string())?;
-    let explicit_sizes = counts
-        .iter()
-        .map(|count| count.saturating_sub(1))
-        .sum::<usize>();
+        .zip(counts.iter().copied().chain(std::iter::repeat(1)));
+    let (total_streams, explicit_sizes) = if counts.is_empty() {
+        (unpack.folders.len(), 0)
+    } else {
+        let total = counts
+            .iter()
+            .try_fold(0usize, |sum, &count| sum.checked_add(count))
+            .ok_or_else(|| "substreams_info_total_count_overflow".to_string())?;
+        (
+            total,
+            total - counts.iter().filter(|&&count| count != 0).count(),
+        )
+    };
     if nid == SZ_SIZE {
         if explicit_sizes > data.len().saturating_sub(*pos + 1) {
             return Err("substreams_info_size_truncated".to_string());
@@ -570,11 +573,9 @@ fn parse_seven_zip_substreams_info(
     } else if explicit_sizes != 0 {
         return Err("substreams_info_sizes_missing_for_multiple_streams".to_string());
     }
-    let mut size_values = seven_zip_vec(total_streams)?;
-    let mut crc_values = seven_zip_vec(total_streams)?;
     if nid == SZ_SIZE {
         *pos += 1;
-        for (folder, count) in unpack.folders.iter().zip(&counts) {
+        for (folder, count) in folders.clone() {
             let mut sum = 0u64;
             for _ in 0..count.saturating_sub(1) {
                 let span = read_sz_vint(data, pos)
@@ -582,95 +583,74 @@ fn parse_seven_zip_substreams_info(
                 sum = sum
                     .checked_add(span.value)
                     .ok_or_else(|| "substreams_info_size_sum_overflow".to_string())?;
-                size_values.push(span.value);
             }
-            if *count > 0 {
-                size_values.push(folder.unpack_size.checked_sub(sum).ok_or_else(|| {
-                    "substreams_info_sizes_exceed_folder_unpack_size".to_string()
-                })?);
+            if sum > folder.unpack_size {
+                return Err("substreams_info_sizes_exceed_folder_unpack_size".to_string());
             }
         }
         nid = *data
             .get(*pos)
             .ok_or_else(|| "substreams_info_truncated_after_sizes".to_string())?;
-    } else {
-        for (folder, count) in unpack.folders.iter().zip(&counts) {
-            if *count == 1 {
-                size_values.push(folder.unpack_size);
-            } else if *count > 1 {
-                return Err("substreams_info_sizes_missing_for_multiple_streams".to_string());
-            }
-        }
     }
     if nid == SZ_CRC {
         *pos += 1;
-        let digest_count = unpack
-            .folders
-            .iter()
-            .zip(&counts)
-            .map(|(folder, count)| {
-                if *count == 1 && folder.expected_crc.is_some() {
-                    0
-                } else {
-                    *count
-                }
-            })
-            .sum::<usize>();
-        let defined = parse_seven_zip_bool_vector(data, pos, digest_count)?;
-        let mut defined_index = 0usize;
-        for (folder, count) in unpack.folders.iter().zip(&counts) {
-            if *count == 1 && folder.expected_crc.is_some() {
-                crc_values.push(folder.expected_crc);
-                continue;
-            }
-            for _ in 0..*count {
-                if defined[defined_index] {
-                    if pos.checked_add(4).is_none_or(|end| end > data.len()) {
-                        return Err("substreams_info_crc_truncated".to_string());
-                    }
-                    crc_values.push(Some(SevenZipCrcSpan {
-                        value: u32_le(data, *pos),
-                    }));
-                    *pos += 4;
-                } else {
-                    crc_values.push(None);
-                }
-                defined_index += 1;
-            }
-        }
+        let inherited = folders
+            .filter(|(folder, count)| *count == 1 && folder.expected_crc.is_some())
+            .count();
+        skip_seven_zip_crcs(
+            data,
+            pos,
+            total_streams - inherited,
+            "substreams_info_crc_truncated",
+        )?;
         nid = *data
             .get(*pos)
             .ok_or_else(|| "substreams_info_truncated_after_crc".to_string())?;
-    } else {
-        for (folder, count) in unpack.folders.iter().zip(&counts) {
-            if *count == 1 {
-                crc_values.push(folder.expected_crc);
-            } else {
-                crc_values.extend((0..*count).map(|_| None));
-            }
-        }
     }
     if nid != SZ_END {
         return Err(format!("unsupported_substreams_info_nid_0x{nid:02x}"));
     }
     *pos += 1;
-    if size_values.len() != total_streams || crc_values.len() != total_streams {
-        return Err("substreams_info_cardinality_mismatch".to_string());
-    }
-    Ok(SevenZipSubStreamsInfoAst {
-        num_unpack_streams: counts,
-        unpack_size_values: size_values,
-        crc_values,
-    })
+    Ok(())
 }
 
-fn parse_seven_zip_bool_vector(
-    data: &[u8],
+enum SevenZipCrcFlags<'a> {
+    All,
+    Mask(&'a [u8]),
+}
+
+impl SevenZipCrcFlags<'_> {
+    fn contains(&self, index: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Mask(bits) => bits[index / 8] & (0x80 >> (index % 8)) != 0,
+        }
+    }
+
+    fn defined_count(&self, count: usize) -> usize {
+        match self {
+            Self::All => count,
+            Self::Mask(bits) => {
+                let mut defined = bits[..count / 8]
+                    .iter()
+                    .map(|byte| byte.count_ones() as usize)
+                    .sum::<usize>();
+                if count % 8 != 0 {
+                    defined += (bits[count / 8] >> (8 - count % 8)).count_ones() as usize;
+                }
+                defined
+            }
+        }
+    }
+}
+
+fn parse_seven_zip_crc_flags<'a>(
+    data: &'a [u8],
     pos: &mut usize,
     count: usize,
-) -> Result<Vec<bool>, String> {
+) -> Result<SevenZipCrcFlags<'a>, String> {
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(SevenZipCrcFlags::All);
     }
     let all_defined = *data
         .get(*pos)
@@ -680,21 +660,29 @@ fn parse_seven_zip_bool_vector(
         if count > data.len().saturating_sub(*pos) / 4 {
             return Err("7z CRC values are truncated".to_string());
         }
-        let mut output = seven_zip_vec(count)?;
-        output.resize(count, true);
-        return Ok(output);
+        return Ok(SevenZipCrcFlags::All);
     }
     let byte_count = count.div_ceil(8);
     if byte_count > data.len().saturating_sub(*pos) {
         return Err("7z boolean bitset is truncated".to_string());
     }
-    let mut output = seven_zip_vec(count)?;
-    for index in 0..count {
-        let byte = data[*pos + index / 8];
-        output.push((byte & (0x80 >> (index % 8))) != 0);
-    }
+    let mask = &data[*pos..*pos + byte_count];
     *pos += byte_count;
-    Ok(output)
+    Ok(SevenZipCrcFlags::Mask(mask))
+}
+
+fn skip_seven_zip_crcs(
+    data: &[u8],
+    pos: &mut usize,
+    count: usize,
+    truncated: &str,
+) -> Result<(), String> {
+    let defined = parse_seven_zip_crc_flags(data, pos, count)?.defined_count(count);
+    if defined > data.len().saturating_sub(*pos) / 4 {
+        return Err(truncated.to_string());
+    }
+    *pos += defined * 4;
+    Ok(())
 }
 
 fn parse_seven_zip_files_info(data: &[u8], pos: &mut usize) -> Result<(), String> {
@@ -775,7 +763,7 @@ mod seven_zip_streams_info_tests {
         pack.extend(vec![0; folders as usize]);
         pack.push(SZ_END);
         assert_eq!(
-            parse_seven_zip_pack_info(&pack, &mut 0)
+            parse_seven_zip_pack_info(&pack, &mut 0, true)
                 .unwrap()
                 .sizes
                 .len(),
@@ -788,13 +776,9 @@ mod seven_zip_streams_info_tests {
         substreams.push(SZ_SIZE);
         substreams.extend(vec![0; 100_000]);
         substreams.push(SZ_END);
-        assert_eq!(
-            parse_seven_zip_substreams_info(&substreams, &mut 0, &unpack)
-                .unwrap()
-                .unpack_size_values
-                .len(),
-            100_001
-        );
+        let mut pos = 0;
+        parse_seven_zip_substreams_info(&substreams, &mut pos, &unpack).unwrap();
+        assert_eq!(pos, substreams.len());
         let mut files = number(100_001);
         files.push(SZ_END);
         assert!(parse_seven_zip_files_info(&files, &mut 0).is_ok());
@@ -803,7 +787,7 @@ mod seven_zip_streams_info_tests {
         impossible.extend(number(u64::MAX));
         impossible.push(0);
         assert!(parse_seven_zip_unpack_info(&impossible, &mut 0).is_err());
-        assert!(parse_seven_zip_bool_vector(&[0], &mut 0, usize::MAX).is_err());
+        assert!(parse_seven_zip_crc_flags(&[0], &mut 0, usize::MAX).is_err());
         assert_eq!(
             seven_zip_vec::<u64>(usize::MAX).unwrap_err(),
             "7z_analysis_resource_limit"
@@ -818,7 +802,8 @@ mod seven_zip_streams_info_tests {
         let expected_crc = 0x4433_2211;
         let mut raw = vec![SZ_PACK_INFO, 0, 1, SZ_SIZE, 10, SZ_END, SZ_UNPACK_INFO];
         raw.extend(one_copy_folder(20, Some(expected_crc)));
-        raw.extend([SZ_SUB_STREAMS_INFO, SZ_END, SZ_END]);
+        // The inherited folder CRC leaves no explicit CRC flags or values.
+        raw.extend([SZ_SUB_STREAMS_INFO, SZ_CRC, SZ_END, SZ_END]);
         let mut pos = 0;
         let streams = parse_seven_zip_streams_info(&raw, &mut pos);
         assert!(streams.diagnostics.is_empty(), "{:?}", streams.diagnostics);
@@ -826,10 +811,8 @@ mod seven_zip_streams_info_tests {
         assert_eq!(unpack.folders.len(), 1);
         assert_eq!(unpack.folders[0].unpack_size, 20);
         assert_eq!(unpack.folders[0].coders[0].method_id, [0]);
-        let substreams = streams.substreams_info.unwrap();
-        assert_eq!(substreams.num_unpack_streams, [1]);
-        assert_eq!(substreams.unpack_size_values, [20]);
-        assert_eq!(substreams.crc_values[0].unwrap().value, expected_crc);
+        assert_eq!(unpack.folders[0].expected_crc.unwrap().value, expected_crc);
+        assert_eq!(pos, raw.len());
     }
 
     #[test]
@@ -843,29 +826,26 @@ mod seven_zip_streams_info_tests {
             SZ_SIZE,
             7,
             SZ_CRC,
-            1,
+            0,
+            // Only the first of the two streams has a CRC. Bits beyond the
+            // two streams are padding even when set.
+            0b1011_1111,
         ]);
         raw.extend(0x1111_1111u32.to_le_bytes());
-        raw.extend(0x2222_2222u32.to_le_bytes());
         raw.extend([SZ_END, SZ_END]);
         let mut pos = 0;
         let streams = parse_seven_zip_streams_info(&raw, &mut pos);
         assert!(streams.diagnostics.is_empty(), "{:?}", streams.diagnostics);
-        let substreams = streams.substreams_info.unwrap();
-        assert_eq!(substreams.num_unpack_streams, [2]);
-        assert_eq!(substreams.unpack_size_values, [7, 13]);
+        assert_eq!(pos, raw.len());
+        raw.truncate(raw.len() - 3);
         assert_eq!(
-            substreams
-                .crc_values
-                .iter()
-                .filter(|crc| crc.is_some())
-                .count(),
-            2
+            parse_seven_zip_streams_info(&raw, &mut 0).diagnostics,
+            ["substreams_info_crc_truncated"],
         );
     }
 
     #[test]
-    fn preserves_pack_info_when_later_substream_graph_is_invalid() {
+    fn preserves_folder_info_when_later_substream_graph_is_invalid() {
         let mut raw = vec![SZ_PACK_INFO, 0, 1, SZ_SIZE, 10, SZ_END, SZ_UNPACK_INFO];
         raw.extend(one_copy_folder(20, None));
         raw.extend([
@@ -878,7 +858,6 @@ mod seven_zip_streams_info_tests {
         ]);
         let mut pos = 0;
         let streams = parse_seven_zip_streams_info(&raw, &mut pos);
-        assert!(streams.pack_info.is_some());
         assert!(streams.unpack_info.is_some());
         assert_eq!(
             streams.diagnostics,
