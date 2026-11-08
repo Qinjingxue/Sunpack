@@ -27,10 +27,19 @@ struct VolumeAttemptPlan {
     std::vector<std::vector<VolumeAttemptSlot>> layouts;
     std::vector<VolumeSlotVariation> variation;
     std::vector<unsigned long long> domain_capacity;
+    bool insufficient_sources = false;
 
     // The plan is immutable after parsing. Summarize domains once, then merge
     // by ordinal AND slot number across layouts (paths alone lose slice identity).
     void prepare() {
+        // Injectivity forbids using a source twice. Even counting unused or
+        // overlapping ranges is a safe upper bound; unknown ends suffice.
+        auto needed = minimum_size;
+        for (const auto& source : sources) {
+            if (!needed) break;
+            needed = source.has_end ? needed - (std::min)(needed, source.end - source.start) : 0;
+        }
+        insufficient_sources = needed != 0;
         std::vector<VolumeSlotVariation> summaries;
         summaries.reserve(domains.size());
         domain_capacity.clear();
@@ -111,6 +120,7 @@ struct VolumeAttemptCursor {
         ++domain_remaining[slots[depth].domain];
     }
     bool next(const VolumeAttemptPlan& plan, const std::atomic<bool>* cancel = nullptr) {
+        if (plan.insufficient_sources) return false;
         while (layout < plan.layouts.size()) {
             const auto& slots = plan.layouts[layout];
             std::size_t depth = 0;

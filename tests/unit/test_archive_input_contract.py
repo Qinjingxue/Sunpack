@@ -106,3 +106,33 @@ def test_path_mapping_moves_each_input_once_and_preserves_the_shared_plan(tmp_pa
     assert task.inputs[0].source_paths == (second, moved)
     assert task.inputs[0].descriptor.primary_extent == InputExtent(second, 37, 512)
     assert set(task.cleanup_parts) == {second, moved}
+
+
+def test_shared_plan_checkpoint_matches_full_extents_and_ordered_domains():
+    # Independent deserialization destroys tuple identity. A trimmed carrier
+    # and competing layouts exercise both domain equality and checkpoint lookup.
+    import json
+    from dataclasses import replace
+    from sunpack.core.contracts.archive_input import VolumeAttemptPlan, VolumeAttemptSlot
+    sources = (InputExtent("head", 17, 117), InputExtent("a", 0, 40),
+               InputExtent("b", 0, 40), InputExtent("tail", 0, 20))
+    choices = (1, 2)
+    slots = (VolumeAttemptSlot(1, "v1", (0,)), VolumeAttemptSlot(2, "v2", choices),
+             VolumeAttemptSlot(3, "v3", choices), VolumeAttemptSlot(4, "v4", (3,)))
+    plan = VolumeAttemptPlan(sources, (slots, tuple(replace(s, canonical_name=s.canonical_name + "x") for s in slots)),
+                             head_size_from_total=150)
+    original = ArchiveInputDescriptor("head", "native_volumes", "7z", volume_style="numeric_suffix",
+        parts=[ArchiveInputPart(sources[0], "first", 1, "v1")], volume_attempts=plan)
+    restored = ArchiveInputDescriptor.from_dict(json.loads(json.dumps(original.to_dict())))
+    assert original.same_retry_input(restored)
+    winner = restored.select_volumes({"layout": 0, "sources": [0, 2, 1, 3]})
+    assert winner.parts[0].extent == InputExtent("head", 17, 67)
+    assert original.admits_selected_volumes(winner)
+    damaged = replace(winner, parts=[replace(winner.parts[0], extent=InputExtent("head", 17, 68)), *winner.parts[1:]])
+    assert not original.admits_selected_volumes(damaged)
+    reordered = replace(plan, layouts=(tuple(replace(s, choices=tuple(reversed(s.choices))) for s in slots), plan.layouts[1]))
+    assert plan != reordered  # Same membership, different attempt priority.
+    restricted = replace(plan, layouts=(tuple(replace(s, choices=(1,)) if s.number == 2 else s for s in slots),))
+    assert not replace(original, volume_attempts=restricted).admits_selected_volumes(winner)
+    with pytest.raises(ValueError, match="unplanned"):
+        restored.select_volumes({"layout": 0, "sources": [0, 3, 1, 2]})

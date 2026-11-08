@@ -19,9 +19,7 @@ impl VolumeAttempts {
     // archive. Reuse the unique mapping's geometry and represent each possible
     // common disk size with ordinary range/domain layouts (no second protocol).
     fn with_spanned_carrier(mut self, head: &VolumeAnchor) -> Self {
-        if head.payload_end.is_some()
-            || (head.carrier_limit.is_none() && head.structure_offset.unwrap_or(0) == 0)
-        {
+        if !head.has_unresolved_carrier_extent() {
             return self;
         }
         let mut domains = Domains::default();
@@ -189,8 +187,7 @@ fn zip_total(anchor: &VolumeAnchor) -> Option<u64> {
 }
 
 fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>, bool) {
-    let trim = head.payload_end.is_none()
-        && (head.carrier_limit.is_some() || head.structure_offset.unwrap_or(0) > 0);
+    let trim = head.has_unresolved_carrier_extent();
     let minimum = (format == "7z")
         .then(|| {
             head.expected_logical_size
@@ -464,6 +461,26 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 .filter(|n| *n > 1)
                 .map(Some)
                 .collect();
+            if let Some(end) = inferred_end {
+                // A name-derived end is only a hypothesis. Unnumbered interior
+                // members may extend it, or may be alternatives for existing
+                // gaps. Keep every feasible length without multiplying domains.
+                let unnamed = indexes
+                    .iter()
+                    .filter(|i| view.facts[i].has_next != Some(false) && numbers[i].is_empty())
+                    .count();
+                let maximum = indexes
+                    .iter()
+                    .filter(|i| view.facts[i].has_next != Some(false))
+                    .count()
+                    + 1;
+                let last = (end as usize).saturating_add(unnamed).min(maximum);
+                terminals.extend(
+                    ((end as usize + 1)..=last)
+                        .filter_map(|n| u32::try_from(n).ok())
+                        .map(Some),
+                );
+            }
             terminals.sort_unstable();
             terminals.dedup();
             if terminals.is_empty() {

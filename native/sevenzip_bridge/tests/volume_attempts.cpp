@@ -66,7 +66,22 @@ int main() {
                     {slot(0, 2), slot(1, 1), slot(2, 1), slot(3, 1)}};
     if (!compare(plan)) return 1;
 
+    // Each slot sees the same large source, but injectivity permits its bytes
+    // only once. This is length infeasibility despite enough distinct choices.
+    plan.sources.resize(12);
+    for (auto& range : plan.sources) { range.has_end = true; range.end = 1; }
+    plan.sources[0].end = 100;
+    plan.minimum_size = 112;
+    plan.domains = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}};
+    plan.layouts = {{}};
+    for (std::size_t i = 0; i < 12; ++i) plan.layouts[0].push_back(slot(i, 0));
+    plan.prepare();
+    VolumeAttemptCursor insufficient;
+    insufficient.reserve(plan);
+    if (insufficient.next(plan) || insufficient.attempts) return 4;
+
     // The large unsatisfiable layout must not obstruct a later valid layout.
+    plan = {};
     plan.sources.resize(11);
     plan.domains = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, {0}};
     plan.layouts = {{}, {slot(0, 1)}};

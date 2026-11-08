@@ -903,11 +903,10 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     # or lost worker cancellation/results. Input/output stay below one MiB.
     import queue
     import threading
+    from tests.helpers.native_build import sevenzip_artifact
     from sunpack.core.platform.windows.process_job import JOBOBJECT_EXTENDED_LIMIT_INFORMATION_STRUCT, _kernel32
 
-    worker = Path(_require_worker_or_skip()).with_name("sunpack_sevenzip_memory_worker.exe")
-    if not worker.is_file():
-        pytest.skip("build the sunpack_sevenzip_memory_worker test target")
+    worker = sevenzip_artifact("sunpack_sevenzip_memory_worker.exe")
     archive = tmp_path / "large-dictionary.blob"
     xz = bytearray(lzma.compress(b"memory replay" * 100, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 20}]))
     header_size = (xz[12] + 1) * 4
@@ -915,14 +914,20 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     xz[16] = 28  # legal 64 MiB LZMA2 dictionary; compressed payload is unchanged
     xz[12 + header_size - 4:12 + header_size] = struct.pack("<I", binascii.crc32(xz[12:12 + header_size - 4]))
     archive.write_bytes(xz)
-    head, short_tail, tail = (tmp_path / name for name in ("head.blob", "short.blob", "tail.blob"))
-    head.write_bytes(xz[:32])
-    short_tail.write_bytes(b"\0")
-    tail.write_bytes(xz[32:])
+    head, bad_tail, tail = (tmp_path / name for name in ("head.blob", "bad.blob", "tail.blob"))
+    # Put the dictionary property in the variable range. A shared 64 MiB
+    # property would park even the corrupt first candidate before it can fail.
+    head.write_bytes(xz[:16])
+    damaged = bytearray(xz)
+    damaged[16] = 0  # 4 KiB dictionary fits while the job is memory constrained.
+    damaged[12 + header_size - 4:12 + header_size] = struct.pack("<I", binascii.crc32(damaged[12:12 + header_size - 4]))
+    damaged[-1] ^= 1  # invalid footer, with the full declared input length
+    bad_tail.write_bytes(damaged[16:])
+    tail.write_bytes(xz[16:])
     trial_input = ArchiveInputDescriptor.from_parts(archive_path=str(head), format_hint="xz").to_dict()
     trial_input["volume_attempts"] = {
         "minimum_size": len(xz),
-        "sources": [{"path": str(p), "start": 0, "end": p.stat().st_size} for p in (head, short_tail, tail)],
+        "sources": [{"path": str(p), "start": 0, "end": p.stat().st_size} for p in (head, bad_tail, tail)],
         "domains": [{"choices": [0]}, {"choices": [1, 2]}],
         "layouts": [{"slots": [
             {"number": 1, "canonical_name": "stream.001", "domain": 0},
@@ -966,6 +971,14 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         reserve_mib = handshake["memory_reserve_bytes"] // 1024**2
         capacity(reserve_mib + 48)
         assert kernel.AssignProcessToJobObject(handle, int(process._handle))
+        # Prove that the losing composition fails before memory admission.
+        # Otherwise two final attempts could hide parking the wrong candidate.
+        rejected = {**trial_input, "volume_attempts": {**trial_input["volume_attempts"],
+                    "domains": [{"choices": [0]}, {"choices": [1]}]}}
+        send({"job_id": "rejected", "archive_input": rejected, "output_dir": str(tmp_path / "rejected")})
+        failure = until(lambda event: event.get("job_id") == "rejected" and event.get("type") == "result")
+        assert failure["status"] == "failed" and failure["volume_attempts"] == 1
+        assert not any(e.get("job_id") == "rejected" and e.get("event") == "memory_blocked" for e in seen)
         large_jobs = {f"large-{index}" for index in range(1, max(2, int(handshake["thread_capacity"])) + 1)}
         for job in sorted(large_jobs):
             descriptor = trial_input if job in {"large-1", "large-2"} else ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="xz").to_dict()

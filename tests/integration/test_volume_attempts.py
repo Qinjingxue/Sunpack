@@ -235,13 +235,17 @@ def _run_trial(tmp_path, descriptor, **kwargs):
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-@pytest.mark.parametrize("unnumbered_middle", [False, True])
+@pytest.mark.parametrize("unnumbered_middle", [False, True, "mixed"])
 def test_unnumbered_structural_tail_survives_ambiguous_middle_order(tmp_path, archive_format, unnumbered_middle):
     # A terminal proven by format structure must not disappear just because
     # its filename has no number. Existing gap cases keep a numbered terminal.
     case, paths, config, _ = _ambiguous_case(tmp_path, archive_format)
     paths[-1].rename(paths[-1].with_name("shared.tail.opaque"))
-    if unnumbered_middle:
+    if unnumbered_middle == "mixed":
+        paths[0].rename(paths[0].with_name("shared.part1.opaque"))
+        paths[1].rename(paths[1].with_name("shared.part2.opaque"))
+        paths[2].rename(paths[2].with_name("shared.alpha.opaque"))
+    elif unnumbered_middle:
         for path, name in zip(paths[1:-1], ["beta", "alpha"]):
             path.rename(path.with_name(f"shared.{name}.opaque"))
     tasks = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)]).tasks
@@ -252,7 +256,8 @@ def test_unnumbered_structural_tail_survives_ambiguous_middle_order(tmp_path, ar
 
 
 @pytest.mark.parametrize("payload_size", [160 * 1024, 3 * 1024 * 1024])
-def test_spanned_zip_carrier_keeps_disk_geometry_during_trials(tmp_path, payload_size):
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_spanned_zip_carrier_keeps_disk_geometry_during_trials(tmp_path, payload_size, ambiguous):
     # Raw split ZIP uses total logical bytes. PKZIP disks use disk-relative
     # offsets, so the raw carrier formula cannot repair this input.
     from tests.helpers.tool_config import get_optional_winrar
@@ -268,16 +273,40 @@ def test_spanned_zip_carrier_keeps_disk_geometry_during_trials(tmp_path, payload
                     str(root / "shared.zip"), str(source)], check=True, capture_output=True)
     parts = sorted(root.iterdir())
     head = parts[0]
-    head.write_bytes(b"prefix" * 17 + head.read_bytes() + b"padding" * 31)
-    bad = parts[1].with_name("shared.z02.a.opaque")
-    damaged = bytearray(parts[1].read_bytes())
-    damaged[len(damaged) // 2] ^= 1
-    bad.write_bytes(damaged)
+    head_size = head.stat().st_size
+    prefix = b"prefix" * 17
+    head.write_bytes(prefix + head.read_bytes() + b"padding" * 31)
+    if ambiguous:
+        bad = parts[1].with_name("shared.z02.a.opaque")
+        damaged = bytearray(parts[1].read_bytes())
+        damaged[len(damaged) // 2] ^= 1
+        bad.write_bytes(damaged)
     tasks = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(root)]).tasks
-    task = next(t for t in tasks if t.archive_input().volume_attempts)
+    task = next(t for t in tasks if t.archive_input().format_hint == "zip")
+    if not ambiguous:
+        assert task.archive_input().parts[0].extent.end == len(prefix) + head_size
     final = _run_trial(tmp_path, task.archive_input())
     assert final["status"] == "ok", json.dumps({"result": final, "input": task.archive_input().to_dict()})
     assert next((tmp_path / "worker-out").rglob("payload.bin")).read_bytes() == expected
+
+
+@pytest.mark.parametrize("archive_format", ["7z", "zip"])
+def test_unique_raw_split_carrier_trims_unsigned_padding(tmp_path, archive_format):
+    # A carrier without a following signature has no carrier_limit. Unique
+    # filename mappings must recover the same head extent as speculative ones.
+    case = ArchiveFixtureFactory().create(tmp_path, "shared", archive_format, split=True,
+        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+    head = sorted(case.archive_dir.iterdir())[0]
+    head_size = head.stat().st_size
+    prefix = b"prefix" * 17
+    head.write_bytes(prefix + head.read_bytes() + b"padding" * 31)
+    tasks = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(case.archive_dir)]).tasks
+    task = next(t for t in tasks if t.archive_input().format_hint == archive_format)
+    descriptor = task.archive_input()
+    assert descriptor.parts[0].extent.end == len(prefix) + head_size, descriptor.to_dict()
+    final = _run_trial(tmp_path, descriptor)
+    assert final["status"] == "ok", final
+    assert next((tmp_path / "worker-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
 
 def test_declared_length_prunes_impossible_subtrees_and_keeps_late_winner(tmp_path):

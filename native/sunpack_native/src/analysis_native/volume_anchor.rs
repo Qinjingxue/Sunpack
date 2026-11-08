@@ -73,6 +73,36 @@ pub(crate) struct VolumeAnchor {
 }
 
 impl VolumeAnchor {
+    pub(crate) fn has_unresolved_carrier_extent(&self) -> bool {
+        self.payload_end.is_none()
+            && (self.carrier_limit.is_some() || self.structure_offset.unwrap_or(0) > 0)
+    }
+
+    fn discard_zip_continuation_head(&mut self) {
+        // A local member header plus EOCD does not prove a standalone ZIP.
+        // Coordinates beyond this disk may refer to an earlier raw chunk.
+        // Reuse the parsed directory; no additional probe or payload reads.
+        if self.zip_directory.as_ref().is_some_and(|d| {
+            d.disk == 0
+                && d.cd_disk == 0
+                && d.offset.checked_add(d.size).is_some_and(|end| end > d.end)
+        }) {
+            self.standalone = false;
+            self.structure_offset = None;
+            self.anchor_roles
+                .retain(|r| !matches!(*r, "first" | "standalone"));
+            self.evidence
+                .retain(|e| !matches!(*e, "zip:local_header" | "zip:embedded_local_header"));
+            if !self
+                .evidence
+                .contains(&"zip:eocd_single_disk_without_local_header")
+            {
+                self.evidence
+                    .push("zip:eocd_single_disk_without_local_header");
+            }
+        }
+    }
+
     // Only a parsed physical boundary can exclude another structure. An
     // opaque chunk's EOF is an input limit, not evidence of ownership.
     pub(crate) fn proven_extent_end(&self) -> Option<u64> {
@@ -1017,6 +1047,7 @@ fn probe_zip_eocd(
         out.continuation_from_previous = eocd_index.is_some();
         out.continuation_to_next = has_first;
     }
+    out.discard_zip_continuation_head();
     true
 }
 
@@ -1073,6 +1104,7 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
         out.evidence
             .retain(|e| *e != "zip:eocd_single_disk_without_local_header");
     }
+    out.discard_zip_continuation_head();
     out
 }
 

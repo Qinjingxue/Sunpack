@@ -110,6 +110,29 @@ class VolumeAttemptPlan:
         object.__setattr__(self, "layouts", tuple(layouts))
         object.__setattr__(self, "_domains", tuple(domains.values()))
 
+    def __eq__(self, other):
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        if self is other:
+            return True
+        if (self.sources != other.sources or self.head_size_from_total != other.head_size_from_total
+                or self.minimum_size != other.minimum_size or self.tail_totals != other.tail_totals
+                or len(self.layouts) != len(other.layouts)):
+            return False
+        compared = set()
+        for left, right in zip(self.layouts, other.layouts):
+            if len(left) != len(right):
+                return False
+            for a, b in zip(left, right):
+                if a.number != b.number or a.canonical_name != b.canonical_name:
+                    return False
+                pair = (id(a.choices), id(b.choices))
+                if pair not in compared:
+                    if a.choices != b.choices:
+                        return False
+                    compared.add(pair)
+        return True
+
     def to_dict(self) -> dict:
         indexes = {id(choices): index for index, choices in enumerate(self._domains)}
         result = {"sources": [source.to_dict() for source in self.sources],
@@ -240,8 +263,12 @@ class ArchiveInputDescriptor:
         if len(sources) != len(layout) or len(set(sources)) != len(sources):
             raise ValueError("volume selection must cover each slot once")
         parts = []
+        domains = {}
         for slot, source in zip(layout, sources):
-            if source not in slot.choices:
+            choices = domains.get(id(slot.choices))
+            if choices is None:
+                choices = domains[id(slot.choices)] = set(slot.choices)
+            if source not in choices:
                 raise ValueError("worker selected an unplanned volume")
             parts.append(ArchiveInputPart(plan.sources[source], "first" if slot.number == 1 else "member",
                                           slot.number, slot.canonical_name))
@@ -264,6 +291,9 @@ class ArchiveInputDescriptor:
                 or self.open_mode != selected.open_mode or self.format_hint != selected.format_hint
                 or self.volume_style != selected.volume_style or self.extents != selected.extents):
             return False
+        # Index a shared domain once per checkpoint validation. These indexes
+        # live only for this call; do not retain source paths in a global cache.
+        domains = {}
         for index, layout in enumerate(plan.layouts):
             if len(layout) != len(selected.parts):
                 continue
@@ -271,9 +301,15 @@ class ArchiveInputDescriptor:
             for slot, part in zip(layout, selected.parts):
                 if slot.number != part.volume_number or slot.canonical_name != part.canonical_name:
                     break
-                source = next((i for i in slot.choices if plan.sources[i] == part.extent or (
-                    slot.number == 1 and (plan.head_size_from_total is not None or plan.tail_totals)
-                    and plan.sources[i].path == part.path and plan.sources[i].start == part.extent.start)), None)
+                trimmed = slot.number == 1 and bool(plan.head_size_from_total is not None or plan.tail_totals)
+                key = (id(slot.choices), trimmed)
+                choices = domains.get(key)
+                if choices is None:
+                    choices = domains[key] = {}
+                    for i in slot.choices:
+                        extent = plan.sources[i]
+                        choices.setdefault((extent.path, extent.start) if trimmed else extent, i)
+                source = choices.get((part.path, part.extent.start) if trimmed else part.extent)
                 if source is None:
                     break
                 sources.append(source)

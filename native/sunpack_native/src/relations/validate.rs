@@ -163,10 +163,10 @@ fn mapped_carrier_end<'a>(
     parts: impl Iterator<Item = (u32, Option<&'a VolumeAnchor>)> + Clone,
 ) -> Option<(&'a VolumeAnchor, u64)> {
     let head = parts.clone().find(|(n, _)| *n == 1)?.1?;
-    let limit = head.carrier_limit?;
-    if head.payload_end.is_some() || format == "rar" {
+    if !head.has_unresolved_carrier_extent() || format == "rar" {
         return None;
     }
+    let limit = head.carrier_limit.unwrap_or(head.size);
     let base = head.structure_offset.unwrap_or(0);
     let length = if format == "7z" {
         let expected = head.expected_logical_size?.checked_sub(base)?;
