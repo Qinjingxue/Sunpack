@@ -55,6 +55,8 @@ pub(crate) struct VolumeAnchor {
     pub(crate) expected_logical_size: Option<u64>,
     pub(crate) zip_eocd_offset: Option<u64>,
     pub(crate) zip_directory: Option<Arc<crate::formats::zip::RelationDirectory>>,
+    // A two-disk directory can locate a carrier head without an interior disk.
+    pub(crate) zip_head_size: Option<u64>,
     pub(crate) seven_zip_next_header: Option<Arc<crate::formats::seven_zip::RelationNextHeader>>,
     pub(crate) continuation_from_previous: bool,
     pub(crate) continuation_to_next: bool,

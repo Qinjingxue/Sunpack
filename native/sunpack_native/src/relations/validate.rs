@@ -144,6 +144,19 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
 /// A sibling's start is only an upper bound: padding is not archive data.
 /// Solve the one carrier extent from the already collected set geometry.
 /// This is shared by assignment and final validation, with no content reads.
+pub(super) fn spanned_carrier_end(
+    head: &VolumeAnchor,
+    mut lengths: impl Iterator<Item = u64>,
+) -> Option<u64> {
+    let length = lengths.next()?;
+    if lengths.any(|value| value != length) {
+        return None;
+    }
+    let end = head.structure_offset.unwrap_or(0).checked_add(length)?;
+    (length > 0 && end <= head.carrier_limit.unwrap_or(head.size) && end <= head.size)
+        .then_some(end)
+}
+
 fn mapped_carrier_end<'a>(
     format: &str,
     spanned: bool,
@@ -184,15 +197,11 @@ fn mapped_carrier_end<'a>(
         // PKZIP disks have disk-relative offsets, not a total byte length.
         // A consistent intermediate disk size supplies the split geometry;
         // extraction still validates the member CRCs using these extents.
-        let mut lengths = parts
+        let lengths = parts
             .clone()
             .filter(|(n, a)| *n > 1 && a.is_some_and(|a| !a.anchor_roles.contains(&"terminal")))
-            .map(|(_, a)| a.map(VolumeAnchor::payload_size));
-        let length = lengths.next()??;
-        if lengths.any(|value| value != Some(length)) {
-            return None;
-        }
-        length
+            .filter_map(|(_, a)| a.map(VolumeAnchor::payload_size));
+        return spanned_carrier_end(head, lengths).map(|end| (head, end));
     } else {
         return None;
     };

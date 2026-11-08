@@ -26,21 +26,27 @@ struct VolumeAttemptPlan {
     std::vector<std::vector<std::size_t>> domains;
     std::vector<std::vector<VolumeAttemptSlot>> layouts;
     std::vector<VolumeSlotVariation> variation;
+    std::vector<unsigned long long> domain_capacity;
 
     // The plan is immutable after parsing. Summarize domains once, then merge
     // by ordinal AND slot number across layouts (paths alone lose slice identity).
     void prepare() {
         std::vector<VolumeSlotVariation> summaries;
+        domain_capacity.clear();
         for (const auto& choices : domains) {
             VolumeSlotVariation info;
             info.source = choices.front();
             const auto& first = sources[info.source];
             info.length = first.has_end ? first.end - first.start : 0;
             info.variable = choices.size() != 1;
+            unsigned long long capacity = 0;
             for (auto choice : choices) {
                 const auto& range = sources[choice];
                 info.variable_length |= !range.has_end || range.end - range.start != info.length;
+                capacity = (std::max)(capacity, range.has_end
+                    ? (std::min)(minimum_size, range.end - range.start) : minimum_size);
             }
+            if (minimum_size) domain_capacity.push_back(capacity);
             summaries.push_back(info);
         }
         std::size_t maximum = 0;
@@ -69,11 +75,13 @@ struct VolumeAttemptCursor {
     std::size_t layout = 0, attempts = 0;
     std::vector<std::size_t> digits, selected;
     std::vector<unsigned char> used;
+    std::vector<unsigned long long> remaining, suffix_capacity;
     bool started = false, discard_pending = false, output_owned = false;
     void reserve(const VolumeAttemptPlan& plan) {
         std::size_t maximum = 0;
         for (const auto& slots : plan.layouts) maximum = (std::max)(maximum, slots.size());
         digits.reserve(maximum); selected.reserve(maximum);
+        if (plan.minimum_size) { remaining.reserve(maximum + 1); suffix_capacity.reserve(maximum + 1); }
         used.assign(plan.sources.size(), 0);
     }
     bool next(const VolumeAttemptPlan& plan, const std::atomic<bool>* cancel = nullptr) {
@@ -81,6 +89,17 @@ struct VolumeAttemptCursor {
             const auto& slots = plan.layouts[layout];
             std::size_t depth = 0;
             if (digits.empty()) {
+                if (plan.minimum_size) {
+                    suffix_capacity.assign(slots.size() + 1, 0);
+                    for (std::size_t i = slots.size(); i-- > 0;)
+                        suffix_capacity[i] = suffix_capacity[i + 1] + (std::min)(
+                            plan.minimum_size - suffix_capacity[i + 1], plan.domain_capacity[slots[i].domain]);
+                    // Even the largest independent choices cannot supply the
+                    // declared bytes. Discard the whole subtree without I/O.
+                    if (suffix_capacity[0] < plan.minimum_size) { ++layout; continue; }
+                    remaining.assign(slots.size() + 1, 0);
+                    remaining[0] = plan.minimum_size;
+                }
                 digits.assign(slots.size(), 0);
                 selected.assign(slots.size(), plan.sources.size());
             } else {
@@ -102,6 +121,14 @@ struct VolumeAttemptCursor {
                 const auto source = choices[digits[depth]];
                 if (used[source]) {
                     ++digits[depth]; continue;
+                }
+                if (plan.minimum_size) {
+                    const auto& range = plan.sources[source];
+                    remaining[depth + 1] = range.has_end
+                        ? remaining[depth] - (std::min)(remaining[depth], range.end - range.start) : 0;
+                    if (remaining[depth + 1] > suffix_capacity[depth + 1]) {
+                        ++digits[depth]; continue;
+                    }
                 }
                 selected[depth] = source;
                 used[source] = 1;

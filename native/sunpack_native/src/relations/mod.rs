@@ -757,6 +757,7 @@ fn build_candidate_groups_from_source(
             if let Some(options) = alternative_anchors {
                 attempts::expand_carrier_sources(validation, options);
             }
+            attempts::resolve_carrier_geometry(validation);
             validate::validate(validation);
         }
         // Arbitration considers every candidate in the active stem bucket,

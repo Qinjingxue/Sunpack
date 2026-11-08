@@ -234,6 +234,73 @@ def _run_trial(tmp_path, descriptor, **kwargs):
     return results[0]
 
 
+@pytest.mark.parametrize("archive_format", ["7z", "zip"])
+@pytest.mark.parametrize("unnumbered_middle", [False, True])
+def test_unnumbered_structural_tail_survives_ambiguous_middle_order(tmp_path, archive_format, unnumbered_middle):
+    # A terminal proven by format structure must not disappear just because
+    # its filename has no number. Existing gap cases keep a numbered terminal.
+    case, paths, config, _ = _ambiguous_case(tmp_path, archive_format)
+    paths[-1].rename(paths[-1].with_name("shared.tail.opaque"))
+    if unnumbered_middle:
+        for path, name in zip(paths[1:-1], ["beta", "alpha"]):
+            path.rename(path.with_name(f"shared.{name}.opaque"))
+    tasks = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)]).tasks
+    task = next(t for t in tasks if t.archive_input().volume_attempts)
+    final = _run_trial(tmp_path, task.archive_input())
+    assert final["status"] == "ok", final
+    assert next((tmp_path / "worker-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+@pytest.mark.parametrize("payload_size", [160 * 1024, 3 * 1024 * 1024])
+def test_spanned_zip_carrier_keeps_disk_geometry_during_trials(tmp_path, payload_size):
+    # Raw split ZIP uses total logical bytes. PKZIP disks use disk-relative
+    # offsets, so the raw carrier formula cannot repair this input.
+    from tests.helpers.tool_config import get_optional_winrar
+    winrar = get_optional_winrar()
+    if winrar is None:
+        pytest.skip("WinRAR is required to generate spanned ZIP")
+    source = tmp_path / "payload.bin"
+    expected = random.Random(73).randbytes(payload_size)
+    source.write_bytes(expected)
+    root = tmp_path / "parts"
+    root.mkdir()
+    subprocess.run([str(winrar), "a", "-afzip", "-m0", "-v64k" if payload_size < 1024 * 1024 else "-v1m", "-inul",
+                    str(root / "shared.zip"), str(source)], check=True, capture_output=True)
+    parts = sorted(root.iterdir())
+    head = parts[0]
+    head.write_bytes(b"prefix" * 17 + head.read_bytes() + b"padding" * 31)
+    bad = parts[1].with_name("shared.z02.a.opaque")
+    damaged = bytearray(parts[1].read_bytes())
+    damaged[len(damaged) // 2] ^= 1
+    bad.write_bytes(damaged)
+    tasks = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(root)]).tasks
+    task = next(t for t in tasks if t.archive_input().volume_attempts)
+    final = _run_trial(tmp_path, task.archive_input())
+    assert final["status"] == "ok", json.dumps({"result": final, "input": task.archive_input().to_dict()})
+    assert next((tmp_path / "worker-out").rglob("payload.bin")).read_bytes() == expected
+
+
+def test_declared_length_prunes_impossible_subtrees_and_keeps_late_winner(tmp_path):
+    # Shared unnumbered domains exercise injectivity, but cannot detect losing
+    # a valid later choice when a prefix fails the known logical length.
+    from dataclasses import replace
+    case, _, _, task = _ambiguous_case(tmp_path)
+    descriptor = task.archive_input()
+    plan = descriptor.volume_attempts
+    short = tuple(replace(source, end=source.start + 1) for source in plan.sources)
+    impossible = replace(descriptor, volume_attempts=replace(plan, sources=short))
+    failed = _run_trial(tmp_path / "short", impossible)
+    assert failed["missing_volume"] and failed["volume_attempts"] == 0, failed
+    count = len(plan.sources)
+    domains = {}
+    layouts = tuple(tuple(replace(slot, choices=domains.setdefault(slot.choices,
+        tuple(i + count for i in slot.choices) + slot.choices)) for slot in layout) for layout in plan.layouts)
+    alternatives = replace(descriptor, volume_attempts=replace(plan, sources=plan.sources + short, layouts=layouts))
+    final = _run_trial(tmp_path / "late", alternatives)
+    assert final["status"] == "ok" and final["volume_attempts"] == 2, final
+    assert next((tmp_path / "late/worker-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
 def test_single_zipcrypto_member_does_not_reject_password_on_wrong_volume_order(tmp_path):
     # Unlike the multi-member encryption fixture, no small member can prove
     # the password before a CRC failure in a reordered encrypted stream.

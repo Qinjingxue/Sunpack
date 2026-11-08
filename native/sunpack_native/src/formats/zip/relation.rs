@@ -140,7 +140,7 @@ pub(crate) fn relation_local_key(
     }))
 }
 
-/// A member wholly contained on one carrier disk proves its physical end.
+/// A member's declared end, possibly spanning into the following disk.
 /// Reuse the local/descriptor parsers; never read or inflate the payload.
 pub(crate) fn relation_member_end(
     reader: &crate::io::reader::ManagedReader,
@@ -162,10 +162,13 @@ pub(crate) fn relation_member_end(
     let Some(end) = start
         .checked_add(len as u64)
         .and_then(|n| n.checked_add(values.compressed))
-        .filter(|end| *end <= limit)
+        .filter(|end| *end <= limit || record.flags & 8 == 0)
     else {
         return Ok(None);
     };
+    if start.checked_add(len as u64).is_none_or(|end| end > limit) {
+        return Ok(None);
+    }
     let bytes = reader.read_cached_at(start, len)?;
     let Some(local) = super::parse_local_header(&bytes, 0) else {
         return Ok(None);

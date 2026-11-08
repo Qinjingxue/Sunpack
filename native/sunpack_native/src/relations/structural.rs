@@ -427,12 +427,12 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 .map(|d| (i, **d))
         })
         .collect();
-    if terminals.len() != 1 {
+    if terminals.is_empty() {
         return;
     }
-    let (terminal, directory) = terminals[0];
+    let unique_directory = terminals.len() == 1;
     let mut local = HashMap::<Vec<u8>, HashMap<RelationLocalFields, Option<usize>>>::new();
-    for &i in indexes {
+    for &i in indexes.iter().filter(|_| unique_directory) {
         let Some(a) = rows[i].anchor.as_ref().filter(|a| {
             a.format == "zip"
                 && a.error.is_empty()
@@ -455,130 +455,157 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
             Ok(None) => {}
         }
     }
-    let mut matches = HashMap::<usize, Option<(u32, u64)>>::new();
-    // Two-disk ZIPs may have no intermediate disk to establish split size.
-    // If all first-disk members fit, their directory lengths prove its end.
-    let carrier = indexes
-        .iter()
-        .filter_map(|&i| {
-            rows[i]
-                .anchor
-                .as_ref()
-                .filter(|a| a.carrier_limit.is_some())
-                .map(|a| (i, a))
+    let mut carriers = indexes.iter().copied().filter(|i| {
+        rows[*i].anchor.as_ref().is_some_and(|a| {
+            a.carrier_limit.is_some()
+                || (a.structure_offset.unwrap_or(0) > 0 && !a.anchor_roles.contains(&"terminal"))
         })
-        .collect::<Vec<_>>();
-    let carrier = if carrier.len() == 1
-        && directory.disk == 1
-        && directory.cd_disk == directory.disk
-        && directory.offset == 0
-    {
-        let (i, a) = carrier[0];
-        crate::io::reader::ManagedReader::open(&a.path)
-            .ok()
-            .map(|reader| (i, a, reader.probe_reader()))
-    } else {
-        None
+    });
+    let carrier = match (carriers.next(), carriers.next()) {
+        (Some(i), None) if terminals.iter().any(|(_, d)| d.disk == 1 && d.cd_disk == 1) => {
+            crate::io::reader::ManagedReader::open(&rows[i].path)
+                .ok()
+                .map(|reader| (i, reader.probe_reader()))
+        }
+        _ => None,
     };
-    let mut carrier_end = Some(0u64);
-    let mut carrier_entries = 0u64;
-    let complete = visit_relation_directory(&rows[terminal].path, directory, |record, values| {
-        if values.disk == 0 {
-            if let Some((_, a, reader)) = &carrier {
-                carrier_entries += 1;
-                carrier_end = carrier_end.and_then(|end| {
-                    crate::formats::zip::relation_member_end(
-                        reader,
-                        a.structure_offset.unwrap_or(0),
-                        a.carrier_limit.unwrap(),
-                        record,
-                        &values,
-                    )
+    for (terminal, directory) in terminals {
+        let mut matches = HashMap::<usize, Option<(u32, u64)>>::new();
+        // Two-disk ZIPs may have no intermediate disk to establish split size.
+        // Declared member ends minus the continuation on disk two locate the
+        // first disk. Keep competing tails' results separate until selection.
+        let carrier = carrier
+            .as_ref()
+            .filter(|_| directory.disk == 1 && directory.cd_disk == 1)
+            .map(|(i, reader)| (*i, rows[*i].anchor.as_ref().unwrap(), reader));
+        let mut carrier_end = Some(0u64);
+        let mut carrier_entries = 0u64;
+        let mut all_first_disk = true;
+        let complete =
+            visit_relation_directory(&rows[terminal].path, directory, |record, values| {
+                all_first_disk &= values.disk == 0;
+                if values.disk == 0 {
+                    if let Some((_, a, reader)) = &carrier {
+                        carrier_entries += 1;
+                        carrier_end = carrier_end.and_then(|end| {
+                            crate::formats::zip::relation_member_end(
+                                reader,
+                                a.structure_offset.unwrap_or(0),
+                                a.carrier_limit.unwrap_or(a.size),
+                                record,
+                                &values,
+                            )
+                            .ok()
+                            .flatten()
+                            .map(|next| end.max(next))
+                        });
+                    }
+                }
+                // Competing directories retain their own carrier geometry. They must
+                // not promote a conditional disk identity into a shared row fact.
+                if !unique_directory {
+                    return;
+                }
+                // A scanned local header may follow carrier padding or continuation
+                // data. Directory disk offsets locate the physical disk's real base.
+                if record.flags & 0x2000 != 0 {
+                    return;
+                }
+                let Some(candidates) = local.get(record.name) else {
+                    return;
+                };
+                let fields = RelationLocalFields::new(
+                    record.method,
+                    record.flags,
+                    record.crc32,
+                    values.compressed,
+                    values.uncompressed,
+                );
+                let Some(&Some(i)) = candidates.get(&fields) else {
+                    return;
+                };
+                let Some(slot) = u32::try_from(values.disk)
                     .ok()
-                    .flatten()
-                    .map(|next| end.max(next))
-                });
+                    .and_then(|n| n.checked_add(1))
+                else {
+                    return;
+                };
+                let anchor = rows[i].anchor.as_ref().unwrap();
+                let Some(base) = anchor
+                    .structure_offset
+                    .unwrap_or(0)
+                    .checked_sub(values.local_offset)
+                else {
+                    return;
+                };
+                if anchor
+                    .internal_volume_number
+                    .is_some_and(|known| known != slot)
+                {
+                    return;
+                }
+                let identity = (slot, base);
+                matches
+                    .entry(i)
+                    .and_modify(|old| {
+                        if *old != Some(identity) {
+                            *old = None;
+                        }
+                    })
+                    .or_insert(Some(identity));
+            });
+        if !matches!(complete, Ok(true)) {
+            continue;
+        }
+        let carrier_extent = carrier.and_then(|(i, _, _)| {
+            carrier_end
+                .filter(|_| carrier_entries > 0 && all_first_disk)
+                .and_then(|end| end.checked_sub(directory.offset))
+                .filter(|end| {
+                    *end > rows[i]
+                        .anchor
+                        .as_ref()
+                        .unwrap()
+                        .structure_offset
+                        .unwrap_or(0)
+                })
+                .and_then(|end| {
+                    let a = rows[i].anchor.as_ref().unwrap();
+                    let size = end - a.structure_offset.unwrap_or(0);
+                    validate::spanned_carrier_end(a, std::iter::once(size))
+                        .map(|end| (i, end, size))
+                })
+        });
+        if let Some((i, end, size)) = carrier_extent {
+            rows[terminal].anchor.as_mut().unwrap().zip_head_size = Some(size);
+            if unique_directory {
+                rows[i].anchor.as_mut().unwrap().payload_end = Some(end);
             }
         }
-        // A scanned local header may follow carrier padding or continuation
-        // data. Directory disk offsets locate the physical disk's real base.
-        if record.flags & 0x2000 != 0 {
-            return;
+        // Terminal directory geometry independently locates its disk base even
+        // when that disk begins in the middle of a member's compressed bytes.
+        if directory.cd_disk == directory.disk {
+            if let Some(base) = directory
+                .end
+                .checked_sub(directory.size)
+                .and_then(|n| n.checked_sub(directory.offset))
+            {
+                rows[terminal].anchor.as_mut().unwrap().structure_offset = Some(base);
+            }
         }
-        let Some(candidates) = local.get(record.name) else {
-            return;
-        };
-        let fields = RelationLocalFields::new(
-            record.method,
-            record.flags,
-            record.crc32,
-            values.compressed,
-            values.uncompressed,
-        );
-        let Some(&Some(i)) = candidates.get(&fields) else {
-            return;
-        };
-        let Some(slot) = u32::try_from(values.disk)
-            .ok()
-            .and_then(|n| n.checked_add(1))
-        else {
-            return;
-        };
-        let anchor = rows[i].anchor.as_ref().unwrap();
-        let Some(base) = anchor
-            .structure_offset
-            .unwrap_or(0)
-            .checked_sub(values.local_offset)
-        else {
-            return;
-        };
-        if anchor
-            .internal_volume_number
-            .is_some_and(|known| known != slot)
-        {
-            return;
+        if !unique_directory {
+            continue;
         }
-        let identity = (slot, base);
-        matches
-            .entry(i)
-            .and_modify(|old| {
-                if *old != Some(identity) {
-                    *old = None;
-                }
-            })
-            .or_insert(Some(identity));
-    });
-    if !matches!(complete, Ok(true)) {
-        return;
-    }
-    let carrier_extent = carrier.and_then(|(i, _, _)| {
-        carrier_end
-            .filter(|_| carrier_entries > 0)
-            .map(|end| (i, end))
-    });
-    if let Some((i, end)) = carrier_extent {
-        rows[i].anchor.as_mut().unwrap().payload_end = Some(end);
-    }
-    // Terminal directory geometry independently locates its disk base even
-    // when that disk begins in the middle of a member's compressed bytes.
-    if directory.cd_disk == directory.disk {
-        if let Some(base) = directory
-            .end
-            .checked_sub(directory.size)
-            .and_then(|n| n.checked_sub(directory.offset))
-        {
-            rows[terminal].anchor.as_mut().unwrap().structure_offset = Some(base);
-        }
-    }
-    for (i, slot) in matches {
-        if let Some((slot, base)) = slot {
-            let a = rows[i].anchor.as_mut().unwrap();
-            a.internal_volume_number = Some(slot);
-            a.structure_offset = Some(base);
-            a.confidence = "strong".into();
-            a.multivolume = true;
-            a.continuation_from_previous = slot > 1;
-            a.evidence.push("zip:directory_member");
+        for (i, slot) in matches {
+            if let Some((slot, base)) = slot {
+                let a = rows[i].anchor.as_mut().unwrap();
+                a.internal_volume_number = Some(slot);
+                a.structure_offset = Some(base);
+                a.confidence = "strong".into();
+                a.multivolume = true;
+                a.continuation_from_previous = slot > 1;
+                a.evidence.push("zip:directory_member");
+            }
         }
     }
 }

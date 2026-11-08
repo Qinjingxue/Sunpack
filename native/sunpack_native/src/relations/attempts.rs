@@ -14,6 +14,134 @@ pub(super) struct VolumeAttempts {
     pub tail_totals: Vec<(usize, u64)>,
 }
 
+impl VolumeAttempts {
+    // PKZIP disk offsets are relative to each disk, not to the concatenated
+    // archive. Reuse the unique mapping's geometry and represent each possible
+    // common disk size with ordinary range/domain layouts (no second protocol).
+    fn with_spanned_carrier(mut self, head: &VolumeAnchor) -> Self {
+        if head.payload_end.is_some()
+            || (head.carrier_limit.is_none() && head.structure_offset.unwrap_or(0) == 0)
+        {
+            return self;
+        }
+        let mut domains = Domains::default();
+        let mut heads = HashMap::new();
+        let mut filtered = HashMap::new();
+        for layout in std::mem::take(&mut self.layouts) {
+            let interiors: Vec<_> = layout
+                .iter()
+                .skip(1)
+                .filter(|(_, choices)| choices.iter().all(|i| !self.sources[*i].terminal))
+                .collect();
+            let mut sizes = None::<HashSet<u64>>;
+            for (_, choices) in &interiors {
+                let available: HashSet<_> = choices
+                    .iter()
+                    .map(|i| self.sources[*i].end - self.sources[*i].start)
+                    .collect();
+                if let Some(sizes) = &mut sizes {
+                    sizes.retain(|size| available.contains(size));
+                } else {
+                    sizes = Some(available);
+                }
+            }
+            let from_tail = interiors.is_empty();
+            let mut sizes: Vec<_> = sizes
+                .unwrap_or_else(|| {
+                    layout
+                        .last()
+                        .into_iter()
+                        .flat_map(|(_, choices)| choices.iter())
+                        .filter_map(|i| self.sources[*i].head_size)
+                        .collect()
+                })
+                .into_iter()
+                .collect();
+            sizes.sort_unstable();
+            for size in sizes {
+                let Some(end) = validate::spanned_carrier_end(head, std::iter::once(size)) else {
+                    continue;
+                };
+                let mut trimmed = Vec::with_capacity(layout.len());
+                for (number, choices) in &layout {
+                    let domain = if *number == 1 {
+                        let mut replacements = Vec::new();
+                        for &i in choices.iter() {
+                            if end > self.sources[i].end {
+                                continue;
+                            }
+                            let index = *heads.entry((i, end)).or_insert_with(|| {
+                                let mut source = self.sources[i].clone();
+                                source.end = end;
+                                if let Some(index) =
+                                    self.sources.iter().position(|old| *old == source)
+                                {
+                                    return index;
+                                }
+                                self.sources.push(source);
+                                self.sources.len() - 1
+                            });
+                            replacements.push(index);
+                        }
+                        domains.intern(replacements)
+                    } else if choices.iter().all(|i| !self.sources[*i].terminal) {
+                        let (_, domain) = filtered
+                            .entry((Arc::as_ptr(choices), size))
+                            .or_insert_with(|| {
+                                (
+                                    Arc::clone(choices),
+                                    domains.intern(
+                                        choices
+                                            .iter()
+                                            .copied()
+                                            .filter(|i| {
+                                                self.sources[*i].end - self.sources[*i].start
+                                                    == size
+                                            })
+                                            .collect(),
+                                    ),
+                                )
+                            });
+                        Arc::clone(domain)
+                    } else if from_tail {
+                        domains.intern(
+                            choices
+                                .iter()
+                                .copied()
+                                .filter(|i| self.sources[*i].head_size == Some(size))
+                                .collect(),
+                        )
+                    } else {
+                        Arc::clone(choices)
+                    };
+                    trimmed.push((*number, domain));
+                }
+                if trimmed.iter().all(|(_, choices)| !choices.is_empty())
+                    && !self.layouts.contains(&trimmed)
+                {
+                    self.layouts.push(trimmed);
+                }
+            }
+            // Equal disk size is a geometry hypothesis, not format identity.
+            // Retain the original for nonuniform disks and unpadded carriers.
+            if !self.layouts.contains(&layout) {
+                self.layouts.push(layout);
+            }
+        }
+        self
+    }
+}
+
+pub(super) fn resolve_carrier_geometry(validation: &mut ProposalValidation) {
+    if validation.proposal.style != "zip_spanned" {
+        return;
+    }
+    if let Some(plan) = validation.attempts.take() {
+        let head = &validation.anchors[&path_key(&validation.proposal.volumes[0].0)];
+        validation.attempts = Some(plan.with_spanned_carrier(head));
+    }
+}
+
 // Request/proposal-local interning; order is part of domain identity.
 #[derive(Default)]
 struct Domains(HashSet<Arc<Vec<usize>>>);
@@ -35,15 +163,19 @@ pub(super) struct AttemptSource {
     pub end: u64,
     pub proven_end: Option<u64>,
     pub terminal: bool,
+    pub head_size: Option<u64>,
 }
 impl AttemptSource {
     fn new(path: &str, anchor: &VolumeAnchor) -> Self {
         Self {
             path: path.into(),
             start: anchor.structure_offset.unwrap_or(0),
-            end: anchor.extent_end(),
+            end: anchor
+                .carrier_limit
+                .map_or(anchor.extent_end(), |limit| limit.min(anchor.extent_end())),
             proven_end: anchor.proven_extent_end(),
             terminal: anchor.anchor_roles.contains(&"terminal"),
+            head_size: anchor.zip_head_size,
         }
     }
 }
@@ -184,21 +316,27 @@ pub(super) fn expand_carrier_sources(
         let mut replacements = HashMap::new();
         for layout in &mut plan.layouts {
             for (_, choices) in layout {
-                *choices =
-                    Arc::clone(replacements.entry(Arc::as_ptr(choices)).or_insert_with(|| {
-                        domains.intern(
-                            choices
-                                .iter()
-                                .flat_map(|i| {
-                                    expanded
-                                        .get(i)
-                                        .map_or(std::slice::from_ref(i), Vec::as_slice)
-                                        .iter()
-                                        .copied()
-                                })
-                                .collect(),
+                // Retain the key's allocation while replacing its last slot.
+                // Otherwise the allocator can reuse its address for a new domain.
+                let (_, replacement) =
+                    replacements.entry(Arc::as_ptr(choices)).or_insert_with(|| {
+                        (
+                            Arc::clone(choices),
+                            domains.intern(
+                                choices
+                                    .iter()
+                                    .flat_map(|i| {
+                                        expanded
+                                            .get(i)
+                                            .map_or(std::slice::from_ref(i), Vec::as_slice)
+                                            .iter()
+                                            .copied()
+                                    })
+                                    .collect(),
+                            ),
                         )
-                    }));
+                    });
+                *choices = Arc::clone(replacement);
             }
         }
         validation.status = ProposalStatus::Valid;
@@ -261,21 +399,69 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         let mut domains = Domains::default();
         for channel in channels.iter().map(Some).chain(std::iter::once(None)) {
             let offset = channel.map_or(0, |c| view.channel_offset(Some(head), c, &profile));
+            // Reuse one channel projection for both terminal bounds and slot
+            // domains. The loose tier must obey the same structural end roles.
+            let numbers: HashMap<_, Vec<u32>> = indexes
+                .iter()
+                .map(|&i| {
+                    let values = if let Some(n) = view.facts[&i].exact_slot {
+                        vec![n]
+                    } else if let Some(f) = view.features.get(&i) {
+                        if let Some(channel) = channel {
+                            profile
+                                .shifted_number(channel, f, offset)
+                                .into_iter()
+                                .collect()
+                        } else {
+                            f.numbers
+                                .iter()
+                                .filter(|n| {
+                                    profile.active(n)
+                                        && n.value > 0
+                                        && n.value as usize <= indexes.len()
+                                })
+                                .map(|n| n.value)
+                                .collect()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    (i, values)
+                })
+                .collect();
+            let unnamed_tail = indexes
+                .iter()
+                .any(|i| view.facts[i].has_next == Some(false) && numbers[i].is_empty());
+            let inferred_end = unnamed_tail
+                .then(|| {
+                    let last = indexes
+                        .iter()
+                        .filter(|i| view.facts[i].has_next != Some(false))
+                        .flat_map(|i| numbers[i].iter().copied())
+                        .max()
+                        .unwrap_or(1);
+                    if last > 1 {
+                        last.checked_add(1)
+                    } else {
+                        // With no numbered interior, keep the unnumbered members
+                        // as shared gap domains. Competing tails occupy one slot.
+                        u32::try_from(
+                            indexes
+                                .iter()
+                                .filter(|i| view.facts[i].has_next != Some(false))
+                                .count(),
+                        )
+                        .ok()
+                        .and_then(|n| n.checked_add(1))
+                    }
+                })
+                .flatten();
             let mut terminals: Vec<_> = indexes
                 .iter()
-                .filter_map(|i| {
-                    let fact = &view.facts[i];
-                    if fact.has_next != Some(false) {
-                        return None;
-                    }
-                    fact.exact_slot.or_else(|| {
-                        channel.and_then(|channel| {
-                            view.features
-                                .get(i)
-                                .and_then(|f| profile.shifted_number(channel, f, offset))
-                        })
-                    })
-                })
+                .filter(|i| view.facts[i].has_next == Some(false))
+                .flat_map(|i| numbers[i].iter().copied())
+                .chain(inferred_end)
+                .filter(|n| *n > 1)
                 .map(Some)
                 .collect();
             terminals.sort_unstable();
@@ -303,22 +489,11 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     if view.facts[&i].exact_slot.is_some() {
                         continue;
                     }
-                    let Some(f) = view.features.get(&i) else {
-                        continue;
-                    };
-                    let numbers: Vec<u32> = if let Some(channel) = channel {
-                        profile
-                            .shifted_number(channel, f, offset)
-                            .into_iter()
-                            .collect()
-                    } else {
-                        f.numbers
-                            .iter()
-                            .filter(|n| profile.active(n) && n.value as usize <= indexes.len())
-                            .map(|n| n.value)
-                            .collect()
-                    };
-                    for n in numbers {
+                    let unnamed_terminal = (view.facts[&i].has_next == Some(false)
+                        && numbers[&i].is_empty())
+                    .then_some(candidate_terminal)
+                    .flatten();
+                    for n in numbers[&i].iter().copied().chain(unnamed_terminal) {
                         if view.legal(i, n, candidate_terminal) && !fixed.contains_key(&n) {
                             Arc::make_mut(slots.entry(n).or_default()).push(i);
                         }
@@ -525,9 +700,14 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 std::cmp::Reverse(layout.len()),
             )
         });
-        let mut sources: Vec<usize> = domains.0.iter().flat_map(|c| c.iter().copied()).collect();
+        let mut sources: Vec<usize> = domains
+            .0
+            .iter()
+            .flat_map(|c| c.iter().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         sources.sort_unstable();
-        sources.dedup();
         let positions: HashMap<_, _> = sources.iter().enumerate().map(|(n, i)| (*i, n)).collect();
         let remapped: HashMap<_, _> = domains
             .0

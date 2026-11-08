@@ -1142,12 +1142,6 @@ void select_volume_attempt(const WorkerArchiveInput& source,
         previous = slots[i].number;
     }
     input.archive_path = input.part_paths.front();
-    auto remaining = source.volume_attempts.minimum_size;
-    for (const auto& range : input.ranges) {
-        if (!range.has_end) { remaining = 0; break; }
-        remaining -= (std::min)(remaining, range.end - range.start);
-    }
-    if (remaining) { input.missing_volume_number = 1; return; }
     const auto total = source.volume_attempts.tail_totals.empty()
         ? source.volume_attempts.head_size_from_total
         : source.volume_attempts.tail_totals[cursor.selected.back()];
@@ -1315,7 +1309,8 @@ int run_request(
                 if (cancel_token && cancel_token->load()) return cancelled_result(job_id);
                 print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
                     "\",\"status\":\"failed\",\"missing_volume\":true,\"failure_stage\":\"archive_open\","
-                    "\"failure_kind\":\"missing_volume\",\"message\":\"no legal volume composition\"}");
+                    "\"failure_kind\":\"missing_volume\",\"missing_volume_evidence\":\"volume_attempts_exhausted\","
+                    "\"volume_attempts\":0,\"message\":\"no legal volume composition\"}");
                 return 2;
             }
             cursor.started = true;
