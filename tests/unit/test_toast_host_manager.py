@@ -241,8 +241,8 @@ def test_native_wrapper_passes_snapshot_and_closes_once(monkeypatch):
     calls = []
 
     class Library:
-        def sunpack_toast_create(self, executable, arguments, log, output):
-            calls.append(('create', executable, arguments, log))
+        def sunpack_toast_create_presenter(self, executable, log, output):
+            calls.append(('create', executable, log))
             output._obj.value = 123
             return 0
 
@@ -255,12 +255,12 @@ def test_native_wrapper_passes_snapshot_and_closes_once(monkeypatch):
             return 0
 
     monkeypatch.setattr(module, '_load_library', Library)
-    monkeypatch.setattr(module, '_activation_command', lambda: ('main.exe', '--toast-activated'))
+    monkeypatch.setattr(module, 'current_process_executable', lambda: 'main.exe')
     presenter = module._NativeToastPresenter(diagnostic_log_path='events.jsonl')
     presenter.show(b'a\0b', 7)
     presenter.close()
     presenter.close()
-    assert calls == [('create', 'main.exe', '--toast-activated', 'events.jsonl'),
+    assert calls == [('create', 'main.exe', 'events.jsonl'),
                      ('show', 123, b'a\0b', 3, 7), ('destroy', 123)]
 
 

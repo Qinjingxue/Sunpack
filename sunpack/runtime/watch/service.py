@@ -74,19 +74,6 @@ def normalize_root(path: str) -> str:
     return os.path.abspath(os.path.normpath(path))
 
 
-def existing_roots(roots: list[str]) -> list[str]:
-    result = []
-    seen = set()
-    for root in roots:
-        normalized = normalize_root(root)
-        key = case_key(normalized)
-        if key in seen or not os.path.isdir(normalized):
-            continue
-        seen.add(key)
-        result.append(normalized)
-    return result
-
-
 def service_state_dir() -> str:
     return os.path.join(normalize_root(str(watch_roots_path().resolve().parent)), ".sunpack_watch")
 

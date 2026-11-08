@@ -1,4 +1,4 @@
-use crate::protocol::FILE_ID_BYTES;
+use crate::protocol::{FILE_ID_BYTES, MAX_DIRECTORY_RESPONSE_BYTES};
 use crate::ChangeReasons;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
@@ -20,7 +20,6 @@ const ALL_USN_REASONS: u32 = 0xffff_ffff;
 #[cfg(test)]
 const USN_REASON_CLOSE: u32 = 0x8000_0000;
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
-const RECOVERY_PAGE_BYTES: usize = 64 * 1024;
 
 pub struct DirectoryChangesPage {
     pub changes: Vec<(u32, String)>,
@@ -380,13 +379,13 @@ fn scan_directories_page(
                 .filter(|change| !changed.contains(*change))
                 .map(|change| 8 + change.1.len())
                 .sum();
-            if added > RECOVERY_PAGE_BYTES {
+            if added > MAX_DIRECTORY_RESPONSE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "USN name exceeds response frame",
                 ));
             }
-            if payload_bytes + added > RECOVERY_PAGE_BYTES {
+            if payload_bytes + added > MAX_DIRECTORY_RESPONSE_BYTES {
                 let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
                 let usn_offset = if major == 2 { 24 } else { 40 };
                 let next_usn =
@@ -912,7 +911,7 @@ mod tests {
                     .iter()
                     .map(|(_, name)| 8 + name.len())
                     .sum::<usize>()
-                    <= RECOVERY_PAGE_BYTES
+                    <= MAX_DIRECTORY_RESPONSE_BYTES
             );
             actual.extend(page.changes);
             cursor = page.next_usn;

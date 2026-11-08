@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 
+from tests.helpers.async_batch import run_extract, stub_worker_attempt
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.tasks import ArchiveTask
@@ -42,9 +43,9 @@ def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encry
     extractor = SingleArchiveExtractor(
         password_store=None,
         password_resolver=SimpleNamespace(reject_extraction_candidates=rejected.append),
-        sevenzip_runner=SimpleNamespace(
-            emit_semantic_event=lambda *a, **k: None,
-            extract_attempt=lambda **k: _worker_completed({
+        sevenzip_runner=stub_worker_attempt(
+            SimpleNamespace(emit_semantic_event=lambda *a, **k: None),
+            lambda **k: _worker_completed({
                 "wrong_password": True, "native_status": "wrong_password",
                 "password_candidates_all_rejected": True, "password_attempts": len(candidate_passwords),
             }),
@@ -52,7 +53,7 @@ def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encry
         quiet=True,
     )
     extractor._resolve_password = lambda *args: resolution
-    result = extractor.extract(task, str(tmp_path / "out"))
+    result = run_extract(extractor, task, str(tmp_path / "out"))
 
     assert result.failure.kind is FailureKind.WRONG_PASSWORD
     assert result.failure.is_password_failure

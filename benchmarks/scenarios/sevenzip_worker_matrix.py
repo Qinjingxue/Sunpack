@@ -7,15 +7,15 @@ against generated archives from the existing extraction-format corpus builder.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
-from sunpack_native import encode_worker_frame, NativeWorkerFrameDecoder
+from sunpack_native import encode_worker_frame
 import os
 import shutil
 import statistics
-import subprocess
 import sys
-import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from benchmarks.scenarios.extraction_format_matrix import GENERATED_FORMATS, create_corpus
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
@@ -38,22 +38,6 @@ SIZE_PROFILES: dict[str, dict[str, int]] = {
     "medium": {"small_files": 512, "large_files": 2, "large_file_mib": 16},
     "large": {"small_files": 2048, "large_files": 2, "large_file_mib": 32},
 }
-
-
-def worker_thread_capacity(worker_path: Path, *, timeout: float | None = None) -> int:
-    """Read the selected binary's capacity before starting measured jobs."""
-    completed = subprocess.run(
-        [str(worker_path)], input=encode_worker_frame({"worker_command": "shutdown", "job_id": "shutdown"}),
-        capture_output=True, check=True, timeout=timeout,
-    )
-    decoder = NativeWorkerFrameDecoder()
-    events = decoder.feed(completed.stdout)
-    decoder.finish()
-    ready = events[0]
-    capacity = ready.get("thread_capacity", 0) if isinstance(ready, dict) and ready.get("type") == "worker_ready" else 0
-    if type(capacity) is not int or capacity < 1:
-        raise ValueError(f"Missing worker capacity from {worker_path}: {ready!r}")
-    return capacity
 
 
 def _parse_csv_values(values: list[str], allowed: set[str], option: str) -> list[str]:
@@ -96,7 +80,7 @@ def _output_summary(path: Path) -> dict[str, int]:
     }
 
 
-def _worker_cpu_ms(worker: _NativeWorkerProcess) -> float | None:
+def _worker_cpu_ms(worker: _AsyncNativeWorkerProcess) -> float | None:
     process = worker.process
     if process is None:
         return None
@@ -107,59 +91,67 @@ def _worker_cpu_ms(worker: _NativeWorkerProcess) -> float | None:
     return (float(times.user) + float(times.system)) * 1000.0
 
 
-def _worker_stderr(worker: _NativeWorkerProcess) -> str:
-    return "".join(worker.take_stderr())
+async def _submit_job(
+    worker: _AsyncNativeWorkerProcess,
+    job: dict[str, Any],
+    *,
+    timeout_seconds: float,
+    observe: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    job_id = str(job["job_id"])
+    completed = asyncio.get_running_loop().create_future()
+    result: dict[str, Any] | None = None
+
+    def on_event(event: dict[str, Any]) -> bool:
+        nonlocal result
+        if observe is not None:
+            observe(event)
+        if event.get("type") == "result":
+            result = event
+        if event.get("type") == "native_event" and event.get("event") == "job_finished" and result is not None:
+            if not completed.done():
+                completed.set_result(result)
+            return True
+        return False
+
+    def on_error(message: str) -> None:
+        if not completed.done():
+            completed.set_exception(RuntimeError(f"worker failed while running job: {job_id}; {message}"))
+
+    async def wait_for_result() -> dict[str, Any]:
+        await worker.submit(encode_worker_frame(job), job_id, on_event=on_event, on_error=on_error)
+        return await completed
+
+    try:
+        return await asyncio.wait_for(wait_for_result(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as error:
+        await worker.abort()
+        raise TimeoutError(f"worker job timed out: {job_id}") from error
+    finally:
+        # A failed submit can notify on_error before raising.
+        if completed.done() and not completed.cancelled():
+            completed.exception()
 
 
-def _run_job(
-    worker: _NativeWorkerProcess,
+async def _run_job(
+    worker: _AsyncNativeWorkerProcess,
     job: dict[str, Any],
     *,
     timeout_seconds: float,
     sampler: ProcessSampler,
 ) -> dict[str, Any]:
-    payload = encode_worker_frame(job)
-    job_id = str(job["job_id"])
     cpu_before = _worker_cpu_ms(worker)
     sample_start = len(sampler.samples)
     sampler.take()
     started = time.perf_counter_ns()
-    events: list[dict[str, Any]] = []
-    result: dict[str, Any] | None = None
-    failure: list[str] = []
-    completed = threading.Event()
+    event_count = progress_event_count = 0
 
-    def on_event(event: dict[str, Any]) -> bool:
-        nonlocal result
-        if not isinstance(event, dict):
-            return False
-        events.append(event)
-        if event.get("type") == "result" and str(event.get("job_id") or "") == job_id:
-            result = event
-        if event.get("type") == "native_event" and event.get("event") == "job_finished" and result is not None:
-            completed.set()
-            return True
-        return False
+    def observe(event: dict[str, Any]) -> None:
+        nonlocal event_count, progress_event_count
+        event_count += 1
+        progress_event_count += event.get("type") == "progress"
 
-    def on_error(message: str) -> None:
-        failure.append(str(message))
-        completed.set()
-
-    worker.submit_async(payload, job_id, on_event=on_event, on_error=on_error)
-    deadline = time.monotonic() + max(1.0, timeout_seconds)
-    while not completed.is_set():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"worker job timed out: {job_id}")
-        completed.wait(timeout=min(0.1, remaining))
-        if not worker.is_alive() and not completed.is_set():
-            raise RuntimeError(f"worker exited while running job: {job_id}; {_worker_stderr(worker)}")
-
-    if failure:
-        raise RuntimeError(f"worker failed while running job: {job_id}; {failure[-1]}")
-    if result is None:
-        raise RuntimeError(f"worker closed before returning a result: {job_id}; {_worker_stderr(worker)}")
-
+    result = await _submit_job(worker, job, timeout_seconds=timeout_seconds, observe=observe)
     finished = time.perf_counter_ns()
     sampler.take()
     cpu_after = _worker_cpu_ms(worker)
@@ -188,7 +180,7 @@ def _run_job(
     nonsequential_read_bytes = int(input_trace.get("nonsequential_read_bytes", 0) or 0)
     logical_read_bytes = sequential_read_bytes + nonsequential_read_bytes
     return {
-        "job_id": job_id,
+        "job_id": str(job["job_id"]),
         "status": status,
         "passed": status == "ok",
         "worker_wall_ms": worker_wall_ms,
@@ -230,8 +222,8 @@ def _run_job(
         "worker_rss_before_mib": round(child_rss[0], 3) if child_rss else None,
         "worker_rss_peak_mib": round(max(child_rss), 3) if child_rss else None,
         "worker_rss_after_mib": round(child_rss[-1], 3) if child_rss else None,
-        "event_count": len(events),
-        "progress_event_count": sum(event.get("type") == "progress" for event in events),
+        "event_count": event_count,
+        "progress_event_count": progress_event_count,
         "files_written": int(result.get("files_written", 0) or 0),
         "bytes_written": int(result.get("bytes_written", 0) or 0),
         "output_file_count": output_stats["file_count"],
@@ -249,7 +241,6 @@ def _case_job(
     *,
     job_id: str,
     output_dir: Path,
-    dll_path: Path,
 ) -> dict[str, Any]:
     volumes = _volume_paths(case)
     archive_format = str(case["format"])
@@ -362,38 +353,38 @@ def _write_csv(path: Path, samples: list[dict[str, Any]]) -> None:
         writer.writerows(samples)
 
 
-def _run_case(
+async def _run_case(
     case: dict[str, Any],
     *,
     workspace: BenchmarkWorkspace,
     worker_path: Path,
-    dll_path: Path,
     runs: int,
     warmups: int,
     timeout_seconds: float,
     sample_interval: float,
 ) -> list[dict[str, Any]]:
     case_slug = str(case["case_id"]).replace(":", "-")
-    worker_start = time.perf_counter_ns()
-    worker = _NativeWorkerProcess(str(worker_path), None)
-    worker_start_ms = round((time.perf_counter_ns() - worker_start) / 1_000_000.0, 3)
+    worker = _AsyncNativeWorkerProcess(str(worker_path))
     sampler = ProcessSampler(interval_seconds=sample_interval)
     rows: list[dict[str, Any]] = []
     try:
+        worker_start = time.perf_counter_ns()
+        await worker.start()
+        worker_start_ms = round((time.perf_counter_ns() - worker_start) / 1_000_000.0, 3)
         sampler.start()
         for warmup in range(warmups):
             output = workspace.outputs / case_slug / f"warmup-{warmup}"
-            job = _case_job(case["item"], job_id=f"{case_slug}-warmup-{warmup}", output_dir=output, dll_path=dll_path)
+            job = _case_job(case["item"], job_id=f"{case_slug}-warmup-{warmup}", output_dir=output)
             try:
-                _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
+                await _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
             finally:
                 if not workspace.keep_workdir:
                     shutil.rmtree(output, ignore_errors=True)
         for run in range(runs):
             output = workspace.outputs / case_slug / f"run-{run}"
-            job = _case_job(case["item"], job_id=f"{case_slug}-run-{run}", output_dir=output, dll_path=dll_path)
+            job = _case_job(case["item"], job_id=f"{case_slug}-run-{run}", output_dir=output)
             try:
-                measured = _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
+                measured = await _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
             finally:
                 if not workspace.keep_workdir:
                     shutil.rmtree(output, ignore_errors=True)
@@ -411,11 +402,11 @@ def _run_case(
             rows.append(measured)
     finally:
         sampler.stop()
-        worker.close()
+        await worker.close()
     return rows
 
 
-def main() -> int:
+async def _main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark the native 7z.dll worker across archive formats and sizes.")
     parser.add_argument("--profile", action="append", default=[], metavar="NAME", help="Size profile(s), comma-separated or repeated.")
     parser.add_argument("--format", action="append", default=[], choices=GENERATED_FORMATS, dest="formats", help="Archive format(s) to include.")
@@ -460,11 +451,10 @@ def main() -> int:
         for index, case in enumerate(cases, start=1):
             print(f"[{index}/{len(cases)}] {case['case_id']} archive={case['archive_bytes']}B", flush=True)
             try:
-                rows = _run_case(
+                rows = await _run_case(
                     case,
                     workspace=workspace,
                     worker_path=worker_path,
-                    dll_path=dll_path,
                     runs=max(1, args.runs),
                     warmups=max(0, args.warmups),
                     timeout_seconds=args.timeout_seconds,
@@ -516,6 +506,10 @@ def main() -> int:
             args.json_out.write_text(rendered, encoding="utf-8")
         print(rendered)
         return 0 if summary["all_passed"] and not failures else 1
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

@@ -211,11 +211,12 @@ pub(crate) fn verify_prepared(
     let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
     let retired = slot.retired.load(Ordering::Acquire);
     // Physical failures may be transient; do not memoize them as archive facts.
-    // Oversized material is valid for this request but must not remain in the
-    // background cache after its last active borrower returns.
+    // Keep oversized material discoverable by concurrent borrowers until
+    // the final borrower returns. It never consumes the idle cache budget.
     if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error")
-        || matches!(prepared, Ok(context) if context.retained_bytes() > MAX_CONTEXT_BYTES)
         || matches!(prepared, Err(PreparedStatus::Status(_,message)) if message.starts_with("resource_unavailable:"))
+        || (Arc::strong_count(&slot) == 2
+            && matches!(prepared, Ok(context) if context.retained_bytes() > MAX_CONTEXT_BYTES))
     {
         entries.retain(|(_, current)| !Arc::ptr_eq(current, &slot));
     }
@@ -227,6 +228,7 @@ pub(crate) fn verify_prepared(
         .filter_map(|(_, slot)| slot.value.get())
         .filter_map(|result| result.as_ref().ok())
         .map(PasswordContext::retained_bytes)
+        .filter(|&size| size <= MAX_CONTEXT_BYTES)
         .sum();
     while entries.len() > MAX_CONTEXTS || bytes > MAX_CONTEXT_BYTES {
         let Some(index) = entries

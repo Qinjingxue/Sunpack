@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import os
 import random
@@ -29,7 +30,7 @@ from benchmarks.scenarios.extraction_format_matrix import (
     create_corpus,
 )
 from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _median, _run_job
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
@@ -382,12 +383,11 @@ def _cold_copy_case(case: dict[str, Any], slot: Path) -> dict[str, Any]:
     return copied
 
 
-def _run_case(
+async def _run_case(
     case: dict[str, Any],
     *,
     workspace: BenchmarkWorkspace,
     worker_path: Path,
-    dll_path: Path,
     runs: int,
     timeout_seconds: float,
     sample_interval: float,
@@ -405,7 +405,7 @@ def _run_case(
             "SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB",
         )
     }
-    worker: _NativeWorkerProcess | None = None
+    worker: _AsyncNativeWorkerProcess | None = None
     sampler = ProcessSampler(interval_seconds=sample_interval)
     sampling = False
     rows: list[dict[str, Any]] = []
@@ -414,7 +414,8 @@ def _run_case(
         os.environ["SUNPACK_SEVENZIP_PROFILE_PIPELINE"] = "1"
         os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if prefetch_enabled else "0"
         os.environ["SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"] = str(prefetch_window_kib)
-        worker = _NativeWorkerProcess(str(worker_path), None)
+        worker = _AsyncNativeWorkerProcess(str(worker_path))
+        await worker.start()
         sampler.start()
         sampling = True
         for run in range(run_start, run_start + runs):
@@ -422,9 +423,9 @@ def _run_case(
             if copy_slots:
                 case = _cold_copy_case(case, copy_slots[run % len(copy_slots)])
             output = workspace.outputs / str(case["case_id"]).replace(":", "-") / mode / f"run-{run}"
-            job = _case_job(case["item"], job_id=f"read-pattern-{case['case_id']}-{run}", output_dir=output, dll_path=dll_path)
+            job = _case_job(case["item"], job_id=f"read-pattern-{case['case_id']}-{run}", output_dir=output)
             try:
-                row = _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
+                row = await _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
             finally:
                 if not workspace.keep_workdir:
                     shutil.rmtree(output, ignore_errors=True)
@@ -437,7 +438,7 @@ def _run_case(
         if sampling:
             sampler.stop()
         if worker is not None:
-            worker.close()
+            await worker.close()
         for name, previous in prior_environment.items():
             if previous is None:
                 os.environ.pop(name, None)
@@ -467,7 +468,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def main() -> int:
+async def _main() -> int:
     parser = argparse.ArgumentParser(description="Profile native worker input read/seek patterns for generated archives.")
     parser.add_argument("--format", action="append", choices=WORKER_FORMATS, dest="formats")
     parser.add_argument("--runs", type=int, default=1)
@@ -607,11 +608,10 @@ def main() -> int:
                         for run in range(args.runs):
                             modes = ("off", "on") if run % 2 == 0 else ("on", "off")
                             for mode in modes:
-                                rows.extend(_run_case(
+                                rows.extend(await _run_case(
                                     case,
                                     workspace=workspace,
                                     worker_path=worker_path,
-                                    dll_path=dll_path,
                                     runs=1,
                                     timeout_seconds=args.timeout_seconds,
                                     sample_interval=args.sample_interval,
@@ -621,11 +621,10 @@ def main() -> int:
                                     copy_slots=copy_slots,
                                 ))
                     else:
-                        rows.extend(_run_case(
+                        rows.extend(await _run_case(
                             case,
                             workspace=workspace,
                             worker_path=worker_path,
-                            dll_path=dll_path,
                             runs=args.runs,
                             timeout_seconds=args.timeout_seconds,
                             sample_interval=args.sample_interval,
@@ -694,6 +693,10 @@ def main() -> int:
             print(table)
             print(rendered)
             return 0 if summary["all_passed"] else 1
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

@@ -19,11 +19,12 @@ import pytest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.failures import FailureKind
+from tests.helpers.async_batch import run_extract
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 from tests.helpers.worker_events import worker_result as build_worker_result, worker_trace_item
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
-    _NativeWorkerProcess,
+    _AsyncNativeWorkerProcess,
     _apply_native_environment,
 )
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
@@ -659,14 +660,17 @@ def test_native_worker_result_escapes_control_characters(tmp_path):
     }
     runner = SevenZipRunner({})
     runner.worker_path = worker_path
-    try:
-        completed = runner.submit_attempt(
-            payload,
-            startupinfo=None,
-            task=_task(archive),
-        ).result(timeout=10)
-    finally:
-        runner.close()
+    async def scenario():
+        try:
+            completed = await runner.submit_attempt_asyncio(
+                payload,
+                task=_task(archive),
+            )
+            return completed
+        finally:
+            await runner.aclose()
+
+    completed = asyncio.run(scenario())
 
     worker_result = worker_result_payload(completed)
     assert completed.returncode != 0
@@ -730,7 +734,7 @@ def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path):
 
 
 @pytest.mark.parametrize("completion", ["job_finished", "worker_exit", "worker_closed"])
-def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path, completion):
+def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path, completion, monkeypatch):
     from sunpack.pipeline.coordinator.engine import PipelineEngine
 
     worker = tmp_path / "cancel_worker.cmd"
@@ -751,13 +755,18 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
         runner.worker_path = str(worker)
         started, cancelling = asyncio.Event(), asyncio.Event()
 
-        def event(_task, value):
+        dispatch = _AsyncNativeWorkerProcess._dispatch_event
+
+        async def observe_event(native, value):
+            await dispatch(native, value)
+            if value.get("job_id") != "cancel-job":
+                return
             if value.get("event") == "job_started":
                 started.set()
             elif value.get("event") == "job_cancelling":
                 cancelling.set()
 
-        runner.native_event_callback = event
+        monkeypatch.setattr(_AsyncNativeWorkerProcess, "_dispatch_event", observe_event)
 
         class Runtime:
             def __init__(self, services, submission, options, leases):
@@ -782,7 +791,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
                 assert not request.done()
                 assert not waiting.done()
                 assert not engine.is_idle()
-                native = await runner._async_worker_holder_or_create().get_or_start(None)
+                native = await runner._async_worker_holder_or_create().get_or_start()
                 if completion == "worker_closed":
                     await native.abort()
                 else:
@@ -860,7 +869,7 @@ def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch
     class StartObserved(RuntimeError):
         pass
 
-    def fake_popen(*args, **kwargs):
+    async def fake_popen(*args, **kwargs):
         captured.update(kwargs)
         raise StartObserved
 
@@ -868,10 +877,10 @@ def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch
         "sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner.runtime_working_directory",
         lambda: str(tmp_path),
     )
-    monkeypatch.setattr("sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner.asyncio.create_subprocess_exec", fake_popen)
 
     with pytest.raises(StartObserved):
-        _NativeWorkerProcess("worker.exe", None)
+        asyncio.run(_AsyncNativeWorkerProcess("worker.exe").start())
 
     assert captured["cwd"] == str(tmp_path)
 
@@ -1312,25 +1321,29 @@ def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
         zf.writestr("ok.txt", "batch payload")
     runner = SevenZipRunner({})
     runner.worker_path = worker
-    try:
-        bad = runner.submit_attempt(
-            {
-                "job_id": "bad",
-                "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(tmp_path / "missing.zip"), part_paths=[str(tmp_path / "missing.zip")]).to_dict(),
-                "output_dir": str(tmp_path / "bad"),
-            },
-            task=_task(tmp_path / "missing.zip"),
-        ).result(timeout=10)
-        good = runner.submit_attempt(
-            {
-                "job_id": "ok",
-                "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), part_paths=[str(archive)]).to_dict(),
-                "output_dir": str(tmp_path / "ok"),
-            },
-            task=_task(archive),
-        ).result(timeout=10)
-    finally:
-        runner.close()
+    async def scenario():
+        try:
+            bad = await runner.submit_attempt_asyncio(
+                {
+                    "job_id": "bad",
+                    "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(tmp_path / "missing.zip"), part_paths=[str(tmp_path / "missing.zip")]).to_dict(),
+                    "output_dir": str(tmp_path / "bad"),
+                },
+                task=_task(tmp_path / "missing.zip"),
+            )
+            good = await runner.submit_attempt_asyncio(
+                {
+                    "job_id": "ok",
+                    "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), part_paths=[str(archive)]).to_dict(),
+                    "output_dir": str(tmp_path / "ok"),
+                },
+                task=_task(archive),
+            )
+            return bad, good
+        finally:
+            await runner.aclose()
+
+    bad, good = asyncio.run(scenario())
 
     assert worker_result_payload(bad)["status"] == "failed"
     assert worker_result_payload(good)["status"] == "ok"
@@ -1343,15 +1356,12 @@ def test_extraction_scheduler_saves_process_failure_diagnostics(tmp_path):
     scheduler = ExtractionScheduler()
     scheduler.sevenzip_runner.worker_path = str(tmp_path / "missing_worker.exe")
 
-    try:
-        result = scheduler.extract(_task(archive), str(tmp_path / "out"))
-    finally:
-        scheduler.close()
+    result = run_extract(scheduler, _task(archive), str(tmp_path / "out"))
 
     assert result.success is False
     assert result.diagnostics["process_failure"]["failure_stage"] == "worker_start"
     assert result.diagnostics["process_failure"]["failure_kind"] == "process_start"
-    assert result.diagnostics["repro"]["request"]["archive_path"] == str(archive)
+    assert result.diagnostics["repro"]["request"]["archive_input"]["entry_path"] == str(archive)
 
 
 def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit(tmp_path):
@@ -1364,10 +1374,7 @@ def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit
     scheduler = ExtractionScheduler()
     scheduler.sevenzip_runner.worker_path = str(worker)
 
-    try:
-        result = scheduler.extract(_task(archive), str(tmp_path / "out"))
-    finally:
-        scheduler.close()
+    result = run_extract(scheduler, _task(archive), str(tmp_path / "out"))
 
     assert result.success is False
     assert result.diagnostics["failure_stage"] == "worker_communication"
@@ -1420,7 +1427,7 @@ def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):
             "end": len(prefix) + len(data),
         }],
     })
-    result = ExtractionScheduler().extract(task, str(tmp_path / "out"))
+    result = run_extract(ExtractionScheduler(), task, str(tmp_path / "out"))
 
     assert result.success is True
     assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "range payload"
@@ -1447,7 +1454,7 @@ def test_confirmed_truncated_file_range_open_failure_is_damaged(tmp_path):
             "end": len(prefix) + len(data),
         }],
     })
-    result = ExtractionScheduler().extract(task, str(tmp_path / "out"))
+    result = run_extract(ExtractionScheduler(), task, str(tmp_path / "out"))
 
     assert result.success is False
     assert result.failure.kind is FailureKind.DAMAGED
@@ -1461,13 +1468,13 @@ def test_confirmed_truncated_file_range_open_failure_is_damaged(tmp_path):
 def test_extraction_scheduler_saves_worker_diagnostics_on_failure(tmp_path):
     _require_worker_or_skip()
     missing = tmp_path / "missing.7z"
-    result = ExtractionScheduler().extract(_task(missing), str(tmp_path / "out"))
+    result = run_extract(ExtractionScheduler(), _task(missing), str(tmp_path / "out"))
 
     assert result.success is False
     assert result.diagnostics["result"]["failure_stage"] == "input_open"
     assert result.diagnostics["result"]["failure_kind"] == "input_stream"
     assert result.diagnostics["result"]["diagnostics"]["input_trace"]["read_error"] is True
-    assert result.diagnostics["repro"]["request"]["archive_path"] == str(missing)
+    assert result.diagnostics["repro"]["request"]["archive_input"]["entry_path"] == str(missing)
 
 
 def test_extraction_scheduler_uses_worker_for_concat_ranges(tmp_path, monkeypatch):
@@ -1492,7 +1499,7 @@ def test_extraction_scheduler_uses_worker_for_concat_ranges(tmp_path, monkeypatc
             {"path": str(part_b), "start": 0},
         ],
     })
-    result = ExtractionScheduler().extract(task, str(tmp_path / "out"))
+    result = run_extract(ExtractionScheduler(), task, str(tmp_path / "out"))
 
     assert result.success is True
     assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "concat payload"
@@ -1741,7 +1748,7 @@ def test_native_qos_ack_can_arrive_after_old_two_second_deadline():
     from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 
     async def scenario():
-        worker = _AsyncNativeWorkerProcess("unused.exe", None)
+        worker = _AsyncNativeWorkerProcess("unused.exe")
         worker.process = SimpleNamespace(pid=1234, returncode=None)
 
         async def send(_payload):

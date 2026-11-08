@@ -171,8 +171,6 @@ struct SegmentState {
     path: PathBuf,
     file: Arc<TrackedFile>,
     last_seq: u64,
-    write_epoch: u64,
-    flushed_epoch: u64,
     sealed_end: Option<u64>,
 }
 
@@ -567,8 +565,6 @@ fn segment_file(
             path: path.to_path_buf(),
             file: file.clone(),
             last_seq: 0,
-            write_epoch: 0,
-            flushed_epoch: 0,
             sealed_end: None,
         },
     );
@@ -664,7 +660,6 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
                 io::Error::new(io::ErrorKind::NotFound, "Watch journal segment disappeared")
             })?;
         segment.last_seq = last_seq;
-        segment.write_epoch = segment.write_epoch.saturating_add(batch.len() as u64);
     }
     stream_state.written_seq = last_seq;
     stream_state.write_count = stream_state.write_count.saturating_add(batch.len() as u64);
@@ -779,12 +774,12 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                         continue;
                     }
                     segment.sealed_end = Some(boundary);
-                    let already_clean = segment.flushed_epoch >= segment.write_epoch;
-                    if stream_state.durable_seq >= boundary && already_clean {
+                    let required = segment.last_seq.max(boundary);
+                    if required <= stream_state.durable_seq {
                         stream_state.segments.remove(&old_start);
                         stream_state.sealed_seq = stream_state.sealed_seq.max(boundary);
                     } else {
-                        stream_state.requested_seq = stream_state.requested_seq.max(boundary);
+                        stream_state.requested_seq = stream_state.requested_seq.max(required);
                     }
                 } else if stream_state.durable_seq >= boundary {
                     // A segment loaded from a previous process has no native handle;
@@ -810,24 +805,18 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
     }
 }
 
-struct FlushSnapshot {
-    start: u64,
-    epoch: u64,
-    file: Arc<TrackedFile>,
-}
-
 struct FlushWork {
     stream: String,
     retired: Arc<OnceLock<StreamFrontier>>,
     target: u64,
-    segments: Vec<FlushSnapshot>,
+    files: Vec<Arc<TrackedFile>>,
 }
 
 fn close_ready_segments(stream: &mut StreamState) {
     stream.segments.retain(|_, segment| {
-        let ready = segment.sealed_end.filter(|&boundary| {
-            boundary <= stream.durable_seq && segment.flushed_epoch >= segment.write_epoch
-        });
+        let ready = segment
+            .sealed_end
+            .filter(|&boundary| segment.last_seq.max(boundary) <= stream.durable_seq);
         if let Some(boundary) = ready {
             stream.sealed_seq = stream.sealed_seq.max(boundary);
             return false;
@@ -900,22 +889,16 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
                 continue;
             }
             let target = stream.written_seq;
-            let segments: Vec<FlushSnapshot> = stream
+            // A single flusher syncs every dirty segment through this snapshot.
+            // Appends published during I/O have a higher sequence than target.
+            let files: Vec<_> = stream
                 .segments
-                .iter()
-                .filter(|(_, segment)| {
-                    segment.last_seq != 0
-                        && segment.last_seq <= target
-                        && segment.flushed_epoch < segment.write_epoch
-                })
-                .map(|(start, segment)| FlushSnapshot {
-                    start: *start,
-                    epoch: segment.write_epoch,
-                    file: segment.file.clone(),
-                })
+                .values()
+                .filter(|segment| segment.last_seq > stream.durable_seq)
+                .map(|segment| segment.file.clone())
                 .collect();
 
-            if segments.is_empty() {
+            if files.is_empty() {
                 stream.durable_seq = stream.durable_seq.max(target);
                 close_ready_segments(stream);
                 retire_closed_stream(&mut state, &key);
@@ -928,7 +911,7 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
                 stream: key,
                 retired: stream.retired.clone(),
                 target,
-                segments,
+                files,
             };
         }
 
@@ -946,23 +929,12 @@ fn flusher_loop(shared: Arc<Shared>) {
             stream,
             retired,
             target,
-            segments,
+            files,
         } = work;
-        let epochs: Vec<(u64, u64)> = segments
-            .iter()
-            .map(|segment| (segment.start, segment.epoch))
-            .collect();
         let flush_started = Instant::now();
-        let mut flush_error = None;
-        for segment in &segments {
-            if let Err(error) = segment.file.sync_all() {
-                flush_error = Some(error);
-                break;
-            }
-        }
-        let flush_calls = segments.len() as u64;
+        let flush_calls = files.len() as u64;
+        let result = files.into_iter().try_for_each(|file| file.sync_all());
         let flush_micros = flush_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        drop(segments);
 
         let mut state = lock_state(&shared);
         let Some(stream_state) = state.streams.get_mut(&stream) else {
@@ -972,18 +944,13 @@ fn flusher_loop(shared: Arc<Shared>) {
         if !Arc::ptr_eq(&stream_state.retired, &retired) {
             continue;
         }
-        if let Some(error) = flush_error {
+        if let Err(error) = result {
             stream_state
                 .error
                 .get_or_insert_with(|| format!("native Watch journal flush failed: {error}"));
             retire_closed_stream(&mut state, &stream);
             shared.cv.notify_all();
             continue;
-        }
-        for (start, epoch) in epochs {
-            if let Some(segment) = stream_state.segments.get_mut(&start) {
-                segment.flushed_epoch = segment.flushed_epoch.max(epoch);
-            }
         }
         stream_state.flush_rounds = stream_state.flush_rounds.saturating_add(1);
         stream_state.flush_calls = stream_state.flush_calls.saturating_add(flush_calls);
@@ -1193,6 +1160,7 @@ mod tests {
     fn clean_flush_does_not_issue_another_physical_sync() {
         let runtime = runtime();
         let path = unique_path("clean_flush");
+        let next_path = unique_path("dirty_flush");
         let stream = path.to_string_lossy().to_string();
         let mut owner = runtime.open(stream.clone()).unwrap();
         let ticket = runtime
@@ -1225,8 +1193,26 @@ mod tests {
             state.streams.get(&stream).unwrap().flush_calls
         };
         assert_eq!(first, second);
+        runtime
+            .submit_append(
+                stream.clone(),
+                next_path.clone(),
+                2,
+                2,
+                empty_operations(),
+                true,
+            )
+            .unwrap()
+            .wait_for(TicketGoal::Durable)
+            .unwrap();
+        let third = {
+            let state = lock_state(&runtime.shared);
+            state.streams.get(&stream).unwrap().flush_calls
+        };
+        assert_eq!(third, second + 1);
         runtime.release(owner.stream.take().unwrap()).unwrap();
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(next_path);
     }
 
     #[test]

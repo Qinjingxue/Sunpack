@@ -45,11 +45,7 @@ def _task(archive: Path):
 
 
 def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_worker") -> Path:
-    """写一个能回显真实 job_id 的假 worker。
-
-    runner 在 `_build_job()` 里自己生成 job_id 并覆盖调用方传入的值；硬编码 job_id 的
-    `.cmd` 会被 dispatcher 当成未知 job_id 丢弃，事件到不了 `progress_callback`。
-    """
+    """写一个从请求回显 job_id 的假 worker，供 dispatcher 路由。"""
 
     script = tmp_path / f"{name}.py"
     script.write_text(
@@ -125,8 +121,7 @@ def test_new_space_episode_accepts_status_and_discards_previous_episode():
 
 
 @pytest.mark.parametrize("resource", ["space", "memory"])
-@pytest.mark.parametrize("transport", ["async", "future"])
-def test_stale_resource_event_is_not_forwarded_to_the_ui(tmp_path, resource, transport):
+def test_stale_resource_event_is_not_forwarded_to_the_ui(tmp_path, resource):
     """端到端：native 按 resumed(ep3) → blocked(ep3) 乱序发送时，
     progress_callback（UI/Toast 的唯一入口）只能看到 resumed。
     """
@@ -158,22 +153,15 @@ def test_stale_resource_event_is_not_forwarded_to_the_ui(tmp_path, resource, tra
 
     async def run_attempt():
         try:
-            await asyncio.wait_for(
+            completed = await asyncio.wait_for(
                 runner.submit_attempt_asyncio({"job_id": "event-job"}, task=_task(archive)),
                 timeout=5,
             )
-        except (asyncio.TimeoutError, TimeoutError):
-            pass
+            assert completed.returncode == 0, completed.stderr
         finally:
             await runner.aclose()
 
-    if transport == "async":
-        asyncio.run(run_attempt())
-    else:
-        try:
-            assert runner._submit_native_job({"job_id": "event-job"}, task=_task(archive)).result(timeout=5).returncode == 0
-        finally:
-            runner.close()
+    asyncio.run(run_attempt())
 
     forwarded = [
         str(event.get("event"))

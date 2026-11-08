@@ -16,20 +16,11 @@ class WatchOutputRoots:
         self._closed = False
         self.recover_flattens()
         changes = []
-        keys = set(state._native.runtime_keys("owned|"))
-        for key in tuple(keys):
+        for key in state._native.runtime_keys("owned|"):
             record = state._native.runtime_record(key)
             paths = self._paths(record["path"])
             if not self._relevant(paths) or not self._matches(record):
                 changes.append({"op": "runtime", "key": key})
-            else:
-                # Upgrade lexical-only records without changing their owner or
-                # identity. Both namespaces share the existing WAL lifecycle.
-                for path in paths:
-                    alias = "owned|" + path_key(path)
-                    if alias not in keys:
-                        changes.append({"op": "runtime", "key": alias, "value": record})
-                        keys.add(alias)
         state.commit_runtime(changes, durable=True)
 
     @staticmethod

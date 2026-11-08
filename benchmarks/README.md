@@ -66,20 +66,16 @@ uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx 
 cmake --build native/sevenzip_bridge/build-probe --config Release --target sunpack_sevenzip_worker
 uv run --locked python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
 uv run --locked python -m benchmarks extraction worker-vs-7z-300m `
-  --sunpack-version v0.7.0 --worker-source-commit c3eaec11 `
   --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
   --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 `
-  --json-out benchmarks/results/worker-vs-7z-300m-v0.7.0-c3eaec11-rss.json
+  --json-out benchmarks/results/worker-vs-7z-300m.json
 uv run --locked python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
 uv run --locked python -m benchmarks extraction worker-concurrency-300m --concurrency 8 --runs 2 --json-out benchmarks/results/worker-concurrency-300m.json
 uv run --locked python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
-# Enable the production format-aware prefetch policy while tuning its defaults (512 KiB x 2).
-uv run --locked python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --prefetch-window-kib 512 --prefetch-depth 2
+# Enable prefetch with a 512 KiB window.
+uv run --locked python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --prefetch-window-kib 512
 # Compare production-policy prefetch on/off in alternating order. Two 512 MiB members retain a meaningful solid-7z case.
 uv run --locked python -m benchmarks extraction worker-read-patterns --format tar --format rar-split --format 7z --7z-variant solid --large-files 2 --large-file-mib 512 --large-content random --runs 5 --prefetch compare
-uv run --locked python -m benchmarks extraction worker-small-file-scheduling --jobs 256 --clients 4 --runs 3
-uv run --locked python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --runs 3 --warmups 1
-uv run --locked python -m benchmarks extraction worker-resource-pressure --modes cpu,io --jobs 4
 uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
 uv run --locked python -m benchmarks watch cli-format-matrix --runs 3 --json-out benchmarks/results/watch-cli-format-matrix.json
 uv run --locked python -m benchmarks watch cli-format-matrix --format zipx --format lz4 --runs 3 --json-out benchmarks/results/watch-cli-zipx-lz4-baseline.json
@@ -269,8 +265,9 @@ recorded but excluded from `aggregates`, and every case has its own `--timeout` 
 stuck format cannot consume the whole scenario budget.
 
 `extraction sevenzip-worker-matrix` measures the native persistent
-`sunpack_sevenzip_worker.exe` directly. It reuses the format-matrix corpus builder,
-generates tiny/small/medium/large profiles by default, and records per-run worker wall time,
+`sunpack_sevenzip_worker.exe` directly through the production asynchronous transport.
+It reuses the format-matrix corpus builder, generates tiny/small/medium/large profiles
+by default, and records per-run worker wall time,
 worker CPU time, child-process RSS peak, output statistics, native status, and failures.
 Use repeated or comma-separated `--profile` values and repeated `--format` values to
 focus the matrix. Durable results contain both `report.json` and `results.csv`.
@@ -307,17 +304,6 @@ The worker disables prefetch by default when the request's `format_hint` is
 for comparison runs. To compare with revisions that predate ENC support, select
 only ZIPX and LZ4 in both CLI and watch commands.
 
-`extraction worker-small-file-scheduling` measures the worker-internal thread
-scheduler under a deliberately adversarial many-small-file workload. It creates
-one small ZIP per job and submits each request's full burst before the next
-request. Per run it uses the selected worker's reported capacity and records
-throughput, observed active-job peak, time-weighted thread-capacity utilization,
-queue/service latency percentiles, queued-but-underutilized thread time,
-worker CPU/RSS/read/write utilization, early- and overall-admission Jain fairness,
-the spread to each request's first admission, and the longest same-request admission
-run. The early index detects short-term monopolization; the overall index detects
-whether requests receive equal admission counts by the end of the batch.
-
 `extraction worker-concurrency-300m` compares one persistent native worker with
 concurrent fresh `7z.exe` processes on all 18 generated 300 MiB format/variant
 cases. It reuses the format builder with payloads written by a standalone Rust
@@ -333,44 +319,6 @@ native diagnostics. Writer thread counts use each worker binary's internal defau
 `--format` and `--no-mixed` restrict diagnostic runs. These direct worker tests
 exclude CLI/watch planning, recursive extraction, and post-extract verification.
 Compressed TAR codecs are measured as one outer stream layer for both engines.
-
-`extraction worker-fair-timing` is the like-for-like wall-clock comparison. The worker's
-completion means "bytes are on the device", while `7z.exe` returns as soon as the bytes
-are in the page cache, so timing only the return is not comparable. It measures each run
-twice — extraction wall as reported by `worker-concurrency-300m`, then a Rust `sync_all`
-over the produced tree — and treats `wall + flush` as the decisive number. A "wait until
-the host disk goes quiet" probe was tried and removed: unrelated background writeback
-keeps the disk busy for about a second here regardless of workload size, so it measured
-the machine rather than the extraction.
-`worker-window-sweep` and `worker-paired-ab` are benchmark-only reproduction helpers
-used by the analysis below: the sweep rewrites the single residency-window constant in
-`sevenzip_async_output.hpp`, rebuilds the probe worker once per value, runs every value in
-alternating order per trial, and restores the original header on exit; the paired A/B
-compares two worker binaries on the same cached corpus with alternating order, and can
-apply per-engine environment overrides such as
-`SUNPACK_ASYNC_WRITER_FILE_INFLIGHT_MIB` (only effective on a build that reads it).
-Run them as scripts (`python benchmarks/scenarios/worker_window_sweep.py --help`)
-because the sweep mutates source.
-`extraction worker-concurrency-ablation` decomposes the parallel worker deficit into
-single-variable ablations on the same cached 300 MiB corpus: shared buffer count
-and input prefetch, each
-optionally paired with concurrent `7z.exe` and with `--dry` (worker `dry_run` against
-`7z t`) to separate decode cost from output-write cost. It reports wall time, process
-CPU split, and per-job decoder credit grants.
-`extraction worker-writer-ablation` reuses the probe-instrumented worker to break the
-output path into phases (dispatch, WriteFile, producer, capacity wait, copy, queue) and
-reports write-completion depth (`inflight_peak`, `queue_depth_peak`) and per-write
-latency. Its `memory` and `memory-nocopy` sink modes write nothing, so decode-only cost
-can be compared against the real write path; the probe phases overlap across threads and
-must not be summed as batch wall time. Both scenarios accept a probe binary built with
-`-DSUP7Z_ENABLE_WRITER_PROBE=ON -DSUP7Z_ENABLE_PIPELINE_TIMING=ON`; the product worker
-build does not carry that instrumentation. The measured root causes are written up in
-[简体中文](../docs/zh-CN/benchmark_worker_concurrency_gap_analysis.md), together with the
-fixes that measurement rejected (deeper per-volume IOCP writer threads, releasing the
-residency window at submission instead of at IO completion, enlarging the residency
-window or the buffer pool) and the two harness bugs found while fixing the timing
-(7z.exe output directories were not cleared before `-aoa`, and one scenario recorded only
-the last `--format`).
 
 `memory many-tasks` measures memory _growth_ (not peak) of the two long-lived
 components under a large task count across every format: the Python pipeline and

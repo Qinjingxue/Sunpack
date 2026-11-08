@@ -7,7 +7,7 @@ import pytest
 from sunpack.pipeline.coordinator.engine import _RequestRuntime
 
 
-@pytest.mark.parametrize("failure_stage", ["cleanup", "shell", "progress", "close"])
+@pytest.mark.parametrize("failure_stage", ["cleanup", "shell", "progress"])
 def test_request_finalization_releases_owners_after_cleanup_failure(monkeypatch, tmp_path, failure_stage):
     # Successful-close coverage misses failures in the finalizer itself. Keep
     # the failed runtime alive, like a retained traceback, and verify that
@@ -42,8 +42,6 @@ def test_request_finalization_releases_owners_after_cleanup_failure(monkeypatch,
                     runtime._shell_updates.flush = fail if failure_stage == "shell" else lambda: None
                     if failure_stage == "progress":
                         runtime.reporter.drain_progress = async_fail
-                    if failure_stage == "close":
-                        runtime.extractor.close = fail
 
                 runtime._discover_and_run = discover
                 return runtime

@@ -59,13 +59,12 @@ def _advance_state(state, sent, *, first: bool, runner: SevenZipRunner, cancella
         except StopIteration as completed:
             return True, completed.value
         first = False
-        startupinfo = request.pop("startupinfo", None)
         try:
             job = runner._build_job(**request)
         except Exception as exc:
             sent = runner.failed_process_for_exception(exc, request)
         else:
-            return False, {"job": job, "startupinfo": startupinfo, "task": request["task"]}
+            return False, {"job": job, "task": request["task"]}
 
 
 class SingleArchiveExtractor:
@@ -86,31 +85,6 @@ class SingleArchiveExtractor:
         self.quiet = bool(quiet)
         self.i18n = I18nContext(language)
         self.output_stream = output_stream if output_stream is not None else sys.stdout
-
-    def extract(
-        self,
-        task: ArchiveTask,
-        out_dir: str,
-        *,
-        phase_timer: Callable[..., Any] | None = None,
-        phase_prefix: str = "extract",
-    ) -> ExtractionResult:
-        state = self._extract_state_machine(
-            task,
-            out_dir,
-            phase_timer=phase_timer,
-            phase_prefix=phase_prefix,
-        )
-        try:
-            request = next(state)
-        except StopIteration as completed:
-            return completed.value
-        while True:
-            result = self.sevenzip_runner.extract_attempt(**request)
-            try:
-                request = state.send(result)
-            except StopIteration as completed:
-                return completed.value
 
     async def extract_asyncio(
         self,
@@ -192,10 +166,10 @@ class SingleArchiveExtractor:
                                  source_layer="analysis", source_module="input_plan")
         descriptor = task.archive_input()
         archive = descriptor.entry_path
-        all_parts = descriptor.part_paths() or [archive]
+        run_parts = descriptor.part_paths()
         is_split = (
             descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
-            or len(all_parts) > 1
+            or len(run_parts) > 1
         )
 
         self._log(self.i18n.t("extract.log.start", archive=archive))
@@ -211,17 +185,12 @@ class SingleArchiveExtractor:
                 diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
             )
 
-        with _phase(phase_timer, f"{phase_prefix}_startupinfo"):
-            startupinfo = self._startupinfo()
-        descriptor = task.archive_input()
-        run_archive = descriptor.entry_path
-        run_parts = descriptor.part_paths()
         run_result = None
         err = ""
         correct_pwd = None
 
         with _phase(phase_timer, f"{phase_prefix}_resolve_password"):
-            resolution = self._resolve_password(task, run_archive, run_parts)
+            resolution = self._resolve_password(task, archive, run_parts)
         resolution_failure = self._password_resolution_failure(resolution)
         if resolution_failure is not None:
             self._cleanup_output(out_dir, OutputCleanupEvent.EXTRACTION_ABORT)
@@ -246,19 +215,18 @@ class SingleArchiveExtractor:
             self.sevenzip_runner.emit_semantic_event(
                 task,
                 "extract_ready",
-                archive_path=run_archive,
+                archive_path=archive,
                 completed_bytes=0,
                 total_bytes=0,
             )
             with _phase(phase_timer, f"{phase_prefix}_sevenzip_attempt"):
                 run_result = yield {
-                    "archive_path": run_archive,
+                    "archive_path": archive,
                     "out_dir": out_dir,
                     "password": correct_pwd,
                     "password_candidates": list(resolution.candidate_passwords),
                     "password_verified": bool(correct_pwd) and not resolution.requires_extraction_confirmation,
                     "selected_codepage": selected_codepage,
-                    "startupinfo": startupinfo,
                     "task": task,
                     "phase_timer": phase_timer,
                     "phase_prefix": f"{phase_prefix}_sevenzip",
@@ -418,11 +386,6 @@ class SingleArchiveExtractor:
             archive_key=archive_key,
             scope_path=scope_path,
         )
-
-    def _startupinfo(self):
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        return startupinfo
 
     @staticmethod
     def _cleanup_output(out_dir: str, event: OutputCleanupEvent) -> None:

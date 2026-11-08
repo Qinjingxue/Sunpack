@@ -18,6 +18,7 @@ from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor impo
     SingleArchiveExtractor,
 )
 from sunpack.pipeline.verification.scheduler import VerificationScheduler
+from tests.helpers.async_batch import run_extract, stub_worker_attempt
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
 from tests.helpers.worker_events import worker_result
@@ -68,11 +69,12 @@ class _FakeSevenZipRunner:
     def __init__(self, *, include_output_counts: bool = True):
         self.sources = []
         self.include_output_counts = bool(include_output_counts)
+        stub_worker_attempt(self, self._complete_attempt)
 
     def emit_semantic_event(self, _task, _event, **_payload):
         pass
 
-    def extract_attempt(self, *, out_dir, task, **_kwargs):
+    def _complete_attempt(self, *, out_dir, task, **_kwargs):
         source = task.archive_input().to_dict()
         self.sources.append(source)
         name = str(source.get("format_hint") or "archive")
@@ -162,7 +164,7 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
         best_effort=True,
     )
 
-    result = extractor.extract(task, str(tmp_path / "out"))
+    result = run_extract(extractor, task, str(tmp_path / "out"))
 
     assert result.success is True
     assert task.archive_input().open_mode == "file"
@@ -210,7 +212,7 @@ def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
         best_effort=True,
     )
 
-    result = extractor.extract(task, str(tmp_path / "out"))
+    result = run_extract(extractor, task, str(tmp_path / "out"))
 
     assert result.success is True
     assert result.password_used == "segment-secret"
@@ -242,7 +244,7 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
         best_effort=True,
     )
 
-    result = extractor.extract(task, str(tmp_path / "out"))
+    result = run_extract(extractor, task, str(tmp_path / "out"))
 
     assert result.success is True
     assert (tmp_path / "out" / "zip.txt").exists()
@@ -308,7 +310,7 @@ def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
         best_effort=True,
     )
 
-    result = extractor.extract(task, str(tmp_path / "out"))
+    result = run_extract(extractor, task, str(tmp_path / "out"))
 
     assert result.success is True
     assert result.files_written == 1

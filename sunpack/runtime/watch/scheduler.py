@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
@@ -238,31 +239,6 @@ class WatchScheduler:
             if any(entry.deep_detect for entry in self.root_entries.values()) else None)
         from sunpack.runtime.watch.roots import discovery_scopes
         self.scopes = discovery_scopes(self.root_entries.values())
-        self.state = WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement,
-                                     scopes=self.scopes.values())
-        self._catalog = NativeWatchCatalog(self.state._native, str(Path(state_path).parent))
-        self._catalog.retain_roots(roots)
-        from sunpack.runtime.watch.output_roots import WatchOutputRoots
-        self._outputs = WatchOutputRoots(self.state, tuple(self.scopes.values()))
-        self._reservations = getattr(getattr(pipeline_engine, "_services", None), "output_reservations", None)
-        if self._reservations is not None:
-            self._reservations.watch_outputs = self._outputs
-        log_path = Path(state_path).with_name("events.json")
-        self.log = WatchLogStore(str(log_path), retention_days=watch_config["event_log_retention_days"], wake_callback=self._wake_service)
-        self.state._native.attach_events(self.log._native)
-        state_parent = Path(state_path).parent
-        if state_parent.name.lower() == ".sunpack_watch":
-            self._metadata_dir_key = absolute_path_key(state_parent)
-            self._metadata_file_keys = set()
-        else:
-            self._metadata_dir_key = absolute_path_key(str(log_path) + ".store")
-            self._metadata_file_keys = {
-                absolute_path_key(path) for path in (
-                    state_path, self.state.journal_path, log_path,
-                    *(state_parent / name for name in
-                      ("catalog.snapshot.bin", "catalog.snapshot.bin.tmp", "catalog.wal.bin", "catalog.lock")),
-                )
-            }
         self._lock = threading.Lock()
         self._tick_lock = asyncio.Lock()
         # Publish claims and observation generations under one short gate.
@@ -327,13 +303,46 @@ class WatchScheduler:
         self._password_file_source = password_file_source()
         self.builtin_password_file = os.path.abspath(str(builtin_passwords_module.builtin_password_path()))
         self._password_source_signature = self._refresh_password_sources()
-        if self.state.record_password_source_signature(self._password_source_signature):
-            self._mark_all_password_failures_dirty()
         self._clipboard_monitor = ClipboardPasswordMonitor(
             volume_changed=self._notify_watch_volumes,
             enabled=bool(watch_config["clipboard_monitor_enabled"]),
             max_entries=int(watch_config["clipboard_builtin_max_entries"]),
         )
+        from sunpack.runtime.watch.output_roots import WatchOutputRoots
+
+        self._reservations = getattr(getattr(pipeline_engine, "_services", None), "output_reservations", None)
+        state_parent = Path(state_path).parent
+        log_path = state_parent / "events.json"
+        # A failed constructor never returns a scheduler for the service to close.
+        with ExitStack() as resources:
+            self.state = WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement,
+                                         scopes=self.scopes.values())
+            resources.callback(self.state.close)
+            self._catalog = NativeWatchCatalog(self.state._native, str(state_parent))
+            resources.callback(self._catalog.close)
+            self._catalog.retain_roots(roots)
+            self._outputs = WatchOutputRoots(self.state, tuple(self.scopes.values()))
+            resources.callback(self._outputs.close)
+            self.log = WatchLogStore(str(log_path), retention_days=watch_config["event_log_retention_days"], wake_callback=self._wake_service)
+            resources.callback(self.log.close)
+            self.state._native.attach_events(self.log._native)
+            if state_parent.name.lower() == ".sunpack_watch":
+                self._metadata_dir_key = absolute_path_key(state_parent)
+                self._metadata_file_keys = set()
+            else:
+                self._metadata_dir_key = absolute_path_key(str(log_path) + ".store")
+                self._metadata_file_keys = {
+                    absolute_path_key(path) for path in (
+                        state_path, self.state.journal_path, log_path,
+                        *(state_parent / name for name in
+                          ("catalog.snapshot.bin", "catalog.snapshot.bin.tmp", "catalog.wal.bin", "catalog.lock")),
+                    )
+                }
+            if self.state.record_password_source_signature(self._password_source_signature):
+                self._mark_all_password_failures_dirty()
+            if self._reservations is not None:
+                self._reservations.watch_outputs = self._outputs
+            resources.pop_all()
 
     def _validate_output_roots(self) -> None:
         resolved = [
@@ -1942,13 +1951,7 @@ class WatchScheduler:
                 _, epoch, generation, _, path = heapq.heappop(self._ready_heap)
                 if path in due_paths:
                     continue
-                state = self._pending.get(path)
-                if (
-                    state is None
-                    or state.epoch != epoch
-                    or state.generation != generation
-                ):
-                    continue
+                state = self._pending[path]  # Already validated under the same lock.
                 due_paths.add(path)
                 due.append((
                     path,

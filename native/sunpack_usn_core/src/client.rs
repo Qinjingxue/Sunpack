@@ -1,5 +1,7 @@
-use crate::protocol::{parse_file_id, Opcode, Request, Response, Status, RESPONSE_BYTES};
-const MAX_BROKER_PAYLOAD_BYTES: usize = 64 * 1024;
+use crate::protocol::{
+    parse_file_id, Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
+    MAX_DIRECTORY_RESPONSE_BYTES, RESPONSE_BYTES,
+};
 use crate::{
     ChangeReasons, PIPE_NAME, PIPE_NAME_ENV, SERVICE_NAME, SERVICE_NAME_ENV, TEST_PIPE_NAME_PREFIX,
     TEST_SERVICE_NAME_PREFIX,
@@ -53,21 +55,15 @@ impl Drop for BrokerConnection {
 
 impl BrokerConnection {
     fn transact(&mut self, request: &Request) -> io::Result<Response> {
-        let (response, payload) = self.transact_query(request, &[])?;
-        if !payload.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected broker payload",
-            ));
-        }
-        Ok(response)
+        self.transact_query(request, &[], &mut Vec::new())
     }
 
     fn transact_query(
         &mut self,
         request: &Request,
         query: &[u8],
-    ) -> io::Result<(Response, Vec<u8>)> {
+        payload: &mut Vec<u8>,
+    ) -> io::Result<Response> {
         let request_id = request.request_id;
         let payload_response = request.opcode == Opcode::ReadDirectoriesChanges;
         let request = request.encode()?;
@@ -90,17 +86,17 @@ impl BrokerConnection {
         } else {
             0
         };
-        if payload_len > MAX_BROKER_PAYLOAD_BYTES {
+        if payload_len > MAX_DIRECTORY_RESPONSE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "broker payload exceeds limit",
             ));
         }
-        let mut payload = vec![0u8; payload_len];
+        payload.resize(payload_len, 0);
         if payload_len > 0 {
-            read_exact(self.0, &mut payload)?;
+            read_exact(self.0, payload)?;
         }
-        Ok((response, payload))
+        Ok(response)
     }
 }
 
@@ -208,7 +204,7 @@ pub fn broker_read_root_changes(
 pub fn broker_read_directories_changes(
     volume: &str,
     journal: u64,
-    directories: &[[u8; 16]],
+    directories: &[[u8; FILE_ID_BYTES]],
     start: i64,
     end: i64,
 ) -> io::Result<Vec<(usize, String)>> {
@@ -223,7 +219,7 @@ pub fn broker_read_directories_changes(
 pub fn broker_for_each_directory_change(
     volume: &str,
     journal: u64,
-    directories: &[[u8; 16]],
+    directories: &[[u8; FILE_ID_BYTES]],
     start: i64,
     end: i64,
     mut observe: impl FnMut(usize, &str) -> io::Result<()>,
@@ -250,13 +246,15 @@ pub fn broker_for_each_directory_change(
     let mut complete_rejection = false;
     let result = (|| {
         let connection = state.connection.as_mut().unwrap();
-        let batch_ids = (crate::protocol::MAX_DIRECTORY_QUERY_BYTES - 8) / 16;
+        let batch_ids = (MAX_DIRECTORY_QUERY_BYTES - 8) / FILE_ID_BYTES;
         // Only the ID and cursor change between pages of this logical query.
         let mut request = Request::simple(Opcode::ReadDirectoriesChanges, 0);
         request.volume_guid = volume.to_owned();
         request.current_usn = end;
+        let mut query = Vec::with_capacity(8 + directories.len().min(batch_ids) * FILE_ID_BYTES);
+        let mut payload = Vec::new();
         for (batch, ids) in directories.chunks(batch_ids).enumerate() {
-            let mut query = Vec::with_capacity(8 + ids.len() * 16);
+            query.clear();
             query.extend_from_slice(&journal.to_le_bytes());
             for id in ids {
                 query.extend_from_slice(id);
@@ -265,7 +263,7 @@ pub fn broker_for_each_directory_change(
             while cursor < end {
                 request.request_id = next_request_id();
                 request.previous_usn = cursor;
-                let (response, payload) = connection.transact_query(&request, &query)?;
+                let response = connection.transact_query(&request, &query, &mut payload)?;
                 // A complete business rejection leaves the pipe framing intact.
                 // In particular, journal rollover must not release a live lease.
                 complete_rejection = response.status != Status::Ok;

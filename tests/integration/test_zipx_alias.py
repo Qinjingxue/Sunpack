@@ -1,4 +1,5 @@
 from sunpack_native import encode_worker_frame
+from tests.helpers.async_batch import run_extract
 from tests.helpers.worker_events import worker_events
 import subprocess
 
@@ -51,10 +52,7 @@ def test_zipx_split_alias_preserves_size_anchors_and_extracts_physical_parts(tmp
 
     extractor = ExtractionScheduler()
     output = tmp_path / "output"
-    try:
-        result = extractor.extract(task, str(output))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, task, str(output))
     assert result.success is True
     assert_exact_tree(output, case.metadata["expected_files"])
 

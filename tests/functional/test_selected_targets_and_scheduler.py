@@ -2,6 +2,7 @@ import pytest
 
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from tests.helpers.async_batch import run_extract
 from tests.helpers.config_factory import make_config
 from tests.helpers.real_archives import ArchiveFixtureFactory
 
@@ -50,12 +51,9 @@ def test_direct_file_task_preserves_explicit_zero_based_split_volumes(tmp_path):
     from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 
     extractor = ExtractionScheduler(extraction_config={"quiet": True})
-    try:
-        result = extractor.extract(task, str(tmp_path / "out"))
-        assert result.success, result.error
-        assert next((tmp_path / "out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
-    finally:
-        extractor.close()
+    result = run_extract(extractor, task, str(tmp_path / "out"))
+    assert result.success, result.error
+    assert next((tmp_path / "out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
 
 def test_explicit_multi_volume_input_requires_structure_not_only_names(tmp_path):

@@ -9,6 +9,7 @@ compared without guessing what was actually tested.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import platform
@@ -37,7 +38,7 @@ from benchmarks.scenarios.sevenzip_worker_matrix import (
     _volume_paths,
 )
 from benchmarks.scenarios.worker_read_patterns import _build_cases
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
 
@@ -253,28 +254,28 @@ def _median(values: list[float]) -> float | None:
     return round(statistics.median(values), 3) if values else None
 
 
-def _run_worker_case(
+async def _run_worker_case(
     case: dict[str, Any],
     *,
     workspace: BenchmarkWorkspace,
     worker_path: Path,
-    dll_path: Path,
     runs: int,
     warmups: int,
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
-    worker = _NativeWorkerProcess(str(worker_path), None)
+    worker = _AsyncNativeWorkerProcess(str(worker_path))
     sampler = ProcessSampler(interval_seconds=RSS_SAMPLE_INTERVAL_SECONDS)
     rows: list[dict[str, Any]] = []
     case_slug = str(case["case_id"]).replace(":", "-")
     try:
+        await worker.start()
         sampler.start()
         for run in range(warmups):
             output = workspace.outputs / case_slug / f"worker-warmup-{run}"
             try:
-                _run_job(
+                await _run_job(
                     worker,
-                    _case_job(case["item"], job_id=f"{case_slug}-worker-warmup-{run}", output_dir=output, dll_path=dll_path),
+                    _case_job(case["item"], job_id=f"{case_slug}-worker-warmup-{run}", output_dir=output),
                     timeout_seconds=timeout_seconds,
                     sampler=sampler,
                 )
@@ -283,9 +284,9 @@ def _run_worker_case(
         for run in range(runs):
             output = workspace.outputs / case_slug / f"worker-run-{run}"
             try:
-                row = _run_job(
+                row = await _run_job(
                     worker,
-                    _case_job(case["item"], job_id=f"{case_slug}-worker-{run}", output_dir=output, dll_path=dll_path),
+                    _case_job(case["item"], job_id=f"{case_slug}-worker-{run}", output_dir=output),
                     timeout_seconds=timeout_seconds,
                     sampler=sampler,
                 )
@@ -295,7 +296,7 @@ def _run_worker_case(
                 shutil.rmtree(output, ignore_errors=True)
     finally:
         sampler.stop()
-        worker.close()
+        await worker.close()
     return rows
 
 
@@ -400,7 +401,7 @@ def _table(results: list[dict[str, Any]]) -> str:
     return "\n".join([*time_lines, "", *rss_lines]) + "\n"
 
 
-def main() -> int:
+async def _main() -> int:
     parser = argparse.ArgumentParser(description="Reproduce the 300 MiB native-worker versus 7z.exe benchmark.")
     parser.add_argument("--format", action="append", choices=DEFAULT_FORMATS, dest="formats")
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
@@ -455,11 +456,10 @@ def main() -> int:
             if not args.metadata_only:
                 for index, case in enumerate(cases, start=1):
                     print(f"[{index}/{len(cases)}] {case['case_id']}", flush=True)
-                    worker_rows = _run_worker_case(
+                    worker_rows = await _run_worker_case(
                         case,
                         workspace=workspace,
                         worker_path=worker_path,
-                        dll_path=dll_path,
                         runs=args.runs,
                         warmups=args.warmups,
                         timeout_seconds=args.timeout_seconds,
@@ -557,6 +557,10 @@ def main() -> int:
         print(table)
         print(json.dumps({"result": str(result_path), "case_count": len(cases), "metadata_only": args.metadata_only}, ensure_ascii=False))
         return 0 if args.metadata_only or (len(complete) == len(cases) and all(sample.get("passed") for row in complete for sample in row["worker"]) and all(sample.get("returncode") == 0 for row in complete for sample in row["seven_zip"])) else 1
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

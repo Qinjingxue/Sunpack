@@ -17,6 +17,7 @@ from sunpack.pipeline.extraction.output_inventory import collect_output_inventor
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.verification.evidence import build_verification_evidence
 from sunpack.pipeline.verification.methods.archive_test_crc import ArchiveTestCrcMethod
+from tests.helpers.async_batch import run_extract
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.native_build import sevenzip_artifact
 from tests.helpers.native_fixture import file_inventory
@@ -217,17 +218,14 @@ def test_stream_verification_dispatch_is_format_neutral(fixtures, tmp_path):
     task = make_archive_task(fixtures / "frame_7_15.lz4", format_hint="lz4")
     ArchiveInputPlanningStage({}).plan_task(task)
     runner = ExtractionScheduler(extraction_config={"quiet": True})
-    try:
-        result = runner.extract(task, str(tmp_path / "output"))
-        assert result.success, result
-        evidence = build_verification_evidence(task, result)
-        from dataclasses import replace
-        neutral = replace(evidence, archive_input=replace(evidence.archive_input, format_hint="other-stream"))
-        step = ArchiveTestCrcMethod().verify(neutral, {})
-        assert step.status == "passed" and step.content_integrity_hint == "verified_complete"
-        assert step.verification_strength == "checksum"
-    finally:
-        runner.close()
+    result = run_extract(runner, task, str(tmp_path / "output"))
+    assert result.success, result
+    evidence = build_verification_evidence(task, result)
+    from dataclasses import replace
+    neutral = replace(evidence, archive_input=replace(evidence.archive_input, format_hint="other-stream"))
+    step = ArchiveTestCrcMethod().verify(neutral, {})
+    assert step.status == "passed" and step.content_integrity_hint == "verified_complete"
+    assert step.verification_strength == "checksum"
 
 
 def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures, tmp_path):
@@ -235,7 +233,7 @@ def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures,
     events = []
 
     async def run():
-        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")), None)
+        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")))
         await process.start()
         try:
             finished = []

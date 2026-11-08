@@ -52,17 +52,8 @@ _ROWS = [
     ("extraction", "sevenzip-worker-matrix", "benchmarks.scenarios.sevenzip_worker_matrix", "Direct native 7z.dll worker format and size matrix."),
     ("extraction", "worker-vs-7z-300m", "benchmarks.scenarios.worker_vs_7z_300m", "Reproducible 300 MiB native worker versus 7z.exe matrix with timing, peak RSS, archive, and machine metadata."),
     ("extraction", "worker-concurrency-300m", "benchmarks.scenarios.worker_concurrency_300m", "Single persistent worker versus concurrent 7z processes on the 300 MiB full format matrix."),
-    ("extraction", "worker-concurrency-ablation", "benchmarks.scenarios.worker_concurrency_ablation", "One-variable worker ablations (writer width, buffers, space gate, CPU budget, prefetch) against concurrent 7z on the cached 300 MiB corpus."),
-    ("extraction", "worker-writer-ablation", "benchmarks.scenarios.worker_writer_ablation", "Writer phase probes and IO ablations, including write-completion depth and latency, on the cached 300 MiB corpus."),
-    ("extraction", "worker-fair-timing", "benchmarks.scenarios.worker_fair_timing", "Worker versus concurrent 7z.exe under a shared completion semantics: extraction plus a forced flush of the produced tree."),
-    ("extraction", "worker-iocp-300m", "benchmarks.scenarios.worker_iocp_300m", "Paired old writer, IOCP and 7z comparison, with native output flush and byte verification."),
     ("extraction", "worker-read-blocking", "benchmarks.scenarios.worker_read_blocking", "ReadFile wall-time share for a single 1 GiB archive through IInStream::Read."),
     ("extraction", "worker-read-patterns", "benchmarks.scenarios.worker_read_patterns", "Configurable native-worker IInStream seek/read pattern profile, with solid-mode variants and prefetch comparison."),
-    ("extraction", "worker-small-file-scheduling", "benchmarks.scenarios.worker_small_file_scheduling", "Native worker parallelism and fairness under many small archive jobs."),
-    ("extraction", "worker-single-file-write", "benchmarks.scenarios.worker_single_file_write", "Before/after native worker throughput for one large output file."),
-    ("extraction", "worker-multi-volume-write", "benchmarks.scenarios.worker_multi_volume_write", "Per-volume writer scheduling across two real physical disks."),
-    ("extraction", "worker-volume-writer-scheduling", "benchmarks.scenarios.worker_volume_writer_scheduling", "Cross-volume versus same-volume writer scheduling with a paired control."),
-    ("extraction", "worker-resource-pressure", "benchmarks.scenarios.worker_resource_pressure", "Real 7z CPU and IO contention."),
     ("extraction", "split-pressure", "benchmarks.scenarios.extraction_split_pressure", "Split and carrier archive matrix."),
 ]
 

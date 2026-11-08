@@ -10,6 +10,7 @@
 #include <cwchar>
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -312,38 +313,35 @@ struct PipeIoEvent {
     ~PipeIoEvent() { if (handle) CloseHandle(handle); }
 };
 
-bool write_all(HANDLE pipe, const char* data, std::size_t size) {
+HANDLE pipe_io_event() {
     thread_local PipeIoEvent event;
-    if (!event.handle) return false;
+    return event.handle;
+}
+
+template <typename Buffer, typename Transfer>
+bool transfer_all(HANDLE pipe, Buffer* data, std::size_t size, Transfer transfer) {
+    const HANDLE event = pipe_io_event();
+    if (!event) return false;
     while (size != 0) {
         OVERLAPPED operation{};
-        operation.hEvent = event.handle;
-        ResetEvent(event.handle);
-        DWORD written = 0;
+        operation.hEvent = event;
+        ResetEvent(event);
+        DWORD processed = 0;
         const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(size, 0x7fffffff));
-        if (!WriteFile(pipe, data, chunk, &written, &operation) && GetLastError() != ERROR_IO_PENDING) return false;
-        if (!GetOverlappedResult(pipe, &operation, &written, TRUE) || written == 0) return false;
-        data += written;
-        size -= written;
+        if (!transfer(pipe, data, chunk, &processed, &operation) && GetLastError() != ERROR_IO_PENDING) return false;
+        if (!GetOverlappedResult(pipe, &operation, &processed, TRUE) || processed == 0) return false;
+        data += processed;
+        size -= processed;
     }
     return true;
 }
 
+bool write_all(HANDLE pipe, const char* data, std::size_t size) {
+    return transfer_all(pipe, data, size, WriteFile);
+}
+
 bool read_all(HANDLE pipe, char* data, std::size_t size) {
-    thread_local PipeIoEvent event;
-    if (!event.handle) return false;
-    while (size != 0) {
-        OVERLAPPED operation{};
-        operation.hEvent = event.handle;
-        ResetEvent(event.handle);
-        DWORD read = 0;
-        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(size, 0x7fffffff));
-        if (!ReadFile(pipe, data, chunk, &read, &operation) && GetLastError() != ERROR_IO_PENDING) return false;
-        if (!GetOverlappedResult(pipe, &operation, &read, TRUE) || read == 0) return false;
-        data += read;
-        size -= read;
-    }
-    return true;
+    return transfer_all(pipe, data, size, ReadFile);
 }
 
 void append_u32(std::string& target, std::uint32_t value) {
@@ -436,7 +434,12 @@ public:
             active_ = this;
             SetConsoleCtrlHandler(control, TRUE);
         }
-        start();
+        try {
+            start();
+        } catch (...) {
+            close();
+            throw;
+        }
     }
     void cancel() {
         if (!sent_.exchange(true)) {
@@ -471,12 +474,12 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     std::array<unsigned char, 32> token{};
     std::string runtime_build_id;
     if (!parse_state(context, pipe_name, token, runtime_build_id)) return RequestOutcome::NotDelivered;
-    HANDLE pipe = connect_pipe(pipe_name);
+    const HANDLE pipe = connect_pipe(pipe_name);
     if (pipe == INVALID_HANDLE_VALUE) return RequestOutcome::NotDelivered;
+    const std::unique_ptr<void, decltype(&CloseHandle)> pipe_owner(pipe, CloseHandle);
 
     const std::string cwd = utf8(request_cwd);
     if (cwd.size() > kMaxFieldBytes) {
-        CloseHandle(pipe);
         return RequestOutcome::NotDelivered;
     }
     std::string wire(kRequestMagic, 4);
@@ -490,31 +493,26 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
     append_u32(wire, static_cast<std::uint32_t>(arguments.size()));
     if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, cwd.data(), cwd.size())) {
-        CloseHandle(pipe);
         return RequestOutcome::NotDelivered;
     }
     for (const auto& argument : arguments) {
         const std::string encoded = utf8(argument);
         if (encoded.size() > kMaxFieldBytes) {
-            CloseHandle(pipe);
             return RequestOutcome::NotDelivered;
         }
         wire.clear();
         append_u32(wire, static_cast<std::uint32_t>(encoded.size()));
         if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, encoded.data(), encoded.size())) {
-            CloseHandle(pipe);
             return RequestOutcome::NotDelivered;
         }
     }
     std::array<char, 4> magic{};
     if (!read_all(pipe, magic.data(), magic.size()) || memcmp(magic.data(), kStreamMagic, 4) != 0) {
-        CloseHandle(pipe);
         return RequestOutcome::DeliveryUncertain;
     }
     std::array<char, 16> build_id{};
     if (!read_all(pipe, build_id.data(), build_id.size()) ||
         memcmp(build_id.data(), runtime_build_id.data(), build_id.size()) != 0) {
-        CloseHandle(pipe);
         return RequestOutcome::DeliveryUncertain;
     }
     ConsoleCancellation controls(pipe, !arguments.empty() && (arguments[0] == L"extract" || arguments[0] == L"x"));
@@ -529,8 +527,6 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         if (kind == 0) {
             if (size != 4) break;
             exit_code = static_cast<std::int32_t>(read_u32(payload.data()));
-            controls.close();
-            CloseHandle(pipe);
             return RequestOutcome::Completed;
         }
         if (kind == 1) write_stream(STD_OUTPUT_HANDLE, payload);
@@ -545,8 +541,6 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
             if (!controls.send(response.data(), response.size())) break;
         }
     }
-    controls.close();
-    CloseHandle(pipe);
     return RequestOutcome::DeliveryUncertain;
 }
 

@@ -133,7 +133,7 @@ def test_shared_worker_interleaves_watch_cli_success_wrong_password_and_damage(t
     events = []
 
     async def run():
-        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")), None)
+        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")))
         await process.start()
         try:
             finished = []

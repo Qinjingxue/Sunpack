@@ -119,6 +119,8 @@ BZip2/TBZ2 worker 峰值约 43–44 MiB，`7z.exe` 约 12.6 MiB；solid 7z/XZ wo
 
 ## 复现
 
+复现下列历史结果时，使用记录的源码提交及该提交构建的原生扩展和 worker。
+
 ```powershell
 uv sync --locked --extra dev
 cmake --build native/sevenzip_bridge/build-x64 --config Release --target sunpack_sevenzip_worker --parallel

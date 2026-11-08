@@ -6,10 +6,10 @@ in Rust, and the existing format builder and worker protocol are reused.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ctypes
 from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
-from sunpack_native import encode_worker_frame
 import json
 import os
 from pathlib import Path
@@ -29,9 +29,11 @@ if str(ROOT) not in sys.path:
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler
 from benchmarks.scenarios.extraction_format_matrix import create_corpus
 from benchmarks.scenarios.worker_read_patterns import _build_cases
-from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _output_summary, _volume_paths, worker_thread_capacity
+from benchmarks.scenarios.sevenzip_worker_matrix import (
+    _case_job, _output_summary, _submit_job, _volume_paths, _worker_cpu_ms,
+)
 from benchmarks.scenarios.worker_vs_7z_300m import DEFAULT_FORMATS, _collect_environment, _git_commit
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.core.support.output_paths import resolve_output_volume_key
 from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
@@ -54,6 +56,18 @@ def cpu_ms(process):
     if not api(wintypes.HANDLE(int(process._handle)), *(ctypes.byref(v) for v in (creation, exit_time, kernel, user))):
         raise ctypes.WinError(ctypes.get_last_error())
     return sum((v.dwHighDateTime << 32) + v.dwLowDateTime for v in (kernel, user)) / 10000
+
+
+async def _worker_capacity(worker_path: Path) -> int:
+    worker = _AsyncNativeWorkerProcess(str(worker_path))
+    try:
+        await worker.start()
+        capacity = worker.handshake.get("thread_capacity")
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError(f"Missing worker capacity from {worker_path}: {worker.handshake!r}")
+        return capacity
+    finally:
+        await worker.close()
 
 
 def prepare(workspace, cache):
@@ -85,80 +99,68 @@ def prepare(workspace, cache):
     return cases, info
 
 
-def run_worker(worker, cases, outputs, concurrency, dll, timeout, dry_run=False):
-    condition = threading.Condition()
-    pending, completed, starts, results, failures = set(), [], {}, {}, {}
+async def run_worker(worker, cases, outputs, concurrency, timeout, dry_run=False):
+    completed, starts, results, failures = [], {}, {}, {}
     cpu_events = []
     active, max_active = 0, 0
-    before = cpu_ms(worker.process)
+    before = _worker_cpu_ms(worker)
     volume_key = resolve_output_volume_key(str(outputs))
     if not volume_key:
         raise RuntimeError("Cannot resolve output volume; refusing per-job synthetic writers")
+    slots = asyncio.Semaphore(concurrency)
     sampler = ProcessSampler(interval_seconds=0.02)
     sampler.start()
     host_before = host_busy_ms()
     started = time.perf_counter()
+    deadline = asyncio.get_running_loop().time() + timeout
 
-    def callbacks(job_id):
-        def on_event(event):
+    async def run_case(index, case):
+        nonlocal active, max_active
+        job_id = f"{outputs.name}-{index}"
+        job = _case_job(case["item"], job_id=job_id, output_dir=outputs / str(index))
+        job["output_volume_key"] = volume_key
+        job["dry_run"] = dry_run
+
+        def observe(event):
             nonlocal active, max_active
-            now = time.perf_counter()
-            with condition:
-                if event.get("type") == "native_event":
-                    if event.get("event") == "job_started":
-                        starts[job_id] = now
-                        active += 1
-                        max_active = max(active, max_active)
-                    elif event.get("event") == "job_finished":
-                        active -= int(job_id in starts)
-                        completed.append({"job_id": job_id, "start_ms": (starts.get(job_id, now) - started) * 1000,
-                                          "finish_ms": (now - started) * 1000})
-                        pending.discard(job_id)
-                        condition.notify_all()
-                        return True
-                elif event.get("type") == "result":
-                    results[job_id] = event
-                elif event.get("type") == "native_cpu":
-                    cpu_events.append(event)
-            return False
-        def on_failure(message):
-            with condition:
-                failures[job_id] = message
-                pending.discard(job_id)
-                condition.notify_all()
-        return on_event, on_failure
+            kind = event.get("type")
+            if kind == "native_event":
+                now = time.perf_counter()
+                if event.get("event") == "job_started":
+                    starts[job_id] = now
+                    active += 1
+                    max_active = max(active, max_active)
+                elif event.get("event") == "job_finished":
+                    active -= int(job_id in starts)
+                    completed.append({
+                        "job_id": job_id,
+                        "start_ms": (starts.get(job_id, now) - started) * 1000,
+                        "finish_ms": (now - started) * 1000,
+                    })
+            elif kind == "native_cpu":
+                cpu_events.append(event)
+
+        async with slots:
+            try:
+                results[job_id] = await _submit_job(
+                    worker, job, timeout_seconds=deadline - asyncio.get_running_loop().time(), observe=observe,
+                )
+            except RuntimeError as error:
+                failures[job_id] = str(error)
 
     try:
-        next_job = 0
-        while True:
-            submissions = []
-            with condition:
-                if next_job == len(cases) and not pending:
-                    break
-                while next_job < len(cases) and len(pending) < concurrency:
-                    job_id = f"{outputs.name}-{next_job}"
-                    job = _case_job(cases[next_job]["item"], job_id=job_id, output_dir=outputs / str(next_job), dll_path=dll)
-                    job["output_volume_key"] = volume_key
-                    job["dry_run"] = dry_run
-                    on_event, on_failure = callbacks(job_id)
-                    pending.add(job_id)
-                    submissions.append((job, job_id, on_event, on_failure))
-                    next_job += 1
-            # Pipe writes can block while the worker emits events; callbacks
-            # must be free to acquire the condition and drain stdout meanwhile.
-            for job, job_id, on_event, on_failure in submissions:
-                worker.submit_async(encode_worker_frame(job), job_id, on_event=on_event,
-                                    on_error=on_failure)
-            with condition:
-                if pending and (next_job == len(cases) or len(pending) >= concurrency):
-                    remaining = timeout - (time.perf_counter() - started)
-                    if remaining <= 0:
-                        raise TimeoutError(f"Incomplete worker jobs: {pending}")
-                    condition.wait(min(remaining, 1))
-                    if not worker.is_alive():
-                        raise RuntimeError("worker exited")
+        outcomes = await asyncio.gather(
+            *(run_case(index, case) for index, case in enumerate(cases)),
+            return_exceptions=True,
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
         wall_ms = (time.perf_counter() - started) * 1000
-        cpu = cpu_ms(worker.process) - before
+        after = _worker_cpu_ms(worker)
+        if before is None or after is None:
+            raise RuntimeError("worker CPU counters are unavailable")
+        cpu = after - before
         host_cpu = host_busy_ms() - host_before
     finally:
         sampler.stop()
@@ -228,7 +230,7 @@ def validate(row, cases, output, tar_bytes):
     row["throughput_mib_s"] = len(cases) * 300 * 1000 / row["wall_ms"]
 
 
-def main():
+async def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--concurrency", default="8")
     parser.add_argument("--runs", type=int, default=2)
@@ -254,7 +256,7 @@ def main():
         os.environ.pop("SUNPACK_SEVENZIP_PREFETCH", None)
     else:
         os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if args.prefetch == "on" else "0"
-    worker_capacity = worker_thread_capacity(worker_path)
+    worker_capacity = await _worker_capacity(worker_path)
     with BenchmarkWorkspace("extraction.worker-concurrency-300m") as workspace:
         cases, corpus = prepare(workspace, args.cache_root.resolve())
         tar_bytes = next(_volume_paths(c["item"])[0].stat().st_size for c in cases if c["format"] == "tar")
@@ -269,7 +271,7 @@ def main():
                   "mixed_enabled": not args.no_mixed,
                   "prefetch": args.prefetch,
                   "complete": False,
-                  "method": "Same cached input, unique outputs. Single persistent worker with product CPU budget; c fresh 7z processes. c jobs per homogeneous burst, fixed two rounds of all formats per mixed batch. Three paired trials, alternating order; no cache flush, no fsync. Output validation/cleanup outside timer. RSS sampled every 20ms; CPU from Windows process handles.",
+                  "method": "Same cached input, unique outputs. Single persistent worker with product CPU budget; c fresh 7z processes. c jobs per homogeneous burst, fixed two rounds of all formats per mixed batch. Three paired trials, alternating order; no cache flush, no fsync. Output validation/cleanup outside timer. RSS sampled every 20ms; CPU from native process counters.",
                   "results": []}
         if args.resume and args.json_out.is_file():
             previous = json.loads(args.json_out.read_text(encoding="utf-8"))
@@ -290,8 +292,9 @@ def main():
         if not args.no_mixed:
             workloads.append(("mixed", cases * 2))
         for case_id, base in workloads:
-            worker = _NativeWorkerProcess(str(worker_path), None)
+            worker = _AsyncNativeWorkerProcess(str(worker_path))
             try:
+                await worker.start()
                 for width in widths:
                     if (case_id, width) in finished_batches:
                         continue
@@ -304,7 +307,7 @@ def main():
                             # 变成 "name(1).bin"，使输出校验看到翻倍的字节数。
                             shutil.rmtree(output, ignore_errors=True)
                             try:
-                                row = (run_worker(worker, batch, output, width, dll, 900, args.dry_run) if engine == "worker"
+                                row = (await run_worker(worker, batch, output, width, 900, args.dry_run) if engine == "worker"
                                        else run_cli(seven, batch, output, width, 900, args.dry_run))
                                 if args.dry_run:
                                     row["throughput_mib_s"] = len(batch) * 300 * 1000 / row["wall_ms"]
@@ -327,12 +330,16 @@ def main():
                     args.json_out.write_text(json.dumps(report, default=str, ensure_ascii=False, indent=2), encoding="utf-8")
                     print(f"{case_id} c={width}: worker={record['median']['worker']['wall_ms']:.1f}ms 7z={record['median']['7z']['wall_ms']:.1f}ms speedup={record['speedup']:.2f} active={record['median']['worker']['max_active']}", flush=True)
             finally:
-                worker.close()
+                await worker.close()
         report["complete"] = True
         args.json_out.write_text(json.dumps(report, default=str, ensure_ascii=False, indent=2), encoding="utf-8")
         workspace.write_result_json("report.json", report)
         print(args.json_out)
     return 0
+
+
+def main():
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

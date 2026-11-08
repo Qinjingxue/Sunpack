@@ -11,7 +11,6 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable, Iterator, Sequence
@@ -48,7 +47,6 @@ class ResourceKind(str, Enum):
 class ResourceState(str, Enum):
     ACTIVE = "active"
     RELEASING = "releasing"
-    RELEASED = "released"
     RELEASE_FAILED = "release_failed"
 
 
@@ -60,10 +58,6 @@ class ScopeState(str, Enum):
 
 def _normalized_path(path: os.PathLike[str] | str) -> str:
     return case_key(os.path.abspath(os.path.normpath(os.fspath(path))))
-
-
-def _is_path_under(candidate: str, root: str) -> bool:
-    return path_key_is_under(candidate, root)
 
 
 @dataclass(frozen=True)
@@ -143,7 +137,7 @@ class FileIdentity:
     def contains(self, other: "FileIdentity") -> bool:
         if self.same_file(other):
             return True
-        return self.is_directory and _is_path_under(other.path, self.path)
+        return self.is_directory and path_key_is_under(other.path, self.path)
 
     def overlaps(self, other: "FileIdentity") -> bool:
         return self.contains(other) or other.contains(self)
@@ -203,7 +197,7 @@ class ResourceRecord:
     files: tuple[FileIdentity, ...]
     owner_type: str
     owner_repr: str
-    release_callback: Callable[[], Any]
+    release_callback: Callable[[], Any] | None
     promotion_blocking: bool
     created_at: float
     created_thread: int
@@ -258,7 +252,6 @@ class PromotionBarrierReport:
 _LOCK = threading.RLock()
 _CHANGED = threading.Condition(_LOCK)
 _RESOURCES: dict[str, ResourceRecord] = {}
-_RELEASE_HISTORY: deque[dict[str, Any]] = deque(maxlen=512)
 _TASK_SCOPES: dict[str, "TaskResourceScope"] = {}
 _ACTIVE_PROMOTIONS: dict[str, tuple[FileIdentity, ...]] = {}
 _CURRENT_SCOPE: contextvars.ContextVar["TaskResourceScope | None"] = contextvars.ContextVar(
@@ -308,9 +301,7 @@ def _matching_active_records(roots: Sequence[FileIdentity]) -> list[ResourceReco
     return [
         record
         for record in _RESOURCES.values()
-        if record.state in {ResourceState.ACTIVE, ResourceState.RELEASING, ResourceState.RELEASE_FAILED}
-        and record.overlaps(roots)
-        and record.promotion_blocking
+        if record.promotion_blocking and record.overlaps(roots)
     ]
 
 
@@ -360,8 +351,7 @@ class ResourceLease:
     @property
     def closed(self) -> bool:
         with _LOCK:
-            record = _RESOURCES.get(self._resource_id)
-            return record is None or record.state is ResourceState.RELEASED
+            return self._resource_id not in _RESOURCES
 
     def close(self) -> bool:
         return _release_resource(self._resource_id)
@@ -449,12 +439,11 @@ def register_resource(
 def _release_resource(resource_id: str) -> bool:
     with _CHANGED:
         record = _RESOURCES.get(resource_id)
-        if record is None or record.state is ResourceState.RELEASED:
-            return False
-        if record.state is ResourceState.RELEASING:
+        if record is None or record.state is ResourceState.RELEASING:
             return False
         record.state = ResourceState.RELEASING
         callback = record.release_callback
+        assert callback is not None
     try:
         callback()
     except BaseException as exc:
@@ -464,10 +453,8 @@ def _release_resource(resource_id: str) -> bool:
             _CHANGED.notify_all()
         raise
     with _CHANGED:
-        record.state = ResourceState.RELEASED
-        record.release_callback = lambda: None
-        _RELEASE_HISTORY.append(record.describe())
         _RESOURCES.pop(resource_id, None)
+        record.release_callback = None
         scope = _TASK_SCOPES.get(record.task_id)
         if scope is not None:
             scope._resource_ids.pop(resource_id, None)
@@ -645,7 +632,6 @@ class TaskResourceScope:
                 _RESOURCES[resource_id]
                 for resource_id in self._resource_ids
                 if resource_id in _RESOURCES
-                and _RESOURCES[resource_id].state is not ResourceState.RELEASED
                 and _RESOURCES[resource_id].overlaps(identities)
             ]
         return _release_records(records)
@@ -701,7 +687,6 @@ class TaskResourceScope:
                 _RESOURCES[resource_id]
                 for resource_id in self._resource_ids
                 if resource_id in _RESOURCES
-                and _RESOURCES[resource_id].state is not ResourceState.RELEASED
             ]
         report = _release_records(records)
         # A failed release retains its callback and owner. Keep their scope
@@ -809,31 +794,15 @@ def register_service_resource(
 
 def resource_snapshot(
     roots: Iterable[os.PathLike[str] | str | FileIdentity] | None = None,
-    *,
-    include_released: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     identities = file_identities(roots or (), directories=True)
     with _LOCK:
-        records = list(_RESOURCES.values())
-        if identities:
-            records = [record for record in records if record.overlaps(identities)]
-        active_operations = _describe_active_file_operations(identities)
-        if not include_released:
-            records = [record for record in records if record.state is not ResourceState.RELEASED]
-            return tuple([*(record.describe() for record in records), *active_operations])
-        history = list(_RELEASE_HISTORY)
-        if identities:
-            root_paths = tuple(item.path for item in identities)
-            history = [
-                item
-                for item in history
-                if any(
-                    _is_path_under(str(path), root) or _is_path_under(root, str(path))
-                    for path in item.get("files", ())
-                    for root in root_paths
-                )
-            ]
-        return tuple([*(record.describe() for record in records), *active_operations, *history])
+        records = [
+            record.describe() for record in _RESOURCES.values()
+            if not identities or record.overlaps(identities)
+        ]
+        records.extend(_describe_active_file_operations(identities))
+        return tuple(records)
 
 
 def _format_busy(records: Sequence[ResourceRecord]) -> str:
@@ -1356,11 +1325,10 @@ def reset_resource_lifecycle_for_tests() -> None:
     """Fail loudly on leaked resources, then reset global coordination state."""
 
     with _LOCK:
-        records = [record for record in _RESOURCES.values() if record.state is not ResourceState.RELEASED]
+        records = list(_RESOURCES.values())
     report = _release_records(records)
     with _CHANGED:
         _RESOURCES.clear()
-        _RELEASE_HISTORY.clear()
         _TASK_SCOPES.clear()
         _ACTIVE_PROMOTIONS.clear()
         _CHANGED.notify_all()

@@ -18,15 +18,13 @@ typedef struct {
     sup_lz4_result *result;
     sup_lz4_allocate allocate;
     sup_lz4_free release;
+    LZ4F_dctx *decoder;
     unsigned char *input, *output;
     size_t pos, size;
 } stream;
 
 static uint32_t le32(const unsigned char *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
-}
-static uint64_t le64(const unsigned char *p) {
-    return (uint64_t)le32(p) | ((uint64_t)le32(p+4)<<32);
 }
 static int is_skip(uint32_t magic) { return (magic & 0xfffffff0U) == 0x184d2a50U; }
 static int tick(stream *s) {
@@ -91,52 +89,53 @@ static int library_error(size_t rc) {
     return SUP_LZ4_DATA;
 }
 static int modern(stream *s) {
-    LZ4F_dctx *ctx = NULL;
     LZ4F_frameInfo_t info;
     size_t header_size, hint, source_size;
-    uint64_t expected = 0, start_out = s->result->output_bytes;
+    const uint64_t start_out = s->result->output_bytes;
     unsigned char flags;
-    int rc = need(s, 7), has_size;
+    int rc = need(s, 7);
     if (rc) return rc;
     flags = s->input[s->pos+4];
-    has_size = (flags & 8) != 0;
-    header_size = 7 + (has_size ? 8 : 0) + ((flags & 1) ? 4 : 0);
+    header_size = LZ4F_headerSize(s->input+s->pos, s->size-s->pos);
+    if (LZ4F_isError(header_size)) return library_error(header_size);
     rc = need(s, header_size);
     if (rc) return rc;
-    if (has_size) expected = le64(s->input+s->pos+6);
-    if (s->allocate) {
-        const LZ4F_CustomMem memory = {s->allocate, NULL, s->release, s->opaque};
-        ctx = LZ4F_createDecompressionContext_advanced(memory, LZ4F_VERSION);
-        if (!ctx) return SUP_LZ4_MEMORY;
-    } else {
-        hint = LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION);
-        if (LZ4F_isError(hint)) return library_error(hint);
+    // A completed frame resets the decoder state while keeping its buffers.
+    if (!s->decoder) {
+        if (s->allocate) {
+            const LZ4F_CustomMem memory = {s->allocate, NULL, s->release, s->opaque};
+            s->decoder = LZ4F_createDecompressionContext_advanced(memory, LZ4F_VERSION);
+            if (!s->decoder) return SUP_LZ4_MEMORY;
+        } else {
+            hint = LZ4F_createDecompressionContext(&s->decoder, LZ4F_VERSION);
+            if (LZ4F_isError(hint)) return library_error(hint);
+        }
     }
     source_size = header_size;
-    hint = LZ4F_getFrameInfo(ctx, &info, s->input+s->pos, &source_size);
-    if (LZ4F_isError(hint)) { rc = library_error(hint); goto done; }
+    hint = LZ4F_getFrameInfo(s->decoder, &info, s->input+s->pos, &source_size);
+    if (LZ4F_isError(hint)) return library_error(hint);
     consume(s, source_size);
-    if (flags & 1) { rc = SUP_LZ4_UNSUPPORTED; goto done; }
+    if (flags & 1) return SUP_LZ4_UNSUPPORTED;
     do {
         size_t dst_size = BUFFER_SIZE;
         rc = need(s, 1);
-        if (rc) goto done;
+        if (rc) return rc;
         source_size = s->size-s->pos;
-        hint = LZ4F_decompress(ctx, s->output, &dst_size,
+        hint = LZ4F_decompress(s->decoder, s->output, &dst_size,
             s->input+s->pos, &source_size, NULL);
-        if (LZ4F_isError(hint)) { rc = library_error(hint); goto done; }
+        if (LZ4F_isError(hint)) return library_error(hint);
         consume(s, source_size);
         rc = emit(s, s->output, dst_size);
-        if (rc) goto done;
-        if (hint && !source_size && !dst_size) { rc = SUP_LZ4_DATA; goto done; }
+        if (rc) return rc;
+        if (hint && !source_size && !dst_size) return SUP_LZ4_DATA;
     } while (hint);
-    if (has_size && s->result->output_bytes-start_out != expected) { rc = SUP_LZ4_DATA; goto done; }
+    // LZ4F validates nonzero content sizes itself. An explicit zero also
+    // promises an empty payload, even though LZ4F treats it like an absent size.
+    if ((flags & 8) && !info.contentSize && s->result->output_bytes != start_out) return SUP_LZ4_DATA;
     ++s->result->frames;
     if (info.contentChecksumFlag) ++s->result->content_checked_frames;
     if (info.blockChecksumFlag) ++s->result->block_checked_frames;
-done:
-    LZ4F_freeDecompressionContext(ctx);
-    return rc;
+    return SUP_LZ4_OK;
 }
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
     sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result) {
@@ -176,6 +175,7 @@ int sup_lz4_decode_with_memory(void *opaque, sup_lz4_read read, sup_lz4_skip ski
         if (rc) break;
     }
 done:
+    LZ4F_freeDecompressionContext(s.decoder);
     free(s.input); free(s.output);
     result->error=rc;
     return rc;

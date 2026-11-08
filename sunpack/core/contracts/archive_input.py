@@ -226,24 +226,33 @@ class ArchiveInputDescriptor:
             object.__setattr__(self, "parts", ordered)
             object.__setattr__(self, "entry_path", next((part.path for part in ordered if part.volume_number == 1), ordered[0].path))
 
-    def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "kind": "archive_input",
-            "entry_path": self.entry_path,
-            "open_mode": self.open_mode,
-        }
+    def _physical_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload["entry_path"] = self.entry_path
+        payload["open_mode"] = self.open_mode
         if self.format_hint:
             payload["format_hint"] = self.format_hint
-        if self.logical_name:
-            payload["logical_name"] = self.logical_name
-        if self.volume_style:
-            payload["volume_style"] = self.volume_style
         if self.volume_attempts is not None:
             payload["volume_attempts"] = self.volume_attempts.to_dict()
         if self.parts:
             payload["parts"] = [part.to_dict() for part in self.parts]
         if self.open_mode == "concat_ranges":
             payload["ranges"] = [item.to_dict() for item in self.extents]
+        return payload
+
+    def to_worker_input(self) -> dict[str, Any]:
+        payload = self._physical_payload({})
+        execution = self.analysis.get("execution")
+        evidence = execution.get("missing_volume_evidence") if isinstance(execution, dict) else None
+        if isinstance(evidence, str) and evidence:
+            payload["analysis"] = {"execution": {"missing_volume_evidence": evidence}}
+        return payload
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self._physical_payload({"kind": "archive_input"})
+        if self.logical_name:
+            payload["logical_name"] = self.logical_name
+        if self.volume_style:
+            payload["volume_style"] = self.volume_style
         analysis = {
             key: value
             for key, value in self.analysis.items()

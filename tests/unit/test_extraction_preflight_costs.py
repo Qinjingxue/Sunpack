@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from sunpack.core.contracts.failures import FailureKind
+from tests.helpers.async_batch import run_extract, stub_worker_attempt
 from tests.helpers.archive_tasks import make_archive_task, merge_task_knowledge
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
@@ -11,11 +12,11 @@ def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):
     archive.write_bytes(b"dummy")
     output = tmp_path / "out"
     task = make_archive_task(archive, format_hint="7z")
-    runner = SimpleNamespace(
-        extract_attempt=lambda **_kwargs: SimpleNamespace(
+    runner = stub_worker_attempt(
+        SimpleNamespace(emit_semantic_event=lambda *_args, **_kwargs: None),
+        lambda **_kwargs: SimpleNamespace(
             returncode=0, stdout="", stderr="", worker_diagnostics={"result": {"status": "ok"}}
         ),
-        emit_semantic_event=lambda *_args, **_kwargs: None,
     )
     extractor = SingleArchiveExtractor(
         password_store=SimpleNamespace(has_candidates=lambda **_kwargs: False),
@@ -24,7 +25,7 @@ def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):
     )
     output.mkdir()
 
-    result = extractor.extract(task, str(output))
+    result = run_extract(extractor, task, str(output))
 
     assert result.success
 
@@ -77,13 +78,13 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
     extractor = SingleArchiveExtractor(
         password_store=SimpleNamespace(has_candidates=lambda **_kwargs: True),
         password_resolver=Resolver(),
-        sevenzip_runner=SimpleNamespace(
-            extract_attempt=lambda **_kwargs: completed,
-            emit_semantic_event=lambda *_args, **_kwargs: None,
+        sevenzip_runner=stub_worker_attempt(
+            SimpleNamespace(emit_semantic_event=lambda *_args, **_kwargs: None),
+            lambda **_kwargs: completed,
         ),
     )
 
-    result = extractor.extract(task, str(output))
+    result = run_extract(extractor, task, str(output))
 
     assert confirmed == ["secret"]
     assert result.failure.kind == FailureKind.DAMAGED
@@ -105,7 +106,10 @@ def test_async_preparation_stays_in_broker_and_preserves_logical_inputs_after_fa
     path = str(tmp_path / "disguised.data")
     second = str(tmp_path / "other.data")
     descriptors = [
-        ArchiveInputDescriptor(path, format_hint="zip"),
+        ArchiveInputDescriptor(path, format_hint="zip", logical_name="archive", analysis={
+            "execution": {"missing_volume_evidence": "fixture_evidence", "irrelevant": True},
+            "diagnostics": {"not_consumed_by_worker": True},
+        }),
         ArchiveInputDescriptor(path, open_mode="file_range", format_hint="zip",
                                parts=[ArchiveInputPart(InputExtent(path, 17, 200))]),
         ArchiveInputDescriptor(path, open_mode="concat_ranges", format_hint="7z",
@@ -135,7 +139,7 @@ def test_async_preparation_stays_in_broker_and_preserves_logical_inputs_after_fa
             return SimpleNamespace(returncode=0)
 
         monkeypatch.setattr(runner, "_build_job", prepare)
-        monkeypatch.setattr(runner, "_submit_native_job_asyncio", submit)
+        monkeypatch.setattr(runner, "submit_attempt_asyncio", submit)
         extractor = object.__new__(SingleArchiveExtractor)
         extractor.sevenzip_runner = runner
 
@@ -147,7 +151,7 @@ def test_async_preparation_stays_in_broker_and_preserves_logical_inputs_after_fa
                     "archive_path": path,
                     "out_dir": str(tmp_path / (str(index) if index else "failed")),
                     "password": "secret", "password_candidates": ["wrong", "secret"],
-                    "selected_codepage": "932", "startupinfo": None, "task": task,
+                    "selected_codepage": "932", "task": task,
                 }
                 codes.append(result.returncode)
             return codes
@@ -158,7 +162,11 @@ def test_async_preparation_stays_in_broker_and_preserves_logical_inputs_after_fa
             codes = await extractor.extract_asyncio(broker, None, "unused", request_id="audit", file_id=path,
                                                    cancellation=CancellationToken())
             assert codes == [-100, 0, 0, 0, 0, 0]
-            assert [job["archive_input"] for job in submitted] == [item.to_dict() for item in descriptors]
+            assert [job["archive_input"] for job in submitted] == [item.to_worker_input() for item in descriptors]
+            assert submitted[0]["archive_input"] == {
+                "entry_path": path, "open_mode": "file", "format_hint": "zip",
+                "analysis": {"execution": {"missing_volume_evidence": "fixture_evidence"}},
+            }
             assert all(job["password_candidates"] == ["wrong", "secret"] and job["codepage"] == "932"
                        for job in submitted)
         finally:

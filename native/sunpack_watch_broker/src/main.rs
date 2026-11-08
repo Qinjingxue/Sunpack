@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
-    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, REQUEST_BYTES,
-    RESPONSE_BYTES,
+    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
+    MAX_DIRECTORY_RESPONSE_BYTES, REQUEST_BYTES, RESPONSE_BYTES,
 };
 use sunpack_usn_core::{JournalReader, PIPE_NAME, SERVICE_NAME};
 use windows_service::{
@@ -469,7 +469,7 @@ fn handle_request(
                         payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                         payload.extend_from_slice(name.as_bytes());
                     }
-                    if payload.len() > 64 * 1024 {
+                    if payload.len() > MAX_DIRECTORY_RESPONSE_BYTES {
                         return Err(io::Error::other("USN recovery exceeded payload budget"));
                     }
                     Ok((
@@ -639,27 +639,15 @@ fn read_overlapped(
     io_event: HANDLE,
     buffer: &mut [u8],
 ) -> io::Result<IoResult> {
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    overlapped.hEvent = io_event;
-    let ok = unsafe {
+    pipe_io(pipe, stop_event, io_event, |overlapped| unsafe {
         ReadFile(
             pipe,
             buffer.as_mut_ptr(),
             buffer.len() as u32,
             null_mut(),
-            &mut overlapped,
+            overlapped,
         )
-    };
-    if ok == 0 {
-        let error = unsafe { GetLastError() };
-        if matches!(error, ERROR_BROKEN_PIPE | ERROR_NO_DATA) {
-            return Ok(IoResult::Disconnected);
-        }
-        if error != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(error as i32));
-        }
-    }
-    wait_io(pipe, stop_event, &mut overlapped)
+    })
 }
 
 fn write_overlapped(
@@ -668,27 +656,15 @@ fn write_overlapped(
     io_event: HANDLE,
     buffer: &[u8],
 ) -> io::Result<IoResult> {
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    overlapped.hEvent = io_event;
-    let ok = unsafe {
+    pipe_io(pipe, stop_event, io_event, |overlapped| unsafe {
         WriteFile(
             pipe,
             buffer.as_ptr(),
             buffer.len() as u32,
             null_mut(),
-            &mut overlapped,
+            overlapped,
         )
-    };
-    if ok == 0 {
-        let error = unsafe { GetLastError() };
-        if matches!(error, ERROR_BROKEN_PIPE | ERROR_NO_DATA) {
-            return Ok(IoResult::Disconnected);
-        }
-        if error != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(error as i32));
-        }
-    }
-    wait_io(pipe, stop_event, &mut overlapped)
+    })
 }
 
 fn cancel_io(pipe: HANDLE, overlapped: &mut OVERLAPPED) {
@@ -699,6 +675,25 @@ fn cancel_io(pipe: HANDLE, overlapped: &mut OVERLAPPED) {
         let mut transferred = 0;
         GetOverlappedResult(pipe, overlapped, &mut transferred, 1);
     }
+}
+
+fn pipe_io(
+    pipe: HANDLE,
+    stop_event: HANDLE,
+    io_event: HANDLE,
+    start: impl FnOnce(&mut OVERLAPPED) -> i32,
+) -> io::Result<IoResult> {
+    let mut overlapped = OVERLAPPED {
+        hEvent: io_event,
+        ..Default::default()
+    };
+    if start(&mut overlapped) == 0 {
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            return pipe_io_error(error);
+        }
+    }
+    wait_io(pipe, stop_event, &mut overlapped)
 }
 
 fn wait_io(pipe: HANDLE, stop_event: HANDLE, overlapped: &mut OVERLAPPED) -> io::Result<IoResult> {
@@ -716,19 +711,20 @@ fn wait_io(pipe: HANDLE, stop_event: HANDLE, overlapped: &mut OVERLAPPED) -> io:
     }
     let mut transferred = 0u32;
     if unsafe { GetOverlappedResult(pipe, overlapped, &mut transferred, 0) } == 0 {
-        let error = unsafe { GetLastError() };
-        if matches!(error, ERROR_BROKEN_PIPE | ERROR_NO_DATA) {
-            return Ok(IoResult::Disconnected);
-        }
-        if error == ERROR_MORE_DATA {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "broker pipe message exceeds frame size",
-            ));
-        }
-        return Err(io::Error::from_raw_os_error(error as i32));
+        return pipe_io_error(unsafe { GetLastError() });
     }
     Ok(IoResult::Completed(transferred as usize))
+}
+
+fn pipe_io_error(error: u32) -> io::Result<IoResult> {
+    match error {
+        ERROR_BROKEN_PIPE | ERROR_NO_DATA => Ok(IoResult::Disconnected),
+        ERROR_MORE_DATA => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "broker pipe message exceeds frame size",
+        )),
+        _ => Err(io::Error::from_raw_os_error(error as i32)),
+    }
 }
 
 struct OwnedHandle(HANDLE);

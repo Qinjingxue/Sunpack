@@ -1,3 +1,4 @@
+import asyncio
 import zipfile
 
 from tests.helpers.archive_tasks import make_archive_task
@@ -18,18 +19,22 @@ def test_native_worker_progress_event_is_forwarded_to_task_callback(tmp_path):
     runner.worker_path = get_sevenzip_bridge_worker_path()
     runner.progress_callback = lambda current_task, event: events.append((current_task, event))
 
-    try:
-        completed = runner.submit_attempt(
-            archive_path=str(archive),
-            part_paths=[str(archive)],
-            out_dir=str(tmp_path / "out"),
-            password=None,
-            selected_codepage=None,
-            startupinfo=None,
-            task=task,
-        ).result(timeout=15)
-    finally:
-        runner.close()
+    job = runner._build_job(
+        archive_path=str(archive),
+        out_dir=str(tmp_path / "out"),
+        password=None,
+        password_candidates=None,
+        selected_codepage=None,
+        task=task,
+    )
+
+    async def run():
+        try:
+            return await asyncio.wait_for(runner.submit_attempt_asyncio(job, task=task), 15)
+        finally:
+            await runner.aclose()
+
+    completed = asyncio.run(run())
 
     assert completed.returncode == 0, completed.stderr
     assert worker_result_payload(completed)["status"] == "ok"
@@ -44,8 +49,6 @@ def test_native_worker_progress_event_is_forwarded_to_task_callback(tmp_path):
 def test_progress_tail_preserves_all_callbacks_and_total_count():
     # The short real-worker case cannot detect dropped callbacks or a count
     # incorrectly derived from a truncated tail. Exercise actual async delivery.
-    import asyncio
-
     count = 512
     class Worker:
         worker_epoch = "history-test"
@@ -59,11 +62,11 @@ def test_progress_tail_preserves_all_callbacks_and_total_count():
             on_event({"type": "result", "job_id": job_id, "status": "ok"})
             on_event({"type": "native_event", "job_id": job_id, "event": "job_finished"})
     class Holder:
-        async def get_or_start(self, _startupinfo): return Worker()
+        async def get_or_start(self): return Worker()
     runner = SevenZipRunner({}, shared_async_worker_holder=Holder())
     indices = []
     runner.progress_callback = lambda _task, event: indices.append(event["item_index"])
-    completed = asyncio.run(runner._submit_native_job_asyncio({"job_id": "history"}))
+    completed = asyncio.run(runner.submit_attempt_asyncio({"job_id": "history"}))
     diagnostics = completed.worker_diagnostics
     assert completed.returncode == 0
     assert indices == list(range(count))

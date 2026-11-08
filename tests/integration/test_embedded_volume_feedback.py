@@ -10,6 +10,7 @@ from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from tests.helpers.async_batch import run_extract
 from tests.helpers.config_factory import make_config
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.real_archives import create_encrypted_rar_archive, create_rar4_archive, create_zip_multidisk_archive
@@ -115,10 +116,7 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
     ArchiveInputPlanningStage(config).plan_task(task)
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "out"
-    try:
-        extracted = extractor.extract(task, str(output))
-    finally:
-        extractor.close()
+    extracted = run_extract(extractor, task, str(output))
     assert extracted.success, extracted.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
     assert next(output.rglob("sibling.txt")).read_text() == "independent embedded archive"
@@ -242,10 +240,7 @@ def test_encrypted_standalone_carrier_keeps_boundary_and_password_failures(tmp_p
     ArchiveInputPlanningStage(config).plan_task(task)
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "out"
-    try:
-        extracted = extractor.extract(task, str(output))
-    finally:
-        extractor.close()
+    extracted = run_extract(extractor, task, str(output))
     assert extracted.success, extracted.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
@@ -257,10 +252,7 @@ def test_encrypted_standalone_carrier_keeps_boundary_and_password_failures(tmp_p
     assert len([node.projection() for node in task.inputs]) == 2
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     sibling_output = tmp_path / "sibling-out"
-    try:
-        extracted = extractor.extract(task, str(sibling_output))
-    finally:
-        extractor.close()
+    extracted = run_extract(extractor, task, str(sibling_output))
     assert not extracted.success and extracted.failure.is_password_failure
     assert next(sibling_output.rglob("sibling.txt")).read_text() == "independent embedded archive"
     from sunpack.pipeline.coordinator.engine import PipelineEngine

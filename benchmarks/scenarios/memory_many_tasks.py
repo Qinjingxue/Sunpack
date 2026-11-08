@@ -26,11 +26,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gc
-from sunpack_native import encode_worker_frame
 import os
 import shutil
 import sys
-import threading
 import time
 import tracemalloc
 from pathlib import Path
@@ -44,8 +42,8 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
 from benchmarks.scenarios.extraction_format_matrix import GENERATED_FORMATS, create_corpus
-from benchmarks.scenarios.sevenzip_worker_matrix import _case_job
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _submit_job
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
@@ -135,56 +133,17 @@ def _worker_sample(label: str, process: psutil.Process) -> dict:
     return row
 
 
-def _run_worker_job(
-    worker: _NativeWorkerProcess,
+async def _run_worker_job(
+    worker: _AsyncNativeWorkerProcess,
     job: dict[str, Any],
     *,
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    """Submit one job to the persistent worker and wait for its result.
-
-    Mirrors the completion protocol used by the sevenzip-worker-matrix
-    scenario: the stdout dispatcher feeds decoded envelopes to on_event, completion is
-    signalled by the native ``job_finished`` event once the result arrived.
-    """
-    payload = encode_worker_frame(job)
-    job_id = str(job["job_id"])
     started = time.perf_counter_ns()
-    result: dict[str, Any] | None = None
-    failure: list[str] = []
-    completed = threading.Event()
-
-    def on_event(event: dict[str, Any]) -> bool:
-        nonlocal result
-        if not isinstance(event, dict):
-            return False
-        if event.get("type") == "result" and str(event.get("job_id") or "") == job_id:
-            result = event
-        if event.get("type") == "native_event" and event.get("event") == "job_finished" and result is not None:
-            completed.set()
-            return True
-        return False
-
-    def on_error(message: str) -> None:
-        failure.append(str(message))
-        completed.set()
-
-    worker.submit_async(payload, job_id, on_event=on_event, on_error=on_error)
-    deadline = time.monotonic() + max(1.0, timeout_seconds)
-    while not completed.is_set():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"worker job timed out: {job_id}")
-        completed.wait(timeout=min(0.1, remaining))
-        if not worker.is_alive() and not completed.is_set():
-            raise RuntimeError(f"worker exited while running job: {job_id}")
-    if failure:
-        raise RuntimeError(f"worker failed while running job: {job_id}; {failure[-1]}")
-    if result is None:
-        raise RuntimeError(f"worker closed before returning a result: {job_id}")
+    result = await _submit_job(worker, job, timeout_seconds=timeout_seconds)
     elapsed_ms = round((time.perf_counter_ns() - started) / 1_000_000.0, 3)
     return {
-        "job_id": job_id,
+        "job_id": str(job["job_id"]),
         "status": str(result.get("status") or ""),
         "passed": str(result.get("status") or "") == "ok",
         "worker_wall_ms": elapsed_ms,
@@ -245,19 +204,19 @@ def _run_python_phase(
     return rows
 
 
-def _run_worker_phase(
+async def _run_worker_phase(
     workspace: BenchmarkWorkspace,
     corpus: dict[str, dict[str, Any]],
     rounds: int,
     *,
     worker_path: Path,
-    dll_path: Path,
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
     """Feed every corpus archive repeatedly through one persistent worker."""
-    worker = _NativeWorkerProcess(str(worker_path), None)
+    worker = _AsyncNativeWorkerProcess(str(worker_path))
     rows: list[dict[str, Any]] = []
     try:
+        await worker.start()
         if worker.process is None:
             raise RuntimeError("worker did not start")
         worker_proc = psutil.Process(worker.process.pid)
@@ -267,8 +226,8 @@ def _run_worker_phase(
             for case_index, (name, item) in enumerate(cases, 1):
                 label = f"worker-r{round_index}-{name.replace(':', '-')}"
                 output_dir = workspace.outputs / f"worker-round-{round_index}" / f"{case_index:03d}-{name.replace(':', '-')}"
-                job = _case_job(item, job_id=label, output_dir=output_dir, dll_path=dll_path)
-                outcome = _run_worker_job(worker, job, timeout_seconds=timeout_seconds)
+                job = _case_job(item, job_id=label, output_dir=output_dir)
+                outcome = await _run_worker_job(worker, job, timeout_seconds=timeout_seconds)
                 sample = _worker_sample(label, worker_proc)
                 sample.update({
                     "round": round_index,
@@ -287,10 +246,9 @@ def _run_worker_phase(
                     flush=True,
                 )
             shutil.rmtree(workspace.outputs / f"worker-round-{round_index}", ignore_errors=True)
-        worker.close()
-        rows.append(_worker_sample("worker-after-close", worker_proc))
     finally:
-        worker.close()
+        await worker.close()
+    rows.append(_worker_sample("worker-after-close", worker_proc))
     return rows
 
 
@@ -426,14 +384,13 @@ def main() -> int:
             python_rows = _run_python_phase(workspace, corpus, max(1, args.python_rounds))
         if not args.skip_worker:
             print("worker phase: driving persistent native worker ...", file=sys.stderr, flush=True)
-            worker_rows = _run_worker_phase(
+            worker_rows = asyncio.run(_run_worker_phase(
                 workspace,
                 corpus,
                 max(1, args.worker_rounds),
                 worker_path=worker_path,
-                dll_path=dll_path,
                 timeout_seconds=args.timeout_seconds,
-            )
+            ))
 
         report = {
             "parameters": {

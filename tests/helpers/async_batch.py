@@ -1,40 +1,31 @@
 import asyncio
 
-from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken
 
 
-def _send(state, result):
-    try:
-        return False, state.send(result)
-    except StopIteration as completed:
-        return True, completed.value
-
-
-def run_extract_verify(runner, task, out_dir, *, missing_volume_retry=None):
+def run_extract(extractor, task, out_dir):
     async def scenario():
         broker = AsyncWorkBroker(thread_capacity=2)
-        state = runner._extract_verify_state_machine(
-            task, out_dir, missing_volume_retry=missing_volume_retry
-        )
         try:
-            try:
-                request = next(state)
-            except StopIteration as completed:
-                return completed.value
-            while True:
-                result = await broker.run(
-                    "test_extract", task.key or task.main_path,
-                    runner.extractor.extract, request["task"], request["out_dir"],
-                    request_id="test",
-                )
-                done, value = await broker.run(
-                    "test_verify_extract", task.key or task.main_path,
-                    _send, state, result, request_id="test",
-                )
-                if done:
-                    return value
-                request = value
+            return await extractor.extract_asyncio(
+                broker, task, out_dir, request_id="test",
+                file_id=task.key or task.main_path, cancellation=CancellationToken(),
+            )
         finally:
-            await broker.close()
+            try:
+                close = getattr(extractor.sevenzip_runner, "aclose", None)
+                if close is not None:
+                    await close()
+            finally:
+                await broker.close()
 
     return asyncio.run(scenario())
+
+
+def stub_worker_attempt(runner, callback):
+    async def submit(job, **_context):
+        return callback(**job)
+
+    runner._build_job = dict
+    runner.submit_attempt_asyncio = submit
+    return runner

@@ -27,7 +27,7 @@ class _FailingRunner:
 
     def failed_process_for_exception(self, exc, request):
         assert isinstance(exc, RuntimeError)
-        assert request == {"job": {"archive": "sample.zip"}, "startupinfo": None, "task": "task"}
+        assert request == {"job": {"archive": "sample.zip"}, "task": "task"}
         return "failed-process"
 
 
@@ -115,6 +115,6 @@ def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
     assert result == "done"
     assert events == [
         ("broker", "extract_prepare"),
-        ("submit", {"job": {"archive": "sample.zip"}, "startupinfo": None, "task": "task"}),
+        ("submit", {"job": {"archive": "sample.zip"}, "task": "task"}),
         ("broker", "extract_continue"),
     ]

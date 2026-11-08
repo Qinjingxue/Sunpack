@@ -551,7 +551,7 @@ def test_pipeline_broker_always_uses_automatic_capacity_and_internal_queue_limit
             return {"thread_capacity": 7}
 
         services.sevenzip_runner = SimpleNamespace(
-            bind_event_loop=lambda loop: None, start_asyncio=handshake,
+            start_asyncio=handshake,
         )
         try:
             await services.start()

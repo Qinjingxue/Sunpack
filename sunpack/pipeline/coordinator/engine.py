@@ -838,7 +838,6 @@ class _PipelineServices:
         self.sevenzip_runner = SevenZipRunner(worker_config)
 
     async def start(self) -> None:
-        self.sevenzip_runner.bind_event_loop(asyncio.get_running_loop())
         handshake = await self.sevenzip_runner.start_asyncio()
         self.broker.configure_thread_capacity(int(handshake["thread_capacity"]))
 
@@ -1107,7 +1106,7 @@ class _RequestRuntime:
         )
         self.output_scan_policy = NestedOutputScanPolicy(self.config)
         self.recursive_authorization = RecursiveAuthorization(self.config)
-        request_runner = services.sevenzip_runner.fork(_worker_config(self.config))
+        request_runner = services.sevenzip_runner.fork()
         request_runner.request_id = submission.request_id
         request_runner.origin = submission.origin
         self.extractor = ExtractionScheduler(
@@ -1257,17 +1256,13 @@ class _RequestRuntime:
             return replace(response, interrupted=True, interruption_cleanup_errors=errors)
         finally:
             try:
-                try:
-                    for request in self.source_cleanup.sweep_requests():
-                        self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
-                    await self._drain_cleanup_tasks()
-                    self._shell_updates.flush()
-                finally:
-                    self.extractor.set_progress_callback(None)
-                    await self.reporter.drain_progress()
+                for request in self.source_cleanup.sweep_requests():
+                    self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
+                await self._drain_cleanup_tasks()
+                self._shell_updates.flush()
             finally:
-                # Fork close performs no I/O; the engine owns shared workers.
-                self.extractor.close()
+                self.extractor.set_progress_callback(None)
+                await self.reporter.drain_progress()
 
     async def _discover_and_run(
         self,

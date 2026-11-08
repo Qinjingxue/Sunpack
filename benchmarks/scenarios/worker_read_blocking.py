@@ -9,6 +9,7 @@ decompression, output writes, or Python protocol handling.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import os
 import shutil
@@ -23,7 +24,7 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _median, _run_job
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
@@ -69,13 +70,12 @@ def _create_stored_zip(workspace: BenchmarkWorkspace, payload_gib: int, timeout_
     return archive, payload_bytes
 
 
-def _run_case(
+async def _run_case(
     *,
     workspace: BenchmarkWorkspace,
     archive: Path,
     payload_bytes: int | None,
     worker_path: Path,
-    dll_path: Path,
     runs: int,
     timeout_seconds: float,
     sample_interval: float,
@@ -87,7 +87,7 @@ def _run_case(
         name: os.environ.get(name)
         for name in ("SUNPACK_SEVENZIP_PROFILE_READS", "SUNPACK_SEVENZIP_PREFETCH", "SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB")
     }
-    worker: _NativeWorkerProcess | None = None
+    worker: _AsyncNativeWorkerProcess | None = None
     sampler = ProcessSampler(interval_seconds=sample_interval)
     sampling = False
     rows: list[dict[str, Any]] = []
@@ -96,15 +96,16 @@ def _run_case(
         os.environ["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
         os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if prefetch_enabled else "0"
         os.environ["SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"] = str(prefetch_window_kib)
-        worker = _NativeWorkerProcess(str(worker_path), None)
+        worker = _AsyncNativeWorkerProcess(str(worker_path))
+        await worker.start()
         sampler.start()
         sampling = True
         for run in range(run_start, run_start + runs):
             mode = "on" if prefetch_enabled else "off"
             output = workspace.outputs / mode / f"run-{run}"
-            job = _case_job(case, job_id=f"read-blocking-{mode}-{run}", output_dir=output, dll_path=dll_path)
+            job = _case_job(case, job_id=f"read-blocking-{mode}-{run}", output_dir=output)
             try:
-                measured = _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
+                measured = await _run_job(worker, job, timeout_seconds=timeout_seconds, sampler=sampler)
             finally:
                 if not workspace.keep_workdir:
                     shutil.rmtree(output, ignore_errors=True)
@@ -120,7 +121,7 @@ def _run_case(
         if sampling:
             sampler.stop()
         if worker is not None:
-            worker.close()
+            await worker.close()
         for name, previous in prior_environment.items():
             if previous is None:
                 os.environ.pop(name, None)
@@ -144,7 +145,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def main() -> int:
+async def _main() -> int:
     parser = argparse.ArgumentParser(description="Measure ReadFile wall time inside IInStream::Read for one large archive.")
     parser.add_argument("--archive", type=Path, help="Existing ZIP archive to use instead of generating a stored archive.")
     parser.add_argument("--payload-gib", type=int, default=1, help="Generated source-file size in GiB (default: 1).")
@@ -188,12 +189,11 @@ def main() -> int:
             mode_runs = ((0, (args.prefetch,)),)
         for run_start, modes in mode_runs:
             for mode in modes:
-                rows.extend(_run_case(
+                rows.extend(await _run_case(
                     workspace=workspace,
                     archive=archive,
                     payload_bytes=payload_bytes,
                     worker_path=worker_path,
-                    dll_path=dll_path,
                     runs=1 if args.prefetch == "compare" else args.runs,
                     timeout_seconds=args.timeout_seconds,
                     sample_interval=args.sample_interval,
@@ -254,6 +254,10 @@ def main() -> int:
             args.json_out.write_text(rendered, encoding="utf-8")
         print(rendered)
         return 0 if summary["all_passed"] else 1
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

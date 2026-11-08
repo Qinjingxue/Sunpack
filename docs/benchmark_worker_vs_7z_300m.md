@@ -134,6 +134,9 @@ peaks and are not summed across formats.
 
 ## Reproduction
 
+Use the recorded source revision and its matching native extension and worker
+binary when reproducing the historical run below.
+
 ```powershell
 uv sync --locked --extra dev
 cmake --build native/sevenzip_bridge/build-x64 --config Release --target sunpack_sevenzip_worker --parallel

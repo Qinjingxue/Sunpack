@@ -189,7 +189,7 @@ def _configure_request_runtime(engine, callback):
     engine._request_runtime_factory = configured
 
 
-def test_pipeline_runner_passes_native_space_configuration():
+def test_pipeline_runner_passes_native_space_configuration(monkeypatch):
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
         "performance": {
@@ -199,17 +199,23 @@ def test_pipeline_runner_passes_native_space_configuration():
         },
     }))
 
-    engine = PipelineEngine(config)
-    captured = {}
-    _configure_request_runtime(engine, lambda runtime: captured.update(
-        extractor=runtime.extractor.sevenzip_runner.process_config,
-    ))
+    spawn = asyncio.create_subprocess_exec
+    worker_poll_intervals = []
+
+    async def capture_worker_environment(program, *args, **kwargs):
+        if Path(program).name == "sunpack_sevenzip_worker.exe":
+            worker_poll_intervals.append(kwargs["env"].get("SUNPACK_VOLUME_SPACE_POLL_MS"))
+        return await spawn(program, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_worker_environment)
+
     async def run():
-        async with engine:
+        async with PipelineEngine(config) as engine:
             await engine.run(["missing.zip"])
+
     asyncio.run(run())
 
-    assert captured["extractor"]["space_poll_interval_ms"] == 2000
+    assert worker_poll_intervals == ["2000"]
 
 
 def test_pipeline_progress_observer_receives_extract_ready_before_native_progress(tmp_path):
@@ -283,31 +289,22 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
 
     monkeypatch.setattr(engine_module, "PostProcessActions", TrackedPostProcessActions)
 
-    def fake_extract(task, out_dir):
+    async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
         out_path = tmp_path / "payload" / "inside.txt"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text("hello", encoding="utf-8")
-        return ExtractionResult(
-            success=True,
-
-            out_dir=out_dir,
-
-        )
-
-    async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
-        return fake_extract(task, out_dir)
+        return ExtractionResult(success=True, out_dir=out_dir)
 
     def configure(runtime):
-        original_close = runtime.extractor.close
+        drain_progress = runtime.reporter.drain_progress
 
-        def tracked_close():
-            original_close()
-            call_order.append("close")
+        async def tracked_drain():
+            await drain_progress()
+            call_order.append("progress_drained")
 
         monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
-        monkeypatch.setattr(runtime.extractor, "close", tracked_close)
+        monkeypatch.setattr(runtime.reporter, "drain_progress", tracked_drain)
 
     _configure_request_runtime(engine, configure)
 
@@ -321,7 +318,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     assert not archive.exists()
     assert (tmp_path / "payload" / "inside.txt").exists()
     # Source cleanup and subtree flattening both finish before the request closes.
-    assert call_order[-1] == "close"
+    assert call_order[-1] == "progress_drained"
     assert call_order.count("postprocess") >= 1
 
 
@@ -364,13 +361,10 @@ def test_independent_jobs_do_not_treat_existing_same_name_directory_as_output(tm
     })))
     extracted = []
 
-    def fake_extract(task, out_dir):
+    async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
         extracted.append(task.main_path)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         return ExtractionResult(success=True, out_dir=out_dir)
-
-    async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
-        return fake_extract(task, out_dir)
 
     def configure(runtime):
         monkeypatch.setattr(
@@ -378,7 +372,6 @@ def test_independent_jobs_do_not_treat_existing_same_name_directory_as_output(tm
             "inspect",
             lambda *_args, **_kwargs: None,
         )
-        monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
 
     _configure_request_runtime(engine, configure)
@@ -414,7 +407,7 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
     engine = PipelineEngine(config)
     extracted = []
 
-    def fake_extract(item, out_dir):
+    async def fake_extract_asyncio(_broker, item, out_dir, **_kwargs):
         extracted.append(item.main_path)
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
@@ -422,16 +415,12 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
             (out_path / "nested.zip").write_bytes(make_zip({"leaf.txt": b"leaf"}))
         return ExtractionResult(success=True, out_dir=out_dir)
 
-    async def fake_extract_asyncio(_broker, item, out_dir, **_kwargs):
-        return fake_extract(item, out_dir)
-
     def configure(runtime):
         monkeypatch.setattr(
             runtime.extractor,
             "inspect",
             lambda *_args, **_kwargs: None,
         )
-        monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
 
     _configure_request_runtime(engine, configure)

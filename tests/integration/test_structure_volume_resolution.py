@@ -13,6 +13,7 @@ from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.core.passwords.internal.store import PasswordStore
+from tests.helpers.async_batch import run_extract
 from tests.helpers.passwords import write_password_json
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
@@ -66,10 +67,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
         ArchiveInputPlanningStage(load_config()).plan_task(task)
         extractor = ExtractionScheduler()
         out_dir = tmp_path / "direct_outputs" / archive_format
-        try:
-            result = extractor.extract(task, str(out_dir))
-        finally:
-            extractor.close()
+        result = run_extract(extractor, task, str(out_dir))
 
         assert result.success is True
         marker = next(out_dir.rglob(cases[archive_format].marker_name))
@@ -169,10 +167,7 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     ArchiveInputPlanningStage(load_config()).plan_task(resolved[0])
     output = tmp_path / "output"
     extractor = ExtractionScheduler()
-    try:
-        result = extractor.extract(resolved[0], str(output))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, resolved[0], str(output))
     assert result.success is True, result.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
     if name_style == "fixed_fields_sparse_labels":
@@ -216,10 +211,7 @@ def test_context_free_numbers_preserve_encrypted_sfx_launcher_ownership(tmp_path
     ArchiveInputPlanningStage(load_config()).plan_task(tasks[0])
     extractor = ExtractionScheduler(cli_passwords=["wrong", password], builtin_passwords=[])
     output = tmp_path / "output"
-    try:
-        result = extractor.extract(tasks[0], str(output))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, tasks[0], str(output))
     assert result.success is True, result.error
     assert result.password_used == password
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
@@ -249,10 +241,7 @@ def test_context_free_numeric_noise_does_not_create_a_missing_7z_volume(tmp_path
     ArchiveInputPlanningStage(load_config()).plan_task(resolved[0])
     output = tmp_path / "output"
     extractor = ExtractionScheduler()
-    try:
-        result = extractor.extract(resolved[0], str(output))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, resolved[0], str(output))
     assert result.success is True, result.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
     assert next(output.rglob("payload.bin")).stat().st_size == MIB // 2
@@ -342,10 +331,7 @@ def test_competing_heads_keep_direct_schemes_and_partition_declared_formats(tmp_
         ArchiveInputPlanningStage(load_config()).plan_task(tasks[0])
         output = tmp_path / "outputs" / case.case_id
         extractor = ExtractionScheduler()
-        try:
-            result = extractor.extract(tasks[0], str(output))
-        finally:
-            extractor.close()
+        result = run_extract(extractor, tasks[0], str(output))
         assert result.success is True, result.error
         assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
     if name_style == "standard":
@@ -388,10 +374,7 @@ def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, mar
     ArchiveInputPlanningStage(load_config()).plan_task(tasks[0])
     output = tmp_path / "output"
     extractor = ExtractionScheduler()
-    try:
-        result = extractor.extract(tasks[0], str(output))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, tasks[0], str(output))
     assert result.success is True, result.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
@@ -434,10 +417,7 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
     PasswordScopeContext().annotate(tasks)
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "output"
-    try:
-        result = extractor.extract(tasks[0], str(output))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, tasks[0], str(output))
     assert result.success is True, result.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
@@ -487,10 +467,7 @@ def test_distinct_global_mappings_are_tried_inside_worker(tmp_path, archive_form
     assert scheduler.resolve_volume_once([paths[0]], paths, format_hint=archive_format).volume_attempts
     output = tmp_path / "attempt_output"
     extractor = ExtractionScheduler()
-    try:
-        extracted = extractor.extract(task, str(output))
-    finally:
-        extractor.close()
+    extracted = run_extract(extractor, task, str(output))
     assert extracted.success, extracted.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
     assert task.archive_input().volume_attempts is None
@@ -960,10 +937,7 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
 
     extractor = ExtractionScheduler()
     output = tmp_path / "output"
-    try:
-        extraction = extractor.extract(task, str(output))
-    finally:
-        extractor.close()
+    extraction = run_extract(extractor, task, str(output))
 
     assert extraction.success is True
     extracted = next(output.rglob("payload.bin"))
@@ -1080,16 +1054,13 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
         process_config={},
         extraction_config=config.get("extraction"),
     )
-    try:
-        for variant, _archive_format, _sfx in variants:
-            output = tmp_path / "outputs" / variant
-            result = extractor.extract(task_by_variant[variant], str(output))
-            assert result.success is True, (variant, result.error, result.diagnostics)
-            assert result.password_used == passwords[variant]
-            marker = next(output.rglob(cases[variant].marker_name))
-            assert marker.read_text(encoding="utf-8") == cases[variant].marker_text
-    finally:
-        extractor.close()
+    for variant, _archive_format, _sfx in variants:
+        output = tmp_path / "outputs" / variant
+        result = run_extract(extractor, task_by_variant[variant], str(output))
+        assert result.success is True, (variant, result.error, result.diagnostics)
+        assert result.password_used == passwords[variant]
+        marker = next(output.rglob(cases[variant].marker_name))
+        assert marker.read_text(encoding="utf-8") == cases[variant].marker_text
 
 
 def _mixed_real_volume_directory(tmp_path: Path):

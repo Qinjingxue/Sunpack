@@ -994,12 +994,12 @@ int self_test() {
 
 } // namespace
 
-HRESULT sunpack_toast_create(const wchar_t* executable, const wchar_t* arguments,
-                             const wchar_t* log_path, void** output) noexcept {
+HRESULT sunpack_toast_create_presenter(const wchar_t* executable, const wchar_t* log_path,
+                                       void** output) noexcept {
     if (!output) return E_POINTER;
     *output = nullptr;
     return protect([&] {
-        if (!executable || !arguments) winrt::throw_hresult(E_INVALIDARG);
+        if (!executable) winrt::throw_hresult(E_INVALIDARG);
         auto context = std::make_unique<ToastContext>();
         if (!toast_app_identity_registered(executable)) {
             register_toast_app_identity(executable);

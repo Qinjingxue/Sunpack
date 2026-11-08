@@ -540,9 +540,6 @@ namespace sunpack::sevenzip
 
         bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
 
-        bool prefetch_enabled() const noexcept { return prefetch_ && prefetch_->enabled(); }
-
-
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
             if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, &path_);

@@ -7,6 +7,7 @@ pub const REQUEST_BYTES: usize = 112;
 pub const RESPONSE_BYTES: usize = 42;
 // A batch query is framed separately after the fixed request: journal ID + 16-byte IDs.
 pub const MAX_DIRECTORY_QUERY_BYTES: usize = 1024 * 1024;
+pub const MAX_DIRECTORY_RESPONSE_BYTES: usize = 64 * 1024;
 const _: () = assert!(REQUEST_BYTES <= 4096);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -2,10 +2,7 @@ from sunpack_native import encode_worker_frame, parse_worker_event
 from tests.helpers.worker_events import worker_events, worker_frames, write_worker_script
 import asyncio
 import gc
-import io
-import queue
 import subprocess
-import threading
 import weakref
 from types import SimpleNamespace
 
@@ -14,12 +11,7 @@ import pytest
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack_native import NativeWorkerResultAccumulator
 
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
-    SevenZipRunner,
-    _AsyncNativeWorkerProcess,
-    _NativeQueueCapacity,
-    _NativeWorkerProcess,
-)
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import StdioHistory
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.worker_events import worker_trace_item
@@ -70,39 +62,7 @@ def test_worker_reads_binary_controls_and_rejects_truncated_request():
     assert result.returncode == 2 and b"truncated worker frame" in result.stderr
 
 
-@pytest.mark.parametrize("outcome", ["success", "protocol_error", "cancelled"])
-def test_completed_sync_future_releases_worker_and_queue(monkeypatch, outcome):
-    # Reader lifetime tests discard the Future. A caller retaining a finished
-    # Future must not keep the worker or other requests' queue callbacks alive.
-    monkeypatch.setattr(_NativeWorkerProcess, "_start", lambda self: None)
-    worker = _NativeWorkerProcess("unused", None)
-    worker.send = lambda _: None
-    runner = SevenZipRunner({}, shared_worker_holder=SimpleNamespace(get_or_start=lambda _: worker))
-    future = runner.submit_attempt({"job_id": "job"})
-    references = weakref.ref(worker), weakref.ref(worker.queue_capacity), weakref.ref(runner)
-    # Refcounts should release the request at completion, even before a GC pass.
-    gc_was_enabled = gc.isenabled()
-    gc.disable()
-    try:
-        if outcome == "protocol_error":
-            worker._dispatch_event(_event("manifest_chunk", seq=1, rows=[_row()]), "job")
-        else:
-            if outcome == "cancelled":
-                future.cancel()
-            worker._dispatch_event(_event("result", status="ok"), "job")
-        worker._dispatch_event(_event("native_event", event="job_finished"), "job")
-        assert future.done() and not worker._async_jobs
-        if outcome != "cancelled":
-            assert (future.result().returncode == 0) == (outcome == "success")
-        del worker, runner
-        assert all(reference() is None for reference in references)
-    finally:
-        if gc_was_enabled:
-            gc.enable()
-
-
-@pytest.mark.parametrize("transport", ["sync", "async"])
-def test_worker_stderr_keeps_bounded_tail_and_drains_for_reuse(monkeypatch, transport):
+def test_worker_stderr_keeps_bounded_tail_and_drains_for_reuse():
     # Progress tests contain no stderr burst. Exercise the real pump while no
     # job result drains it, including a line larger than the async stream limit
     # and a UTF-8 character split across two pipe reads.
@@ -111,20 +71,16 @@ def test_worker_stderr_keeps_bounded_tail_and_drains_for_reuse(monkeypatch, tran
     block_size = 64 * 1024
     data += b"x" * (block_size + (-len(data) - 1) % block_size) + "中\n".encode()
     expected_tail = data.decode()[-4000:]
-    if transport == "sync":
-        monkeypatch.setattr(_NativeWorkerProcess, "_start", lambda self: None)
-        worker = _NativeWorkerProcess("unused", None)
-        worker._pump_stderr(io.BytesIO(data))
-    else:
-        async def pump():
-            worker = _AsyncNativeWorkerProcess("unused", None)
-            stream = asyncio.StreamReader(limit=4096)
-            stream.feed_data(data)
-            stream.feed_eof()
-            worker.process = SimpleNamespace(stderr=stream)
-            await worker._pump_stderr()
-            return worker
-        worker = asyncio.run(pump())
+    async def pump():
+        worker = _AsyncNativeWorkerProcess("unused")
+        stream = asyncio.StreamReader(limit=4096)
+        stream.feed_data(data)
+        stream.feed_eof()
+        worker.process = SimpleNamespace(stderr=stream)
+        await worker._pump_stderr()
+        return worker
+
+    worker = asyncio.run(pump())
     assert "".join(worker.take_stderr()) == expected_tail
     assert worker.take_stderr() == []
 
@@ -141,7 +97,7 @@ def test_shared_worker_process_mode_retries_failed_ack_and_serializes_transition
     # The transport needs successful acknowledgements, not requested labels.
     # Concurrent callers must also retain independent acknowledgement ownership.
     async def scenario():
-        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker = _AsyncNativeWorkerProcess("unused")
         stdout = asyncio.StreamReader()
         worker.process = SimpleNamespace(pid=123, returncode=None, stdout=stdout)
         worker.handshake = {"process_mode": "high", "process_mode_applied": False}
@@ -272,89 +228,7 @@ def test_malformed_routed_chunk_and_unattributable_frame_are_distinguished():
         parse_worker_transport_event(b"broken stream")
 
 
-def test_sync_bad_job_waits_for_native_finish_and_does_not_affect_other_jobs():
-    worker = object.__new__(_NativeWorkerProcess)
-    worker.process_config = {}
-    worker.worker_epoch = "test"
-    worker._async_jobs = {}
-    worker._dispatch_lock = threading.Lock()
-    worker._idle = threading.Condition(worker._dispatch_lock)
-    worker._closing = False
-    worker._shutdown_sent = False
-    sent, callbacks, failures = [], [], []
-    worker.send = sent.append
-    for job_id in ["bad", "good"]:
-        worker.submit_async(encode_worker_frame({}), job_id,
-                            on_event=lambda event: callbacks.append(event) or event.get("event") == "job_finished",
-                            on_error=lambda message: failures.append(message))
-    payload = _event("manifest_chunk", "bad", seq=1, rows=[_row()])
-    worker._dispatch_event(payload, "bad")
-    assert "bad" in worker._async_jobs and not failures and not callbacks
-    assert parse_worker_event(sent[-1]) == {"worker_command": "cancel", "job_id": "bad"}
-    good_result = _event("result", "good", status="ok")
-    worker._dispatch_event(good_result, "good")
-    worker._dispatch_event(_event("native_event", "good", event="job_finished"), "good")
-    assert "good" not in worker._async_jobs and not failures
-    worker._dispatch_event(_event("native_event", "bad", event="job_finished"), "bad")
-    assert not worker._async_jobs and len(failures) == 1
-    assert [event["job_id"] for event in callbacks] == ["good", "good"]
-
-
-def test_sync_fatal_protocol_error_stops_process_before_failure_callback():
-    worker = object.__new__(_NativeWorkerProcess)
-    worker._dispatch_lock = threading.Lock()
-    worker._idle = threading.Condition(worker._dispatch_lock)
-    worker._closing = False
-    worker._shutdown_sent = False
-    worker.queue_capacity = _NativeQueueCapacity()
-    order = []
-    worker._async_jobs = {"job": {"completion_lock": threading.Lock(), "on_error": lambda message: order.append("failed")}}
-    worker.abort = lambda: order.append("stopped")
-    worker._dispatch_stdout(io.BytesIO(b"broken frame"))
-    assert order == ["stopped", "failed"]
-
-
-def test_sync_terminal_callback_can_resubmit_before_returning():
-    # Queue mocks finish on one thread. Force the loop/thread handoff while the
-    # stdout callback is still on the stack; without retirement it rejects the
-    # replacement job, and an unconditional old cleanup would delete it.
-    worker = object.__new__(_NativeWorkerProcess)
-    worker.process_config = {}
-    worker.worker_epoch = "test"
-    worker._async_jobs = {}
-    worker._dispatch_lock = threading.Lock()
-    worker._idle = threading.Condition(worker._dispatch_lock)
-    worker._closing = False
-    worker._shutdown_sent = False
-    worker.send = lambda _: None
-    failures = []
-    replacement = []
-
-    def terminal(event):
-        def resubmit():
-            try:
-                worker.submit_async("retry", "job",
-                    on_event=lambda event: True, on_error=failures.append)
-                replacement.append(worker._async_jobs["job"])
-            except Exception as exc:
-                failures.append(str(exc))
-        thread = threading.Thread(target=resubmit)
-        thread.start()
-        thread.join(2)
-        assert not thread.is_alive()
-        return True
-
-    worker.submit_async(encode_worker_frame({}), "job",
-                        on_event=terminal, on_error=failures.append)
-    worker._dispatch_event(_event("native_event", event="job_finished"), "job")
-    assert not failures and len(replacement) == 1
-    assert worker._async_jobs["job"] is replacement[0]
-    worker._dispatch_event(_event("native_event", event="job_finished"), "job")
-    assert not worker._async_jobs
-
-
-@pytest.mark.parametrize("transport", ["sync", "async"])
-def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_events(tmp_path, transport):
+def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_events(tmp_path):
     # Existing transport tests finish promptly and cannot catch a watchdog
     # cancelling a queued job. The short legacy setting keeps this inexpensive.
     script = tmp_path / "queued_worker.cmd"
@@ -369,7 +243,6 @@ def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_ev
     ])
 
     async def run():
-        loop = asyncio.get_running_loop()
         started, queued, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
         events, failures, sent = [], [], []
         config = {"watchdog_no_progress_timeout_seconds": 0.01, "cancel_grace_seconds": 0.01}
@@ -377,61 +250,44 @@ def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_ev
         def callback(event):
             events.append(event)
             if event.get("event") == "job_started":
-                loop.call_soon_threadsafe(started.set)
+                started.set()
             if event.get("event") == "job_queued":
-                loop.call_soon_threadsafe(queued.set)
+                queued.set()
             if event.get("event") == "job_finished" and event["job_id"] == "queued":
-                loop.call_soon_threadsafe(finished.set)
+                finished.set()
             return event.get("event") == "job_finished"
 
-        if transport == "async":
-            worker = _AsyncNativeWorkerProcess(str(script), None, config)
-            await worker.start()
-            send = worker.send
+        worker = _AsyncNativeWorkerProcess(str(script), config)
+        await worker.start()
+        send = worker.send
 
-            async def send_recorded(payload):
-                sent.append(payload)
-                await send(payload)
-        else:
-            worker = _NativeWorkerProcess(str(script), None, config)
-            send = worker.send
-
-            def send_recorded(payload):
-                sent.append(payload)
-                send(payload)
+        async def send_recorded(payload):
+            sent.append(payload)
+            await send(payload)
 
         worker.send = send_recorded
         try:
             for job_id in ("active", "queued"):
-                if transport == "async":
-                    await worker.submit(encode_worker_frame({}), job_id, on_event=callback, on_error=failures.append)
-                else:
-                    worker.submit_async(encode_worker_frame({}), job_id, on_event=callback, on_error=failures.append)
+                await worker.submit(encode_worker_frame({}), job_id, on_event=callback, on_error=failures.append)
                 if job_id == "active":
                     await asyncio.wait_for(started.wait(), 2)
             await asyncio.wait_for(queued.wait(), 2)
             await asyncio.sleep(0.08)
             assert worker.is_alive() and not failures and not finished.is_set()
             assert sent == [encode_worker_frame({}), encode_worker_frame({})]
-            if transport == "async":
-                await worker.send(encode_worker_frame({"worker_command": "finish"}))
-            else:
-                worker.send(encode_worker_frame({"worker_command": "finish"}))
+            await worker.send(encode_worker_frame({"worker_command": "finish"}))
             await asyncio.wait_for(finished.wait(), 2)
             assert not failures
             assert {e["job_id"] for e in events if e["type"] == "result"} == {"active", "queued"}
         finally:
-            if transport == "async":
-                await worker.close()
-            else:
-                worker.close()
+            await worker.close()
 
     asyncio.run(run())
 
 
 def test_async_bad_chunk_cancels_only_its_job_and_retains_ownership_until_finish():
     async def run():
-        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker = _AsyncNativeWorkerProcess("unused")
         reader = asyncio.StreamReader()
         exited = asyncio.Event()
         sent, callbacks, failures = [], [], []
@@ -484,61 +340,6 @@ def test_async_bad_chunk_cancels_only_its_job_and_retains_ownership_until_finish
     asyncio.run(run())
 
 
-def test_idle_sync_reader_releases_processed_event_and_line(monkeypatch):
-    # EOF tests cannot detect transport buffers retained during an idle wait.
-    # One blocking in-memory stream covers that lifetime without a worker or
-    # timing/RSS assumptions; a second registered job must remain live.
-    import sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner as runner_module
-
-    class Block(bytearray):
-        pass
-
-    class Envelope(dict):
-        pass
-
-    waiting = threading.Event()
-    lines = queue.Queue()
-    references = []
-
-    class Stream:
-        def read1(self, size):
-            waiting.set()
-            line = lines.get()
-            if line is None:
-                return b""
-            return line
-
-    def parse(line):
-        event = Envelope(type="native_event", job_id="finished", event="job_finished")
-        references.extend((weakref.ref(line), weakref.ref(event)))
-        return [event]
-
-    monkeypatch.setattr(runner_module, "NativeWorkerFrameDecoder", lambda: SimpleNamespace(feed=parse, check=lambda: None, finish=lambda: None))
-    monkeypatch.setattr(_NativeWorkerProcess, "_start", lambda self: None)
-    worker = _NativeWorkerProcess("unused", None)
-    worker.send = lambda payload: None
-    worker._shutdown_sent = True
-    failures = []
-    for job_id in ("finished", "active"):
-        worker.submit_async(encode_worker_frame({}), job_id,
-                            on_event=lambda event: event.get("event") == "job_finished",
-                            on_error=failures.append)
-    reader = threading.Thread(target=worker._dispatch_stdout, args=(Stream(),))
-    reader.start()
-    try:
-        assert waiting.wait(2)
-        waiting.clear()
-        lines.put(Block(b"worker event"))
-        assert waiting.wait(2)
-        assert len(references) == 2 and all(ref() is None for ref in references)
-        assert set(worker._async_jobs) == {"active"} and not failures
-        assert reader.is_alive()
-    finally:
-        lines.put(None)
-        reader.join(2)
-        assert not reader.is_alive()
-
-
 @pytest.mark.parametrize("outcome", ["success", "callback_error", "malformed_chunk"])
 def test_idle_async_reader_releases_finished_callbacks_but_keeps_active_jobs(outcome):
     # Outcome tests stop at EOF and cannot detect idle tail-held callbacks.
@@ -563,7 +364,7 @@ def test_idle_async_reader_releases_finished_callbacks_but_keeps_active_jobs(out
                 failures.append(message)
 
         reader = Reader()
-        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker = _AsyncNativeWorkerProcess("unused")
         worker.process = SimpleNamespace(stdout=reader, returncode=0, wait=lambda: asyncio.sleep(0))
         failures, sent = [], []
 
@@ -611,7 +412,7 @@ def test_idle_async_reader_releases_finished_callbacks_but_keeps_active_jobs(out
 @pytest.mark.parametrize("oversized", [False, True])
 def test_async_fatal_stream_error_stops_process_before_failing_jobs(oversized):
     async def run():
-        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker = _AsyncNativeWorkerProcess("unused")
         reader = asyncio.StreamReader(limit=4 * 1024 * 1024)
         order = []
 
@@ -697,48 +498,28 @@ def test_real_worker_chunks_are_bounded_by_serialized_bytes(many_item_archive):
     _assert_many_item_result(result)
 
 
-@pytest.mark.parametrize("transport", ["sync", "async"])
-def test_real_worker_large_results_are_assembled_in_both_transports(many_item_archive, transport):
+def test_real_worker_large_results_are_assembled_for_interleaved_origins(many_item_archive):
     events = []
 
     def callback(event):
         events.append(event)
         return event.get("event") == "job_finished"
 
-    if transport == "sync":
-        worker = _NativeWorkerProcess(get_sevenzip_bridge_worker_path(), None)
-        finished = threading.Event()
-
-        def sync_callback(event):
-            done = callback(event)
-            if done and sum(event.get("event") == "job_finished" for event in events) == 2:
-                finished.set()
-            return done
-
+    async def run():
+        worker = _AsyncNativeWorkerProcess(get_sevenzip_bridge_worker_path())
+        await worker.start()
         try:
+            finished = []
             for job_id, origin in [("watch", "watch"), ("cli", "foreground")]:
-                worker.submit_async(_request(many_item_archive, job_id, origin), job_id,
-                                    on_event=sync_callback, on_error=lambda message: (events.append({"error": message}), finished.set()))
-            assert finished.wait(15)
+                await worker.submit(_request(many_item_archive, job_id, origin), job_id,
+                                    on_event=callback, on_error=lambda message: events.append({"error": message}))
+                finished.append(worker._jobs[job_id]["finished"])
+            await asyncio.wait_for(asyncio.gather(*finished), 15)
         finally:
-            worker.close()
-        assert not any("error" in event for event in events)
-    else:
-        async def run():
-            worker = _AsyncNativeWorkerProcess(get_sevenzip_bridge_worker_path(), None)
-            await worker.start()
-            try:
-                finished = []
-                for job_id, origin in [("watch", "watch"), ("cli", "foreground")]:
-                    await worker.submit(_request(many_item_archive, job_id, origin), job_id,
-                                        on_event=callback, on_error=lambda message: events.append({"error": message}))
-                    finished.append(worker._jobs[job_id]["finished"])
-                await asyncio.wait_for(asyncio.gather(*finished), 15)
-            finally:
-                await worker.close()
+            await worker.close()
 
-        asyncio.run(run())
-        assert not any("error" in event for event in events)
+    asyncio.run(run())
+    assert not any("error" in event for event in events)
     assert not any(event.get("type") in {"manifest_chunk", "trace_chunk"} for event in events)
     results = [event for event in events if event.get("type") == "result"]
     assert {result["job_id"] for result in results} == {"watch", "cli"}
@@ -790,7 +571,7 @@ def test_async_close_drains_before_shutdown_and_joins_all_readers(broken):
     # close with an active job, concurrent callers, EOF failure and pipe teardown.
     # Event gates make the ordering deterministic without timer sleeps.
     async def scenario():
-        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker = _AsyncNativeWorkerProcess("unused")
         reader = asyncio.StreamReader()
         exit_gate, reader_gate = asyncio.Event(), asyncio.Event()
         stopping = asyncio.Event()
@@ -853,108 +634,13 @@ def test_async_close_drains_before_shutdown_and_joins_all_readers(broken):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("broken", [False, True])
-def test_sync_close_drains_before_shutdown_and_joins_all_readers(monkeypatch, broken):
-    # Sync transports have separate admission and reader threads; the async
-    # regression cannot catch their locking or an early return before EOF.
-    # A fake pipe and event gates cover this without launching a child process.
-    import queue
-    from sunpack.pipeline.extraction.internal.sevenzip import sevenzip_runner as module
-
-    lines = queue.Queue()
-    exited, shutdown, close_waiting = threading.Event(), threading.Event(), threading.Event()
-    reader_gate = threading.Event()
-    sent, errors = [], []
-
-    class Output:
-        def read1(self, size):
-            return lines.get() or b""
-
-        def close(self):
-            pass
-
-    class Input:
-        def write(self, payload):
-            sent.append(payload)
-            if parse_worker_event(payload).get("worker_command") == "shutdown":
-                shutdown.set()
-
-        def flush(self):
-            pass
-
-        def close(self):
-            pass
-
-    class Process:
-        pid = 0
-        stdin, stdout = Input(), Output()
-
-        class Stderr:
-            def read1(self, size):
-                assert reader_gate.wait(3)
-                return b""
-
-            def close(self):
-                pass
-
-        stderr = Stderr()
-
-        def poll(self):
-            return 0 if exited.is_set() else None
-
-        def terminate(self):
-            exited.set()
-
-        def wait(self):
-            assert exited.wait(3)
-            return 0
-
-    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: Process())
-    worker = _NativeWorkerProcess("unused", None)
-    original_wait = worker._idle.wait_for
-
-    def wait_for(predicate):
-        close_waiting.set()
-        return original_wait(predicate)
-
-    monkeypatch.setattr(worker._idle, 'wait_for', wait_for)
-    worker.submit_async(encode_worker_frame({}), "active",
-                        on_event=lambda event: event.get('event') == 'job_finished',
-                        on_error=errors.append)
-    closing = threading.Thread(target=worker.close)
-    closing.start()
-    try:
-        assert close_waiting.wait(3)
-        with pytest.raises(RuntimeError, match="closing"):
-            worker.submit_async(encode_worker_frame({}), "late", on_event=lambda event: False, on_error=errors.append)
-        assert not shutdown.is_set() and closing.is_alive()
-        if broken:
-            lines.put(b'broken stream')
-        else:
-            lines.put(encode_worker_frame({'type': 'native_event', 'job_id': 'active', 'event': 'job_finished'}))
-            assert shutdown.wait(3)
-            assert closing.is_alive() and not errors
-        exited.set()
-        lines.put(None)
-        worker._reader_threads[0].join(3)
-        assert not worker._reader_threads[0].is_alive() and closing.is_alive()
-    finally:
-        exited.set()
-        lines.put(None)
-        reader_gate.set()
-        closing.join(3)
-    assert not closing.is_alive() and bool(errors) == broken
-    assert not worker._async_jobs
-    assert shutdown.is_set() != broken
-
-
 def test_async_broken_pipe_above_reader_limit_reaches_process_exit():
     # In-memory fatal-stream tests cannot reproduce asyncio transport wait()
     # waiting on a paused OS pipe. One small child covers that independent hang.
     import sys
 
     async def scenario():
-        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker = _AsyncNativeWorkerProcess("unused")
         worker.process = await asyncio.create_subprocess_exec(
             sys.executable, '-c', 'import os; os.write(1, b"x" * (512 * 1024))',
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,

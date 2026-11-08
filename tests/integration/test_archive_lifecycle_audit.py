@@ -71,7 +71,7 @@ def test_shared_worker_keeps_concurrent_request_identity_after_refresh(tmp_path,
     original = _AsyncNativeWorkerProcess.send
     async def capture(worker, payload):
         job = parse_worker_event(payload)
-        if job.get("stage") == "extract":
+        if "archive_input" in job:
             sent.append((worker, job))
         await original(worker, payload)
     monkeypatch.setattr(_AsyncNativeWorkerProcess, "send", capture)
@@ -90,7 +90,7 @@ def test_shared_worker_keeps_concurrent_request_identity_after_refresh(tmp_path,
             assert (Path(result.output_dir) / "payload.txt").read_bytes() == path.stem.encode()
     asyncio.run(scenario())
     assert len(sent) == 3 and len({id(worker) for worker, _ in sent}) == 1
-    jobs = {Path(job["archive_path"]): job for _, job in sent}
+    jobs = {Path(job["archive_input"]["entry_path"]): job for _, job in sent}
     assert all("job_buffer_budget_bytes" not in job for job in jobs.values())
     assert [jobs[path]["origin"] for path in paths] == ["foreground", "watch", "foreground"]
     assert len({job["request_id"] for job in jobs.values()}) == 3

@@ -13,6 +13,7 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
     attach_worker_diagnostics,
 )
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from tests.helpers.async_batch import run_extract, stub_worker_attempt
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.worker_events import worker_result, worker_trace_item
@@ -67,12 +68,13 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.password_resolver = FakePasswordResolver()
 
             calls = []
-            extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
-                calls.append(kwargs) or _completed(returncode=0, stdout="", stderr="")
+            stub_worker_attempt(
+                extractor.sevenzip_runner,
+                lambda **kwargs: calls.append(kwargs) or _completed(returncode=0, stdout="", stderr=""),
             )
             task = make_archive_task(archive_path, format_hint="zip")
 
-            result = extractor.extract(task, str(out_dir))
+            result = run_extract(extractor, task, str(out_dir))
 
             scan.assert_called_once()
             self.assertTrue(result.success)
@@ -96,8 +98,8 @@ class ExtractionExecutionTests(unittest.TestCase):
             task.cleanup_parts = [str(archive_path), str(launcher_path)]
 
             succeeded = _completed(returncode=0, stdout="", stderr="")
-            extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: succeeded
-            result = extractor.extract(task, str(out_dir))
+            stub_worker_attempt(extractor.sevenzip_runner, lambda **_kwargs: succeeded)
+            result = run_extract(extractor, task, str(out_dir))
 
             self.assertTrue(result.success)
             self.assertEqual(task.cleanup_parts, [str(archive_path), str(launcher_path)])
@@ -116,10 +118,8 @@ class ExtractionExecutionTests(unittest.TestCase):
 
                 failed = _completed(returncode=returncode, stdout="", stderr=stderr)
                 calls = []
-                extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
-                    calls.append(kwargs) or failed
-                )
-                result = extractor.extract(make_archive_task(archive_path), str(Path(tmp) / "out"))
+                stub_worker_attempt(extractor.sevenzip_runner, lambda **kwargs: calls.append(kwargs) or failed)
+                result = run_extract(extractor, make_archive_task(archive_path), str(Path(tmp) / "out"))
                 self.assertFalse(result.success)
                 self.assertEqual(len(calls), 1)
                 self.assertNotIn("retried", result.error.lower())
@@ -157,8 +157,8 @@ class ExtractionExecutionTests(unittest.TestCase):
                 calls += 1
                 return failed
 
-            extractor.sevenzip_runner.extract_attempt = fake_extract
-            result = extractor.extract(task, str(out_dir))
+            stub_worker_attempt(extractor.sevenzip_runner, fake_extract)
+            result = run_extract(extractor, task, str(out_dir))
 
             self.assertFalse(result.success)
             self.assertEqual(result.error, "Archive is damaged")
@@ -229,9 +229,9 @@ class ExtractionExecutionTests(unittest.TestCase):
                 return _completed(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             task = make_archive_task(archive_path)
-            extractor.sevenzip_runner.extract_attempt = fake_extract
+            stub_worker_attempt(extractor.sevenzip_runner, fake_extract)
 
-            result = extractor.extract(task, str(out_dir))
+            result = run_extract(extractor, task, str(out_dir))
 
             self.assertFalse(result.success)
             self.assertTrue(result.partial_outputs)

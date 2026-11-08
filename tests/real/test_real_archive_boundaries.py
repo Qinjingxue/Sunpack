@@ -10,6 +10,7 @@ import pytest
 
 from sunpack.pipeline.coordinator.task_scan import direct_file_task
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from tests.helpers.async_batch import run_extract
 from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.real_archives import ArchiveFixtureFactory, corrupt_file
 
@@ -127,7 +128,4 @@ def _extract_direct(
     descriptor = replace(task.archive_input(), format_hint=detected_ext)
     task.set_archive_input(descriptor)
     scheduler = ExtractionScheduler()
-    try:
-        return scheduler.extract(task, str(output_dir))
-    finally:
-        scheduler.close()
+    return run_extract(scheduler, task, str(output_dir))

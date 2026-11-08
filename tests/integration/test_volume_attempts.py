@@ -7,6 +7,7 @@ individual implementation helpers.
 """
 import asyncio
 from sunpack_native import encode_worker_frame
+from tests.helpers.async_batch import run_extract
 from tests.helpers.worker_events import worker_events
 import json
 from pathlib import Path
@@ -62,10 +63,7 @@ def test_attempt_plan_survives_passwords_carrier_ranges_and_serialization(tmp_pa
     output = tmp_path / "out"
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     extractor.sevenzip_runner.worker_path = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
-    try:
-        result = extractor.extract(task, str(output))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, task, str(output))
     assert result.success, (result.error, result.diagnostics)
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
     assert all(node.descriptor.volume_attempts is None for node in task.inputs)
@@ -225,10 +223,7 @@ def test_conflicting_rar_slot_uses_winner_without_claiming_loser(tmp_path, carri
     refs.register(task)
     extractor = ExtractionScheduler()
     extractor.sevenzip_runner.worker_path = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
-    try:
-        result = extractor.extract(task, str(tmp_path / "out"))
-    finally:
-        extractor.close()
+    result = run_extract(extractor, task, str(tmp_path / "out"))
     assert result.success, (result.error, result.diagnostics)
     assert task.archive_input().part_paths() == [str(path) for path in parts]
     refs.refresh(task)
@@ -513,12 +508,9 @@ def test_rejected_candidate_keeps_its_independent_embedded_archive(tmp_path, pas
     tasks = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)]).tasks
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     extractor.sevenzip_runner.worker_path = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
-    try:
-        for index, task in enumerate(tasks):
-            result = extractor.extract(task, str(tmp_path / "outputs" / str(index)))
-            assert result.success, (result.error, result.diagnostics)
-    finally:
-        extractor.close()
+    for index, task in enumerate(tasks):
+        result = run_extract(extractor, task, str(tmp_path / "outputs" / str(index)))
+        assert result.success, (result.error, result.diagnostics)
     assert len(list((tmp_path / "outputs").rglob(case.marker_name))) == 1
     assert [p.read_text(encoding="utf-8") for p in (tmp_path / "outputs").rglob("independent.txt")] == ["independent content"]
 
@@ -607,11 +599,8 @@ def test_candidate_carrier_retains_an_independent_split_head(tmp_path, archive_f
     tasks = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(first.archive_dir)]).tasks
     extractor = ExtractionScheduler()
     extractor.sevenzip_runner.worker_path = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
-    try:
-        for index, task in enumerate(tasks):
-            result = extractor.extract(task, str(tmp_path / "outputs" / str(index)))
-            assert result.success, (result.error, result.diagnostics)
-    finally:
-        extractor.close()
+    for index, task in enumerate(tasks):
+        result = run_extract(extractor, task, str(tmp_path / "outputs" / str(index)))
+        assert result.success, (result.error, result.diagnostics)
     for case in (first, second):
         assert [p.read_text(encoding="utf-8") for p in (tmp_path / "outputs").rglob(case.marker_name)] == [case.marker_text]

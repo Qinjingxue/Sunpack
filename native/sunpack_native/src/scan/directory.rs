@@ -1399,11 +1399,11 @@ fn build_inventory_snapshot_views(
         }
         let item = &files[item_index];
         if item.magic.len() >= item.size.min(512) as usize {
-            record.relation_anchor = Some(CheapAnchor::from_cheap(probe_volume_anchor_from_head(
+            record.relation_anchor = Some(probe_volume_anchor_from_head(
                 &record.path,
                 item.size,
                 &item.magic,
-            )));
+            ));
         }
     }
 

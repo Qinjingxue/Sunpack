@@ -223,9 +223,9 @@ void check_open_callback()
     check(rejects(as_unknown(probe), IID_IProgress), "QI(foreign IID) == E_NOINTERFACE");
 }
 
-void check_open_callback_volume_prefetch()
+void check_open_callback_canonical_range()
 {
-    std::printf("OpenCallback volume prefetch\n");
+    std::printf("OpenCallback canonical range\n");
 
     wchar_t executable[MAX_PATH]{};
     const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
@@ -236,21 +236,22 @@ void check_open_callback_volume_prefetch()
     }
 
     const std::wstring path(executable, length);
-    const std::wstring name = std::filesystem::path(path).filename().wstring();
-    InputPrefetchConfig prefetch;
-    prefetch.enabled = false;
+    const std::wstring name = L"archive.part2.rar";
 
     auto *raw = new OpenCallback(
-        L"", path, std::vector<std::wstring>{path}, std::vector<std::wstring>{}, prefetch);
+        L"", L"archive.part1.rar", {}, {name}, InputPrefetchConfig{false}, {},
+        {{path, 1, 2, true}});
     CMyComPtr<IArchiveOpenCallback> callback(raw);
 
     CMyComPtr<IInStream> stream;
     const HRESULT hr = raw->GetStream(name.c_str(), &stream);
-    check(hr == S_OK && stream, "volume callback opens configured stream");
+    check(hr == S_OK && stream, "volume callback resolves a canonical name to its range");
     if (hr == S_OK && stream)
     {
-        auto *file = static_cast<FileInStream *>(stream.Interface());
-        check(!file->prefetch_enabled(), "volume callback preserves disabled prefetch policy");
+        char bytes[2]{};
+        UInt32 read = 0;
+        check(stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 1 && bytes[0] == 'Z',
+              "volume callback reads only the configured range");
     }
 }
 
@@ -569,7 +570,7 @@ int main()
     check_extract_to_disk_callback();
     check_archive_root_directory_entries();
     check_open_callback();
-    check_open_callback_volume_prefetch();
+    check_open_callback_canonical_range();
     check_streams();
     check_crc32_incremental_contract();
     check_archive_open_start_and_carrier_fallback();

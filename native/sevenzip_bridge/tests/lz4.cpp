@@ -253,6 +253,12 @@ int wmain(int argc,wchar_t **argv) {
         save(root/L"concat_partial.bin",partial);
         Bytes prefix=standard;prefix.resize(prefix.size()+29,0x88);save(root/L"prefix_carrier.dat",prefix);
         auto empty=frame({},4,false,true,true,true);decode(empty,{});save(root/L"empty.lz4",empty);
+        auto wrong_size=frame(Bytes{'a','b'},4,false,true,true,true);
+        for (int size : {0, 1}) {
+            wrong_size[6]=static_cast<unsigned char>(size);
+            wrong_size[14]=static_cast<unsigned char>(XXH32(wrong_size.data()+4,10,0)>>8);
+            decode(wrong_size,{},31,SUP_LZ4_DATA);
+        }
         auto damaged=standard;damaged.back()^=1;decode(damaged,{},4096,SUP_LZ4_CHECKSUM);save(root/L"bad_content.lz4",damaged);
         auto bad_header=standard;bad_header[14]^=1;decode(bad_header,{},31,SUP_LZ4_CHECKSUM);save(root/L"bad_header.lz4",bad_header);
         auto bad_block=standard;bad_block[19]^=1;decode(bad_block,{},31,SUP_LZ4_CHECKSUM);save(root/L"bad_block.lz4",bad_block);

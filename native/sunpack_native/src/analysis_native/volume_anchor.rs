@@ -195,7 +195,7 @@ pub(crate) enum CheapAnchor {
 }
 
 impl CheapAnchor {
-    pub(crate) fn from_cheap(anchor: VolumeAnchor) -> Self {
+    fn from_probe(path: &str, mut anchor: VolumeAnchor) -> Self {
         if anchor.format.is_empty()
             && anchor.pe_state == PeState::None
             && anchor.error.is_empty()
@@ -207,6 +207,7 @@ impl CheapAnchor {
                 reject_mask: anchor.format_reject_mask,
             }
         } else {
+            anchor.path = path.to_owned();
             Self::Full(Arc::new(anchor))
         }
     }
@@ -263,23 +264,43 @@ pub(crate) fn probe_volume_anchor_record_cheap(
     if let Some(anchor) = cached.as_deref().and_then(Option::as_ref) {
         return anchor.clone();
     }
-    let anchor = CheapAnchor::from_cheap(probe_path_cheap_direct(path, size, None, scope));
+    let read_len = size.min(512) as usize;
+    let mut prefix = [0u8; 512];
+    let read = scope
+        .map_or_else(|| open_cheap_file(path), |scope| scope.open_reader(path))
+        .and_then(|mut file| file.read_exact(&mut prefix[..read_len]));
+    let anchor = match read {
+        Ok(()) => probe_volume_anchor_from_head(path, size, &prefix[..read_len]),
+        Err(error) => CheapAnchor::from_probe(
+            path,
+            VolumeAnchor {
+                size,
+                error: error.to_string(),
+                ..VolumeAnchor::default()
+            },
+        ),
+    };
     if let Some(cached) = cached.as_deref_mut().filter(|_| anchor.reusable()) {
         *cached = Some(anchor.clone());
     }
     anchor
 }
 
-pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) -> VolumeAnchor {
+pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) -> CheapAnchor {
     let prefix_len = head.len().min(size.min(512) as usize);
-    let mut result = VolumeAnchor {
-        path: path.to_string(),
+    let prefix = &head[..prefix_len];
+    let result = VolumeAnchor {
         size,
         bytes_read: prefix_len as u64,
+        format_reject_mask: unified_prefilter_mask_from_head(size, prefix),
         ..VolumeAnchor::default()
     };
-    result.format_reject_mask = unified_prefilter_mask_from_head(size, &head[..prefix_len]);
-    probe_cheap_prefix(result, &head[..prefix_len], None)
+    CheapAnchor::from_probe(
+        path,
+        probe_cheap_prefix(result, prefix, None, Some(path), |offset, len| {
+            ManagedReader::open(path)?.read_at(offset, len)
+        }),
+    )
 }
 
 pub(crate) fn cheap_fast_probe_pool() -> &'static rayon::ThreadPool {
@@ -355,7 +376,9 @@ fn probe_path(path: &str, password: Option<&str>, depth: VolumeAnchorProbeDepth)
     result.bytes_read += prefix.len() as u64;
     result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
     if depth == VolumeAnchorProbeDepth::Cheap {
-        return probe_cheap_prefix(result, &prefix, password);
+        return probe_cheap_prefix(result, &prefix, password, None, |offset, len| {
+            reader.read_at(offset, len)
+        });
     }
     let pe = probe_pe_prefix(&prefix, size);
     result.pe_state = pe.state();
@@ -372,8 +395,10 @@ fn probe_cheap_prefix(
     mut result: VolumeAnchor,
     prefix: &[u8],
     password: Option<&str>,
+    path: Option<&str>,
+    read: impl Fn(u64, usize) -> std::io::Result<Vec<u8>>,
 ) -> VolumeAnchor {
-    let prefix = complete_anchor_prefix(prefix, &mut result, 0, None);
+    let prefix = complete_anchor_prefix(prefix, &mut result, 0, &read);
     let prefix = prefix.as_ref();
     // Relation is a split-volume recovery layer, not a general archive
     // detector.  The cheap pass only keeps structure that can itself seed
@@ -381,7 +406,7 @@ fn probe_cheap_prefix(
     // numbered ordinary archive from being mistaken for a volume.
     if anchored_signature(prefix, RAR5)
         .or_else(|| anchored_signature(prefix, RAR4))
-        .is_some_and(|offset| probe_rar(prefix, offset, &mut result, password))
+        .is_some_and(|offset| probe_rar_at_reader(prefix, offset, &mut result, password, 0, &read))
     {
         return result;
     }
@@ -402,38 +427,8 @@ fn probe_cheap_prefix(
     let pe = probe_pe_prefix(prefix, result.size);
     result.pe_state = pe.state();
     result.pe_image_end = pe.image_end();
-    probe_standalone_stream(prefix, &mut result);
+    probe_standalone_stream(prefix, &mut result, path);
     result
-}
-
-fn probe_path_cheap_direct(
-    path: &str,
-    size: u64,
-    password: Option<&str>,
-    scope: Option<&NativeReadScope>,
-) -> VolumeAnchor {
-    let mut result = VolumeAnchor {
-        path: path.to_string(),
-        size,
-        ..VolumeAnchor::default()
-    };
-    let read_len = size.min(512) as usize;
-    let mut prefix = [0u8; 512];
-    let mut file =
-        match scope.map_or_else(|| open_cheap_file(path), |scope| scope.open_reader(path)) {
-            Ok(file) => file,
-            Err(error) => {
-                result.error = error.to_string();
-                return result;
-            }
-        };
-    if let Err(error) = file.read_exact(&mut prefix[..read_len]) {
-        result.error = error.to_string();
-        return result;
-    }
-    result.bytes_read = read_len as u64;
-    result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix[..read_len]);
-    probe_cheap_prefix(result, &prefix[..read_len], password)
 }
 
 fn open_cheap_file(path: &str) -> std::io::Result<TrackedFile> {
@@ -446,7 +441,7 @@ fn read_anchor_header_from(
     out: &mut VolumeAnchor,
     offset: u64,
     len: usize,
-    reader: Option<&ManagedReader>,
+    read: impl FnOnce(u64, usize) -> std::io::Result<Vec<u8>>,
 ) -> Option<Vec<u8>> {
     if offset
         .checked_add(len as u64)
@@ -455,10 +450,7 @@ fn read_anchor_header_from(
         out.error = "archive_header_incomplete".into();
         return None;
     }
-    match reader.map_or_else(
-        || ManagedReader::open(&out.path).and_then(|r| r.read_at(offset, len)),
-        |r| r.read_at(offset, len),
-    ) {
+    match read(offset, len) {
         Ok(bytes) if bytes.len() == len => {
             out.bytes_read += len as u64;
             Some(bytes)
@@ -480,7 +472,7 @@ fn complete_anchor_prefix<'a>(
     prefix: &'a [u8],
     out: &mut VolumeAnchor,
     base: u64,
-    reader: Option<&ManagedReader>,
+    read: impl FnOnce(u64, usize) -> std::io::Result<Vec<u8>>,
 ) -> Cow<'a, [u8]> {
     let required = if let Some(at) = anchored_signature(prefix, RAR5) {
         rar5_header_len(&prefix[at + RAR5.len()..]).and_then(|n| (at + RAR5.len()).checked_add(n))
@@ -509,7 +501,7 @@ fn complete_anchor_prefix<'a>(
     // A continuation may merely resemble another format's leading header.
     // Failed speculative completion must not exclude that opaque volume.
     let previous_error = std::mem::take(&mut out.error);
-    let rest = read_anchor_header_from(out, offset, required - prefix.len(), reader);
+    let rest = read_anchor_header_from(out, offset, required - prefix.len(), read);
     out.error = previous_error;
     let Some(rest) = rest else {
         return Cow::Borrowed(prefix);
@@ -570,27 +562,13 @@ fn probe_zip_eocd_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
     true
 }
 
-fn probe_rar(prefix: &[u8], offset: usize, out: &mut VolumeAnchor, password: Option<&str>) -> bool {
-    probe_rar_at(prefix, offset, out, password, 0)
-}
-
-fn probe_rar_at(
-    prefix: &[u8],
-    offset: usize,
-    out: &mut VolumeAnchor,
-    password: Option<&str>,
-    base: u64,
-) -> bool {
-    probe_rar_at_reader(prefix, offset, out, password, base, None)
-}
-
 fn probe_rar_at_reader(
     prefix: &[u8],
     offset: usize,
     out: &mut VolumeAnchor,
     password: Option<&str>,
     base: u64,
-    reader: Option<&ManagedReader>,
+    read: impl Fn(u64, usize) -> std::io::Result<Vec<u8>>,
 ) -> bool {
     if prefix
         .get(offset..)
@@ -613,7 +591,7 @@ fn probe_rar_at_reader(
                     &prefix[offset..],
                     password,
                     |relative, len| {
-                        read_anchor_header_from(out, base + offset as u64 + relative, len, reader)
+                        read_anchor_header_from(out, base + offset as u64 + relative, len, &read)
                     },
                 ) {
                     out.needs_password = false;
@@ -670,7 +648,7 @@ fn probe_rar_at_reader(
                     &prefix[offset..],
                     password,
                     |relative, len| {
-                        read_anchor_header_from(out, base + offset as u64 + relative, len, reader)
+                        read_anchor_header_from(out, base + offset as u64 + relative, len, &read)
                     },
                 )
                 .is_some()
@@ -1501,12 +1479,13 @@ fn probe_anchor_reader_prefix(
     prefix: &[u8],
     result: &mut VolumeAnchor,
 ) -> std::io::Result<bool> {
-    let prefix = complete_anchor_prefix(prefix, result, offset, Some(reader));
+    let read = |offset, len| reader.read_at(offset, len);
+    let prefix = complete_anchor_prefix(prefix, result, offset, read);
     let prefix = prefix.as_ref();
     let remaining = reader.len().saturating_sub(offset);
     if (format.is_empty() || format == "rar")
         && (prefix.starts_with(RAR4) || prefix.starts_with(RAR5))
-        && probe_rar_at_reader(prefix, 0, result, password, offset, Some(reader))
+        && probe_rar_at_reader(prefix, 0, result, password, offset, read)
     {
         return Ok(true);
     }
@@ -1517,7 +1496,7 @@ fn probe_anchor_reader_prefix(
         return Ok(true);
     }
     if format.is_empty() && offset == 0 {
-        probe_standalone_stream(prefix, result);
+        probe_standalone_stream(prefix, result, None);
         if !result.format.is_empty() {
             return Ok(true);
         }
@@ -1537,7 +1516,7 @@ fn probe_anchor_reader_prefix(
     Ok(!result.format.is_empty())
 }
 
-fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
+fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor, path: Option<&str>) {
     let format = if prefix.starts_with(sunpack_enc::MAGIC) {
         "enc"
     } else if crate::formats::lz4::leading(prefix) {
@@ -1558,7 +1537,7 @@ fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
     // A continuation volume may start with arbitrary compressed/encrypted
     // bytes. Magic alone must not remove it from its archive's cohort.
     // Keep the canonical identity fact on the anchor for Detection to reuse.
-    if !crate::analysis_native::confirm_format_identity_native(&out.path, format) {
+    if !crate::analysis_native::confirm_format_identity_native(path.unwrap_or(&out.path), format) {
         return;
     }
     out.format = format.to_string();
@@ -1805,11 +1784,23 @@ mod tests {
             .collect()
     }
 
+    fn probe_encrypted_rar(prefix: &[u8], password: Option<&str>) -> VolumeAnchor {
+        let mut anchor = VolumeAnchor::default();
+        assert!(probe_rar_at_reader(
+            prefix,
+            0,
+            &mut anchor,
+            password,
+            0,
+            |_, _| { unreachable!("test fixture contains the encrypted header") }
+        ));
+        anchor
+    }
+
     #[test]
     fn encrypted_single_rar_without_password_is_not_multivolume() {
         let prefix = hex_bytes(SINGLE_HP_HEX);
-        let mut anchor = VolumeAnchor::default();
-        assert!(probe_rar(&prefix, 0, &mut anchor, None));
+        let anchor = probe_encrypted_rar(&prefix, None);
         assert!(anchor.encrypted);
         assert!(anchor.needs_password);
         assert!(!anchor.wrong_password);
@@ -1824,8 +1815,7 @@ mod tests {
     #[test]
     fn encrypted_single_rar_with_correct_password_is_standalone() {
         let prefix = hex_bytes(SINGLE_HP_HEX);
-        let mut anchor = VolumeAnchor::default();
-        assert!(probe_rar(&prefix, 0, &mut anchor, Some("secret")));
+        let anchor = probe_encrypted_rar(&prefix, Some("secret"));
         assert!(anchor.standalone);
         assert!(!anchor.multivolume);
         assert!(!anchor.needs_password);
@@ -1835,8 +1825,7 @@ mod tests {
     #[test]
     fn encrypted_single_rar_with_wrong_password_reports_wrong_password() {
         let prefix = hex_bytes(SINGLE_HP_HEX);
-        let mut anchor = VolumeAnchor::default();
-        assert!(probe_rar(&prefix, 0, &mut anchor, Some("wrong")));
+        let anchor = probe_encrypted_rar(&prefix, Some("wrong"));
         assert!(anchor.encrypted);
         assert!(anchor.needs_password);
         assert!(anchor.wrong_password);
@@ -1848,14 +1837,12 @@ mod tests {
     fn encrypted_split_rar_uses_decrypted_volume_numbers() {
         let first = hex_bytes(PART1_HP_HEX);
         let second = hex_bytes(PART2_HP_HEX);
-        let mut first_anchor = VolumeAnchor::default();
-        assert!(probe_rar(&first, 0, &mut first_anchor, Some("secret")));
+        let first_anchor = probe_encrypted_rar(&first, Some("secret"));
         assert!(first_anchor.multivolume);
         assert_eq!(first_anchor.internal_volume_number, Some(1));
         assert!(first_anchor.anchor_roles.contains(&"first"));
 
-        let mut second_anchor = VolumeAnchor::default();
-        assert!(probe_rar(&second, 0, &mut second_anchor, Some("secret")));
+        let second_anchor = probe_encrypted_rar(&second, Some("secret"));
         assert!(second_anchor.multivolume);
         assert_eq!(second_anchor.internal_volume_number, Some(2));
         assert!(second_anchor.anchor_roles.contains(&"member"));

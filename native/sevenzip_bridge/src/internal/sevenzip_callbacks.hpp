@@ -94,7 +94,7 @@ namespace sunpack::sevenzip
         explicit OpenCallback(
             std::wstring password,
             std::wstring archive_path = L"",
-            std::vector<std::wstring> part_paths = {},
+            const std::vector<std::wstring> &part_paths = {},
             const std::vector<std::wstring> &canonical_names = {},
             InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
             std::shared_ptr<std::atomic<bool>> cancel_token = native_job_cancel_token(),
@@ -104,15 +104,19 @@ namespace sunpack::sevenzip
 
               archive_path_(std::move(archive_path)),
 
-              part_paths_(std::move(part_paths)),
               part_ranges_(part_ranges),
 
               volume_prefetch_config_(volume_prefetch_config), cancel_token_(std::move(cancel_token))
         {
 
-            if (!canonical_names.empty() && canonical_names.size() == part_paths_.size())
+            const auto part_count = part_paths.empty() ? part_ranges_.size() : part_paths.size();
+            const bool canonical = !canonical_names.empty() && canonical_names.size() == part_count;
+            // Canonical range inputs already own one physical path per alias.
+            if (!canonical || part_ranges_.size() != part_count)
+                part_paths_ = part_paths;
+            if (canonical)
             {
-                for (std::size_t index = 0; index < part_paths_.size(); ++index)
+                for (std::size_t index = 0; index < canonical_names.size(); ++index)
                 {
                     std::wstring alias = lower_path(std::filesystem::path(canonical_names[index]).filename().wstring());
                     if (!alias.empty())
@@ -221,10 +225,9 @@ namespace sunpack::sevenzip
             }
 
             const auto index = found->second;
-            const auto &path = part_paths_[index];
-            auto* stream = new VolumeInStream(path,
-                index < part_ranges_.size() ? &part_ranges_[index] : nullptr,
-                volume_prefetch_config_, input_error_);
+            const auto* range = index < part_ranges_.size() ? &part_ranges_[index] : nullptr;
+            const auto &path = range ? range->path : part_paths_[index];
+            auto* stream = new VolumeInStream(path, range, volume_prefetch_config_, input_error_);
             CMyComPtr<IInStream> stream_holder(stream);
             const bool opened = stream->is_open();
             if (!opened) {

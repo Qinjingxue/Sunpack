@@ -283,8 +283,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
     }
     const bool structured = mode == "native_volumes" || mode == "sfx_with_volumes";
     std::vector<ParsedPart> structured_parts;
-    input.part_paths.reserve(part_objects.size());
     if (structured) structured_parts.reserve(part_objects.size());
+    else input.part_paths.reserve(part_objects.size());
     for (const auto object_frame : part_objects) {
         const wire::ObjectView object(object_frame);
         const std::string_view path = object.string_field("path", "");
@@ -310,6 +310,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         const bool has_ranges = std::any_of(structured_parts.begin(), structured_parts.end(),
             [](const ParsedPart &part) { return part.start != 0 || part.has_end; });
         if (has_ranges) input.ranges.reserve(structured_parts.size());
+        else input.part_paths.reserve(structured_parts.size());
+        input.canonical_names.reserve(structured_parts.size());
         for (std::size_t index = 0; index < structured_parts.size(); ++index) {
             // Volume numbers are the Relations contract, so a gap is a proven
             // missing volume rather than a malformed request.  It is reported
@@ -327,11 +329,11 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
                 input.missing_volume_number = structured_parts[index - 1].number + 1;
             }
             auto& part = structured_parts[index];
-            if (has_ranges) input.ranges.push_back({part.path, part.start, part.end, part.has_end});
-            input.part_paths.push_back(std::move(part.path));
+            if (has_ranges) input.ranges.push_back({std::move(part.path), part.start, part.end, part.has_end});
+            else input.part_paths.push_back(std::move(part.path));
             input.canonical_names.push_back(std::move(part.canonical_name));
         }
-        if (input.part_paths.empty()) {
+        if (input.canonical_names.empty()) {
             input.validation_error = "structured volume descriptor has no parts";
         }
     }
@@ -731,21 +733,18 @@ void select_volume_attempt(const WorkerArchiveInput& source,
                            WorkerArchiveInput& input) {
     const auto& slots = source.volume_attempts.layouts[cursor.layout];
     const auto count = cursor.selected.size();
-    input.part_paths.resize(count);
     input.ranges.resize(count);
     input.canonical_names.resize(count);
     input.missing_volume_number = 0;
     unsigned int previous = 0;
     for (std::size_t i = 0; i < count; ++i) {
-        const auto& range = source.volume_attempts.sources[cursor.selected[i]];
-        input.part_paths[i] = range.path;
-        input.ranges[i] = range;
+        input.ranges[i] = source.volume_attempts.sources[cursor.selected[i]];
         input.canonical_names[i] = slots[i].name;
         if (!input.missing_volume_number && slots[i].number != previous + 1)
             input.missing_volume_number = static_cast<int>(previous + 1);
         previous = slots[i].number;
     }
-    input.archive_path = input.part_paths.front();
+    input.archive_path = input.ranges.front().path;
     if (input.missing_volume_number) return;
     const auto total = source.volume_attempts.tail_totals.empty()
         ? source.volume_attempts.head_size_from_total
@@ -806,15 +805,8 @@ int run_request(
     using namespace sunpack::sevenzip;
 
     const std::string& job_id = request.job_id;
-    const std::string& command = request.worker_command;
     if (auto *memory = current_native_memory_job(); memory && memory->revoked.load(std::memory_order_acquire))
         return kMemoryRetry;
-    if (command == "shutdown") {
-        print_frame(
-            (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
-            (wire::key("status") + wire::text("ok") + wire::key("native_status") + wire::text("ok") + wire::key("message") + wire::text("worker shutdown") + wire::end()));
-        return 0;
-    }
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
         return interrupted_result(job_id);
     }

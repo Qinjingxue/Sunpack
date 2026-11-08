@@ -27,8 +27,9 @@ class ExtractionScheduler:
             builtin_passwords=builtin_passwords or [],
         )
         self.password_session = PasswordSession()
-        self.password_tester = ArchivePasswordTester(password_store=self.password_store)
-        self.password_resolver = PasswordResolver(self.password_tester, self.password_session)
+        self.password_resolver = PasswordResolver(
+            ArchivePasswordTester(password_store=self.password_store), self.password_session,
+        )
         extraction_config = extraction_config if isinstance(extraction_config, dict) else {}
         self.output_config = output_config if isinstance(output_config, dict) else None
         self.extraction_config = extraction_config
@@ -84,20 +85,6 @@ class ExtractionScheduler:
         )
         return ExtractionResult(False, out_dir, error=failure.message, failure=failure)
 
-    def extract(
-        self,
-        task: ArchiveTask,
-        out_dir: str,
-        phase_timer: Any = None,
-        phase_prefix: str = "extract",
-    ) -> ExtractionResult:
-        return self._single_archive_extractor().extract(
-            task,
-            out_dir,
-            phase_timer=phase_timer,
-            phase_prefix=phase_prefix,
-        )
-
     async def extract_asyncio(
         self,
         broker,
@@ -120,9 +107,6 @@ class ExtractionScheduler:
             phase_timer=phase_timer,
             phase_prefix=phase_prefix,
         )
-
-    def close(self) -> None:
-        self.sevenzip_runner.close()
 
     def _single_archive_extractor(self) -> SingleArchiveExtractor:
         return SingleArchiveExtractor(

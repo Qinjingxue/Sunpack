@@ -20,109 +20,42 @@ namespace sunpack::sevenzip
         InputPrefetchConfig prefetch_config,
         const std::vector<ExtractInputRange> &input_ranges)
     {
-        if (!input_ranges.empty())
-        {
-            auto *stream = new MultiRangeInStream(input_ranges, trace, prefetch_config);
+        const auto opened_stream = [&](auto *stream) {
             opened = stream->is_open();
             return CMyComPtr<IInStream>(stream);
-        }
-        opened = false;
-
-        if (is_sfx_path(archive_path))
+        };
+        if (!input_ranges.empty())
         {
-
-            std::vector<std::wstring> volumes = unique_existing_paths(archive_path, part_paths);
-
-            if (!structured_order)
-            {
-
-                volumes = sorted_data_volume_paths(volumes);
-            }
-
-            if (!volumes.empty() && is_sfx_path(volumes.front()))
-            {
-
-                auto *stream = new FileInStream(volumes.front(), trace, L"sfx_file", prefetch_config);
-
-                opened = stream->is_open();
-
-                CMyComPtr<IInStream> owner(stream);
-
-                return owner;
-            }
-
-            if (volumes.size() > 1)
-            {
-
-                auto *stream = new MultiRangeInStream(std::move(volumes), trace, prefetch_config);
-
-                opened = stream->is_open();
-
-                CMyComPtr<IInStream> owner(stream);
-
-                return owner;
-            }
-
-            if (volumes.size() == 1)
-            {
-
-                auto *stream = new FileInStream(volumes.front(), trace, L"file", prefetch_config);
-
-                opened = stream->is_open();
-
-                CMyComPtr<IInStream> owner(stream);
-
-                return owner;
-            }
-
-            auto *stream = new FileInStream(archive_path, trace, L"file", prefetch_config);
-
-            opened = stream->is_open();
-
-            CMyComPtr<IInStream> owner(stream);
-
-            return owner;
+            return opened_stream(new MultiRangeInStream(input_ranges, trace, prefetch_config));
         }
-
+        const bool sfx = is_sfx_path(archive_path);
+        if (part_paths.empty() || (part_paths.size() == 1 && part_paths.front() == archive_path))
+        {
+            const bool sfx_volume = sfx && (structured_order || parse_volume_number(archive_path).has_value());
+            return opened_stream(new FileInStream(archive_path, trace, sfx_volume ? L"sfx_file" : L"file", prefetch_config));
+        }
         std::vector<std::wstring> paths = unique_existing_paths(archive_path, part_paths);
-
         if (!structured_order)
         {
-
             paths = sorted_data_volume_paths(paths);
         }
-
-        if (paths.empty())
+        if (sfx && !paths.empty() && is_sfx_path(paths.front()))
         {
-
-            paths = std::vector<std::wstring>{archive_path};
+            return opened_stream(new FileInStream(paths.front(), trace, L"sfx_file", prefetch_config));
         }
-
         if (paths.size() > 1)
         {
-
-            auto *stream = new MultiRangeInStream(std::move(paths), trace, prefetch_config);
-
-            opened = stream->is_open();
-
-            CMyComPtr<IInStream> owner(stream);
-
-            return owner;
+            return opened_stream(new MultiRangeInStream(std::move(paths), trace, prefetch_config));
         }
-
-        auto *stream = new FileInStream(archive_path, trace, L"file", prefetch_config);
-
-        opened = stream->is_open();
-
-        CMyComPtr<IInStream> owner(stream);
-
-        return owner;
+        const auto &single_path = sfx && !paths.empty() ? paths.front() : archive_path;
+        return opened_stream(new FileInStream(single_path, trace, L"file", prefetch_config));
     }
 
     std::wstring callback_archive_path(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths)
     {
 
-        if (is_sfx_path(archive_path))
+        if (!part_paths.empty() && !(part_paths.size() == 1 && part_paths.front() == archive_path) &&
+            is_sfx_path(archive_path))
         {
 
             const auto volumes = sorted_data_volume_paths(unique_existing_paths(archive_path, part_paths));

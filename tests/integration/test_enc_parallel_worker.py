@@ -60,7 +60,7 @@ def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_p
     capacities = []
 
     async def run():
-        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")), None)
+        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")))
         await process.start()
         capacities.append(int(process.handshake["thread_capacity"]))
         try:

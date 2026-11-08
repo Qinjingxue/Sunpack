@@ -80,7 +80,7 @@ def _load_library():
     # Keep one module reference across watch reloads and late COM callbacks.
     library = ctypes.CDLL(os.path.abspath(get_toast_library_path()))
     signatures = {
-        "create": [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
+        "create_presenter": [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
         "show": [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint64],
         "clear": [ctypes.c_void_p],
         "destroy": [ctypes.c_void_p],
@@ -106,9 +106,8 @@ class _NativeToastPresenter:
     def __init__(self, *, diagnostic_log_path=None):
         self._library = _load_library()
         self._context = ctypes.c_void_p()
-        executable, arguments = _activation_command()
-        _check_hresult(self._library.sunpack_toast_create(
-            executable, arguments, diagnostic_log_path or "", ctypes.byref(self._context),
+        _check_hresult(self._library.sunpack_toast_create_presenter(
+            str(current_process_executable()), diagnostic_log_path or "", ctypes.byref(self._context),
         ))
 
     def show(self, payload: bytes, sequence: int) -> None:

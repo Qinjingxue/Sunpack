@@ -324,18 +324,18 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     auto matches_value=[&](const Json& value) {
         return matches(value,query,time_query) && matches_root(value);
     };
+    const bool filter_values=!query.empty() || !view.task_root.empty();
     if(manifest.contains("live") && manifest["live"].is_object()) {
         auto live=std::make_unique<RunReader>(folder,manifest["live"],before,revision);
         if(live->unordered) {
-            // Live slots are mutable. Scan only their compact metadata, keeping
-            // at most one page of candidates; historical runs remain seekable.
+            // Keep at most one page of live candidates. Only filters on record
+            // contents need decoding before the merge with historical runs.
             auto earlier=[](const Entry& a,const Entry& b) { return std::tie(a.time,a.offset)<std::tie(b.time,b.offset); };
             while(live->position>=0) {
                 if((++scanned&63)==0 && cancelled && cancelled()) return Json();
                 auto key=live->key(); auto row=live->current;
                 if((!before || key<*before) && (live->selected.size()<PageRows+1 || earlier(live->selected.front(),row)) && matches_entry(row)) {
-                    auto value=live->value(packed,raw);
-                    if(matches_value(value)) {
+                    if(!filter_values || matches_value(live->value(packed,raw))) {
                         auto at=std::lower_bound(live->selected.begin(),live->selected.end(),row,earlier);
                         live->selected.insert(at,row);
                         if(live->selected.size()>PageRows+1) live->selected.erase(live->selected.begin());
@@ -355,10 +355,14 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         if(!selected) break;
         auto cursor=selected->key(); auto record=selected->current;
         if(!matches_entry(record)) { selected->previous(); continue; }
-        auto value=selected->value(packed,raw);
-        if(!matches_value(value)) { selected->previous(); continue; }
+        Json value;
+        if(filter_values) {
+            value=selected->value(packed,raw);
+            if(!matches_value(value)) { selected->previous(); continue; }
+        }
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
+        if(!filter_values) value=selected->value(packed,raw);
         auto row=project_task(value,root_index,language,labels,PageRows-projected.size());
         if(!row.is_null() && ids.insert(row.at("id").get_ref<const std::string&>()).second) {
             const auto timestamp=row.at("sortTimestamp").get<double>();

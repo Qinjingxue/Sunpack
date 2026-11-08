@@ -2,12 +2,10 @@ import asyncio
 import logging
 import os
 import subprocess
-import threading
 import time
 import uuid
 from codecs import getincrementaldecoder
 from collections import OrderedDict
-from concurrent.futures import Future
 from contextlib import nullcontext
 from typing import Any, Callable
 
@@ -42,47 +40,41 @@ class _NativeQueueCapacity:
     The worker reports every job's end with ``job_finished``. A rejected job's
     own ``job_finished`` frees nothing, while an admitted job's frees exactly
     one queue slot, so each such event resubmits one parked job. Retries are
-    therefore driven by native completion events instead of timers.
+    therefore driven by native completion events on the owner loop.
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
         self._waiters: OrderedDict[str, Callable[[], None]] = OrderedDict()
         self._rejected: set[str] = set()
 
     def park(
         self, job_id: str, resubmit: Callable[[], None], *,
-        completion: Future | asyncio.Future, other_jobs_active: bool,
+        completion: asyncio.Future, other_jobs_active: bool,
     ) -> None:
-        with self._lock:
-            self._rejected.add(job_id)
-            if completion.done():
-                return
-            if other_jobs_active:
-                self._waiters[job_id] = resubmit
-                return
+        self._rejected.add(job_id)
+        if completion.done():
+            return
+        if other_jobs_active:
+            self._waiters[job_id] = resubmit
+            return
         # Nothing admitted is left to finish, so no event could wake this job.
         resubmit()
 
     def release(self, job_id: str) -> None:
-        with self._lock:
-            if job_id in self._rejected:
-                self._rejected.discard(job_id)
-                return
-            waiter = self._waiters.popitem(last=False)[1] if self._waiters else None
-        if waiter is not None:
+        if job_id in self._rejected:
+            self._rejected.remove(job_id)
+        elif self._waiters:
+            _, waiter = self._waiters.popitem(last=False)
             waiter()
 
     def discard(self, job_id: str) -> None:
-        with self._lock:
-            self._waiters.pop(job_id, None)
+        self._waiters.pop(job_id, None)
 
     def flush(self) -> None:
         """Run every parked resubmission; each observes the dead worker and fails."""
-        with self._lock:
-            waiters = list(self._waiters.values())
-            self._waiters.clear()
-            self._rejected.clear()
+        waiters = list(self._waiters.values())
+        self._waiters.clear()
+        self._rejected.clear()
         for waiter in waiters:
             waiter()
 
@@ -137,296 +129,11 @@ def _is_stale_resource_event(state: dict[str, Any], payload: dict) -> bool:
     return False
 
 
-class _NativeWorkerProcess:
-    def __init__(self, worker_path: str, startupinfo, process_config: dict | None = None):
-        self.worker_path = worker_path
-        self.startupinfo = startupinfo
-        self.process_config = process_config or {}
-        self.process: subprocess.Popen | None = None
-        self.worker_epoch = ""
-        self._stderr = StdioHistory()
-        self._stderr_lock = threading.Lock()
-        self._async_jobs: dict[str, dict[str, Any]] = {}
-        self._dispatch_lock = threading.Lock()
-        self._stdin_lock = threading.Lock()
-        self._idle = threading.Condition(self._dispatch_lock)
-        self._close_lock = threading.Lock()
-        self._closing = False
-        self._aborted = False
-        self._shutdown_sent = False
-        self.queue_capacity = _NativeQueueCapacity()
-        self._start()
-
-    def _start(self) -> None:
-        self.worker_epoch = uuid.uuid4().hex
-        environment = os.environ.copy()
-        _apply_native_environment(environment, self.process_config)
-        self.process = subprocess.Popen(
-            [self.worker_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            startupinfo=self.startupinfo,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            cwd=runtime_working_directory(),
-            env=environment,
-        )
-        from sunpack.core.platform.windows.process_job import assign_child_process
-
-        assign_child_process(getattr(self.process, "pid", 0))
-        self._reader_threads = [
-            threading.Thread(target=self._dispatch_stdout, args=(self.process.stdout,), daemon=True),
-            threading.Thread(target=self._pump_stderr, args=(self.process.stderr,), daemon=True),
-        ]
-        for thread in self._reader_threads:
-            thread.start()
-
-    def submit_async(
-        self,
-        payload: bytes,
-        job_id: str,
-        *,
-        on_event: Callable[..., bool],
-        on_error: Callable[[str], None],
-    ) -> None:
-        """Send a job without allocating a Python wait thread.
-
-        The stdout dispatcher is the only reader of the worker's pipe; the native process owns extraction concurrency.
-        """
-        state = {
-            "on_event": on_event,
-            "on_error": on_error,
-            "completion_lock": threading.Lock(),
-            "accumulator": NativeWorkerResultAccumulator(job_id),
-        }
-        with self._dispatch_lock:
-            if self._closing:
-                raise RuntimeError("sevenzip_worker is closing")
-            if job_id in self._async_jobs:
-                raise RuntimeError(f"sevenzip_worker job id is already active: {job_id}")
-            self._async_jobs[job_id] = state
-        try:
-            self.send(payload)
-        except Exception:
-            # A failed write may have delivered a partial or complete request.
-            self.abort()
-            self._finish_async_job(job_id)
-            raise
-
-    def _finish_async_job(
-        self,
-        job_id: str,
-        *,
-        expected: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        with self._dispatch_lock:
-            state = self._async_jobs.get(job_id)
-            if state is None or (expected is not None and state is not expected):
-                return None
-            self._async_jobs.pop(job_id, None)
-            self._idle.notify_all()
-        return state
-
-    def _fail_async_job(self, job_id: str, state: dict[str, Any], message: str) -> bool:
-        with state["completion_lock"]:
-            claimed = self._finish_async_job(job_id, expected=state)
-            if claimed is None:
-                return False
-            try:
-                claimed["on_error"](message)
-            except Exception:
-                pass
-            return True
-
-    def has_other_jobs(self, job_id: str) -> bool:
-        with self._dispatch_lock:
-            return any(other != job_id for other in self._async_jobs)
-
-    def _dispatch_stdout(self, stream) -> None:
-        failure = "sevenzip_worker exited before job completion"
-        broken = False
-        try:
-            decoder = NativeWorkerFrameDecoder()
-            while block := stream.read1(_PIPE_BLOCK_BYTES):
-                events = decoder.feed(block)
-                del block
-                for payload in events:
-                    job_id = str(payload.get("job_id") or "")
-                    try:
-                        self._dispatch_event(payload, job_id)
-                    finally:
-                        if job_id and _is_job_finished(payload):
-                            self.queue_capacity.release(job_id)
-                        del payload
-                del events
-                decoder.check()
-            decoder.finish()
-        except Exception as exc:
-            broken = True
-            failure = f"sevenzip_worker transport/protocol failed: {exc}"
-        finally:
-            # EOF before shutdown or a broken protocol requires confirmed exit.
-            if broken or not self._shutdown_sent:
-                self.abort()
-            with self._dispatch_lock:
-                async_jobs = list(self._async_jobs.items())
-            for job_id, state in async_jobs:
-                self._fail_async_job(job_id, state, str(state.get("callback_error") or failure))
-            self.queue_capacity.flush()
-
-    def _dispatch_event(self, payload: dict[str, Any], job_id: str) -> None:
-        with self._dispatch_lock:
-            async_state = self._async_jobs.get(job_id) if job_id else None
-            if async_state is None or _is_stale_resource_event(async_state, payload):
-                return
-        terminal = _is_job_finished(payload)
-        completed = False
-        cancel_job = False
-        callback_error = async_state.get("callback_error")
-        with async_state["completion_lock"]:
-            with self._dispatch_lock:
-                if self._async_jobs.get(job_id) is not async_state:
-                    return
-            # Completion callbacks can publish results or resubmit from
-            # another thread immediately. Retire terminal registrations
-            # before handing off ownership, just as _fail_async_job does.
-            if terminal:
-                self._finish_async_job(job_id, expected=async_state)
-            try:
-                if callback_error:
-                    completed = terminal
-                else:
-                    if payload.get("type") == "protocol_error":
-                        raise ValueError(payload["message"])
-                    if async_state["accumulator"].accept(payload):
-                        return
-                    callback = async_state["on_event"]
-                    completed = bool(callback(payload))
-                    if terminal and not completed:
-                        raise ValueError("sevenzip_worker finished without a result")
-            except Exception as exc:
-                callback_error = f"sevenzip_worker job protocol/callback failed: {exc}"
-                async_state["callback_error"] = callback_error
-                async_state.pop("accumulator", None)
-                completed = terminal
-                cancel_job = not completed
-            if completed and not terminal:
-                self._finish_async_job(job_id, expected=async_state)
-        if cancel_job:
-            try:
-                self.cancel(job_id)
-            except Exception:
-                self.abort()
-        if completed and callback_error:
-            try:
-                async_state["on_error"](callback_error)
-            except Exception:
-                pass
-
-    def _pump_stderr(self, stream) -> None:
-        decoder = getincrementaldecoder("utf-8")("replace")
-        try:
-            while block := stream.read1(_PIPE_BLOCK_BYTES):
-                with self._stderr_lock:
-                    self._stderr.append(decoder.decode(block))
-                del block
-        except Exception:
-            pass
-        finally:
-            with self._stderr_lock:
-                self._stderr.append(decoder.decode(b"", final=True))
-
-    def take_stderr(self) -> list[str]:
-        with self._stderr_lock:
-            return self._stderr.take()
-
-    def is_alive(self) -> bool:
-        return self.process is not None and self.process.poll() is None
-
-    def send(self, payload: bytes) -> None:
-        if not self.is_alive() or self.process is None or self.process.stdin is None:
-            raise RuntimeError("sevenzip_worker is not running")
-        with self._stdin_lock:
-            self.process.stdin.write(payload)
-            self.process.stdin.flush()
-
-    def cancel(self, job_id: str) -> None:
-        self.send(encode_worker_frame({"worker_command": "cancel", "job_id": job_id}))
-
-    def abort(self) -> None:
-        """Stop native IO after confirmed transport failure or an explicit abort."""
-        with self._idle:
-            self._closing = True
-            self._aborted = True
-            self._idle.notify_all()
-        if self.process is not None:
-            if self.is_alive():
-                try:
-                    self.process.terminate()
-                except OSError:
-                    if self.is_alive():
-                        raise
-            self.process.wait()
-
-    def close(self) -> None:
-        if self.process is None:
-            return
-        with self._close_lock:
-            with self._idle:
-                self._closing = True
-                self._idle.wait_for(lambda: not self._async_jobs or self._aborted)
-            if self.is_alive() and not self._aborted:
-                try:
-                    # Publish intent before the write: EOF may arrive immediately.
-                    self._shutdown_sent = True
-                    self.send(encode_worker_frame({"worker_command": "shutdown", "job_id": "shutdown"}))
-                except Exception:
-                    self.abort()
-            self.process.wait()
-            for thread in self._reader_threads:
-                if thread is not threading.current_thread():
-                    thread.join()
-            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
-                if stream is not None:
-                    stream.close()
-
-
-class _NativeWorkerHolder:
-    def __init__(self, worker_path_callback, process_config: dict):
-        self.worker_path_callback = worker_path_callback
-        self.process_config = process_config
-        self._lock = threading.Lock()
-        self._worker: _NativeWorkerProcess | None = None
-        self._closed = False
-
-    def get_or_start(self, startupinfo) -> _NativeWorkerProcess:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("native worker is closed")
-            if self._worker is not None and self._worker.is_alive():
-                return self._worker
-            if self._worker is not None:
-                self._worker.close()
-            self._worker = _NativeWorkerProcess(
-                self.worker_path_callback(), startupinfo, self.process_config
-            )
-            return self._worker
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            worker = self._worker
-            self._worker = None
-        if worker is not None:
-            worker.close()
-
-
 class _AsyncNativeWorkerProcess:
     """Long-lived native worker transported entirely by the owner event loop."""
 
-    def __init__(self, worker_path: str, startupinfo, process_config: dict | None = None):
+    def __init__(self, worker_path: str, process_config: dict | None = None):
         self.worker_path = worker_path
-        self.startupinfo = startupinfo
         self.process_config = process_config or {}
         self.process: asyncio.subprocess.Process | None = None
         self.worker_epoch = ""
@@ -458,7 +165,6 @@ class _AsyncNativeWorkerProcess:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_WORKER_STREAM_LIMIT,
-            startupinfo=self.startupinfo,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             cwd=runtime_working_directory(),
             env=environment,
@@ -733,15 +439,15 @@ class _AsyncNativeWorkerProcess:
 
 
 class _AsyncNativeWorkerHolder:
-    def __init__(self, worker_path_callback, process_config: dict):
-        self.worker_path_callback = worker_path_callback
+    def __init__(self, worker_path: str | None, process_config: dict):
+        self.worker_path = worker_path
         self.process_config = process_config
         self._lock = asyncio.Lock()
         self._worker: _AsyncNativeWorkerProcess | None = None
         self._closed = False
         self._desired_process_mode = "normal"
 
-    async def get_or_start(self, startupinfo) -> _AsyncNativeWorkerProcess:
+    async def get_or_start(self) -> _AsyncNativeWorkerProcess:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("native worker is closed")
@@ -749,7 +455,7 @@ class _AsyncNativeWorkerHolder:
                 if self._worker is not None:
                     await self._worker.close()
                 self._worker = _AsyncNativeWorkerProcess(
-                    self.worker_path_callback(), startupinfo, self.process_config
+                    self.worker_path or get_sevenzip_bridge_worker_path(), self.process_config,
                 )
                 await self._worker.start()
                 await self._worker.set_process_mode(mode=self._desired_process_mode)
@@ -775,18 +481,17 @@ class _WorkerAttempt:
 
     __slots__ = (
         "runner", "worker", "request", "job_id", "task", "completion",
-        "schedule_retry", "frame", "stderr", "progress", "result", "cancelled",
+        "frame", "stderr", "progress", "result", "cancelled",
     )
 
     def __init__(
         self,
         runner: "SevenZipRunner",
-        worker: _NativeWorkerProcess | _AsyncNativeWorkerProcess,
+        worker: _AsyncNativeWorkerProcess,
         request: dict,
         job_id: str,
         task: ArchiveTask | None,
-        completion: Future | asyncio.Future,
-        schedule_retry: Callable[["_WorkerAttempt"], None] | None,
+        completion: asyncio.Future,
     ):
         self.runner = runner
         self.worker = worker
@@ -794,7 +499,6 @@ class _WorkerAttempt:
         self.job_id = job_id
         self.task = task
         self.completion = completion
-        self.schedule_retry = schedule_retry
         self.frame = encode_worker_frame(request)
         self.stderr = StdioHistory()
         self.progress = ProgressHistory()
@@ -817,48 +521,50 @@ class _WorkerAttempt:
         return True
 
     def resubmit(self) -> None:
-        self.schedule_retry(self)
+        self.worker.spawn_resubmission(self._retry())
+
+    async def _retry(self) -> None:
+        if not self.can_resubmit():
+            return
+        try:
+            await self.worker.submit(self.frame, self.job_id, on_event=self.on_event, on_error=self.on_error)
+        except Exception as exc:
+            self.on_error(f"native worker retry failed: {exc}")
 
     def on_event(self, event: dict[str, Any]) -> bool:
-        event.setdefault("worker_epoch", self.worker.worker_epoch)
         kind = event.get("type")
         if kind == "progress" or (kind == "native_memory" and event.get("event") in _MEMORY_EVENTS):
+            event.setdefault("worker_epoch", self.worker.worker_epoch)
             self.progress.append(event)
-            if kind == "native_memory":
-                self.runner._emit_native_event(self.task, event)
             self.runner._emit_progress(self.task, event)
-        elif kind in {"native_cpu", "native_memory", "native_event"}:
-            self.runner._emit_native_event(self.task, event)
-            if _is_job_finished(event) and self.result is not None:
-                result, self.result = self.result, None
-                if (
-                    not self.cancelled
-                    and result.get("retryable")
-                    and result.get("native_status") == "backpressure"
-                ):
-                    if self.schedule_retry is None:
-                        self.on_error("native worker backpressure requires an event loop")
-                    else:
-                        self.worker.queue_capacity.park(
-                            self.job_id,
-                            self.resubmit,
-                            completion=self.completion,
-                            other_jobs_active=self.worker.has_other_jobs(self.job_id),
-                        )
-                else:
-                    self.complete(self.runner._completed_process(
-                        [self.worker.worker_path],
-                        0 if result.get("status") == "ok" else 1,
-                        "",
-                        self.stderr.text(),
-                        request_payload=self.request,
-                        result_payload=result,
-                        progress_events=self.progress,
-                    ))
-                return True
         elif kind == "result":
+            event.setdefault("worker_epoch", self.worker.worker_epoch)
             self.stderr.extend(self.worker.take_stderr())
             self.result = event
+        elif _is_job_finished(event) and self.result is not None:
+            result, self.result = self.result, None
+            if (
+                not self.cancelled
+                and result.get("retryable")
+                and result.get("native_status") == "backpressure"
+            ):
+                self.worker.queue_capacity.park(
+                    self.job_id,
+                    self.resubmit,
+                    completion=self.completion,
+                    other_jobs_active=self.worker.has_other_jobs(self.job_id),
+                )
+            else:
+                self.complete(self.runner._completed_process(
+                    [self.worker.worker_path],
+                    0 if result.get("status") == "ok" else 1,
+                    "",
+                    self.stderr.text(),
+                    request_payload=self.request,
+                    result_payload=result,
+                    progress_events=self.progress,
+                ))
+            return True
         return False
 
     def on_error(self, message: str) -> None:
@@ -887,110 +593,40 @@ class _WorkerAttempt:
 class SevenZipRunner:
     def __init__(
         self,
-        process_config: dict,
+        process_config: dict | None = None,
         *,
-        shared_worker_holder: _NativeWorkerHolder | None = None,
         shared_async_worker_holder: _AsyncNativeWorkerHolder | None = None,
-        event_loop=None,
     ):
-        self.process_config = dict(process_config)
+        self.process_config = dict(process_config or {}) if shared_async_worker_holder is None else None
         self.progress_callback = None
-        self.native_event_callback = None
         self.request_id = ""
         self.origin = "foreground"
         self.worker_path = None
-        self._worker_holder: _NativeWorkerHolder | None = shared_worker_holder
-        self._owns_worker_holder = shared_worker_holder is None
         self._async_worker_holder = shared_async_worker_holder
         self._owns_async_worker_holder = shared_async_worker_holder is None
-        self._worker_holder_lock = threading.Lock()
-        self._event_loop = event_loop
 
-    def fork(self, process_config: dict) -> "SevenZipRunner":
-        """Create request-local callback state while sharing native workers."""
-        shared_holder = self._worker_holder_or_create()
-        shared_async_holder = self._async_worker_holder_or_create()
-        runner = SevenZipRunner(
-            process_config,
-            shared_worker_holder=shared_holder,
-            shared_async_worker_holder=shared_async_holder,
-            event_loop=self._event_loop,
-        )
+    def fork(self) -> "SevenZipRunner":
+        """Create request-local callback state while sharing the native worker."""
+        runner = SevenZipRunner(shared_async_worker_holder=self._async_worker_holder_or_create())
         runner.worker_path = self.worker_path
-        runner.native_event_callback = self.native_event_callback
         runner.request_id = self.request_id
         runner.origin = self.origin
         return runner
 
-    def bind_event_loop(self, loop) -> None:
-        self._event_loop = loop
-
     async def start_asyncio(self) -> dict[str, Any]:
-        worker = await self._async_worker_holder_or_create().get_or_start(None)
+        worker = await self._async_worker_holder_or_create().get_or_start()
         return dict(worker.handshake)
 
     async def set_process_mode_asyncio(self, *, mode: str) -> dict[str, Any]:
         holder = self._async_worker_holder_or_create()
         holder.set_desired_process_mode(mode)
-        worker = await holder.get_or_start(None)
+        worker = await holder.get_or_start()
         return await worker.set_process_mode(mode=mode)
 
-    def extract_attempt(self, **kwargs) -> subprocess.CompletedProcess:
-        return self.submit_attempt(**kwargs).result()
-
-    def submit_attempt(self, job: dict | None = None, **kwargs) -> Future:
-        """Submit an extraction attempt to native scheduling.
-
-        The returned future is completed by the stdout dispatcher; the Python callback executor never waits on native jobs.
-        """
-        try:
-            if job is None:
-                job = self._build_job(
-                    archive_path=kwargs["archive_path"],
-                    out_dir=kwargs["out_dir"],
-                    password=kwargs.get("password"),
-                    password_candidates=kwargs.get("password_candidates"),
-                    password_verified=bool(kwargs.get("password_verified")),
-                    selected_codepage=kwargs.get("selected_codepage"),
-                    task=kwargs["task"],
-                    phase_timer=kwargs.get("phase_timer"),
-                    phase_prefix=kwargs.get("phase_prefix", "sevenzip"),
-                )
-        except Exception as exc:
-            future = Future()
-            future.set_result(self._completed_process(
-                [self.worker_path or "sunpack_sevenzip_worker.exe"],
-                -100,
-                "",
-                f"sevenzip_worker setup failed: {exc}",
-                process_failure={
-                    "failure_stage": "worker_setup",
-                    "failure_kind": "process_start",
-                    "message": str(exc),
-                },
-            ))
-            return future
-        return self._submit_native_job(
-            job,
-            startupinfo=kwargs.get("startupinfo"),
-            task=kwargs.get("task"),
-        )
-
     async def submit_attempt_asyncio(
-        self, job: dict, *, startupinfo=None, task: ArchiveTask | None = None,
-    ) -> subprocess.CompletedProcess:
-        """Transport a prepared attempt; filesystem preparation belongs to the broker."""
-        return await self._submit_native_job_asyncio(
-            job,
-            startupinfo=startupinfo,
-            task=task,
-        )
-
-    async def _submit_native_job_asyncio(
         self,
         job: dict,
         *,
-        startupinfo=None,
         task: ArchiveTask | None = None,
     ) -> subprocess.CompletedProcess:
         prepared_job = dict(job)
@@ -1000,23 +636,10 @@ class SevenZipRunner:
         result_future = asyncio.get_running_loop().create_future()
         worker: _AsyncNativeWorkerProcess | None = None
         try:
-            worker = await self._async_worker_holder_or_create().get_or_start(startupinfo)
+            worker = await self._async_worker_holder_or_create().get_or_start()
             result_future.add_done_callback(lambda _: worker.queue_capacity.discard(job_id))
 
-            async def retry(attempt: _WorkerAttempt) -> None:
-                if not attempt.can_resubmit():
-                    return
-                try:
-                    await worker.submit(
-                        attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
-                    )
-                except Exception as exc:
-                    attempt.on_error(f"native worker retry failed: {exc}")
-
-            def schedule_retry(attempt: _WorkerAttempt) -> None:
-                worker.spawn_resubmission(retry(attempt))
-
-            attempt = _WorkerAttempt(self, worker, prepared_job, job_id, task, result_future, schedule_retry)
+            attempt = _WorkerAttempt(self, worker, prepared_job, job_id, task, result_future)
             submission = asyncio.create_task(worker.submit(
                 attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
             ))
@@ -1075,75 +698,6 @@ class SevenZipRunner:
             },
         )
 
-    def _submit_native_job(
-        self,
-        job: dict,
-        *,
-        startupinfo=None,
-        task: ArchiveTask | None = None,
-    ) -> Future:
-        """Submit one prepared job to the single native worker process."""
-        prepared_job = dict(job)
-        job_id = str(prepared_job.get("job_id") or "")
-        if not job_id:
-            raise ValueError("native job_id is required")
-        future = Future()
-
-        def complete(result: subprocess.CompletedProcess) -> None:
-            if not future.done():
-                future.set_result(result)
-
-        worker = None
-        try:
-            worker = self._worker_holder_or_create().get_or_start(startupinfo)
-            capacity = worker.queue_capacity
-
-            def retire_queue(_: Future) -> None:
-                nonlocal capacity
-                retired, capacity = capacity, None
-                retired.discard(job_id)
-
-            # concurrent.futures keeps done callbacks for the Future's whole
-            # lifetime. Release the queue reference when this one has run.
-            future.add_done_callback(retire_queue)
-
-            def retry(attempt: _WorkerAttempt) -> None:
-                if not attempt.can_resubmit():
-                    return
-                try:
-                    worker.submit_async(
-                        attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
-                    )
-                except Exception as exc:
-                    attempt.on_error(f"native worker retry failed: {exc}")
-
-            event_loop = self._event_loop
-
-            def schedule_retry(attempt: _WorkerAttempt) -> None:
-                event_loop.call_soon_threadsafe(retry, attempt)
-
-            attempt = _WorkerAttempt(
-                self, worker, prepared_job, job_id, task, future, schedule_retry if event_loop is not None else None,
-            )
-            worker.submit_async(
-                attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
-            )
-        except Exception as exc:
-            process_failure = {
-                "failure_stage": "worker_start" if worker is None else "worker_communication",
-                "failure_kind": "process_start" if worker is None else "process_io",
-                "message": str(exc),
-            }
-            complete(self._completed_process(
-                [self.worker_path or "sunpack_sevenzip_worker.exe"],
-                -100,
-                "",
-                f"native worker communication failed: {exc}",
-                request_payload=prepared_job,
-                process_failure=process_failure,
-            ))
-        return future
-
     def _build_job(
         self,
         *,
@@ -1157,21 +711,16 @@ class SevenZipRunner:
         phase_prefix: str = "sevenzip_build_job",
         password_verified: bool = False,
     ) -> dict:
-        attempt_id = f"{str(getattr(task, 'key', '') or archive_path)}:{time.monotonic_ns()}"
+        job_id = f"{str(getattr(task, 'key', '') or archive_path)}:{time.monotonic_ns()}"
         # The routing key and the request must use the same absolute path.  A failed
         # volume resolution falls back to a synthetic per-job key so the job gets an
         # isolated write facility rather than silently sharing another volume's.
         out_dir = normalized_output_dir(out_dir)
-        volume_key = resolve_output_volume_key(out_dir) or f"job:{attempt_id}"
+        volume_key = resolve_output_volume_key(out_dir) or f"job:{job_id}"
         job = {
-            "job_id": attempt_id,
-            "attempt_id": attempt_id,
+            "job_id": job_id,
             "request_id": str(self.request_id or ""),
             "origin": "watch" if self.origin == "watch" else "foreground",
-            "file_id": str(getattr(task, "key", "") or archive_path),
-            "input_id": task.inputs[0].input_id,
-            "stage": "extract",
-            "archive_path": archive_path,
             "output_dir": out_dir,
             "output_volume_key": volume_key,
             "password": password or "",
@@ -1184,10 +733,7 @@ class SevenZipRunner:
             job["codepage"] = selected_codepage
 
         with _phase(phase_timer, f"{phase_prefix}_archive_input"):
-            archive_input = task.archive_input()
-        if archive_input:
-            descriptor_payload = archive_input.to_dict()
-            job["archive_input"] = descriptor_payload
+            job["archive_input"] = task.archive_input().to_worker_input()
         return job
 
     @staticmethod
@@ -1210,20 +756,9 @@ class SevenZipRunner:
             progress_events=progress_events,
         )
 
-    def _worker_path(self) -> str:
-        if self.worker_path is None:
-            self.worker_path = get_sevenzip_bridge_worker_path()
-        return self.worker_path
-
-    def _worker_holder_or_create(self) -> _NativeWorkerHolder:
-        with self._worker_holder_lock:
-            if self._worker_holder is None:
-                self._worker_holder = _NativeWorkerHolder(self._worker_path, self.process_config)
-            return self._worker_holder
-
     def _async_worker_holder_or_create(self) -> _AsyncNativeWorkerHolder:
         if self._async_worker_holder is None:
-            self._async_worker_holder = _AsyncNativeWorkerHolder(self._worker_path, self.process_config)
+            self._async_worker_holder = _AsyncNativeWorkerHolder(self.worker_path, self.process_config)
         return self._async_worker_holder
 
     async def aclose(self) -> None:
@@ -1231,22 +766,6 @@ class SevenZipRunner:
             holder = self._async_worker_holder
             self._async_worker_holder = None
             await holder.close()
-        self.close()
-
-    def close(self) -> None:
-        if not self._owns_worker_holder:
-            return
-        with self._worker_holder_lock:
-            holder = self._worker_holder
-            self._worker_holder = None
-        if holder is not None:
-            holder.close()
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def _emit_progress(self, task: ArchiveTask, event: dict[str, Any]) -> None:
         callback = self.progress_callback
@@ -1279,16 +798,6 @@ class SevenZipRunner:
         callback = self.progress_callback
         if callback is not None:
             callback(task, item)
-
-    def _emit_native_event(self, task: ArchiveTask | None, event: dict[str, Any]) -> None:
-        callback = self.native_event_callback
-        if callback is None:
-            return
-        try:
-            callback(task, event)
-        except Exception:
-            pass
-
 
 def _phase(timer: Any | None, name: str):
     if timer is None:

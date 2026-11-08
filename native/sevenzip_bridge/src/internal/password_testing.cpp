@@ -287,7 +287,13 @@ namespace sunpack::sevenzip
             if (!stream_opened)
             {
 
-                if (is_sfx_path(archive_path) && !sorted_data_volume_paths(part_paths).empty())
+                const auto numbered = [](const std::wstring& path) { return parse_volume_number(path).has_value(); };
+                if (is_sfx_path(archive_path) &&
+                    (std::any_of(part_paths.begin(), part_paths.end(), numbered) ||
+                     (part_paths.empty() && !canonical_names.empty() &&
+                      std::any_of(input_ranges.begin(), input_ranges.end(), [&](const ExtractInputRange& range) {
+                          return numbered(range.path);
+                      }))))
                 {
                     result.status = PasswordTestStatus::NeedsVolumeOrTailDamaged;
                     result.is_archive = true;

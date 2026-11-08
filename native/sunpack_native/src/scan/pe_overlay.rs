@@ -555,6 +555,7 @@ mod tests {
                 bytes.len() as u64,
                 &bytes,
             );
+            let anchor = anchor.anchor().unwrap();
             assert_eq!(anchor.bytes_read, 512);
             assert!(!anchor.sfx);
             assert!(anchor.format.is_empty());

@@ -560,7 +560,7 @@ def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion
 ):
     """Lexical-only tests miss generated inputs re-entering through a junction.
 
-    One tiny real extraction covers admission after reservations end, legacy WAL
+    One tiny real extraction covers admission after reservations end, WAL
     recovery, promotion and retirement. Removing it leaves both output namespaces
     untested; four cases cover the two entry modes and scope relevance at low cost.
     """
@@ -568,7 +568,6 @@ def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion
     import subprocess
     import zipfile
 
-    from sunpack.core.support.path_keys import path_key
     from sunpack.runtime.watch.scheduler import WatchScheduler
 
     watched = tmp_path / "watched"
@@ -608,11 +607,6 @@ def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion
                     assert scheduler.should_ignore_event_path(str(root / "inner.blob"))
                     scheduler.enqueue(str(root / "inner.blob"), event_type="initial_scan")
                 assert scheduler.pending_count == before
-                # Simulate a pre-upgrade record: recovery must add the physical
-                # alias to the same persistent index without an event-time stat.
-                scheduler.state.commit_runtime([
-                    {"op": "runtime", "key": "owned|" + path_key(physical)},
-                ], durable=True)
                 return output, physical
             finally:
                 await scheduler.aclose()
