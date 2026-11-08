@@ -2,7 +2,7 @@ use crate::analysis_native::volume_anchor::CheapAnchor;
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
     build_native_candidate_groups_from_snapshot,
-    build_native_candidate_groups_from_snapshot_cached, relation_group_cached_anchors,
+    build_native_candidate_groups_from_snapshot_cached, collect_relation_cache,
     resolve_embedded_volumes, NativeRelationGroup, RelationCache,
 };
 use crate::scan::directory::{
@@ -179,13 +179,10 @@ impl NativeCandidateTable {
     }
 
     fn relation_cache(&self) -> RelationCache {
-        let mut cache = RelationCache::default();
-        for row in &self.rows {
-            if let Candidate::Relation(group) = row {
-                relation_group_cached_anchors(group, &mut cache);
-            }
-        }
-        cache
+        collect_relation_cache(self.rows.iter().filter_map(|row| match row {
+            Candidate::Relation(group) => Some(group.as_ref()),
+            Candidate::File(..) => None,
+        }))
     }
 
     fn relation_groups(
@@ -663,7 +660,7 @@ impl NativeEmbeddedBatch {
             let match_key = (key.clone(), anchor.structure_offset.unwrap_or(0));
             if anchor.standalone || (!anchor.multivolume && anchor.needs_password) {
                 if path_counts[&key] == 1 {
-                    self.excluded.insert(key.clone());
+                    batch.excluded.insert(key);
                 }
                 if let Some(scan) = item.scan {
                     let failure_reason = anchor.expected_logical_size.is_none().then(|| {
@@ -1287,9 +1284,14 @@ impl NativeCandidateTable {
     ) -> NativeEmbeddedBatch {
         let mut ids = std::mem::take(&mut routes.embedded);
         let ratio = recursive_ratio.clamp(0.0, 1.0);
-        let sized = if enabled && recursive && !force_scan && ratio > 0.0 {
-            ids.iter()
-                .filter_map(|&index| {
+        let select_all = enabled && (force_scan || !recursive);
+        if !select_all {
+            let mut threshold = 0.0;
+            let mut sizes = Vec::new();
+            if enabled && ratio > 0.0 {
+                sizes.reserve_exact(ids.len());
+                let mut total = 0.0;
+                for &index in &ids {
                     let size = match &self.rows[index] {
                         Candidate::File(table, row) => table.sizes[*row],
                         Candidate::Relation(group) => {
@@ -1300,35 +1302,22 @@ impl NativeCandidateTable {
                                 data.size()
                             }
                         }
-                    }?;
-                    (size > 0).then_some((index, size))
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let threshold = if recursive && !force_scan && ratio > 0.0 {
-            sized.iter().map(|(_, size)| *size as f64).sum::<f64>() * ratio
-        } else {
-            0.0
-        };
-        let select_all = enabled && (force_scan || !recursive);
-        let selected: HashSet<usize> = if !enabled || select_all || ratio <= 0.0 {
-            HashSet::new()
-        } else {
-            sized
-                .into_iter()
-                .filter(|(_, size)| *size as f64 >= threshold)
-                .map(|(index, _)| index)
-                .collect()
-        };
-        // Keep observed errors even when new I/O is disabled. The shared
-        // scheduler carries only work selected by this root's original policy.
-        ids.retain(|index| {
-            select_all
-                || selected.contains(index)
-                || matches!(routes.scans.get(index), Some(Err(_)))
-        });
+                    }
+                    .unwrap_or(0);
+                    sizes.push(size);
+                    total += size as f64;
+                }
+                threshold = total * ratio;
+            }
+            // Sizes follow the candidate order, so selection needs no hash set.
+            // Keep observed errors even when policy disables new I/O.
+            let mut sizes = sizes.into_iter();
+            ids.retain(|index| {
+                let size = sizes.next().unwrap_or(0);
+                (size > 0 && size as f64 >= threshold)
+                    || matches!(routes.scans.get(index), Some(Err(_)))
+            });
+        }
         if ids.is_empty() {
             // This root has no remaining I/O or cached errors. Its primary
             // decisions are already owned by Python; no recovery can use it.

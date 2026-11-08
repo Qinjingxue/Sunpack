@@ -518,15 +518,10 @@ class ArchiveInputDescriptor:
                 raise ValueError("archive input must use the canonical archive_input schema")
             descriptor = cls.from_dict(raw, archive_path=archive_path, part_paths=part_paths)
             if not descriptor.format_hint and format_hint:
-                return cls(
-                    entry_path=descriptor.entry_path,
-                    open_mode=descriptor.open_mode,
+                return replace(
+                    descriptor,
                     format_hint=format_hint,
                     logical_name=descriptor.logical_name or logical_name,
-                    volume_style=descriptor.volume_style,
-                    parts=list(descriptor.parts),
-                    extents=list(descriptor.extents),
-                    analysis=dict(descriptor.analysis),
                 )
             return descriptor
         return cls.from_parts(

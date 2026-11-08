@@ -60,16 +60,10 @@ enum ProposalStatus {
 pub(crate) struct ProposalValidation {
     status: ProposalStatus,
     proposal: RelationProposal,
-    facts: Arc<ProposalFacts>,
+    facts: Arc<RelationCache>,
     reason: Option<RelationFailureReason>,
     unresolved: Vec<String>,
     attempts: Option<attempts::VolumeAttempts>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ProposalFacts {
-    anchors: HashMap<String, VolumeAnchor>,
-    name_features: HashMap<String, filename::NameFeatures>,
 }
 
 impl ProposalValidation {
@@ -82,24 +76,17 @@ impl ProposalValidation {
     }
 }
 
-/// Owned by the candidate table's scan lifetime; never a process-wide cache.
-#[derive(Default)]
+/// Structural facts shared by proposals and reused during the same scan.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RelationCache {
     pub(crate) anchors: HashMap<String, VolumeAnchor>,
     names: HashMap<String, filename::NameFeatures>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum GroupKind {
-    Valid,
-    Password,
-    Incomplete,
-}
-
 #[derive(Debug)]
 pub(crate) enum NativeRelationGroup {
     Ordinary(RelationInput, bool),
-    Proposal(ProposalValidation, GroupKind),
+    Proposal(ProposalValidation),
 }
 
 pub(crate) struct RelationCandidateData<'a> {
@@ -120,7 +107,7 @@ impl<'a> RelationCandidateData<'a> {
     pub(crate) fn parts(&self) -> impl Iterator<Item = &'a str> {
         let (ordinary, proposal) = match self.group {
             NativeRelationGroup::Ordinary(row, _) => (Some(row.path.as_str()), None),
-            NativeRelationGroup::Proposal(validation, _) => (None, Some(validation)),
+            NativeRelationGroup::Proposal(validation) => (None, Some(validation)),
         };
         ordinary.into_iter().chain(
             proposal
@@ -132,7 +119,7 @@ impl<'a> RelationCandidateData<'a> {
     pub(crate) fn parts_len(&self) -> usize {
         match self.group {
             NativeRelationGroup::Ordinary(..) => 1,
-            NativeRelationGroup::Proposal(validation, _) => {
+            NativeRelationGroup::Proposal(validation) => {
                 validation.proposal.volumes.len() + validation.unresolved.len()
             }
         }
@@ -147,7 +134,7 @@ impl<'a> RelationCandidateData<'a> {
                     .map(logical_name_from_parsed)
                     .unwrap_or_else(|| get_logical_name(&row.name, true)),
             ),
-            NativeRelationGroup::Proposal(validation, _) => {
+            NativeRelationGroup::Proposal(validation) => {
                 Cow::Borrowed(&validation.proposal.logical_name)
             }
         }
@@ -168,7 +155,7 @@ impl<'a> RelationCandidateData<'a> {
                     Cow::Owned(split_family_for_proposal(format, parsed.style))
                 })
                 .unwrap_or(Cow::Borrowed("")),
-            NativeRelationGroup::Proposal(validation, _) => Cow::Owned(proposal_split_family(
+            NativeRelationGroup::Proposal(validation) => Cow::Owned(proposal_split_family(
                 &validation.proposal,
                 &validation.facts.anchors,
             )),
@@ -178,7 +165,7 @@ impl<'a> RelationCandidateData<'a> {
     pub(crate) fn size(&self) -> Option<u64> {
         match self.group {
             NativeRelationGroup::Ordinary(row, _) => row.size,
-            NativeRelationGroup::Proposal(validation, _) => validation
+            NativeRelationGroup::Proposal(validation) => validation
                 .facts
                 .anchors
                 .get(&path_key(self.entry_path))
@@ -189,7 +176,7 @@ impl<'a> RelationCandidateData<'a> {
     pub(crate) fn logical_size(&self) -> Option<u64> {
         match self.group {
             NativeRelationGroup::Ordinary(row, _) => row.size,
-            NativeRelationGroup::Proposal(validation, _) => {
+            NativeRelationGroup::Proposal(validation) => {
                 proposal_logical_size(&validation.proposal, &validation.facts.anchors)
             }
         }
@@ -198,13 +185,13 @@ impl<'a> RelationCandidateData<'a> {
 
 impl NativeRelationGroup {
     pub(crate) fn is_incomplete(&self) -> bool {
-        matches!(self, Self::Proposal(_, GroupKind::Incomplete))
+        matches!(self, Self::Proposal(validation) if validation.status == ProposalStatus::Inconclusive)
     }
 
     pub(crate) fn entry_anchor(&self) -> Option<&VolumeAnchor> {
         match self {
             Self::Ordinary(row, _) => row.anchor.as_ref(),
-            Self::Proposal(validation, _) => validation
+            Self::Proposal(validation) => validation
                 .facts
                 .anchors
                 .get(&path_key(self.candidate_data().entry_path)),
@@ -214,15 +201,7 @@ impl NativeRelationGroup {
     pub(crate) fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = match self {
             Self::Ordinary(row, confirmed) => ordinary_file_group_to_dict(py, row, *confirmed),
-            Self::Proposal(validation, GroupKind::Valid) => {
-                validated_proposal_to_dict(py, validation)
-            }
-            Self::Proposal(validation, GroupKind::Password) => {
-                password_error_proposal_to_dict(py, validation)
-            }
-            Self::Proposal(validation, GroupKind::Incomplete) => {
-                incomplete_proposal_to_dict(py, validation)
-            }
+            Self::Proposal(validation) => proposal_to_dict(py, validation),
         }?;
         let data = self.candidate_data();
         let reason = if data.needs_password {
@@ -259,7 +238,7 @@ impl NativeRelationGroup {
 
     pub(crate) fn speculative_paths(&self) -> impl Iterator<Item = &str> {
         let plan = match self {
-            Self::Proposal(validation, _) => validation.attempts.as_ref(),
+            Self::Proposal(validation) => validation.attempts.as_ref(),
             _ => None,
         };
         plan.into_iter()
@@ -283,7 +262,7 @@ impl NativeRelationGroup {
             }
         };
         match self {
-            Self::Proposal(validation, _) => {
+            Self::Proposal(validation) => {
                 if let Some(plan) = &validation.attempts {
                     for source in &plan.sources {
                         record(path_key(&source.path), source.start, source.proven_end);
@@ -339,7 +318,7 @@ impl NativeRelationGroup {
                     }),
                 }
             }
-            Self::Proposal(validation, kind) => {
+            Self::Proposal(validation) => {
                 let proposal = &validation.proposal;
                 let head = proposal
                     .volumes
@@ -358,7 +337,7 @@ impl NativeRelationGroup {
                         .map(String::as_str)
                         .unwrap_or(&head.0),
                     is_split: true,
-                    needs_password: matches!(kind, GroupKind::Password),
+                    needs_password: validation.status == ProposalStatus::NeedsPassword,
                     multivolume: true,
                     relation_confirmed: validation_relation_confirmed(validation),
                     structural_non_head: false,
@@ -475,33 +454,43 @@ pub(crate) fn build_native_candidate_groups_from_snapshot_cached(
     )
 }
 
-pub(crate) fn relation_group_cached_anchors(
-    group: &NativeRelationGroup,
-    cache: &mut RelationCache,
-) {
-    match group {
-        NativeRelationGroup::Ordinary(row, _) => {
-            if let Some(anchor) = &row.anchor {
-                cache.anchors.insert(row.path_key.clone(), anchor.clone());
+pub(crate) fn collect_relation_cache<'a>(
+    groups: impl DoubleEndedIterator<Item = &'a NativeRelationGroup>,
+) -> RelationCache {
+    let mut cache = RelationCache::default();
+    let mut seen = HashSet::new();
+    // Visit the last writer first. Several hypotheses can share an entire
+    // bucket; copying it again cannot change the winners for any path.
+    for group in groups.rev() {
+        match group {
+            NativeRelationGroup::Ordinary(row, _) => {
+                if let Some(anchor) = &row.anchor {
+                    cache
+                        .anchors
+                        .entry(row.path_key.clone())
+                        .or_insert_with(|| anchor.clone());
+                }
+            }
+            NativeRelationGroup::Proposal(validation) => {
+                if !seen.insert(Arc::as_ptr(&validation.facts)) {
+                    continue;
+                }
+                for (path, anchor) in &validation.facts.anchors {
+                    cache
+                        .anchors
+                        .entry(path.clone())
+                        .or_insert_with(|| anchor.clone());
+                }
+                for (path, features) in &validation.facts.names {
+                    cache
+                        .names
+                        .entry(path.clone())
+                        .or_insert_with(|| features.clone());
+                }
             }
         }
-        NativeRelationGroup::Proposal(validation, _) => {
-            cache.anchors.extend(
-                validation
-                    .facts
-                    .anchors
-                    .iter()
-                    .map(|(path, anchor)| (path.clone(), anchor.clone())),
-            );
-            cache.names.extend(
-                validation
-                    .facts
-                    .name_features
-                    .iter()
-                    .map(|(path, features)| (path.clone(), features.clone())),
-            );
-        }
     }
+    cache
 }
 
 /// Re-enter only the original same-stem buckets, borrowing this scan's raw
@@ -626,7 +615,7 @@ fn resolve_shared_carrier_volumes(
                 Some(&cache),
                 Some(&by_path),
             ) {
-                let NativeRelationGroup::Proposal(ref validation, _) = group else {
+                let NativeRelationGroup::Proposal(ref validation) = group else {
                     continue;
                 };
                 if !validation
@@ -670,7 +659,7 @@ fn resolve_shared_carrier_volumes(
     let mut covered = HashSet::new();
     let mut output = Vec::new();
     for group in proposals {
-        if let NativeRelationGroup::Proposal(validation, _) = &group {
+        if let NativeRelationGroup::Proposal(validation) = &group {
             covered.extend(validation.proposal.volumes.iter().filter_map(|part| {
                 validation
                     .facts
@@ -711,39 +700,32 @@ fn resolve_shared_carrier_volumes(
             "zip" => "zip_spanned",
             _ => "numeric_suffix",
         };
-        output.push(NativeRelationGroup::Proposal(
-            ProposalValidation {
-                attempts: None,
-                status: if needs_password {
-                    ProposalStatus::NeedsPassword
-                } else {
-                    ProposalStatus::Inconclusive
-                },
-                proposal: RelationProposal {
-                    format,
-                    logical_name,
-                    style: style.into(),
-                    width: 3,
-                    volumes: vec![(path.clone(), number)],
-                    companions: Vec::new(),
-                },
-                facts: Arc::new(ProposalFacts {
-                    anchors: HashMap::from([(path_key(&path), anchor)]),
-                    ..Default::default()
-                }),
-                reason: Some(if needs_password {
-                    RelationFailureReason::NeedsPassword
-                } else {
-                    RelationFailureReason::MissingVolume
-                }),
-                unresolved: Vec::new(),
-            },
-            if needs_password {
-                GroupKind::Password
+        output.push(NativeRelationGroup::Proposal(ProposalValidation {
+            attempts: None,
+            status: if needs_password {
+                ProposalStatus::NeedsPassword
             } else {
-                GroupKind::Incomplete
+                ProposalStatus::Inconclusive
             },
-        ));
+            proposal: RelationProposal {
+                format,
+                logical_name,
+                style: style.into(),
+                width: 3,
+                volumes: vec![(path.clone(), number)],
+                companions: Vec::new(),
+            },
+            facts: Arc::new(RelationCache {
+                anchors: HashMap::from([(path_key(&path), anchor)]),
+                ..Default::default()
+            }),
+            reason: Some(if needs_password {
+                RelationFailureReason::NeedsPassword
+            } else {
+                RelationFailureReason::MissingVolume
+            }),
+            unresolved: Vec::new(),
+        }));
     }
     output
 }
@@ -757,124 +739,125 @@ fn build_candidate_groups_from_source(
 ) -> Vec<NativeRelationGroup> {
     let scope = RelationScopeIndex::build(&source, filtered_keys);
     let mut output = Vec::new();
-    for indices in [scope.rows] {
-        let mut directory_rows: Vec<_> = indices
+    let mut directory_rows: Vec<_> = scope
+        .rows
+        .into_iter()
+        .map(|row| source.materialize(row))
+        .collect();
+    let name_index = BucketIndex::build(&directory_rows, Some(filtered_keys));
+    structural::collect(&mut directory_rows, &name_index, path_passwords);
+    let mut validations = assignment::resolve_buckets(&directory_rows, &name_index, cached);
+    for validation in &mut validations {
+        if let Some(options) = alternative_anchors {
+            attempts::expand_carrier_sources(validation, options);
+        }
+        attempts::resolve_carrier_geometry(validation);
+        validate::validate(validation);
+    }
+    // Arbitration considers every candidate in the active stem bucket,
+    // including competitors whose head was not selected by the caller.
+    let validation_owned_paths: Vec<HashSet<String>> =
+        validations.iter().map(validation_owned_paths).collect();
+    let selected: Vec<_> = validation_owned_paths
+        .iter()
+        .map(|owned| !owned.is_disjoint(filtered_keys))
+        .collect();
+
+    let password_conflicted = conflicting_proposal_indexes(
+        &validations,
+        &validation_owned_paths,
+        ProposalStatus::NeedsPassword,
+    );
+
+    let mut claimed_paths = HashSet::new();
+    let mut password_paths = HashSet::new();
+    let mut selected_groups = Vec::new();
+    for (index, validation) in validations.iter().enumerate() {
+        if validation.status != ProposalStatus::Valid {
+            continue;
+        }
+        let owned = &validation_owned_paths[index];
+        claimed_paths.extend(owned.iter().cloned());
+        if selected[index] {
+            selected_groups.push(index);
+        }
+    }
+
+    // Only an unambiguous encrypted proposal is handed to the existing
+    // password path.  Ambiguous proposals must not claim the same
+    // physical files or suppress their ordinary single-file analysis.
+    for (index, validation) in validations.iter().enumerate() {
+        if validation.status != ProposalStatus::NeedsPassword {
+            continue;
+        }
+        if password_conflicted.contains(&index) {
+            continue;
+        }
+        let owned = &validation_owned_paths[index];
+        if owned.iter().any(|path| claimed_paths.contains(path)) {
+            continue;
+        }
+        password_paths.extend(owned.iter().cloned());
+        if selected[index] {
+            selected_groups.push(index);
+        }
+    }
+
+    // A structurally proven volume set that is missing volumes is still
+    // one logical archive.  Hand it to Extraction as a split candidate so
+    // the worker makes the authoritative missing-volume decision (CLI
+    // partial recovery, Watch `suspended_missing_volume`) instead of the
+    // set silently vanishing from discovery.
+    let incomplete_indexes: Vec<usize> = validations
+        .iter()
+        .enumerate()
+        .filter(|(_, validation)| {
+            validation.status == ProposalStatus::Inconclusive
+                && validation.reason.is_some_and(|reason| {
+                    matches!(
+                        reason,
+                        RelationFailureReason::MissingVolume
+                            | RelationFailureReason::AmbiguousVolumeMapping
+                            | RelationFailureReason::StructuralConflict
+                    )
+                })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let incomplete_conflicted =
+        conflicting_indexes_among(&validation_owned_paths, incomplete_indexes.iter().copied());
+    for index in incomplete_indexes {
+        if incomplete_conflicted.contains(&index) {
+            continue;
+        }
+        let owned = &validation_owned_paths[index];
+        if owned
+            .iter()
+            .any(|path| claimed_paths.contains(path) || password_paths.contains(path))
+        {
+            continue;
+        }
+        claimed_paths.extend(owned.iter().cloned());
+        if selected[index] {
+            selected_groups.push(index);
+        }
+    }
+    // Preserve arbitration order without copying the selected group's
+    // anchors, filename features and attempt plan out of the working set.
+    let mut validations: Vec<_> = validations.into_iter().map(Some).collect();
+    output.extend(
+        selected_groups
             .into_iter()
-            .map(|row| source.materialize(row))
-            .collect();
-        let name_index = BucketIndex::build(&directory_rows, Some(filtered_keys));
-        structural::collect(&mut directory_rows, &name_index, path_passwords);
-        let mut validations = assignment::resolve_buckets(&directory_rows, &name_index, cached);
-        for validation in &mut validations {
-            if let Some(options) = alternative_anchors {
-                attempts::expand_carrier_sources(validation, options);
-            }
-            attempts::resolve_carrier_geometry(validation);
-            validate::validate(validation);
-        }
-        // Arbitration considers every candidate in the active stem bucket,
-        // including competitors whose head was not selected by the caller.
-        let validation_owned_paths: Vec<HashSet<String>> =
-            validations.iter().map(validation_owned_paths).collect();
-        let selected: Vec<_> = validation_owned_paths
-            .iter()
-            .map(|owned| !owned.is_disjoint(filtered_keys))
-            .collect();
+            .map(|index| NativeRelationGroup::Proposal(validations[index].take().unwrap())),
+    );
 
-        let password_conflicted = conflicting_proposal_indexes(
-            &validations,
-            &validation_owned_paths,
-            ProposalStatus::NeedsPassword,
-        );
-
-        let mut claimed_paths = HashSet::new();
-        let mut password_paths = HashSet::new();
-        let mut selected_groups = Vec::new();
-        for (index, validation) in validations.iter().enumerate() {
-            if validation.status != ProposalStatus::Valid {
-                continue;
-            }
-            let owned = &validation_owned_paths[index];
-            claimed_paths.extend(owned.iter().cloned());
-            if selected[index] {
-                selected_groups.push((index, GroupKind::Valid));
-            }
-        }
-
-        // Only an unambiguous encrypted proposal is handed to the existing
-        // password path.  Ambiguous proposals must not claim the same
-        // physical files or suppress their ordinary single-file analysis.
-        for (index, validation) in validations.iter().enumerate() {
-            if validation.status != ProposalStatus::NeedsPassword {
-                continue;
-            }
-            if password_conflicted.contains(&index) {
-                continue;
-            }
-            let owned = &validation_owned_paths[index];
-            if owned.iter().any(|path| claimed_paths.contains(path)) {
-                continue;
-            }
-            password_paths.extend(owned.iter().cloned());
-            if selected[index] {
-                selected_groups.push((index, GroupKind::Password));
-            }
-        }
-
-        // A structurally proven volume set that is missing volumes is still
-        // one logical archive.  Hand it to Extraction as a split candidate so
-        // the worker makes the authoritative missing-volume decision (CLI
-        // partial recovery, Watch `suspended_missing_volume`) instead of the
-        // set silently vanishing from discovery.
-        let incomplete_indexes: Vec<usize> = validations
-            .iter()
-            .enumerate()
-            .filter(|(_, validation)| {
-                validation.status == ProposalStatus::Inconclusive
-                    && validation.reason.is_some_and(|reason| {
-                        matches!(
-                            reason,
-                            RelationFailureReason::MissingVolume
-                                | RelationFailureReason::AmbiguousVolumeMapping
-                                | RelationFailureReason::StructuralConflict
-                        )
-                    })
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let incomplete_conflicted =
-            conflicting_indexes_among(&validation_owned_paths, incomplete_indexes.iter().copied());
-        for index in incomplete_indexes {
-            if incomplete_conflicted.contains(&index) {
-                continue;
-            }
-            let owned = &validation_owned_paths[index];
-            if owned
-                .iter()
-                .any(|path| claimed_paths.contains(path) || password_paths.contains(path))
-            {
-                continue;
-            }
-            claimed_paths.extend(owned.iter().cloned());
-            if selected[index] {
-                selected_groups.push((index, GroupKind::Incomplete));
-            }
-        }
-        // Preserve arbitration order without copying the selected group's
-        // anchors, filename features and attempt plan out of the working set.
-        let mut validations: Vec<_> = validations.into_iter().map(Some).collect();
-        output.extend(selected_groups.into_iter().map(|(index, kind)| {
-            NativeRelationGroup::Proposal(validations[index].take().unwrap(), kind)
-        }));
-
-        for row in directory_rows.into_iter().filter(|row| {
-            filtered_keys.contains(&row.path_key)
-                && !claimed_paths.contains(&row.path_key)
-                && !password_paths.contains(&row.path_key)
-        }) {
-            let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
-            output.push(NativeRelationGroup::Ordinary(row, confirmed));
-        }
+    for row in directory_rows.into_iter().filter(|row| {
+        filtered_keys.contains(&row.path_key)
+            && !claimed_paths.contains(&row.path_key)
+            && !password_paths.contains(&row.path_key)
+    }) {
+        let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
+        output.push(NativeRelationGroup::Ordinary(row, confirmed));
     }
     output
 }
@@ -1161,10 +1144,7 @@ fn validation_relation_confirmed(validation: &ProposalValidation) -> bool {
             }))
 }
 
-fn validated_proposal_to_dict(
-    py: Python<'_>,
-    validation: &ProposalValidation,
-) -> PyResult<Py<PyDict>> {
+fn proposal_to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResult<Py<PyDict>> {
     let proposal = &validation.proposal;
     let head = proposal
         .volumes
@@ -1248,13 +1228,42 @@ fn validated_proposal_to_dict(
             logical_start = logical_start.saturating_add(anchor.payload_size());
         }
     }
-    if validation
-        .facts
-        .anchors
-        .values()
-        .any(|anchor| anchor.evidence.contains(&"embedded:unresolved_volume"))
+    let metadata_dict = metadata.bind(py);
+    match validation.status {
+        ProposalStatus::Valid => {}
+        ProposalStatus::NeedsPassword => {
+            metadata_dict.set_item("needs_password", true)?;
+            metadata_dict.set_item("proposal_paths", validation_owned_paths(validation))?;
+            metadata_dict.set_item("password_scope", &proposal.logical_name)?;
+            metadata_dict.set_item(
+                "relation_failure_reason",
+                RelationFailureReason::NeedsPassword.as_str(),
+            )?;
+        }
+        ProposalStatus::Inconclusive => {
+            metadata_dict.set_item(
+                "relation_failure_reason",
+                validation.reason.map(RelationFailureReason::as_str),
+            )?;
+        }
+        ProposalStatus::Reject | ProposalStatus::Unsupported => {
+            unreachable!("only admitted proposals become relation groups");
+        }
+    }
+    if validation.status != ProposalStatus::Valid {
+        metadata_dict.set_item(
+            "relation_confirmed",
+            validation_relation_confirmed(validation),
+        )?;
+    }
+    if validation.status == ProposalStatus::Inconclusive
+        || validation
+            .facts
+            .anchors
+            .values()
+            .any(|anchor| anchor.evidence.contains(&"embedded:unresolved_volume"))
     {
-        metadata.bind(py).set_item("volume_set_incomplete", true)?;
+        metadata_dict.set_item("volume_set_incomplete", true)?;
     }
     dict.set_item("head_metadata", metadata)?;
     dict.set_item("companion_paths", &proposal.companions)?;
@@ -1267,53 +1276,6 @@ fn validated_proposal_to_dict(
             .unwrap_or(0),
     )?;
     Ok(dict.unbind())
-}
-
-fn password_error_proposal_to_dict(
-    py: Python<'_>,
-    validation: &ProposalValidation,
-) -> PyResult<Py<PyDict>> {
-    let dict = validated_proposal_to_dict(py, validation)?;
-    let bound = dict.bind(py);
-    if let Some(metadata) = bound.get_item("head_metadata")? {
-        let metadata = metadata.cast::<PyDict>()?;
-        metadata.set_item(
-            "relation_confirmed",
-            validation_relation_confirmed(validation),
-        )?;
-        metadata.set_item("needs_password", true)?;
-        metadata.set_item("proposal_paths", validation_owned_paths(validation))?;
-        metadata.set_item("password_scope", &validation.proposal.logical_name)?;
-        metadata.set_item(
-            "relation_failure_reason",
-            RelationFailureReason::NeedsPassword.as_str(),
-        )?;
-    }
-    Ok(dict)
-}
-
-fn incomplete_proposal_to_dict(
-    py: Python<'_>,
-    validation: &ProposalValidation,
-) -> PyResult<Py<PyDict>> {
-    let dict = validated_proposal_to_dict(py, validation)?;
-    {
-        let bound = dict.bind(py);
-        if let Some(metadata) = bound.get_item("head_metadata")? {
-            if let Ok(metadata) = metadata.cast::<PyDict>() {
-                metadata.set_item("volume_set_incomplete", true)?;
-                metadata.set_item(
-                    "relation_failure_reason",
-                    validation.reason.map(RelationFailureReason::as_str),
-                )?;
-                metadata.set_item(
-                    "relation_confirmed",
-                    validation_relation_confirmed(validation),
-                )?;
-            }
-        }
-    }
-    Ok(dict)
 }
 
 fn proposal_logical_size(

@@ -123,8 +123,12 @@ def test_shared_plan_checkpoint_matches_full_extents_and_ordered_domains():
                              head_size_from_total=150)
     original = ArchiveInputDescriptor("head", "native_volumes", "7z", volume_style="numeric_suffix",
         parts=[ArchiveInputPart(sources[0], "first", 1, "v1")], volume_attempts=plan)
-    restored = ArchiveInputDescriptor.from_dict(json.loads(json.dumps(original.to_dict())))
+    payload = json.loads(json.dumps(original.to_dict()))
+    restored = ArchiveInputDescriptor.from_dict(payload)
     assert original.same_retry_input(restored)
+    payload.pop("format_hint")
+    with_format_hint = ArchiveInputDescriptor.from_any(payload, archive_path="head", format_hint="7z")
+    assert original.same_retry_input(with_format_hint)
     winner = restored.select_volumes({"layout": 0, "sources": [0, 2, 1, 3]})
     assert winner.parts[0].extent == InputExtent("head", 17, 67)
     assert original.admits_selected_volumes(winner)

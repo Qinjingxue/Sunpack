@@ -124,6 +124,40 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
     assert next(output.rglob("sibling.txt")).read_text() == "independent embedded archive"
 
 
+def test_encrypted_standalone_carrier_is_excluded_from_same_stem_volume_plan(tmp_path):
+    split = ArchiveFixtureFactory().create(
+        tmp_path, "split", "7z", split=True, compression_level=0,
+        payload_size=160 * 1024, split_volume_size=48 * 1024,
+    )
+    password = "independent-secret"
+    standalone = create_encrypted_rar_archive(
+        tmp_path, "standalone", password=password, header_encrypt=True, payload_size=4 * 1024,
+    )
+    prefix = b"unrecognized-carrier-prefix\0" * 211
+    originals = sorted(split.archive_dir.iterdir(), key=lambda path: (path != split.entry_path, path.name))
+    parts = []
+    for number, source in enumerate(originals, 1):
+        target = split.archive_dir / ("shared.jpg" if number == 1 else f"shared.chunk{number}.z.opaque")
+        source.rename(target)
+        parts.append(target)
+    parts[0].write_bytes(prefix + parts[0].read_bytes())
+    # Same stem, slot and size as the real second volume. Only the successful
+    # native password probe distinguishes this independent archive during recovery.
+    competing = split.archive_dir / "shared.chunk2.a.opaque"
+    competing.write_bytes((prefix + standalone.entry_path.read_bytes()).ljust(parts[1].stat().st_size, b"!"))
+    config = make_config({"embedded_scan": {"enabled": True}})
+    config["password_snapshot"] = write_password_json(
+        tmp_path / "passwords.json", scopes=[(password, [str(split.archive_dir)])],
+    )
+
+    result = ArchiveTaskProvider(config).discover_targets([str(split.archive_dir)])
+    nodes = {node.descriptor.format_hint: node for task in result.tasks for node in task.inputs}
+    assert nodes["rar"].failure is None
+    assert nodes["rar"].descriptor.part_paths() == [str(competing)]
+    assert nodes["7z"].failure is None
+    assert set(nodes["7z"].descriptor.part_paths()) == {str(path) for path in parts}
+
+
 @pytest.mark.parametrize("rar4", [False, True])
 def test_multiple_encrypted_standalone_inputs_share_one_scan_projection(tmp_path, monkeypatch, rar4):
     # The existing standalone and split cases have only one encrypted head.

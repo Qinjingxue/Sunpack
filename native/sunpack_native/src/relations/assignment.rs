@@ -893,7 +893,7 @@ pub(super) fn materialize(
     assignment: VolumeAssignment,
     logical: &str,
     reason: Option<RelationFailureReason>,
-    shared_facts: Option<&Arc<ProposalFacts>>,
+    shared_facts: Option<&Arc<RelationCache>>,
 ) -> Option<ProposalValidation> {
     let rows = view.rows;
     let spanned = view.spanned();
@@ -973,9 +973,9 @@ pub(super) fn materialize(
     })
 }
 
-pub(super) fn proposal_facts(view: &BucketView<'_>, companions: &[usize]) -> Arc<ProposalFacts> {
+pub(super) fn proposal_facts(view: &BucketView<'_>, companions: &[usize]) -> Arc<RelationCache> {
     let rows = view.rows;
-    Arc::new(ProposalFacts {
+    Arc::new(RelationCache {
         anchors: view
             .indexes
             .iter()
@@ -987,7 +987,7 @@ pub(super) fn proposal_facts(view: &BucketView<'_>, companions: &[usize]) -> Arc
                     .map(|a| (rows[*i].path_key.clone(), a))
             })
             .collect(),
-        name_features: view
+        names: view
             .indexes
             .iter()
             .filter_map(|i| {
@@ -1150,7 +1150,7 @@ mod tests {
 
         let cache = RelationCache {
             anchors: groups[0].facts.anchors.clone(),
-            names: groups[0].facts.name_features.clone(),
+            names: groups[0].facts.names.clone(),
         };
         let mut renamed = rows.clone();
         for row in &mut renamed[1..] {
@@ -1504,7 +1504,7 @@ mod tests {
         let first = resolve(&rows);
         let cache = RelationCache {
             anchors: first[0].facts.anchors.clone(),
-            names: first[0].facts.name_features.clone(),
+            names: first[0].facts.names.clone(),
         };
         let mut renamed = rows.clone();
         renamed[1].name = "same.no_numeric_channel".into();
