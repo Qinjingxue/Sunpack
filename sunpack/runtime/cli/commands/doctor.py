@@ -5,9 +5,9 @@ from sunpack.core.support.resource_lifecycle import named_task_temporary_file
 
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED
-from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_config_output_parser, localize_help_action
+from sunpack.runtime.cli.cli_parsers import build_config_output_parser
 from sunpack.runtime.cli.cli_types import CliCommandResult
-from sunpack.runtime.cli.persistent_runtime import load_request_config, load_request_config_payload
+from sunpack.runtime.cli.persistent_runtime import load_request_config_payload
 from sunpack.runtime.config_validation import validate_config_payload
 from sunpack.runtime.watch.service import list_watch_roots
 from sunpack.core.support.process_executable import current_process_executable, is_packaged_process
@@ -53,10 +53,8 @@ def register(subparsers, ctx):
         parents=[common_parser],
         help=ctx.t("cli.doctor.help"),
         usage="sunpack doctor [options]",
-        formatter_class=CliHelpFormatter,
     )
     parser.set_defaults(command=COMMAND)
-    localize_help_action(parser, ctx)
 
 
 def _check(name: str, status: str, detail: str | None = None, **extra) -> dict:
@@ -69,8 +67,7 @@ def _check(name: str, status: str, detail: str | None = None, **extra) -> dict:
 
 def _config_check(ctx) -> tuple[dict, dict | None, bool]:
     try:
-        config_path, _ = load_request_config_payload(ctx.cwd, refresh=True)
-        payload = load_request_config(ctx.cwd)
+        config_path, payload = load_request_config_payload(ctx.cwd, refresh=True, normalized=True)
         validation = validate_config_payload(payload)
     except Exception as exc:
         return _check("config", "fail", str(exc)), None, False

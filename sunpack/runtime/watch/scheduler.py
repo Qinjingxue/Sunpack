@@ -129,8 +129,7 @@ class _ActivePipelineRequest:
     archive_registry: ActiveArchiveRegistry | None = None
     source_input_root: str = ""
     deep_detect: bool = False
-    source_paths: tuple[str, ...] = ()
-    top_level_keys: set[str] = field(default_factory=set)
+    top_level_sources: dict[str, str] = field(default_factory=dict)
     password_scope_dir: str = ""
     source_groups: dict[str, dict] = field(default_factory=dict)
     source_observations: dict = field(default_factory=dict)
@@ -174,9 +173,14 @@ class WatchScheduler:
                         # Persist user intent before signalling; restart recovery
                         # must never resume this input generation. Defer all waits
                         # so the writer can batch this group off the event loop.
-                        for path in dedupe_normalized_paths((request.candidate.path, *request.source_paths, *request.source_observations)):
-                            observed = (request.candidate if path_key(path) == path_key(request.candidate.path)
-                                        else request.source_observations.get(path_key(path)))
+                        candidate_key = path_key(request.candidate.path)
+                        paths = dedupe_normalized_paths((
+                            request.candidate.path, *request.top_level_sources.values(), *request.source_observations,
+                        ))
+                        for path in paths:
+                            key = path_key(path)
+                            observed = (request.candidate if key == candidate_key
+                                        else request.source_observations.get(key))
                             if observed is None:
                                 observed = _candidate_for_event_path(path)
                             if observed is not None:
@@ -247,14 +251,18 @@ class WatchScheduler:
         self.log = WatchLogStore(str(log_path), retention_days=watch_config["event_log_retention_days"], wake_callback=self._wake_service)
         self.state._native.attach_events(self.log._native)
         state_parent = Path(state_path).parent
-        self.metadata_dir = os.path.abspath(str(state_parent)) if state_parent.name == ".sunpack_watch" else ""
-        self.metadata_files = {
-            os.path.abspath(str(Path(state_path))),
-            os.path.abspath(str(self.state.journal_path)),
-            os.path.abspath(str(log_path)),
-            *(os.path.abspath(str(Path(state_path).with_name(name))) for name in
-              ("catalog.snapshot.bin", "catalog.snapshot.bin.tmp", "catalog.wal.bin", "catalog.lock")),
-        }
+        if state_parent.name.lower() == ".sunpack_watch":
+            self._metadata_dir_key = absolute_path_key(state_parent)
+            self._metadata_file_keys = set()
+        else:
+            self._metadata_dir_key = absolute_path_key(str(log_path) + ".store")
+            self._metadata_file_keys = {
+                absolute_path_key(path) for path in (
+                    state_path, self.state.journal_path, log_path,
+                    *(state_parent / name for name in
+                      ("catalog.snapshot.bin", "catalog.snapshot.bin.tmp", "catalog.wal.bin", "catalog.lock")),
+                )
+            }
         self._lock = threading.Lock()
         self._tick_lock = asyncio.Lock()
         # Publish claims and observation generations under one short gate.
@@ -672,7 +680,7 @@ class WatchScheduler:
                 continue
             if not watch_path_available(pending.source_input_root or pending.path, self.scopes.values()):
                 continue
-            active_outputs = dict(getattr(pending, "active_outputs", {}) or {})
+            active_outputs = pending.active_outputs
             entry = self.state.latest_entry_for_path(pending.path)
             # A continuation borrows this retained container; it is never an
             # uncommitted tree that crash recovery may remove wholesale.
@@ -683,14 +691,14 @@ class WatchScheduler:
                 and _candidate_change_kind(_candidate_from_state_entry(entry), WatchCandidate(
                     pending.path, pending.size, pending.mtime, pending.file_id, pending.change_usn,
                 )) != _CandidateChangeKind.CONTENT_CHANGED)
-            committed_roots = list(getattr(pending, "committed_roots", []) or [])
+            committed_roots = pending.committed_roots
             completed_sources = {
                 path_key(path)
-                for path in list(getattr(pending, "completed_sources", []) or [])
+                for path in pending.completed_sources
                 if path
             }
-            scope_dir = str(getattr(pending, "password_scope_dir", "") or "")
-            internal = bool(getattr(pending, "internal_recovery", False))
+            scope_dir = pending.password_scope_dir
+            internal = pending.internal_recovery
             promoted_destinations = pending.promoted_destinations
             if not active_outputs and not committed_roots and not promoted_destinations:
                 if interrupted:
@@ -1141,8 +1149,7 @@ class WatchScheduler:
             # PipelineEngine.run() is done here, so its path lease and any
             # source cleanup promotion have already ended. Hand off only paths
             # that actually changed while this request owned them.
-            request.source_paths = ()
-            request.top_level_keys.clear()
+            request.top_level_sources.clear()
             request.source_groups.clear()
             request.source_observations.clear()
             try:
@@ -1174,16 +1181,23 @@ class WatchScheduler:
         requests: Iterable[_ActivePipelineRequest],
     ) -> None:
         for request in requests:
-            path = request.candidate.path
-            key = absolute_path_key(path)
+            key = absolute_path_key(request.candidate.path)
             count = self._inflight_path_counts.get(key, 0)
             if count <= 1:
                 self._inflight_path_counts.pop(key, None)
-                state = self._pending.get(path)
-                if state is not None:
-                    self._schedule_active_locked(path, state, path_key_value=key)
+                self._reschedule_pending_key_locked(key)
             else:
                 self._inflight_path_counts[key] = count - 1
+        if not self._inflight_path_counts:
+            self._inflight_path_counts.clear()
+
+    def _reschedule_pending_key_locked(self, key: str) -> bool:
+        aliases = self._pending_by_key.get(key)
+        if not aliases:
+            return False
+        for path in aliases:
+            self._schedule_active_locked(path, self._pending[path], path_key_value=key)
+        return True
 
     def _add_pending_locked(
         self,
@@ -1448,10 +1462,7 @@ class WatchScheduler:
                     self._source_probes.clear()
                 if probe.recheck:
                     with self._lock:
-                        state = self._pending.get(probe.path)
-                        if state is not None:
-                            self._schedule_active_locked(probe.path, state)
-                            recheck = True
+                        recheck = self._reschedule_pending_key_locked(key)
         if recheck:
             self._wake_service()
 
@@ -2104,9 +2115,10 @@ class WatchScheduler:
             self._retire_quiet_tracker_locked(path, absolute_path_key(path))
 
     def _retire_quiet_tracker_locked(self, path: str, key: str) -> None:
-        if (key in self._pending_by_key or key in self._inflight_path_counts
-                or key in self._active_claims or key in self._source_probes):
+        if key in self._pending_by_key or key in self._inflight_path_counts or key in self._active_claims:
             return
+        # A source probe owns no queued work until publication under these
+        # locks. If it queues a new generation, it can load the saved cadence.
         tracker = self._quiet_trackers.pop(path, None)
         self._catalog.retire_observation(
             path,
@@ -2302,18 +2314,18 @@ class WatchScheduler:
         if name == "task_sources_claimed":
             source_paths = event.get("source_paths") or getattr(archive_task, "cleanup_parts", ()) or ()
             if request is not None:
+                top_level = event.get("depth") == 1
                 with self._lock:
                     for path in source_paths:
                         key = path_key(path)
+                        # Keep this request's input evidence even if live
+                        # claims transfer to a newer family owner.
+                        if top_level:
+                            request.top_level_sources.setdefault(key, path)
                         if key not in request.source_observations:
                             observed = self._candidate_baseline_locked(path)
                             if observed is not None:
                                 request.source_observations[key] = observed
-            if request is not None and event.get("depth") == 1:
-                # Reuse the published tuple. Keep this request's input evidence
-                # even if live source claims transfer to a newer family owner.
-                request.source_paths = tuple(source_paths)
-                request.top_level_keys.update(path_key(path) for path in source_paths)
             groups = event.get("groups") or ()
             if request is not None:
                 for group in groups:
@@ -2404,12 +2416,10 @@ class WatchScheduler:
                 raise error
         except FileNotFoundError as exc:
             missing_path = os.path.abspath(os.fsdecode(exc.filename)) if exc.filename else ""
+            missing_key = path_key(missing_path) if missing_path else ""
             if (
-                not missing_path
-                or not any(
-                    path_key(path) == path_key(missing_path)
-                    for path in (candidate.path, *request.source_paths)
-                )
+                not missing_key
+                or (missing_key != path_key(candidate.path) and missing_key not in request.top_level_sources)
                 or os.path.exists(missing_path)
             ):
                 raise
@@ -2573,7 +2583,7 @@ class WatchScheduler:
             if not task_path:
                 continue
             task_path_key = path_key(task_path)
-            if task_path_key not in request.top_level_keys or (task_path_key == candidate_key and not blocked_results):
+            if task_path_key not in request.top_level_sources or (task_path_key == candidate_key and not blocked_results):
                 continue
             if outcome in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
                 self.log.write("done", path=task_path, owner=request.notification_id,
@@ -2770,11 +2780,8 @@ class WatchScheduler:
         return any(scope.contains(path) for scope in self.scopes.values())
 
     def _is_under_metadata_dir(self, path: str) -> bool:
-        normalized = os.path.abspath(path)
-        if normalized in self.metadata_files:
-            return True
-        return (_is_relative_to(normalized, os.path.abspath(str(self.log.path) + ".store"))
-                or bool(self.metadata_dir and _is_relative_to(normalized, self.metadata_dir)))
+        key = absolute_path_key(path)
+        return key in self._metadata_file_keys or path_key_is_under(key, self._metadata_dir_key)
 
     def _refresh_password_sources(self) -> str:
         snapshot = self._password_file_source.snapshot

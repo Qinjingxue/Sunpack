@@ -226,6 +226,9 @@ class PipelineEngine:
                     owner_task = coalesced.owner_task
                     if owner_task is task:
                         raise
+                    # A coalesced request only needs the owner's task. Drop
+                    # discovery frames and snapshots before joining it.
+                    coalesced.__traceback__ = None
                     try:
                         owner_response = await cancellation.wait(asyncio.shield(owner_task))
                     except asyncio.CancelledError:
@@ -420,7 +423,6 @@ class _PathLeaseRegistry:
         self._active_requests = active_requests
         self._lease_paths: dict[str, dict[str, _LeasePath]] = {}
         self._exact_owners: dict[str, str] = {}
-        self._entries_by_key: dict[str, _LeasePath] = {}
         self._directory_owners: dict[str, dict[str, int]] = {}
         self._prefix_owners: dict[str, dict[str, int]] = {}
         self._pins: dict[str, dict[object, frozenset[str]]] = {}
@@ -457,23 +459,13 @@ class _PathLeaseRegistry:
             key = path_key(normalized)
             if key in prepared:
                 continue
-            existing = self._entries_by_key.get(key)
             # A missing member may arrive while volume recovery is resolving
             # the family. Only existing physical inputs have a pinned lifetime.
-            if existing is not None and not refresh and not existing.missing:
-                if existing.path == normalized:
-                    prepared[key] = existing
-                else:
-                    prepared[key] = _LeasePath(
-                        path=normalized,
-                        key=key,
-                        resolved_key=existing.resolved_key,
-                        ancestor_keys=existing.ancestor_keys,
-                        is_dir=existing.is_dir,
-                        version_row=existing.version_row,
-                        missing=existing.missing,
-                    )
-                continue
+            if not refresh and (owner := self._exact_owners.get(key)) is not None:
+                existing = self._lease_paths[owner][key]
+                if not existing.missing:
+                    prepared[key] = existing if existing.path == normalized else replace(existing, path=normalized)
+                    continue
             prepared[key] = _snapshot_lease_path(normalized)
         return tuple(prepared.values())
 
@@ -730,7 +722,6 @@ class _PathLeaseRegistry:
                 continue
             owner_paths[path.key] = path
             self._exact_owners[path.key] = owner
-            self._entries_by_key[path.key] = path
 
             if path.resolved_key:
                 if path.is_dir:
@@ -766,7 +757,6 @@ class _PathLeaseRegistry:
             removed = True
             if self._exact_owners.get(path.key) == owner:
                 self._exact_owners.pop(path.key, None)
-                self._entries_by_key.pop(path.key, None)
 
             if path.resolved_key:
                 if path.is_dir:
@@ -829,9 +819,9 @@ def _replace_mapping_in_place(target: dict, source: dict) -> None:
 
 
 def _worker_config(config: dict) -> dict:
-    performance = config.get("performance") if isinstance(config.get("performance"), dict) else {}
-    worker = performance.get("worker") if isinstance(performance.get("worker"), dict) else {}
-    return dict(worker)
+    performance = config.get("performance")
+    worker = performance.get("worker") if isinstance(performance, dict) else None
+    return worker if isinstance(worker, dict) else {}
 
 
 class _PipelineServices:
@@ -1117,18 +1107,11 @@ class _RequestRuntime:
         )
         self.output_scan_policy = NestedOutputScanPolicy(self.config)
         self.recursive_authorization = RecursiveAuthorization(self.config)
-        performance = self.config.get("performance", {}) if isinstance(self.config.get("performance"), dict) else {}
-        worker_config = dict(
-            performance.get("worker", {})
-            if isinstance(performance.get("worker"), dict)
-            else {}
-        )
-        request_runner = services.sevenzip_runner.fork(worker_config)
+        request_runner = services.sevenzip_runner.fork(_worker_config(self.config))
         request_runner.request_id = submission.request_id
         request_runner.origin = submission.origin
         self.extractor = ExtractionScheduler(
             password_store=submission.password_store,
-            process_config=worker_config,
             output_config=self.config.get("output", {}),
             extraction_config={
                 **(self.config.get("extraction", {}) if isinstance(self.config.get("extraction"), dict) else {}),
@@ -1198,15 +1181,6 @@ class _RequestRuntime:
             cleanup_paths=candidate.cleanup_paths,
             discovery_evidence=dict(candidate.relation_anchor),
         )
-        if replacement is not None:
-            replacement.runtime["discovery_scope"] = scope
-            replacement.runtime["discovery_catalog"] = task.runtime.get("discovery_catalog")
-            replacement.runtime["discovery_snapshot"] = task.runtime.get("discovery_snapshot")
-            replacement.runtime["volume_retry_attempted"] = True
-            replacement.runtime["volume_retry_basis"] = [
-                "confirmed_structure",
-                "anchor_constrained_filename",
-            ]
         if replacement is None:
             return None
         self.input_planning_stage.plan_task(replacement)
@@ -2070,10 +2044,11 @@ class _RequestResults:
     def remember_tasks(self, tasks) -> None:
         for task in tasks:
             target = self._target_for_path(task.main_path)
-            paths = tuple(dict.fromkeys(task.all_parts or [task.main_path]))
-            self._task_targets[path_key(task.main_path)] = target
+            paths = tuple(task.all_parts or [task.main_path])
+            key = path_key(task.main_path)
+            self._task_targets[key] = target
             self._claimed_paths.extend(paths)
-            self._task_paths[path_key(task.main_path)] = paths
+            self._task_paths[key] = paths
 
     def remember_results(self, results) -> None:
         for result in results:
@@ -2107,12 +2082,8 @@ class _RequestResults:
         return default_output_dir_for_task(task, output_config)
 
     def response(self, context: RunState, *, recent_passwords: Iterable[str]) -> PipelineResponse:
-        request_results = list(context.target_results)
-        summary = context.snapshot(
-            target_results=request_results,
-            scan_failures=list(context.scan_failures),
-            policy_skips=list(context.policy_skips),
-        )
+        summary = context.snapshot()
+        request_results = summary.target_results
         blocked_paths = []
         for result in request_results:
             if result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:

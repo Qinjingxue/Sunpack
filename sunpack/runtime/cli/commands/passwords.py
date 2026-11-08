@@ -1,6 +1,6 @@
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_USAGE
-from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_json_parser, build_password_parser, localize_help_action
+from sunpack.runtime.cli.cli_parsers import build_json_parser, build_password_parser
 from sunpack.runtime.cli.cli_runtime import build_password_summary, collect_clipboard_passwords, collect_cli_passwords, password_summary_item
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.runtime.cli.persistent_runtime import load_request_config
@@ -16,10 +16,8 @@ def register(subparsers, ctx):
         parents=[build_json_parser(ctx), build_password_parser(ctx)],
         help=ctx.t("cli.passwords.help"),
         usage="sunpack passwords [options]",
-        formatter_class=CliHelpFormatter,
     )
     parser.set_defaults(command=COMMAND)
-    localize_help_action(parser, ctx)
 
 
 def handle(args, ctx):

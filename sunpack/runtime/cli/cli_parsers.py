@@ -1,4 +1,5 @@
 import argparse
+from functools import partial
 
 from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_values import parse_archive_cleanup_value, parse_process_mode_value, parse_recursive_extract_value
@@ -6,10 +7,9 @@ from sunpack.core.i18n import I18nContext
 
 
 class CliHelpFormatter(argparse.RawDescriptionHelpFormatter):
-    language = "en"
-
-    def __init__(self, prog: str):
+    def __init__(self, prog: str, *, language: str):
         super().__init__(prog, max_help_position=44, width=120)
+        self.language = language
 
     def add_usage(self, usage, actions, groups, prefix=None):
         if prefix is None and self.language == "zh":
@@ -26,13 +26,18 @@ class CliHelpFormatter(argparse.RawDescriptionHelpFormatter):
         return super().start_section(heading)
 
 
-def localize_help_action(parser: argparse.ArgumentParser, ctx: CliContext):
-    for action in parser._actions:
-        if "-h" in getattr(action, "option_strings", []):
-            action.help = ctx.t("cli.help")
-        if isinstance(action, argparse._SubParsersAction):
-            for child in dict.fromkeys(action.choices.values()):
-                localize_help_action(child, ctx)
+def localize_parser(parser: argparse.ArgumentParser, ctx: CliContext) -> None:
+    formatter = partial(CliHelpFormatter, language=ctx.language)
+    help_text = ctx.t("cli.help")
+    pending = [parser]
+    while pending:
+        current = pending.pop()
+        current.formatter_class = formatter
+        for action in current._actions:
+            if "-h" in action.option_strings:
+                action.help = help_text
+            if isinstance(action, argparse._SubParsersAction):
+                pending.extend(dict.fromkeys(action.choices.values()))
 
 
 def build_common_parser(ctx: CliContext) -> argparse.ArgumentParser:

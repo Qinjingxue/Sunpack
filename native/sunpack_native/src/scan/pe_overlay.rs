@@ -362,7 +362,7 @@ pub(crate) fn inspect_pe_overlay_structure(
     let evidence = PyList::new(py, facts.evidence)?;
     result.set_item("evidence", &evidence)?;
     if let Some(fault) = facts.read_fault {
-        write_read_fault(&result, &fault)?;
+        fault.write_python_with_damage_flags(&result)?;
     }
     if facts.archive_like && facts.detected_ext == ".zip" {
         let header = inspect_zip_local_header(py, path, facts.archive_offset as i64)?;
@@ -382,18 +382,6 @@ pub(crate) fn inspect_pe_overlay_structure(
         }
     }
     Ok(result.unbind())
-}
-
-fn write_read_fault(result: &Bound<'_, PyDict>, fault: &ReadFault) -> PyResult<()> {
-    fault.write_python(result)?;
-    let mut flags = vec!["read_error"];
-    if fault.code == "unexpected_eof" {
-        flags.push("input_truncated");
-    }
-    if fault.possible_missing_volume() {
-        flags.push("missing_volume");
-    }
-    result.set_item("damage_flags", PyList::new(result.py(), flags)?)
 }
 
 fn empty_result<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict>> {

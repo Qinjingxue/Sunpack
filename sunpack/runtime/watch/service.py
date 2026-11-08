@@ -17,7 +17,7 @@ from sunpack.core.i18n import I18nContext
 from sunpack.core.platform.windows.message_box import show_error
 from sunpack.runtime.watch.config_observer import ConfigFileObserver
 from sunpack.runtime.watch.log import WatchLogStore
-from sunpack.runtime.watch.scheduler import WatchScheduler, _nearest_existing_directory
+from sunpack.runtime.watch.scheduler import WatchRunResult, WatchScheduler, _nearest_existing_directory
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.toast import WatchToastCoordinator
 from sunpack.core.support.resources import get_resource_path
@@ -401,7 +401,7 @@ class WatchService:
         self._toast_host_signature = None
         self.toast_coordinator: WatchToastCoordinator | None = None
         self._stop_requested = False
-        self._last_idle_tick_signature = None
+        self._last_logged_pending = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._control_queue: asyncio.Queue[str | None] | None = None
         self._scheduler_wakeup_lock = threading.Lock()
@@ -463,7 +463,7 @@ class WatchService:
                         # An idle service can outlive its last scheduler.
                         active_scheduler_ref = weakref.ref(self.scheduler)
                         next_scheduler_run = 0.0
-                        self._last_idle_tick_signature = None
+                        self._last_logged_pending = 0
                     if next_scheduler_run is not None and now >= next_scheduler_run:
                         try:
                             result = await self.scheduler.run_once()
@@ -481,7 +481,8 @@ class WatchService:
                         finally:
                             # The next scheduler wake may be hours away.
                             result = None
-                        delay = self._scheduler_next_delay()
+                        now = self._loop.time()
+                        delay = self.scheduler.next_delay_seconds() if self.scheduler is not None else None
                         next_scheduler_run = None if delay is None else now + delay
                     sleep_seconds = None if next_scheduler_run is None else max(0.0, next_scheduler_run - now)
                 else:
@@ -506,14 +507,12 @@ class WatchService:
                     # the next tick must be able to request another tick.
                     with self._scheduler_wakeup_lock:
                         self._scheduler_wakeup_pending = False
-                if control_event == CONTROL_SCHEDULER_WAKEUP and self.scheduler is not None:
-                    # A pipeline completion wakes the service so run_once() can
-                    # harvest the finished request.  Recomputing the delay here
-                    # can return None while that request is still registered as
-                    # inflight, leaving the completed request unharvested.
-                    next_scheduler_run = self._loop.time()
-                else:
-                    self._handle_control_event(control_event)
+                    if self.scheduler is not None:
+                        # A completed request is still inflight until the next
+                        # tick harvests it, so run even if no deadline is due.
+                        next_scheduler_run = self._loop.time()
+                elif control_event == CONTROL_STOP:
+                    self._stop_requested = True
             return 0
         except Exception as exc:
             self._startup_error = exc
@@ -757,7 +756,7 @@ class WatchService:
                 finally:
                     if self._owns_pipeline_engine:
                         self.pipeline_engine = None
-                    self._last_idle_tick_signature = None
+                    self._last_logged_pending = 0
 
     def _reconcile_toast_host(self, config: dict) -> None:
         watch_config = config["watch"]
@@ -830,35 +829,13 @@ class WatchService:
         if refresh is not None:
             refresh()
 
-    def _handle_control_event(self, event: str | None) -> None:
-        if event == CONTROL_STOP:
-            self._stop_requested = True
-            return
-
-    def _should_log_scheduler_tick(self, result) -> bool:
+    def _should_log_scheduler_tick(self, result: WatchRunResult) -> bool:
         if result.processed or result.failed or result.errors:
-            self._last_idle_tick_signature = None
+            self._last_logged_pending = 0
             return True
-        pending = int(getattr(result, "pending", 0) or 0)
-        if pending <= 0:
-            self._last_idle_tick_signature = None
-            return False
-        signature = ("pending", pending)
-        if signature == self._last_idle_tick_signature:
-            return False
-        self._last_idle_tick_signature = signature
-        return True
-
-    def _scheduler_next_delay(self) -> float | None:
-        if self.scheduler is None:
-            return None
-        if hasattr(self.scheduler, "next_delay_seconds"):
-            try:
-                delay = self.scheduler.next_delay_seconds()
-                return None if delay is None else max(0.0, float(delay))
-            except Exception:
-                pass
-        return None
+        pending_changed = result.pending != self._last_logged_pending
+        self._last_logged_pending = result.pending
+        return result.pending > 0 and pending_changed
 
     def _wake_scheduler(self) -> None:
         with self._scheduler_wakeup_lock:

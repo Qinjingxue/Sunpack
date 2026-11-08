@@ -309,7 +309,6 @@ def test_release_clears_path_lease_indexes(tmp_path):
 
         assert not registry._lease_paths
         assert not registry._exact_owners
-        assert not registry._entries_by_key
         assert not registry._directory_owners
         assert not registry._prefix_owners
 

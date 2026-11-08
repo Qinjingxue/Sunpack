@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -181,6 +181,22 @@ impl ReadFault {
         output.set_item("error_field", self.field)?;
         output.set_item("possible_missing_volume", self.possible_missing_volume())?;
         Ok(())
+    }
+
+    pub(crate) fn write_python_with_damage_flags(
+        &self,
+        output: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        self.write_python(output)?;
+        let mut flags = Vec::with_capacity(3);
+        flags.push("read_error");
+        if self.code == "unexpected_eof" {
+            flags.push("input_truncated");
+        }
+        if self.possible_missing_volume() {
+            flags.push("missing_volume");
+        }
+        output.set_item("damage_flags", PyList::new(output.py(), flags)?)
     }
 }
 

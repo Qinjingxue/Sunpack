@@ -1,3 +1,4 @@
+from sunpack.runtime.cli import cli
 from sunpack.runtime.cli.cli import build_cli_parser
 from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.core.i18n.context import validate_catalog
@@ -72,11 +73,20 @@ def test_cli_parser_registers_discovered_commands():
 def test_cli_parser_uses_command_module_language_text():
     ctx = CliContext(language="zh")
     parser = build_cli_parser(ctx)
+    build_cli_parser(CliContext(language="en"))
     help_text = parser.format_help()
 
     assert "解压压缩包" in help_text
     assert "查看或校验配置" in help_text
     assert "选项" in help_text
+
+
+def test_cached_scan_parser_keeps_its_command_scope(monkeypatch):
+    monkeypatch.setattr(cli, "_PARSER_CACHE", {})
+    first = cli.cached_cli_parser(CliContext(), command="scan")
+    ctx = CliContext()
+    assert cli.cached_cli_parser(ctx, command="scan") is first
+    assert set(ctx.commands) == {"scan"}
 
 
 def test_command_help_exposes_public_options(subtests, capsys):

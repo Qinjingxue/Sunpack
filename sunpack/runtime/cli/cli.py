@@ -5,25 +5,20 @@ import inspect
 import os
 import sys
 from contextlib import asynccontextmanager
+from types import ModuleType
 
 from sunpack.runtime.cli.cli_aliases import canonical_command
 from sunpack.runtime.cli.cli_commands import command_map, discover_command_modules
 from sunpack.runtime.cli.cli_constants import EXIT_OK, EXIT_RUNTIME, EXIT_USAGE
-from sunpack.runtime.cli.cli_context import (
-    CliContext,
-)
-from sunpack.core.config.cli_settings import DEFAULT_CLI_LANG, load_cli_language_from_config
-from sunpack.runtime.cli.cli_parsers import (
-    CliHelpFormatter,
-    localize_help_action,
-)
+from sunpack.runtime.cli.cli_context import CliContext
+from sunpack.core.config.cli_settings import load_cli_language_from_config
+from sunpack.runtime.cli.cli_parsers import localize_parser
 from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.core.support.runtime_identity import runtime_id_available
 from sunpack.core.support.resources import resource_path_resolution_scope
 
-CURRENT_CLI_LANG = DEFAULT_CLI_LANG
-_PARSER_CACHE: dict[str, argparse.ArgumentParser] = {}
+_PARSER_CACHE: dict[tuple[str, str | None], tuple[argparse.ArgumentParser, dict[str, ModuleType]]] = {}
 _PARSER_STDOUT: contextvars.ContextVar = contextvars.ContextVar("sunpack_parser_stdout", default=None)
 _PARSER_STDERR: contextvars.ContextVar = contextvars.ContextVar("sunpack_parser_stderr", default=None)
 
@@ -61,8 +56,7 @@ def preprocess_sys_argv(argv: list[str]) -> list[str]:
 
 
 def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) -> argparse.ArgumentParser:
-    ctx = ctx or CliContext(language=CURRENT_CLI_LANG)
-    CliHelpFormatter.language = ctx.language
+    ctx = ctx or CliContext()
     modules = discover_command_modules(command)
     ctx.commands = command_map(modules)
 
@@ -76,24 +70,25 @@ def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) 
             "  sunpack pw -a\n"
             "  sunpack w add C:\\Downloads -s -i"
         ),
-        formatter_class=CliHelpFormatter,
     )
-    localize_help_action(parser, ctx)
     subparsers = parser.add_subparsers(dest="command", required=True, parser_class=_ContextArgumentParser)
     for module in modules:
         module.register(subparsers, ctx)
-    localize_help_action(parser, ctx)
+    localize_parser(parser, ctx)
     return parser
 
 
 def cached_cli_parser(ctx: CliContext, command: str | None = None) -> argparse.ArgumentParser:
-    cache_key = f"{ctx.language}:{command or '*'}"
-    parser = _PARSER_CACHE.get(cache_key)
-    if parser is None:
+    cache_key = ctx.language, command
+    cached = _PARSER_CACHE.get(cache_key)
+    if cached is None:
         parser = build_cli_parser(ctx, command=command)
-        _PARSER_CACHE[cache_key] = parser
-    elif ctx.commands is None:
-        ctx.commands = command_map()
+        assert ctx.commands is not None
+        _PARSER_CACHE[cache_key] = parser, ctx.commands
+        return parser
+    parser, commands = cached
+    if ctx.commands is None:
+        ctx.commands = commands
     return parser
 
 
@@ -163,7 +158,6 @@ async def async_main(
     stderr=None,
     input_reader=None,
 ):
-    global CURRENT_CLI_LANG
     if argv is None:
         argv = sys.argv[1:]
     if stdout is None and stderr is None:
@@ -185,9 +179,8 @@ async def async_main(
     ):
         argv = preprocess_sys_argv(argv)
         request_cwd = os.path.abspath(cwd or os.getcwd())
-        CURRENT_CLI_LANG = load_cli_language_from_config(request_cwd)
         ctx = CliContext(
-            language=CURRENT_CLI_LANG,
+            language=load_cli_language_from_config(request_cwd),
             cwd=request_cwd,
             stdin=stdin if stdin is not None else sys.stdin,
             stdout=stdout if stdout is not None else sys.stdout,

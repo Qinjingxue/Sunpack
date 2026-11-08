@@ -3,10 +3,10 @@ import json
 
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_USAGE
-from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_config_output_parser, localize_help_action
+from sunpack.runtime.cli.cli_parsers import build_config_output_parser
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.runtime.config_validation import validate_config_payload
-from sunpack.runtime.cli.persistent_runtime import load_request_config, load_request_config_payload
+from sunpack.runtime.cli.persistent_runtime import load_request_config_payload
 from sunpack.core.support.json_format import to_json_text
 
 COMMAND = "config"
@@ -21,17 +21,14 @@ def register(subparsers, ctx):
         parents=[common_parser],
         help=ctx.t("cli.config.help"),
         usage="sunpack config [options] <show|validate>",
-        formatter_class=CliHelpFormatter,
     )
     config_parser.set_defaults(command=COMMAND)
-    localize_help_action(config_parser, ctx)
     config_subparsers = config_parser.add_subparsers(dest="config_action", required=True)
-    config_subparsers.add_parser("show", parents=[common_parser], help=ctx.t("cli.config.show_help"), formatter_class=CliHelpFormatter)
+    config_subparsers.add_parser("show", parents=[common_parser], help=ctx.t("cli.config.show_help"))
     validation = config_subparsers.add_parser(
         "validate",
         parents=[common_parser],
         help=ctx.t("cli.config.validate_help"),
-        formatter_class=CliHelpFormatter,
     )
     validation.add_argument("--scan-rule-stdin", action="store_true", help=argparse.SUPPRESS)
 
@@ -46,13 +43,13 @@ async def handle(args, ctx):
             validate_path_rule_config({**rule, "name": "blacklist"})
             NativePathRule(*(rule.get(field, []) for field in ("paths", "files", "extensions", "full_names")))
             return 0, CliCommandResult(command=COMMAND, inputs={"action": "validate"}, summary={"valid": True})
-        config_path, payload = load_request_config_payload(ctx.cwd, refresh=True)
+        config_path, payload = load_request_config_payload(ctx.cwd, refresh=True, normalized=args.config_action == "validate")
         item = payload
         if args.config_action == "show":
             if not args.json and not args.quiet:
                 print(to_json_text(payload), file=ctx.stdout, flush=True)
         elif args.config_action == "validate":
-            item = validate_config_payload(load_request_config(ctx.cwd))
+            item = validate_config_payload(payload)
             if not item["ok"]:
                 localized_errors = [ctx.t("cli.config.validation_error", error=error) for error in item["errors"]]
                 for error in localized_errors:

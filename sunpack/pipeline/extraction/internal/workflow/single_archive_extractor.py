@@ -20,7 +20,7 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import com
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, recoverable_partial_inventory
 from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.core.passwords.resolver import archive_structure_requires_password, archive_structure_password_state
+from sunpack.core.passwords.resolver import archive_structure_password_state
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.archive_input_projection import write_source_password_probe_input
 from sunpack.pipeline.extraction.output_inventory import OutputInventory, collect_output_inventory
@@ -397,8 +397,11 @@ class SingleArchiveExtractor:
                 status=PasswordResolutionStatus.RESOLVED,
                 archive_key=archive_key,
             )
-        if not self.password_store.has_candidates(scope_path=scope_path) and not self._task_requires_password(task):
-            unknown = archive_structure_password_state(task) == "unknown"
+        if (
+            not self.password_store.has_candidates(scope_path=scope_path)
+            and (password_state := archive_structure_password_state(task)) != "required"
+        ):
+            unknown = password_state == "unknown"
             return PasswordResolution(
                 password="",
                 status=PasswordResolutionStatus.RESOLVED if unknown else PasswordResolutionStatus.UNENCRYPTED,
@@ -415,10 +418,6 @@ class SingleArchiveExtractor:
             archive_key=archive_key,
             scope_path=scope_path,
         )
-
-    @staticmethod
-    def _task_requires_password(task: ArchiveTask) -> bool:
-        return archive_structure_requires_password(task)
 
     def _startupinfo(self):
         startupinfo = subprocess.STARTUPINFO()

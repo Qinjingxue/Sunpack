@@ -11,18 +11,23 @@ from threading import Lock, RLock
 from typing import Any, AsyncIterator, Callable
 
 from sunpack.core.config.loader import (
-    clear_config_cache, config_source_key, load_config, load_raw_config_payload, normalize_config_payload,
+    ConfigSources,
+    clear_config_cache,
+    load_config,
+    load_config_sources,
+    load_raw_config_payload,
+    normalize_config_payload,
+    resolve_config_sources,
 )
 from sunpack.core.config.advanced_defaults import advanced_config_value
 from sunpack.pipeline.coordinator.engine import PipelineEngine, new_work_broker
 from sunpack.runtime.cli.runtime_state import server_runtime_active, set_server_runtime_active
 
 
-ConfigSourceKey = tuple[str | None, str | None, str | None]
 _LOG = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _ConfigSnapshot:
     config_path: Path
     raw_payload: dict[str, Any]
@@ -39,9 +44,9 @@ _ENGINE: PipelineEngine | None = None
 _WORK_BROKER = None
 _ENGINE_LOCK = asyncio.Lock()
 _CONFIG_SNAPSHOT_LIMIT = 64
-_CONFIG_SNAPSHOTS: OrderedDict[ConfigSourceKey, _ConfigSnapshot] = OrderedDict()
-_CONFIG_DIRTY_SOURCES: set[ConfigSourceKey] = set()
-_CONFIG_READERS: Counter[ConfigSourceKey] = Counter()
+_CONFIG_SNAPSHOTS: OrderedDict[ConfigSources, _ConfigSnapshot] = OrderedDict()
+_CONFIG_DIRTY_SOURCES: set[ConfigSources] = set()
+_CONFIG_READERS: Counter[ConfigSources] = Counter()
 _CONFIG_SNAPSHOT_LOCK = RLock()
 _CONFIG_SUBSCRIPTIONS_LOCK = Lock()
 _CONFIG_GENERATION = 0
@@ -196,7 +201,7 @@ def persistent_server_idle_seconds() -> float:
 
 
 def _snapshot_for(request_cwd: str | Path | None, *, refresh: bool = False) -> _ConfigSnapshot:
-    source_key = config_source_key(request_cwd)
+    source_key = resolve_config_sources(request_cwd)
     with _CONFIG_SNAPSHOT_LOCK:
         previous = _CONFIG_SNAPSHOTS.get(source_key)
         if previous is not None and source_key not in _CONFIG_DIRTY_SOURCES and not refresh:
@@ -214,7 +219,7 @@ def _snapshot_for(request_cwd: str | Path | None, *, refresh: bool = False) -> _
     try:
         if previous is None:
             _observe_config_sources()
-        config_path, raw_payload = load_raw_config_payload(request_cwd, refresh=True)
+        config_path, raw_payload = load_config_sources(source_key, request_cwd=request_cwd)
         replacement = _ConfigSnapshot(
             config_path=config_path,
             raw_payload=raw_payload,
@@ -262,13 +267,10 @@ def _observe_config_sources() -> None:
         with _CONFIG_SNAPSHOT_LOCK:
             sources = _CONFIG_SNAPSHOTS.keys() | _CONFIG_READERS.keys()
         files = set()
-        for simple, advanced, override in sources:
-            files.update(path for path in (simple, advanced) if path)
-            if override and override.startswith("file:"):
-                files.add(override[len("file:"):])
-        paths = map(Path, sorted(files))
+        for source in sources:
+            files.update(path for path in (source.simple, source.advanced, source.override) if isinstance(path, Path))
         _CONFIG_OBSERVER.set_additional_files([
-            (path.parent, [path.name], _configuration_files_changed) for path in paths
+            (path.parent, [path.name], _configuration_files_changed) for path in sorted(files)
         ])
 
 
@@ -281,13 +283,14 @@ def load_request_config(request_cwd: str | Path | None = None) -> dict[str, Any]
 
 
 def load_request_config_payload(
-    request_cwd: str | Path | None = None, *, refresh: bool = False,
+    request_cwd: str | Path | None = None, *, refresh: bool = False, normalized: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     """Return request data, or strictly read current files for explicit diagnostics."""
     if not server_runtime_active():
-        return load_raw_config_payload(request_cwd, refresh=refresh)
+        path, raw = load_raw_config_payload(request_cwd, refresh=refresh)
+        return path, normalize_config_payload(raw) if normalized else raw
     snapshot = _snapshot_for(request_cwd, refresh=refresh)
-    return snapshot.config_path, copy.deepcopy(snapshot.raw_payload)
+    return snapshot.config_path, copy.deepcopy(snapshot.normalized_config if normalized else snapshot.raw_payload)
 
 
 @asynccontextmanager

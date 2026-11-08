@@ -177,7 +177,6 @@ class ArchiveTask:
             self.password_probe_input = self.password_probe_input.with_path_mapping(mapped)
 
     def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:
-        runtime = dict(self.runtime)
         self.carrier_path = replacement.carrier_path
         self.cleanup_parts = list(replacement.cleanup_parts)
         self.key = replacement.key
@@ -186,7 +185,6 @@ class ArchiveTask:
         self.discovery_failure = replacement.discovery_failure
         self.inputs = replacement.inputs
         self.password_probe_input = replacement.password_probe_input
-        self.runtime = runtime
 
     def _initialize_knowledge(
         self,

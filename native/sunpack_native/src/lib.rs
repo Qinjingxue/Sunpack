@@ -249,10 +249,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        analysis_native::inspect_zip_local_header,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
         analysis_native::inspect_zip_eocd_structure,
         m
     )?)?;
@@ -262,10 +258,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         analysis_native::inspect_zip_structure_graph,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        analysis_native::inspect_seven_zip_structure,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(analysis_native::inspect_rar_structure, m)?)?;

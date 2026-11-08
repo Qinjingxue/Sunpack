@@ -799,7 +799,7 @@ def test_request_completion_always_releases_source_index(completion):
     watcher = _claim_scheduler_for_test()
     path = os.path.abspath("completion.disguised")
     registry_releases = []
-    request = SimpleNamespace(source_groups={"group": object()}, source_observations={}, top_level_keys=set(),
+    request = SimpleNamespace(source_groups={"group": object()}, source_observations={}, top_level_sources={},
         notification_id="owner", candidate=WatchCandidate(path, 10, 1.0, "file", 1),
         archive_registry=SimpleNamespace(release=registry_releases.append), interruption_cleanup_failed=False,
     )
@@ -1103,15 +1103,18 @@ def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(mo
 def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(monkeypatch):
     watcher = _indexed_scheduler_for_test()
     first_path = os.path.abspath("first.zip")
+    pending_path = first_path.upper()
     second_path = os.path.abspath("second.zip")
     first = WatchCandidate(first_path, 10, 1.0, "first", 1)
     second = WatchCandidate(second_path, 10, 1.0, "second", 1)
-    first_state = watcher._add_pending_locked(first, last_event_at=100.0, quiet_seconds=1.0)
+    first_state = watcher._add_pending_locked(
+        WatchCandidate(pending_path, 10, 2.0, "first", 2), last_event_at=100.0, quiet_seconds=1.0,
+    )
     second_state = watcher._add_pending_locked(second, last_event_at=100.0, quiet_seconds=2.0)
     request = SimpleNamespace(candidate=first)
 
     with watcher._lock:
-        watcher._schedule_active_locked(first_path, first_state)
+        watcher._schedule_active_locked(pending_path, first_state)
         watcher._schedule_active_locked(second_path, second_state)
         watcher._register_inflight_request_locked(request)
 
@@ -1125,6 +1128,25 @@ def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(m
 
     assert watcher.next_delay_seconds() == pytest.approx(1.0)
     assert watcher._inflight_path_counts == {}
+
+
+def test_watch_ready_index_requeues_alias_after_overlapping_observation(monkeypatch):
+    # A differently spelled notification can own the source probe when a
+    # candidate becomes due. Ending that probe must restore its heap entry.
+    watcher = _claim_scheduler_for_test()
+    watcher.state = SimpleNamespace(pending_work_for_path=lambda path: None)
+    path = os.path.abspath("overlap.zip")
+    candidate = WatchCandidate(path, 10, 1.0, "file", 1)
+    with watcher._lock:
+        state = watcher._add_pending_locked(candidate, last_event_at=100.0, quiet_seconds=1.0)
+        watcher._schedule_active_locked(path, state)
+
+    probe = watcher._start_source_probe(path.upper())
+    assert watcher._pop_ready(101.0) == []
+    watcher._end_source_probe(probe)
+
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 101.0)
+    assert watcher.next_delay_seconds() == 0.0
 
 
 class WatchState:
@@ -1257,7 +1279,6 @@ def test_watch_missing_input_completion_uses_request_sources(tmp_path, case):
             watcher._handle_pipeline_progress(str(seed), "owner", SimpleNamespace(),
                                              {"event": "task_sources_claimed", "depth": 2,
                                               "source_paths": (failure_path,)}, request=request)
-        assert request.source_paths is sources
         if case == "transferred":
             watcher._claim_pipeline_sources("new-owner", sources)
             assert "owner" not in watcher._claims_by_owner
@@ -1360,7 +1381,7 @@ def test_cancelled_input_generation_survives_restart_until_content_changes(tmp_p
         watcher.enqueue(str(archive))
         _await(watcher.run_once())
         request = watcher._inflight_requests[0]
-        request.source_paths = (str(archive), str(sibling))
+        request.top_level_sources = {scheduler_module.path_key(path): str(path) for path in (archive, sibling)}
 
         async def stop_with_slow_journal():
             # Restart checks alone cannot detect blocking the shared loop or
@@ -1822,6 +1843,31 @@ def test_filtered_admission_retires_tracker_before_global_idle(tmp_path, monkeyp
         watcher._close_blocking()
 
 
+def test_watch_completion_retires_tracker_during_unchanged_source_probe(tmp_path, monkeypatch):
+    # Completion can overlap the observer reading a duplicate event. That
+    # event will never submit new work or trigger another retirement.
+    watcher = _watcher(tmp_path)
+    path = str(tmp_path / "retained.zip")
+    _write_zip(Path(path))
+    try:
+        watcher.enqueue(path)
+        [candidate] = watcher._pop_ready(time.monotonic() + 1.0)
+        assert path in watcher._quiet_trackers
+
+        def observe(event_path, *, since_usn=0):
+            watcher.state.complete_work_if_matches(candidate)
+            watcher._retire_quiet_tracker(event_path)
+            return candidate
+
+        monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", observe)
+        watcher.enqueue(path, event_type="modified")
+
+        assert watcher.pending_count == 0
+        assert path not in watcher._quiet_trackers
+    finally:
+        watcher._close_blocking()
+
+
 @pytest.mark.parametrize("failure", [asyncio.CancelledError, RuntimeError])
 def test_interrupted_harvest_and_close_wait_for_completion_callbacks(tmp_path, failure):
     from sunpack.runtime.watch.journal_commit import journal_stats
@@ -1847,7 +1893,7 @@ def test_interrupted_harvest_and_close_wait_for_completion_callbacks(tmp_path, f
         await task
         request = scheduler_module._ActivePipelineRequest("request", candidate, task,
             watcher._password_signature_for_scope(str(tmp_path)))
-        request.source_paths = (str(archive),)
+        request.top_level_sources[scheduler_module.path_key(archive)] = str(archive)
         watcher._register_inflight_request_locked(request)
         if failure is RuntimeError:
             finish_request = watcher._finish_active_request
@@ -1885,7 +1931,7 @@ def test_interrupted_harvest_and_close_wait_for_completion_callbacks(tmp_path, f
             await harvest
         await closing
         assert not watcher._completion_batches
-        assert not request.source_paths
+        assert not request.top_level_sources
         assert not watcher._quiet_trackers
         assert watcher._catalog is None
         # An idle owner releases the shared native catalogs and WAL on stop.

@@ -393,14 +393,14 @@ class _ConnectionOutputQueue(asyncio.Queue[bytes | None]):
         self._space_ready.set()
         self.closed = False
 
-    def put_nowait(self, frame: bytes | None) -> None:
+    def put_nowait(self, frame: bytes | None, *, control: bool = False) -> None:
         size = len(frame) if frame else 0
         if size > self.max_bytes:
             raise ValueError("persistent output frame exceeds queue capacity")
         with self._capacity:
             if self.closed:
                 return
-            if self.buffered_bytes + size > self.max_bytes:
+            if not control and self.buffered_bytes + size > self.max_bytes:
                 raise asyncio.QueueFull
             self.buffered_bytes += size
         self._enqueue_reserved(frame)
@@ -616,7 +616,9 @@ class _PipeRequestProtocol(asyncio.Protocol):
             if first:
                 language = load_cli_language_from_config(str((self._payload or {}).get("cwd") or runtime_working_directory()))
                 message = I18nContext(language).t("interrupt.stopping").encode("utf-8") + b"\n"
-                self.output_queue.put_nowait(struct.pack("!BI", 2, len(message)) + message)
+                # This one notice must fit even while data producers are
+                # waiting on a full queue. It still counts against capacity.
+                self.output_queue.put_nowait(struct.pack("!BI", 2, len(message)) + message, control=True)
         if self._input_size is None and len(self._buffer) < 4:
             return
         waiter = self._input_waiter

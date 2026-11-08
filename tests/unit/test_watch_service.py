@@ -11,6 +11,7 @@ import pytest
 import sunpack.runtime.cli.commands.watch as watch_command
 import sunpack.runtime.watch.runtime as watch_runtime
 import sunpack.runtime.watch.service as service_module
+from sunpack.runtime.watch.scheduler import WatchRunResult
 from sunpack.runtime.watch.service import (
     CONTROL_SCHEDULER_WAKEUP,
     CONTROL_STOP,
@@ -1295,7 +1296,10 @@ def test_watch_service_waits_indefinitely_when_scheduler_is_idle(tmp_path, monke
     class FakeScheduler:
         async def run_once(self):
             scheduler_runs.append(len(scheduler_runs))
-            return SimpleNamespace(processed=0, succeeded=0, failed=0, pending=0, errors=[])
+            return WatchRunResult()
+
+        def next_delay_seconds(self):
+            return None
 
     async def start_scheduler():
         service.scheduler = FakeScheduler()
@@ -1493,10 +1497,10 @@ def test_watch_service_deduplicates_unchanged_pending_ticks(tmp_path, monkeypatc
     class FakeScheduler:
         def __init__(self):
             self.results = iter([
-                SimpleNamespace(processed=0, succeeded=0, failed=0, pending=1, errors=[]),
-                SimpleNamespace(processed=0, succeeded=0, failed=0, pending=1, errors=[]),
-                SimpleNamespace(processed=1, succeeded=1, failed=0, pending=0, errors=[]),
-                SimpleNamespace(processed=0, succeeded=0, failed=0, pending=1, errors=[]),
+                WatchRunResult(pending=1),
+                WatchRunResult(pending=1),
+                WatchRunResult(processed=1, succeeded=1),
+                WatchRunResult(pending=1),
             ])
 
         async def run_once(self):

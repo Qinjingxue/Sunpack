@@ -1,4 +1,3 @@
-#[pyfunction]
 pub(crate) fn inspect_zip_local_header(
     py: Python<'_>,
     path: &str,
@@ -374,25 +373,6 @@ pub(crate) fn inspect_zip_structure_graph(
     max_entries: usize,
 ) -> PyResult<Py<PyDict>> {
     crate::formats::zip::inspect_zip_structure_graph(py, path, max_entries)
-}
-
-#[pyfunction]
-pub(crate) fn inspect_seven_zip_structure(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
-    let reader = match ManagedReader::open(path) {
-        Ok(reader) => reader,
-        Err(_) => return Ok(seven_empty(py, "os_error")?.unbind()),
-    };
-    let view = crate::analysis_native::AnalysisBinaryView {
-        path: path.to_owned(),
-        reader,
-        closed: false,
-    };
-    let result = view.probe_seven_zip(py, 0)?.into_bound(py);
-    let valid = result
-        .get_item("magic_matched")?
-        .is_some_and(|value| value.is_truthy().unwrap_or(false));
-    result.set_item("detected_ext", if valid { ".7z" } else { "" })?;
-    Ok(result.unbind())
 }
 
 #[pyfunction]

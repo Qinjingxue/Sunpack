@@ -5,6 +5,7 @@ from dataclasses import replace
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
 from sunpack.core.support.archive_formats import canonical_format
+from sunpack.core.support.archive_sessions import archive_session_scope
 
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
@@ -15,13 +16,9 @@ from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchRe
 from sunpack.core.passwords.session import PasswordSession
 
 
-def _selected_structure_format(task: Any | None) -> str:
-    if task is None:
-        return ""
-    knowledge = _knowledge(task)
-    descriptor = _archive_input_descriptor(task)
+def _selected_structure_format(knowledge: ArchiveKnowledge, descriptor, probe_input) -> str:
     values = (
-        getattr(getattr(task, "password_probe_input", None), "format_hint", ""),
+        getattr(probe_input, "format_hint", ""),
         knowledge.get("inspection.summary.format"),
         descriptor.format_hint if descriptor is not None else "",
     )
@@ -46,11 +43,7 @@ def _selected_structure_format(task: Any | None) -> str:
     return ""
 
 
-def _structure_facts(task: Any | None) -> list[tuple[str, dict]]:
-    if task is None:
-        return []
-    knowledge = _knowledge(task)
-    selected_format = _selected_structure_format(task)
+def _structure_facts(knowledge: ArchiveKnowledge, selected_format: str):
     candidates = (
         ("rar", ("format.rar.structure",)),
         ("zip", ("format.zip.structure",)),
@@ -58,16 +51,14 @@ def _structure_facts(task: Any | None) -> list[tuple[str, dict]]:
         ("tar", ("format.tar.structure",)),
         ("compression", ("format.compression.structure", "compression.stream_structure")),
     )
-    output: list[tuple[str, dict]] = []
     for fmt, paths in candidates:
         if selected_format and fmt != selected_format:
             continue
         for path in paths:
             value = knowledge.get(path)
             if isinstance(value, dict):
-                output.append((fmt, value))
+                yield fmt, value
                 break
-    return output
 
 
 def _validated_format_password_state(fmt: str, structure: dict) -> str:
@@ -150,27 +141,23 @@ def archive_structure_password_state(task: Any | None) -> str:
         if analysis.get("password_required"):
             return "required"
 
-    evidence = _knowledge(task).get("discovery.evidence", {})
+    knowledge = _knowledge(task)
+    evidence = knowledge.get("discovery.evidence", {})
     if isinstance(evidence, dict) and evidence.get("needs_password"):
         return "required"
 
-    active_format = _selected_structure_format(task)
+    active_format = _selected_structure_format(knowledge, descriptor, getattr(task, "password_probe_input", None))
     if active_format in {"tar", "compression"}:
         return "not_required"
 
-    states = [
-        _validated_format_password_state(fmt, value)
-        for fmt, value in _structure_facts(task)
-    ]
-    if "required" in states:
-        return "required"
-    if "not_required" in states:
-        return "not_required"
-    return "unknown"
-
-
-def archive_structure_requires_password(task: Any | None) -> bool:
-    return archive_structure_password_state(task) == "required"
+    state = "unknown"
+    for fmt, structure in _structure_facts(knowledge, active_format):
+        candidate = _validated_format_password_state(fmt, structure)
+        if candidate == "required":
+            return candidate
+        if candidate == "not_required":
+            state = candidate
+    return state
 
 
 class PasswordResolver:
@@ -197,9 +184,10 @@ class PasswordResolver:
         scope_path: str = "",
     ) -> PasswordResolution:
         archive_key = archive_key or _archive_key(task) or archive_path
-        if self.password_session.has_resolved(archive_key):
+        password = self.password_session.get_resolved(archive_key)
+        if password is not None:
             return PasswordResolution(
-                password=self.password_session.get_resolved(archive_key),
+                password=password,
                 status=PasswordResolutionStatus.RESOLVED,
                 archive_key=archive_key,
             )
@@ -213,42 +201,41 @@ class PasswordResolver:
                 encrypted=False,
             )
 
-        archive_input = self._archive_input_for_password_probe(task) or {}
-        fingerprint = build_archive_fingerprint(
-            archive_path,
-            part_paths,
-            archive_input=archive_input,
-        )
-
-        has_candidates = self.password_tester.password_store.has_candidates(
-            scope_path=scope_path
-        )
-        if not has_candidates:
-            if password_state == "required":
-                return PasswordResolution(
-                    password=None,
-                    status=PasswordResolutionStatus.PASSWORD_REQUIRED,
-                    error_text="archive requires a password but no candidates were provided",
-                    archive_key=archive_key,
-                    encrypted=True,
-                )
-            return self._confirmation_resolution(
-                archive_key,
-                "",
-                fingerprint.key,
-                task,
-                candidate_passwords=("",),
-                candidate_evidence="empty_password_direct",
+        has_candidates = self.password_tester.password_store.has_candidates(scope_path=scope_path)
+        if not has_candidates and password_state == "required":
+            return PasswordResolution(
+                password=None,
+                status=PasswordResolutionStatus.PASSWORD_REQUIRED,
+                error_text="archive requires a password but no candidates were provided",
+                archive_key=archive_key,
+                encrypted=True,
             )
 
-        search = self._plan_password_search(
-            archive_path,
-            task=task,
-            part_paths=part_paths,
-            fingerprint=fingerprint,
-            scope_path=scope_path,
-            include_empty=password_state == "unknown",
-        )
+        archive_input = self._archive_input_for_password_probe(task)
+        # Fingerprinting validates each physical file. Reuse those readers for
+        # the bounded password probes of this same logical input operation.
+        with archive_session_scope():
+            fingerprint = build_archive_fingerprint(
+                archive_path,
+                part_paths,
+                archive_input=archive_input,
+            )
+            if not has_candidates:
+                return self._confirmation_resolution(
+                    archive_key,
+                    "",
+                    fingerprint.key,
+                    candidate_passwords=("",),
+                    candidate_evidence="empty_password_direct",
+                )
+            search = self._plan_password_search(
+                archive_path,
+                archive_input=archive_input,
+                part_paths=part_paths,
+                fingerprint=fingerprint,
+                scope_path=scope_path,
+                include_empty=password_state == "unknown",
+            )
         if search.status in {
             PasswordSearchStatus.FOUND,
             PasswordSearchStatus.UNENCRYPTED,
@@ -267,14 +254,14 @@ class PasswordResolver:
                 archive_key,
                 candidate_passwords[0],
                 fingerprint.key,
-                task,
+                encrypted=True if password_state == "required" else None,
                 candidate_evidence=search.extraction_candidate_evidence,
                 candidate_passwords=candidate_passwords,
             )
         return self._remember_search(
             archive_key,
             search,
-            encrypted=True if archive_structure_requires_password(task) else None,
+            encrypted=True if password_state == "required" else None,
         )
 
     def confirm_extraction(
@@ -309,13 +296,12 @@ class PasswordResolver:
         self,
         archive_path: str,
         *,
-        task: Any | None,
+        archive_input: ArchiveInputDescriptor | None,
         part_paths: list[str] | None,
         fingerprint,
         scope_path: str,
         include_empty: bool = False,
     ) -> PasswordSearchResult:
-        archive_input = self._archive_input_for_password_probe(task)
         candidates = PasswordCandidatePipeline.from_password_store(
             self.password_tester.password_store,
             scope_path=scope_path,
@@ -337,8 +323,8 @@ class PasswordResolver:
         archive_key: str,
         password: str,
         fingerprint_key: str,
-        task: Any | None,
         *,
+        encrypted: bool | None = None,
         candidate_evidence: str = "",
         candidate_passwords: tuple[str, ...] = (),
     ) -> PasswordResolution:
@@ -346,7 +332,7 @@ class PasswordResolver:
             password=password,
             status=PasswordResolutionStatus.RESOLVED,
             archive_key=archive_key,
-            encrypted=True if archive_structure_requires_password(task) else None,
+            encrypted=encrypted,
             requires_extraction_confirmation=True,
             candidate_passwords=candidate_passwords,
             fingerprint_key=fingerprint_key,
@@ -357,13 +343,15 @@ class PasswordResolver:
     def _archive_input_for_password_probe(task: Any | None) -> ArchiveInputDescriptor | None:
         if task is None:
             return None
-        descriptor = getattr(task, "password_probe_input", None) or _archive_input_descriptor(task)
-        if descriptor is None:
+        probe_input = getattr(task, "password_probe_input", None)
+        descriptor = _archive_input_descriptor(task)
+        selected_input = probe_input or descriptor
+        if selected_input is None:
             return None
-        selected_format = _selected_structure_format(task)
-        if selected_format in {"zip", "rar", "7z"} and selected_format != descriptor.format_hint:
-            return replace(descriptor, format_hint=selected_format)
-        return descriptor
+        selected_format = _selected_structure_format(_knowledge(task), descriptor, probe_input)
+        if selected_format in {"zip", "rar", "7z"} and selected_format != selected_input.format_hint:
+            return replace(selected_input, format_hint=selected_format)
+        return selected_input
 
     def _remember(
         self,
@@ -373,9 +361,8 @@ class PasswordResolver:
         test_result: object = None,
         error_text: str = "",
         encrypted: bool | None = None,
-        remember_only_on_success: bool = False,
     ) -> PasswordResolution:
-        if not remember_only_on_success or password is not None:
+        if password is not None:
             self.password_session.set_resolved(archive_key, password)
         return PasswordResolution(
             password=password,
@@ -411,7 +398,6 @@ class PasswordResolver:
             test_result=search.test_result,
             error_text=search.error_text,
             encrypted=encrypted,
-            remember_only_on_success=True,
         )
 
 

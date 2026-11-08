@@ -6,13 +6,13 @@ from types import ModuleType
 from typing import Any, Callable, TextIO
 
 from sunpack.runtime.cli.cli_reporter import CliReporter
-from sunpack.core.config.cli_settings import DEFAULT_CLI_LANG
+from sunpack.core.config.fields.cli import DEFAULT_CLI_LANGUAGE
 from sunpack.core.i18n import I18nContext
 
 
 @dataclass
 class CliContext:
-    language: str = DEFAULT_CLI_LANG
+    language: str = DEFAULT_CLI_LANGUAGE
     reporter: CliReporter | None = None
     commands: dict[str, ModuleType] | None = None
     cwd: str = field(default_factory=os.getcwd)

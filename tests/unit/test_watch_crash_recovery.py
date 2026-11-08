@@ -262,8 +262,7 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
         write_throttled=lambda *_args, **_kwargs: None,
     )
     scheduler._wake_callback = None
-    scheduler.metadata_files = set()
-    scheduler.metadata_dir = ""
+    scheduler._is_under_metadata_dir = lambda _path: False
     from sunpack.core.support.path_keys import path_key
     key = path_key(str(tmp_path))
     scheduler.root_entries[key] = scheduler_module.WatchRootEntry(str(tmp_path))
@@ -457,8 +456,7 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
         write_throttled=lambda *_args, **_kwargs: None,
     )
     scheduler._wake_callback = None
-    scheduler.metadata_files = set()
-    scheduler.metadata_dir = ""
+    scheduler._is_under_metadata_dir = lambda _path: False
     from sunpack.core.support.path_keys import path_key
     key = path_key(str(tmp_path))
     scheduler.root_entries[key] = scheduler_module.WatchRootEntry(str(tmp_path))

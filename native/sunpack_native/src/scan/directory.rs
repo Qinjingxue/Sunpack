@@ -12,9 +12,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCatalog};
 use super::path_filter::{FilterPath, NativePathRule, PathRule, PathRuleScratch};
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
-    probe_volume_anchor_records_cheap, CheapAnchor, CheapAnchorCell,
+    cheap_fast_probe_pool, probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
+    probe_volume_anchor_record_cheap, CheapAnchor, CheapAnchorCell,
 };
+use crate::io::resource_lifecycle::NativeReadScope;
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryEntryRecord {
@@ -1877,45 +1878,48 @@ fn populate_relation_anchors_cached(
     cells: &[Option<CheapAnchorCell>],
     root: Option<&str>,
 ) {
-    let eligible_indices: Vec<usize> = records
+    let needs_anchor = |record: &DirectoryEntryRecord| {
+        !record.is_dir && record.relation_member_eligible && record.relation_anchor.is_none()
+    };
+    if records
         .iter()
-        .enumerate()
-        .filter_map(|(index, record)| {
-            (!record.is_dir && record.relation_member_eligible && record.relation_anchor.is_none())
-                .then_some(index)
-        })
-        .collect();
-    if eligible_indices.is_empty() {
-        return;
+        .any(|record| record.size.is_some() && needs_anchor(record))
+    {
+        // A conflicting promotion retains the original per-file error/retry path.
+        let scope = root.and_then(|root| NativeReadScope::new(Path::new(root)).ok());
+        cheap_fast_probe_pool().install(|| {
+            records
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(index, record)| {
+                    if let Some(size) = record.size.filter(|_| needs_anchor(record)) {
+                        record.relation_anchor = Some(probe_volume_anchor_record_cheap(
+                            &record.path,
+                            size,
+                            cells.get(index).and_then(Option::as_ref),
+                            scope.as_ref(),
+                        ));
+                    }
+                });
+        });
     }
 
-    let mut known_size_inputs = Vec::with_capacity(eligible_indices.len());
-    let mut unknown_size_inputs = Vec::new();
-    for &index in &eligible_indices {
-        let record = &records[index];
-        if let Some(size) = record.size {
-            known_size_inputs.push((
-                record.path.as_str(),
-                size,
-                cells.get(index).and_then(Option::as_ref),
-            ));
-        } else {
-            unknown_size_inputs.push(record.path.clone());
-        }
-    }
-    let mut known_anchors = probe_volume_anchor_records_cheap(&known_size_inputs, root).into_iter();
-    let mut unknown_anchors =
-        probe_volume_anchor_paths_cheap(&unknown_size_inputs, None).into_iter();
-    for index in eligible_indices {
-        let anchor = if records[index].size.is_some() {
-            known_anchors.next()
-        } else {
+    let needs_size = |record: &DirectoryEntryRecord| record.size.is_none() && needs_anchor(record);
+    let unknown_size_paths: Vec<_> = records
+        .iter()
+        .filter(|record| needs_size(record))
+        .map(|record| record.path.clone())
+        .collect();
+    if !unknown_size_paths.is_empty() {
+        let anchors = probe_volume_anchor_paths_cheap(&unknown_size_paths, None);
+        for (record, anchor) in records
+            .iter_mut()
+            .filter(|record| needs_size(record))
+            .zip(anchors)
+        {
             // Without a size column the full anchor owns the probed size.
-            unknown_anchors
-                .next()
-                .map(|anchor| CheapAnchor::Full(Arc::new(anchor)))
-        };
-        records[index].relation_anchor = anchor;
+            record.relation_anchor = Some(CheapAnchor::Full(Arc::new(anchor)));
+        }
     }
 }
 

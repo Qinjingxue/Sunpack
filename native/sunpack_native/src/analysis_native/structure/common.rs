@@ -8,16 +8,7 @@ fn set_read_fault(
     legacy_error: &str,
 ) -> PyResult<()> {
     result.set_item("error", legacy_error)?;
-    fault.write_python(result)?;
-    let mut flags = vec!["read_error"];
-    if fault.code == "unexpected_eof" {
-        flags.push("input_truncated");
-    }
-    if fault.possible_missing_volume() {
-        flags.push("missing_volume");
-    }
-    result.set_item("damage_flags", PyList::new(result.py(), flags)?)?;
-    Ok(())
+    fault.write_python_with_damage_flags(result)
 }
 
 fn has_central_directory_signature(file: &mut SourceCursor, offset: u64, file_size: u64) -> bool {

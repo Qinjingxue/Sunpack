@@ -243,7 +243,7 @@ def test_password_resolver_submits_all_inconclusive_candidates_as_one_batch():
     assert first.candidate_passwords == ("", "user-password", "builtin-password")
     assert first.requires_extraction_confirmation is True
     assert tester.test_without_password_calls == 0
-    assert session.has_resolved("archive-key") is False
+    assert session.get_resolved("archive-key") is None
 
     resolver.confirm_extraction(first, password="builtin-password")
 

@@ -69,14 +69,11 @@ class AdaptiveQuietTracker:
     last_size: int | None = None
     last_mtime: float | None = None
     last_change_usn: int | None = None
-    _samples: deque[tuple[float, float]] = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self._samples = deque(maxlen=self.policy.window_size)
+    _samples: deque[tuple[float, float]] | None = field(default=None, init=False, repr=False)
 
     @property
     def intervals(self) -> tuple[float, ...]:
-        return tuple(interval for interval, _ in self._samples)
+        return tuple(interval for interval, _ in self._samples) if self._samples is not None else ()
 
     def observe(
         self,
@@ -111,7 +108,7 @@ class AdaptiveQuietTracker:
             return self.quiet_seconds
         if self.last_size is not None and size < self.last_size:
             # A truncate/restart is not an interval in the old writing phase.
-            self._samples.clear()
+            self._samples = None
             self.quiet_seconds = self.cadence_seconds = self.pending_interval_seconds = 0.0
             self.last_content_event_at = None
         if self.last_content_event_at is not None and learn_interval:
@@ -133,14 +130,21 @@ class AdaptiveQuietTracker:
         # Quarantine unknown/out-of-phase gaps without extending the deadline.
         # Repeated compatible intervals establish a real slower writing phase.
         cadence = self.cadence_seconds
+        pending_sample = None
         if cadence == 0.0 or interval > self.policy.pause_ratio * cadence:
             pending = self.pending_interval_seconds
             if not pending or max(interval, pending) > self.policy.phase_confirmation_ratio * min(interval, pending):
                 self.pending_interval_seconds = interval
                 return
-            self._samples.clear()
-            self._samples.append((pending, self.last_content_event_at))
+            pending_sample = (pending, self.last_content_event_at)
+        samples = self._samples
+        if samples is None:
+            # One-shot arrivals and metadata-only activity need no history.
+            self._samples = samples = deque(maxlen=self.policy.window_size)
+        if pending_sample is not None:
+            samples.clear()
+            samples.append(pending_sample)
         self.pending_interval_seconds = 0.0
-        self._samples.append((interval, now))
-        self.cadence_seconds = self.policy.effective_interval(self._samples)
+        samples.append((interval, now))
+        self.cadence_seconds = self.policy.effective_interval(samples)
         self.quiet_seconds = self.policy.target_seconds(self.cadence_seconds)

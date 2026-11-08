@@ -22,6 +22,13 @@ ADVANCED_CONFIG_FILENAME = "sunpack_advanced_config.json"
 OVERRIDES_ENV_VAR = "SUNPACK_CONFIG_OVERRIDES"
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigSources:
+    simple: Path | None
+    advanced: Path | None
+    override: Path | str | None = None
+
+
 @dataclass(slots=True)
 class _ConfigSnapshot:
     signature: tuple[Any, ...]
@@ -61,22 +68,20 @@ def _known_config_sections() -> frozenset[str]:
     return frozenset(sections)
 
 
-def _load_override_payload() -> dict[str, Any]:
+def _load_override_payload(source: Path | str | None) -> dict[str, Any]:
     """Read the SUNPACK_CONFIG_OVERRIDES layer (inline JSON object or file path)."""
-    raw = os.environ.get(OVERRIDES_ENV_VAR, "").strip()
-    if not raw:
+    if source is None:
         return {}
-    path = Path(raw)
-    if path.is_file():
-        payload = load_json_file(path)
+    if isinstance(source, Path):
+        payload = load_json_file(source)
     else:
         try:
-            payload = json.loads(raw)
+            payload = json.loads(source)
         except json.JSONDecodeError as exc:
-            if raw[:1] in {"{", "["}:
+            if source[:1] in {"{", "["}:
                 raise ConfigError(f"{OVERRIDES_ENV_VAR} contains invalid JSON: {exc}") from exc
             raise ConfigError(
-                f"{OVERRIDES_ENV_VAR} must be an inline JSON object or an existing JSON file: {raw}"
+                f"{OVERRIDES_ENV_VAR} must be an inline JSON object or an existing JSON file: {source}"
             ) from exc
     if not isinstance(payload, dict):
         raise ConfigError(f"{OVERRIDES_ENV_VAR} must contain a JSON object")
@@ -86,16 +91,6 @@ def _load_override_payload() -> dict[str, Any]:
             f"{OVERRIDES_ENV_VAR} contains unknown config sections: {', '.join(unknown)}"
         )
     return payload
-
-
-def _override_signature() -> tuple[str, int, int] | str | None:
-    raw = os.environ.get(OVERRIDES_ENV_VAR, "").strip()
-    if not raw:
-        return None
-    path = Path(raw)
-    if not path.is_file():
-        return raw
-    return _config_file_signature(path)
 
 
 def _deep_merge_config(base: dict[str, Any], override: dict[str, Any], path: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -156,12 +151,13 @@ def apply_config_overrides(config: dict[str, Any], overrides: dict[str, Any]) ->
     return config
 
 
-def _load_layered_config_paths(
-    simple_path: Path | None,
-    advanced_path: Path | None,
+def load_config_sources(
+    sources: ConfigSources,
     *,
     request_cwd: str | Path | None = None,
 ) -> tuple[Path, dict[str, Any]]:
+    """Read the exact sources selected for this snapshot."""
+    simple_path, advanced_path = sources.simple, sources.advanced
     if simple_path is None and advanced_path is None:
         searched = [
             *[str(path) for path in _searched_config_paths(SIMPLE_CONFIG_FILENAME, request_cwd)],
@@ -173,7 +169,7 @@ def _load_layered_config_paths(
     config = advanced
     if simple_path is not None:
         config = _deep_merge_config(advanced, _load_json(simple_path))
-    overrides = _load_override_payload()
+    overrides = _load_override_payload(sources.override)
     return (simple_path or advanced_path), apply_config_overrides(config, overrides)
 
 
@@ -182,23 +178,25 @@ def load_raw_config_payload(
 ) -> tuple[Path, dict[str, Any]]:
     """Load the merged external payload without schema initialization or validation."""
     if refresh:
-        simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
-        advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
-        return _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
+        return load_config_sources(resolve_config_sources(request_cwd), request_cwd=request_cwd)
     snapshot = _config_snapshot(request_cwd)
     return snapshot.path, copy.deepcopy(snapshot.raw)
 
 
 def _config_snapshot(request_cwd: str | Path | None) -> _ConfigSnapshot:
     global _CONFIG_CACHE
-    simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
-    advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
-    signature = (_config_file_signature(simple_path), _config_file_signature(advanced_path), _override_signature())
+    sources = resolve_config_sources(request_cwd)
+    override = sources.override
+    signature = (
+        _config_file_signature(sources.simple),
+        _config_file_signature(sources.advanced),
+        _config_file_signature(override) if isinstance(override, Path) else override,
+    )
     with _CONFIG_CACHE_LOCK:
         previous = _CONFIG_CACHE
         if previous is not None and previous.signature == signature:
             return previous
-    config_path, config = _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
+    config_path, config = load_config_sources(sources, request_cwd=request_cwd)
     snapshot = _ConfigSnapshot(signature, config_path, config)
     with _CONFIG_CACHE_LOCK:
         if _CONFIG_CACHE is previous:
@@ -208,33 +206,26 @@ def _config_snapshot(request_cwd: str | Path | None) -> _ConfigSnapshot:
     return snapshot
 
 
-def _config_file_signature(path: Path | None) -> tuple[str, int, int] | None:
+def _config_file_signature(path: Path | None) -> tuple[Path, int, int] | None:
     if path is None:
         return None
     try:
         stat = path.stat()
     except OSError:
-        return (str(resolve_resource_path(path)), -1, -1)
-    return (str(resolve_resource_path(path)), int(stat.st_mtime_ns), int(stat.st_size))
+        return (path, -1, -1)
+    return (path, stat.st_mtime_ns, stat.st_size)
 
 
-def _config_source_path(path: Path | None) -> str | None:
-    return str(resolve_resource_path(path)) if path is not None else None
-
-
-def _override_source_identity() -> str | None:
-    raw = os.environ.get(OVERRIDES_ENV_VAR, "").strip()
-    if not raw:
-        return None
-    path = Path(raw)
-    return f"file:{resolve_resource_path(path)}" if path.is_file() else f"inline:{raw}"
-
-
-def config_source_key(request_cwd: str | Path | None = None) -> tuple[str | None, str | None, str | None]:
-    """Return the config source identity without any mtime-based invalidation."""
+def resolve_config_sources(request_cwd: str | Path | None = None) -> ConfigSources:
     simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
     advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
-    return (_config_source_path(simple_path), _config_source_path(advanced_path), _override_source_identity())
+    override = os.environ.get(OVERRIDES_ENV_VAR, "").strip()
+    override_path = Path(override) if override else None
+    return ConfigSources(
+        resolve_resource_path(simple_path) if simple_path is not None else None,
+        resolve_resource_path(advanced_path) if advanced_path is not None else None,
+        resolve_resource_path(override_path) if override_path is not None and override_path.is_file() else override or None,
+    )
 
 
 def clear_config_cache() -> None:

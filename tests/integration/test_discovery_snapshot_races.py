@@ -14,7 +14,7 @@ from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
 from sunpack.core.support.resource_lifecycle import promotion_barrier
-from sunpack.pipeline.coordinator.engine import PipelineEngine, _PathLeaseRegistry, _SourceCleanup
+from sunpack.pipeline.coordinator.engine import PipelineEngine, _PathLeaseRegistry, _RequestRuntime, _SourceCleanup
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
@@ -385,6 +385,12 @@ def test_missing_volume_retry_sees_live_arrival_even_before_catalog_event(tmp_pa
         loop = asyncio.get_running_loop()
         paused, resume = asyncio.Event(), threading.Event()
         original = ArchiveTaskProvider.resolve_volume_once
+        original_retry = _RequestRuntime._resolve_missing_volume_once
+        retry_tasks = []
+
+        def remember_retry_task(self, task, outcome):
+            retry_tasks.append(task)
+            return original_retry(self, task, outcome)
 
         def retry_after_arrival(self, *args, **kwargs):
             loop.call_soon_threadsafe(paused.set)
@@ -392,6 +398,7 @@ def test_missing_volume_retry_sees_live_arrival_even_before_catalog_event(tmp_pa
             return original(self, *args, **kwargs)
 
         monkeypatch.setattr(ArchiveTaskProvider, "resolve_volume_once", retry_after_arrival)
+        monkeypatch.setattr(_RequestRuntime, "_resolve_missing_volume_once", remember_retry_task)
         async with PipelineEngine(config) as engine:
             run = asyncio.create_task(engine.run([str(case.entry_path)], origin=origin, discovery_scope=scope, catalog=catalog))
             try:
@@ -405,6 +412,9 @@ def test_missing_volume_retry_sees_live_arrival_even_before_catalog_event(tmp_pa
                 raise result
             assert result.summary.success_count == 1
             assert not result.summary.failures
+            assert len(retry_tasks) == 1
+            # A consumer can keep the task, but its volume-retry inventory has ended.
+            assert not {"discovery_snapshot", "discovery_catalog"} & retry_tasks[0].runtime.keys()
             assert not any(path.exists() for path in parts)
             assert_expected_files_extracted(case, output)
             assert not engine._path_leases._pins

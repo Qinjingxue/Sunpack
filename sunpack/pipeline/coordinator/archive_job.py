@@ -146,15 +146,21 @@ class ArchiveJobExecutor:
     ) -> tuple[ArchiveTask, ArchiveJobOutcome, TargetRunResult]:
         """Run one logical archive through preflight, extraction and verification."""
 
-        task, outcome = await self._execute_one_async(
-            task,
-            output_dir_resolver,
-            depth=depth,
-            broker=broker,
-            cancellation=cancellation,
-            missing_volume_retry=missing_volume_retry,
-            ensure_input_lease=ensure_input_lease,
-        )
+        try:
+            task, outcome = await self._execute_one_async(
+                task,
+                output_dir_resolver,
+                depth=depth,
+                broker=broker,
+                cancellation=cancellation,
+                missing_volume_retry=missing_volume_retry,
+                ensure_input_lease=ensure_input_lease,
+            )
+        finally:
+            # A later output or progress consumer may still own the task.
+            # The native inventory and catalog are only needed for volume retry.
+            task.runtime.pop("discovery_snapshot", None)
+            task.runtime.pop("discovery_catalog", None)
         result = await broker.run(
             "collect_result_cleanup",
             task.key or task.main_path,
@@ -251,7 +257,6 @@ class ArchiveJobExecutor:
             if not isinstance(replacement, ArchiveTask):
                 break
             task.adopt_detection_plan(replacement)
-            task.runtime["volume_retry_attempted"] = True
         if terminal is not None:
             terminal.planned_out_dir = planned_out_dir
             return task, terminal
@@ -276,6 +281,7 @@ class ArchiveJobExecutor:
             task,
             planned_out_dir,
             missing_volume_retry=missing_volume_retry,
+            volume_retry_attempted=retried_missing_volume,
         )
         sent = None
         first = True
@@ -325,8 +331,8 @@ class ArchiveJobExecutor:
         out_dir: str,
         *,
         missing_volume_retry=None,
+        volume_retry_attempted: bool = False,
     ):
-        volume_retry_attempted = bool(task.runtime.get("volume_retry_attempted"))
         while True:
             self._report_task_status(task, "extracting")
             result = yield {
@@ -357,11 +363,6 @@ class ArchiveJobExecutor:
                             planned_output_dir=out_dir,
                         )
                         task.adopt_detection_plan(replacement)
-                        task.runtime["volume_retry_attempted"] = True
-                        task.runtime["volume_retry_basis"] = [
-                            "confirmed_structure",
-                            "anchor_constrained_filename",
-                        ]
                         self.password_scope_context.annotate([task])
                         continue
                 return current_outcome

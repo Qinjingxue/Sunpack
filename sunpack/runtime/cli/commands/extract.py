@@ -2,13 +2,11 @@ from sunpack.core.support.path_keys import case_key
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED, EXIT_USAGE
 from sunpack.runtime.cli.cli_parsers import (
-    CliHelpFormatter,
     build_common_parser,
     build_detection_parser,
     build_extract_config_override_parser,
     build_password_parser,
     build_process_mode_parser,
-    localize_help_action,
 )
 from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
@@ -52,10 +50,8 @@ def register(subparsers, ctx):
         parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_extract_config_override_parser(ctx), build_process_mode_parser(ctx)],
         help=ctx.t("cli.extract.help"),
         usage="sunpack extract [options] <paths...>",
-        formatter_class=CliHelpFormatter,
     )
     parser.set_defaults(command=COMMAND)
-    localize_help_action(parser, ctx)
     parser.add_argument("--direct-file", "--direct", dest="direct_file", action="store_true", help=ctx.t("cli.extract.direct_file"))
     parser.add_argument("paths", nargs="+", help=ctx.t("cli.extract.paths"))
 

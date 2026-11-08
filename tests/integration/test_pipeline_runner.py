@@ -202,7 +202,7 @@ def test_pipeline_runner_passes_native_space_configuration():
     engine = PipelineEngine(config)
     captured = {}
     _configure_request_runtime(engine, lambda runtime: captured.update(
-        extractor=runtime.extractor.process_config,
+        extractor=runtime.extractor.sevenzip_runner.process_config,
     ))
     async def run():
         async with engine:

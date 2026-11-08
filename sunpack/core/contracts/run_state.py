@@ -31,11 +31,9 @@ class RunState:
     def add_target_result(self, result: TargetRunResult) -> None:
         slot = len(self.target_results)
         self.target_results.append(result)
-        self._store_target_result(slot, result)
+        self._index_target_result(slot, result)
 
-    def _store_target_result(self, slot: int, result: TargetRunResult) -> None:
-        self._target_slots.pop(id(self.target_results[slot]), None)
-        self.target_results[slot] = result
+    def _index_target_result(self, slot: int, result: TargetRunResult) -> None:
         self._target_slots[id(result)] = slot
         if result.output_dir:
             self._target_outputs.setdefault(result.output_dir, []).append(slot)
@@ -50,7 +48,8 @@ class RunState:
                 slots.remove(slot)
                 if not slots:
                     del self._target_outputs[old.output_dir]
-        self._store_target_result(slot, new)
+        self.target_results[slot] = new
+        self._index_target_result(slot, new)
 
     @property
     def cleanup_results(self) -> tuple[ArchiveCleanupResult, ...]:
@@ -72,8 +71,10 @@ class RunState:
                         **failure.details, "retry_output_dir": result.relocate(failure.details["retry_output_dir"]),
                         "input_recovery": InputRecovery.from_failure(failure).relocate_outputs(result.relocate).to_dict(),
                     })
-                self._store_target_result(slot, replace(old, output_dir=path, failure=failure)
-                                          if path != old.output_dir or failure is not old.failure else old)
+                if path != old.output_dir or failure is not old.failure:
+                    self._target_slots.pop(id(old), None)
+                    self.target_results[slot] = replace(old, output_dir=path, failure=failure)
+                self._index_target_result(slot, self.target_results[slot])
         for _path, old in self._cleanup_results.pop_under(result.path):
             path = result.relocate(old.path)
             self.add_cleanup_result(replace(old, path=path) if path != old.path else old)
@@ -123,16 +124,10 @@ class RunState:
                 if failure not in self._scan_failures:
                     self._scan_failures.append(failure)
 
-    def snapshot(
-        self,
-        *,
-        target_results: list[TargetRunResult],
-        scan_failures: list[FailureInfo],
-        policy_skips: list[dict],
-    ) -> RunSummary:
+    def snapshot(self) -> RunSummary:
         return RunSummary(
-            target_results=tuple(target_results),
-            scan_failures=tuple(scan_failures),
-            policy_skips=tuple(policy_skips),
+            target_results=tuple(self.target_results),
+            scan_failures=tuple(self.scan_failures),
+            policy_skips=tuple(self.policy_skips),
             cleanup_results=self.cleanup_results,
         )

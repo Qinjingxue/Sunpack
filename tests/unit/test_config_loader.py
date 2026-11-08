@@ -194,7 +194,7 @@ def test_load_config_uses_explicit_request_cwd(tmp_path, monkeypatch):
     try:
         assert loader.load_config(first_root)["cli"]["language"] == "zh"
         assert loader.load_config(second_root)["cli"]["language"] == "en"
-        assert loader.config_source_key(first_root) != loader.config_source_key(second_root)
+        assert loader.resolve_config_sources(first_root) != loader.resolve_config_sources(second_root)
     finally:
         loader.clear_config_cache()
 

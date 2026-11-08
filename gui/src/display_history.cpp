@@ -74,9 +74,9 @@ void read_at(HANDLE file,uint64_t offset,void* output,size_t bytes) {
         if(!got) throw std::runtime_error("logRecordTooLarge"); p+=got; bytes-=got;
     }
 }
-HANDLE open_reader(const fs::path& path) {
+Handle open_reader(const fs::path& path) {
     auto file=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
-    if(file==INVALID_HANDLE_VALUE) win_error("opReadEventLog"); return file;
+    if(file==INVALID_HANDLE_VALUE) win_error("opReadEventLog"); return Handle(file);
 }
 std::string run_name(const Json& run) {
     auto name=run.at("name").get<std::string>();
@@ -110,7 +110,7 @@ struct RunReader {
     std::string name;
     fs::path data_path;
     Handle index;
-    std::unique_ptr<Handle> data;
+    std::optional<Handle> data;
     uint64_t head=0,count=0,revision=0;
     int64_t position=-1;
     Entry current{};
@@ -166,7 +166,7 @@ struct RunReader {
         }
     }
     Json decode_value(std::vector<char>& packed,std::vector<char>& raw) {
-        if(!data) data=std::make_unique<Handle>(open_reader(data_path));
+        if(!data) data.emplace(open_reader(data_path));
         if(!current.raw && !current.compressed) {
             std::array<char,24> header{};read_at(*data,current.offset,header.data(),header.size());
             uint64_t size=0,raw_size=0;std::memcpy(&size,header.data()+8,8);std::memcpy(&raw_size,header.data()+16,8);
@@ -315,7 +315,15 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     std::vector<char> packed,raw;
     size_t bytes=0,scanned=0;
     bool more=false;
-    uint32_t desired=view.task_status=="taskSucceeded"?4:view.task_status=="taskFailed"?5:view.task_status=="taskProcessing"?1:0;
+    const uint32_t desired=view.task_status=="taskSucceeded"?4:view.task_status=="taskFailed"?5:view.task_status=="taskProcessing"?1:0;
+    const bool waiting=view.task_status=="taskWaiting";
+    auto matches_entry=[&](const Entry& row) {
+        return row.kind && (!desired || row.kind==desired) && (!waiting || row.kind==2 || row.kind==3) &&
+            includes(row,root_bits) && (includes(row,bits) || matches_time(row));
+    };
+    auto matches_value=[&](const Json& value) {
+        return matches(value,query,time_query) && matches_root(value);
+    };
     if(manifest.contains("live") && manifest["live"].is_object()) {
         auto live=std::make_unique<RunReader>(folder,manifest["live"],before,revision);
         if(live->unordered) {
@@ -325,11 +333,9 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
             while(live->position>=0) {
                 if((++scanned&63)==0 && cancelled && cancelled()) return Json();
                 auto key=live->key(); auto row=live->current;
-                bool possible=row.kind && (!before || key<*before) && (!desired || row.kind==desired) &&
-                    (view.task_status!="taskWaiting" || row.kind==2 || row.kind==3) && includes(row,root_bits) && (includes(row,bits) || matches_time(row));
-                if(possible && (live->selected.size()<PageRows+1 || earlier(live->selected.front(),row))) {
+                if((!before || key<*before) && (live->selected.size()<PageRows+1 || earlier(live->selected.front(),row)) && matches_entry(row)) {
                     auto value=live->value(packed,raw);
-                    if(matches(value,query,time_query) && matches_root(value)) {
+                    if(matches_value(value)) {
                         auto at=std::lower_bound(live->selected.begin(),live->selected.end(),row,earlier);
                         live->selected.insert(at,row);
                         if(live->selected.size()>PageRows+1) live->selected.erase(live->selected.begin());
@@ -348,10 +354,9 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         for(auto& run:runs) if(run->position>=0 && (!selected || run->key()>selected->key())) selected=run.get();
         if(!selected) break;
         auto cursor=selected->key(); auto record=selected->current;
-        if(!record.kind || (desired && record.kind!=desired) ||
-           (view.task_status=="taskWaiting" && record.kind!=2 && record.kind!=3) || !includes(record,root_bits) || (!includes(record,bits) && !matches_time(record))) { selected->previous(); continue; }
+        if(!matches_entry(record)) { selected->previous(); continue; }
         auto value=selected->value(packed,raw);
-        if(!matches(value,query,time_query) || !matches_root(value)) { selected->previous(); continue; }
+        if(!matches_value(value)) { selected->previous(); continue; }
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
         auto row=project_task(value,root_index,language,labels,PageRows-projected.size());

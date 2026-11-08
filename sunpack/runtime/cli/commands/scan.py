@@ -1,5 +1,5 @@
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
-from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_common_parser, build_detection_parser, build_process_mode_parser, localize_help_action
+from sunpack.runtime.cli.cli_parsers import build_common_parser, build_detection_parser, build_process_mode_parser
 from sunpack.runtime.cli.cli_runtime import (
     resolve_common_root,
     resolve_target_paths,
@@ -41,10 +41,8 @@ def register(subparsers, ctx):
         parents=[build_common_parser(ctx), build_detection_parser(ctx), build_process_mode_parser(ctx)],
         help=ctx.t("cli.scan.help"),
         usage="sunpack scan [options] <paths...>",
-        formatter_class=CliHelpFormatter,
     )
     parser.set_defaults(command=COMMAND)
-    localize_help_action(parser, ctx)
     parser.add_argument("paths", nargs="+", help=ctx.t("cli.scan.paths"))
 
 

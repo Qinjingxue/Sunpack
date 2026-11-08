@@ -10,7 +10,6 @@ use std::io::Read;
 include!("constants.rs");
 include!("api.rs");
 include!("common.rs");
-include!("seven_zip.rs");
 include!("rar.rs");
 include!("tar.rs");
 include!("compression.rs");

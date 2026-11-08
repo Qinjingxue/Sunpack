@@ -4,9 +4,9 @@ pub(crate) mod volume_anchor;
 
 pub(crate) use structure::{
     confirm_compression_format_identity_native, inspect_compression_stream_identity,
-    inspect_compression_stream_structure, inspect_rar_structure, inspect_seven_zip_structure,
-    inspect_tar_header_structure, inspect_zip_directory_consistency, inspect_zip_eocd_structure,
-    inspect_zip_local_header, inspect_zip_structure_graph,
+    inspect_compression_stream_structure, inspect_rar_structure, inspect_tar_header_structure,
+    inspect_zip_directory_consistency, inspect_zip_eocd_structure, inspect_zip_local_header,
+    inspect_zip_structure_graph,
 };
 pub(crate) use view::{
     clear_stream_structure_cache, confirm_format_identity, confirm_format_identity_native,

@@ -32,12 +32,11 @@ class ExtractionScheduler:
         extraction_config = extraction_config if isinstance(extraction_config, dict) else {}
         self.output_config = output_config if isinstance(output_config, dict) else None
         self.extraction_config = extraction_config
-        self.process_config = {
+        self.sevenzip_runner = sevenzip_runner if sevenzip_runner is not None else SevenZipRunner({
             key: value
             for key, value in (process_config or {}).items()
             if value is not None
-        }
-        self.sevenzip_runner = sevenzip_runner or SevenZipRunner(self.process_config)
+        })
         self.output_stream = output_stream
 
     def set_progress_callback(self, callback: Callable[[ArchiveTask, dict], None] | None) -> None:

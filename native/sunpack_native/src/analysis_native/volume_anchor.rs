@@ -253,44 +253,21 @@ impl CheapAnchor {
     }
 }
 
-pub(crate) fn probe_volume_anchor_records_cheap(
-    records: &[(&str, u64, Option<&CheapAnchorCell>)],
-    root: Option<&str>,
-) -> Vec<CheapAnchor> {
-    if records.is_empty() {
-        return Vec::new();
+pub(crate) fn probe_volume_anchor_record_cheap(
+    path: &str,
+    size: u64,
+    cell: Option<&CheapAnchorCell>,
+    scope: Option<&NativeReadScope>,
+) -> CheapAnchor {
+    let mut cached = cell.map(|cell| cell.lock().unwrap_or_else(|error| error.into_inner()));
+    if let Some(anchor) = cached.as_deref().and_then(Option::as_ref) {
+        return anchor.clone();
     }
-    // A conflicting promotion retains the original per-file error/retry path.
-    let scope = root.and_then(|root| NativeReadScope::new(std::path::Path::new(root)).ok());
-    cheap_fast_probe_pool().install(|| {
-        records
-            .par_iter()
-            .map(|(path, size, cell)| {
-                let Some(cell) = cell else {
-                    return CheapAnchor::from_cheap(probe_path_cheap_direct(
-                        path,
-                        *size,
-                        None,
-                        scope.as_ref(),
-                    ));
-                };
-                let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(anchor) = cached.as_ref() {
-                    return anchor.clone();
-                }
-                let anchor = CheapAnchor::from_cheap(probe_path_cheap_direct(
-                    path,
-                    *size,
-                    None,
-                    scope.as_ref(),
-                ));
-                if anchor.reusable() {
-                    *cached = Some(anchor.clone());
-                }
-                anchor
-            })
-            .collect()
-    })
+    let anchor = CheapAnchor::from_cheap(probe_path_cheap_direct(path, size, None, scope));
+    if let Some(cached) = cached.as_deref_mut().filter(|_| anchor.reusable()) {
+        *cached = Some(anchor.clone());
+    }
+    anchor
 }
 
 pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) -> VolumeAnchor {
@@ -305,7 +282,7 @@ pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) 
     probe_cheap_prefix(result, &head[..prefix_len], None)
 }
 
-fn cheap_fast_probe_pool() -> &'static rayon::ThreadPool {
+pub(crate) fn cheap_fast_probe_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()

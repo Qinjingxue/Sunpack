@@ -19,7 +19,7 @@ from sunpack.core.support.work_context import (
 T = TypeVar("T")
 
 
-@dataclass
+@dataclass(slots=True)
 class _WorkItem(Generic[T]):
     context: WorkContext
     operation: Callable[[], T]
@@ -122,7 +122,7 @@ class _StageWorkQueue:
         return self._pop(priority)
 
 
-@dataclass
+@dataclass(slots=True)
 class _RequestQueue:
     jobs: _StageWorkQueue = field(default_factory=_StageWorkQueue)
     origin: str = "foreground"
