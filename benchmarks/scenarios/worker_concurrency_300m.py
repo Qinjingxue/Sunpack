@@ -28,11 +28,10 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler
 from benchmarks.scenarios.extraction_format_matrix import create_corpus
-from benchmarks.scenarios.worker_read_patterns import _build_cases
 from benchmarks.scenarios.sevenzip_worker_matrix import (
     _case_job, _output_summary, _submit_job, _volume_paths, _worker_cpu_ms,
 )
-from benchmarks.scenarios.worker_vs_7z_300m import DEFAULT_FORMATS, _collect_environment, _git_commit
+from benchmarks.scenarios.worker_vs_7z_300m import DEFAULT_FORMATS, _build_cases, _collect_environment, _git_commit
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.core.support.output_paths import resolve_output_volume_key
@@ -87,11 +86,10 @@ def prepare(workspace, cache):
     corpus, skipped = create_corpus(cache, {}, 8, 2, 150, progress=lambda s: print(s, flush=True),
                                     payloads={"few_large": cache / "payloads/few-large", "many_small": cache / "payloads/many-small"},
                                     copy_file=lambda source, dest: subprocess.run([str(generator), "--copy", str(source), str(dest)], check=True))
-    # Existing case/solid-variant builder accepts a prepared corpus.
-    from types import SimpleNamespace
-    cases, info = _build_cases(SimpleNamespace(corpus=cache), list(DEFAULT_FORMATS), small_files=8,
-                              large_files=2, large_file_mib=150, seven_zip_variants={"solid", "non-solid"},
-                              large_content="mixed", cached_corpus=corpus, cache_info={"path": str(cache), "skipped": skipped})
+    cases, info = _build_cases(
+        cache, list(DEFAULT_FORMATS), small_files=8, large_files=2, large_file_mib=150,
+        cached_corpus=corpus, cache_info={"path": str(cache), "skipped": skipped},
+    )
     if len(cases) != 18:
         raise RuntimeError(f"Expected 18 generated format/variant cases, got {len(cases)}: {skipped}")
     info["generator"] = "Rust xorshift64 seed 20260729; 150 MiB repeated text + 150 MiB random; differs from historical Python random fixture"

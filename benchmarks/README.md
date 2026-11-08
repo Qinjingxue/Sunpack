@@ -2,26 +2,6 @@
 
 Performance measurements and diagnostic profiles live here; behavioural assertions live under `tests/`.
 
-File-quiescence research uses 28 complex writer programs: segmented downloads,
-retries, sparse holes, cached writes, block reuse, assembly, handle lifetimes,
-archive backpatching and actual multipart arrival timelines. See the
-[writer/source matrix](quiet_window/WRITERS.md), [protocol](quiet_window/PROTOCOL.md)
-and [research survey](quiet_window/RESEARCH.md). Obsolete synthetic cadence code
-and its historical results have been removed.
-
-Use `scheduling watch-quiet-scheduler` for zero missing complete inputs, then
-complete-arrival-to-first-valid-proposal latency, then sliding-window peaks of
-invalid attempts (100ms/1s/10s; per input and concurrent trace).
-It reuses production admission, boundary checks and tracker retirement with
-virtual metadata/readiness IO; multipart inputs are scored once per group.
-`scheduling watch-quiet-window` isolates the estimator on the same writer corpus.
-`scheduling watch-quiet-cost` measures paired tracker CPU and allocation costs.
-`scheduling watch-quiet-search` searches bounded symbolic mappings and constants
-through the same production replay; see [search protocol](quiet_window/SEARCH.md).
-CPU, IO, inflight work and total invalid attempts are not search/acceptance goals.
-These offline experiments require no Watch Broker. Existing real Watch/CLI
-scenarios remain the system-level and archive-format evaluation.
-
 The typed-hit index protocol, pinned baselines, corpus recipes, statistics and
 release gates are documented in [hit_index/PROTOCOL.md](hit_index/PROTOCOL.md).
 `scan hit-index` runs exact semantic conformance separately from timing and
@@ -48,7 +28,6 @@ include the test service/pipe identity, Broker binary XXH128 (the two-seed Rust 
 
 ```powershell
 uv run --locked python -m benchmarks reader password-fast-path --rounds 5
-uv run --locked python -m benchmarks reader volume-anchor --files 128 --logical-mib 64 --rounds 5
 uv run --locked python -m benchmarks reader embedded-scan --generate-gib 10 --rounds 3 --skip-cli `
   --iocp-chunk-mib 2 --iocp-buffers 8 --iocp-workers 2
 uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 500 --rounds 3 --skip-cli `
@@ -63,19 +42,12 @@ uv run --locked python -m benchmarks extraction cli-format-matrix --runs 3 --pre
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --format enc --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-enc-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch off --json-out benchmarks/results/cli-zipx-lz4-prefetch-off.json
-cmake --build native/sevenzip_bridge/build-probe --config Release --target sunpack_sevenzip_worker
 uv run --locked python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
 uv run --locked python -m benchmarks extraction worker-vs-7z-300m `
   --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
   --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 `
   --json-out benchmarks/results/worker-vs-7z-300m.json
-uv run --locked python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
 uv run --locked python -m benchmarks extraction worker-concurrency-300m --concurrency 8 --runs 2 --json-out benchmarks/results/worker-concurrency-300m.json
-uv run --locked python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
-# Enable prefetch with a 512 KiB window.
-uv run --locked python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --prefetch-window-kib 512
-# Compare production-policy prefetch on/off in alternating order. Two 512 MiB members retain a meaningful solid-7z case.
-uv run --locked python -m benchmarks extraction worker-read-patterns --format tar --format rar-split --format 7z --7z-variant solid --large-files 2 --large-file-mib 512 --large-content random --runs 5 --prefetch compare
 uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
 uv run --locked python -m benchmarks watch cli-format-matrix --runs 3 --json-out benchmarks/results/watch-cli-format-matrix.json
 uv run --locked python -m benchmarks watch cli-format-matrix --format zipx --format lz4 --runs 3 --json-out benchmarks/results/watch-cli-zipx-lz4-baseline.json
@@ -88,12 +60,8 @@ uv run --locked python -m benchmarks watch format-matrix --formats zip,rar,tar,7
 uv run --locked python -m benchmarks extraction split-pressure --profile acceptance --strict
 uv run --locked python -m benchmarks memory residual-rss
 uv run --locked python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --json-out benchmarks/results/memory-growth.json
-uv run --no-sync python -m benchmarks scheduling broker-queue --baseline-ref <before-commit> --runs 5 --warmups 1
-uv run --no-sync python -m benchmarks scheduling broker-request-selection --baseline-ref <before-commit> --runs 7 --warmups 1
-uv run --no-sync python -m benchmarks scheduling watch-source-claims --baseline-ref <before-commit> --runs 7 --warmups 1
 uv run --no-sync python -m benchmarks scheduling event-log --tasks 5000 --rounds 5 --cold-starts 40
 uv run --no-sync python -m benchmarks scheduling event-log --tasks 1 --rounds 1 --cold-starts 1 --lifetime-batches 1 --compaction-tasks 10000 100000
-uv run --no-sync python -m benchmarks memory watch-source-indexes --paths 4096 --batches 12 --warmups 2
 ```
 
 The catalog scenario includes the final Written barrier in each event batch;
@@ -126,43 +94,6 @@ cmake --build .cache/gui-x64 --config Release --target sunpack_gui_performance -
 Options are `--tasks`, `--passwords`, `--history`, `--roots` and `--rounds` (5..100).
 See [gui/README.md](gui/README.md) for the report fields, the current baseline and the
 observed hotspots.
-
-`scheduling watch-source-claims` compares watch claim, release, and state
-retirement against the committed scheduler. The lifecycle case includes pending
-index maintenance, metadata updates, dirty events, partial ownership transfer,
-and release. Each sample verifies identical ownership and ordered event replay.
-It uses metadata fixtures and production locks without requiring a Broker
-service; archive IO and log/state persistence are outside the measurement.
-Additional index allocations are measured separately with tracemalloc.
-
-`memory watch-source-indexes` repeatedly inserts unique candidates, claims
-sources, transfers dirty paths, and releases owners. It checks collection through
-weak references, empty index table capacity, and destruction of a populated
-scheduler. Scheduler allocations and RSS are reported separately; allocator
-reserves can keep RSS elevated after the indexed objects have been freed.
-
-`scheduling broker-queue` loads the exact broker source from `--baseline-ref` and
-compares it with the working tree in alternating A/B order. It verifies identical
-selection order/results and reports single-selection latency, enqueue-plus-drain
-cost, and actual broker submit-to-completion time at the same thread capacity.
-The default queue sizes range from 1 to 4096, with homogeneous and mixed stages;
-broker workloads include one request and mixed watch/foreground requests. Reports
-record the baseline revision and all raw wall/CPU samples. These are scheduling
-measurements without archive decoding or filesystem IO.
-
-`scheduling broker-request-selection` measures `_pop_next_request_id` against
-the number of distinct queued requests: all Watch, foreground at the tail, and
-foreground at the head. It also measures real broker bursts with 32 executor
-threads and the default 4096 pending-job bound, including a shared-request
-control. Event barriers admit the burst before releasing workers; no polling or
-fixed cooldown is used. Alternating A/B samples compare the exact production
-source at `--baseline-ref` with the working tree and verify identical dispatch
-order/results. Reports retain the baseline revision, candidate diff, raw wall/CPU
-samples and separate admission/drain timings. Empty operations isolate scheduling;
-the measured reductions do not predict end-to-end archive extraction speedups.
-Separate instrumented runs record selection and state-notification time.
-Tracemalloc separately measures ready-order metadata while populated, drained,
-and destroyed, including batches of Watch-to-foreground promotions.
 
 ## Run timeout
 
@@ -314,8 +245,9 @@ the mixed batch contains two rounds of all cases at every concurrency. Reports
 include paired trials with alternating engine order, throughput, sampled RSS,
 process CPU time, and worker start/finish timelines. `--resume` continues completed
 batches after checking binary and configuration fingerprints. For diagnosis,
-`--dry-run` compares decode/verify against `7z t`, and `--profile` enables available
-native diagnostics. Writer thread counts use each worker binary's internal defaults.
+`--dry-run` compares decode/verify against `7z t`. `--profile` enables read diagnostics
+and collects pipeline timing when the worker is built with `-DSUP7Z_DEBUG=ON`.
+Writer thread counts use each worker binary's internal defaults.
 `--format` and `--no-mixed` restrict diagnostic runs. These direct worker tests
 exclude CLI/watch planning, recursive extraction, and post-extract verification.
 Compressed TAR codecs are measured as one outer stream layer for both engines.

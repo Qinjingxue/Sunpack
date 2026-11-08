@@ -112,23 +112,6 @@ function Test-BytePatternInFile {
     return $hits
 }
 
-function Get-CachedCMakeOption {
-    param(
-        [Parameter(Mandatory = $true)][string]$BuildDir,
-        [Parameter(Mandatory = $true)][string]$Name
-    )
-
-    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
-    if (-not (Test-Path -LiteralPath $cachePath)) { return $null }
-
-    foreach ($line in Get-Content -LiteralPath $cachePath) {
-        if ($line -like "$Name`:BOOL=*") {
-            return ($line.Substring("$Name`:BOOL=".Length).Trim() -eq "ON")
-        }
-    }
-    return $null
-}
-
 function Assert-SevenZipAsmSelection {
     param(
         [Parameter(Mandatory = $true)][string]$BuildDir,
@@ -138,11 +121,9 @@ function Assert-SevenZipAsmSelection {
     )
 
     if ($BuildArch -eq "x64") {
-        $optionName = "SUP7Z_USE_X64_ASM"
         $sourceName = "LzmaDecOpt.asm"
         $asmObject = Join-Path $BuildDir "sunpack_7zip_asm_objects.dir\Release\LzmaDecOpt.obj"
     } elseif ($BuildArch -eq "arm64") {
-        $optionName = "SUP7Z_USE_ARM64_ASM"
         $sourceName = "LzmaDecOpt.S"
         $asmObject = Join-Path $BuildDir "sunpack_7zip_arm64_asm\LzmaDecOpt.obj"
     } else {
@@ -150,15 +131,9 @@ function Assert-SevenZipAsmSelection {
         return
     }
 
-    if ((Get-CachedCMakeOption -BuildDir $BuildDir -Name $optionName) -eq $false) {
-        Write-Host "7-Zip asm check skipped: $BuildDir was configured with $optionName=OFF" -ForegroundColor Yellow
-        return
-    }
-
     if (-not (Test-Path -LiteralPath $asmObject)) {
         throw ("7-Zip asm check failed: $asmObject does not exist, so the $BuildArch build did not " +
-               "assemble $sourceName. Configure with -D$optionName=OFF to build without that " +
-               "assembly hot path on purpose.")
+               "assemble $sourceName.")
     }
 
     $symbol = Get-CoffSymbol -ObjectPath $asmObject -SymbolName $ExpectedSymbol

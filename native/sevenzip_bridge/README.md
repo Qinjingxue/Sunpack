@@ -38,8 +38,11 @@ On ARM64, upstream 7-Zip uses `Asm/arm64/LzmaDecOpt.S` for the optimized LZMA
 decoder core. CMake invokes `clang-cl --target=arm64-pc-windows-msvc` for that
 single assembly file; CRC/AES/SHA remain on upstream C/intrinsics.
 
-`SUP7Z_USE_X64_ASM` and `SUP7Z_USE_ARM64_ASM` default to `ON` and remain
-benchmark/rollback switches. `SUP7Z_ENABLE_PIPELINE_TIMING` is benchmark-only.
+For local diagnostics, configure with `-DSUP7Z_DEBUG=ON` and build with
+`--config Release`. This keeps compiler optimizations and the architecture's
+assembly paths, skips final LTO, selects Cargo's `ci` profile for ENC, and
+includes worker pipeline timing. Set `SUNPACK_SEVENZIP_PROFILE_PIPELINE=1`
+before launching that worker to collect timing. `setup_windows_dev.ps1 -BuildProfile ci` selects this mode automatically.
 
 Release runtime output:
 

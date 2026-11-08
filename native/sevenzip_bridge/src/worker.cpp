@@ -38,7 +38,7 @@
 #include "internal/native_memory.hpp"
 #include "internal/extraction_replay.hpp"
 #include "internal/native_cpu_budget.hpp"
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
 #include "internal/worker_pipeline_timing.hpp"
 #endif
 #ifdef _WIN32
@@ -548,7 +548,7 @@ std::string output_trace_wire(const sunpack::sevenzip::ExtractOutputTrace& trace
         wire::end();
 }
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
 std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming& timing) {
     return wire::object() +
         wire::key("pipeline_wall_ns") + wire::number(timing.pipeline_wall_ns) +
@@ -1193,7 +1193,7 @@ int run_request(
         wire::key("first_item_index") + wire::number(output_trace.metadata_first_item_index) +
         wire::key("first_item") + wire::text(wide_to_utf8(output_trace.metadata_first_item)) +
         wire::key("win32_error") + wire::number(output_trace.metadata_first_win32_error) + wire::end() : "";
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
         wire::key("pipeline_timing") + pipeline_timing_wire(result.pipeline_timing) : "";
 #endif
@@ -1236,7 +1236,7 @@ int run_request(
         wire::key("failed_item") + wire::text(wide_to_utf8(result.failed_item)) +
         wire::key("message") + wire::text(result.message) + metadata_warning_field +
         failure_fields + input_trace_field
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
         + pipeline_timing_field
 #endif
         + diagnostic_fields + stream_receipt_field + wire::end());

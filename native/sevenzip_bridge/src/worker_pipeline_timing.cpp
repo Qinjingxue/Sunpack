@@ -1,6 +1,6 @@
 #include "internal/worker_pipeline_timing.hpp"
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
 
 #include <algorithm>
 #include <limits>

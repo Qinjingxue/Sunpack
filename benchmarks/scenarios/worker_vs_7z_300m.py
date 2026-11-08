@@ -30,14 +30,20 @@ if str(ROOT) not in sys.path:
 from sunpack_native import fast_hash128_file
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler
-from benchmarks.scenarios.extraction_format_matrix import GENERATED_FORMATS
+from benchmarks.scenarios.extraction_format_matrix import (
+    GENERATED_FORMATS,
+    _create_archive,
+    _run_7z,
+    _run_rar,
+    _write_payloads,
+    create_corpus,
+)
 from benchmarks.scenarios.sevenzip_worker_matrix import (
     _case_job,
     _output_summary,
     _run_job,
     _volume_paths,
 )
-from benchmarks.scenarios.worker_read_patterns import _build_cases
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
@@ -73,6 +79,163 @@ METHODS = {
     "zst": ("Zstandard over TAR", "zstd level 3", "single compressed TAR stream"),
     "tzst": ("Zstandard over TAR", "same bytes as .tar.zst", "single compressed TAR stream"),
 }
+
+
+def _solid_variants(
+    root: Path,
+    payload_bytes: int,
+    *,
+    reuse_existing: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    source = root / "payloads" / "few-large"
+    variants_root = root / "solid-variants"
+    variants_root.mkdir(parents=True, exist_ok=True)
+    cases: list[dict[str, Any]] = []
+    skipped: dict[str, str] = {}
+    commands = (
+        ("7z", "solid", ["a", "-y", "-t7z", "-ms=on"]),
+        ("7z", "non-solid", ["a", "-y", "-t7z", "-ms=off"]),
+        ("rar", "solid", ["a", "-idq", "-r", "-ep1", "-s"]),
+        ("rar", "non-solid", ["a", "-idq", "-r", "-ep1", "-s-"]),
+        ("rar4", "solid", ["a", "-idq", "-r", "-ep1", "-ma4", "-s"]),
+        ("rar4", "non-solid", ["a", "-idq", "-r", "-ep1", "-ma4", "-s-"]),
+    )
+    for archive_format, variant, command in commands:
+        archive = variants_root / f"few-large-{archive_format}-{variant}.{archive_format}"
+        if reuse_existing and archive.is_file() and archive.stat().st_size > 0:
+            created = True
+        else:
+            created = _run_7z([*command, str(archive), str(source)]) if archive_format == "7z" else _run_rar([*command, str(archive), str(source)])
+        if not created or not archive.is_file():
+            skipped[f"few_large:{archive_format}:{variant}"] = "bundled archiver could not create explicit solid-mode archive"
+            continue
+        cases.append({
+            "case_id": f"few_large:{archive_format}:{variant}",
+            "format": archive_format,
+            "variant": variant,
+            "workload": "few_large",
+            "archive_path": archive,
+            "archive_bytes": archive.stat().st_size,
+            "payload_bytes": payload_bytes,
+            "item": {"path": archive, "format": archive_format, "expected_payload_bytes": payload_bytes},
+        })
+    return cases, skipped
+
+
+def _focused_corpus(
+    root: Path,
+    formats: set[str],
+    *,
+    small_files: int,
+    large_files: int,
+    large_file_mib: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Generate only the requested standard cases and the shared solid-variant payload."""
+    source = _write_payloads(root / "payloads", small_files, large_files, large_file_mib)["few_large"]
+    payload_bytes = large_files * large_file_mib * MIB
+    corpus: dict[str, dict[str, Any]] = {}
+    skipped: dict[str, str] = {}
+    if "tar" in formats:
+        archive = root / "few-large.tar"
+        if _create_archive(archive, "tar", source):
+            corpus["few_large:tar"] = {
+                "workload": "few_large",
+                "format": "tar",
+                "path": archive,
+                "expected_payload_bytes": payload_bytes,
+            }
+        else:
+            skipped["few_large:tar"] = "bundled 7-Zip cannot create this format"
+    if "rar-split" in formats:
+        archive = root / "few-large.split.rar"
+        if _run_rar(["a", "-idq", "-r", "-ep1", "-v16m", str(archive), str(source)]):
+            volumes = sorted(root.glob("few-large.split.part*.rar"))
+        else:
+            volumes = []
+        if len(volumes) > 1:
+            corpus["few_large:rar-split"] = {
+                "workload": "few_large",
+                "format": "rar-split",
+                "path": volumes[0],
+                "expected_payload_bytes": payload_bytes,
+            }
+        else:
+            skipped["few_large:rar-split"] = "workload did not produce multiple RAR volumes"
+    return corpus, skipped
+
+
+def _build_cases(
+    corpus_root: Path,
+    formats: list[str],
+    *,
+    small_files: int,
+    large_files: int,
+    large_file_mib: int,
+    cached_corpus: dict[str, dict[str, Any]] | None = None,
+    cache_info: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    targeted_formats = {"7z", "rar4", "rar-split", "tar"}
+    requested = set(formats)
+    if cached_corpus is not None:
+        # The cache already holds the payload tree; rebuild only missing solid variants.
+        corpus = cached_corpus
+        skipped: dict[str, str] = {}
+        variants, variant_skipped = _solid_variants(
+            corpus_root, large_files * large_file_mib * MIB, reuse_existing=True
+        )
+    else:
+        if requested <= targeted_formats:
+            corpus, skipped = _focused_corpus(
+                corpus_root,
+                requested,
+                small_files=small_files,
+                large_files=large_files,
+                large_file_mib=large_file_mib,
+            )
+        else:
+            corpus, skipped = create_corpus(
+                corpus_root,
+                {},
+                small_files,
+                large_files,
+                large_file_mib,
+            )
+        variants, variant_skipped = _solid_variants(corpus_root, large_files * large_file_mib * MIB)
+    cases: list[dict[str, Any]] = []
+    for name, item in sorted(corpus.items()):
+        archive_format = str(item["format"])
+        if item.get("workload") != "few_large" or archive_format not in requested or archive_format in {"7z", "rar", "rar4"}:
+            continue
+        archive = Path(item["path"])
+        cases.append({
+            "case_id": name,
+            "format": archive_format,
+            "variant": "split" if archive_format.endswith("-split") else "standard",
+            "workload": "few_large",
+            "archive_path": archive,
+            "archive_bytes": archive.stat().st_size,
+            "payload_bytes": int(item.get("expected_payload_bytes") or 0),
+            "item": item,
+        })
+    cases.extend(
+        case
+        for case in variants
+        if case["format"] in requested
+    )
+    cases.sort(key=lambda case: (str(case["format"]), str(case["variant"])))
+    return cases, {
+        "payload": {
+            "small_files": small_files,
+            "large_files": large_files,
+            "large_file_mib": large_file_mib,
+            "large_content": "mixed",
+        },
+        "generated_formats": list(GENERATED_FORMATS),
+        "requested_formats": formats,
+        "case_count": len(cases),
+        "skipped": {**skipped, **variant_skipped},
+        "corpus_cache": cache_info,
+    }
 
 
 def _git_commit() -> str | None:
@@ -438,13 +601,11 @@ async def _main() -> int:
     scenario = "extraction.worker-vs-7z-300m"
     with BenchmarkWorkspace(scenario, results_root=args.results_root, keep_workdir=args.keep_workdir) as workspace:
         cases, corpus_info = _build_cases(
-            workspace,
+            workspace.corpus,
             formats,
             small_files=args.small_files,
             large_files=args.large_files,
             large_file_mib=args.large_file_mib,
-            seven_zip_variants={"solid", "non-solid"},
-            large_content="mixed",
         )
         descriptors = [_case_descriptor(case, seven_zip) for case in cases]
         results: list[dict[str, Any]] = []

@@ -52,7 +52,7 @@ class AdaptiveQuietPolicy:
         return weighted[-1][0]
 
     def target_seconds(self, interval: float) -> float:
-        # Frozen closed-loop search winner; see benchmarks/quiet_window/FUNCTION_SEARCH_RESULTS.md.
+        # Parameters selected by the offline closed-loop search.
         scaled = interval / 0.84
         return 1.52 * math.log1p(0.5 * scaled + 0.5 * math.log1p(scaled))
 

@@ -12,25 +12,11 @@ class Scenario:
 
 
 _ROWS = [
-    ("scheduling", "watch-quiet-scheduler", "benchmarks.scenarios.watch_quiet_scheduler", "Complex writer programs driving production Watch admission; complete-input latency and invalid attempts."),
-    ("scheduling", "watch-quiet-window", "benchmarks.scenarios.watch_quiet_window", "Estimator diagnostics on the same complex writer byte-range, retry, publication and handle timelines."),
-    ("scheduling", "watch-quiet-cost", "benchmarks.quiet_window.cost", "Paired tracker CPU and bounded-history allocation cost against a frozen policy source."),
-    ("scheduling", "watch-quiet-search", "benchmarks.quiet_window.search", "Bounded symbolic mapping and constant search; first-valid latency and sliding-window invalid-attempt peaks."),
-    ("scheduling", "watch-quiet-information", "benchmarks.quiet_window.information", "Calibrated handle/notification admission ablations with a frozen quiet mapping."),
     ("scheduling", "event-log", "benchmarks.scenarios.event_log", "State-log submission, deletion storms, compaction and short restart retention."),
-    ("scheduling", "broker-request-selection", "benchmarks.scenarios.broker_request_selection", "Request-count scaling and fixed-order no-scan scheduling ceiling."),
-    ("scheduling", "broker-queue", "benchmarks.scenarios.broker_queue", "Committed versus working-tree broker queue selection and throughput."),
-    ("scheduling", "watch-source-claims", "benchmarks.scenarios.watch_source_claims", "Watch source claim/release indexes versus committed baseline, including maintenance cost."),
     ("reader", "password-fast-path", "benchmarks.scenarios.reader_password_fast_path", "Password candidate fast paths."),
-    ("reader", "password-size-scaling", "benchmarks.scenarios.reader_password_size_scaling", "Password cost versus payload size."),
-    ("reader", "seven-zip-password", "benchmarks.scenarios.reader_seven_zip_password", "7z password probe optimization."),
-    ("reader", "header-scaling", "benchmarks.scenarios.reader_header_scaling", "Paired frozen-native 7z header entry-count, time and process-memory comparison."),
     ("reader", "embedded-scan", "benchmarks.scenarios.reader_embedded_scan", "Native and CLI embedded scanning."),
-    ("reader", "volume-anchor", "benchmarks.scenarios.reader_volume_anchor", "Bounded native volume-anchor probing."),
     ("memory", "residual-rss", "benchmarks.scenarios.memory_residual_rss", "Residual RSS and Python allocations."),
     ("memory", "password-store", "benchmarks.scenarios.password_store", "Password snapshot memory and unrelated-scope query scaling."),
-    ("memory", "watch-source-indexes", "benchmarks.scenarios.watch_source_index_retention", "Watch source-index object collection and empty-table capacity across unique batches."),
-    ("memory", "worker-manifest", "benchmarks.scenarios.memory_worker_manifest", "Native manifest materialization."),
     ("memory", "many-tasks", "benchmarks.scenarios.memory_many_tasks", "Python and native worker memory growth across formats."),
     ("scan", "directory", "benchmarks.scenarios.scan_directory", "Directory scanner comparison."),
     ("scan", "watch-catalog", "benchmarks.scenarios.watch_catalog", "Native Watch catalog, bucket lookup, protected output pruning and state lifetime."),
@@ -38,7 +24,6 @@ _ROWS = [
     ("scan", "hit-index", "benchmarks.scenarios.hit_index", "Pinned integer-index baselines, exact typed-hit conformance, real traces and production Builder lifecycle."),
     ("scan", "synthetic-pressure", "benchmarks.scenarios.scan_synthetic_pressure", "Synthetic mixed-corpus scan."),
     ("watch", "catalog-recovery", "benchmarks.scenarios.watch_catalog_recovery", "Per-directory versus batched USN catalog recovery on one journal interval."),
-    ("watch", "quiet-calibrate", "benchmarks.quiet_window.calibration", "Real Windows handle sharing, CLOSE and directory-notification lifecycle anchors."),
     ("watch", "real-file", "benchmarks.scenarios.watch_real_file", "End-to-end watch arrival, extraction, and completion for one supplied file."),
     ("watch", "format-matrix", "benchmarks.scenarios.watch_format_matrix", "Per-format watch internal stage timings across formats and input shapes."),
     ("watch", "cli-format-matrix", "benchmarks.scenarios.watch_cli_format_matrix", "End-to-end watch matrix for ZIPX, LZ4 and ENC on the fixed 300 MiB corpus."),
@@ -52,8 +37,6 @@ _ROWS = [
     ("extraction", "sevenzip-worker-matrix", "benchmarks.scenarios.sevenzip_worker_matrix", "Direct native 7z.dll worker format and size matrix."),
     ("extraction", "worker-vs-7z-300m", "benchmarks.scenarios.worker_vs_7z_300m", "Reproducible 300 MiB native worker versus 7z.exe matrix with timing, peak RSS, archive, and machine metadata."),
     ("extraction", "worker-concurrency-300m", "benchmarks.scenarios.worker_concurrency_300m", "Single persistent worker versus concurrent 7z processes on the 300 MiB full format matrix."),
-    ("extraction", "worker-read-blocking", "benchmarks.scenarios.worker_read_blocking", "ReadFile wall-time share for a single 1 GiB archive through IInStream::Read."),
-    ("extraction", "worker-read-patterns", "benchmarks.scenarios.worker_read_patterns", "Configurable native-worker IInStream seek/read pattern profile, with solid-mode variants and prefetch comparison."),
     ("extraction", "split-pressure", "benchmarks.scenarios.extraction_split_pressure", "Split and carrier archive matrix."),
 ]
 

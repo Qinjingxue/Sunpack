@@ -4,10 +4,9 @@
 #include "sevenzip_space_retry.hpp"
 #include "sevenzip_volume_state.hpp"
 #include "sevenzip_writer_meters.hpp"
-#include "sevenzip_writer_probe.hpp"
 #include "extraction_replay.hpp"
 #include "decoder_memory.h"
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
 #include "worker_pipeline_timing.hpp"
 #endif
 
@@ -87,13 +86,13 @@ namespace sunpack::sevenzip
             explicit JobState(
                 std::size_t budget,
                 std::shared_ptr<std::atomic<bool>> external_cancel = nullptr
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                 , PipelineTiming *pipeline_timing = nullptr
 #endif
                 )
                 : max_inflight_bytes(budget),
                   cancel_token(std::move(external_cancel))
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                   , pipeline_timing(pipeline_timing)
 #endif
                   {}
@@ -110,11 +109,8 @@ namespace sunpack::sevenzip
             bool cancelled = false;
             const std::size_t max_inflight_bytes;
             std::shared_ptr<std::atomic<bool>> cancel_token;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             PipelineTiming *pipeline_timing = nullptr;
-#endif
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            WriterProbe probe;
 #endif
         };
 
@@ -263,9 +259,6 @@ namespace sunpack::sevenzip
             ReplayFile *replay = nullptr;
             bool track_replay = false;
             WrittenRanges written_ranges_;
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            UInt64 probe_expected_size = 0;
-#endif
         };
 
         struct IoRequest
@@ -289,9 +282,6 @@ namespace sunpack::sevenzip
             ProbeLease probe_lease;
             FileStatePtr file;
             UInt32 size = 0;
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            unsigned long long probe_queued_at = 0;
-#endif
         };
 
         static constexpr std::size_t kBufferSize = 1U << 20;
@@ -328,7 +318,7 @@ namespace sunpack::sevenzip
         JobStatePtr make_job(
             std::size_t max_inflight_bytes = 0,
             std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             , PipelineTiming *pipeline_timing = nullptr
 #endif
             )
@@ -340,7 +330,7 @@ namespace sunpack::sevenzip
             auto job = std::make_shared<JobState>(
                 max_inflight_bytes,
                 std::move(cancel_token)
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                 , pipeline_timing
 #endif
                 );
@@ -357,9 +347,6 @@ namespace sunpack::sevenzip
             UInt32 item_index,
             std::size_t trace_index,
             const ArchiveItemMetadata &metadata = {}
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            , UInt64 expected_size = 0
-#endif
             , ReplayFile *replay = nullptr
             )
         {
@@ -375,9 +362,6 @@ namespace sunpack::sevenzip
                 file->mtime_ns = replay->mtime;
             }
             std::lock_guard<std::mutex> lock(mutex_);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            file->probe_expected_size = expected_size;
-#endif
             // 快照本卷的空间 gate；功能关闭 / 空 key 时为 nullptr。
             file->space_gate = state_ ? state_->space_gate : nullptr;
             file->active_index = active_files_.size();
@@ -452,17 +436,7 @@ namespace sunpack::sevenzip
                 return E_FAIL;
             }
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_producer(job->probe, WriterProbePhase::Producer);
-#endif
-
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_filelock(job->probe, WriterProbePhase::FileLock);
-#endif
             std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_filelock.finish();
-#endif
 
             while (consumed < size)
             {
@@ -472,32 +446,11 @@ namespace sunpack::sevenzip
                 UInt32 chunk = 0;
                 HRESULT setup_error = S_OK;
                 {
-
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_setup(job->probe, WriterProbePhase::SetupLock);
-#endif
                     std::unique_lock<std::mutex> lock(mutex_);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_setup.finish();
-#endif
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                    if (!can_accept_locked(job, file)) {
-                        if (file->inflight_bytes >= kDefaultFileInFlightBytes) job->probe.file_full++;
-                        if (job->inflight_bytes >= job->max_inflight_bytes) job->probe.job_full++;
-                        if (free_buffers_.empty()) job->probe.buffers_empty++;
-                    }
-#endif
-
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_capacity(job->probe, WriterProbePhase::CapacityWait);
-#endif
                     producer_cv_.wait(lock, [this, &job, &file]
                                       { return terminal_result_locked(job) != S_OK || file->close_requested ||
                                                can_accept_locked(job, file); });
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_capacity.finish();
-#endif
 
                     const HRESULT error = terminal_result_locked(job);
                     if (error != S_OK || file->close_requested)
@@ -598,31 +551,14 @@ namespace sunpack::sevenzip
                     return setup_error;
                 }
 
-
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_copy(job->probe, WriterProbePhase::Copy);
-#endif
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                if (std::strcmp(writer_probe_mode(), "memory-nocopy") != 0)
-#endif
                 std::memcpy(
                     file->staging_buffer->data.get() + previous_size,
                     source + consumed,
                     chunk);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_copy.finish();
-#endif
 
                 HRESULT enqueue_result = S_OK;
                 {
-
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_commit(job->probe, WriterProbePhase::CommitLock);
-#endif
                     std::unique_lock<std::mutex> lock(mutex_);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_commit.finish();
-#endif
                     const HRESULT error = terminal_result_locked(job);
                     Buffer *buffer = file->staging_buffer;
                     if (error != S_OK || file->close_requested || !buffer)
@@ -747,22 +683,10 @@ namespace sunpack::sevenzip
             if (job->terminal_requested.load(std::memory_order_acquire) && state_->space_gate)
                 state_->space_gate->wake_waiters();
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_finishlock(job->probe, WriterProbePhase::FinishLock);
-#endif
             std::unique_lock<std::mutex> lock(mutex_);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_finishlock.finish();
-#endif
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_finishwait(job->probe, WriterProbePhase::FinishWait);
-#endif
             producer_cv_.wait(lock, [&job]
                               { return job->pending_jobs == 0; });
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_finishwait.finish();
-#endif
 
             const HRESULT result = terminal_result_locked(job);
             unregister_job_locked(job);
@@ -771,10 +695,6 @@ namespace sunpack::sevenzip
                 meters_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
                 state_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
             }
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            lock.unlock();
-            job->probe.dump();
-#endif
             return result;
         }
 
@@ -1260,14 +1180,6 @@ namespace sunpack::sevenzip
             }
             try
             {
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                buffer->probe_queued_at = file->job->probe.enabled ? writer_probe_clock() : 0;
-                if (buffer->probe_queued_at)
-                {
-                    file->job->probe.begin_inflight();
-                    file->job->probe.observe_queue_depth(queued_jobs_ + 1);
-                }
-#endif
                 work_queue_.emplace_back(WorkItem::data(buffer, output_offset));
                 const DWORD error = post_work_locked();
                 if (error != ERROR_SUCCESS)
@@ -1396,10 +1308,6 @@ namespace sunpack::sevenzip
                 }
                 Buffer *buffer = item.buffer;
                 const auto file = buffer->file;
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                if (file && file->job->probe.enabled && buffer->probe_queued_at)
-                    file->job->probe.add(WriterProbePhase::Queue, writer_probe_clock() - buffer->probe_queued_at);
-#endif
                 buffer->output_offset = item.output_offset;
                 buffer->transferred = 0;
                 dispatch_data(buffer);
@@ -1442,7 +1350,7 @@ namespace sunpack::sevenzip
             {
                 std::lock_guard<std::mutex> io_lock(buffer->io_mutex);
                 const auto file = buffer->file;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                 if (file && file->job->pipeline_timing)
                     file->job->pipeline_timing->end(PipelineStage::Output);
 #endif
@@ -1544,13 +1452,7 @@ namespace sunpack::sevenzip
                 if (file->open_attempted)
                     return {AttemptResult::Kind::PermanentFailure, ERROR_OPEN_FAILED};
             }
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            WriterProbeSpan probe_openlock(file->job->probe, WriterProbePhase::OpenLock);
-#endif
             std::lock_guard<std::mutex> open_lock(file->open_mutex);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            probe_openlock.finish();
-#endif
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (file->failed)
@@ -1574,9 +1476,6 @@ namespace sunpack::sevenzip
             }
 #endif
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_open(file->job->probe, WriterProbePhase::Open);
-#endif
             const HANDLE handle = CreateFileW(
                 win32_extended_path(file->path).c_str(),
                 GENERIC_WRITE,
@@ -1586,9 +1485,6 @@ namespace sunpack::sevenzip
                 creation_flags,
                 nullptr);
             const DWORD open_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_open.finish();
-#endif
             if (handle == INVALID_HANDLE_VALUE)
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1613,17 +1509,7 @@ namespace sunpack::sevenzip
                         static_cast<unsigned long>(error)};
             }
             DWORD registration_error = ERROR_SUCCESS;
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            if (file->probe_expected_size && std::strcmp(writer_probe_mode(), "eof") == 0) {
-                WriterProbeSpan preallocate(file->job->probe, WriterProbePhase::Preallocate);
-                FILE_END_OF_FILE_INFO info{};
-                info.EndOfFile.QuadPart = file->probe_expected_size;
-                if (!SetFileInformationByHandle(handle, FileEndOfFileInfo, &info, sizeof(info))) {
-                    registration_error = GetLastError();
-                }
-            }
-#endif
-            if (!registration_error && !CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
+            if (!CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
             {
                 registration_error = GetLastError();
             }
@@ -1702,23 +1588,12 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> io_lock(buffer->io_mutex);
             submitted = false;
             const auto job = file->job;
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            WriterProbeSpan probe_dispatch(job->probe, WriterProbePhase::Dispatch);
-#endif
             const auto global_error = current_error(job);
             if (global_error != S_OK)
             {
                 record_failure(file, global_error, current_win32_error(job));
                 return {AttemptResult::Kind::Terminal, 0};
             }
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            if (writer_probe_memory())
-            {
-                add_written_bytes(file, buffer->size - buffer->transferred);
-                buffer->transferred = buffer->size;
-                return {};
-            }
-#endif
             const auto opened = try_open_file(file);
             if (opened.kind != AttemptResult::Kind::Succeeded) return opened;
             if (!begin_data_write(file)) return {AttemptResult::Kind::Terminal, 0};
@@ -1739,18 +1614,15 @@ namespace sunpack::sevenzip
             const auto chunk = max_write_chunk_.load(std::memory_order_relaxed);
             if (chunk && size > chunk) size = chunk;
 #endif
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             if (job->pipeline_timing) job->pipeline_timing->begin(PipelineStage::Output);
-#endif
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            WriterProbeSpan probe_writefile(job->probe, WriterProbePhase::WriteFile);
 #endif
             const BOOL started = WriteFile(file->handle, buffer->data.get() + buffer->transferred,
                                            size, nullptr, &buffer->request.overlapped);
             const DWORD error = started ? ERROR_SUCCESS : GetLastError();
             if (!started && error != ERROR_IO_PENDING)
             {
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                 if (job->pipeline_timing) job->pipeline_timing->end(PipelineStage::Output);
 #endif
 #ifdef SUP7Z_TEST_IO_FAULTS
@@ -1810,9 +1682,6 @@ namespace sunpack::sevenzip
                 std::lock_guard<std::mutex> lock(mutex_);
                 should_open = !file->failed && file->handle == INVALID_HANDLE_VALUE &&
                               !file->open_attempted && !(file->replay && file->replay->complete && !file->new_writes);
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                if (writer_probe_memory()) should_open = false;
-#endif
             }
             AttemptResult result;
             if (should_open) result = try_open_file(file);
@@ -1877,14 +1746,8 @@ namespace sunpack::sevenzip
                     }
                 }
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_close(job->probe, WriterProbePhase::Close);
-#endif
                 const BOOL closed = CloseHandle(handle);
                 const DWORD close_error = closed ? ERROR_SUCCESS : GetLastError();
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_close.finish();
-#endif
                 if (!closed)
                 {
                     const DWORD error = close_error;
@@ -1919,24 +1782,11 @@ namespace sunpack::sevenzip
             }
             const auto file = buffer->file;
             const auto job = file ? file->job : nullptr;
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-            if (job && buffer->probe_queued_at)
-            {
-                job->probe.end_inflight(buffer->probe_queued_at);
-                buffer->probe_queued_at = 0;
-            }
-#endif
             bool direct_close = false;
             {
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_release(job ? &job->probe : nullptr, WriterProbePhase::ReleaseLock);
-#endif
                 std::lock_guard<std::mutex> lock(mutex_);
 
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_release.finish();
-#endif
                 if (file)
                 {
                     file->inflight_bytes -= buffer->size;

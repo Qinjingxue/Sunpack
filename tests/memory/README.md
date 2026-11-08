@@ -1,21 +1,5 @@
 # Watch 内存增长测试
 
-解压 worker 的预留测量使用独立测试可执行文件和 Windows Job。执行示例：
-
-```powershell
-cmake --build native/sevenzip_bridge/build-x64-ci --config Release --target sunpack_sevenzip_memory_probe sunpack_sevenzip_memory_worker --parallel 4
-.venv/Scripts/python.exe tests/memory/worker_reserve_probe.py <压缩包路径> --format 7z --jobs 8 --dynamic
-```
-
-它不属于默认 pytest 收集；需要时手工测量。Job 限额、CPU 限额和 2 ms 采样均只用于测试子进程。
-
-全格式手动矩阵：`.venv/Scripts/python.exe tests/memory/worker_format_probe.py --jobs 32`。
-可用 `--corpus <目录>` 加入独立的旧 ZIP/RAR/7z 样本，`--case` 选择执行组。
-动态压力 probe 用 `--dynamic`，较快样本加 `--cpu-rate 25`，`--volumes 32` 测独立写入设施的叠加。
-当前默认预留为 `128 MiB + 16 MiB × CPU credit`，不再提供固定值覆盖。
-CPU credit 扩展使用测试程序专有的处理器查询注入，不修改生产 worker 配置。使用 `worker_credit_reserve_probe.py --credits 4 32 64 128 --all-formats --independent-volumes` 可复现。
-机制、完整测量与 A/B 命令参数见 [worker 内存优化报告](../../docs/worker_memory_optimization.md)。
-
 运行长期、大量文件的 watch 内存测试：
 
 ```powershell

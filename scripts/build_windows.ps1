@@ -562,11 +562,7 @@ function Build-SevenZipWorker {
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    # Request the upstream optimized paths explicitly for product builds:
-    # x64 uses MASM for LZMA/CRC/AES/SHA; ARM64 uses clang-cl only for LzmaDecOpt.S while
-    # CRC/AES/SHA keep the upstream C/intrinsics implementations. Each architecture has an
-    # explicit OFF switch for same-commit A/B benchmarking and rollback.
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON", "-DSUP7Z_ENABLE_LTO=ON", "-DSUP7Z_RUST_PROFILE=release", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DSUP7Z_DEBUG=OFF", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
     # The old in-process wrapper DLL target is gone. Remove stale incremental-build artifacts
     # so a previous sunpack_sevenzip.dll cannot be mistaken for a current output.
     Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue

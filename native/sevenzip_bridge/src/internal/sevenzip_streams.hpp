@@ -3,7 +3,7 @@
 #include "sevenzip_paths.hpp"
 #include "extraction_replay.hpp"
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
 #include "worker_pipeline_timing.hpp"
 #endif
 
@@ -67,14 +67,6 @@ namespace sunpack::sevenzip
             {
                 value.enabled = enabled[0] != '0';
             }
-            if (const char *window_kib = std::getenv("SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"))
-            {
-                const unsigned long parsed = std::strtoul(window_kib, nullptr, 10);
-                if (parsed >= 64 && parsed <= 16 * 1024)
-                {
-                    value.window_bytes = static_cast<UInt32>(parsed * 1024);
-                }
-            }
             return value;
         }();
         return config;
@@ -116,7 +108,7 @@ namespace sunpack::sevenzip
     public:
         explicit ReadFileWallTimer(ExtractInputTrace *trace) noexcept
             : trace_(read_file_timing_enabled() ? trace : nullptr)
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
               , pipeline_scope_(trace ? trace->pipeline_timing : nullptr, PipelineStage::Input)
 #endif
         {
@@ -144,7 +136,7 @@ namespace sunpack::sevenzip
     private:
         ExtractInputTrace *trace_ = nullptr;
         std::chrono::steady_clock::time_point started_{};
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
         PipelineStageScope pipeline_scope_;
 #endif
     };
@@ -270,7 +262,7 @@ namespace sunpack::sevenzip
                 if (slot.state == State::Pending)
                 {
                     DWORD read = 0;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                     PipelineStageScope input_scope(trace_ ? trace_->pipeline_timing : nullptr, PipelineStage::Input);
 #endif
                     const BOOL ok = GetOverlappedResult(slot.handle, &slot.overlapped, &read, TRUE);

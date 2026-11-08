@@ -9,7 +9,7 @@
 namespace sunpack::sevenzip {
 
 class AsyncFileWriter;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
 class PipelineTiming;
 
 struct ExtractPipelineTiming {
@@ -85,7 +85,7 @@ struct ExtractHandlerAttempt {
 };
 
 struct ExtractInputTrace {
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
     PipelineTiming *pipeline_timing = nullptr;
 #endif
     std::wstring mode;
@@ -160,7 +160,7 @@ struct ExtractOutputItemTrace {
 };
 
 struct ExtractOutputTrace {
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
     PipelineTiming *pipeline_timing = nullptr;
 #endif
     unsigned long long total_bytes_written = 0;
@@ -191,7 +191,7 @@ struct StreamDecodeReceipt {
 struct ExtractArchiveResult {
     bool has_stream_receipt = false;
     StreamDecodeReceipt stream_receipt;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
     ExtractPipelineTiming pipeline_timing;
 #endif
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;

@@ -2,7 +2,7 @@
 
 #include "sevenzip_bridge/bridge.hpp"
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
 
 #include <array>
 #include <chrono>

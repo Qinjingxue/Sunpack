@@ -14,9 +14,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 99)
 
-option(SUP7Z_ENABLE_LTO "Enable final release link-time optimization" ON)
-set(SUP7Z_RUST_PROFILE "release" CACHE STRING "Cargo profile for the embedded ENC library")
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ${SUP7Z_ENABLE_LTO})
+option(SUP7Z_DEBUG "Build an optimized diagnostic worker without release LTO" OFF)
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+if(SUP7Z_DEBUG)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+    set(SUP_ENC_PROFILE ci)
+else()
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    set(SUP_ENC_PROFILE release)
+endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/SunpackParallelBuild.cmake")
 
 function(apply_release_optimizations target_name)
@@ -26,7 +34,7 @@ function(apply_release_optimizations target_name)
         )
         target_link_options(${target_name} PRIVATE
             $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>
-            $<$<AND:$<CONFIG:Release>,$<BOOL:${SUP7Z_ENABLE_LTO}>>:/LTCG>
+            $<$<AND:$<CONFIG:Release>,$<BOOL:${CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE}>>:/LTCG>
         )
     else()
         target_compile_options(${target_name} PRIVATE
@@ -73,17 +81,6 @@ add_subdirectory(
     "${CMAKE_CURRENT_BINARY_DIR}/zlib-ng"
     EXCLUDE_FROM_ALL)
 
-option(SUP7Z_USE_X64_ASM
-    "Use upstream 7-Zip x64 assembly hot paths (LZMA decoder, CRC32/CRC64, AES, SHA)"
-    ON)
-option(SUP7Z_USE_ARM64_ASM
-    "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
-    ON)
-option(SUP7Z_ENABLE_PIPELINE_TIMING
-    "Build the benchmark-only worker pipeline timing instrumentation"
-    OFF)
-option(SUP7Z_ENABLE_WRITER_PROBE "Build benchmark-only writer phase probes and IO ablations" OFF)
-
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
     if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
@@ -98,51 +95,14 @@ if(MSVC)
 endif()
 
 set(SUP7Z_X64_ASM_ENABLED OFF)
-if(SUP7Z_USE_X64_ASM AND
-   (SUP7Z_TARGET_UARCH STREQUAL "x64" OR SUP7Z_TARGET_UARCH STREQUAL "AMD64"))
+if(SUP7Z_TARGET_UARCH STREQUAL "x64" OR SUP7Z_TARGET_UARCH STREQUAL "AMD64")
     set(SUP7Z_X64_ASM_ENABLED ON)
 endif()
 
 set(SUP7Z_ARM64_ASM_ENABLED OFF)
-if(SUP7Z_USE_ARM64_ASM AND
-   (SUP7Z_TARGET_UARCH STREQUAL "ARM64" OR SUP7Z_TARGET_UARCH STREQUAL "arm64"))
+if(SUP7Z_TARGET_UARCH STREQUAL "ARM64" OR SUP7Z_TARGET_UARCH STREQUAL "arm64")
     set(SUP7Z_ARM64_ASM_ENABLED ON)
 endif()
-
-# Keep the existing x64 selection guard stable so existing build-x64 directories
-# do not need a one-time clean after this change. ARM64 gets its own guard file:
-# old ARM64 build directories did not have this file, so the first optimized
-# configure is a normal migration; later ON/OFF flips are rejected for clean A/B.
-set(SUP7Z_ASM_LAST_SELECTION_FILE "${CMAKE_BINARY_DIR}/sup7z_asm_last_selection.txt")
-if(EXISTS "${SUP7Z_ASM_LAST_SELECTION_FILE}")
-    file(READ "${SUP7Z_ASM_LAST_SELECTION_FILE}" SUP7Z_ASM_LAST_SELECTION)
-    string(STRIP "${SUP7Z_ASM_LAST_SELECTION}" SUP7Z_ASM_LAST_SELECTION)
-    if(NOT SUP7Z_ASM_LAST_SELECTION STREQUAL "${SUP7Z_X64_ASM_ENABLED}")
-        message(FATAL_ERROR
-            "SUP7Z_USE_X64_ASM changed from "
-            "'${SUP7Z_ASM_LAST_SELECTION}' to '${SUP7Z_X64_ASM_ENABLED}' in the same build "
-            "directory (${CMAKE_BINARY_DIR}). Delete that directory, or configure the other "
-            "setting into its own build directory (e.g. build-asm-off), so objects left over "
-            "from the previous run cannot be reused.")
-    endif()
-endif()
-file(WRITE "${SUP7Z_ASM_LAST_SELECTION_FILE}" "${SUP7Z_X64_ASM_ENABLED}")
-
-set(SUP7Z_ARM64_ASM_LAST_SELECTION_FILE
-    "${CMAKE_BINARY_DIR}/sup7z_arm64_asm_last_selection.txt")
-if(EXISTS "${SUP7Z_ARM64_ASM_LAST_SELECTION_FILE}")
-    file(READ "${SUP7Z_ARM64_ASM_LAST_SELECTION_FILE}" SUP7Z_ARM64_ASM_LAST_SELECTION)
-    string(STRIP "${SUP7Z_ARM64_ASM_LAST_SELECTION}" SUP7Z_ARM64_ASM_LAST_SELECTION)
-    if(NOT SUP7Z_ARM64_ASM_LAST_SELECTION STREQUAL "${SUP7Z_ARM64_ASM_ENABLED}")
-        message(FATAL_ERROR
-            "SUP7Z_USE_ARM64_ASM changed from "
-            "'${SUP7Z_ARM64_ASM_LAST_SELECTION}' to '${SUP7Z_ARM64_ASM_ENABLED}' in the same "
-            "build directory (${CMAKE_BINARY_DIR}). Delete that directory, or configure the "
-            "other setting into its own build directory (e.g. build-arm64-asm-off), so the "
-            "LzmaDec object cannot be accidentally reused across A/B builds.")
-    endif()
-endif()
-file(WRITE "${SUP7Z_ARM64_ASM_LAST_SELECTION_FILE}" "${SUP7Z_ARM64_ASM_ENABLED}")
 
 set(SUP7Z_X64_ASM_SOURCES
     "${SUP7Z_7Z_ROOT}/Asm/x86/LzmaDecOpt.asm"
@@ -222,9 +182,7 @@ elseif(SUP7Z_ARM64_ASM_ENABLED)
         "CRC/AES/SHA keep upstream C/intrinsics")
 else()
     message(STATUS
-        "7-Zip asm: disabled (target arch '${SUP7Z_TARGET_UARCH}', "
-        "x64=${SUP7Z_USE_X64_ASM}, ARM64=${SUP7Z_USE_ARM64_ASM}) - "
-        "using upstream C/intrinsics")
+        "7-Zip asm: using upstream C/intrinsics for '${SUP7Z_TARGET_UARCH}'")
 endif()
 
 
@@ -253,9 +211,7 @@ if(SUP7Z_X64_ASM_ENABLED)
     foreach(SUP7Z_ASM_SOURCE IN LISTS SUP7Z_X64_ASM_SOURCES)
         if(NOT EXISTS "${SUP7Z_ASM_SOURCE}")
             message(FATAL_ERROR
-                "x64 assembly is enabled but ${SUP7Z_ASM_SOURCE} is missing. "
-                "Either restore it from upstream or configure with "
-                "-DSUP7Z_USE_X64_ASM=OFF - do not build a half-swapped tree.")
+                "Restore missing upstream x64 assembly source: ${SUP7Z_ASM_SOURCE}")
         endif()
     endforeach()
 
@@ -271,9 +227,7 @@ if(SUP7Z_ARM64_ASM_ENABLED)
     if(NOT EXISTS "${SUP7Z_ARM64_LZMA_ASM_SOURCE}" OR
        NOT EXISTS "${SUP7Z_ARM64_LZMA_ASM_INCLUDE}")
         message(FATAL_ERROR
-            "ARM64 LZMA assembly is enabled but the upstream Asm/arm64 sources are missing. "
-            "Restore LzmaDecOpt.S + 7zAsm.S or configure with "
-            "-DSUP7Z_USE_ARM64_ASM=OFF.")
+            "Restore missing upstream ARM64 assembly sources LzmaDecOpt.S and 7zAsm.S.")
     endif()
 
     if(NOT SUP7Z_CLANG_CL_EXECUTABLE)
@@ -296,8 +250,7 @@ if(SUP7Z_ARM64_ASM_ENABLED)
         message(FATAL_ERROR
             "ARM64 LZMA assembly requires clang-cl, matching upstream 7-Zip. "
             "Install the Visual Studio 'C++ Clang tools for Windows' component, put "
-            "clang-cl on PATH, set -DSUP7Z_CLANG_CL_EXECUTABLE=<path>, or deliberately "
-            "configure -DSUP7Z_USE_ARM64_ASM=OFF.")
+            "clang-cl on PATH, or set -DSUP7Z_CLANG_CL_EXECUTABLE=<path>.")
     endif()
 
     set(SUP7Z_ARM64_ASM_OUTPUT_DIR
@@ -357,11 +310,11 @@ if(WIN32)
     endif()
     set(SUP_ENC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../sunpack_enc")
     set(SUP_ENC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/enc-rust")
-    set(SUP_ENC_LIBRARY "${SUP_ENC_TARGET_DIR}/${SUP_ENC_RUST_TARGET}/${SUP7Z_RUST_PROFILE}/sunpack_enc.lib")
+    set(SUP_ENC_LIBRARY "${SUP_ENC_TARGET_DIR}/${SUP_ENC_RUST_TARGET}/${SUP_ENC_PROFILE}/sunpack_enc.lib")
     file(GLOB SUP_ENC_SOURCES CONFIGURE_DEPENDS "${SUP_ENC_ROOT}/src/*.rs")
     add_custom_command(OUTPUT "${SUP_ENC_LIBRARY}"
         COMMAND "${CMAKE_COMMAND}" -E env "RUSTFLAGS=-Ctarget-feature=+crt-static"
-            "${SUP_ENC_CARGO}" build --profile "${SUP7Z_RUST_PROFILE}" --locked --package sunpack-enc
+            "${SUP_ENC_CARGO}" build --profile "${SUP_ENC_PROFILE}" --locked --package sunpack-enc
             --manifest-path "${SUP_ENC_ROOT}/Cargo.toml"
             --target "${SUP_ENC_RUST_TARGET}" --target-dir "${SUP_ENC_TARGET_DIR}"
         DEPENDS ${SUP_ENC_SOURCES} "${SUP_ENC_ROOT}/Cargo.toml"
@@ -421,7 +374,7 @@ set(SUP7Z_COMMON_SOURCES
     src/internal/zlib_ng_deflate_decoder.cpp
 )
 
-if(SUP7Z_ENABLE_PIPELINE_TIMING)
+if(SUP7Z_DEBUG)
     list(APPEND SUP7Z_COMMON_SOURCES
         src/worker_pipeline_timing.cpp)
 endif()
@@ -447,11 +400,8 @@ foreach(core IN ITEMS sunpack_sevenzip_common sunpack_sevenzip_core sunpack_seve
             OleAut32 Psapi sunpack_enc Userenv Ws2_32 Bcrypt Ntdll AdvApi32)
     endif()
     target_link_libraries(${core} PUBLIC sunpack_lz4 PRIVATE zlib-ng::zlibstatic)
-    if(SUP7Z_ENABLE_WRITER_PROBE)
-        target_compile_definitions(${core} PUBLIC SUP7Z_ENABLE_WRITER_PROBE=1)
-    endif()
-    if(SUP7Z_ENABLE_PIPELINE_TIMING)
-        target_compile_definitions(${core} PUBLIC SUP7Z_ENABLE_PIPELINE_TIMING=1)
+    if(SUP7Z_DEBUG)
+        target_compile_definitions(${core} PUBLIC SUP7Z_DEBUG=1)
     endif()
 endforeach()
 
@@ -536,23 +486,6 @@ if(WIN32)
     target_compile_definitions(sunpack_sevenzip_space_retry PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
-add_executable(sunpack_sevenzip_writer_cost EXCLUDE_FROM_ALL
-    ../../benchmarks/native/writer_construction_cost.cpp
-)
-apply_release_optimizations(sunpack_sevenzip_writer_cost)
-apply_source_charset(sunpack_sevenzip_writer_cost)
-
-target_link_libraries(sunpack_sevenzip_writer_cost
-    PRIVATE sunpack_sevenzip_core
-)
-
-sup7z_attach_bundled_7z(sunpack_sevenzip_writer_cost)
-
-target_include_directories(sunpack_sevenzip_writer_cost
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
 add_executable(sunpack_sevenzip_worker
     src/worker.cpp
     src/worker_alloc.cpp
@@ -573,18 +506,14 @@ sup7z_attach_bundled_7z(sunpack_sevenzip_worker)
 
 add_executable(sunpack_sevenzip_memory_worker
     src/worker.cpp tests/memory_worker.cpp src/worker_alloc.cpp)
-add_executable(sunpack_sevenzip_memory_probe EXCLUDE_FROM_ALL
-    tests/memory_probe_worker.cpp tests/memory_probe.cpp src/worker_alloc.cpp)
-foreach(test_worker IN ITEMS sunpack_sevenzip_memory_worker sunpack_sevenzip_memory_probe)
-    apply_release_optimizations(${test_worker})
-    apply_source_charset(${test_worker})
-    target_link_libraries(${test_worker} PRIVATE sunpack_sevenzip_core)
-    sup7z_attach_bundled_7z(${test_worker})
-    if(MSVC)
-        target_link_options(${test_worker} PRIVATE /STACK:1048576,65536)
-    endif()
-    target_compile_definitions(${test_worker} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-endforeach()
+apply_release_optimizations(sunpack_sevenzip_memory_worker)
+apply_source_charset(sunpack_sevenzip_memory_worker)
+target_link_libraries(sunpack_sevenzip_memory_worker PRIVATE sunpack_sevenzip_core)
+sup7z_attach_bundled_7z(sunpack_sevenzip_memory_worker)
+if(MSVC)
+    target_link_options(sunpack_sevenzip_memory_worker PRIVATE /STACK:1048576,65536)
+endif()
+target_compile_definitions(sunpack_sevenzip_memory_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -668,13 +597,6 @@ if(WIN32)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/toast_registration.cmake")
     set_tests_properties(sunpack_launcher_toast_registration PROPERTIES TIMEOUT 15)
 endif()
-add_executable(sunpack_memory_admission_cost EXCLUDE_FROM_ALL ../../benchmarks/native/memory_admission.cpp)
-apply_release_optimizations(sunpack_memory_admission_cost)
-apply_source_charset(sunpack_memory_admission_cost)
-target_include_directories(sunpack_memory_admission_cost PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(sunpack_memory_admission_cost PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(sunpack_memory_admission_cost PRIVATE sunpack_sevenzip_core)
-sup7z_attach_bundled_7z(sunpack_memory_admission_cost)
 add_executable(sunpack_sevenzip_memory_replay tests/memory_replay.cpp)
 apply_release_optimizations(sunpack_sevenzip_memory_replay)
 apply_source_charset(sunpack_sevenzip_memory_replay)

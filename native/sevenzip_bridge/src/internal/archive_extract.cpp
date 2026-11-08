@@ -231,7 +231,7 @@ namespace sunpack::sevenzip
         result.backend_available = true;
         result.requested_codepage = codepage;
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
         auto pipeline_timing = std::make_shared<PipelineTiming>(pipeline_timing_enabled());
         result.input_trace.pipeline_timing = pipeline_timing.get();
         result.output_trace.pipeline_timing = pipeline_timing.get();
@@ -285,7 +285,7 @@ namespace sunpack::sevenzip
             };
 
             std::error_code prepare_error;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             bool directory_ready = false;
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::OutputDirectory);
@@ -321,7 +321,7 @@ namespace sunpack::sevenzip
             }
         }
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
         const auto formats = [&]()
         {
             PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::FormatCandidates);
@@ -358,7 +358,7 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IInArchive> archive;
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             HRESULT hr = E_FAIL;
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::HandlerCreate);
@@ -406,7 +406,7 @@ namespace sunpack::sevenzip
 
             bool stream_opened = false;
             auto stream = [&] {
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::StreamOpen);
 #endif
                 return open_archive_stream(archive_path, part_paths, stream_opened, &result.input_trace,
@@ -438,7 +438,7 @@ namespace sunpack::sevenzip
             }
 
             auto *raw_open_callback = [&] {
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
 #endif
                 auto callback_path = canonical_names.empty()
@@ -448,7 +448,7 @@ namespace sunpack::sevenzip
             }();
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveOpen);
                 hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
@@ -518,7 +518,7 @@ namespace sunpack::sevenzip
 
             UInt32 num_items = 0;
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             bool item_count_read = false;
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ItemProbe);
@@ -555,7 +555,7 @@ namespace sunpack::sevenzip
                 (!job_replay->initialized || job_replay->handler == handler) ? job_replay : nullptr);
             if (current_extraction_replay && !job_replay->initialized) job_replay->handler = handler;
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             ExtractToDiskCallback *raw_extract_callback = nullptr;
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
@@ -588,7 +588,7 @@ namespace sunpack::sevenzip
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
             raw_extract_callback->set_input_file(archive_path);
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             pipeline_timing->start_pipeline();
             PipelineThreadCpuScope compute_cpu_scope(pipeline_timing.get());
             PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
@@ -607,7 +607,7 @@ namespace sunpack::sevenzip
             // Output callbacks have captured all item metadata. Release the
             // decoder and its cached dictionaries before draining disk output
             // or allocating a replay inventory under pressure.
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveClose);
                 archive->Close();
@@ -617,7 +617,7 @@ namespace sunpack::sevenzip
             archive->Close();
             archive.Release();
 #endif
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::OutputFinalize);
                 raw_extract_callback->finalize_output();

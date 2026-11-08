@@ -710,7 +710,8 @@ function Build-SevenZipWorker {
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON", "-DSUP7Z_ENABLE_LTO=$lto", "-DSUP7Z_RUST_PROFILE=$BuildProfile", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
+    $workerDebug = if ($BuildProfile -eq "ci") { "ON" } else { "OFF" }
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DSUP7Z_DEBUG=$workerDebug", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
     Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)

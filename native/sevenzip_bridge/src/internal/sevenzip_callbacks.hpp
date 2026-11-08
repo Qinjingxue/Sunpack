@@ -753,7 +753,7 @@ namespace sunpack::sevenzip
             std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
 
             std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
             , PipelineTiming *pipeline_timing = nullptr
 #endif
 
@@ -768,7 +768,7 @@ namespace sunpack::sevenzip
                 dry_run_(dry_run),
 
                 output_trace_(output_trace ? output_trace : &owned_output_trace_)
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                 , pipeline_timing_(pipeline_timing)
 #endif
                 ,
@@ -777,7 +777,7 @@ namespace sunpack::sevenzip
                 cancel_token_(std::move(cancel_token)),
 
                 async_job_(async_writer_ ? async_writer_->make_job(0, cancel_token_
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
                     , pipeline_timing_
 #endif
                     ) : nullptr),
@@ -1321,9 +1321,6 @@ namespace sunpack::sevenzip
             const auto metadata = read_item_metadata(index, false);
             current_async_file_ = async_writer_->make_file(async_job_,
                                                            target.wstring(), name, index, current_trace_index_, metadata
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                                                           , has_expected_size ? expected_size : 0
-#endif
                                                            , receipt
                                                            );
             async_files_.push_back(current_async_file_);
@@ -1988,7 +1985,7 @@ namespace sunpack::sevenzip
         std::vector<HardLink> hard_links_;
         bool supports_hard_links_ = false;
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#ifdef SUP7Z_DEBUG
         PipelineTiming *pipeline_timing_ = nullptr;
 #endif
 
