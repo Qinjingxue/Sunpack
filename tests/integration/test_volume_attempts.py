@@ -406,19 +406,25 @@ def test_zip_carrier_competing_tails_trim_the_selected_geometry(tmp_path, total_
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-def test_sparse_raw_labels_with_competing_member_are_ranked(tmp_path, archive_format):
+@pytest.mark.parametrize("unnamed_tail", [False, True])
+def test_sparse_raw_labels_with_competing_member_are_ranked(tmp_path, archive_format, unnamed_tail):
     case = ArchiveFixtureFactory().create(tmp_path, "sparse", archive_format, split=True,
-        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+        compression_level=0, payload_size=(112 if unnamed_tail else 160) * 1024, split_volume_size=48 * 1024)
     parts = []
     originals = sorted(case.archive_dir.iterdir())
-    assert len(originals) == 4
-    for label, source in zip((1, 3, 10, 11), originals):
-        target = source.with_name(f"shared.part{label:03}.z.opaque")
+    assert len(originals) == (3 if unnamed_tail else 4)
+    for label, source in zip((1, 4, None) if unnamed_tail else (1, 3, 10, 11), originals):
+        target = source.with_name(f"shared.part{label:03}.z.opaque" if label is not None else "shared.tail.opaque")
         source.rename(target)
         parts.append(target)
     bad = parts[1].with_name(parts[1].name.replace(".z.", ".a."))
-    bad.write_bytes(b"\0" * (parts[1].stat().st_size + 1))
-    if archive_format == "zip":
+    bad.write_bytes(b"\0" * (parts[1].stat().st_size + (not unnamed_tail)))
+    if unnamed_tail:
+        # Four equal-length alternatives at label 4 infer end label 6.
+        # Geometry ranks [1, 4, 6] into three slots, not five or six.
+        for suffix in ("b", "c"):
+            parts[1].with_name(f"shared.part004.{suffix}.opaque").write_bytes(bad.read_bytes())
+    if archive_format == "zip" and not unnamed_tail:
         # A competing larger tail carries impossible central-directory geometry.
         # It cannot stand in for the good tail when ranking the whole domain.
         tail = bytearray(parts[-1].read_bytes())
@@ -427,6 +433,10 @@ def test_sparse_raw_labels_with_competing_member_are_ranked(tmp_path, archive_fo
         parts[-1].with_name(parts[-1].name.replace(".z.", ".a.")).write_bytes(tail + b"x")
     task = ArchiveTaskProvider(make_config()).discover_targets([str(case.archive_dir)]).tasks[0]
     assert task.archive_input().volume_attempts
+    if unnamed_tail:
+        plan = task.archive_input().volume_attempts
+        assert any(len(layout) == 3 and minimum == 0
+                   for layout, minimum in zip(plan.layouts, plan.minimum_slots))
     final = _run_trial(tmp_path, task.archive_input())
     assert final["status"] == "ok", final
     assert next((tmp_path / "worker-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text

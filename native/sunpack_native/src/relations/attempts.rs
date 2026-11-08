@@ -624,9 +624,18 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     ordered_domains.insert(key, (Arc::clone(choices), Arc::clone(&ordered)));
                     *choices = ordered;
                 }
+                let contiguous = slots.keys().copied().zip(1u32..).all(|(n, rank)| n == rank);
+                // The variable bound uses filename-label coordinates. Geometry
+                // can rank a sparse layout, but only proves that fixed layout;
+                // it does not translate the old bound into a new slot count.
+                let minimum = if variable && candidate_terminal == upper && contiguous {
+                    lower.unwrap() as usize
+                } else {
+                    0
+                };
                 if channel.is_some()
                     && (view.format == "7z" || (view.format == "zip" && !spanned))
-                    && slots.keys().copied().zip(1u32..).any(|(n, rank)| n != rank)
+                    && !contiguous
                 {
                     let mut represented = HashSet::new();
                     let mut summaries = HashMap::new();
@@ -703,14 +712,6 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     }
                 }
                 let layout: Vec<_> = slots.into_iter().collect();
-                let minimum = if variable
-                    && candidate_terminal == upper
-                    && layout.iter().zip(1u32..).all(|((n, _), rank)| *n == rank)
-                {
-                    lower.unwrap() as usize
-                } else {
-                    0
-                };
                 if minimum != 0 {
                     let mut family = layout.clone();
                     let tails = &mut family.last_mut().unwrap().1;
