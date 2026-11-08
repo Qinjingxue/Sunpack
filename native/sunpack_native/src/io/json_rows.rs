@@ -10,7 +10,7 @@ use std::io::{self, Write};
 #[derive(Default)]
 pub(crate) struct JsonArrayBuilder {
     data: Spool,
-    offsets: Spool,
+    row_ends: Spool,
     count: usize,
 }
 
@@ -18,10 +18,8 @@ impl JsonArrayBuilder {
     pub(crate) fn push<T: Serialize>(&mut self, value: &T) -> io::Result<()> {
         self.data
             .write_all(if self.count == 0 { b"[" } else { b"," })?;
-        let start = self.data.len()?;
         serde_json::to_writer(&mut self.data, value).map_err(io::Error::other)?;
-        self.offsets.write_all(&start.to_le_bytes())?;
-        self.offsets.write_all(&self.data.len()?.to_le_bytes())?;
+        self.row_ends.write_all(&self.data.len()?.to_le_bytes())?;
         self.count += 1;
         Ok(())
     }
@@ -31,7 +29,7 @@ impl JsonArrayBuilder {
             .write_all(if self.count == 0 { b"[]" } else { b"]" })?;
         Ok(NativeJsonArray {
             data: self.data.finish()?,
-            offsets: self.offsets.finish()?,
+            row_ends: self.row_ends.finish()?,
             count: self.count,
         })
     }
@@ -40,7 +38,7 @@ impl JsonArrayBuilder {
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeJsonArray {
     data: Blob,
-    offsets: Blob,
+    row_ends: Blob,
     count: usize,
 }
 
@@ -76,11 +74,17 @@ impl NativeJsonArray {
         if index < 0 || index as usize >= self.count {
             return Err(PyIndexError::new_err("JSON row index out of range"));
         }
-        let offset = index as usize * 16;
-        let start =
-            u64::from_le_bytes(self.offsets[offset..offset + 8].try_into().unwrap()) as usize;
-        let end =
-            u64::from_le_bytes(self.offsets[offset + 8..offset + 16].try_into().unwrap()) as usize;
+        let offset = index as usize * 8;
+        let row_end = |offset| {
+            u64::from_le_bytes(self.row_ends[offset..offset + 8].try_into().unwrap()) as usize
+        };
+        // Skip the opening bracket or the comma after the preceding row.
+        let start = if offset == 0 {
+            1
+        } else {
+            row_end(offset - 8) + 1
+        };
+        let end = row_end(offset);
         // Explicit UI/test row access, outside the report-writing hot path.
         let text = std::str::from_utf8(&self.data[start..end]).map_err(io::Error::other)?;
         Ok(py.import("json")?.call_method1("loads", (text,))?.unbind())

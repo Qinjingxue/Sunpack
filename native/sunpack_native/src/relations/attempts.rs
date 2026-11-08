@@ -5,7 +5,7 @@ use super::filename::NameProfile;
 use super::*;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct VolumeAttempts {
     pub sources: Vec<AttemptSource>,
     pub layouts: Vec<Vec<(u32, Arc<Vec<usize>>)>>,
@@ -26,24 +26,33 @@ impl VolumeAttempts {
         let mut heads = HashMap::new();
         let mut filtered = HashMap::new();
         for layout in std::mem::take(&mut self.layouts) {
-            let interiors: Vec<_> = layout
-                .iter()
-                .skip(1)
-                .filter(|(_, choices)| choices.iter().all(|i| !self.sources[*i].terminal))
-                .collect();
+            let mut interiors = HashMap::new();
             let mut sizes = None::<HashSet<u64>>;
-            for (_, choices) in &interiors {
+            for (_, choices) in layout.iter().skip(1) {
+                let domain = Arc::as_ptr(choices);
+                let std::collections::hash_map::Entry::Vacant(entry) = interiors.entry(domain)
+                else {
+                    continue;
+                };
+                let interior = !choices.iter().any(|i| self.sources[*i].terminal);
+                entry.insert(interior);
+                if !interior {
+                    continue;
+                }
                 let available: HashSet<_> = choices
                     .iter()
                     .map(|i| self.sources[*i].end - self.sources[*i].start)
                     .collect();
                 if let Some(sizes) = &mut sizes {
                     sizes.retain(|size| available.contains(size));
+                    if sizes.is_empty() {
+                        break;
+                    }
                 } else {
                     sizes = Some(available);
                 }
             }
-            let from_tail = interiors.is_empty();
+            let from_tail = sizes.is_none();
             let mut sizes: Vec<_> = sizes
                 .unwrap_or_else(|| {
                     layout
@@ -82,7 +91,7 @@ impl VolumeAttempts {
                             replacements.push(index);
                         }
                         domains.intern(replacements)
-                    } else if choices.iter().all(|i| !self.sources[*i].terminal) {
+                    } else if interiors[&Arc::as_ptr(choices)] {
                         let (_, domain) = filtered
                             .entry((Arc::as_ptr(choices), size))
                             .or_insert_with(|| {
@@ -585,9 +594,8 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                         }));
                     }
                     ordered.sort_by(|a, b| {
-                        let local = |i: &usize| {
-                            Path::new(&view.rows[*i].path).parent() == head_parent
-                        };
+                        let local =
+                            |i: &usize| Path::new(&view.rows[*i].path).parent() == head_parent;
                         let width = |i: &usize| {
                             view.features
                                 .get(i)

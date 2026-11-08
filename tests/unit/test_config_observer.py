@@ -6,33 +6,7 @@ import weakref
 
 import pytest
 
-from watchdog.events import FileCreatedEvent, FileDeletedEvent, FileModifiedEvent, FileMovedEvent
-
 from sunpack.runtime.watch.config_observer import ConfigFileObserver
-
-
-class FakeObserver:
-    def __init__(self):
-        self.handler = None
-        self.path = None
-        self.recursive = None
-        self.started = False
-        self.stopped = False
-        self.join_timeout = None
-
-    def schedule(self, handler, path, *, recursive):
-        self.handler = handler
-        self.path = path
-        self.recursive = recursive
-
-    def start(self):
-        self.started = True
-
-    def stop(self):
-        self.stopped = True
-
-    def join(self, timeout=None):
-        self.join_timeout = timeout
 
 
 @pytest.mark.parametrize("started", [False, True])
@@ -47,23 +21,20 @@ def test_stopped_config_observer_releases_owners_without_cyclic_gc(tmp_path, sta
         owner = Owner()
         observer = ConfigFileObserver(
             tmp_path, ("config.json",), owner.changed,
-            observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
+            loop=asyncio.get_running_loop(),
         )
         if started:
             observer.start()
         # Stopping before the loop dispatches a queued event must cancel that
         # handle too; otherwise the ready queue still owns the retired listener.
-        observer.notify_path_changed(str(tmp_path / "config.json"))
+        observer._notify(tmp_path.resolve(), ["config.json"])
         owner_ref = weakref.ref(owner)
         del owner
         observer.stop()
         assert owner_ref() is None
-        handler = observer._handler
         observer_ref = weakref.ref(observer)
         del observer
         assert observer_ref() is None
-        # A saved handler must also be harmless after its listener has gone.
-        handler.dispatch(FileModifiedEvent(str(tmp_path / "config.json")))
 
     enabled = gc.isenabled()
     gc.disable()
@@ -75,25 +46,25 @@ def test_stopped_config_observer_releases_owners_without_cyclic_gc(tmp_path, sta
 
 
 def test_config_observer_failed_start_stops_already_started_emitters(tmp_path, monkeypatch):
-    # A dispatcher that never starts can still own earlier native listeners.
+    # A later startup failure must close native listeners already running.
     # Normal shutdown tests cannot exercise this partial-start resource leak.
-    from sunpack.runtime.watch.config_observer import _ConfigEmitter
+    from sunpack.runtime.watch import config_observer
     from sunpack_native import native_resource_snapshot
 
     directories = [tmp_path / name for name in ("first", "second")]
     for directory in directories:
         directory.mkdir()
-    original = _ConfigEmitter.on_thread_start
+    original = config_observer.NativeConfigChanges
     starts = 0
 
-    def start(emitter):
+    def open_changes(directory):
         nonlocal starts
         starts += 1
         if starts == 2:
             raise OSError("second config listener failed")
-        original(emitter)
+        return original(directory)
 
-    monkeypatch.setattr(_ConfigEmitter, "on_thread_start", start)
+    monkeypatch.setattr(config_observer, "NativeConfigChanges", open_changes)
 
     async def scenario():
         observer = ConfigFileObserver(
@@ -104,31 +75,12 @@ def test_config_observer_failed_start_stops_already_started_emitters(tmp_path, m
         try:
             with pytest.raises(OSError, match="second config listener failed"):
                 observer.start()
-            assert not observer._observer.emitters
+            assert not observer._watches
             assert not list(native_resource_snapshot([str(tmp_path)]))
         finally:
-            observer._observer.stop()
             observer.stop()
 
     asyncio.run(scenario())
-
-
-def test_config_observer_watches_program_directory_non_recursively(tmp_path):
-    async def scenario():
-        observer = ConfigFileObserver(
-            tmp_path, ("sunpack_config.json",), lambda: None,
-            observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
-        )
-        observer.start()
-        observer.stop()
-        return observer
-    observer = asyncio.run(scenario())
-
-    assert observer._observer.path == str(tmp_path.resolve())
-    assert observer._observer.recursive is False
-    assert observer._observer.started is True
-    assert observer._observer.stopped is True
-    assert observer._observer.join_timeout is None
 
 
 def test_config_observer_filters_files_and_coalesces_event_burst(tmp_path, monkeypatch):
@@ -147,18 +99,18 @@ def test_config_observer_filters_files_and_coalesces_event_burst(tmp_path, monke
             tmp_path,
             ("sunpack_config.json", "sunpack_advanced_config.json", "sunpack_watch_roots.txt"),
             lambda: (calls.append("reload"), emitted.set()),
-            observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
+            loop=asyncio.get_running_loop(),
         )
-        observer.start(); handler = observer._observer.handler
-        handler.dispatch(FileModifiedEvent(str(tmp_path / "unrelated.txt")))
-        handler.dispatch(FileCreatedEvent(str(tmp_path / "SUNPACK_CONFIG.JSON")))
-        for _ in range(256):
-            handler.dispatch(FileModifiedEvent(str(tmp_path / "sunpack_advanced_config.json")))
-        handler.dispatch(FileDeletedEvent(str(tmp_path / "sunpack_watch_roots.txt")))
-        # Coalescing reloads alone still permits an event-sized ready queue.
-        assert queued == ["_emit"]
-        await asyncio.wait_for(emitted.wait(), 1.0)
-        observer.stop()
+        try:
+            directory = tmp_path.resolve()
+            observer._notify(directory, ["unrelated.txt", "subdir\\sunpack_config.json"])
+            assert queued == []
+            observer._notify(directory, ["SUNPACK_CONFIG.JSON", *["sunpack_advanced_config.json"] * 256])
+            observer._notify(directory, ["sunpack_watch_roots.txt"])
+            assert queued == ["_emit"]
+            await asyncio.wait_for(emitted.wait(), 1.0)
+        finally:
+            observer.stop()
         return calls
     assert asyncio.run(scenario()) == ["reload"]
 
@@ -178,17 +130,14 @@ def test_shared_callbacks_dispatch_immediately_and_reentrant_events_are_not_lost
             calls.append("config")
             if calls.count("config") == 1:
                 for _ in range(256):
-                    observer.notify_path_changed(str(tmp_path / "config.json"))
+                    observer._notify(tmp_path.resolve(), ["config.json"])
         observer = ConfigFileObserver(
             tmp_path, ("passwords.json",), password_changed,
             additional_files=[(tmp_path, ("config.json",), config_changed)],
-            observer_factory=FakeObserver, loop=loop,
+            loop=loop,
         )
-        observer.start()
         try:
-            for _ in range(256):
-                observer.notify_path_changed(str(tmp_path / "config.json"))
-                observer.notify_path_changed(str(tmp_path / "passwords.json"))
+            observer._notify(tmp_path.resolve(), None)
             await asyncio.sleep(0)
             assert sorted(calls) == ["config", "password"]
             await asyncio.sleep(0)
@@ -198,36 +147,7 @@ def test_shared_callbacks_dispatch_immediately_and_reentrant_events_are_not_lost
     asyncio.run(scenario())
 
 
-def test_config_observer_handles_atomic_replace_destination(tmp_path):
-    async def scenario():
-        emitted = asyncio.Event()
-        observer = ConfigFileObserver(
-            tmp_path, ("sunpack_config.json",), emitted.set,
-            observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
-        )
-        observer.start()
-        observer._observer.handler.dispatch(FileMovedEvent(
-            str(tmp_path / ".sunpack_config.json.tmp"), str(tmp_path / "sunpack_config.json")
-        ))
-        await asyncio.wait_for(emitted.wait(), 1.0)
-        observer.stop()
-    asyncio.run(scenario())
-
-
-def test_config_observer_cancels_pending_reload_when_stopped(tmp_path):
-    async def scenario():
-        emitted = asyncio.Event()
-        observer = ConfigFileObserver(
-            tmp_path, ("sunpack_config.json",), emitted.set,
-            observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
-        )
-        observer.start(); observer.notify_path_changed(str(tmp_path / "sunpack_config.json"))
-        observer.stop(); await asyncio.sleep(0)
-        return emitted.is_set()
-    assert not asyncio.run(scenario())
-
-
-def test_real_watchdog_observer_detects_config_change(tmp_path):
+def test_native_config_observer_detects_config_change(tmp_path):
     async def scenario():
         emitted = asyncio.Event()
         observer = ConfigFileObserver(

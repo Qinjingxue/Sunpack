@@ -915,12 +915,7 @@ impl NativeCandidateTable {
         let raw_snapshot = &*raw_snapshot;
         let filtered_snapshot = &*filtered_snapshot;
         py.detach(|| {
-            let mut cached = RelationCache::default();
-            for row in &self.rows {
-                if let Candidate::Relation(group) = row {
-                    relation_group_cached_anchors(group, &mut cached);
-                }
-            }
+            let cached = self.relation_cache();
             // A short password probe may start after another request consumed its
             // inputs. Drop only proven departures from that proposal, sharing the
             // original snapshot and surviving anchors instead of scanning again.
@@ -1319,9 +1314,7 @@ impl NativeCandidateTable {
             0.0
         };
         let select_all = enabled && (force_scan || !recursive);
-        let selected: HashSet<usize> = if !enabled || select_all {
-            HashSet::new()
-        } else if ratio <= 0.0 {
+        let selected: HashSet<usize> = if !enabled || select_all || ratio <= 0.0 {
             HashSet::new()
         } else {
             sized

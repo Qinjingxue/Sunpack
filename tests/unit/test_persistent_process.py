@@ -1149,19 +1149,19 @@ def test_external_config_sources_reload_between_requests_and_evict_watches(tmp_p
     import json
     import threading
     from pathlib import Path
-    from watchdog.observers.api import EventEmitter
     from sunpack.runtime.cli import persistent_runtime as runtime
+    from sunpack.runtime.watch.config_observer import _ConfigWatch
 
     read_allowed = threading.Event()
-    original_run = EventEmitter.run
+    original_run = _ConfigWatch.run
 
-    def run_after_replacement(emitter):
-        if Path(emitter.watch.path).name == "external-one":
+    def run_after_replacement(watch):
+        if watch._directory.name == "external-one":
             read_allowed.wait()
-        original_run(emitter)
+        original_run(watch)
 
     if delay_reader:
-        monkeypatch.setattr(EventEmitter, "run", run_after_replacement)
+        monkeypatch.setattr(_ConfigWatch, "run", run_after_replacement)
 
     async def scenario():
         await runtime.close_persistent_runtime()

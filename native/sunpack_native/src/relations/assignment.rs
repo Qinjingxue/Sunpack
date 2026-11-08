@@ -932,15 +932,7 @@ pub(super) fn materialize(
     let mut volumes: Vec<_> = assignment
         .slots
         .iter()
-        .map(|(&n, &i)| {
-            (
-                rows[i].path.clone(),
-                n,
-                style.to_string(),
-                family_width,
-                false,
-            )
-        })
+        .map(|(&n, &i)| (rows[i].path.clone(), n))
         .collect();
     let mut unresolved: Vec<_> = assignment
         .unresolved
@@ -952,7 +944,7 @@ pub(super) fn materialize(
         // Output still needs an entry path. Slot zero explicitly denotes an
         // unresolved identity and is never handed to extraction.
         let i = *view.indexes.iter().find(|i| view.facts[i].owned)?;
-        volumes.push((rows[i].path.clone(), 0, style.into(), 3, false));
+        volumes.push((rows[i].path.clone(), 0));
         unresolved.retain(|p| p != &rows[i].path);
     }
     let anchors = view
@@ -973,6 +965,7 @@ pub(super) fn materialize(
             format: view.format.into(),
             logical_name: logical.into(),
             style: style.into(),
+            width: family_width,
             volumes,
             companions: assignment
                 .companions
@@ -1487,7 +1480,7 @@ mod tests {
         ];
         let groups = resolve(&rows);
         assert_eq!(slots(&groups[0]), vec![1, 2]);
-        assert!(groups[0].proposal.volumes.iter().all(|p| p.3 == 1));
+        assert_eq!(groups[0].proposal.width, 1);
     }
 
     #[test]

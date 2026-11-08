@@ -210,7 +210,6 @@ struct MatchResult {
     mismatch_count: usize,
     size_mismatch_count: usize,
     size_mismatches: NativeJsonArray,
-    missing_count: usize,
     mismatches: NativeJsonArray,
     missing: NativeJsonArray,
     observations: Vec<MatchObservation>,
@@ -409,7 +408,6 @@ fn match_inventory_source(
     let mut mismatch_count = 0usize;
     let mut size_mismatch_count = 0usize;
     let mut size_mismatches = JsonArrayBuilder::default();
-    let mut missing_count = 0usize;
     // Allocate once, only after a matched file actually needs a disk CRC read.
     // Worker CRC, disabled CRC, missing/failed/unwritten outputs need no buffer.
     let mut crc_buffer = Vec::new();
@@ -460,7 +458,6 @@ fn match_inventory_source(
         });
         let Some((output_index, matched_by)) = matched else {
             coverage.missing_files += 1;
-            missing_count += 1;
             if report_issues {
                 missing.push(&item.path)?;
             }
@@ -516,7 +513,6 @@ fn match_inventory_source(
                             errors.push(&error)?;
                         }
                         coverage.missing_files += 1;
-                        missing_count += 1;
                         if report_issues {
                             missing.push(&item.path)?;
                         }
@@ -637,7 +633,6 @@ fn match_inventory_source(
         mismatch_count,
         size_mismatch_count,
         size_mismatches: size_mismatches.finish()?,
-        missing_count,
         mismatches: mismatches.finish()?,
         missing: missing.finish()?,
         observations,
@@ -666,7 +661,6 @@ fn empty_status_result(
         mismatch_count: 0,
         size_mismatch_count: 0,
         size_mismatches: JsonArrayBuilder::default().finish()?,
-        missing_count: 0,
         mismatches: JsonArrayBuilder::default().finish()?,
         missing: JsonArrayBuilder::default().finish()?,
         observations: Vec::new(),
@@ -687,7 +681,7 @@ fn match_result_to_py(py: Python<'_>, matched: MatchResult) -> PyResult<Py<PyDic
     result.set_item("mismatch_count", matched.mismatch_count)?;
     result.set_item("size_mismatch_count", matched.size_mismatch_count)?;
     result.set_item("size_mismatches", matched.size_mismatches)?;
-    result.set_item("missing_count", matched.missing_count)?;
+    result.set_item("missing_count", matched.coverage.missing_files)?;
     result.set_item("used_worker_crc", matched.used_worker_crc)?;
     result.set_item("crc_files_read", matched.crc_files_read)?;
     result.set_item("detail_total", matched.detail_total)?;
@@ -1119,7 +1113,7 @@ mod windows_output_name_tests {
         let names = [("\u{e9}.txt", 100), ("e\u{301}.txt", 100)];
         let result = bug_regression_match(&names, &names[..1], BasenameMode::Any);
         assert_eq!(result.coverage.complete_files, 1);
-        assert_eq!(result.missing_count, 1);
+        assert_eq!(result.coverage.missing_files, 1);
         assert_eq!(result.coverage.complete_bytes, 1);
     }
 
@@ -1143,7 +1137,7 @@ mod windows_output_name_tests {
             BasenameMode::Any,
         );
         assert_eq!(result.coverage.complete_files, 0);
-        assert_eq!(result.missing_count, 1);
+        assert_eq!(result.coverage.missing_files, 1);
     }
 
     #[test]

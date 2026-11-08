@@ -37,12 +37,13 @@ pub(crate) struct RelationInput {
     anchor_cell: Option<CheapAnchorCell>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RelationProposal {
     format: String,
     logical_name: String,
     style: String,
-    volumes: Vec<(String, u32, String, usize, bool)>,
+    width: usize,
+    volumes: Vec<(String, u32)>,
     companions: Vec<String>,
 }
 
@@ -55,7 +56,7 @@ enum ProposalStatus {
     Inconclusive,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ProposalValidation {
     status: ProposalStatus,
     proposal: RelationProposal,
@@ -64,6 +65,16 @@ pub(crate) struct ProposalValidation {
     unresolved: Vec<String>,
     name_features: HashMap<String, filename::NameFeatures>,
     attempts: Option<attempts::VolumeAttempts>,
+}
+
+impl ProposalValidation {
+    fn part_paths(&self) -> impl Iterator<Item = &str> {
+        self.proposal
+            .volumes
+            .iter()
+            .map(|part| part.0.as_str())
+            .chain(self.unresolved.iter().map(String::as_str))
+    }
 }
 
 /// Owned by the candidate table's scan lifetime; never a process-wide cache.
@@ -80,7 +91,7 @@ pub(crate) enum GroupKind {
     Incomplete,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum NativeRelationGroup {
     Ordinary(RelationInput, bool),
     Proposal(ProposalValidation, GroupKind),
@@ -102,28 +113,15 @@ pub(crate) struct RelationCandidateData<'a> {
 
 impl<'a> RelationCandidateData<'a> {
     pub(crate) fn parts(&self) -> impl Iterator<Item = &'a str> {
-        let ordinary = match self.group {
-            NativeRelationGroup::Ordinary(row, _) => Some(row.path.as_str()),
-            NativeRelationGroup::Proposal(..) => None,
+        let (ordinary, proposal) = match self.group {
+            NativeRelationGroup::Ordinary(row, _) => (Some(row.path.as_str()), None),
+            NativeRelationGroup::Proposal(validation, _) => (None, Some(validation)),
         };
-        let volumes = match self.group {
-            NativeRelationGroup::Ordinary(..) => None,
-            NativeRelationGroup::Proposal(validation, _) => {
-                Some(validation.proposal.volumes.as_slice())
-            }
-        };
-        let unresolved = match self.group {
-            NativeRelationGroup::Proposal(validation, _) => validation.unresolved.as_slice(),
-            _ => &[],
-        };
-        ordinary
-            .into_iter()
-            .chain(
-                volumes
-                    .into_iter()
-                    .flat_map(|volumes| volumes.iter().map(|volume| volume.0.as_str())),
-            )
-            .chain(unresolved.iter().map(String::as_str))
+        ordinary.into_iter().chain(
+            proposal
+                .into_iter()
+                .flat_map(ProposalValidation::part_paths),
+        )
     }
 
     pub(crate) fn parts_len(&self) -> usize {
@@ -339,7 +337,7 @@ impl NativeRelationGroup {
                 let head = proposal
                     .volumes
                     .iter()
-                    .find(|(_, number, _, _, _)| *number == 1)
+                    .find(|(_, number)| *number == 1)
                     .unwrap_or(&proposal.volumes[0]);
                 RelationCandidateData {
                     group: self,
@@ -714,7 +712,8 @@ fn resolve_shared_carrier_volumes(
                     format,
                     logical_name,
                     style: style.into(),
-                    volumes: vec![(path.clone(), number, style.into(), 3, false)],
+                    width: 3,
+                    volumes: vec![(path.clone(), number)],
                     companions: Vec::new(),
                 },
                 anchors: HashMap::from([(path_key(&path), anchor)]),
@@ -762,28 +761,12 @@ fn build_candidate_groups_from_source(
         }
         // Arbitration considers every candidate in the active stem bucket,
         // including competitors whose head was not selected by the caller.
-        let selected: Vec<_> = validations
-            .iter()
-            .map(|validation| {
-                validation
-                    .proposal
-                    .volumes
-                    .iter()
-                    .any(|part| filtered_keys.contains(&path_key(&part.0)))
-                    || validation
-                        .unresolved
-                        .iter()
-                        .any(|path| filtered_keys.contains(&path_key(path)))
-                    || validation
-                        .proposal
-                        .companions
-                        .iter()
-                        .any(|path| filtered_keys.contains(&path_key(path)))
-            })
-            .collect();
-
         let validation_owned_paths: Vec<HashSet<String>> =
             validations.iter().map(validation_owned_paths).collect();
+        let selected: Vec<_> = validation_owned_paths
+            .iter()
+            .map(|owned| !owned.is_disjoint(filtered_keys))
+            .collect();
 
         let password_conflicted = conflicting_proposal_indexes(
             &validations,
@@ -793,6 +776,7 @@ fn build_candidate_groups_from_source(
 
         let mut claimed_paths = HashSet::new();
         let mut password_paths = HashSet::new();
+        let mut selected_groups = Vec::new();
         for (index, validation) in validations.iter().enumerate() {
             if validation.status != ProposalStatus::Valid {
                 continue;
@@ -800,10 +784,7 @@ fn build_candidate_groups_from_source(
             let owned = &validation_owned_paths[index];
             claimed_paths.extend(owned.iter().cloned());
             if selected[index] {
-                output.push(NativeRelationGroup::Proposal(
-                    validation.clone(),
-                    GroupKind::Valid,
-                ));
+                selected_groups.push((index, GroupKind::Valid));
             }
         }
 
@@ -823,10 +804,7 @@ fn build_candidate_groups_from_source(
             }
             password_paths.extend(owned.iter().cloned());
             if selected[index] {
-                output.push(NativeRelationGroup::Proposal(
-                    validation.clone(),
-                    GroupKind::Password,
-                ));
+                selected_groups.push((index, GroupKind::Password));
             }
         }
 
@@ -866,12 +844,15 @@ fn build_candidate_groups_from_source(
             }
             claimed_paths.extend(owned.iter().cloned());
             if selected[index] {
-                output.push(NativeRelationGroup::Proposal(
-                    validations[index].clone(),
-                    GroupKind::Incomplete,
-                ));
+                selected_groups.push((index, GroupKind::Incomplete));
             }
         }
+        // Preserve arbitration order without copying the selected group's
+        // anchors, filename features and attempt plan out of the working set.
+        let mut validations: Vec<_> = validations.into_iter().map(Some).collect();
+        output.extend(selected_groups.into_iter().map(|(index, kind)| {
+            NativeRelationGroup::Proposal(validations[index].take().unwrap(), kind)
+        }));
 
         for row in directory_rows.into_iter().filter(|row| {
             filtered_keys.contains(&row.path_key)
@@ -1006,19 +987,12 @@ fn promote_sfx_archive_anchor(
     Some(anchor)
 }
 
-fn proposal_owned_paths(proposal: &RelationProposal) -> HashSet<String> {
-    proposal
-        .volumes
-        .iter()
-        .map(|(path, _, _, _, _)| path_key(path))
-        .chain(proposal.companions.iter().map(|path| path_key(path)))
-        .collect()
-}
-
 fn validation_owned_paths(validation: &ProposalValidation) -> HashSet<String> {
-    let mut paths = proposal_owned_paths(&validation.proposal);
-    paths.extend(validation.unresolved.iter().map(|p| path_key(p)));
-    paths
+    validation
+        .part_paths()
+        .chain(validation.proposal.companions.iter().map(String::as_str))
+        .map(path_key)
+        .collect()
 }
 
 fn conflicting_proposal_indexes(
@@ -1182,7 +1156,7 @@ fn validated_proposal_to_dict(
     let head = proposal
         .volumes
         .iter()
-        .find(|(_, number, _, _, _)| *number == 1)
+        .find(|(_, number)| *number == 1)
         .unwrap_or(&proposal.volumes[0]);
     let head_path = &head.0;
     let head_anchor = validation.anchors.get(&path_key(&head_path));
@@ -1205,12 +1179,10 @@ fn validated_proposal_to_dict(
         split_index: 1,
     };
     let volume_dicts = proposal_volume_dicts(py, proposal, &split_family, &validation.anchors)?;
-    let all_parts: Vec<String> = proposal
-        .volumes
-        .iter()
-        .map(|(path, _, _, _, _)| path.clone())
-        .chain(validation.unresolved.iter().cloned())
-        .collect();
+    let all_parts = PyList::empty(py);
+    for path in validation.part_paths() {
+        all_parts.append(path)?;
+    }
     let carrier = proposal.companions.first().cloned().unwrap_or_default();
     let carrier_size = (!carrier.is_empty())
         .then(|| {
@@ -1228,7 +1200,7 @@ fn validated_proposal_to_dict(
     dict.set_item("head_name", basename(head_path))?;
     dict.set_item("logical_name", &proposal.logical_name)?;
     dict.set_item("relation", relation_to_dict(py, &relation)?)?;
-    dict.set_item("all_parts", PyList::new(py, &all_parts)?)?;
+    dict.set_item("all_parts", all_parts)?;
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", head_anchor.map(|anchor| anchor.size))?;
     dict.set_item(
@@ -1247,7 +1219,7 @@ fn validated_proposal_to_dict(
     };
     if proposal.format == "zip" {
         let mut logical_start = 0u64;
-        for (path, _, _, _, _) in &proposal.volumes {
+        for (path, _) in &proposal.volumes {
             let Some(anchor) = validation.anchors.get(&path_key(path)) else {
                 break;
             };
@@ -1332,14 +1304,11 @@ fn proposal_logical_size(
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
 ) -> Option<u64> {
-    proposal
-        .volumes
-        .iter()
-        .try_fold(0u64, |total, (path, _, _, _, _)| {
-            anchors
-                .get(&path_key(path))
-                .map(|anchor| total.saturating_add(anchor.payload_size()))
-        })
+    proposal.volumes.iter().try_fold(0u64, |total, (path, _)| {
+        anchors
+            .get(&path_key(path))
+            .map(|anchor| total.saturating_add(anchor.payload_size()))
+    })
 }
 
 fn proposal_volume_dicts(
@@ -1352,12 +1321,11 @@ fn proposal_volume_dicts(
         .volumes
         .iter()
         .filter(|part| part.1 > 0)
-        .map(|(path, number, _style, width, _decorated)| {
+        .map(|(path, number)| {
+            let anchor = anchors.get(&path_key(path));
             let dict = PyDict::new(py);
             let role = if proposal.style == "zip_spanned"
-                && anchors
-                    .get(&path_key(path))
-                    .is_some_and(|anchor| anchor.anchor_roles.contains(&"terminal"))
+                && anchor.is_some_and(|anchor| anchor.anchor_roles.contains(&"terminal"))
             {
                 "terminal"
             } else if *number == 1 {
@@ -1375,18 +1343,17 @@ fn proposal_volume_dicts(
             dict.set_item("source", "structure")?;
             dict.set_item("style", split_family)?;
             dict.set_item("prefix", &proposal.logical_name)?;
-            dict.set_item("width", *width)?;
-            if let Some(start) = anchors
-                .get(&path_key(path))
+            dict.set_item("width", proposal.width)?;
+            if let Some(start) = anchor
                 .and_then(|anchor| anchor.structure_offset)
                 .filter(|offset| *offset > 0)
             {
                 dict.set_item("start", start)?;
             }
-            if let Some(end) = anchors
-                .get(&path_key(path))
-                .and_then(|a| (a.extent_end() < a.size).then(|| a.extent_end()))
-            {
+            if let Some(end) = anchor.and_then(|a| {
+                let end = a.extent_end();
+                (end < a.size).then_some(end)
+            }) {
                 dict.set_item("end", end)?;
             }
             Ok(dict.unbind())
@@ -1408,8 +1375,8 @@ fn proposal_split_family(
         let head_evidence = proposal
             .volumes
             .iter()
-            .find(|(_, number, _, _, _)| *number == 1)
-            .and_then(|(path, _, _, _, _)| anchors.get(&path_key(path)))
+            .find(|(_, number)| *number == 1)
+            .and_then(|(path, _)| anchors.get(&path_key(path)))
             .map(|anchor| anchor.evidence.as_slice())
             .unwrap_or(&[]);
         let old_naming = head_evidence.contains(&"rar4:old_volume_naming");
@@ -2484,18 +2451,11 @@ mod tests {
                 format: "rar".to_string(),
                 logical_name: "test".to_string(),
                 style: "rar_part".to_string(),
+                width: 2,
                 volumes: paths
                     .iter()
                     .enumerate()
-                    .map(|(index, path)| {
-                        (
-                            (*path).to_string(),
-                            index as u32 + 1,
-                            "rar_part".to_string(),
-                            2,
-                            true,
-                        )
-                    })
+                    .map(|(index, path)| ((*path).to_string(), index as u32 + 1))
                     .collect(),
                 companions: Vec::new(),
             },
