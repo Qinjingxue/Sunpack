@@ -2,7 +2,7 @@
 
 **English** | [简体中文](zh-CN/configuration.md)
 
-Edit `sunpack_config.json` to change everyday settings. When running from source, use the file in the project root. For an installed copy, use `%ProgramData%\SunPack\sunpack_config.json`. `sunpack_advanced_config.json` supplies the remaining defaults; you only need to add fields you want to change to the main file.
+Edit `sunpack_config.json` to change everyday settings. When running from source, use the file in the project root. For an installed copy, use `%ProgramData%\SunPack\sunpack_config.json`. `sunpack_advanced_config.json` supplies the remaining defaults. Keep everyday settings in the ordinary file; manually copied advanced overrides are not preserved by the pre-1.4.0 upgrade reset.
 
 Ordinary configuration values take precedence over the same fields in the advanced file; `SUNPACK_CONFIG_OVERRIDES` remains the final explicit override layer. Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
 
@@ -40,7 +40,7 @@ For example, add these fields to the main configuration to keep original archive
 
 CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
 
-Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. The installer retains its atomic configuration upgrade and failure-recovery framework. Upgrading from the released v1.3.4 configuration migrates the old scan-filter fields into the current schema.
+Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. Upgrades from installed versions below 1.4.0 reset managed runtime data and convert legacy scan-filter fields. Read the [upgrade warning](upgrade-v1.4.md) and back up your data first.
 
 ## Partial success and result verification
 
@@ -120,15 +120,17 @@ edit it; blue tags denote regex records. Enter submits the change.
 Validation failures retain the draft and leave the saved configuration intact.
 Enter regex backslashes normally in the GUI; saving handles JSON escaping.
 
-The installer migrates the released v1.3.4 schema directly into these records;
-untagged development schemas have no migration path. Old complete filenames move
-to `full_names`, and old extension entries move to `extensions`. Their whitelist
-AND relationship remains in one module. Directory-prune rules merge into the
-blacklist regardless of their former enabled states; if either was enabled, the
-merged blacklist is enabled. Old path Globs retain component-boundary matching,
-using regex records when necessary. Legacy whitelist path groups are combined
-into one OR list instead of separate AND conditions. Migration is idempotent;
-runtime uses only the current schema.
+The installer converts the released v1.3.0–v1.3.4 filter schema; the modern
+v1.3.5 shape is retained. Untagged development schemas have no compatibility
+guarantee. Old complete filenames move to `full_names`, and old extension entries
+to `extensions`; their whitelist AND relationship remains in one module.
+Directory-prune and blacklist rules merge when both old modules are enabled.
+If only one is enabled, only that module's active rules are retained; the disabled
+side is discarded so its rules are not silently enabled. If both are disabled,
+the merged rules are retained with the blacklist disabled. Old path Globs retain
+component-boundary matching, using regex records when necessary. Legacy whitelist
+path groups are combined into one OR list instead of separate AND conditions.
+Runtime uses only the current schema.
 
 Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bounds select one exact size. Time bounds use UTC minute strings in `YYYY-MM-DDTHH:mmZ` format, including the start and excluding the end. `null` leaves that side unbounded; specify both bounds explicitly to override defaults. For example:
 
@@ -161,7 +163,7 @@ Monitored roots are stored in `sunpack_watch_roots.txt` and managed through the 
 
 Monitored input folders require NTFS. On startup or configuration reload, the backend removes confirmed non-NTFS paths from the watch list and displays a classic Windows error dialog in `cli.language`, listing the paths, filesystems, and removal result. Monitoring starts for the remaining folders without waiting for dialog acknowledgment. An empty list still allows the service to start and wait for new folders. Files and folders are not deleted, and temporarily offline paths are retained.
 
-Analysis recognizes only the current archive layer. GZIP, BZIP2, XZ, Zstandard and LZ4 streams are extracted first; a resulting TAR is discovered and extracted by the normal recursive pipeline. The former `tar_*` analysis modules and all `max_probe_bytes` settings have been removed. Ordinary TAR analysis starts at offset zero; only the canonical embedded scanner can supply TAR candidates at other offsets. `watch.event_log_retention_days` controls task history and event retention shared by CLI and Watch. Installer upgrades update named filters, analysis modules, and verification methods while preserving user values, module order, and unknown extensions.
+Analysis recognizes only the current archive layer. GZIP, BZIP2, XZ, Zstandard and LZ4 streams are extracted first; a resulting TAR is discovered and extracted by the normal recursive pipeline. The former `tar_*` analysis modules and all `max_probe_bytes` settings have been removed. Ordinary TAR analysis starts at offset zero; only the canonical embedded scanner can supply TAR candidates at other offsets. `watch.event_log_retention_days` controls task history and event retention shared by CLI and Watch.
 
 Add a monitored directory with `python sunpack.py watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory; leaving it empty writes beside each archive. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
 
@@ -177,7 +179,9 @@ Failure reports use only `watch.toast_report_retention_days`. Count and byte lim
 
 State always lives in `.sunpack_watch` under the writable data directory (`%ProgramData%\SunPack` for installed copies). It is shared by CLI, Watch and the GUI. There is no state-directory setting or runtime directory-switch mechanism.
 
-The installer and `scripts/upgrade_config.ps1` own upgrades: ordinary clipboard/report values are preserved, missing ones are copied from the old advanced file, then filled with defaults. Retired controls are removed from the ordinary file, and installation deploys the new advanced template. Custom-state recovery/history files are copied to the fixed directory without deleting their originals; unrelated files are not copied. Conflicting existing default data, changed legacy data on a retry, or reparse points stop the migration rather than overwrite data. Runtime code does not migrate or read retired controls.
+The installer and `scripts/upgrade_config.ps1` own upgrades. For installed numeric base versions below 1.4.0, the new ordinary template defines the retained fields: existing ordinary values (including `false`, `0`, empty values and `null`) take precedence, then old advanced values for fields promoted to ordinary settings, then new defaults. New fields are added and retired fields removed. Manually copied advanced-only fields and unknown extensions are not retained; the advanced file is replaced by the new template.
+
+Only the ordinary settings, Watch roots and nonblank built-in passwords are retained from managed data. Watch root paths, outputs, `deep_detect`, `recursive` and comments are preserved, but `initial_scanned` resets to `false`. Other managed data, including recovery tasks, catalog, task/event history, caches and failure reports, is deleted rather than migrated. In a custom Watch state directory outside managed data, only known SunPack records are removed; unrelated contents are left untouched. An unknown installed version with existing data stops the destructive reset; versions 1.4.0 and newer do not receive this legacy reset. See the [bilingual upgrade notes](upgrade-v1.4.md) for backup and rescan warnings. Runtime code does not migrate or read retired controls.
 
 Persistent passwords come only from `builtin_passwords.json`, including its `clipboard_history`. Add records with `value` to `passwords`; optional `scopes` lists absolute directories and applies to their descendants too. Omit `scopes` for global passwords. Runtime sources are explicit input (`-p`, `--pw-file`, or the password prompt) and the current clipboard.
 
