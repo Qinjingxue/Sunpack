@@ -650,6 +650,12 @@ if(WIN32)
 endif()
 
 enable_testing()
+add_executable(sunpack_sevenzip_volume_attempts tests/volume_attempts.cpp)
+apply_release_optimizations(sunpack_sevenzip_volume_attempts)
+apply_source_charset(sunpack_sevenzip_volume_attempts)
+target_include_directories(sunpack_sevenzip_volume_attempts PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_test(NAME sunpack_sevenzip_volume_attempts COMMAND sunpack_sevenzip_volume_attempts)
 if(WIN32)
     add_executable(sunpack_toast_registration_runtime tests/toast_registration_runtime.cpp)
     apply_release_optimizations(sunpack_toast_registration_runtime)

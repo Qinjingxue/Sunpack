@@ -76,6 +76,7 @@ struct VolumeAttemptCursor {
     std::vector<std::size_t> digits, selected;
     std::vector<unsigned char> used;
     std::vector<unsigned long long> remaining, suffix_capacity;
+    std::vector<std::size_t> domain_remaining, shared_domains;
     bool started = false, discard_pending = false, output_owned = false;
     void reserve(const VolumeAttemptPlan& plan) {
         std::size_t maximum = 0;
@@ -83,12 +84,41 @@ struct VolumeAttemptCursor {
         digits.reserve(maximum); selected.reserve(maximum);
         if (plan.minimum_size) { remaining.reserve(maximum + 1); suffix_capacity.reserve(maximum + 1); }
         used.assign(plan.sources.size(), 0);
+        domain_remaining.resize(plan.domains.size());
+    }
+    // Necessary injectivity condition for each repeated domain, not a general
+    // matching solver. Count only until enough unused choices are found.
+    bool shared_domains_fit(const VolumeAttemptPlan& plan, std::size_t depth, std::size_t selected_domain) const {
+        for (auto domain : shared_domains) {
+            // Consuming a source in the slot's own domain also satisfies one
+            // of its demands; only the other domains can lose capacity.
+            if (domain == selected_domain) continue;
+            auto needed = domain_remaining[domain];
+            const auto& choices = plan.domains[domain];
+            if (!needed) continue;
+            if (needed > choices.size()) return false;
+            // At most depth choices can have been consumed by the prefix.
+            if (depth <= choices.size() - needed) continue;
+            for (auto source : choices)
+                if (!used[source] && --needed == 0) break;
+            if (needed) return false;
+        }
+        return true;
+    }
+    void unselect(const std::vector<VolumeAttemptSlot>& slots, std::size_t depth) {
+        used[selected[depth]] = 0;
+        ++domain_remaining[slots[depth].domain];
     }
     bool next(const VolumeAttemptPlan& plan, const std::atomic<bool>* cancel = nullptr) {
         while (layout < plan.layouts.size()) {
             const auto& slots = plan.layouts[layout];
             std::size_t depth = 0;
             if (digits.empty()) {
+                std::fill(domain_remaining.begin(), domain_remaining.end(), 0);
+                shared_domains.clear();
+                for (const auto& slot : slots)
+                    if (++domain_remaining[slot.domain] == 2) shared_domains.push_back(slot.domain);
+                if (!shared_domains_fit(plan, 0, plan.domains.size())) { ++layout; continue; }
                 if (plan.minimum_size) {
                     suffix_capacity.assign(slots.size() + 1, 0);
                     for (std::size_t i = slots.size(); i-- > 0;)
@@ -104,7 +134,7 @@ struct VolumeAttemptCursor {
                 selected.assign(slots.size(), plan.sources.size());
             } else {
                 depth = slots.size() - 1;
-                used[selected[depth]] = 0;
+                unselect(slots, depth);
                 ++digits[depth];
             }
             for (;;) {
@@ -114,7 +144,7 @@ struct VolumeAttemptCursor {
                     digits[depth] = 0;
                     if (depth == 0) break;
                     --depth;
-                    used[selected[depth]] = 0;
+                    unselect(slots, depth);
                     ++digits[depth];
                     continue;
                 }
@@ -132,6 +162,10 @@ struct VolumeAttemptCursor {
                 }
                 selected[depth] = source;
                 used[source] = 1;
+                --domain_remaining[slots[depth].domain];
+                if (!shared_domains_fit(plan, depth + 1, slots[depth].domain)) {
+                    unselect(slots, depth); ++digits[depth]; continue;
+                }
                 if (++depth != slots.size()) { digits[depth] = 0; continue; }
                 // Overlapping evidence tiers can denote the same composition.
                 // Membership in an earlier layout avoids an ever-growing seen set.
@@ -147,7 +181,7 @@ struct VolumeAttemptCursor {
                         }
                 }
                 if (!duplicate) { ++attempts; return true; }
-                --depth; used[selected[depth]] = 0; ++digits[depth];
+                --depth; unselect(slots, depth); ++digits[depth];
             }
             ++layout; digits.clear(); selected.clear();
         }
