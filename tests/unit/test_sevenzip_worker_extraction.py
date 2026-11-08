@@ -923,9 +923,10 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     trial_input["volume_attempts"] = {
         "minimum_size": len(xz),
         "sources": [{"path": str(p), "start": 0, "end": p.stat().st_size} for p in (head, short_tail, tail)],
+        "domains": [{"choices": [0]}, {"choices": [1, 2]}],
         "layouts": [{"slots": [
-            {"number": 1, "canonical_name": "stream.001", "choices": [0]},
-            {"number": 2, "canonical_name": "stream.002", "choices": [1, 2]},
+            {"number": 1, "canonical_name": "stream.001", "domain": 0},
+            {"number": 2, "canonical_name": "stream.002", "domain": 1},
         ]}],
     }
     tiny = tmp_path / "small.zip"

@@ -579,6 +579,14 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
         attempts.uint_field("head_size_from_total", &plan.head_size_from_total);
         attempts.uint_field("minimum_size", &plan.minimum_size);
         plan.sources = parse_ranges_from_objects(attempts.object_array_field("sources"), "");
+        for (auto raw : attempts.object_array_field("domains")) {
+            std::vector<std::size_t> choices;
+            if (!JsonObjectView(raw).index_array_field("choices", choices) ||
+                std::any_of(choices.begin(), choices.end(), [&](auto i) { return i >= plan.sources.size(); })) {
+                input.validation_error = "invalid volume attempt domain"; return input;
+            }
+            plan.domains.push_back(std::move(choices));
+        }
         for (auto raw : attempts.object_array_field("tail_totals")) {
             unsigned long long source = 0, total = 0;
             const JsonObjectView entry(raw);
@@ -598,13 +606,14 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
                 unsigned long long number = 0;
                 sunpack::sevenzip::VolumeAttemptSlot parsed;
                 parsed.name = utf8_to_wide(slot.string_field("canonical_name", ""));
+                unsigned long long domain = 0;
                 if (!slot.uint_field("number", &number) || number <= previous || number > INT_MAX ||
                     (slots.empty() && number != 1) || parsed.name.empty() || !names.insert(parsed.name).second ||
-                    !slot.index_array_field("choices", parsed.choices) ||
-                    std::any_of(parsed.choices.begin(), parsed.choices.end(), [&](auto i) { return i >= plan.sources.size(); })) {
+                    !slot.uint_field("domain", &domain) || domain >= plan.domains.size()) {
                     input.validation_error = "invalid volume attempt slot"; return input;
                 }
                 parsed.number = static_cast<unsigned int>(number);
+                parsed.domain = static_cast<std::size_t>(domain);
                 previous = number;
                 slots.push_back(std::move(parsed));
             }
@@ -615,6 +624,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
             std::any_of(plan.sources.begin(), plan.sources.end(), [](const auto& source) {
                 return source.path.empty() || (source.has_end && source.end < source.start);
             })) { input.validation_error = "invalid volume attempt sources"; return input; }
+        plan.prepare();
     }
 
     struct ParsedPart {
@@ -1349,19 +1359,9 @@ int run_request(
             for (std::size_t i = 0; i < selected_input.ranges.size(); ++i) {
                 const auto& range = selected_input.ranges[i];
                 const auto length = range.has_end ? (std::min)(range.end - range.start, UINT64_MAX - offset) : UINT64_MAX - offset;
-                bool variable = i == 0 && (request.archive_input.volume_attempts.head_size_from_total != 0 ||
-                    !request.archive_input.volume_attempts.tail_totals.empty());
-                bool variable_length = variable;
-                for (const auto& layout : request.archive_input.volume_attempts.layouts) {
-                    if (i >= layout.size() || layout[i].number != static_cast<unsigned int>(selected_input.volume_numbers[i])) {
-                        variable = variable_length = true; continue;
-                    }
-                    variable |= layout[i].choices.size() != 1 || layout[i].choices.front() != cursor.selected[i];
-                    for (auto choice : layout[i].choices) {
-                        const auto& source = request.archive_input.volume_attempts.sources[choice];
-                        variable_length |= !source.has_end || source.end - source.start != length;
-                    }
-                }
+                const auto& variation = request.archive_input.volume_attempts.variation[i];
+                const bool variable = variation.variable;
+                const bool variable_length = variation.variable_length || variation.length != length;
                 if (variable || variable_offset)
                     volume_replay->uncertain_ranges.emplace_back(offset, offset + length);
                 if (variable)

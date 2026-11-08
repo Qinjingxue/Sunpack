@@ -71,18 +71,20 @@ pub(crate) struct VolumeAnchor {
 }
 
 impl VolumeAnchor {
-    pub(crate) fn extent_end(&self) -> u64 {
-        self.payload_end.unwrap_or_else(|| {
-            if self.format == "rar"
-                || (self.format == "zip" && self.anchor_roles.contains(&"terminal"))
-            {
-                self.expected_logical_size
-                    .unwrap_or(self.size)
-                    .min(self.size)
-            } else {
-                self.size
-            }
+    // Only a parsed physical boundary can exclude another structure. An
+    // opaque chunk's EOF is an input limit, not evidence of ownership.
+    pub(crate) fn proven_extent_end(&self) -> Option<u64> {
+        self.payload_end.or_else(|| {
+            (self.format == "rar"
+                || (self.format == "zip" && self.anchor_roles.contains(&"terminal")))
+            .then_some(self.expected_logical_size)
+            .flatten()
+            .map(|end| end.min(self.size))
         })
+    }
+
+    pub(crate) fn extent_end(&self) -> u64 {
+        self.proven_extent_end().unwrap_or(self.size)
     }
 
     pub(crate) fn payload_size(&self) -> u64 {

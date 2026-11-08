@@ -279,6 +279,12 @@ struct PendingEmbeddedVolume {
 }
 
 impl NativeEmbeddedBatch {
+    fn claims_offset(&self, key: &str, offset: u64) -> bool {
+        self.claimed_ranges.get(key).is_some_and(|ranges| {
+            ranges.iter().any(|&(start, end)| start <= offset && offset < end)
+        })
+    }
+
     fn project_outcomes(
         &mut self,
         py: Python<'_>,
@@ -288,7 +294,6 @@ impl NativeEmbeddedBatch {
         let mut projected = Vec::new();
         for (index, outcome) in outcomes {
             let key = path_key(&table.summary(index)?.0);
-            let claimed = self.claimed_ranges.get(&key);
             let row: PyResult<_> = match outcome {
                 EmbeddedOutcome::Residual => {
                     unreachable!("residuals are filtered before projection")
@@ -300,17 +305,15 @@ impl NativeEmbeddedBatch {
                 }
                 EmbeddedOutcome::Scan(scan) => {
                     let mut anchors = scan.relation_anchors();
-                    if let Some(claimed) = claimed {
-                        // Existing volume hypotheses remain authoritative.
+                    if self.claimed_ranges.contains_key(&key) {
+                        // Only proven extents (or the identical known anchor)
+                        // exclude another head; an opaque chunk's EOF does not.
                         // Independent encrypted archives still use the normal
                         // boundary/password resolution before projection.
                         anchors.retain(|a| {
                             a.standalone
                                 || (!a.multivolume && a.needs_password)
-                                || !claimed.iter().any(|&(start, end)| {
-                                    let offset = a.structure_offset.unwrap_or(0);
-                                    start <= offset && offset < end
-                                })
+                                || !self.claims_offset(&key, a.structure_offset.unwrap_or(0))
                         });
                         if anchors.is_empty() && !scan.has_independent_archive() {
                             continue;
@@ -682,8 +685,14 @@ impl NativeEmbeddedBatch {
                 }
                 continue;
             }
-            anchor.evidence.push("embedded:volume_candidate");
-            anchors.push(anchor);
+            // Encrypted RAR exposes its split role only after password
+            // resolution. Apply the same ownership evidence at that point.
+            if !anchor.multivolume
+                || !self.claims_offset(&key, anchor.structure_offset.unwrap_or(0))
+            {
+                anchor.evidence.push("embedded:volume_candidate");
+                anchors.push(anchor);
+            }
             // Project once after Relations; Python combines logical inputs
             // sharing this carrier under the existing multi-segment task.
             if let Some(scan) = item
@@ -1343,7 +1352,10 @@ impl NativeCandidateTable {
                 group.collect_source_ranges(&scanned_paths, &mut claimed_ranges);
                 // Candidate membership is a lease, not exclusive ownership.
                 // Independent heads may need the same peer domains.
-                for path in group.speculative_paths() {
+                // The confirmed head is not an alternative peer. A genuinely
+                // new slice in that carrier re-enters via anchor_paths above.
+                let head = group.candidate_data().entry_path;
+                for path in group.speculative_paths().filter(|path| *path != head) {
                     excluded.remove(&path_key(path));
                 }
             }

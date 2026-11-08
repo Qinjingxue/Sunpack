@@ -131,6 +131,29 @@ def test_worker_attempts_emit_one_result_and_stop_on_independent_errors(tmp_path
     assert sentinel.read_text(encoding="utf-8") == "user output"
 
 
+def test_unnumbered_gap_domains_share_storage_and_backtrack_without_reusing_sources(tmp_path):
+    # Numbered alternatives do not exercise one domain reused at several slots,
+    # or source exclusion during backtracking.
+    case, paths, config, _ = _ambiguous_case(tmp_path)
+    paths[1].rename(paths[1].with_name("shared.beta.opaque"))
+    paths[2].rename(paths[2].with_name("shared.alpha.opaque"))
+    paths[3].with_name("shared.build04.chunk04.other").write_bytes(paths[3].read_bytes())
+    tasks = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)]).tasks
+    task = next(t for t in tasks if t.archive_input().volume_attempts)
+    descriptor = task.archive_input()
+    plan = descriptor.volume_attempts
+    assert plan.layouts[0][1].choices is plan.layouts[0][2].choices
+    restored = ArchiveInputDescriptor.from_dict(descriptor.to_dict())
+    assert restored.same_retry_input(descriptor)
+    assert restored.volume_attempts.layouts[0][1].choices is restored.volume_attempts.layouts[0][2].choices
+    worker = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
+    run = subprocess.run([worker], input=json.dumps({"job_id": "shared", "archive_input": restored.to_dict(),
+        "output_dir": str(tmp_path / "shared-out")}), text=True, capture_output=True)
+    final = next(json.loads(line) for line in run.stdout.splitlines() if json.loads(line).get("type") == "result")
+    assert final["status"] == "ok" and final["volume_attempts"] == 3, final
+    assert next((tmp_path / "shared-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
 def test_nested_attempt_plan_uses_the_normal_pipeline(tmp_path, origin):
     # Direct extraction cannot detect losing the plan during nested discovery,
@@ -434,10 +457,11 @@ def test_variable_zipcrypto_password_header_and_weak_password_exhaustion(tmp_pat
     assert checkpoint.input.volume_completeness != "missing"
 
 
-def test_candidate_carrier_retains_an_independent_split_head(tmp_path):
-    first = ArchiveFixtureFactory().create(tmp_path, "first", "rar", split=True,
+@pytest.mark.parametrize("archive_format", ["rar", "7z", "zip"])
+def test_candidate_carrier_retains_an_independent_split_head(tmp_path, archive_format):
+    first = ArchiveFixtureFactory().create(tmp_path, "first", archive_format, split=True,
         compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
-    second = ArchiveFixtureFactory().create(tmp_path, "second", "rar", split=True,
+    second = ArchiveFixtureFactory().create(tmp_path, "second", archive_format, split=True,
         compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
     parts = sorted(first.archive_dir.iterdir())
     other = sorted(second.archive_dir.iterdir())

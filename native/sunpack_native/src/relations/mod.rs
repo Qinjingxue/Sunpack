@@ -266,8 +266,11 @@ impl NativeRelationGroup {
         paths: &HashSet<String>,
         ranges: &mut HashMap<String, Vec<(u64, u64)>>,
     ) {
-        let mut record = |key: String, start, end| {
+        let mut record = |key: String, start: u64, end: Option<u64>| {
             if paths.contains(&key) {
+                // Even an unbounded chunk owns its already known anchor,
+                // but cannot suppress a different anchor later in the file.
+                let end = end.unwrap_or_else(|| start.saturating_add(1));
                 let extents = ranges.entry(key).or_default();
                 if !extents.contains(&(start, end)) {
                     extents.push((start, end));
@@ -278,14 +281,14 @@ impl NativeRelationGroup {
             Self::Proposal(validation, _) => {
                 if let Some(plan) = &validation.attempts {
                     for source in &plan.sources {
-                        record(path_key(&source.path), source.start, source.end);
+                        record(path_key(&source.path), source.start, source.proven_end);
                     }
                 } else {
                     for (path, a) in &validation.anchors {
                         record(
                             path.clone(),
                             a.structure_offset.unwrap_or(0),
-                            a.extent_end(),
+                            a.proven_extent_end(),
                         );
                     }
                 }
@@ -295,7 +298,7 @@ impl NativeRelationGroup {
                     record(
                         row.path_key.clone(),
                         a.structure_offset.unwrap_or(0),
-                        a.extent_end(),
+                        a.proven_extent_end(),
                     );
                 }
             }

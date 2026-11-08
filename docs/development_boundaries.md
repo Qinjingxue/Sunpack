@@ -87,6 +87,8 @@ Files, volume sets, and carrier segments share one logical input lifecycle. Rust
 
 Uncertain volumes belong to `ArchiveInputDescriptor.volume_attempts`: a shared source-extent pool and prioritized slot domains. Python passes and persists this plan, then commits the source indexes returned on worker success. Logical input IDs remain stable; cleanup references shrink to the selected sources. The plan contains neither an execution cursor nor expanded combinations.
 
+Identical ordered domains share request-local storage in Rust and Python and cross JSON as domain-table references; the worker retains one vector per domain. The worker summarizes cross-layout slot/source/length variation at request load, then forms uncertain ranges in linear time in the current volume count. Source-index occupancy makes cursor prefix exclusion constant-time and survives the existing replay lifecycle. Domain and source identity include order, slot position and carrier extents, not merely file paths. This reduces request heap duplication before decoder admission; queued metadata is still outside the decoder memory budget.
+
 Unresolved ZIP compositions skip the optional archive-wide filename encoding guess, so another candidate's directory cannot override the input's encoding. The worker still handles UTF-8 flags, Unicode extra fields, and backend defaults.
 
 ### pipeline.discovery.filesystem
@@ -104,6 +106,8 @@ The worker lazily enumerates compositions without reusing a source, through the 
 Password rejection and encrypted CRC/data failures involving variable ranges cannot reject a password globally or enter its negative cache. If password uncertainty survives exhaustion, `password_or_volume_inconclusive` maps to the existing `PASSWORD_INCONCLUSIVE` result with password and volume-change recovery blockers, without confirming missing volumes. Fixed-input rejection still stops immediately. Callback volume readers retain the first real input HRESULT independently of subsequent reads or handler attempts. Raw ZIP carrier trimming uses the selected tail's logical total; sparse raw labels reuse the relation normalizer, accepting a feasible tail hypothesis without enumerating slot combinations. Structural RAR/spanned ZIP numbers stay fixed. Completed checkpoints are matched against new domains using only the winning source generations; both execution and checkpoint reuse release unused cleanup candidates while retaining active/checkpoint dependencies.
 
 Speculative source leases do not suppress independent embedded archives. Candidates introduced by password resolution borrow File rows from the original snapshot. The existing Rust Embedded stage scans those sources once under the normal scan policy, deduplicates multivolume anchors within known source extents, and lets independent heads at other offsets reuse candidate peer domains. Independent inputs join the existing shared-source task model before extraction; selecting a winner does not trigger a second scan of its volumes.
+
+An opaque raw chunk's EOF is an execution limit, not a proven occupied interval. Deduplication excludes its identical anchor only; a parsed physical boundary may exclude the full interval. Independent split heads appended after raw intermediate data therefore remain discoverable. Unique assignments and speculative plans share numeric-channel translation, role legality and sparse normalization, while unambiguous inputs retain direct execution.
 
 Publicly allowed relation capabilities include:
 

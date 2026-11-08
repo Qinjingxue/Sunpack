@@ -1,17 +1,31 @@
 //! Sparse, ordered hypotheses. Only slot domains cross the execution boundary;
 //! their Cartesian product is never allocated or probed during discovery.
 use super::assignment::{materialize, BucketView, VolumeAssignment};
-use super::filename::{NameProfile, NumberChannel};
+use super::filename::NameProfile;
 use super::*;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub(super) struct VolumeAttempts {
     pub sources: Vec<AttemptSource>,
-    pub layouts: Vec<Vec<(u32, Vec<usize>)>>,
+    pub layouts: Vec<Vec<(u32, Arc<Vec<usize>>)>>,
     pub head_size_from_total: Option<u64>,
     pub minimum_size: Option<u64>,
     pub tail_totals: Vec<(usize, u64)>,
+}
+
+// Request/proposal-local interning; order is part of domain identity.
+#[derive(Default)]
+struct Domains(HashSet<Arc<Vec<usize>>>);
+impl Domains {
+    fn intern(&mut self, choices: Vec<usize>) -> Arc<Vec<usize>> {
+        if let Some(existing) = self.0.get(&choices) {
+            return Arc::clone(existing);
+        }
+        let choices = Arc::new(choices);
+        self.0.insert(Arc::clone(&choices));
+        choices
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +33,7 @@ pub(super) struct AttemptSource {
     pub path: String,
     pub start: u64,
     pub end: u64,
+    pub proven_end: Option<u64>,
     pub terminal: bool,
 }
 impl AttemptSource {
@@ -27,6 +42,7 @@ impl AttemptSource {
             path: path.into(),
             start: anchor.structure_offset.unwrap_or(0),
             end: anchor.extent_end(),
+            proven_end: anchor.proven_extent_end(),
             terminal: anchor.anchor_roles.contains(&"terminal"),
         }
     }
@@ -66,7 +82,7 @@ pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts
             .volumes
             .iter()
             .enumerate()
-            .map(|(i, part)| (part.1, vec![i]))
+            .map(|(i, part)| (part.1, Arc::new(vec![i])))
             .collect()],
         head_size_from_total,
         minimum_size,
@@ -164,12 +180,25 @@ pub(super) fn expand_carrier_sources(
         }
     }
     if !expanded.is_empty() {
+        let mut domains = Domains::default();
+        let mut replacements = HashMap::new();
         for layout in &mut plan.layouts {
             for (_, choices) in layout {
-                *choices = choices
-                    .iter()
-                    .flat_map(|i| expanded.get(i).cloned().unwrap_or_else(|| vec![*i]))
-                    .collect();
+                *choices =
+                    Arc::clone(replacements.entry(Arc::as_ptr(choices)).or_insert_with(|| {
+                        domains.intern(
+                            choices
+                                .iter()
+                                .flat_map(|i| {
+                                    expanded
+                                        .get(i)
+                                        .map_or(std::slice::from_ref(i), Vec::as_slice)
+                                        .iter()
+                                        .copied()
+                                })
+                                .collect(),
+                        )
+                    }));
             }
         }
         validation.status = ProposalStatus::Valid;
@@ -229,18 +258,9 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         let (canonical, tokens) = local.channels(&structural, &profile);
         let channels: Vec<_> = canonical.into_iter().chain(tokens).collect();
         let mut layouts = Vec::new();
+        let mut domains = Domains::default();
         for channel in channels.iter().map(Some).chain(std::iter::once(None)) {
-            let offset = if view.format != "rar"
-                && !view.spanned()
-                && matches!(channel, Some(NumberChannel::Token { .. }))
-            {
-                view.features
-                    .get(&head)
-                    .and_then(|f| profile.number(channel.unwrap(), f))
-                    .map_or(0, |n| 1 - i64::from(n))
-            } else {
-                0
-            };
+            let offset = channel.map_or(0, |c| view.channel_offset(Some(head), c, &profile));
             let mut terminals: Vec<_> = indexes
                 .iter()
                 .filter_map(|i| {
@@ -252,8 +272,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                         channel.and_then(|channel| {
                             view.features
                                 .get(i)
-                                .and_then(|f| profile.number(channel, f))
-                                .and_then(|n| u32::try_from(i64::from(n) + offset).ok())
+                                .and_then(|f| profile.shifted_number(channel, f, offset))
                         })
                     })
                 })
@@ -276,7 +295,10 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                         (!choices.is_empty()).then_some((n, choices))
                     })
                     .collect();
-                let mut slots = fixed.clone();
+                let mut slots: BTreeMap<_, _> = fixed
+                    .iter()
+                    .map(|(&n, choices)| (n, Arc::new(choices.clone())))
+                    .collect();
                 for &i in &indexes {
                     if view.facts[&i].exact_slot.is_some() {
                         continue;
@@ -286,8 +308,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     };
                     let numbers: Vec<u32> = if let Some(channel) = channel {
                         profile
-                            .number(channel, f)
-                            .and_then(|n| u32::try_from(i64::from(n) + offset).ok())
+                            .shifted_number(channel, f, offset)
                             .into_iter()
                             .collect()
                     } else {
@@ -299,7 +320,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     };
                     for n in numbers {
                         if view.legal(i, n, candidate_terminal) && !fixed.contains_key(&n) {
-                            slots.entry(n).or_default().push(i);
+                            Arc::make_mut(slots.entry(n).or_default()).push(i);
                         }
                     }
                 }
@@ -307,20 +328,28 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 // members. Never allocate up to a huge filename/terminal number.
                 let bound = candidate_terminal.or_else(|| slots.last_key_value().map(|(&n, _)| n));
                 if let Some(end) = bound.filter(|end| *end as usize <= indexes.len()) {
-                    let assigned: HashSet<_> = slots.values().flatten().copied().collect();
+                    let assigned: HashSet<_> =
+                        slots.values().flat_map(|c| c.iter()).copied().collect();
+                    let mut gaps = HashMap::new();
                     for n in 1..=end {
                         if !slots.contains_key(&n) {
-                            let choices: Vec<_> = indexes
-                                .iter()
-                                .copied()
-                                .filter(|i| {
-                                    view.facts[i].exact_slot.is_none()
-                                        && view.legal(*i, n, Some(end))
-                                        && !assigned.contains(i)
-                                })
-                                .collect();
+                            // legal() only distinguishes first/interior/terminal
+                            // positions. Share otherwise unnumbered gap members.
+                            let choices = gaps.entry((n == 1, n == end)).or_insert_with(|| {
+                                Arc::new(
+                                    indexes
+                                        .iter()
+                                        .copied()
+                                        .filter(|i| {
+                                            view.facts[i].exact_slot.is_none()
+                                                && view.legal(*i, n, Some(end))
+                                                && !assigned.contains(i)
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            });
                             if !choices.is_empty() {
-                                slots.insert(n, choices);
+                                slots.insert(n, Arc::clone(choices));
                             }
                         }
                     }
@@ -328,22 +357,42 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 if slots.len() < 2 {
                     continue;
                 }
-                if channel.is_none() {
-                    // A structurally owned, unnumbered member is another choice,
-                    // never silently discarded in favour of an opaque named file.
-                    for (&number, choices) in &mut slots {
-                        if fixed.contains_key(&number) {
-                            continue;
-                        }
-                        choices.extend(indexes.iter().copied().filter(|i| {
+                let width_numbers: HashSet<_> = if channel.is_none() {
+                    indexes
+                        .iter()
+                        .filter_map(|i| view.features.get(i))
+                        .flat_map(|f| f.numbers.iter())
+                        .filter(|n| profile.active(n))
+                        .map(|n| n.value)
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+                let mut ordered_domains = HashMap::new();
+                for (&number, choices) in &mut slots {
+                    let key = (
+                        Arc::as_ptr(choices),
+                        number == 1,
+                        candidate_terminal == Some(number),
+                        fixed.contains_key(&number),
+                        width_numbers.contains(&number).then_some(number),
+                    );
+                    if let Some((_, ordered)) = ordered_domains.get(&key) {
+                        *choices = Arc::clone(ordered);
+                        continue;
+                    }
+                    // Consume one domain at a time: never retain G copies of
+                    // U gap members while sorting/interning.
+                    let mut ordered = (**choices).clone();
+                    if channel.is_none() && !fixed.contains_key(&number) {
+                        // Structurally owned unnamed members remain candidates.
+                        ordered.extend(indexes.iter().copied().filter(|i| {
                             view.facts[i].owned
                                 && view.facts[i].exact_slot.is_none()
                                 && view.legal(*i, number, candidate_terminal)
                         }));
                     }
-                }
-                for (&number, choices) in &mut slots {
-                    choices.sort_by(|a, b| {
+                    ordered.sort_by(|a, b| {
                         let local = |i: &usize| {
                             Path::new(&view.rows[*i].path).parent()
                                 == Path::new(&view.rows[head].path).parent()
@@ -371,13 +420,17 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                             })
                             .then(view.rows[*a].path_key.cmp(&view.rows[*b].path_key))
                     });
-                    choices.dedup();
+                    ordered.dedup();
+                    let ordered = domains.intern(ordered);
+                    ordered_domains.insert(key, (Arc::clone(choices), Arc::clone(&ordered)));
+                    *choices = ordered;
                 }
                 if channel.is_some()
                     && (view.format == "7z" || (view.format == "zip" && !view.spanned()))
                     && slots.keys().copied().zip(1u32..).any(|(n, rank)| n != rank)
                 {
-                    let represented: HashSet<_> = slots.values().flatten().copied().collect();
+                    let represented: HashSet<_> =
+                        slots.values().flat_map(|c| c.iter()).copied().collect();
                     let mapping = VolumeAssignment {
                         slots: slots
                             .iter()
@@ -472,13 +525,20 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 std::cmp::Reverse(layout.len()),
             )
         });
-        let mut sources: Vec<usize> = layouts
-            .iter()
-            .flat_map(|l| l.iter().flat_map(|(_, c)| c.iter().copied()))
-            .collect();
+        let mut sources: Vec<usize> = domains.0.iter().flat_map(|c| c.iter().copied()).collect();
         sources.sort_unstable();
         sources.dedup();
         let positions: HashMap<_, _> = sources.iter().enumerate().map(|(n, i)| (*i, n)).collect();
+        let remapped: HashMap<_, _> = domains
+            .0
+            .iter()
+            .map(|choices| {
+                (
+                    Arc::as_ptr(choices),
+                    Arc::new(choices.iter().map(|i| positions[i]).collect::<Vec<_>>()),
+                )
+            })
+            .collect();
         let assignment = VolumeAssignment {
             slots: BTreeMap::from([(1, head)]),
             unresolved: sources.iter().copied().filter(|i| *i != head).collect(),
@@ -522,9 +582,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 .map(|layout| {
                     layout
                         .into_iter()
-                        .map(|(n, choices)| {
-                            (n, choices.into_iter().map(|i| positions[&i]).collect())
-                        })
+                        .map(|(n, choices)| (n, Arc::clone(&remapped[&Arc::as_ptr(&choices)])))
                         .collect()
                 })
                 .collect(),
@@ -555,13 +613,24 @@ pub(super) fn to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResu
         sources.append(source)?;
     }
     let layouts = PyList::empty(py);
+    let domains = PyList::empty(py);
+    let mut domain_indexes = HashMap::new();
     for layout in &attempts.layouts {
         let slots = PyList::empty(py);
         for (number, choices) in layout {
             let slot = PyDict::new(py);
             slot.set_item("number", number)?;
-            slot.set_item("choices", choices)?;
-            let terminal = choices.iter().all(|i| attempts.sources[*i].terminal);
+            let (domain, terminal) = match domain_indexes.get(&Arc::as_ptr(choices)) {
+                Some(index) => *index,
+                None => {
+                    let index = domains.len();
+                    domains.append(choices.as_ref())?;
+                    let info = (index, choices.iter().all(|i| attempts.sources[*i].terminal));
+                    domain_indexes.insert(Arc::as_ptr(choices), info);
+                    info
+                }
+            };
+            slot.set_item("domain", domain)?;
             slot.set_item(
                 "role",
                 if validation.proposal.style == "zip_spanned" && terminal {
@@ -575,6 +644,7 @@ pub(super) fn to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResu
         layouts.append(slots)?;
     }
     result.set_item("sources", sources)?;
+    result.set_item("domains", domains)?;
     result.set_item("layouts", layouts)?;
     Ok(result.unbind())
 }

@@ -71,9 +71,6 @@ class VolumeAttemptSlot:
     canonical_name: str
     choices: tuple[int, ...]
 
-    def to_dict(self) -> dict:
-        return {"number": self.number, "canonical_name": self.canonical_name, "choices": self.choices}
-
 
 @dataclass(frozen=True, slots=True)
 class VolumeAttemptPlan:
@@ -82,26 +79,44 @@ class VolumeAttemptPlan:
     head_size_from_total: int | None = None
     minimum_size: int | None = None
     tail_totals: tuple[tuple[int, int], ...] = ()
+    _domains: tuple[tuple[int, ...], ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.sources or not self.layouts:
             raise ValueError("volume attempts require sources and layouts")
+        domains = {}
+        identities = {}
+        layouts = []
         for layout in self.layouts:
             if not layout or layout[0].number != 1:
                 raise ValueError("volume attempts require a structural head")
             previous = 0
             names = set()
+            slots = []
             for slot in layout:
+                choices = identities.get(id(slot.choices))
+                if choices is None:
+                    if not slot.choices or any(i < 0 or i >= len(self.sources) for i in slot.choices):
+                        raise ValueError("invalid volume attempt domain")
+                    choices = domains.setdefault(slot.choices, slot.choices)
+                    identities[id(slot.choices)] = choices
                 if (slot.number <= previous or not slot.canonical_name
-                        or case_key(slot.canonical_name) in names or not slot.choices
-                        or any(i < 0 or i >= len(self.sources) for i in slot.choices)):
+                        or case_key(slot.canonical_name) in names):
                     raise ValueError("invalid volume attempt slot")
                 previous = slot.number
                 names.add(case_key(slot.canonical_name))
+                slots.append(slot if slot.choices is choices else replace(slot, choices=choices))
+            layouts.append(tuple(slots))
+        object.__setattr__(self, "layouts", tuple(layouts))
+        object.__setattr__(self, "_domains", tuple(domains.values()))
 
     def to_dict(self) -> dict:
+        indexes = {id(choices): index for index, choices in enumerate(self._domains)}
         result = {"sources": [source.to_dict() for source in self.sources],
-                  "layouts": [{"slots": [slot.to_dict() for slot in layout]} for layout in self.layouts]}
+                  "domains": [{"choices": choices} for choices in self._domains],
+                  "layouts": [{"slots": [{"number": slot.number, "canonical_name": slot.canonical_name,
+                                          "domain": indexes[id(slot.choices)]} for slot in layout]}
+                              for layout in self.layouts]}
         if self.head_size_from_total is not None:
             result["head_size_from_total"] = self.head_size_from_total
         if self.minimum_size is not None:
@@ -116,8 +131,10 @@ class VolumeAttemptPlan:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "VolumeAttemptPlan":
+        domains = tuple(tuple(domain["choices"]) for domain in raw["domains"])
         return cls(tuple(InputExtent(**source) for source in raw["sources"]),
-                   tuple(tuple(VolumeAttemptSlot(int(s["number"]), s["canonical_name"], tuple(s["choices"]))
+                   tuple(tuple(VolumeAttemptSlot(int(s["number"]), s["canonical_name"],
+                                                 domains[s["domain"]])
                                for s in layout["slots"]) for layout in raw["layouts"]),
                    raw.get("head_size_from_total"), raw.get("minimum_size"),
                    tuple((pair["source"], pair["total"]) for pair in raw.get("tail_totals", ())))

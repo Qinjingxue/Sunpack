@@ -26,6 +26,7 @@ def archive_input_for_group(group: CandidateGroup) -> ArchiveInputDescriptor | N
         )
         if group.volume_attempts:
             raw = group.volume_attempts
+            domains = tuple(tuple(choices) for choices in raw["domains"])
             width = group.split_volumes[0].width
             plan = VolumeAttemptPlan(
                 tuple(InputExtent(**source) for source in raw["sources"]),
@@ -33,7 +34,7 @@ def archive_input_for_group(group: CandidateGroup) -> ArchiveInputDescriptor | N
                     int(slot["number"]), canonical_volume_name(
                         prefix=group.logical_name, number=int(slot["number"]),
                         style=descriptor.volume_style, width=width, role=slot["role"]),
-                    tuple(slot["choices"]),
+                    domains[slot["domain"]],
                 ) for slot in layout) for layout in raw["layouts"]),
                 raw.get("head_size_from_total"),
                 raw.get("minimum_size"),

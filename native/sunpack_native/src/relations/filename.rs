@@ -84,6 +84,17 @@ pub(super) struct NameProfile<'a> {
 }
 
 impl<'a> NameProfile<'a> {
+    pub(super) fn shifted_number(
+        &self,
+        channel: &NumberChannel,
+        features: &NameFeatures,
+        offset: i64,
+    ) -> Option<u32> {
+        self.number(channel, features)
+            .and_then(|n| u32::try_from(i64::from(n) + offset).ok())
+            .filter(|n| *n > 0)
+    }
+
     pub fn new(names: impl Iterator<Item = &'a NameFeatures>) -> Self {
         let mut fields = HashMap::new();
         for name in names {

@@ -43,6 +43,24 @@ pub(super) struct BucketView<'a> {
 }
 
 impl BucketView<'_> {
+    pub(super) fn channel_offset(
+        &self,
+        head: Option<usize>,
+        channel: &NumberChannel,
+        profile: &NameProfile<'_>,
+    ) -> i64 {
+        if matches!(self.format, "7z" | "zip")
+            && !self.spanned()
+            && matches!(channel, NumberChannel::Token { .. })
+        {
+            head.and_then(|i| self.features.get(&i))
+                .and_then(|f| profile.number(channel, f))
+                .map_or(0, |n| 1 - i64::from(n))
+        } else {
+            0
+        }
+    }
+
     pub(super) fn legal(&self, i: usize, n: u32, terminal: Option<u32>) -> bool {
         let f = &self.facts[&i];
         n > 0
@@ -270,22 +288,8 @@ impl BucketView<'_> {
         // Raw chunks may be labelled from zero (or another origin). Only a
         // structurally proven head establishes the translation to logical #1;
         // RAR/spanned ZIP internal volume numbers retain their exact meaning.
-        let offset = if generic && matches!(self.format, "7z" | "zip") && !self.spanned() {
-            structural
-                .slots
-                .get(&1)
-                .and_then(|i| self.features.get(i))
-                .and_then(|f| profile.number(channel, f))
-                .map_or(0, |value| 1 - i64::from(value))
-        } else {
-            0
-        };
-        let number = |features: &NameFeatures| {
-            profile
-                .number(channel, features)
-                .and_then(|value| u32::try_from(i64::from(value) + offset).ok())
-                .filter(|value| *value > 0)
-        };
+        let offset = self.channel_offset(structural.slots.get(&1).copied(), channel, profile);
+        let number = |features: &NameFeatures| profile.shifted_number(channel, features, offset);
         // Bound the candidate before inserting optional files. A terminal whose
         // slot is inferred by this channel still excludes same-channel noise.
         let terminal = self.terminal_for_assignment(fixed).or_else(|| {
