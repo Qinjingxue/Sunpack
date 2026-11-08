@@ -227,3 +227,18 @@ sys.exit(0 if builtin.merge_watch_clipboard_passwords([sys.argv[2]], max_entries
     assert not builtin.merge_watch_clipboard_passwords(["last"], max_entries=2)
     assert path.stat().st_mtime_ns == before
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_clipboard_merge_preserves_existing_line_endings(tmp_path, monkeypatch):
+    # JSON reads hide extra carriage returns. Check the actual file after repeated writes.
+    path = tmp_path / "builtin_passwords.json"
+    monkeypatch.setattr(builtin, "builtin_password_path", lambda: path)
+    clean = (
+        b'{\r\n  "passwords": [{"value": " manual\\r\\n ", "scopes": ["D:/Work"]}],\r\n'
+        b'\r\n  "clipboard_history": ["first"]\n}\n'
+    )
+    path.write_bytes(clean)
+
+    assert builtin.merge_watch_clipboard_passwords(["second"])
+    assert builtin.merge_watch_clipboard_passwords(["third"])
+    assert path.read_bytes() == clean.replace(b'["first"]', b'["first", "second", "third"]')

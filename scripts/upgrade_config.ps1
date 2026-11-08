@@ -128,7 +128,7 @@ function Assert-PlainPath([string]$Path) {
     for ($part = $Path; $part; $part = [IO.Path]::GetDirectoryName($part)) {
         if ((Test-Path -LiteralPath $part) -and
             ((Get-Item -LiteralPath $part -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            throw "Refusing a reparse point in Watch state migration: $part"
+            throw "Refusing a reparse point during SunPack upgrade: $part"
         }
     }
 }
@@ -322,24 +322,34 @@ foreach ($prune in $pruned) {
         $target | Add-Member -NotePropertyName enabled -NotePropertyValue ([bool]($target.enabled -or $prune.enabled)) -Force
     }
 }
-if (-not $changed) { exit 0 }
-if ($hasFilters) { $user.filesystem.scan_filters = @($converted.ToArray()) }
-
-$target = [IO.Path]::GetFullPath($UserConfig)
-$parent = [IO.Path]::GetDirectoryName($target)
-for ($path = $target; $path; $path = [IO.Path]::GetDirectoryName($path)) {
-    if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) {
-        throw "Refusing a reparse point in the installer configuration target: $path"
+function Write-AtomicUpgradeFile([string]$Target, [byte[]]$Bytes) {
+    Assert-PlainPath $Target
+    $parent = [IO.Path]::GetDirectoryName($Target)
+    $temporary = [IO.Path]::Combine($parent, '.sunpack-upgrade-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $stream = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($Bytes, 0, $Bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        [IO.File]::Replace($temporary, $Target, [System.Management.Automation.Language.NullString]::Value, $false)
+    } finally {
+        if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
     }
 }
-$temporary = [IO.Path]::Combine($parent, '.sunpack-config-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-try {
-    $text = ($user | ConvertTo-Json -Depth 100) + [Environment]::NewLine
-    $null = $text | ConvertFrom-Json
-    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($text)
-    $stream = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-    [IO.File]::Replace($temporary, $target, [System.Management.Automation.Language.NullString]::Value, $false)
-} finally {
-    if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+
+# Older clipboard writes added an extra CR before each existing CRLF. Use a
+# one-byte mapping so the BOM, password text and all other bytes round-trip.
+$passwordFile = Join-Path $dataDirectory 'builtin_passwords.json'
+if (Test-Path -LiteralPath $passwordFile -PathType Leaf) {
+    Assert-PlainPath $passwordFile
+    $byteEncoding = [Text.Encoding]::GetEncoding(28591)
+    $original = $byteEncoding.GetString([IO.File]::ReadAllBytes($passwordFile))
+    $repaired = $original -creplace '(?<!\r)\r{2,}\n', "`r`n"
+    if ($repaired -cne $original) {
+        Write-AtomicUpgradeFile $passwordFile ($byteEncoding.GetBytes($repaired))
+    }
 }
+
+if (-not $changed) { exit 0 }
+if ($hasFilters) { $user.filesystem.scan_filters = @($converted.ToArray()) }
+$text = ($user | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+$null = $text | ConvertFrom-Json
+Write-AtomicUpgradeFile ([IO.Path]::GetFullPath($UserConfig)) ([Text.UTF8Encoding]::new($false).GetBytes($text))

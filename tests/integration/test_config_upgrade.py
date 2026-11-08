@@ -6,6 +6,28 @@ from sunpack.core.config.schema import normalize_config
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 
 
+def test_installer_repairs_password_line_endings_with_current_config(tmp_path, repo_root):
+    # Runtime tests cannot catch an upgrade that skips the repair when config is current.
+    user = tmp_path / "sunpack_config.json"
+    user.write_bytes((repo_root / user.name).read_bytes())
+    config_before = user.read_bytes(), user.stat().st_mtime_ns
+    passwords = tmp_path / "builtin_passwords.json"
+    clean = (
+        '\ufeff{\r\n  "passwords": [{"value": " 密码\\r\\n ", "scopes": ["D:/工作"]}],\r\n'
+        '\r\n  "clipboard_history": ["历史"]\n}\r\n'
+    ).encode("utf-8")
+    passwords.write_bytes(clean.replace(b"\r\n", b"\r" * 1011 + b"\n"))
+    command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(repo_root / "scripts/upgrade_config.ps1"), "-UserConfig", str(user)]
+    subprocess.run(command, check=True, capture_output=True)
+    assert passwords.read_bytes() == clean
+    assert (user.read_bytes(), user.stat().st_mtime_ns) == config_before
+
+    stamp = passwords.stat().st_mtime_ns
+    subprocess.run(command, check=True, capture_output=True)
+    assert (passwords.read_bytes(), passwords.stat().st_mtime_ns) == (clean, stamp)
+
+
 def test_installer_resets_old_input_recovery_once_and_preserves_user_files(tmp_path, repo_root):
     # Configuration migration does not exercise checkpoint/WAL retirement. One
     # real upgrade and repeat prove old continuations cannot enter the new model

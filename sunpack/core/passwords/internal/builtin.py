@@ -11,7 +11,7 @@ from types import MappingProxyType
 from sunpack_native import read_changed_shared_utf8_text, read_shared_utf8_text
 
 from sunpack.core.platform.windows.file_mutex import file_mutex
-from sunpack.core.support.resource_lifecycle import open_service_file, write_task_text
+from sunpack.core.support.resource_lifecycle import open_service_file, open_task_file
 from sunpack.core.support.resources import get_resource_path
 from sunpack.core.passwords.internal.store import PasswordSnapshot, EMPTY_PASSWORD_SNAPSHOT, password_scope_key
 
@@ -237,7 +237,9 @@ def merge_watch_clipboard_passwords(passwords: list[str], *, max_entries: int = 
             else:
                 start, end = bounds
                 content = original[:start] + replacement + original[end:]
-            write_task_text(temp, content, encoding="utf-8")
+            # The shared reader preserves line endings, so write them verbatim.
+            with open_task_file(temp, "w", encoding="utf-8", newline="") as handle:
+                handle.write(content)
             temp.replace(path)
             return True
     except (OSError, ValueError, UnicodeError):
