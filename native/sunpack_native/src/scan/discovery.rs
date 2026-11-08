@@ -133,6 +133,51 @@ impl FileTargets {
 }
 
 impl NativeCandidateTable {
+    fn append_speculative_files(&mut self, snapshot: &NativeDirectorySnapshot) {
+        // The relations-only API projects every row as a group. File routing
+        // belongs only to the shared discovery table, including password retry.
+        if !self.filesystem_routed {
+            return;
+        }
+        let mut pending: HashSet<_> = self
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Candidate::Relation(group) => Some(group),
+                _ => None,
+            })
+            .flat_map(|group| {
+                let head = group.candidate_data().entry_path;
+                group
+                    .speculative_paths()
+                    .filter(move |path| *path != head)
+                    .map(path_key)
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        for row in &self.rows {
+            if let Candidate::File(table, row) = row {
+                pending.remove(&path_key(&table.paths[*row]));
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        // Password resolution can introduce candidates after filesystem routing.
+        // Borrow their original rows; no new enumeration, analysis or file I/O.
+        for &row in &snapshot.rows {
+            if pending.remove(&path_key(&snapshot.table.paths[row])) {
+                self.rows
+                    .push(Candidate::File(Arc::clone(&snapshot.table), row));
+                if pending.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
     fn relation_cache(&self) -> RelationCache {
         let mut cache = RelationCache::default();
         for row in &self.rows {
@@ -224,6 +269,7 @@ pub(crate) struct NativeEmbeddedBatch {
     force_scan: bool,
     pending_volumes: Vec<PendingEmbeddedVolume>,
     excluded: HashSet<String>,
+    claimed_ranges: HashMap<String, Vec<(u64, u64)>>,
 }
 
 struct PendingEmbeddedVolume {
@@ -241,7 +287,8 @@ impl NativeEmbeddedBatch {
     ) -> PyResult<Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>> {
         let mut projected = Vec::new();
         for (index, outcome) in outcomes {
-            let claimed = self.excluded.contains(&path_key(&table.summary(index)?.0));
+            let key = path_key(&table.summary(index)?.0);
+            let claimed = self.claimed_ranges.get(&key);
             let row: PyResult<_> = match outcome {
                 EmbeddedOutcome::Residual => {
                     unreachable!("residuals are filtered before projection")
@@ -253,11 +300,18 @@ impl NativeEmbeddedBatch {
                 }
                 EmbeddedOutcome::Scan(scan) => {
                     let mut anchors = scan.relation_anchors();
-                    if claimed {
+                    if let Some(claimed) = claimed {
                         // Existing volume hypotheses remain authoritative.
                         // Independent encrypted archives still use the normal
                         // boundary/password resolution before projection.
-                        anchors.retain(|a| a.standalone || (!a.multivolume && a.needs_password));
+                        anchors.retain(|a| {
+                            a.standalone
+                                || (!a.multivolume && a.needs_password)
+                                || !claimed.iter().any(|&(start, end)| {
+                                    let offset = a.structure_offset.unwrap_or(0);
+                                    start <= offset && offset < end
+                                })
+                        });
                         if anchors.is_empty() && !scan.has_independent_archive() {
                             continue;
                         }
@@ -656,6 +710,10 @@ impl NativeEmbeddedBatch {
             return Ok(fallback);
         }
         let sources = &table.relation_sources;
+        // Only these newly discovered slices may re-enter a claimed carrier.
+        // Other files retain the existing whole-file ownership exclusion.
+        let anchor_paths: HashSet<_> = anchors.iter().map(|a| path_key(&a.path)).collect();
+        self.excluded.retain(|key| !anchor_paths.contains(key));
         let excluded = &self.excluded;
         let mut groups = py.detach(|| resolve_embedded_volumes(sources, anchors, excluded, cache));
         // A failed NextHeader inside a carrier can also be damaged standalone
@@ -777,16 +835,6 @@ impl NativeCandidateTable {
             self.filesystem_routed = true;
             self.targets = targets.map(FileTargets::new);
             let groups = self.relation_groups(raw_snapshot, filtered_snapshot, None, None);
-            let speculative: HashSet<_> = groups
-                .iter()
-                .flat_map(|group| {
-                    let head = group.candidate_data().entry_path;
-                    group
-                        .speculative_paths()
-                        .filter(move |path| *path != head)
-                        .map(path_key)
-                })
-                .collect();
             let selected = self
                 .targets
                 .as_ref()
@@ -801,14 +849,14 @@ impl NativeCandidateTable {
             );
             for &row in &filtered_snapshot.rows {
                 if !filtered_snapshot.table.is_dirs[row]
-                    && (filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
-                        || speculative.contains(&path_key(&filtered_snapshot.table.paths[row])))
+                    && filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
                 {
                     self.rows
                         .push(Candidate::File(Arc::clone(&filtered_snapshot.table), row));
                 }
             }
             self.retain_targets();
+            self.append_speculative_files(raw_snapshot);
             self.relation_sources
                 .push(raw_snapshot.view(raw_snapshot.rows.clone()));
         });
@@ -893,6 +941,7 @@ impl NativeCandidateTable {
             replacement.append(&mut self.rows);
             self.rows = replacement;
             self.retain_targets();
+            self.append_speculative_files(raw);
         });
         Ok(())
     }
@@ -1276,7 +1325,7 @@ impl NativeCandidateTable {
             *self = Self::default();
             return NativeEmbeddedBatch::default();
         }
-        let excluded = routes.relation_resolved.iter().filter(|&&index| {
+        let mut excluded: HashSet<_> = routes.relation_resolved.iter().filter(|&&index| {
             !matches!(&self.rows[index], Candidate::Relation(group) if group.is_incomplete())
         }).chain(&routes.detection_resolved)
             .flat_map(|&index| self.path_keys(index).unwrap_or_default()).collect();
@@ -1284,6 +1333,21 @@ impl NativeCandidateTable {
         // and their execution metadata from every root. Raw snapshots still
         // supply all eligible peers; primary decisions have been projected.
         let relation_cache = self.relation_cache();
+        let mut claimed_ranges = HashMap::new();
+        let scanned_paths = ids
+            .iter()
+            .map(|&index| path_key(self.rows[index].embedded_source().0))
+            .collect();
+        for &index in &routes.relation_resolved {
+            if let Candidate::Relation(group) = &self.rows[index] {
+                group.collect_source_ranges(&scanned_paths, &mut claimed_ranges);
+                // Candidate membership is a lease, not exclusive ownership.
+                // Independent heads may need the same peer domains.
+                for path in group.speculative_paths() {
+                    excluded.remove(&path_key(path));
+                }
+            }
+        }
         let mut scans = HashMap::new();
         if ids.len() == self.rows.len() {
             // A full deep scan already uses every row; do not duplicate its
@@ -1315,6 +1379,7 @@ impl NativeCandidateTable {
             relation_cache,
             pending_volumes: Vec::new(),
             excluded,
+            claimed_ranges,
             scans,
             ids,
             force_scan,

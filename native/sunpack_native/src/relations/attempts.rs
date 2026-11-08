@@ -375,6 +375,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 }
                 if channel.is_some()
                     && (view.format == "7z" || (view.format == "zip" && !view.spanned()))
+                    && slots.keys().copied().zip(1u32..).any(|(n, rank)| n != rank)
                 {
                     let represented: HashSet<_> = slots.values().flatten().copied().collect();
                     let mapping = VolumeAssignment {
@@ -413,26 +414,42 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                         };
                         total.saturating_add(sizes().max().unwrap() - sizes().min().unwrap())
                     });
-                    if let Some(normalized) = local.finish_mapping(mapping, slack) {
-                        if normalized
-                            .slots
-                            .keys()
-                            .copied()
-                            .zip(1u32..)
-                            .all(|(n, rank)| n == rank)
-                            && slots.values().zip(1u32..).all(|(choices, rank)| {
-                                choices.iter().all(|i| {
-                                    view.facts[i].exact_slot.is_none_or(|n| n == rank)
-                                        && view.legal(*i, rank, Some(slots.len() as u32))
+                    // ZIP geometry belongs to a particular tail. A larger bad
+                    // tail must not veto the feasible domain of another tail.
+                    // Check tails only; never enumerate the slot product.
+                    let (&last, tails) = slots.last_key_value().unwrap();
+                    let can_normalize = tails
+                        .iter()
+                        .take(if view.format == "zip" { tails.len() } else { 1 })
+                        .any(|tail| {
+                            let mut representative = mapping.clone();
+                            if view.format == "zip" {
+                                representative.slots.insert(last, *tail);
+                            }
+                            local
+                                .finish_mapping(representative, slack)
+                                .is_some_and(|normalized| {
+                                    normalized
+                                        .slots
+                                        .keys()
+                                        .copied()
+                                        .zip(1u32..)
+                                        .all(|(n, rank)| n == rank)
                                 })
+                        });
+                    if can_normalize
+                        && slots.values().zip(1u32..).all(|(choices, rank)| {
+                            choices.iter().all(|i| {
+                                view.facts[i].exact_slot.is_none_or(|n| n == rank)
+                                    && view.legal(*i, rank, Some(slots.len() as u32))
                             })
-                        {
-                            slots = slots
-                                .into_values()
-                                .zip(1u32..)
-                                .map(|(choices, rank)| (rank, choices))
-                                .collect();
-                        }
+                        })
+                    {
+                        slots = slots
+                            .into_values()
+                            .zip(1u32..)
+                            .map(|(choices, rank)| (rank, choices))
+                            .collect();
                     }
                 }
                 let layout: Vec<_> = slots.into_iter().collect();

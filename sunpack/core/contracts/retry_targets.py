@@ -66,9 +66,12 @@ def apply_input_retry(task, failure: FailureInfo | None, generation: tuple, *, p
     recovery = InputRecovery.from_failure(failure)
     if not recovery.checkpoints or not generation:
         return
-    selected, recovery = recovery.select(task.inputs, generation, password_changed=password_changed)
+    previous = task.inputs
+    selected, recovery = recovery.select(previous, generation, password_changed=password_changed)
     task.set_inputs(selected)
     task.recovery = recovery
+    task.release_unused_sources(path for node in previous if node.descriptor.volume_attempts
+                                for path in node.source_paths)
     if recovery.output_dir:
         task.runtime["retry_output_dir"] = recovery.output_dir
 

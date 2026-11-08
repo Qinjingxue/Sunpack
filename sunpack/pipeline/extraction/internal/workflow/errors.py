@@ -49,6 +49,10 @@ def classify_extract_failure(
                 "failure.missing_volume",
                 details=_missing_volume_details(worker_result, confirmed=True),
             )
+        if worker_result.get("failure_kind") == "password_or_volume_inconclusive":
+            return _failure(FailureKind.PASSWORD_INCONCLUSIVE, "failure.password_state_unknown",
+                user_action="request_password",
+                details={"evidence": "password_or_volume_inconclusive"})
         if worker_result.get("password_candidates_all_rejected"):
             return _failure(FailureKind.WRONG_PASSWORD, "failure.wrong_password", user_action="request_password")
         if password_evidence == "zipcrypto_header_byte" or (

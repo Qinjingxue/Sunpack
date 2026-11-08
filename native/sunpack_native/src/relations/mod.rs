@@ -261,6 +261,47 @@ impl NativeRelationGroup {
             .flat_map(|plan| plan.sources.iter().map(|source| source.path.as_str()))
     }
 
+    pub(crate) fn collect_source_ranges(
+        &self,
+        paths: &HashSet<String>,
+        ranges: &mut HashMap<String, Vec<(u64, u64)>>,
+    ) {
+        let mut record = |key: String, start, end| {
+            if paths.contains(&key) {
+                let extents = ranges.entry(key).or_default();
+                if !extents.contains(&(start, end)) {
+                    extents.push((start, end));
+                }
+            }
+        };
+        match self {
+            Self::Proposal(validation, _) => {
+                if let Some(plan) = &validation.attempts {
+                    for source in &plan.sources {
+                        record(path_key(&source.path), source.start, source.end);
+                    }
+                } else {
+                    for (path, a) in &validation.anchors {
+                        record(
+                            path.clone(),
+                            a.structure_offset.unwrap_or(0),
+                            a.extent_end(),
+                        );
+                    }
+                }
+            }
+            Self::Ordinary(row, _) => {
+                if let Some(a) = &row.anchor {
+                    record(
+                        row.path_key.clone(),
+                        a.structure_offset.unwrap_or(0),
+                        a.extent_end(),
+                    );
+                }
+            }
+        }
+    }
+
     pub(crate) fn candidate_data(&self) -> RelationCandidateData<'_> {
         match self {
             Self::Ordinary(row, confirmed) => {

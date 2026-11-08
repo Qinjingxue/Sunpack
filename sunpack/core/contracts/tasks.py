@@ -133,19 +133,25 @@ class ArchiveTask:
 
     def select_volumes(self, node: LogicalArchiveInput, descriptor: ArchiveInputDescriptor) -> None:
         """Commit the worker's winning composition; release unused candidates."""
-        rejected = {path_key(path) for path in node.source_paths}
         self.inputs = tuple(replace(item, descriptor=descriptor) if item.input_id == node.input_id else item
                             for item in self.inputs)
-        retained = {path_key(path) for item in self.inputs for path in item.source_paths}
-        retained.update(path_key(path) for checkpoint in self.recovery.checkpoints
-                        if checkpoint.input.input_id != node.input_id
-                        for path in checkpoint.input.source_paths)
-        unused = rejected - retained
-        self.cleanup_parts = [path for path in self.cleanup_parts if path_key(path) not in unused]
+        self.release_unused_sources(node.source_paths, superseded_input_id=node.input_id)
         if self._archive_input is node.descriptor:
             self._archive_input = descriptor
         if self.password_probe_input is node.descriptor:
             self.password_probe_input = descriptor
+
+    def release_unused_sources(self, sources, *, superseded_input_id: str = "") -> None:
+        """Reconcile candidate cleanup against active inputs and retained outputs."""
+        rejected = {path_key(path) for path in sources}
+        if not rejected:
+            return
+        retained = {path_key(path) for item in self.inputs for path in item.source_paths}
+        retained.update(path_key(path) for checkpoint in self.recovery.checkpoints
+                        if checkpoint.input.input_id != superseded_input_id
+                        for path in checkpoint.input.source_paths)
+        unused = rejected - retained
+        self.cleanup_parts = [path for path in self.cleanup_parts if path_key(path) not in unused]
 
     def apply_path_mapping(self, path_map: dict[str, str]) -> None:
         if not path_map:

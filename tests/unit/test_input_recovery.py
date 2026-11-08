@@ -74,3 +74,30 @@ def test_selected_volume_checkpoint_reuses_winner_and_preserves_shared_cleanup(t
     task.recovery = InputRecovery((InputCheckpoint(sibling, (generation[2],), "out/sibling", complete=True),))
     task.select_volumes(discovered, winner.descriptor)
     assert set(task.cleanup_parts) == set(paths[:3])
+
+    # Reusing a winner bypasses extraction/select_volumes. Reconcile the same
+    # cleanup lease on retry, including shared active and completed inputs.
+    from sunpack.core.contracts.retry_targets import apply_input_retry
+    from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
+    pending = LogicalArchiveInput(ArchiveInputDescriptor(paths[3], format_hint="zip"), position=2)
+    password = FailureInfo(FailureKind.PASSWORD_REQUIRED, "extraction", "password required")
+    for shared in ("none", "active", "checkpoint"):
+        checkpoints = [*recovery.checkpoints,
+            InputCheckpoint(pending, (generation[3],), "out/pending", failure=password)]
+        inputs = (discovered, pending)
+        if shared != "none":
+            inputs += (sibling,)
+            if shared == "checkpoint":
+                checkpoints.append(InputCheckpoint(sibling, (changed_loser[2],), "out/sibling", complete=True))
+        failure = replace(password, details={"input_recovery": replace(recovery, checkpoints=tuple(checkpoints)).to_dict()})
+        task = ArchiveTask.from_archive_input(descriptor, discovery_source="test", logical_inputs=inputs)
+        refs = CleanupRefTable()
+        refs.register(task)
+        apply_input_retry(task, failure, changed_loser)
+        assert discovered.input_id not in {node.input_id for node in task.inputs}
+        if shared == "checkpoint":
+            assert sibling.input_id not in {node.input_id for node in task.inputs}
+        refs.refresh(task)
+        refs.mark_cleanup_eligible(task)
+        released = set(refs.release(task).cleanup_paths)
+        assert released == set(paths if shared != "none" else (paths[0], paths[1], paths[3]))

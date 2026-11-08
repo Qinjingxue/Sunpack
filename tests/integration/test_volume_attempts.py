@@ -74,8 +74,14 @@ def test_attempt_plan_survives_passwords_carrier_ranges_and_serialization(tmp_pa
         run = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
                              input=json.dumps(request), text=True, capture_output=True)
         final = next(json.loads(line) for line in run.stdout.splitlines() if json.loads(line).get("type") == "result")
-        assert final["volume_attempts"] == 1 and not final["missing_volume"]
-        assert final["wrong_password"]
+        assert not final["missing_volume"]
+        if archive_format == "7z":
+            assert final["volume_attempts"] == 1 and final["wrong_password"]
+        else:
+            # ZIP may read variable bytes before rejecting its weak header.
+            # Without fixed-byte evidence it cannot reject every composition.
+            assert final["volume_attempts"] == 2
+            assert final["failure_kind"] == "password_or_volume_inconclusive"
 
 
 def test_worker_attempts_emit_one_result_and_stop_on_independent_errors(tmp_path):
@@ -267,6 +273,13 @@ def test_sparse_raw_labels_with_competing_member_are_ranked(tmp_path, archive_fo
         parts.append(target)
     bad = parts[1].with_name(parts[1].name.replace(".z.", ".a."))
     bad.write_bytes(b"\0" * (parts[1].stat().st_size + 1))
+    if archive_format == "zip":
+        # A competing larger tail carries impossible central-directory geometry.
+        # It cannot stand in for the good tail when ranking the whole domain.
+        tail = bytearray(parts[-1].read_bytes())
+        eocd = tail.rfind(b"PK\x05\x06")
+        struct.pack_into("<I", tail, eocd + 16, len(tail) + 1024 * 1024)
+        parts[-1].with_name(parts[-1].name.replace(".z.", ".a.")).write_bytes(tail + b"x")
     task = ArchiveTaskProvider(make_config()).discover_targets([str(case.archive_dir)]).tasks[0]
     assert task.archive_input().volume_attempts
     final = _run_trial(tmp_path, task.archive_input())
@@ -320,10 +333,11 @@ def test_callback_volume_sharing_error_is_not_candidate_exhaustion(tmp_path):
     assert missing["status"] == "ok" and missing["volume_attempts"] == 2, missing
 
 
-def test_rejected_candidate_keeps_its_independent_embedded_archive(tmp_path):
+@pytest.mark.parametrize("password", [None, "secret"])
+def test_rejected_candidate_keeps_its_independent_embedded_archive(tmp_path, password):
     import io
     case = ArchiveFixtureFactory().create(tmp_path, "mixed", "rar", split=True,
-        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024, password=password)
     parts = sorted(case.archive_dir.iterdir())
     extra = io.BytesIO()
     with zipfile.ZipFile(extra, "w") as archive:
@@ -332,8 +346,16 @@ def test_rejected_candidate_keeps_its_independent_embedded_archive(tmp_path):
     damaged[len(damaged) // 2] ^= 1
     bad = parts[1].with_name("mixed.part2.a.opaque")
     bad.write_bytes(damaged + b"carrier gap" * 19 + extra.getvalue())
-    tasks = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(case.archive_dir)]).tasks
-    extractor = ExtractionScheduler()
+    config = make_config({"embedded_scan": {"enabled": True}})
+    if password:
+        config["password_snapshot"] = write_password_json(tmp_path / "passwords.json", scopes=[(password, [str(case.archive_dir)])])
+        from sunpack.pipeline.discovery.relations.scheduler import RelationsScheduler
+        from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+        # The same retry also serves a relations-only API whose rows must all
+        # remain groups, rather than filesystem scan jobs.
+        assert RelationsScheduler(config).build_candidate_groups(DirectoryScanner(str(case.archive_dir), config=config).scan())
+    tasks = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)]).tasks
+    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     extractor.sevenzip_runner.worker_path = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
     try:
         for index, task in enumerate(tasks):
@@ -343,3 +365,96 @@ def test_rejected_candidate_keeps_its_independent_embedded_archive(tmp_path):
         extractor.close()
     assert len(list((tmp_path / "outputs").rglob(case.marker_name))) == 1
     assert [p.read_text(encoding="utf-8") for p in (tmp_path / "outputs").rglob("independent.txt")] == ["independent content"]
+
+
+def test_variable_zipcrypto_password_header_and_weak_password_exhaustion(tmp_path):
+    # The old single encrypted member starts in the fixed head. Put the next
+    # encrypted member/header in an ambiguous volume and test real execution.
+    from tests.helpers.tool_config import require_7z
+    from sunpack.core.contracts.input_plan import InputCheckpoint, LogicalArchiveInput
+    from sunpack.core.contracts.failures import FailureKind
+    from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
+    source = tmp_path / "z-encrypted.bin"
+    expected = random.Random(27).randbytes(80 * 1024)
+    source.write_bytes(expected)
+    archive = tmp_path / "mixed.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("plain.bin", random.Random(19).randbytes(50 * 1024))
+    subprocess.run([require_7z(), "a", "-tzip", "-mx=0", "-psecret", str(archive), str(source)],
+                   check=True, capture_output=True)
+    data = archive.read_bytes()
+    with zipfile.ZipFile(archive) as output:
+        info = output.getinfo(source.name)
+    name_len, extra_len = struct.unpack_from("<HH", data, info.header_offset + 26)
+    header = info.header_offset + 30 + name_len + extra_len
+    assert 48 * 1024 <= header < 96 * 1024
+    root = tmp_path / "parts"
+    root.mkdir()
+    parts = []
+    for index, offset in enumerate(range(0, len(data), 48 * 1024), 1):
+        part = root / f"shared.part{index:03}.z.opaque"
+        part.write_bytes(data[offset:offset + 48 * 1024])
+        parts.append(part)
+    damaged = bytearray(parts[1].read_bytes())
+    damaged[header - 48 * 1024 + 11] ^= 1
+    bad = parts[1].with_name(parts[1].name.replace(".z.", ".a."))
+    bad.write_bytes(damaged)
+    descriptor = ArchiveTaskProvider(make_config()).discover_targets([str(root)]).tasks[0].archive_input()
+    assert descriptor.volume_attempts
+    good = _run_trial(tmp_path / "correct", descriptor, password_candidates=["secret", "wrong"])
+    assert good["status"] == "ok" and good["volume_attempts"] == 2, good
+    assert (tmp_path / "correct/worker-out/z-encrypted.bin").read_bytes() == expected
+    verified = _run_trial(tmp_path / "verified", descriptor, password="secret", password_verified=True)
+    assert verified["status"] == "ok" and verified["volume_attempts"] == 2, verified
+    # Find a wrong password which passes this real ZipCrypto header's one-byte
+    # check. No worker loop/probe is mocked; CRC failure must stay inconclusive.
+    check = (info._raw_time >> 8) & 255 if info.flag_bits & 8 else info.CRC >> 24
+    encrypted_header = data[header:header + 12]
+    candidate = 0
+    while True:
+        weak = f"wrong-{candidate}"
+        if zipfile._ZipDecrypter(weak.encode())(encrypted_header)[-1] == check:
+            break
+        candidate += 1
+    # Keep the same password header in both alternatives for this half: every
+    # candidate reaches CRC failure, independently of the header-rejection case.
+    damaged = bytearray(parts[1].read_bytes())
+    damaged[header - 48 * 1024 + 120] ^= 1
+    bad.write_bytes(damaged)
+    failed = _run_trial(tmp_path / "wrong", descriptor, password_candidates=[weak])
+    assert not failed["missing_volume"] and not failed["password_candidates_all_rejected"], failed
+    assert failed["failure_kind"] == "password_or_volume_inconclusive", failed
+    run = subprocess.CompletedProcess([], 2)
+    # Match the normal runner's diagnostic projection.
+    run.worker_diagnostics = {"result": failed}
+    failure = classify_extract_failure(run, "", is_split_archive=True)
+    assert failure.kind == FailureKind.PASSWORD_INCONCLUSIVE
+    checkpoint = InputCheckpoint(LogicalArchiveInput(descriptor), (), failure=failure)
+    assert checkpoint.blockers == {"password", "missing_volume"}
+    assert checkpoint.input.volume_completeness != "missing"
+
+
+def test_candidate_carrier_retains_an_independent_split_head(tmp_path):
+    first = ArchiveFixtureFactory().create(tmp_path, "first", "rar", split=True,
+        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+    second = ArchiveFixtureFactory().create(tmp_path, "second", "rar", split=True,
+        compression_level=0, payload_size=160 * 1024, split_volume_size=48 * 1024)
+    parts = sorted(first.archive_dir.iterdir())
+    other = sorted(second.archive_dir.iterdir())
+    damaged = bytearray(parts[1].read_bytes())
+    damaged[len(damaged) // 2] ^= 1
+    carrier = parts[1].with_name("first.part2.a.opaque")
+    carrier.write_bytes(damaged + b"carrier gap" * 19 + other[0].read_bytes())
+    for index, part in enumerate(other[1:], 2):
+        part.rename(first.archive_dir / f"first.part{index}.other.opaque")
+    tasks = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(first.archive_dir)]).tasks
+    extractor = ExtractionScheduler()
+    extractor.sevenzip_runner.worker_path = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
+    try:
+        for index, task in enumerate(tasks):
+            result = extractor.extract(task, str(tmp_path / "outputs" / str(index)))
+            assert result.success, (result.error, result.diagnostics)
+    finally:
+        extractor.close()
+    for case in (first, second):
+        assert [p.read_text(encoding="utf-8") for p in (tmp_path / "outputs").rglob(case.marker_name)] == [case.marker_text]

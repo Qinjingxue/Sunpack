@@ -82,10 +82,13 @@ class InputCheckpoint:
         if self.complete:
             return frozenset()
         failure = self.failure
+        # Blockers select wakeup events; an uncertain composition can wait for
+        # volume changes without publishing a confirmed missing-volume fact.
         return frozenset(name for name, present in (
             ("password", failure is not None and failure.is_password_failure),
             ("missing_volume", self.input.volume_completeness == "missing"
-             or failure is not None and failure.contains(FailureKind.MISSING_VOLUME)),
+             or failure is not None and (failure.contains(FailureKind.MISSING_VOLUME)
+                 or failure.details.get("evidence") == "password_or_volume_inconclusive")),
         ) if present)
 
     def to_dict(self) -> dict:

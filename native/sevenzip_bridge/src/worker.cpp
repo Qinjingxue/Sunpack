@@ -1157,10 +1157,11 @@ void select_volume_attempt(const WorkerArchiveInput& source,
 bool uncertain_volume_password(const sunpack::sevenzip::ExtractArchiveResult& result,
                                const sunpack::sevenzip::ExtractionReplay& replay) {
     using namespace sunpack::sevenzip;
-    return result.encrypted && !result.password_crc_proven && !result.password_rejected &&
+    return result.encrypted && !result.password_crc_proven &&
         !result.input_trace.read_error && result.status != PasswordTestStatus::Error &&
-        result.failure_stage == "item_extract" &&
-        (result.operation_result == kOpCrcError || result.operation_result == kOpDataError ||
+        (result.failure_stage == "item_extract" || result.failure_stage == "archive_open") &&
+        (result.password_rejected || result.operation_result == kOpWrongPassword ||
+         result.operation_result == kOpCrcError || result.operation_result == kOpDataError ||
          result.operation_result == kOpUnexpectedEnd || result.operation_result == kOpHeadersError) &&
         replay.uncertain_read.load(std::memory_order_relaxed);
 }
@@ -1170,7 +1171,8 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
                                 bool password_verified) {
     using namespace sunpack::sevenzip;
     if ((result.status == PasswordTestStatus::Ok && result.command_ok) ||
-        (result.wrong_password && !password_verified && !uncertain_volume_password(result, replay)) || result.password_rejected ||
+        ((result.wrong_password || result.password_rejected) && !password_verified &&
+         !result.password_crc_proven && !uncertain_volume_password(result, replay)) ||
         (result.encrypted && !result.password_crc_proven && !password_verified && !uncertain_volume_password(result, replay)) ||
         result.unsupported_method || result.status == PasswordTestStatus::BackendUnavailable ||
         result.status == PasswordTestStatus::Error ||
@@ -1178,8 +1180,8 @@ bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& r
     if (result.missing_volume) return true;
     if (result.failure_stage != "archive_open" && result.failure_stage != "item_extract") return false;
     if (result.failure_kind != "structure_recognition" && result.failure_kind != "checksum_error" &&
-        result.failure_kind != "data_error" && result.failure_kind != "headers_error" &&
-        !((password_verified || uncertain_volume_password(result, replay)) && result.failure_kind == "encrypted_or_wrong_password") &&
+        result.failure_kind != "data_error" && result.failure_kind != "corrupted_data" && result.failure_kind != "headers_error" &&
+        !((password_verified || result.password_crc_proven || uncertain_volume_password(result, replay)) && result.failure_kind == "encrypted_or_wrong_password") &&
         result.failure_kind != "unexpected_end" && result.failure_kind != "missing_volume_or_tail") return false;
     // Binary readers record whether a variable source/range participated.
     // Seeks, fixed tails and failures confined to the fixed head are not proof.
@@ -1487,6 +1489,7 @@ int run_request(
 
         if (volume_trials && (uncertain_volume_password(result, *volume_replay) ||
             (volume_replay->volume_password_uncertain && result.password_candidates_all_rejected))) {
+            if (!request.password_verified) volume_replay->volume_password_ambiguous = true;
             result.status = PasswordTestStatus::Damaged;
             result.wrong_password = result.password_rejected = result.password_candidates_all_rejected = false;
             result.failure_stage = "item_extract";
@@ -1503,13 +1506,15 @@ int run_request(
         if (!cursor.next(request.archive_input.volume_attempts, cancel_token.get())) {
             if (cancel_token && cancel_token->load()) return cancelled_result(job_id);
             result.status = PasswordTestStatus::Damaged;
-            result.missing_volume = true;
+            const bool ambiguous = volume_replay->volume_password_ambiguous;
+            result.missing_volume = !ambiguous;
             result.damaged = true;
-            result.wrong_password = result.password_rejected = false;
+            result.wrong_password = result.password_rejected = result.password_candidates_all_rejected = false;
             result.missing_volume_suspected = false;
-            result.missing_volume_evidence = "volume_attempts_exhausted";
-            result.failure_kind = "missing_volume";
-            result.message = "no supplied volume composition completed the archive";
+            result.missing_volume_evidence = ambiguous ? "" : "volume_attempts_exhausted";
+            result.failure_kind = ambiguous ? "password_or_volume_inconclusive" : "missing_volume";
+            result.message = ambiguous ? "password or volume composition remains unconfirmed" :
+                "no supplied volume composition completed the archive";
             break;
         }
         cursor.discard_pending = true;

@@ -62,6 +62,7 @@ struct ExtractionReplay {
     VolumeAttemptCursor volumes;
     bool volume_attempt_active = false;
     bool volume_password_uncertain = false;
+    bool volume_password_ambiguous = false;
     // Request-owned read receipts distinguish fixed-input damage from a
     // composition failure; decoder threads only update the atomic flag.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> uncertain_ranges;

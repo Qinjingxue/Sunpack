@@ -45,7 +45,9 @@ class FailureInfo:
 
     @property
     def is_password_failure(self) -> bool:
-        return self.kind in PASSWORD_FAILURE_KINDS or any(cause.is_password_failure for cause in self.causes)
+        return (self.kind in PASSWORD_FAILURE_KINDS
+                or self.kind == FailureKind.PASSWORD_INCONCLUSIVE and self.user_action == "request_password"
+                or any(cause.is_password_failure for cause in self.causes))
 
     def contains(self, *kinds: FailureKind) -> bool:
         expected = set(kinds)

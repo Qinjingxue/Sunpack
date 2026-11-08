@@ -2857,7 +2857,8 @@ def test_member_failure_persists_confirmed_group_across_recovery(tmp_path):
         log.close()
 
 
-def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_source_change(tmp_path, monkeypatch):
+@pytest.mark.parametrize("volume_uncertain", [False, True])
+def test_watch_scheduler_retries_only_actionable_password_inconclusive(tmp_path, monkeypatch, volume_uncertain):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     attempts = {"count": 0}
 
@@ -2867,13 +2868,23 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
 
         def run_targets(self, paths):
             attempts["count"] += 1
+            if attempts["count"] > 1:
+                return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
+            failure = FailureInfo(FailureKind.PASSWORD_INCONCLUSIVE, "extraction",
+                "password or damage is inconclusive",
+                user_action="request_password" if volume_uncertain else "",
+                details={"evidence": "password_or_volume_inconclusive"} if volume_uncertain else {})
+            if volume_uncertain:
+                from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+                from sunpack.core.contracts.input_plan import InputRecovery, InputCheckpoint, LogicalArchiveInput
+                from dataclasses import replace
+                checkpoint = InputCheckpoint(LogicalArchiveInput(ArchiveInputDescriptor(paths[0], format_hint="zip")),
+                    (), failure=failure)
+                failure = replace(failure, details={**failure.details,
+                    "input_recovery": InputRecovery((checkpoint,), input_count=1).to_dict()})
             return RunSummary(target_results=(TargetRunResult(
                 paths[0], OutcomeKind.FAILURE, error="password or damage is inconclusive",
-                failure=FailureInfo(
-                    FailureKind.PASSWORD_INCONCLUSIVE,
-                    "extraction",
-                    "password or damage is inconclusive",
-                ),
+                failure=failure,
             ),))
 
     watch_root = tmp_path / "in"
@@ -2889,12 +2900,15 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
     )
     watcher.enqueue(str(archive_path))
     first = _await(watcher.run_once())
+    if volume_uncertain:
+        entry = watcher.state.latest_entry_for_path(str(archive_path))
+        assert set(entry.failure_payload["blockers"]) == {"password", "missing_volume"}
     _change_password_source(watcher)
     second = _await(watcher.run_once())
 
     assert first.failed == 1
-    assert second.processed == 0
-    assert attempts["count"] == 1
+    assert second.processed == int(volume_uncertain)
+    assert attempts["count"] == 1 + int(volume_uncertain)
     assert not watcher.state.entries
 
 
