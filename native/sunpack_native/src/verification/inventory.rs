@@ -94,7 +94,6 @@ impl BasenameMode {
     }
 }
 
-#[derive(Clone)]
 struct ArchiveFile<'a> {
     path: Cow<'a, str>,
     raw_path: Cow<'a, str>,
@@ -117,7 +116,17 @@ impl Expected<'_> {
     }
     fn get(&self, index: usize) -> io::Result<ArchiveFile<'_>> {
         match self {
-            Self::Items(items) => Ok(items[index].clone()),
+            Self::Items(items) => {
+                let item = &items[index];
+                Ok(ArchiveFile {
+                    path: Cow::Borrowed(&item.path),
+                    raw_path: Cow::Borrowed(&item.raw_path),
+                    unsafe_path: item.unsafe_path,
+                    size: item.size,
+                    has_crc: item.has_crc,
+                    crc32: item.crc32,
+                })
+            }
             Self::Manifest(manifest, _, names_only) => {
                 let item = manifest.entry_view(index)?;
                 let raw = item.raw_path.unwrap_or(item.path);

@@ -7,10 +7,16 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         return;
     }
     if validation.reason.is_some() {
-        if validation.anchors.values().any(|a| !a.error.is_empty()) {
+        if validation
+            .facts
+            .anchors
+            .values()
+            .any(|a| !a.error.is_empty())
+        {
             validation.status = ProposalStatus::Reject;
             validation.reason = Some(RelationFailureReason::CorruptArchive);
         } else if validation
+            .facts
             .anchors
             .values()
             .any(|a| a.needs_password || a.wrong_password)
@@ -27,13 +33,17 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         proposal
             .volumes
             .iter()
-            .map(|p| (p.1, validation.anchors.get(&path_key(&p.0)))),
+            .map(|p| (p.1, validation.facts.anchors.get(&path_key(&p.0)))),
     )
     .map(|(head, end)| (path_key(&head.path), end))
     {
-        validation.anchors.get_mut(&key).unwrap().payload_end = Some(end);
+        Arc::make_mut(&mut validation.facts)
+            .anchors
+            .get_mut(&key)
+            .unwrap()
+            .payload_end = Some(end);
     }
-    let anchors = &validation.anchors;
+    let anchors = &validation.facts.anchors;
     let get = |path: &str| anchors.get(&path_key(path));
     if proposal
         .volumes
@@ -63,7 +73,7 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
     if proposal.format == "7z" && validation.status == ProposalStatus::Valid {
         match verify_seven_zip_mapping(validation) {
             Ok(Some(true)) => {
-                if let Some(head) = validation
+                if let Some(head) = Arc::make_mut(&mut validation.facts)
                     .anchors
                     .get_mut(&path_key(&proposal.volumes[0].0))
                 {
@@ -98,7 +108,7 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
         .proposal
         .volumes
         .first()
-        .and_then(|p| validation.anchors.get(&path_key(&p.0)))
+        .and_then(|p| validation.facts.anchors.get(&path_key(&p.0)))
     else {
         return Ok(None);
     };
@@ -113,7 +123,7 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
         .proposal
         .volumes
         .last()
-        .and_then(|p| validation.anchors.get(&path_key(&p.0)));
+        .and_then(|p| validation.facts.anchors.get(&path_key(&p.0)));
     // The structure-only pass has already checked this exact terminal range.
     if last.is_some_and(|a| a.evidence.contains(&"7z:next_header_crc") && a.size >= next.size) {
         return Ok(Some(true));
@@ -122,7 +132,7 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
     let mut logical = 0u64;
     let mut consumed = 0u64;
     for part in &validation.proposal.volumes {
-        let Some(anchor) = validation.anchors.get(&path_key(&part.0)) else {
+        let Some(anchor) = validation.facts.anchors.get(&path_key(&part.0)) else {
             return Ok(None);
         };
         let base = anchor.structure_offset.unwrap_or(0);

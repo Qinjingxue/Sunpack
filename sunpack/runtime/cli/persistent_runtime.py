@@ -54,8 +54,6 @@ def enable_persistent_runtime(*, state_changed: Callable[[], None] | None = None
     global _ENGINE_LOCK, _STATE_CHANGED_CALLBACK, _CONFIG_OBSERVER
     if not server_runtime_active():
         _ENGINE_LOCK = asyncio.Lock()
-    _STATE_CHANGED_CALLBACK = state_changed
-    set_server_runtime_active(True)
     if _CONFIG_OBSERVER is None:
         from sunpack.core.passwords.internal.builtin import password_file_source
         from sunpack.runtime.watch.config_observer import ConfigFileObserver
@@ -66,8 +64,14 @@ def enable_persistent_runtime(*, state_changed: Callable[[], None] | None = None
             loop=asyncio.get_running_loop(), additional_files=[(watch_roots_path().resolve().parent,
                 [SIMPLE_CONFIG_FILENAME, ADVANCED_CONFIG_FILENAME, WATCH_ROOTS_FILENAME], _configuration_files_changed)])
         observer.start()
+        try:
+            source.reload()
+        except BaseException:
+            observer.stop()
+            raise
         _CONFIG_OBSERVER = observer
-        source.reload()
+    _STATE_CHANGED_CALLBACK = state_changed
+    set_server_runtime_active(True)
 
 
 def _configuration_files_changed() -> None:
@@ -110,11 +114,14 @@ async def _reload_password_file(source) -> None:
     try:
         while _PASSWORD_RELOAD_PENDING:
             _PASSWORD_RELOAD_PENDING = False
-            await asyncio.to_thread(source.reload)
             from sunpack.runtime.cli.runtime_state import runtime_host
-            host = runtime_host()
-            if host is not None:
-                host.password_source_changed()
+            try:
+                await asyncio.to_thread(source.reload)
+                host = runtime_host()
+                if host is not None:
+                    host.password_source_changed()
+            except Exception:
+                _LOG.exception("failed to apply runtime password change")
     finally:
         _PASSWORD_RELOAD_TASK = None
 

@@ -1137,6 +1137,33 @@ def test_persistent_config_snapshot_reuses_a_source_without_mtime_checks(tmp_pat
     assert calls == ["first", "second"]
 
 
+def test_failed_password_startup_releases_armed_config_listener(tmp_path, monkeypatch):
+    from sunpack.core.passwords.internal import builtin
+    from sunpack.runtime.cli import persistent_runtime as runtime
+    from sunpack.runtime.watch import service
+    from sunpack_native import native_resource_snapshot
+
+    class Source:
+        path = tmp_path / "passwords.json"
+
+        def reload(self):
+            raise RuntimeError("password reload failed")
+
+    monkeypatch.setattr(builtin, "password_file_source", Source)
+    monkeypatch.setattr(service, "watch_roots_path", lambda: tmp_path / "roots.txt")
+
+    async def scenario():
+        try:
+            with pytest.raises(RuntimeError, match="password reload failed"):
+                runtime.enable_persistent_runtime()
+            assert not runtime.server_runtime_active()
+            assert not native_resource_snapshot([str(tmp_path)])
+        finally:
+            await runtime.close_persistent_runtime()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("delay_reader", [False, True])
 def test_external_config_sources_reload_between_requests_and_evict_watches(tmp_path, monkeypatch, delay_reader):
     """Cover real request-source events and bounded watch lifetime together.

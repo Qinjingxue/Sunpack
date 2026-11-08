@@ -13,8 +13,6 @@ struct VolumeAttemptSlot {
     std::size_t domain = 0;
 };
 struct VolumeSlotVariation {
-    std::size_t source = 0;
-    unsigned int number = 0;
     unsigned long long length = 0;
     bool variable = false, variable_length = false;
 };
@@ -46,8 +44,7 @@ struct VolumeAttemptPlan {
         if (minimum_size) domain_capacity.reserve(domains.size());
         for (const auto& choices : domains) {
             VolumeSlotVariation info;
-            info.source = choices.front();
-            const auto& first = sources[info.source];
+            const auto& first = sources[choices.front()];
             info.length = first.has_end ? first.end - first.start : 0;
             info.variable = choices.size() != 1;
             unsigned long long capacity = 0;
@@ -60,23 +57,26 @@ struct VolumeAttemptPlan {
             if (minimum_size) domain_capacity.push_back(capacity);
             summaries.push_back(info);
         }
-        std::size_t maximum = 0;
-        for (const auto& slots : layouts) maximum = (std::max)(maximum, slots.size());
-        variation.assign(maximum, {});
-        std::vector<std::size_t> counts(maximum);
+        const auto [shortest, longest] = std::minmax_element(layouts.begin(), layouts.end(),
+            [](const auto& a, const auto& b) { return a.size() < b.size(); });
+        variation.clear();
+        if (longest == layouts.end()) return;
+        variation.reserve(longest->size());
+        for (const auto& slot : *longest) variation.push_back(summaries[slot.domain]);
         for (const auto& slots : layouts) for (std::size_t i = 0; i < slots.size(); ++i) {
+            const auto& reference = (*longest)[i];
             const auto& info = summaries[slots[i].domain];
             auto& merged = variation[i];
-            if (!counts[i]++) { merged = info; merged.number = slots[i].number; }
-            else {
-                merged.variable |= info.variable || merged.source != info.source || merged.number != slots[i].number;
-                merged.variable_length |= info.variable_length || merged.length != info.length || merged.number != slots[i].number;
-            }
+            const bool different_slot = reference.number != slots[i].number;
+            merged.variable |= info.variable || different_slot ||
+                domains[reference.domain].front() != domains[slots[i].domain].front();
+            merged.variable_length |= info.variable_length || different_slot || merged.length != info.length;
         }
-        for (std::size_t i = 0; i < maximum; ++i) {
-            if (counts[i] != layouts.size() || (i == 0 && (head_size_from_total || !tail_totals.empty())))
-                variation[i].variable = variation[i].variable_length = true;
+        for (std::size_t i = shortest->size(); i < variation.size(); ++i) {
+            variation[i].variable = variation[i].variable_length = true;
         }
+        if (!variation.empty() && (head_size_from_total || !tail_totals.empty()))
+            variation.front().variable = variation.front().variable_length = true;
     }
 };
 

@@ -278,7 +278,9 @@ struct PendingEmbeddedVolume {
 impl NativeEmbeddedBatch {
     fn claims_offset(&self, key: &str, offset: u64) -> bool {
         self.claimed_ranges.get(key).is_some_and(|ranges| {
-            ranges.iter().any(|&(start, end)| start <= offset && offset < end)
+            ranges
+                .iter()
+                .any(|&(start, end)| start <= offset && offset < end)
         })
     }
 
@@ -496,23 +498,17 @@ impl NativeEmbeddedBatch {
             .collect()
     }
 
-    fn encrypted_volume_inputs(
-        &self,
-        table: PyRef<'_, NativeCandidateTable>,
-    ) -> PyResult<Vec<(String, u64)>> {
-        let mut requests = HashMap::new();
-        for pending in &self.pending_volumes {
-            if pending.anchor.needs_password {
-                requests.insert(
-                    pending.anchor.path.clone(),
-                    pending.anchor.structure_offset.unwrap_or(0),
-                );
-            }
-        }
+    fn encrypted_volume_paths(&self, table: PyRef<'_, NativeCandidateTable>) -> Vec<String> {
+        let mut requests: HashSet<_> = self
+            .pending_volumes
+            .iter()
+            .filter(|pending| pending.anchor.needs_password)
+            .map(|pending| pending.anchor.path.as_str())
+            .collect();
         if requests.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
-        let selected: HashSet<_> = requests.keys().map(|path| path_key(path)).collect();
+        let selected: HashSet<_> = requests.iter().map(|path| path_key(path)).collect();
         let cache = &self.relation_cache;
         for snapshot in &table.relation_sources {
             let stems: HashSet<_> = snapshot
@@ -555,14 +551,12 @@ impl NativeEmbeddedBatch {
                     .or(snapshot.table.relation_anchors[row]
                         .as_ref()
                         .and_then(CheapAnchor::anchor));
-                if let Some(anchor) = anchor.filter(|a| a.needs_password) {
-                    requests
-                        .entry(path.clone())
-                        .or_insert(anchor.structure_offset.unwrap_or(0));
+                if anchor.is_some_and(|a| a.needs_password) {
+                    requests.insert(path.as_str());
                 }
             }
         }
-        Ok(requests.into_iter().collect())
+        requests.into_iter().map(str::to_owned).collect()
     }
 
     /// One directed Relations call per source scope, using native scan facts.
@@ -590,7 +584,11 @@ impl NativeEmbeddedBatch {
             .iter()
             .map(|item| path_key(&item.anchor.path))
             .collect();
-        for snapshot in table.relation_sources.iter().filter(|_| !candidates.is_empty()) {
+        for snapshot in table
+            .relation_sources
+            .iter()
+            .filter(|_| !candidates.is_empty())
+        {
             for &row in &snapshot.rows {
                 let key = path_key(&snapshot.table.paths[row]);
                 if candidates.contains_key(&key)
@@ -1268,7 +1266,8 @@ impl NativeCandidateTable {
         for index in detection_residual {
             if let Candidate::File(table, file_index) = &self.rows[index] {
                 let key = path_key(&table.paths[*file_index]);
-                if !speculative.contains(&key) && !claimed.contains(&key) && !blocked.contains(&key) {
+                if !speculative.contains(&key) && !claimed.contains(&key) && !blocked.contains(&key)
+                {
                     routes.embedded.push(index);
                 }
             }

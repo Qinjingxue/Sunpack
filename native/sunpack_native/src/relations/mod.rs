@@ -60,11 +60,16 @@ enum ProposalStatus {
 pub(crate) struct ProposalValidation {
     status: ProposalStatus,
     proposal: RelationProposal,
-    anchors: HashMap<String, VolumeAnchor>,
+    facts: Arc<ProposalFacts>,
     reason: Option<RelationFailureReason>,
     unresolved: Vec<String>,
-    name_features: HashMap<String, filename::NameFeatures>,
     attempts: Option<attempts::VolumeAttempts>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProposalFacts {
+    anchors: HashMap<String, VolumeAnchor>,
+    name_features: HashMap<String, filename::NameFeatures>,
 }
 
 impl ProposalValidation {
@@ -165,7 +170,7 @@ impl<'a> RelationCandidateData<'a> {
                 .unwrap_or(Cow::Borrowed("")),
             NativeRelationGroup::Proposal(validation, _) => Cow::Owned(proposal_split_family(
                 &validation.proposal,
-                &validation.anchors,
+                &validation.facts.anchors,
             )),
         }
     }
@@ -174,6 +179,7 @@ impl<'a> RelationCandidateData<'a> {
         match self.group {
             NativeRelationGroup::Ordinary(row, _) => row.size,
             NativeRelationGroup::Proposal(validation, _) => validation
+                .facts
                 .anchors
                 .get(&path_key(self.entry_path))
                 .map(|anchor| anchor.size),
@@ -184,7 +190,7 @@ impl<'a> RelationCandidateData<'a> {
         match self.group {
             NativeRelationGroup::Ordinary(row, _) => row.size,
             NativeRelationGroup::Proposal(validation, _) => {
-                proposal_logical_size(&validation.proposal, &validation.anchors)
+                proposal_logical_size(&validation.proposal, &validation.facts.anchors)
             }
         }
     }
@@ -199,6 +205,7 @@ impl NativeRelationGroup {
         match self {
             Self::Ordinary(row, _) => row.anchor.as_ref(),
             Self::Proposal(validation, _) => validation
+                .facts
                 .anchors
                 .get(&path_key(self.candidate_data().entry_path)),
         }
@@ -282,7 +289,7 @@ impl NativeRelationGroup {
                         record(path_key(&source.path), source.start, source.proven_end);
                     }
                 } else {
-                    for (path, a) in &validation.anchors {
+                    for (path, a) in &validation.facts.anchors {
                         record(
                             path.clone(),
                             a.structure_offset.unwrap_or(0),
@@ -481,12 +488,14 @@ pub(crate) fn relation_group_cached_anchors(
         NativeRelationGroup::Proposal(validation, _) => {
             cache.anchors.extend(
                 validation
+                    .facts
                     .anchors
                     .iter()
                     .map(|(path, anchor)| (path.clone(), anchor.clone())),
             );
             cache.names.extend(
                 validation
+                    .facts
                     .name_features
                     .iter()
                     .map(|(path, features)| (path.clone(), features.clone())),
@@ -621,6 +630,7 @@ fn resolve_shared_carrier_volumes(
                     continue;
                 };
                 if !validation
+                    .facts
                     .anchors
                     .get(&key)
                     .is_some_and(|a| a.structure_offset == anchor.structure_offset)
@@ -640,7 +650,7 @@ fn resolve_shared_carrier_volumes(
                     .volumes
                     .iter()
                     .map(|part| {
-                        let a = validation.anchors.get(&path_key(&part.0));
+                        let a = validation.facts.anchors.get(&path_key(&part.0));
                         (
                             path_key(&part.0),
                             part.1,
@@ -663,6 +673,7 @@ fn resolve_shared_carrier_volumes(
         if let NativeRelationGroup::Proposal(validation, _) = &group {
             covered.extend(validation.proposal.volumes.iter().filter_map(|part| {
                 validation
+                    .facts
                     .anchors
                     .get(&path_key(&part.0))
                     .map(|a| (path_key(&a.path), a.structure_offset))
@@ -716,14 +727,16 @@ fn resolve_shared_carrier_volumes(
                     volumes: vec![(path.clone(), number)],
                     companions: Vec::new(),
                 },
-                anchors: HashMap::from([(path_key(&path), anchor)]),
+                facts: Arc::new(ProposalFacts {
+                    anchors: HashMap::from([(path_key(&path), anchor)]),
+                    ..Default::default()
+                }),
                 reason: Some(if needs_password {
                     RelationFailureReason::NeedsPassword
                 } else {
                     RelationFailureReason::MissingVolume
                 }),
                 unresolved: Vec::new(),
-                name_features: HashMap::new(),
             },
             if needs_password {
                 GroupKind::Password
@@ -1159,8 +1172,8 @@ fn validated_proposal_to_dict(
         .find(|(_, number)| *number == 1)
         .unwrap_or(&proposal.volumes[0]);
     let head_path = &head.0;
-    let head_anchor = validation.anchors.get(&path_key(&head_path));
-    let split_family = proposal_split_family(proposal, &validation.anchors);
+    let head_anchor = validation.facts.anchors.get(&path_key(&head_path));
+    let split_family = proposal_split_family(proposal, &validation.facts.anchors);
     let relation = FileRelationNative {
         filename: basename(head_path).to_string(),
         logical_name: proposal.logical_name.clone(),
@@ -1178,7 +1191,8 @@ fn validated_proposal_to_dict(
         split_family: split_family.clone(),
         split_index: 1,
     };
-    let volume_dicts = proposal_volume_dicts(py, proposal, &split_family, &validation.anchors)?;
+    let volume_dicts =
+        proposal_volume_dicts(py, proposal, &split_family, &validation.facts.anchors)?;
     let all_parts = PyList::empty(py);
     for path in validation.part_paths() {
         all_parts.append(path)?;
@@ -1187,6 +1201,7 @@ fn validated_proposal_to_dict(
     let carrier_size = (!carrier.is_empty())
         .then(|| {
             validation
+                .facts
                 .anchors
                 .get(&path_key(&carrier))
                 .map(|anchor| anchor.size)
@@ -1205,7 +1220,7 @@ fn validated_proposal_to_dict(
     dict.set_item("head_size", head_anchor.map(|anchor| anchor.size))?;
     dict.set_item(
         "logical_size",
-        proposal_logical_size(proposal, &validation.anchors),
+        proposal_logical_size(proposal, &validation.facts.anchors),
     )?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
     let metadata = if let Some(anchor) = head_anchor {
@@ -1220,7 +1235,7 @@ fn validated_proposal_to_dict(
     if proposal.format == "zip" {
         let mut logical_start = 0u64;
         for (path, _) in &proposal.volumes {
-            let Some(anchor) = validation.anchors.get(&path_key(path)) else {
+            let Some(anchor) = validation.facts.anchors.get(&path_key(path)) else {
                 break;
             };
             let start = anchor.structure_offset.unwrap_or(0);
@@ -1234,6 +1249,7 @@ fn validated_proposal_to_dict(
         }
     }
     if validation
+        .facts
         .anchors
         .values()
         .any(|anchor| anchor.evidence.contains(&"embedded:unresolved_volume"))
@@ -2446,7 +2462,6 @@ mod tests {
             status,
             reason: None,
             unresolved: Vec::new(),
-            name_features: HashMap::new(),
             proposal: RelationProposal {
                 format: "rar".to_string(),
                 logical_name: "test".to_string(),
@@ -2459,7 +2474,7 @@ mod tests {
                     .collect(),
                 companions: Vec::new(),
             },
-            anchors: HashMap::new(),
+            facts: Arc::default(),
         }
     }
 
@@ -2469,7 +2484,7 @@ mod tests {
             let path = "archive.part1.rar";
             let mut validation = validation_with_owned_paths(ProposalStatus::Inconclusive, &[path]);
             validation.reason = reason;
-            validation.anchors.insert(
+            Arc::make_mut(&mut validation.facts).anchors.insert(
                 path.into(),
                 VolumeAnchor {
                     format: "rar".into(),
@@ -2483,13 +2498,17 @@ mod tests {
                 validate::assignment_status(
                     "rar",
                     false,
-                    [(1, validation.anchors.get(path))].into_iter()
+                    [(1, validation.facts.anchors.get(path))].into_iter()
                 ),
                 ProposalStatus::NeedsPassword,
             );
 
             validation.reason = reason;
-            validation.anchors.get_mut(path).unwrap().error = "input could not be read".into();
+            Arc::make_mut(&mut validation.facts)
+                .anchors
+                .get_mut(path)
+                .unwrap()
+                .error = "input could not be read".into();
             validate::validate(&mut validation);
             assert_eq!(validation.status, ProposalStatus::Reject);
             assert_eq!(
@@ -2500,7 +2519,7 @@ mod tests {
                 validate::assignment_status(
                     "rar",
                     false,
-                    [(1, validation.anchors.get(path))].into_iter()
+                    [(1, validation.facts.anchors.get(path))].into_iter()
                 ),
                 ProposalStatus::Reject,
             );

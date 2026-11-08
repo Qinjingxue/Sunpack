@@ -89,20 +89,7 @@ def _override_signature() -> tuple[str, int, int] | str | None:
     path = Path(raw)
     if not path.is_file():
         return raw
-    try:
-        stat = path.stat()
-    except OSError:
-        return (str(resolve_resource_path(path)), -1, -1)
-    return (str(resolve_resource_path(path)), int(stat.st_mtime_ns), int(stat.st_size))
-
-
-_NAMED_MODULE_LIST_PATHS = {
-    ("filesystem", "scan_filters"),
-}
-
-_OVERRIDE_ORDERED_NAMED_MODULE_LIST_PATHS = {
-    ("filesystem", "scan_filters"),
-}
+    return _config_file_signature(path)
 
 
 def _deep_merge_config(base: dict[str, Any], override: dict[str, Any], path: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -112,57 +99,45 @@ def _deep_merge_config(base: dict[str, Any], override: dict[str, Any], path: tup
         base_value = merged.get(key)
         if isinstance(base_value, dict) and isinstance(value, dict):
             merged[key] = _deep_merge_config(base_value, value, item_path)
-        elif item_path in _NAMED_MODULE_LIST_PATHS and isinstance(base_value, list) and isinstance(value, list):
-            merged[key] = _merge_named_module_list(
-                base_value,
-                value,
-                override_order=item_path in _OVERRIDE_ORDERED_NAMED_MODULE_LIST_PATHS,
-            )
+        elif item_path == ("filesystem", "scan_filters") and isinstance(base_value, list) and isinstance(value, list):
+            merged[key] = _merge_named_module_list(base_value, value)
         else:
             merged[key] = value
     return merged
 
 
-def _merge_named_module_list(base: list[Any], override: list[Any], *, override_order: bool = False) -> list[Any]:
+def _merge_named_module_list(base: list[Any], override: list[Any]) -> list[Any]:
     merged = list(base)
     indexes = {
         item.get("name"): index
         for index, item in enumerate(merged)
         if isinstance(item, dict) and isinstance(item.get("name"), str)
     }
+    override_names = []
     for item in override:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             merged.append(item)
             continue
-        existing_index = indexes.get(item["name"])
-        if existing_index is None or not isinstance(merged[existing_index], dict):
-            indexes[item["name"]] = len(merged)
+        name = item["name"]
+        override_names.append(name)
+        existing_index = indexes.get(name)
+        if existing_index is None:
+            indexes[name] = len(merged)
             merged.append(item)
             continue
         merged[existing_index] = _deep_merge_config(merged[existing_index], item)
-    if override_order:
-        override_names = [
-            item.get("name")
-            for item in override
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        ]
-        by_name = {
-            item.get("name"): item
-            for item in merged
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
-        ordered = [by_name[name] for name in override_names if name in by_name]
-        ordered.extend(
-            item
-            for item in merged
-            if not (
-                isinstance(item, dict)
-                and isinstance(item.get("name"), str)
-                and item["name"] in override_names
-            )
+    overridden = set(override_names)
+    ordered = [merged[indexes[name]] for name in override_names]
+    ordered.extend(
+        item
+        for item in merged
+        if not (
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and item["name"] in overridden
         )
-        return ordered
-    return merged
+    )
+    return ordered
 
 
 def apply_config_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:

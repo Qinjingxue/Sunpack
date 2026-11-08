@@ -95,7 +95,7 @@ class EmbeddedDiscovery:
     def _resolve_native_volumes(self, result, table, batch, session) -> None:
         passwords = [
             (path, self._password_candidates(path))
-            for path, _offset in batch.encrypted_volume_inputs(table)
+            for path in batch.encrypted_volume_paths(table)
         ]
         shared_inputs = False
         for index, status, raw_scan, password in batch.resolve_volumes(table, passwords):

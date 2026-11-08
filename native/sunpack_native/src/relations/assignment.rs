@@ -875,7 +875,7 @@ pub(super) fn resolve_buckets(
                         }
                     }
                 }
-                output.extend(materialize(&view, assignment, &logical, reason));
+                output.extend(materialize(&view, assignment, &logical, reason, None));
             }
         }
     }
@@ -893,6 +893,7 @@ pub(super) fn materialize(
     assignment: VolumeAssignment,
     logical: &str,
     reason: Option<RelationFailureReason>,
+    shared_facts: Option<&Arc<ProposalFacts>>,
 ) -> Option<ProposalValidation> {
     let rows = view.rows;
     let spanned = view.spanned();
@@ -947,17 +948,10 @@ pub(super) fn materialize(
         volumes.push((rows[i].path.clone(), 0));
         unresolved.retain(|p| p != &rows[i].path);
     }
-    let anchors = view
-        .indexes
-        .iter()
-        .chain(&assignment.companions)
-        .filter_map(|i| {
-            rows[*i]
-                .anchor
-                .clone()
-                .map(|a| (rows[*i].path_key.clone(), a))
-        })
-        .collect();
+    let facts = match shared_facts {
+        Some(facts) => Arc::clone(facts),
+        None => proposal_facts(view, &assignment.companions),
+    };
     Some(ProposalValidation {
         attempts: None,
         status: ProposalStatus::Inconclusive,
@@ -973,9 +967,26 @@ pub(super) fn materialize(
                 .map(|i| rows[*i].path.clone())
                 .collect(),
         },
-        anchors,
+        facts,
         reason,
         unresolved,
+    })
+}
+
+pub(super) fn proposal_facts(view: &BucketView<'_>, companions: &[usize]) -> Arc<ProposalFacts> {
+    let rows = view.rows;
+    Arc::new(ProposalFacts {
+        anchors: view
+            .indexes
+            .iter()
+            .chain(companions)
+            .filter_map(|i| {
+                rows[*i]
+                    .anchor
+                    .clone()
+                    .map(|a| (rows[*i].path_key.clone(), a))
+            })
+            .collect(),
         name_features: view
             .indexes
             .iter()
@@ -1138,8 +1149,8 @@ mod tests {
         assert!(!validation_owned_paths(&groups[0]).contains(&rows[4].path));
 
         let cache = RelationCache {
-            anchors: groups[0].anchors.clone(),
-            names: groups[0].name_features.clone(),
+            anchors: groups[0].facts.anchors.clone(),
+            names: groups[0].facts.name_features.clone(),
         };
         let mut renamed = rows.clone();
         for row in &mut renamed[1..] {
@@ -1431,6 +1442,7 @@ mod tests {
             } else {
                 assert_eq!(groups.len(), 2);
                 assert!(groups.iter().all(|group| group.attempts.is_some()));
+                assert!(Arc::ptr_eq(&groups[0].facts, &groups[1].facts));
             }
         }
     }
@@ -1491,8 +1503,8 @@ mod tests {
         ];
         let first = resolve(&rows);
         let cache = RelationCache {
-            anchors: first[0].anchors.clone(),
-            names: first[0].name_features.clone(),
+            anchors: first[0].facts.anchors.clone(),
+            names: first[0].facts.name_features.clone(),
         };
         let mut renamed = rows.clone();
         renamed[1].name = "same.no_numeric_channel".into();

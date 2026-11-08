@@ -1,6 +1,6 @@
 //! Sparse, ordered hypotheses. Only slot domains cross the execution boundary;
 //! their Cartesian product is never allocated or probed during discovery.
-use super::assignment::{materialize, BucketView, VolumeAssignment};
+use super::assignment::{materialize, proposal_facts, BucketView, VolumeAssignment};
 use super::filename::NameProfile;
 use super::*;
 use std::collections::BTreeMap;
@@ -91,7 +91,8 @@ impl VolumeAttempts {
                             replacements.push(index);
                         }
                         domains.intern(replacements)
-                    } else if interiors[&Arc::as_ptr(choices)] {
+                    } else if interiors[&Arc::as_ptr(choices)] || from_tail {
+                        let interior = interiors[&Arc::as_ptr(choices)];
                         let (_, domain) = filtered
                             .entry((Arc::as_ptr(choices), size))
                             .or_insert_with(|| {
@@ -102,22 +103,18 @@ impl VolumeAttempts {
                                             .iter()
                                             .copied()
                                             .filter(|i| {
-                                                self.sources[*i].end - self.sources[*i].start
-                                                    == size
+                                                let source = &self.sources[*i];
+                                                if interior {
+                                                    source.end - source.start == size
+                                                } else {
+                                                    source.head_size == Some(size)
+                                                }
                                             })
                                             .collect(),
                                     ),
                                 )
                             });
                         Arc::clone(domain)
-                    } else if from_tail {
-                        domains.intern(
-                            choices
-                                .iter()
-                                .copied()
-                                .filter(|i| self.sources[*i].head_size == Some(size))
-                                .collect(),
-                        )
                     } else {
                         Arc::clone(choices)
                     };
@@ -144,7 +141,7 @@ pub(super) fn resolve_carrier_geometry(validation: &mut ProposalValidation) {
         return;
     }
     if let Some(plan) = validation.attempts.take() {
-        let head = &validation.anchors[&path_key(&validation.proposal.volumes[0].0)];
+        let head = &validation.facts.anchors[&path_key(&validation.proposal.volumes[0].0)];
         validation.attempts = Some(plan.with_spanned_carrier(head));
     }
 }
@@ -208,13 +205,13 @@ fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>
 
 pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts {
     let proposal = &validation.proposal;
-    let head = &validation.anchors[&path_key(&proposal.volumes[0].0)];
+    let head = &validation.facts.anchors[&path_key(&proposal.volumes[0].0)];
     let (head_size_from_total, minimum_size, trim) = head_geometry(head, &proposal.format);
     VolumeAttempts {
         sources: proposal
             .volumes
             .iter()
-            .map(|part| AttemptSource::new(&part.0, &validation.anchors[&path_key(&part.0)]))
+            .map(|part| AttemptSource::new(&part.0, &validation.facts.anchors[&path_key(&part.0)]))
             .collect(),
         layouts: vec![proposal
             .volumes
@@ -230,7 +227,8 @@ pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts
                 .iter()
                 .enumerate()
                 .filter_map(|(index, part)| {
-                    zip_total(&validation.anchors[&path_key(&part.0)]).map(|total| (index, total))
+                    zip_total(&validation.facts.anchors[&path_key(&part.0)])
+                        .map(|total| (index, total))
                 })
                 .collect()
         } else {
@@ -280,7 +278,7 @@ pub(super) fn expand_carrier_sources(
         let Some(options) = by_path.get(&key) else {
             continue;
         };
-        let anchor = &validation.anchors[&key];
+        let anchor = &validation.facts.anchors[&key];
         let replacements: Vec<_> = options
             .iter()
             .filter(|a| {
@@ -364,6 +362,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         .collect();
     heads.sort_by(|a, b| view.rows[*a].path_key.cmp(&view.rows[*b].path_key));
     let mut output = Vec::new();
+    let mut shared_facts = None;
     for head in heads {
         let indexes: Vec<_> = view
             .indexes
@@ -628,26 +627,35 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     && (view.format == "7z" || (view.format == "zip" && !spanned))
                     && slots.keys().copied().zip(1u32..).any(|(n, rank)| n != rank)
                 {
-                    let represented: HashSet<_> =
-                        slots.values().flat_map(|c| c.iter()).copied().collect();
+                    let mut represented = HashSet::new();
+                    let mut summaries = HashMap::new();
+                    let mut slack = 0u64;
+                    let mut representatives = BTreeMap::new();
+                    for (&number, choices) in &slots {
+                        let (representative, difference) =
+                            *summaries.entry(Arc::as_ptr(choices)).or_insert_with(|| {
+                                let mut smallest = u64::MAX;
+                                let mut largest = 0;
+                                let mut representative = choices[0];
+                                for &i in choices.iter() {
+                                    represented.insert(i);
+                                    let size = view.rows[i]
+                                        .anchor
+                                        .as_ref()
+                                        .map_or(0, VolumeAnchor::payload_size);
+                                    smallest = smallest.min(size);
+                                    if size >= largest {
+                                        largest = size;
+                                        representative = i;
+                                    }
+                                }
+                                (representative, largest - smallest)
+                            });
+                        representatives.insert(number, representative);
+                        slack = slack.saturating_add(difference);
+                    }
                     let mapping = VolumeAssignment {
-                        slots: slots
-                            .iter()
-                            .map(|(&n, choices)| {
-                                (
-                                    n,
-                                    *choices
-                                        .iter()
-                                        .max_by_key(|i| {
-                                            view.rows[**i]
-                                                .anchor
-                                                .as_ref()
-                                                .map_or(0, |a| a.payload_size())
-                                        })
-                                        .unwrap(),
-                                )
-                            })
-                            .collect(),
+                        slots: representatives,
                         unresolved: indexes
                             .iter()
                             .copied()
@@ -655,17 +663,6 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                             .collect(),
                         ..Default::default()
                     };
-                    let slack = slots.values().fold(0u64, |total, choices| {
-                        let sizes = || {
-                            choices.iter().map(|i| {
-                                view.rows[*i]
-                                    .anchor
-                                    .as_ref()
-                                    .map_or(0, |a| a.payload_size())
-                            })
-                        };
-                        total.saturating_add(sizes().max().unwrap() - sizes().min().unwrap())
-                    });
                     // ZIP geometry belongs to a particular tail. A larger bad
                     // tail must not veto the feasible domain of another tail.
                     // Check tails only; never enumerate the slot product.
@@ -747,7 +744,8 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             slots: BTreeMap::from([(1, head)]),
             ..Default::default()
         };
-        let mut proposal = materialize(view, assignment, logical, None).unwrap();
+        let facts = shared_facts.get_or_insert_with(|| proposal_facts(view, &[]));
+        let mut proposal = materialize(view, assignment, logical, None, Some(facts)).unwrap();
         proposal.unresolved = sources
             .iter()
             .filter(|i| **i != head)
