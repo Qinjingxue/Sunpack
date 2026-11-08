@@ -1083,7 +1083,11 @@ bool extraction_rejects_password(const sunpack::sevenzip::ExtractArchiveResult& 
     return tested;
 }
 
-int cancelled_result(const std::string& job_id) {
+int interrupted_result(const std::string& job_id) {
+    // The attempt token also stops work for memory reclamation. Only the
+    // executor's persistent user token decides whether a parked job is canceled.
+    const auto* memory = sunpack::sevenzip::current_native_memory_job();
+    if (memory && memory->revoked.load(std::memory_order_acquire)) return kMemoryRetry;
     print_json_line(
         "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
         "\",\"status\":\"failed\",\"native_status\":\"cancelled\","
@@ -1206,7 +1210,7 @@ int run_request(
         return 0;
     }
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
-        return cancelled_result(job_id);
+        return interrupted_result(job_id);
     }
 
     const std::wstring& archive_path = request.archive_input.archive_path;
@@ -1301,14 +1305,6 @@ int run_request(
                     "\"message\":\"volume composition trials require an empty output directory\"}");
                 return 2;
             }
-            if (!cursor.next(request.archive_input.volume_attempts, cancel_token.get())) {
-                if (cancel_token && cancel_token->load()) return cancelled_result(job_id);
-                print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"status\":\"failed\",\"missing_volume\":true,\"failure_stage\":\"archive_open\","
-                    "\"failure_kind\":\"missing_volume\",\"missing_volume_evidence\":\"volume_attempts_exhausted\","
-                    "\"volume_attempts\":0,\"message\":\"no legal volume composition\"}");
-                return 2;
-            }
             cursor.started = true;
         }
         volume_replay->volume_attempt_active = true;
@@ -1324,6 +1320,25 @@ int run_request(
     for (;;) {
         if (volume_trials) {
             auto& cursor = volume_replay->volumes;
+            if (cursor.needs_next) {
+                if (!cursor.next(request.archive_input.volume_attempts, cancel_token.get())) {
+                    if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
+                    result.status = PasswordTestStatus::Damaged;
+                    const bool ambiguous = volume_replay->volume_password_ambiguous;
+                    result.missing_volume = !ambiguous;
+                    result.damaged = true;
+                    result.wrong_password = result.password_rejected = result.password_candidates_all_rejected = false;
+                    result.missing_volume_suspected = false;
+                    result.missing_volume_evidence = ambiguous ? "" : "volume_attempts_exhausted";
+                    if (result.failure_stage.empty()) result.failure_stage = "archive_open";
+                    result.failure_kind = ambiguous ? "password_or_volume_inconclusive" : "missing_volume";
+                    result.message = ambiguous ? "password or volume composition remains unconfirmed" :
+                        "no supplied volume composition completed the archive";
+                    break;
+                }
+                cursor.discard_pending = cursor.attempts > 1;
+                result = ExtractArchiveResult{};
+            }
             if (cursor.discard_pending) {
                 if (!dry_run) {
                     const auto error = discard_candidate_output(output_dir);
@@ -1476,7 +1491,7 @@ int run_request(
             if (memory->revoked.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok)) return kMemoryRetry;
         }
 
-        if (cancel_token && cancel_token->load(std::memory_order_acquire)) return cancelled_result(job_id);
+        if (cancel_token && cancel_token->load(std::memory_order_acquire)) return interrupted_result(job_id);
 
         if (volume_trials && (uncertain_volume_password(result, *volume_replay) ||
             (volume_replay->volume_password_uncertain && result.password_candidates_all_rejected))) {
@@ -1497,22 +1512,7 @@ int run_request(
         // Every composition of a sparse layout is missing the same slot.
         // Slot 1 instead denotes a candidate-dependent carrier trim failure.
         if (archive_input.missing_volume_number > 1) cursor.skip_layout();
-        if (!cursor.next(request.archive_input.volume_attempts, cancel_token.get())) {
-            if (cancel_token && cancel_token->load()) return cancelled_result(job_id);
-            result.status = PasswordTestStatus::Damaged;
-            const bool ambiguous = volume_replay->volume_password_ambiguous;
-            result.missing_volume = !ambiguous;
-            result.damaged = true;
-            result.wrong_password = result.password_rejected = result.password_candidates_all_rejected = false;
-            result.missing_volume_suspected = false;
-            result.missing_volume_evidence = ambiguous ? "" : "volume_attempts_exhausted";
-            result.failure_kind = ambiguous ? "password_or_volume_inconclusive" : "missing_volume";
-            result.message = ambiguous ? "password or volume composition remains unconfirmed" :
-                "no supplied volume composition completed the archive";
-            break;
-        }
-        cursor.discard_pending = true;
-        result = ExtractArchiveResult{};
+        cursor.needs_next = true;
     }
 
     if (!archive_input.analyzed_missing_volume_evidence.empty()) {

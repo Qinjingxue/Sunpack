@@ -120,12 +120,14 @@ struct VolumeAttemptPlan {
 // Iterative DFS keeps only one injective composition. No product, attempt
 // limit, recursion stack or archive/decoder object survives a retry.
 struct VolumeAttemptCursor {
-    std::size_t layout = 0, attempts = 0, slot_count = 0;
+    std::size_t layout = 0, attempts = 0, slot_count = 0, depth = 0;
     std::vector<std::size_t> digits, selected;
     std::vector<unsigned char> used;
     std::vector<unsigned long long> remaining, suffix_capacity;
     std::vector<std::size_t> domain_remaining, shared_domains;
-    bool started = false, discard_pending = false;
+    // A stopped search retains its exact DFS depth. The worker requests the
+    // next composition separately from replaying an already yielded candidate.
+    bool started = false, discard_pending = false, needs_next = true, searching = false;
     void reserve(const VolumeAttemptPlan& plan) {
         const auto maximum = plan.variation.size();
         digits.reserve(maximum); selected.reserve(maximum);
@@ -160,12 +162,14 @@ struct VolumeAttemptCursor {
         for (auto source : selected) used[source] = 0;
         ++layout;
         slot_count = 0;
+        searching = false;
         digits.clear();
         selected.clear();
     }
     void advance(const VolumeAttemptPlan& plan) {
         if (slot_count > plan.minimum_slots_for(layout)) --slot_count;
         else { ++layout; slot_count = 0; }
+        searching = false;
         digits.clear(); selected.clear();
     }
     bool next(const VolumeAttemptPlan& plan, const std::atomic<bool>* cancel = nullptr) {
@@ -175,8 +179,8 @@ struct VolumeAttemptCursor {
             if (!plan.feasible_layouts[layout]) { skip_layout(); continue; }
             const auto& slots = plan.layouts[layout];
             if (!slot_count) slot_count = slots.size();
-            std::size_t depth = 0;
             if (digits.empty()) {
+                depth = 0;
                 // Only domains referenced by this layout can be read below.
                 for (const auto& slot : slots) domain_remaining[slot.domain] = 0;
                 shared_domains.clear();
@@ -196,13 +200,16 @@ struct VolumeAttemptCursor {
                     remaining.assign(slot_count + 1, 0);
                     remaining[0] = plan.minimum_size;
                 }
-                digits.assign(slot_count, 0);
                 selected.assign(slot_count, plan.sources.size());
-            } else {
+                // Publish initialization last: an allocation failure must not
+                // leave a partial search looking like a yielded composition.
+                digits.assign(slot_count, 0);
+            } else if (!searching) {
                 depth = slot_count - 1;
                 unselect(plan, depth);
                 ++digits[depth];
             }
+            searching = true;
             for (;;) {
                 if (cancel && cancel->load(std::memory_order_relaxed)) return false;
                 const auto domain = plan.domain_for(layout, slot_count, depth);
@@ -252,7 +259,7 @@ struct VolumeAttemptCursor {
                             }
                         }
                 }
-                if (!duplicate) { ++attempts; return true; }
+                if (!duplicate) { ++attempts; searching = needs_next = false; return true; }
                 --depth; unselect(plan, depth); ++digits[depth];
             }
             advance(plan);
