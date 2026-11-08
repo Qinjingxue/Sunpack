@@ -99,7 +99,6 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
             return PipelineResponse("request", summary, PipelineArtifacts((output,)))
         request = scheduler_module._ActivePipelineRequest(
             "notice", WatchCandidate(str(source), 6, 1.0), asyncio.create_task(complete()),
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(tmp_path)),
         )
         return await watcher._complete_candidate(request)
@@ -151,7 +150,6 @@ def test_accepted_partial_watch_result_keeps_warnings_out_of_failure_policy(
         request = scheduler_module._ActivePipelineRequest(
             "notice", WatchCandidate(str(source), source.stat().st_size, source.stat().st_mtime),
             asyncio.create_task(complete()),
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(tmp_path)),
         )
         return await watcher._complete_candidate(request)
@@ -209,7 +207,6 @@ def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notification
             return PipelineResponse("request", summary, PipelineArtifacts())
         request = scheduler_module._ActivePipelineRequest(
             "notice", candidate, asyncio.create_task(complete()),
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(tmp_path)),
         )
         return await watcher._finish_active_request(request)
@@ -1194,7 +1191,6 @@ def test_coalesced_pipeline_completion_is_consumed_without_duplicate_terminal_no
             notification_id="watch-request",
             candidate=candidate,
             task=task,
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(tmp_path)),
         )
         return await watcher._complete_candidate(request)
@@ -1236,7 +1232,7 @@ def test_watch_missing_input_completion_uses_request_sources(tmp_path, case):
             raise error
 
         request = scheduler_module._ActivePipelineRequest(
-            "owner", WatchCandidate(str(seed), 7, 1), asyncio.create_task(fail()), 0,
+            "owner", WatchCandidate(str(seed), 7, 1), asyncio.create_task(fail()),
             watcher._password_signature_for_scope(str(tmp_path)),
         )
         watcher._handle_pipeline_progress(str(seed), "owner", SimpleNamespace(),
@@ -1580,7 +1576,6 @@ def test_nested_watch_lifecycle_and_completion_keep_wal_off_loop(tmp_path, monke
                 task = asyncio.get_running_loop().create_future()
                 task.set_result(response)
                 request = scheduler_module._ActivePipelineRequest("failure", scheduler_module._candidate_for_event_path(str(locked)), task,
-                    password_generation=watcher.state.password_generation,
                     password_signature=watcher._password_signature_for_scope(str(tmp_path)))
                 lookup = engine.completed_watch_family_output
                 def completed_output(*args, **kwargs):
@@ -1809,7 +1804,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
         watcher._complete_candidate = complete_request
         task = asyncio.create_task(completed_pipeline())
         await task
-        request = scheduler_module._ActivePipelineRequest("request", candidate, task, 0,
+        request = scheduler_module._ActivePipelineRequest("request", candidate, task,
             watcher._password_signature_for_scope(str(tmp_path)))
         request.source_paths = (str(archive),)
         watcher._register_inflight_requests_locked([request])
@@ -2769,7 +2764,6 @@ def test_nested_completion_only_publishes_top_level_and_promoted_blockers(tmp_pa
             return PipelineResponse("nested", summary)
         request = scheduler_module._ActivePipelineRequest(
             "nested", WatchCandidate(str(outer), 7, 1.0), asyncio.create_task(complete()),
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(tmp_path)),
         )
         for depth, path in enumerate((outer, locked, leaf), 1):
@@ -2829,7 +2823,6 @@ def test_member_failure_persists_confirmed_group_across_recovery(tmp_path):
             return PipelineResponse("nested", summary)
         request = scheduler_module._ActivePipelineRequest(
             "nested", WatchCandidate(str(outer), 7, 1.0), asyncio.create_task(complete()),
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(tmp_path)),
         )
         watcher._handle_pipeline_progress(str(outer), "nested", SimpleNamespace(), {
@@ -4042,7 +4035,6 @@ def test_terminal_report_does_not_materialize_failure_tree_or_large_formatted_er
         response.set_result(PipelineResponse("report", summary, PipelineArtifacts(())))
         request = scheduler_module._ActivePipelineRequest(
             "report", WatchCandidate(str(source), 6, 1.0), response,
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(tmp_path)),
         )
         return await watcher._complete_candidate(request)

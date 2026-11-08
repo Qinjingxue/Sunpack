@@ -575,7 +575,8 @@ impl NativeEmbeddedBatch {
         password_candidates: Option<Vec<(String, Vec<String>)>>,
     ) -> PyResult<Vec<(usize, u8, Option<Py<PyDict>>, Option<String>)>> {
         use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
-        if self.pending_volumes.is_empty() {
+        let mut batch = std::mem::take(self);
+        if batch.pending_volumes.is_empty() {
             return Ok(Vec::new());
         }
         let candidates: HashMap<_, _> = password_candidates
@@ -583,13 +584,13 @@ impl NativeEmbeddedBatch {
             .into_iter()
             .map(|(path, values)| (path_key(&path), values))
             .collect();
-        let mut cache = std::mem::take(&mut self.relation_cache);
-        let mut pending = std::mem::take(&mut self.pending_volumes);
+        let mut cache = std::mem::take(&mut batch.relation_cache);
+        let mut pending = std::mem::take(&mut batch.pending_volumes);
         let pending_keys: HashSet<_> = pending
             .iter()
             .map(|item| path_key(&item.anchor.path))
             .collect();
-        for snapshot in &table.relation_sources {
+        for snapshot in table.relation_sources.iter().filter(|_| !candidates.is_empty()) {
             for &row in &snapshot.rows {
                 let key = path_key(&snapshot.table.paths[row]);
                 if candidates.contains_key(&key)
@@ -695,7 +696,7 @@ impl NativeEmbeddedBatch {
             // Encrypted RAR exposes its split role only after password
             // resolution. Apply the same ownership evidence at that point.
             if !anchor.multivolume
-                || !self.claims_offset(&key, anchor.structure_offset.unwrap_or(0))
+                || !batch.claims_offset(&key, anchor.structure_offset.unwrap_or(0))
             {
                 anchor.evidence.push("embedded:volume_candidate");
                 anchors.push(anchor);
@@ -729,8 +730,8 @@ impl NativeEmbeddedBatch {
         // Only these newly discovered slices may re-enter a claimed carrier.
         // Other files retain the existing whole-file ownership exclusion.
         let anchor_paths: HashSet<_> = anchors.iter().map(|a| path_key(&a.path)).collect();
-        self.excluded.retain(|key| !anchor_paths.contains(key));
-        let excluded = &self.excluded;
+        batch.excluded.retain(|key| !anchor_paths.contains(key));
+        let excluded = &batch.excluded;
         let mut groups = py.detach(|| resolve_embedded_volumes(sources, anchors, excluded, cache));
         // A failed NextHeader inside a carrier can also be damaged standalone
         // data. Require actual peers for this speculative split identity.
@@ -1240,13 +1241,15 @@ impl NativeCandidateTable {
         // residuals, then Detection residuals.
         for (index, row) in self.rows.iter().enumerate() {
             if let Candidate::File(table, file_index) = row {
-                if speculative.contains(&path_key(&table.paths[*file_index])) {
+                let residual = table.file_routes[*file_index] == FILE_ROUTE_RESIDUAL;
+                if !residual && speculative.is_empty() {
+                    continue;
+                }
+                let key = path_key(&table.paths[*file_index]);
+                if speculative.contains(&key)
+                    || (residual && !claimed.contains(&key) && !blocked.contains(&key))
+                {
                     routes.embedded.push(index);
-                } else if table.file_routes[*file_index] == FILE_ROUTE_RESIDUAL {
-                    let key = path_key(&table.paths[*file_index]);
-                    if !claimed.contains(&key) && !blocked.contains(&key) {
-                        routes.embedded.push(index);
-                    }
                 }
             }
         }
@@ -1288,7 +1291,7 @@ impl NativeCandidateTable {
         enabled: bool,
         recursive_ratio: f64,
     ) -> NativeEmbeddedBatch {
-        let mut ids = routes.embedded.clone();
+        let mut ids = std::mem::take(&mut routes.embedded);
         let ratio = recursive_ratio.clamp(0.0, 1.0);
         let sized = if enabled && recursive && !force_scan && ratio > 0.0 {
             ids.iter()
@@ -1368,15 +1371,12 @@ impl NativeCandidateTable {
             }
         }
         let mut prepass = std::mem::take(&mut routes.scans);
-        let mut scans = HashMap::new();
-        if ids.len() == self.rows.len() {
+        let scans = if ids.len() == self.rows.len() {
             // A full deep scan already uses every row; do not duplicate its
-            // candidate storage merely to reproduce the same indices.
-            scans
-                .extend(ids.iter().filter_map(|index| {
-                    prepass.remove(index).map(|scan| (*index, scan))
-                }));
+            // candidate storage or prepass map merely to reproduce the same indices.
+            prepass
         } else {
+            let mut scans = HashMap::new();
             let positions: HashMap<_, _> = ids
                 .iter()
                 .enumerate()
@@ -1394,7 +1394,8 @@ impl NativeCandidateTable {
                 }
             }
             self.rows = rows;
-        }
+            scans
+        };
         NativeEmbeddedBatch {
             relation_cache,
             pending_volumes: Vec::new(),

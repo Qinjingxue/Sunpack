@@ -137,7 +137,8 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
             first_entries = list(watcher.state.entries.values())
             assert len(first_entries) == 1, first_entries
             assert first_entries[0].status == "failed_password"
-            assert first_entries[0].password_generation < watcher.state.password_generation
+            entry = first_entries[0]
+            assert entry.failure_payload["password_signature"] != watcher._password_signature_for_scope(entry.password_scope_dir)
             if update_timing == "before_failure_restart":
                 watcher.state.flush()
                 watcher = WatchScheduler(

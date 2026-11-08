@@ -126,7 +126,6 @@ class _ActivePipelineRequest:
     notification_id: str
     candidate: WatchCandidate
     task: asyncio.Task
-    password_generation: int
     password_signature: str
     registry_owner: str = ""
     source_input_root: str = ""
@@ -2162,7 +2161,6 @@ class WatchScheduler:
         notification_id = uuid.uuid4().hex
         with self._password_source_lock:
             run_config = dict(self.config)
-            password_generation = self.state.password_generation
             retry_entry = self.state.latest_entry_for_path(candidate.path)
             pending = self.state.pending_work_for_path(candidate.path)
             scope_dir = ""
@@ -2240,7 +2238,6 @@ class WatchScheduler:
             notification_id=notification_id,
             candidate=candidate,
             task=task,
-            password_generation=password_generation,
             password_signature=password_signature,
             registry_owner=notification_id if host is not None else "",
             source_input_root=source_input_root,
@@ -2500,7 +2497,6 @@ class WatchScheduler:
                     file_id=retry_candidate.file_id, change_usn=retry_candidate.change_usn,
                     status=status, error=error, failure_payload=payload,
                     source_group=request.source_groups.get(path_key(retry_path)),
-                    password_generation=request.password_generation,
                 )
                 retry_password = (
                     password

@@ -310,8 +310,7 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
         path=str(password_archive),
         status="failed_password",
         password_scope_dir=str(scope),
-        password_generation=0,
-        failure_payload={},
+        failure_payload={"password_signature": "previous-scope"},
     )
     missing_entry = SimpleNamespace(
         path=str(missing_archive),
@@ -321,7 +320,6 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
     )
     scheduler.state = SimpleNamespace(
         entry_items=lambda: [password_entry, missing_entry],
-        password_generation=1,
     )
     scheduler._user_password_signature = "configured-passwords"
     scheduler.config = {"password_snapshot": SimpleNamespace(scope_signature=lambda scope: "current-scope")}
@@ -337,7 +335,7 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
     assert calls[0][1]["event_type"] == "startup_password_reconcile"
     assert calls[1][1]["event_type"] == "startup_missing_volume_reconcile"
 
-    # An unchanged scope must not retry just because the global generation differs.
+    # An unchanged scope must not retry.
     password_entry.failure_payload["password_signature"] = scheduler._password_signature_for_scope(str(scope))
     calls.clear()
     scheduler._reconcile_persisted_blockers()

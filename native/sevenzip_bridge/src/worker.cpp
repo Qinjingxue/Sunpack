@@ -443,7 +443,6 @@ struct WorkerArchiveInput {
     std::wstring open_mode;
     std::vector<std::wstring> part_paths;
     std::vector<std::wstring> canonical_names;
-    std::vector<int> volume_numbers;
     std::string analyzed_missing_volume_evidence;
     // First absent number of a structured volume sequence (0 = contiguous).
     int missing_volume_number = 0;
@@ -632,44 +631,36 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
         std::wstring path;
         std::wstring canonical_name;
         unsigned long long start = 0;
-        bool has_start = false;
         unsigned long long end = 0;
         bool has_end = false;
     };
     const auto part_objects = descriptor.object_array_field("parts");
+    const bool structured = mode == "native_volumes" || mode == "sfx_with_volumes";
     std::vector<ParsedPart> structured_parts;
-    std::vector<std::wstring> parts;
-    parts.reserve(part_objects.size());
+    input.part_paths.reserve(part_objects.size());
+    if (structured) structured_parts.reserve(part_objects.size());
     for (const auto object_json : part_objects) {
         const JsonObjectView object(object_json);
         const std::string path = object.string_field("path", "");
-        if (!path.empty()) {
-            parts.push_back(utf8_to_wide(path));
-            unsigned long long number = 0;
-            const std::string canonical_name = object.string_field("canonical_name", "");
-            if (mode == "native_volumes" || mode == "sfx_with_volumes") {
-                if (!object.uint_field("volume_number", &number) || number == 0 || canonical_name.empty()) {
-                    input.validation_error = "structured volume part requires volume_number and canonical_name";
-                } else {
-                    unsigned long long start = 0;
-                    const bool has_start =
-                        object.uint_field("start", &start);
-                    unsigned long long end = 0;
-                    const bool has_end = object.uint_field("end", &end);
-                    if (has_end && end < start) input.validation_error = "structured volume extent is reversed";
-                    structured_parts.push_back({
-                        static_cast<int>(number),
-                        utf8_to_wide(path),
-                        utf8_to_wide(canonical_name),
-                        start,
-                        has_start, end, has_end,
-                    });
-                }
-            }
+        if (path.empty()) continue;
+        if (!structured) {
+            input.part_paths.push_back(utf8_to_wide(path));
+            continue;
         }
+        unsigned long long number = 0;
+        const std::string canonical_name = object.string_field("canonical_name", "");
+        if (!object.uint_field("volume_number", &number) || number == 0 || canonical_name.empty()) {
+            input.validation_error = "structured volume part requires volume_number and canonical_name";
+            continue;
+        }
+        unsigned long long start = 0, end = 0;
+        object.uint_field("start", &start);
+        const bool has_end = object.uint_field("end", &end);
+        if (has_end && end < start) input.validation_error = "structured volume extent is reversed";
+        structured_parts.push_back({static_cast<int>(number), utf8_to_wide(path),
+                                    utf8_to_wide(canonical_name), start, end, has_end});
     }
-    if (mode == "native_volumes" || mode == "sfx_with_volumes") {
-        parts.clear();
+    if (structured) {
         const bool has_ranges = std::any_of(structured_parts.begin(), structured_parts.end(),
             [](const ParsedPart &part) { return part.start != 0 || part.has_end; });
         if (has_ranges) input.ranges.reserve(structured_parts.size());
@@ -689,18 +680,14 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
                 structured_parts[index].number != structured_parts[index - 1].number + 1) {
                 input.missing_volume_number = structured_parts[index - 1].number + 1;
             }
-            const auto &part = structured_parts[index];
+            auto& part = structured_parts[index];
             if (has_ranges) input.ranges.push_back({part.path, part.start, part.end, part.has_end});
-            parts.push_back(part.path);
-            input.canonical_names.push_back(structured_parts[index].canonical_name);
-            input.volume_numbers.push_back(structured_parts[index].number);
+            input.part_paths.push_back(std::move(part.path));
+            input.canonical_names.push_back(std::move(part.canonical_name));
         }
-        if (parts.empty()) {
+        if (input.part_paths.empty()) {
             input.validation_error = "structured volume descriptor has no parts";
         }
-    }
-    if (!parts.empty()) {
-        input.part_paths = parts;
     }
 
     if (mode == "file_range") {
@@ -1126,17 +1113,17 @@ std::error_code discard_candidate_output(const std::wstring& output_dir) {
 void select_volume_attempt(const WorkerArchiveInput& source,
                            const sunpack::sevenzip::VolumeAttemptCursor& cursor,
                            WorkerArchiveInput& input) {
-    input = WorkerArchiveInput{};
-    input.open_mode = source.open_mode;
-    input.format_hint = source.format_hint;
     const auto& slots = source.volume_attempts.layouts[cursor.layout];
+    input.part_paths.resize(slots.size());
+    input.ranges.resize(slots.size());
+    input.canonical_names.resize(slots.size());
+    input.missing_volume_number = 0;
     unsigned int previous = 0;
     for (std::size_t i = 0; i < slots.size(); ++i) {
         const auto& range = source.volume_attempts.sources[cursor.selected[i]];
-        input.part_paths.push_back(range.path);
-        input.ranges.push_back(range);
-        input.canonical_names.push_back(slots[i].name);
-        input.volume_numbers.push_back(static_cast<int>(slots[i].number));
+        input.part_paths[i] = range.path;
+        input.ranges[i] = range;
+        input.canonical_names[i] = slots[i].name;
         if (!input.missing_volume_number && slots[i].number != previous + 1)
             input.missing_volume_number = static_cast<int>(previous + 1);
         previous = slots[i].number;
@@ -1221,7 +1208,6 @@ int run_request(
     const std::wstring& codepage = request.codepage;
     const bool dry_run = request.dry_run;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
-    const std::vector<std::wstring>& part_paths = request.archive_input.part_paths;
     if (archive_path.empty() || (!dry_run && output_dir.empty())) {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
@@ -1292,14 +1278,16 @@ int run_request(
     auto* volume_replay = current_extraction_replay;
     WorkerArchiveInput selected_input;
     if (volume_trials) {
+        selected_input.open_mode = request.archive_input.open_mode;
+        selected_input.format_hint = request.archive_input.format_hint;
         auto& cursor = volume_replay->volumes;
         if (!cursor.started) {
             cursor.reserve(request.archive_input.volume_attempts);
             std::error_code error;
             const auto root = std::filesystem::path(win32_extended_path(output_dir));
-            cursor.output_owned = dry_run ||
+            const bool output_owned = dry_run ||
                 ((!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error);
-            if (!cursor.output_owned) {
+            if (!output_owned) {
                 print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
                     "\",\"status\":\"failed\",\"failure_stage\":\"output_prepare\",\"failure_kind\":\"output_filesystem\","
                     "\"message\":\"volume composition trials require an empty output directory\"}");

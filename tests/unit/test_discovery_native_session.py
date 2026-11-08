@@ -22,6 +22,29 @@ from sunpack.pipeline.coordinator.target_scan import (
 from tests.helpers.config_factory import make_config
 
 
+def test_shared_embedded_pages_preserve_root_and_candidate_order(monkeypatch):
+    from sunpack.pipeline.discovery.embedded import discovery
+
+    def scan_pages(groups, offset, limit):
+        jobs = [(group, index) for group, (_, batch) in enumerate(groups) for index in batch]
+        rows = {}
+        for group, index in jobs[offset:offset + limit]:
+            rows.setdefault(group, []).append(index)
+        return rows.items()
+
+    monkeypatch.setattr(discovery, "NativeEmbeddedBatch", type("Batch", (), {"scan_pages": staticmethod(scan_pages)}))
+    embedded = discovery.EmbeddedDiscovery(make_config())
+    monkeypatch.setattr(embedded, "_project_scan_rows", lambda result, table, rows, session: result.traces.extend(rows))
+    monkeypatch.setattr(embedded, "_resolve_native_volumes", lambda *args: None)
+    # Cross a root within page one, start page two inside that root, then
+    # start page three exactly at a root boundary. Empty roots keep their result.
+    scans = [(object(), range(count)) for count in (255, 0, 257, 2)]
+
+    results = embedded.discover_many_native(scans, None)
+
+    assert [result.traces for result in results] == [list(batch) for _, batch in scans]
+
+
 def test_independent_file_requests_keep_full_context_and_observe_disguised_volume_changes(tmp_path):
     """Guard the scope/freshness contract when optimizing repeated file requests.
 

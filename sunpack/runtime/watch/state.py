@@ -139,7 +139,6 @@ class WatchStateEntry:
     failure_stage: str = ""
     failure_payload: dict[str, Any] = field(default_factory=dict)
     last_attempt_at: float = 0.0
-    password_generation: int = 0
 
     def blocks(self, blocker: str) -> bool:
         return blocker in self.failure_payload.get("blockers", ())
@@ -1345,7 +1344,6 @@ class WatchStateStore:
         error: str = "",
         failure_payload: dict[str, Any] | None = None,
         source_group: dict | None = None,
-        password_generation: int | None = None,
     ) -> bool:
         """Publish a live blocker, or retire it when its source is already gone."""
         with self._state_lock:
@@ -1380,7 +1378,6 @@ class WatchStateStore:
                 failure_stage=str(payload.get("stage") or ""),
                 failure_payload=payload,
                 last_attempt_at=time.time(),
-                password_generation=self.password_generation if password_generation is None else password_generation,
             )
             self._commit_operations_locked([
                 self._put_operation("entries", key, entry),

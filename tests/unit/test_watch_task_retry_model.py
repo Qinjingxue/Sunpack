@@ -92,7 +92,6 @@ async def _complete(watcher, candidate, response):
         notification_id="request",
         candidate=candidate,
         task=asyncio.create_task(done()),
-        password_generation=watcher.state.password_generation,
         password_signature=watcher._password_signature_for_scope(os.path.dirname(candidate.path)),
         source_input_root=watcher._source_input_root_for(candidate.path),
     )
@@ -369,7 +368,6 @@ def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
 
         old_request = _ActivePipelineRequest(
             "old-request", _candidate(second), asyncio.create_task(old_pipeline()),
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(root)),
             source_input_root=str(root),
         )
@@ -400,7 +398,6 @@ def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
 
         new_request = _ActivePipelineRequest(
             "new-request", _candidate(second), asyncio.create_task(new_pipeline()),
-            password_generation=watcher.state.password_generation,
             password_signature=watcher._password_signature_for_scope(str(root)),
             source_input_root=str(root), deep_detect=invalidation == "deep_detect",
         )
@@ -683,7 +680,7 @@ def test_missing_file_exception_is_suppressed_only_for_departed_input(tmp_path, 
             raise FileNotFoundError(2, "input consumed", str(archive))
 
         request = _ActivePipelineRequest(notification_id="request", candidate=candidate,
-            task=asyncio.create_task(failed()), password_generation=watcher.state.password_generation,
+            task=asyncio.create_task(failed()),
             password_signature=watcher._password_signature_for_scope(str(root)),
             source_input_root=str(root))
         if departed:

@@ -8,6 +8,7 @@ to both long-running tests and diagnostic benchmark runs.
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import json
 import math
@@ -17,10 +18,11 @@ import threading
 import time
 import tracemalloc
 import zipfile
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import mean
-from typing import Any, Callable, Iterable
+from typing import Any, AsyncIterator, Callable, Iterable
 
 import psutil
 
@@ -96,10 +98,10 @@ def publish_files(
 
 def _watch_is_idle(watcher: WatchScheduler) -> bool:
     with watcher._lock:
-        return not watcher._inflight_requests and not watcher._completion_requests
+        return not watcher._inflight_requests and not watcher._completion_batches
 
 
-def drive_watch_until(
+async def drive_watch_until(
     watcher: WatchScheduler,
     condition: Callable[[], bool],
     *,
@@ -111,7 +113,7 @@ def drive_watch_until(
     deadline = time.perf_counter() + max(0.1, timeout_seconds)
     combined = WatchRunResult()
     while time.perf_counter() < deadline:
-        result = watcher.run_once()
+        result = await watcher.run_once()
         combined.processed += result.processed
         combined.succeeded += result.succeeded
         combined.failed += result.failed
@@ -119,16 +121,16 @@ def drive_watch_until(
         combined.errors.extend(result.errors)
         if condition() and watcher.pending_count == 0 and _watch_is_idle(watcher):
             return combined
-        time.sleep(max(0.0, poll_seconds))
+        await asyncio.sleep(poll_seconds)
     raise TimeoutError(
         "watch workload did not settle: "
         f"pending={watcher.pending_count}, "
         f"inflight={len(watcher._inflight_requests)}, "
-        f"completion={len(watcher._completion_requests)}"
+        f"completion={len(watcher._completion_batches)}"
     )
 
 
-def drive_watch_until_cache_cleanup(
+async def drive_watch_until_cache_cleanup(
     watcher: WatchScheduler,
     *,
     timeout_seconds: float = 30.0,
@@ -138,21 +140,17 @@ def drive_watch_until_cache_cleanup(
 
     deadline = time.perf_counter() + max(0.1, timeout_seconds)
     while time.perf_counter() < deadline:
-        watcher.run_once()
+        await watcher.run_once()
         with watcher._lock:
             active = bool(
                 watcher._pending
                 or watcher._inflight_requests
-                or watcher._completion_requests
+                or watcher._completion_batches
             )
             cleanup_pending = watcher._cache_cleanup_deadline is not None
-        engine_idle = True
-        is_idle = getattr(watcher.pipeline_engine, "is_idle", None)
-        if callable(is_idle):
-            engine_idle = bool(is_idle())
-        if not active and engine_idle and not cleanup_pending:
+        if not active and watcher.pipeline_engine.is_idle() and not cleanup_pending:
             return
-        time.sleep(max(0.0, poll_seconds))
+        await asyncio.sleep(poll_seconds)
     raise TimeoutError("watch cache cleanup did not settle")
 
 
@@ -172,43 +170,32 @@ class WatchMemoryHarness:
     watcher: WatchScheduler
 
     @classmethod
-    def create(
+    @asynccontextmanager
+    async def create(
         cls,
         root: Path,
         config: dict[str, Any],
         *,
         label: str = "watch-memory",
-    ) -> "WatchMemoryHarness":
+    ) -> AsyncIterator[WatchMemoryHarness]:
         base = root / label
         watch_root = base / "watch"
         output_root = base / "out"
         state_path = base / "state.snapshot"
         watch_root.mkdir(parents=True, exist_ok=True)
         output_root.mkdir(parents=True, exist_ok=True)
-        engine = PipelineEngine(config).start()
-        watcher = WatchScheduler(
-            config,
-            [str(watch_root)],
-            output_roots={str(watch_root): str(output_root)},
-            state_path=str(state_path),
-            pipeline_engine=engine,
-        )
-        return cls(watch_root, output_root, state_path, config, engine, watcher)
-
-    def close(self) -> None:
-        try:
-            self.watcher.stop()
-        finally:
-            completion_pool = getattr(self.watcher, "_completion_pool", None)
-            if completion_pool is not None and not getattr(completion_pool, "_shutdown", False):
-                completion_pool.shutdown(wait=True, cancel_futures=False)
-            self.engine.close()
-
-    def __enter__(self) -> "WatchMemoryHarness":
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        self.close()
+        async with PipelineEngine(config) as engine:
+            watcher = WatchScheduler(
+                config,
+                [str(watch_root)],
+                output_roots={str(watch_root): str(output_root)},
+                state_path=str(state_path),
+                pipeline_engine=engine,
+            )
+            try:
+                yield cls(watch_root, output_root, state_path, config, engine, watcher)
+            finally:
+                await watcher.aclose()
 
 
 def _children(process: psutil.Process) -> list[psutil.Process]:
@@ -304,15 +291,10 @@ def _state_stats(watcher: WatchScheduler, state_path: Path) -> dict[str, Any]:
 def _engine_stats(engine: PipelineEngine | None) -> dict[str, Any]:
     if engine is None:
         return {}
-    result: dict[str, Any] = {}
-    queue = getattr(engine, "_queue", None)
-    if queue is not None:
-        result["queue_size"] = int(queue.qsize())
-    dispatch_condition = getattr(engine, "_dispatch_condition", None)
-    if dispatch_condition is not None:
-        with dispatch_condition:
-            result["request_threads"] = len(getattr(engine, "_request_threads", ()))
-    return result
+    return {
+        "pending_jobs": engine.work_broker.pending_jobs,
+        "active_jobs": engine.work_broker.active_jobs,
+    }
 
 
 @dataclass(frozen=True)

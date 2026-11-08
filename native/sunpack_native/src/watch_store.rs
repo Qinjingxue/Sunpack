@@ -296,7 +296,6 @@ struct EntryRecord {
     failure_stage: String,
     failure_payload: Map<String, Value>,
     last_attempt_at: f64,
-    password_generation: i64,
 }
 
 impl EntryRecord {
@@ -1661,8 +1660,7 @@ mod tests {
                 "path":"c:\\input\\opaque.001", "size":1, "mtime":1.0,
                 "file_id":"", "change_usn":0, "status":"failed_password",
                 "last_error":"locked", "attempt_count":1, "failure_kind":"",
-                "failure_stage":"", "failure_payload":{}, "last_attempt_at":1.0,
-                "password_generation":0
+                "failure_stage":"", "failure_payload":{}, "last_attempt_at":1.0
             }))
             .unwrap();
             let key = path_key(&record.path);

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import time
 
 import pytest
 
@@ -45,7 +45,7 @@ def _watch_memory_config() -> dict:
 
 
 @pytest.mark.performance
-def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property):
+def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property, monkeypatch):
     """Measure long-lived watch growth at batch checkpoints and during idle time.
 
     The default workload is intentionally opt-in and can be scaled without a
@@ -57,14 +57,19 @@ def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property
     ``SUNPACK_WATCH_MEMORY_PAYLOAD_KIB`` (legacy override),
     ``SUNPACK_WATCH_MEMORY_INTERVAL_SECONDS`` (default 0.2), and
     ``SUNPACK_WATCH_MEMORY_TIMEOUT_SECONDS`` (default 90).
-    ``SUNPACK_WATCH_MEMORY_MAX_ACTIVE_PIPELINES`` can be set to 1 to
-    exclude Windows output contention from a run.
 
     The detailed JSON report includes RSS, private memory, child processes,
     reader cache, global cache namespaces, archive sessions, inspection cache,
     watch state, engine queues, handles, and threads at every checkpoint.
     """
+    from sunpack.runtime.watch import scheduler
 
+    # The harness delivers arrivals directly, without an installed Watch Broker.
+    monkeypatch.setattr(scheduler, "validate_ntfs_watch_roots", lambda _roots: None)
+    asyncio.run(_run_watch_memory_growth(tmp_path, record_property))
+
+
+async def _run_watch_memory_growth(tmp_path, record_property):
     batches = env_int("SUNPACK_WATCH_MEMORY_BATCHES", 4)
     files_per_batch = env_int("SUNPACK_WATCH_MEMORY_FILES_PER_BATCH", 2)
     if "SUNPACK_WATCH_MEMORY_PAYLOAD_KIB" in os.environ:
@@ -92,7 +97,7 @@ def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property
     total_files = batches * files_per_batch
     corpus_root = tmp_path / "corpus"
 
-    with WatchMemoryHarness.create(tmp_path, _watch_memory_config()) as harness:
+    async with WatchMemoryHarness.create(tmp_path, _watch_memory_config()) as harness:
         sampler = WatchMemorySampler(
             watcher=harness.watcher,
             engine=harness.engine,
@@ -122,7 +127,7 @@ def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property
                     source.unlink()
                 published_count += len(published)
                 expected_outputs = published_count
-                result = drive_watch_until(
+                result = await drive_watch_until(
                     harness.watcher,
                     lambda expected=expected_outputs: count_output_files(
                         harness.output_root, "payload-*.txt"
@@ -137,14 +142,14 @@ def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property
                     label=f"after_batch_{batch + 1}",
                 )
                 if settle_seconds:
-                    time.sleep(settle_seconds)
+                    await asyncio.sleep(settle_seconds)
                 sampler.sample(
                     files_seen=published_count,
                     completed_files=completed,
                     label=f"idle_batch_{batch + 1}",
                 )
                 if cleanup_wait_seconds:
-                    drive_watch_until_cache_cleanup(
+                    await drive_watch_until_cache_cleanup(
                         harness.watcher,
                         timeout_seconds=max(timeout, cleanup_wait_seconds + 5.0),
                     )
@@ -159,16 +164,17 @@ def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property
         finally:
             sampler.stop()
 
-        # Capture the release boundary separately from the warm idle curve.
-        harness.close()
-        sampler.sample(
-            files_seen=published_count,
-            completed_files=published_count,
-            label="after-engine-close",
-        )
-        report = sampler.report()
-        report_path = tmp_path / "watch-memory-report.json"
-        report_path.write_text(sampler.json_report(), encoding="utf-8")
+    # Capture the release boundary separately from the warm idle curve.
+    sampler.watcher = sampler.engine = None
+    del harness
+    sampler.sample(
+        files_seen=published_count,
+        completed_files=published_count,
+        label="after-engine-close",
+    )
+    report = sampler.report()
+    report_path = tmp_path / "watch-memory-report.json"
+    report_path.write_text(sampler.json_report(), encoding="utf-8")
 
     record_property("watch_memory_summary", json.dumps(report, ensure_ascii=False))
     record_property("watch_memory_report", str(report_path))

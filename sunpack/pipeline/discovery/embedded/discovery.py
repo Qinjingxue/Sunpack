@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import replace
 import os
 from typing import Any
@@ -52,10 +53,23 @@ class EmbeddedDiscovery:
 
     def discover_many_native(self, scans, session) -> list[StageResult]:
         results = [StageResult() for _ in scans]
-        for offset in range(0, sum(len(batch) for _, batch in scans), 256):
-            for group, rows in NativeEmbeddedBatch.scan_pages(scans, offset, 256):
-                table, _ = scans[group]
-                self._project_scan_rows(results[group], table, rows, session)
+        groups, ends = [], []
+        total = 0
+        for index, (_, batch) in enumerate(scans):
+            if count := len(batch):
+                total += count
+                groups.append(index)
+                ends.append(total)
+        page_size = 256
+        for offset in range(0, total, page_size):
+            first = bisect_right(ends, offset)
+            last = bisect_left(ends, min(offset + page_size, total), lo=first)
+            page_groups = groups[first:last + 1]
+            page = [scans[index] for index in page_groups]
+            local_offset = offset - (ends[first - 1] if first else 0)
+            for group, rows in NativeEmbeddedBatch.scan_pages(page, local_offset, page_size):
+                index = page_groups[group]
+                self._project_scan_rows(results[index], scans[index][0], rows, session)
         for (table, batch), result in zip(scans, results):
             self._resolve_native_volumes(result, table, batch, session)
         return results

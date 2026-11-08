@@ -35,7 +35,7 @@ pub(super) struct VolumeAssignment {
 
 pub(super) struct BucketView<'a> {
     pub(super) rows: &'a [RelationInput],
-    pub(super) indexes: Vec<usize>,
+    pub(super) indexes: &'a [usize],
     pub(super) facts: &'a HashMap<usize, StructuralFacts>,
     pub(super) features: &'a HashMap<usize, NameFeatures>,
     pub(super) format: &'a str,
@@ -120,7 +120,7 @@ impl BucketView<'_> {
     fn fixed(&self) -> Result<VolumeAssignment, RelationFailureReason> {
         let mut out = VolumeAssignment::default();
         let terminal = self.terminal();
-        for &i in &self.indexes {
+        for &i in self.indexes {
             let f = &self.facts[&i];
             if let Some(n) = f.exact_slot {
                 if !self.legal(i, n, terminal) || out.slots.insert(n, i).is_some() {
@@ -165,7 +165,7 @@ impl BucketView<'_> {
 
     fn name_terminal(&self, profile: &NameProfile<'_>) -> Option<u32> {
         let mut terminal = None;
-        for &i in &self.indexes {
+        for &i in self.indexes {
             if self.facts[&i].has_next != Some(false) {
                 continue;
             }
@@ -469,7 +469,7 @@ impl BucketView<'_> {
                 // conflicts. The attempt planner retains the competing slot domains.
                 return (
                     VolumeAssignment {
-                        unresolved: self.indexes.clone(),
+                        unresolved: self.indexes.to_vec(),
                         ..Default::default()
                     },
                     Some(reason),
@@ -652,7 +652,7 @@ pub(super) fn resolve_buckets(
             }
             let structural_only = BucketView {
                 rows,
-                indexes: members.clone(),
+                indexes: &members,
                 facts: &facts,
                 features: &features,
                 format,
@@ -752,7 +752,7 @@ pub(super) fn resolve_buckets(
                     for indexes in local.into_values() {
                         let view = BucketView {
                             rows,
-                            indexes: indexes.clone(),
+                            indexes: &indexes,
                             facts: &facts,
                             features: &features,
                             format,
@@ -820,7 +820,7 @@ pub(super) fn resolve_buckets(
                     rows,
                     loose_numeric_allowed: !competing_families
                         && indexes.iter().filter(|i| head_indexes.contains(i)).count() == 1,
-                    indexes,
+                    indexes: &indexes,
                     facts: &facts,
                     features: &features,
                     format,
@@ -831,7 +831,7 @@ pub(super) fn resolve_buckets(
                     } else if competing_families {
                         (
                             VolumeAssignment {
-                                unresolved: view.indexes.clone(),
+                                unresolved: view.indexes.to_vec(),
                                 ..Default::default()
                             },
                             Some(RelationFailureReason::AmbiguousVolumeMapping),

@@ -346,6 +346,7 @@ pub(super) fn expand_carrier_sources(
 }
 
 pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidation> {
+    let spanned = view.spanned();
     let mut heads: Vec<_> = view
         .indexes
         .iter()
@@ -384,7 +385,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         };
         let local = BucketView {
             rows: view.rows,
-            indexes: indexes.clone(),
+            indexes: &indexes,
             facts: view.facts,
             features: view.features,
             format: view.format,
@@ -486,8 +487,20 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             if terminals.is_empty() {
                 terminals.push(None);
             }
+            let width_numbers: HashSet<_> = if channel.is_none() {
+                indexes
+                    .iter()
+                    .filter_map(|i| view.features.get(i))
+                    .flat_map(|f| f.numbers.iter())
+                    .filter(|n| profile.active(n))
+                    .map(|n| n.value)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let head_parent = Path::new(&view.rows[head].path).parent();
             for candidate_terminal in terminals {
-                let fixed: BTreeMap<u32, Vec<usize>> = fixed
+                let mut slots: BTreeMap<_, _> = fixed
                     .iter()
                     .filter_map(|(&n, choices)| {
                         let choices: Vec<_> = choices
@@ -495,13 +508,10 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                             .copied()
                             .filter(|i| view.legal(*i, n, candidate_terminal))
                             .collect();
-                        (!choices.is_empty()).then_some((n, choices))
+                        (!choices.is_empty()).then(|| (n, Arc::new(choices)))
                     })
                     .collect();
-                let mut slots: BTreeMap<_, _> = fixed
-                    .iter()
-                    .map(|(&n, choices)| (n, Arc::new(choices.clone())))
-                    .collect();
+                let fixed_numbers: HashSet<_> = slots.keys().copied().collect();
                 for &i in &indexes {
                     if view.facts[&i].exact_slot.is_some() {
                         continue;
@@ -511,7 +521,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     .then_some(candidate_terminal)
                     .flatten();
                     for n in numbers[&i].iter().copied().chain(unnamed_terminal) {
-                        if view.legal(i, n, candidate_terminal) && !fixed.contains_key(&n) {
+                        if view.legal(i, n, candidate_terminal) && !fixed_numbers.contains(&n) {
                             Arc::make_mut(slots.entry(n).or_default()).push(i);
                         }
                     }
@@ -549,24 +559,14 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 if slots.len() < 2 {
                     continue;
                 }
-                let width_numbers: HashSet<_> = if channel.is_none() {
-                    indexes
-                        .iter()
-                        .filter_map(|i| view.features.get(i))
-                        .flat_map(|f| f.numbers.iter())
-                        .filter(|n| profile.active(n))
-                        .map(|n| n.value)
-                        .collect()
-                } else {
-                    HashSet::new()
-                };
                 let mut ordered_domains = HashMap::new();
                 for (&number, choices) in &mut slots {
+                    let fixed = fixed_numbers.contains(&number);
                     let key = (
                         Arc::as_ptr(choices),
                         number == 1,
                         candidate_terminal == Some(number),
-                        fixed.contains_key(&number),
+                        fixed,
                         width_numbers.contains(&number).then_some(number),
                     );
                     if let Some((_, ordered)) = ordered_domains.get(&key) {
@@ -576,7 +576,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     // Consume one domain at a time: never retain G copies of
                     // U gap members while sorting/interning.
                     let mut ordered = (**choices).clone();
-                    if channel.is_none() && !fixed.contains_key(&number) {
+                    if channel.is_none() && !fixed {
                         // Structurally owned unnamed members remain candidates.
                         ordered.extend(indexes.iter().copied().filter(|i| {
                             view.facts[i].owned
@@ -586,8 +586,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     }
                     ordered.sort_by(|a, b| {
                         let local = |i: &usize| {
-                            Path::new(&view.rows[*i].path).parent()
-                                == Path::new(&view.rows[head].path).parent()
+                            Path::new(&view.rows[*i].path).parent() == head_parent
                         };
                         let width = |i: &usize| {
                             view.features
@@ -618,7 +617,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     *choices = ordered;
                 }
                 if channel.is_some()
-                    && (view.format == "7z" || (view.format == "zip" && !view.spanned()))
+                    && (view.format == "7z" || (view.format == "zip" && !spanned))
                     && slots.keys().copied().zip(1u32..).any(|(n, rank)| n != rank)
                 {
                     let represented: HashSet<_> =
@@ -738,7 +737,6 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             .collect();
         let assignment = VolumeAssignment {
             slots: BTreeMap::from([(1, head)]),
-            unresolved: sources.iter().copied().filter(|i| *i != head).collect(),
             ..Default::default()
         };
         let mut proposal = materialize(view, assignment, logical, None).unwrap();
@@ -753,7 +751,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         let head_anchor = view.rows[head].anchor.as_ref().unwrap();
         let (head_size_from_total, minimum_size, trim_head) =
             head_geometry(head_anchor, view.format);
-        let tail_totals = if trim_head && view.format == "zip" && !view.spanned() {
+        let tail_totals = if trim_head && view.format == "zip" && !spanned {
             sources
                 .iter()
                 .enumerate()

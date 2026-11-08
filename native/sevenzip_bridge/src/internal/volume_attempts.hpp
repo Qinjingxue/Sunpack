@@ -88,7 +88,7 @@ struct VolumeAttemptCursor {
     std::vector<unsigned char> used;
     std::vector<unsigned long long> remaining, suffix_capacity;
     std::vector<std::size_t> domain_remaining, shared_domains;
-    bool started = false, discard_pending = false, output_owned = false;
+    bool started = false, discard_pending = false;
     void reserve(const VolumeAttemptPlan& plan) {
         const auto maximum = plan.variation.size();
         digits.reserve(maximum); selected.reserve(maximum);
