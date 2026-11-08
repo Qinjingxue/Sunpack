@@ -11,14 +11,14 @@ namespace {
 // the existing presentation clock, including the popup's background/border.
 // A widget opacity layer alone would leave an opaque window flashing behind it.
 class PopupSurface final : public ui::Widget {
-    HWND hwnd_;
+    ui::UiWindowImpl& window_; // This wrapper belongs to the window's root tree.
     int alpha_=-1;
 public:
-    explicit PopupSurface(HWND hwnd) : hwnd_(hwnd) { id = "datePopupSurface"; }
+    explicit PopupSurface(ui::UiWindowImpl& window) : window_(window) { id = "datePopupSurface"; }
     void DrawTree(ui::Renderer& renderer) override {
         int alpha=int(std::clamp(opacity,0.0f,1.0f)*255);
         if(alpha!=alpha_) {
-            SetLayeredWindowAttributes(hwnd_,0,BYTE(alpha),LWA_ALPHA);
+            window_.SetWindowAlpha(BYTE(alpha));
             alpha_=alpha;
         }
         for(auto& child:Children()) child->DrawTree(renderer);
@@ -49,12 +49,11 @@ void popup(UiWindow handle, bool opening, std::function<void()> complete) {
     if(!window || !window->Root()) { if(complete) complete(); return; }
     auto* surface = dynamic_cast<PopupSurface*>(window->Root().get());
     if(!surface) {
-        auto frame=std::make_shared<PopupSurface>(window->Handle());
+        auto frame=std::make_shared<PopupSurface>(*window);
         auto contents=window->Root();
         frame->opacity=opening?0.0f:1.0f;
         frame->AddChild(contents);
-        SetWindowLongPtrW(window->Handle(),GWL_EXSTYLE,GetWindowLongPtrW(window->Handle(),GWL_EXSTYLE)|WS_EX_LAYERED);
-        SetLayeredWindowAttributes(window->Handle(),0,opening?0:255,LWA_ALPHA);
+        window->SetWindowAlpha(opening?0:255);
         surface=frame.get();
         window->SetRoot(std::move(frame));
     }

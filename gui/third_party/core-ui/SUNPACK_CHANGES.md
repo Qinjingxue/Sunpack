@@ -11,6 +11,18 @@ preserved.
 
 Local changes:
 
+- Gate startup reveal on a successful render-thread Present, rather than a
+  completed display list or skipped hidden frame. Show at alpha zero before
+  submitting, retaining the hidden-HWND AMD Present guard. Normal, maximized,
+  animated and deferred-commit paths carry a globally unique show token; hide,
+  close and recycled HWNDs cannot accept an earlier completion. Host-owned
+  window alpha uses SetWindowAlpha so popup animation cannot bypass the gate or
+  lose its layered style. A startup DeviceFailure uses the existing close
+  callback instead of leaving an invisible retry loop, notifying the host via
+  onRenderFailure so it can report the error outside the unpresented window;
+  this also cancels opening for transient device failures. RecreateTarget keeps
+  the existing device recovery path. Windows/GPU validation remains required.
+
 - Let nested ScrollViews and multi-line text areas pass outward wheel input
   to their existing ancestor route at the top/bottom boundary. ScrollViews
   retain input until their presented view reaches the physical edge. Preserve

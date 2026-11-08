@@ -5,6 +5,7 @@
 #include "motion.hpp"
 #include "tag_collection.hpp"
 #include "ui_defaults_json.h"
+#include "registry_fixture.hpp"
 #include <cassert>
 #include <iostream>
 #include <dwmapi.h>
@@ -19,6 +20,8 @@
 #include <ui/overlay_service.h>
 using namespace spg;
 void rendering_contracts();
+int theme_contracts(int argc,wchar_t** argv);
+int startup_failure_contract();
 namespace {
 void caret_blink_contracts() {
     // The engine follows Windows, including the no-blink (INFINITE) policy.
@@ -1981,6 +1984,9 @@ void directory_selection(Application& app,const fs::path& dir) {
 int wmain(int argc,wchar_t** argv) {
     _set_error_mode(_OUT_TO_STDERR);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    if(argc==2 && std::wstring(argv[1])==L"--startup-failure") return startup_failure_contract();
+    if((argc==2 && std::wstring(argv[1])==L"--theme") ||
+       (argc==6 && std::wstring(argv[1])==L"--theme-session")) return theme_contracts(argc,argv);
     if(argc>1 && std::wstring(argv[1])==L"--fake-cli") {
         Json args=Json::array(); for(int i=3;i<argc;++i) args.push_back(utf8(argv[i])); atomic_write(fs::current_path()/"cli-arguments.json",args.dump());
         if(args==Json::array({"config","validate","--scan-rule-stdin","--json"})) {
@@ -2004,6 +2010,7 @@ int wmain(int argc,wchar_t** argv) {
     const bool historyOnly=argc==2 && std::wstring(argv[1])==L"--history";
     const auto expected_fields=config_fields(parse_json(kUiDefaultsJson),kUiDefaultsJson).size();
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    RegistryFixture registry;
     auto dir=fs::temp_directory_path()/(L"sunpack-gui-ui-"+std::to_wstring(GetCurrentProcessId())); fs::create_directory(dir);
     auto gate_name=L"Local\\SunPack.GUI.TestCommand."+std::to_wstring(GetCurrentProcessId());
     Handle gate(CreateEventW(nullptr,TRUE,TRUE,gate_name.c_str()));

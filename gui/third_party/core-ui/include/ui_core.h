@@ -196,6 +196,8 @@ UI_API void ui_trace_set_sink(UiTraceSink sink, void* userdata);
 /* ------------------------------------------------------------------ */
 UI_API UiWindow ui_window_create(const UiWindowConfig* config);
 UI_API void     ui_window_destroy(UiWindow win);
+/* Show requests reveal after the message loop receives a successful first
+ * presentation. "Immediate" skips the opening animation, not this frame gate. */
 UI_API void     ui_window_show(UiWindow win);
 UI_API void     ui_window_show_immediate(UiWindow win);  /* 跳过开场动画 */
 UI_API void     ui_window_show_immediate_no_activate(UiWindow win);  /* 显示但不抢键盘焦点 */

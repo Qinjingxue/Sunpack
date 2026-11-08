@@ -77,3 +77,49 @@ def test_installer_initializes_language_before_context_menu_registration(repo_ro
     assert prepare.index("InitializeLanguageOnInstall := not FileExists(") < prepare.index(
         "UpgradeConfigurationFields"
     ) < prepare.index("RemoveMachinePath(ExistingApplicationDirectory)")
+    # GUI preferences belong to HKCU, not to the shared configuration migration.
+    # Only uninstall may remove them, through the original desktop-user helper
+    # rather than the elevated installer's possibly different HKCU.
+    install, uninstall = installer.split("procedure CurUninstallStepChanged", 1)
+    assert "RemoveGuiPreferences" not in install
+    assert "RunInstallerIntegration('RemoveGuiPreferences', ResultCode)" in uninstall
+    integration = (repo_root / "installer/integration.ps1").read_text(encoding="utf-8")
+    assert integration.index("exit (Invoke-AsShellUser $Action)") < integration.index("switch ($Action)")
+    assert "'RemoveGuiPreferences' { Remove-Registration 'HKCU:\\Software\\SunPack\\GUI' }" in integration
+
+
+def test_uninstall_removes_only_gui_preferences(tmp_path, repo_root):
+    # The GUI registry tests do not execute the uninstall helper. Run its real
+    # shell-user action against a unique test key and retain a sibling value.
+    powershell = shutil.which("powershell.exe")
+    if not powershell:
+        pytest.skip("Requires Windows PowerShell (installer runtime)")
+    import uuid
+    import winreg
+
+    path = "Software\\SunPackInstallerTests\\" + uuid.uuid4().hex
+    script = (repo_root / "installer/integration.ps1").read_text(encoding="utf-8")
+    target = "HKCU:\\Software\\SunPack\\GUI"
+    assert script.count(target) == 1
+    helper = tmp_path / "integration.ps1"
+    helper.write_text(script.replace(target, "HKCU:\\" + path + "\\GUI"), encoding="utf-8-sig")
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, path) as key:
+            winreg.SetValueEx(key, "Keep", 0, winreg.REG_DWORD, 1)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, path + "\\GUI") as key:
+            winreg.SetValueEx(key, "Theme", 0, winreg.REG_DWORD, 2)
+        command = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                   "-File", str(helper), "-Action", "RemoveGuiPreferences", "-ShellUser"]
+        for _ in range(2):  # Already absent preferences must not fail uninstall.
+            result = subprocess.run(command, capture_output=True, text=True)
+            assert result.returncode == 0, result.stdout + result.stderr
+        with pytest.raises(FileNotFoundError):
+            winreg.OpenKey(winreg.HKEY_CURRENT_USER, path + "\\GUI")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+            assert winreg.QueryValueEx(key, "Keep")[0] == 1
+    finally:
+        for key in (path + "\\GUI", path):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
+            except FileNotFoundError:
+                pass

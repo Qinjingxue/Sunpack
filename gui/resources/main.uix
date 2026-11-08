@@ -949,6 +949,7 @@ export default {
             <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startupEnabled?'startupDisable':'startupEnable'})">{{ startupEnabled?texts.startupOff:texts.startupOn }}</button>
           </div>
           <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label id="theme-title" class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" class="selector-host"/></div>
+          <label id="theme-error" v-show="showThemeSetting &amp;&amp; saveErrors['@theme']" class="error">{{ errorText(saveErrors['@theme']) }}</label>
           <div id="contextMenuSetting" v-show="showContextMenuSetting" class="card settings-row">
             <div class="setting-copy"><label id="context-menu-title" class="setting-title">{{ texts.contextMenu }}</label></div>
             <button id="contextMenuToggle" :enabled="cliAllowed &amp;&amp; !busy" @click="send('contextMenu',{enabled:!contextMenuEnabled})">{{ contextMenuAction }}</button>

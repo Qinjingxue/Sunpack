@@ -1,11 +1,125 @@
+#include <ui_core.h>
 #include <ui/renderer.h>
 #include <ui/display_list.h>
+#include <ui/render_thread.h>
+#include <ui/ui_context.h>
+#include <ui/ui_window.h>
 #include <cassert>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 
 namespace {
+bool transparent(HWND hwnd) {
+    BYTE alpha=255; DWORD flags=0;
+    return GetLayeredWindowAttributes(hwnd,nullptr,&alpha,&flags) &&
+        (flags&LWA_ALPHA) && alpha==0;
+}
+MSG startup_completion(HWND hwnd, WPARAM afterToken=0) {
+    const auto deadline=GetTickCount64()+5000;
+    for(;;) {
+        MSG message{};
+        while(PeekMessageW(&message,hwnd,0,0,PM_REMOVE)) {
+            if(message.message==ui::kUiCoreStartupPresentedMessage && message.wParam>afterToken) return message;
+            TranslateMessage(&message); DispatchMessageW(&message);
+        }
+        const auto now=GetTickCount64();
+        if(now>=deadline) throw std::runtime_error("No presented startup frame");
+        MsgWaitForMultipleObjectsEx(0,nullptr,DWORD(deadline-now),QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+    }
+}
+void startup_present_contracts() {
+    // Final screenshots cannot detect revealing an unpresented buffer. Hold the
+    // real render completion in the UI queue and inspect HWND alpha before/after
+    // dispatch, including a stale completion from an interrupted show attempt.
+    assert(ui_init()==0);
+    UiWindowConfig config{};
+    config.title=L"SunPack startup check";
+    config.width=240; config.height=180; config.tool_window=1;
+    config.skip_animation=1;
+    auto handle=ui_window_create(&config); assert(handle);
+    auto* window=ui::GetContext().GetWindow(handle); assert(window);
+    auto hwnd=window->Handle();
+    window->SetRoot(std::make_shared<ui::Widget>());
+    window->ShowImmediate(false);
+    assert(IsWindowVisible(hwnd) && transparent(hwnd));
+    window->ShowImmediate(false); // An explicit retry stays behind the same gate.
+    assert(transparent(hwnd));
+    auto stale=startup_completion(hwnd);
+    assert(transparent(hwnd));
+    window->Hide();
+    DispatchMessageW(&stale);
+    assert(!IsWindowVisible(hwnd) && transparent(hwnd));
+    window->ShowImmediate(false);
+    auto presented=startup_completion(hwnd,stale.wParam);
+    assert(presented.wParam!=stale.wParam && transparent(hwnd));
+    DispatchMessageW(&stale);
+    assert(transparent(hwnd));
+    DispatchMessageW(&presented);
+    assert(IsWindowVisible(hwnd) && !(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_LAYERED));
+    window->ShowImmediate(false); // Already shown must not become transparent.
+    assert(!(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_LAYERED));
+
+    window->Hide();
+    window->Show();
+    presented=startup_completion(hwnd,presented.wParam);
+    assert(transparent(hwnd)); // Open-animation timer cannot reveal early.
+    DispatchMessageW(&presented);
+    window->Hide(); // Cancel the animation and its already posted timer message.
+    window->ShowImmediate(false);
+    presented=startup_completion(hwnd,presented.wParam);
+    assert(transparent(hwnd));
+    DispatchMessageW(&presented);
+    assert(!(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_LAYERED));
+
+    window->Hide();
+    window->startMaximizedPending_=true;
+    window->PrepareRT();
+    window->ShowImmediate(false);
+    assert(IsZoomed(hwnd) && transparent(hwnd));
+    presented=startup_completion(hwnd,presented.wParam);
+    DispatchMessageW(&presented);
+    assert(IsZoomed(hwnd) && !(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_LAYERED));
+
+    window->Hide();
+    window->SetWindowAlpha(0);
+    window->ShowImmediate(false);
+    window->SetWindowAlpha(128); // Same operation used by popup DrawTree.
+    assert(transparent(hwnd));
+    presented=startup_completion(hwnd,presented.wParam);
+    DispatchMessageW(&presented);
+    BYTE alpha=0; DWORD flags=0;
+    assert(GetLayeredWindowAttributes(hwnd,nullptr,&alpha,&flags) && alpha==128);
+    window->SetWindowAlpha(255);
+    assert(GetLayeredWindowAttributes(hwnd,nullptr,&alpha,&flags) && alpha==255);
+
+    window->Hide();
+    window->ShowImmediate(false);
+    presented=startup_completion(hwnd,presented.wParam);
+    bool closed=false,reported=false;
+    window->onRenderFailure=[&] { reported=true; };
+    window->onClose=[&] { closed=true; };
+    auto failed=presented;
+    failed.message=ui::kUiCoreStartupFailedMessage;
+    DispatchMessageW(&failed); // Deterministic fatal-result handler injection.
+    assert(reported && closed && !IsWindow(hwnd));
+
+    handle=ui_window_create(&config); assert(handle);
+    window=ui::GetContext().GetWindow(handle); hwnd=window->Handle();
+    window->SetRoot(std::make_shared<ui::Widget>());
+    window->ShowImmediate(false);
+    presented.hwnd=hwnd; // Simulate reuse of the old HWND by a new window.
+    DispatchMessageW(&presented);
+    assert(transparent(hwnd));
+    // Close while the render thread owns the first frame. Destruction must not
+    // wait for reveal, resurrect the HWND, or leak its render registration.
+    ui_window_destroy(handle);
+    assert(!IsWindow(hwnd) && ui::RenderThread::Instance().RegisteredWindowCount()==0);
+    ui_shutdown();
+    MSG quit{};
+    while(PeekMessageW(&quit,nullptr,WM_QUIT,WM_QUIT,PM_REMOVE)) {}
+}
+
 struct Surface {
     HWND hwnd=nullptr;
     ui::Renderer renderer;
@@ -99,6 +213,48 @@ ui::DisplayList scene(Surface& surface,int step) {
 // One end-to-end pixel oracle: optimized partial frames versus fresh full
 // replay, including alternating buffers, fractional motion, alpha and lifecycle.
 void rendering_contracts() {
+    startup_present_contracts();
+    // Hidden and prepared buffers must not masquerade as actual presentation.
+    // This also exercises the hidden-HWND Present guard on the real driver.
+    auto hidden=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED,L"STATIC",L"Prepared frame check",
+        WS_POPUP,20,20,120,80,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    assert(hidden && SetLayeredWindowAttributes(hidden,0,0,LWA_ALPHA));
+    {
+        ui::RenderWindow target({1,1},hidden);
+        auto frame=[&](bool defer) {
+            ui::FrameJob job; job.window={1,1}; job.hwnd=hidden;
+            job.width_px=120; job.height_px=80; job.defer_present=defer;
+            ui::DisplayListRecorder list;
+            list.Clear(D2D1::ColorF(0x202020)); job.display_list=list.Finish();
+            return job;
+        };
+        auto skipped=frame(false);
+        assert(target.RenderFrame(skipped)==ui::RenderFrameResult::Skipped);
+        assert(target.PresentPrepared(true)==ui::RenderFrameResult::Skipped);
+        ShowWindow(hidden,SW_SHOWNOACTIVATE);
+        auto prepared=frame(true);
+        assert(target.RenderFrame(prepared)==ui::RenderFrameResult::Prepared);
+        assert(target.PresentPrepared(true)==ui::RenderFrameResult::Presented);
+    }
+    {
+        auto& thread=ui::RenderThread::Instance();
+        const ui::RenderWindowId id{12345,1};
+        thread.Start(); thread.RegisterWindow(id,hidden);
+        ui::FrameJob job; job.window=id; job.hwnd=hidden; job.generation=1;
+        job.width_px=120; job.height_px=80; job.defer_present=true;
+        job.render_thread_present=true; job.startup_reveal=123;
+        ui::DisplayListRecorder list; list.Clear(D2D1::ColorF(0x202020));
+        job.display_list=list.Finish(); thread.Submit(std::move(job));
+        assert(thread.WaitForGeneration(id.window_id,1,5000));
+        MSG message{};
+        assert(!PeekMessageW(&message,hidden,ui::kUiCoreStartupPresentedMessage,
+            ui::kUiCoreStartupPresentedMessage,PM_REMOVE));
+        assert(thread.PresentPrepared(id,true,5000,123));
+        assert(PeekMessageW(&message,hidden,ui::kUiCoreStartupPresentedMessage,
+            ui::kUiCoreStartupPresentedMessage,PM_REMOVE) && message.wParam==123);
+        thread.UnregisterWindow(id); thread.Stop();
+    }
+    DestroyWindow(hidden);
     Surface actual(20),reference(700);
     // Existing frame-damage scenes have no find ranges. Check shaped UTF-16
     // ranges, both colors, clipped active hits, and record/replay in one scene.

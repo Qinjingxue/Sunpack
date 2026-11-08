@@ -16,6 +16,7 @@
 #include <wrl/client.h>
 #include <wincodec.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cmath>
 #include <unordered_set>
@@ -81,7 +82,6 @@ static void StampDomMouseState(MouseEvent& e, int button = -1);
 #endif
 
 namespace {
-constexpr UINT kMsgStartupReveal = WM_APP + 101;
 constexpr UINT kMsgRenderFrame = WM_APP + 130;
 constexpr UINT kMsgRenderDeviceLost = kUiCoreRenderDeviceLostMessage;
 constexpr UINT_PTR kCaretBlinkTimerId = 0xCA11;
@@ -381,6 +381,44 @@ static bool MaximizedWorkRect(HWND hwnd, RECT& out) {
     return true;
 }
 
+void UiWindowImpl::SetWindowAlpha(BYTE alpha) {
+    customWindowAlpha_ = true;
+    windowAlpha_ = alpha;
+    if (!hwnd_ || startupRevealPending_) return;
+    EnsureLayeredForAlpha(hwnd_);
+    SetLayeredWindowAttributes(hwnd_, 0, alpha, LWA_ALPHA);
+}
+
+bool UiWindowImpl::BeginStartupReveal(bool animate, bool activate) {
+    // Repeated show requests must not make an already visible window transparent
+    // again, or restart a first frame that is still in flight. PrepareRT may
+    // already have shown a maximized HWND at alpha 0, including after Hide().
+    BYTE alpha = 255;
+    DWORD flags = 0;
+    const bool transparent = GetLayeredWindowAttributes(hwnd_, nullptr, &alpha, &flags) &&
+                             (flags & LWA_ALPHA) && alpha == 0;
+    if (IsWindowVisible(hwnd_) && !IsIconic(hwnd_) &&
+        (startupRevealPending_ || windowAnimating_ || !transparent)) {
+        if (startupRevealPending_) {
+            startupRevealActivate_ = startupRevealActivate_ || activate;
+            // An explicit repeat is also a retry after a skipped frame.
+            RequestRenderFrame(FrameReason::Startup, PresentPolicy::Immediate);
+        } else if (activate && !toolWindow_) {
+            BringWindowToTop(hwnd_);
+            SetForegroundWindow(hwnd_);
+        }
+        return false;
+    }
+    EnsureLayeredForAlpha(hwnd_);
+    SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
+    static std::atomic<uint64_t> nextShowToken{0};
+    startupRevealToken_ = ++nextShowToken; // Also rejects recycled HWND messages.
+    startupRevealPending_ = true;
+    startupRevealAnimate_ = animate && !customWindowAlpha_;
+    startupRevealActivate_ = activate;
+    return true;
+}
+
 void UiWindowImpl::Show() {
     if (!hwnd_) return;
 
@@ -410,10 +448,7 @@ void UiWindowImpl::Show() {
     DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED,
                           &disableTransitions, sizeof(disableTransitions));
 
-    EnsureLayeredForAlpha(hwnd_);
-
-    startupRevealPending_ = false;
-    startupRevealPosted_ = false;
+    if (!BeginStartupReveal(!preMaximized, true)) return;
 
     if (preMaximized) {
         /* 最大化路径：不走 slide 动画。
@@ -430,15 +465,11 @@ void UiWindowImpl::Show() {
             SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
+        // Visible to DXGI before rendering, still transparent to the user.
+        ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
         RefreshClientSizeCache();
         LayoutRoot();
-        SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
-        ValidateRect(hwnd_, nullptr);
-        /* 直接以最大化态显示，不走 slide 动画 */
-        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
-        ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
-        ClearLayeredAfterAlpha(hwnd_);
-        if (!toolWindow_) SetForegroundWindow(hwnd_);
+        FlushRenderFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
         return;
     }
 
@@ -446,13 +477,10 @@ void UiWindowImpl::Show() {
     SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_,
                  (int)windowTargetWidth_, (int)windowTargetHeight_,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     RefreshClientSizeCache();
-
     LayoutRoot();
-    SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
-    ValidateRect(hwnd_, nullptr);
-
-    StartWindowOpenAnimation();
+    FlushRenderFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
 }
 
 void UiWindowImpl::PrepareRT() {
@@ -519,6 +547,7 @@ void UiWindowImpl::ShowImmediate(bool activate) {
      * 即最大化态. argv 启动 (文件关联) + 上次最大化关闭场景下用. */
     bool startMax = startMaximizedPending_;
     startMaximizedPending_ = false;
+    if (!BeginStartupReveal(false, activate)) return;
 
     if (!framePrepared_) {
         /* 未经 PrepareRT 的直接 show: 仍需 FRAMECHANGED 触发 NCCALCSIZE
@@ -526,29 +555,17 @@ void UiWindowImpl::ShowImmediate(bool activate) {
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
+    // Hidden HWNDs must never Present1 (AMD can deadlock). Showing at alpha 0
+    // lets the render thread submit a real frame without exposing an empty
+    // swapchain. Neither display-list recording nor a skipped job can reveal it.
+    ShowWindow(hwnd_, startMax ? SW_SHOWMAXIMIZED : SW_SHOWNA);
     RefreshClientSizeCache();
-
     LayoutRoot();
-    SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
-    ValidateRect(hwnd_, nullptr);
-
-    if (startMax) {
-        /* L102/L103: 窗口已在 PrepareRT 真最大化 + WS_EX_LAYERED alpha 0(shown 但透明,
-         * client=工作区, rcNormalPosition=常规)。OnPaint 已把内容绘进 RT, 这里一次
-         * alpha→255 揭示 → 首帧即全屏 + 有内容, 无黑底/白边/先小后大闪。 */
-        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
-        ClearLayeredAfterAlpha(hwnd_);
-    } else {
-        /* SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步(部分机器 200-300ms)。 */
-        ShowWindow(hwnd_, SW_SHOWNA);
-    }
-    if (activate && !toolWindow_) {
-        BringWindowToTop(hwnd_);
-        SetForegroundWindow(hwnd_);
-    }
+    FlushRenderFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
 }
 
 void UiWindowImpl::Hide() {
+    startupRevealPending_ = false;
     HideTooltip(true);
     StopAnimationFrames();
     ShowWindow(hwnd_, SW_HIDE);
@@ -704,6 +721,7 @@ void UiWindowImpl::SubmitFrameJob(const FrameRequest& frame, DisplayList display
     job.render_thread_present = renderThreadPresentActive_;
     job.defer_present = deferNextFramePresent_ && FrameRequiresPresentBarrier(frame);
     job.animate = HasAnimationFrameWork() || scrollFrameRecorded_ || scrollFrameGeneration_ != 0;
+    job.startup_reveal = startupRevealPending_ ? startupRevealToken_ : 0;
     if (scrollFrameRecorded_ && !job.defer_present &&
         IsWindowVisible(hwnd_) && !IsIconic(hwnd_)) scrollFrameGeneration_ = frame.generation;
     scrollFrameRecorded_ = false;
@@ -736,7 +754,7 @@ bool UiWindowImpl::WaitForRenderGeneration(const FrameRequest& frame, bool force
         renderWindowId_.window_id, frame.generation, 1000);
     TraceEvent("core_window",
                completed ? (prepared ? "render_generation_prepared"
-                                     : "render_generation_presented")
+                                     : "render_generation_completed")
                          : "render_generation_wait_incomplete",
                {TraceU64("frame_generation", frame.generation),
                 TraceBool("forced", force),
@@ -865,7 +883,8 @@ void UiWindowImpl::CommitDeferredVisualWindowRect() {
 
 bool UiWindowImpl::PresentPreparedVisualWindowFrame(uint64_t generation) {
     if (!hwnd_ || !renderWindowId_.IsValid() || !renderThreadPresentActive_) return false;
-    const bool presented = RenderThread::Instance().PresentPrepared(renderWindowId_, true, 1000);
+    const bool presented = RenderThread::Instance().PresentPrepared(
+        renderWindowId_, true, 1000, startupRevealPending_ ? startupRevealToken_ : 0);
     if (presented) {
         // A prepared transaction can supersede the scroll job before it ever
         // presents. Its commit is the acknowledgement in that case.
@@ -1494,7 +1513,12 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             // WM_PAINT to resume motion after the hidden startup frame.
             if (HasAnimationFrameWork()) RequestRenderFrame(FrameReason::Animation);
         }
-        else { HideTooltip(true); scrollFrameGeneration_ = 0; StopAnimationFrames(); }
+        else {
+            startupRevealPending_ = false;
+            KillTimer(hwnd_, kWindowOpenAnimTimerId);
+            if (!windowClosing_) windowAnimating_ = false;
+            HideTooltip(true); scrollFrameGeneration_ = 0; StopAnimationFrames();
+        }
         break;
     case WM_SIZE: {
         if (wParam == SIZE_MINIMIZED) { HideTooltip(true); scrollFrameGeneration_ = 0; StopAnimationFrames(); }
@@ -2065,27 +2089,46 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                            PresentPolicy::Final);
         return 0;
     }
-    case kMsgStartupReveal: {
-        if (startupRevealPending_) {
-            SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
-
-            if (borderless_) {
-                MARGINS margins = maximized_ ? MARGINS{0, 0, 0, 0} : MARGINS{0, 0, 1, 0};
-                DwmExtendFrameIntoClientArea(hwnd_, &margins);
+    case kUiCoreStartupFailedMessage: {
+        if (!startupRevealPending_ ||
+            static_cast<uint64_t>(wParam) != startupRevealToken_ ||
+            static_cast<uint64_t>(lParam) != renderWindowId_.hwnd_generation) return 0;
+        TraceEvent("core_window", "startup_frame_failed",
+                   {TraceU64("show_token", startupRevealToken_)});
+        // Reuse the application's existing close callback and cleanup. No blank
+        // fallback, no timeout that guesses whether the driver will recover.
+        const HWND failedHwnd = hwnd_;
+        const uint64_t failedWindow = windowId;
+        auto notifyFailure = onRenderFailure;
+        if (notifyFailure) notifyFailure();
+        if (GetContext().GetWindow(failedWindow) == this)
+            return SendMessageW(failedHwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    case kUiCoreStartupPresentedMessage: {
+        if (!startupRevealPending_ ||
+            static_cast<uint64_t>(wParam) != startupRevealToken_ ||
+            static_cast<uint64_t>(lParam) != renderWindowId_.hwnd_generation ||
+            !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return 0;
+        startupRevealPending_ = false;
+        TraceEvent("core_window", "startup_frame_revealed",
+                   {TraceU64("show_token", startupRevealToken_)});
+        if (startupRevealAnimate_) {
+            StartWindowOpenAnimation();
+        } else {
+            SetLayeredWindowAttributes(hwnd_, 0, customWindowAlpha_ ? windowAlpha_ : 255, LWA_ALPHA);
+            if (!customWindowAlpha_) ClearLayeredAfterAlpha(hwnd_);
+            if (startupRevealActivate_ && !toolWindow_) {
+                BringWindowToTop(hwnd_);
+                SetForegroundWindow(hwnd_);
             }
-
-            SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-            InvalidateRect(hwnd_, nullptr, FALSE);
-            SetCursor(LoadCursor(nullptr, IDC_ARROW));
-            startupRevealPending_ = false;
         }
-        startupRevealPosted_ = false;
         return 0;
     }
 
     case WM_CLOSE:
         if (onCloseRequest && !onCloseRequest()) return 0;
+        startupRevealPending_ = false;
         if (onClose) onClose();
         DestroyWindow(hwnd_);
         return 0;
@@ -2617,10 +2660,6 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         }
     }
 
-    if (startupRevealPending_ && !startupRevealPosted_) {
-        startupRevealPosted_ = true;
-        PostMessageW(hwnd_, kMsgStartupReveal, 0, 0);
-    }
     TraceEvent("core_window", "on_paint_end");
     if (recordDisplayList) {
         return recorder.Finish();

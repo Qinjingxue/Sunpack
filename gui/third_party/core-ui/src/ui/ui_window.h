@@ -45,6 +45,9 @@ public:
                 HWND ownerHwnd = nullptr);  /* Build 65+ (L14) */
     void Show();
     void ShowImmediate(bool activate = true);  /* 跳过开场动画 */
+    // Host-owned whole-window opacity. Defers alpha changes until startup has
+    // presented, and retains WS_EX_LAYERED for the host's subsequent animation.
+    void SetWindowAlpha(BYTE alpha);
     /* PrepareRT 已完成 frame 确立 (premax 的 SW_SHOWMAXIMIZED 或普通分支的
      * SWP_FRAMECHANGED) — ShowImmediate 跳过重复的 SetWindowPos(FRAMECHANGED)
      * (~10ms DWM 事务)。未走 prepare 的独立调用方仍执行, 行为不变。 */
@@ -67,6 +70,9 @@ public:
 
     // Callbacks
     std::function<void()> onClose;
+    // Startup rendering failed; notify the host before normal close/cleanup so
+    // it can report the failure without relying on this unpresented window.
+    std::function<void()> onRenderFailure;
     std::function<bool()> onCloseRequest;
     std::function<void(int, int)> onResize;
     std::function<void(int, int)> onPageResize;
@@ -187,6 +193,7 @@ private:
     void ShowTooltip(Widget* owner);
     void HideTooltip(bool immediate = false);
     void StartWindowOpenAnimation();
+    bool BeginStartupReveal(bool animate, bool activate);
     void StartWindowCloseAnimation();
     void UnregisterRenderWindow();
 
@@ -234,7 +241,11 @@ private:
     void     DestroyToast();
 
     bool        startupRevealPending_ = false;
-    bool        startupRevealPosted_ = false;
+    uint64_t    startupRevealToken_ = 0;
+    bool        startupRevealAnimate_ = false;
+    bool        startupRevealActivate_ = false;
+    bool        customWindowAlpha_ = false;
+    BYTE        windowAlpha_ = 255;
     bool        caretBlinkTimerRunning_ = false;
     bool        animationFramesActive_ = false;
     bool        renderFramePosted_ = false;

@@ -54,6 +54,10 @@ public:
 };
 bool startup_enabled();
 bool context_menu_enabled();
+// Per-user GUI preference, independent of the shared CLI/watch configuration.
+enum class ThemeChoice : DWORD { System = 0, Light = 1, Dark = 2 };
+ThemeChoice load_theme_choice() noexcept;
+void save_theme_choice(ThemeChoice choice);
 fs::path choose_directory(HWND owner, const fs::path& initial = {});
 std::wstring quote_arg(const std::wstring& arg);
 struct CliCommand { fs::path executable, cwd; std::vector<std::wstring> prefix; };

@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('RegisterToast', 'EnableContextMenu', 'DisableContextMenu', 'EnableStartup',
-        'DisableStartup', 'StartWatch', 'UninstallToast')]
+        'DisableStartup', 'StartWatch', 'UninstallToast', 'RemoveGuiPreferences')]
     [string]$Action,
     [switch]$ShellUser
 )
@@ -157,6 +157,7 @@ switch ($Action) {
     'DisableStartup' { Invoke-Watch @('startup', 'disable') }
     'StartWatch' { Invoke-Watch @('start') }
     'UninstallToast' { Remove-Registration $toastAppId }
+    'RemoveGuiPreferences' { Remove-Registration 'HKCU:\Software\SunPack\GUI' }
     default { throw "Invalid shell-user action: $Action" }
 }
 exit 0

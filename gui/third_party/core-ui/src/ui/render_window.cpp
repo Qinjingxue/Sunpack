@@ -109,7 +109,7 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
                            job.policy != PresentPolicy::Screenshot;
     renderer_->PrepareDisplayList(job.display_list);
     renderer_->BeginDraw();
-    renderer_->RenderDisplayList(std::move(job.display_list), !sizeChanged && !job.defer_present &&
+    renderer_->RenderDisplayList(std::move(job.display_list), !sizeChanged && !job.defer_present && !job.startup_reveal &&
         visible && surfaceKind_==RenderSurfaceKind::HwndSwapChain && job.policy!=PresentPolicy::Screenshot);
     HRESULT hr = renderer_->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) {
@@ -120,7 +120,7 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
         ReleaseResources();
         return RenderFrameResult::DeviceFailure;
     }
-    if (presentNow) return RenderFrameResult::Presented;
+    if (presentNow) return hr == S_OK ? RenderFrameResult::Presented : RenderFrameResult::Skipped;
     return job.defer_present ? RenderFrameResult::Prepared : RenderFrameResult::Skipped;
 }
 
@@ -144,7 +144,7 @@ RenderFrameResult RenderWindow::PresentPrepared(bool skipVSync) {
         ReleaseResources();
         return RenderFrameResult::DeviceFailure;
     }
-    return RenderFrameResult::Presented;
+    return hr == S_OK ? RenderFrameResult::Presented : RenderFrameResult::Skipped;
 }
 
 int RenderWindow::ScreenshotRegion(D2D1_RECT_F region, const std::wstring& outPath, float dpiScale) {

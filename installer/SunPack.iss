@@ -861,10 +861,17 @@ begin
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
     StopAndDeleteBrokerService;
     RemoveMachinePath(ExpandConstant('{app}'));
+    { InitializeUninstall already stopped the GUI. Run before deleting the
+      helper, under the desktop user token even with cross-account elevation.
+      Upgrades never run this handler or write GUI preferences. }
+    if not RunInstallerIntegration('RemoveGuiPreferences', ResultCode) or (ResultCode <> 0) then
+      Log(Format('Current-user GUI preference cleanup failed with code %d.', [ResultCode]));
   end;
 end;

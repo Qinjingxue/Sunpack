@@ -57,6 +57,12 @@ UiThemeMode system_theme() {
         L"AppsUseLightTheme",RRF_RT_REG_DWORD,nullptr,&light,&size);
     return light?UI_THEME_LIGHT:UI_THEME_DARK;
 }
+UiThemeMode selected_theme(ThemeChoice choice) {
+    return choice==ThemeChoice::Light?UI_THEME_LIGHT:choice==ThemeChoice::Dark?UI_THEME_DARK:system_theme();
+}
+const char* theme_name(ThemeChoice choice) {
+    return choice==ThemeChoice::Light?"light":choice==ThemeChoice::Dark?"dark":"system";
+}
 // The window already owns the tree. Register only the child used by the C API.
 ui::Widget* find_widget(ui::UiWindowImpl* owner,const std::string& id) {
     return owner && owner->Root()?owner->Root()->FindById(id):nullptr;
@@ -465,7 +471,7 @@ void Application::reveal() {
     if(shown_) return;
     shown_=true;
     ui_window_show_immediate(window_);
-    style_frame(hwnd_,system_theme());
+    style_frame(hwnd_,ui_theme_get_mode());
 }
 void Application::navigate(const std::string& tab) {
     date_popup_.reset();
@@ -600,10 +606,16 @@ void Application::rebuild_theme(const std::string& language) {
     theme_widget_=ui_combobox(texts,3); ui_widget_set_id(theme_widget_,"themeSelector"); ui_widget_set_height(theme_widget_,32);
     ui_combobox_set_selected(theme_widget_,page_value(page_,"themeChoice").get<int>());
     ui_combobox_on_changed(theme_widget_,[](UiWidget,int index,void* context){
+        if(index<0 || index>2) return;
         auto* self=static_cast<Application*>(context);
+        const auto choice=static_cast<ThemeChoice>(index);
         ui_page_set_int(self->page_,"themeChoice",index);
-        set_text(self->page_,"theme",index==1?"light":index==2?"dark":"system");
-        apply_theme(self->page_,index==1?UI_THEME_LIGHT:index==2?UI_THEME_DARK:system_theme(),self->hwnd_);
+        set_text(self->page_,"theme",theme_name(choice));
+        apply_theme(self->page_,selected_theme(choice),self->hwnd_);
+        // Persist the selection, not its resolved appearance. One atomic value
+        // write also survives an immediate close without a shutdown save queue.
+        try { save_theme_choice(choice); self->save_error("@theme",""); }
+        catch(const std::exception& e) { self->save_error("@theme",e.what()); }
     },this);
     ui_widget_add_child(host,theme_widget_);
     auto status_host=widget_handle(window_,"taskStatusHost");
@@ -880,9 +892,11 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
 }
 void Application::open() {
     auto language=startup_language(options_.data_dir);
+    const auto theme_choice=load_theme_choice();
+    const auto initial_theme=selected_theme(theme_choice);
     const char* stage="stageRenderer";
     try {
-    ui_init_with_theme(system_theme());
+    ui_init_with_theme(initial_theme);
     stage="stageLogo";
     auto module=GetModuleHandleW(nullptr);
     auto resource=FindResourceW(module,MAKEINTRESOURCEW(2),RT_RCDATA);
@@ -898,7 +912,9 @@ void Application::open() {
     if(!page_) throw std::runtime_error("layoutLoadFailed");
     auto texts=interface_texts(language).dump(); ui_page_set_json(page_,"texts",texts.c_str());
     set_text(page_,"language",language);
-    apply_theme(page_,system_theme());
+    ui_page_set_int(page_,"themeChoice",int(theme_choice));
+    set_text(page_,"theme",theme_name(theme_choice));
+    apply_theme(page_,initial_theme);
     stage="stageWindow";
     UiWindowConfig window_config{}; window_config.skip_animation=1;
     window_=ui_page_prepare_window(page_,&window_config);
@@ -906,10 +922,13 @@ void Application::open() {
     stage="stageEvents";
     hwnd_=static_cast<HWND>(ui_window_hwnd(window_));
     ui_window_set_title(window_,wide(tr("title",language)).c_str());
-    style_frame(hwnd_,system_theme());
+    style_frame(hwnd_,initial_theme);
     update_icons(GetDpiForWindow(hwnd_));
     SetPropW(hwnd_,mutex_name(options_.data_dir,L"SunPack.GUI").c_str(),reinterpret_cast<HANDLE>(1));
     if(!SetWindowSubclass(hwnd_,subclass,1,reinterpret_cast<DWORD_PTR>(this))) win_error("opWindowEvents");
+    // The render failure arrives inside WndProc. Let normal close/cleanup run,
+    // then report through main.cpp's existing localized startup notification.
+    ui::GetContext().GetWindow(window_)->onRenderFailure=[this]{ render_failed_=true; };
     if(auto* list=dynamic_cast<ui::VirtualListWidget*>(ui::GetContext().GetWindow(window_)->Root()->FindById("taskItems"))) {
         auto realize=std::move(list->onRangeChanged);
         list->onRangeChanged=[this,realize=std::move(realize)] {
@@ -968,7 +987,13 @@ void Application::open() {
     });
     } catch(const std::exception& e) { throw std::runtime_error(error_text("startupFailure",{{"stage",{{"source",stage}}},{"detail",{{"source",e.what()}}}})); }
 }
-int Application::run() { open(); return ui_run(); }
+int Application::run() {
+    open();
+    auto result=ui_run();
+    if(render_failed_) throw std::runtime_error(error_text("startupFailure",{
+        {"stage",{{"source","stageRenderer"}}},{"detail",{{"source","firstFrameFailed"}}}}));
+    return result;
+}
 Application::~Application() {
     find_.reset();
     date_popup_.reset();

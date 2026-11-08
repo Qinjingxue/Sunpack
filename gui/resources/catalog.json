@@ -672,6 +672,10 @@
       "zh": "启动失败（{stage}）：{detail}",
       "en": "Startup failed ({stage}): {detail}"
     },
+    "firstFrameFailed": {
+      "zh": "窗口首帧渲染失败，无法显示界面。",
+      "en": "The first window frame could not be rendered."
+    },
     "windowsFailure": {
       "zh": "{operation}失败（Windows 错误 {code}）：{detail}",
       "en": "{operation} failed (Windows error {code}): {detail}"
@@ -735,6 +739,10 @@
     "opReadStartupRegistry": {
       "zh": "读取启动项注册表",
       "en": "Read startup registry"
+    },
+    "opSaveTheme": {
+      "zh": "保存界面主题",
+      "en": "Save GUI theme"
     },
     "opReadStartupValue": {
       "zh": "读取启动项",

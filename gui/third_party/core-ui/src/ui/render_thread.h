@@ -20,6 +20,8 @@ namespace ui {
 
 constexpr UINT kUiCoreRenderDeviceLostMessage = WM_APP + 131;
 constexpr UINT kUiCoreAnimationFrameMessage = WM_APP + 132;
+constexpr UINT kUiCoreStartupPresentedMessage = WM_APP + 133;
+constexpr UINT kUiCoreStartupFailedMessage = WM_APP + 134;
 
 struct FrameJob {
     RenderWindowId window;
@@ -33,6 +35,8 @@ struct FrameJob {
     bool render_thread_present = false;
     bool defer_present = false;
     bool animate = false;
+    // A show-attempt token, carried by replacement/recovery frames as well.
+    uint64_t startup_reveal = 0;
     DisplayList display_list;
 
     FrameJob() = default;
@@ -62,7 +66,8 @@ public:
                         RenderSurfaceKind surfaceKind = RenderSurfaceKind::HwndSwapChain);
     void UnregisterWindow(RenderWindowId id);
     void Submit(FrameJob job);
-    bool PresentPrepared(RenderWindowId id, bool skipVSync, uint32_t timeoutMs);
+    bool PresentPrepared(RenderWindowId id, bool skipVSync, uint32_t timeoutMs,
+                         uint64_t startupReveal = 0);
     int ScreenshotRegion(RenderWindowId id, D2D1_RECT_F region, std::wstring outPath, float dpiScale);
     bool WaitForGeneration(uint64_t windowId, uint64_t generation, uint32_t timeoutMs);
 
@@ -104,6 +109,7 @@ private:
     struct PresentJob {
         RenderWindowId window;
         bool skipVSync = true;
+        uint64_t startupReveal = 0;
         std::promise<bool> result;
 
         PresentJob() = default;

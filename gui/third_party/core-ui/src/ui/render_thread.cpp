@@ -125,12 +125,14 @@ void RenderThread::Submit(FrameJob job) {
     cv_.notify_one();
 }
 
-bool RenderThread::PresentPrepared(RenderWindowId id, bool skipVSync, uint32_t timeoutMs) {
+bool RenderThread::PresentPrepared(RenderWindowId id, bool skipVSync, uint32_t timeoutMs,
+                                  uint64_t startupReveal) {
     if (!id.IsValid()) return false;
 
     PresentJob job;
     job.window = id;
     job.skipVSync = skipVSync;
+    job.startupReveal = startupReveal;
     auto future = job.result.get_future();
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -328,8 +330,14 @@ void RenderThread::ThreadMain() {
             RenderFrameResult result = window
                 ? window->PresentPrepared(present.skipVSync)
                 : RenderFrameResult::InvalidWindow;
-            const bool ok = result == RenderFrameResult::Presented ||
-                            result == RenderFrameResult::Skipped;
+            if (present.startupReveal && window &&
+                (result == RenderFrameResult::Presented || result == RenderFrameResult::DeviceFailure)) {
+                PostMessageW(window->Hwnd(), result == RenderFrameResult::Presented
+                                ? kUiCoreStartupPresentedMessage : kUiCoreStartupFailedMessage,
+                             static_cast<WPARAM>(present.startupReveal),
+                             static_cast<LPARAM>(present.window.hwnd_generation));
+            }
+            const bool ok = result == RenderFrameResult::Presented;
             present.result.set_value(ok);
             lock.lock();
 
@@ -382,6 +390,14 @@ void RenderThread::ThreadMain() {
                 ? window->RenderFrame(*job)
                 : RenderFrameResult::InvalidWindow;
 
+            // A failed initial frame must not leave an invisible application
+            // retrying forever. Queue normal close before device-recovery events;
+            // established windows keep the existing recovery behavior.
+            if (job->startup_reveal && renderResult == RenderFrameResult::DeviceFailure) {
+                PostMessageW(job->hwnd, kUiCoreStartupFailedMessage,
+                             static_cast<WPARAM>(job->startup_reveal),
+                             static_cast<LPARAM>(job->window.hwnd_generation));
+            }
             lock.lock();
             if (renderResult == RenderFrameResult::RecreateTarget ||
                 renderResult == RenderFrameResult::DeviceFailure) {
@@ -402,6 +418,11 @@ void RenderThread::ThreadMain() {
             it->second &&
             it->second->Matches(job->window)) {
             completedGenerations_[job->window.window_id] = job->generation;
+            if (job->startup_reveal && renderResult == RenderFrameResult::Presented) {
+                PostMessageW(job->hwnd, kUiCoreStartupPresentedMessage,
+                             static_cast<WPARAM>(job->startup_reveal),
+                             static_cast<LPARAM>(job->window.hwnd_generation));
+            }
             // Only a visible presented frame drives the next animation frame.
             // Present(1) supplies VSync pacing without a competing WM_TIMER.
             // Prepared frames resume when committed by the UI; hidden/skipped

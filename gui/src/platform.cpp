@@ -33,6 +33,26 @@ void win_error(const char* op) {
     DWORD code = GetLastError();
     throw WinError(code,error_text("windowsFailure",{{"operation",{{"source",op}}},{"code",code}}));
 }
+namespace {
+constexpr wchar_t GuiPreferencesKey[] = L"Software\\SunPack\\GUI";
+}
+ThemeChoice load_theme_choice() noexcept {
+    DWORD value=0, bytes=sizeof(value);
+    if(RegGetValueW(HKEY_CURRENT_USER,GuiPreferencesKey,L"Theme",RRF_RT_REG_DWORD,
+        nullptr,&value,&bytes)!=ERROR_SUCCESS || bytes!=sizeof(value) || value>DWORD(ThemeChoice::Dark))
+        return ThemeChoice::System;
+    return static_cast<ThemeChoice>(value);
+}
+void save_theme_choice(ThemeChoice choice) {
+    HKEY key=nullptr;
+    auto result=RegCreateKeyExW(HKEY_CURRENT_USER,GuiPreferencesKey,0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr);
+    if(result==ERROR_SUCCESS) {
+        const DWORD value=DWORD(choice);
+        result=RegSetValueExW(key,L"Theme",0,REG_DWORD,reinterpret_cast<const BYTE*>(&value),sizeof(value));
+        RegCloseKey(key);
+    }
+    if(result!=ERROR_SUCCESS) { SetLastError(result); win_error("opSaveTheme"); }
+}
 fs::path resolve_path(const fs::path& path, const fs::path& base) {
     fs::path p = path;
     auto s = p.wstring();

@@ -680,7 +680,7 @@ HRESULT Renderer::EndDraw() {
     }
     /* L177: skipPresent → 只 flush D2D 绘制 (上面 ctx_->EndDraw 已做), 不 flip 到
      * DWM。给"绘制隐藏窗但不上屏"用 (避免 DWM 未合成窗的 Present 在 AMD 死锁)。 */
-    if (swapChain_ && !skipPresent) {
+    if (SUCCEEDED(hr) && swapChain_ && !skipPresent) {
         DXGI_PRESENT_PARAMETERS params = {};
         if (partialPresent_) { params.DirtyRectsCount = 1; params.pDirtyRects = &presentDamage_; }
         UINT syncInterval = skipVSync ? 0 : 1;
@@ -689,8 +689,8 @@ HRESULT Renderer::EndDraw() {
                     TraceBool("skip_vsync", skipVSync)});
         {
             TraceScope presentScope("core_renderer", "present_duration");
-            const HRESULT presented = swapChain_->Present1(syncInterval, 0, &params);
-            if (FAILED(presented)) hr = presented;
+            // Keep non-error statuses too: OCCLUDED is not a presented frame.
+            hr = swapChain_->Present1(syncInterval, 0, &params);
         }
     }
     skipVSync = false;
