@@ -763,10 +763,9 @@ function Test-NativeImport {
 import sunpack_native as n
 required = [
     'native_available',
-    'scan_directory_snapshot', 'scan_directory_snapshots',
+    'NativeDirectoryScanOptions', 'NativeCandidateTable',
     'directory_snapshot_from_columns', 'filter_inventory_file_indices',
     'batch_file_head_facts', 'authorize_nested_candidates',
-    'relations_build_candidate_groups_from_snapshot',
     'profile_directory_scan', 'list_regular_files_in_directory',
     'scan_embedded_archives',
     'analyze_zip_filename_encoding', 'inspect_zip_eocd_structure',

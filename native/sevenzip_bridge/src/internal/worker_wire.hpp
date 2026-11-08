@@ -109,6 +109,7 @@ class ObjectView {
         for (const auto& field : fields_) if (field.key == key) return field.value;
         return std::nullopt;
     }
+public:
     std::vector<std::string_view> array_field(std::string_view key) const {
         std::vector<std::string_view> out; const auto raw = raw_field(key);
         if (!raw) return out;
@@ -118,7 +119,6 @@ class ObjectView {
         }
         return out;
     }
-public:
     ObjectView() = default;
     explicit ObjectView(std::string_view data) {
         Reader reader(data); if (reader.byte() != kObject) throw std::runtime_error("worker object expected");
@@ -130,8 +130,8 @@ public:
         valid_ = true;
     }
     bool valid() const noexcept { return valid_; }
-    std::string string_field(std::string_view key, std::string_view fallback = {}) const {
-        auto raw = raw_field(key); return raw ? std::string(Reader(*raw).text()) : std::string(fallback);
+    std::string_view string_field(std::string_view key, std::string_view fallback = {}) const {
+        auto raw = raw_field(key); return raw ? Reader(*raw).text() : fallback;
     }
     bool uint_field(std::string_view key, unsigned long long* out) const {
         auto raw = raw_field(key); if (!raw || raw->front() == kNull) return false;
@@ -147,16 +147,17 @@ public:
     ObjectView object_field(std::string_view key) const {
         auto raw = raw_field(key); return raw && raw->front() != kNull ? ObjectView(*raw) : ObjectView();
     }
-    std::vector<std::string_view> object_array_field(std::string_view key) const { return array_field(key); }
-    std::vector<std::string> string_array_field(std::string_view key) const {
-        std::vector<std::string> out; for (auto raw : array_field(key)) out.emplace_back(Reader(raw).text()); return out;
-    }
     bool index_array_field(std::string_view key, std::vector<std::size_t>& out) const {
-        for (auto raw : array_field(key)) {
-            Reader reader(raw); auto tag = reader.byte();
+        const auto raw = raw_field(key);
+        if (!raw) return false;
+        Reader reader(*raw);
+        if (reader.byte() != kArray) throw std::runtime_error("worker array expected");
+        while (!reader.data.empty() && reader.data.front() != kEnd) {
+            const auto tag = reader.byte();
             if (tag != kU8 && tag != kU32 && tag != kU64) return false;
-            auto value = reader.integer(tag == kU8 ? 1 : tag == kU32 ? 4 : 8);
-            if (value > SIZE_MAX) return false; out.push_back(static_cast<std::size_t>(value));
+            const auto value = reader.integer(tag == kU8 ? 1 : tag == kU32 ? 4 : 8);
+            if (value > SIZE_MAX) return false;
+            out.push_back(static_cast<std::size_t>(value));
         }
         return !out.empty();
     }

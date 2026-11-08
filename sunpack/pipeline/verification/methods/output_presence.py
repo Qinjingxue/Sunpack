@@ -1,8 +1,9 @@
-from sunpack.pipeline.extraction.progress import iter_progress_files
 from sunpack.pipeline.verification.evidence import VerificationEvidence
-from sunpack.pipeline.verification.methods._output_stats import output_stats_for_evidence, should_emit_file_observations
+from sunpack.pipeline.verification.methods._output_stats import (
+    output_stats_for_evidence, progress_observations, should_emit_file_observations,
+)
 from sunpack.pipeline.verification.registry import register_verification_method
-from sunpack.core.contracts.verification import FileVerificationObservation, VerificationIssue, VerificationStep
+from sunpack.core.contracts.verification import VerificationIssue, VerificationStep
 
 
 @register_verification_method("output_presence")
@@ -41,7 +42,7 @@ class OutputPresenceMethod:
                 actual=stats.unreadable_count,
             ))
 
-        observations = _manifest_observations(evidence) if should_emit_file_observations(evidence, self.name) else []
+        observations = progress_observations(evidence, self.name) if should_emit_file_observations(evidence, self.name) else []
         manifest = evidence.progress_manifest
         manifest_completeness = manifest.completeness() if manifest is not None else 1.0
         if manifest is not None:
@@ -82,34 +83,3 @@ class OutputPresenceMethod:
                 )
             ],
         )
-
-
-def _manifest_observations(evidence: VerificationEvidence) -> list[FileVerificationObservation]:
-    observations: list[FileVerificationObservation] = []
-    for item in iter_progress_files(evidence.progress_manifest):
-        state = str(item.get("status") or "unverified")
-        observations.append(FileVerificationObservation(
-            path=str(item.get("path") or item.get("archive_path") or ""),
-            archive_path=str(item.get("archive_path") or ""),
-            state=state if state in {"complete", "partial", "failed", "missing", "unverified"} else "unverified",
-            method="output_presence",
-            bytes_written=int(item.get("bytes_written") or 0),
-            expected_size=item.get("expected_size"),
-            progress=_progress(item),
-        ))
-    return observations
-
-
-def _progress(item: dict) -> float | None:
-    expected = item.get("expected_size")
-    bytes_written = int(item.get("bytes_written") or 0)
-    if expected:
-        return min(1.0, max(0.0, bytes_written / expected))
-    status = str(item.get("status") or "")
-    if status == "complete":
-        return 1.0
-    if status == "failed":
-        return 0.0
-    if status == "partial":
-        return 0.5
-    return None

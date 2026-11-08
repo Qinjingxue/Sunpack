@@ -170,14 +170,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        scan::directory::scan_directory_snapshot,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::scan_directory_snapshots,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
         scan::directory::directory_snapshot_from_columns,
         m
     )?)?;
@@ -214,10 +206,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         relations::relations_apply_split_size_anchors,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        relations::relations_build_candidate_groups_from_snapshot,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(

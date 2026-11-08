@@ -36,14 +36,11 @@ class ResourcePolicy(str, Enum):
 class ResourceKind(str, Enum):
     PYTHON_FILE = "python_file"
     DIRECTORY_ITERATOR = "directory_iterator"
-    NATIVE_READER = "native_reader"
     NATIVE_ARCHIVE_SESSION = "native_archive_session"
     NATIVE_ANALYSIS_VIEW = "native_analysis_view"
     NATIVE_MULTI_VOLUME_VIEW = "native_multi_volume_view"
     ARCHIVE_SESSION_BORROW = "archive_session_borrow"
     FILE_OPERATION = "file_operation"
-    IOCP_FILE_HANDLE = "iocp_file_handle"
-    VOLUME_DEVICE = "volume_device"
     DIRECTORY_WATCH = "directory_watch"
     OTHER = "other"
 

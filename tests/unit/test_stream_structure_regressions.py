@@ -77,6 +77,26 @@ def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carvin
                for row in carved["candidates"])
 
 
+def test_stream_analysis_uses_the_open_file_after_path_replacement(tmp_path):
+    # Other stream tests keep the path stable, so they miss a structure cache
+    # initialized from a replacement after the view admitted an older source.
+    from sunpack_native import AnalysisBinaryView, NativeAnalysisConfig
+
+    path = tmp_path / "stream.bin"
+    path.write_bytes(bz2.compress(b"original contents"))
+    cfg = NativeAnalysisConfig({"modules": [{"name": "bzip2", "enabled": True}]})
+    view = AnalysisBinaryView(str(path))
+    try:
+        path.rename(tmp_path / "previous.bin")
+        path.write_bytes(b"ordinary replacement")
+        for _ in range(2):
+            report = view.analyze(cfg)
+            assert report["evidences"][0][1] == "extractable"
+        assert not inspect_compression_stream_structure(str(path))["plausible"]
+    finally:
+        view.close()
+
+
 def test_dense_false_headers_preserve_empty_and_nonempty_bzip2_peers(tmp_path):
     # This is discovery correctness, not a speed assertion: filtering noisy
     # prefixes must retain both legal first-marker kinds and later real peers.

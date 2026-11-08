@@ -1,5 +1,6 @@
 import os
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from threading import Event
@@ -80,8 +81,20 @@ def test_failed_journal_append_faults_store(tmp_path):
     journal_path = state.journal_path
     journal_path.mkdir()
 
-    with pytest.raises(RuntimeError, match="native Watch journal append failed"):
+    class CallerPayload:
+        pass
+
+    payload_refs = []
+
+    def append():
+        payload = CallerPayload()
+        payload_refs.append(weakref.ref(payload))
         state.queue_active(_candidate(tmp_path / "queued.7z"), durable=True)
+
+    with pytest.raises(RuntimeError, match="native Watch journal append failed"):
+        append()
+    # The store still reports its fault but can release the failed caller's locals.
+    assert payload_refs[0]() is None
     with pytest.raises(RuntimeError, match="persistence is unavailable"):
         state.queue_active(_candidate(tmp_path / "second.7z"), durable=True)
     ticket = watch_journal_request_flush(state._writer_stream, state.applied_seq)

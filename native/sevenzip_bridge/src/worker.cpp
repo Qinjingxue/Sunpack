@@ -58,7 +58,7 @@ bool read_file_timing_enabled() noexcept {
     return enabled;
 }
 
-std::wstring utf8_to_wide(const std::string& value) {
+std::wstring utf8_to_wide(std::string_view value) {
 #ifdef _WIN32
     if (value.empty()) {
         return L"";
@@ -182,7 +182,7 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
 
 std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
     const std::vector<std::string_view>& objects,
-    const std::string& default_path
+    std::string_view default_path
 ) {
     using sunpack::sevenzip::ExtractInputRange;
     std::vector<ExtractInputRange> ranges;
@@ -195,7 +195,7 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
             object.uint_field("start", &start);
         const bool has_end =
             object.uint_field("end", &end);
-        const std::string path = object.string_field("path", default_path);
+        const std::string_view path = object.string_field("path", default_path);
         if (path.empty() && default_path.empty()) {
             continue;
         }
@@ -204,7 +204,7 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
         range.start = has_start ? start : 0;
         range.end = end;
         range.has_end = has_end;
-        ranges.push_back(range);
+        ranges.push_back(std::move(range));
     }
     return ranges;
 }
@@ -216,9 +216,9 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         input.validation_error = "archive_input descriptor is required";
         return input;
     }
-    const std::string entry_path = descriptor.string_field("entry_path", "");
+    const std::string_view entry_path = descriptor.string_field("entry_path", "");
     input.archive_path = utf8_to_wide(entry_path);
-    const std::string mode = descriptor.string_field("open_mode", "file");
+    const std::string_view mode = descriptor.string_field("open_mode", "file");
     input.open_mode = utf8_to_wide(mode);
     input.format_hint = utf8_to_wide(descriptor.string_field("format_hint", ""));
 
@@ -232,8 +232,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         auto& plan = input.volume_attempts;
         attempts.uint_field("head_size_from_total", &plan.head_size_from_total);
         attempts.uint_field("minimum_size", &plan.minimum_size);
-        plan.sources = parse_ranges_from_objects(attempts.object_array_field("sources"), "");
-        for (auto raw : attempts.object_array_field("domains")) {
+        plan.sources = parse_ranges_from_objects(attempts.array_field("sources"), "");
+        for (auto raw : attempts.array_field("domains")) {
             std::vector<std::size_t> choices;
             if (!wire::ObjectView(raw).index_array_field("choices", choices) ||
                 std::any_of(choices.begin(), choices.end(), [&](auto i) { return i >= plan.sources.size(); })) {
@@ -241,7 +241,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
             }
             plan.domains.push_back(std::move(choices));
         }
-        for (auto raw : attempts.object_array_field("tail_totals")) {
+        for (auto raw : attempts.array_field("tail_totals")) {
             unsigned long long source = 0, total = 0;
             const wire::ObjectView entry(raw);
             if (!entry.uint_field("source", &source) || source >= plan.sources.size() ||
@@ -251,11 +251,12 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
             if (plan.tail_totals.empty()) plan.tail_totals.resize(plan.sources.size());
             plan.tail_totals[source] = total;
         }
-        for (auto raw_layout : attempts.object_array_field("layouts")) {
+        for (auto raw_layout : attempts.array_field("layouts")) {
             std::vector<sunpack::sevenzip::VolumeAttemptSlot> slots;
             unsigned long long previous = 0;
             std::unordered_set<std::wstring> names;
-            for (auto raw_slot : wire::ObjectView(raw_layout).object_array_field("slots")) {
+            const wire::ObjectView layout(raw_layout);
+            for (auto raw_slot : layout.array_field("slots")) {
                 const wire::ObjectView slot(raw_slot);
                 unsigned long long number = 0;
                 sunpack::sevenzip::VolumeAttemptSlot parsed;
@@ -273,8 +274,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
             }
             if (slots.empty()) { input.validation_error = "empty volume attempt layout"; return input; }
             unsigned long long minimum = 0;
-            const wire::ObjectView raw(raw_layout);
-            raw.uint_field("minimum_slots", &minimum);
+            layout.uint_field("minimum_slots", &minimum);
             if (minimum && (minimum < 2 || minimum > slots.size() ||
                     slots.back().number != slots.size())) {
                 input.validation_error = "invalid variable volume layout"; return input;
@@ -297,21 +297,28 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         unsigned long long end = 0;
         bool has_end = false;
     };
-    const auto part_objects = descriptor.object_array_field("parts");
+    const auto part_objects = descriptor.array_field("parts");
+    if (mode == "file_range") {
+        input.ranges = parse_ranges_from_objects(part_objects, entry_path);
+        if (input.ranges.empty()) {
+            input.validation_error = "file_range descriptor requires canonical parts with extents";
+        }
+        return input;
+    }
     const bool structured = mode == "native_volumes" || mode == "sfx_with_volumes";
     std::vector<ParsedPart> structured_parts;
     input.part_paths.reserve(part_objects.size());
     if (structured) structured_parts.reserve(part_objects.size());
     for (const auto object_frame : part_objects) {
         const wire::ObjectView object(object_frame);
-        const std::string path = object.string_field("path", "");
+        const std::string_view path = object.string_field("path", "");
         if (path.empty()) continue;
         if (!structured) {
             input.part_paths.push_back(utf8_to_wide(path));
             continue;
         }
         unsigned long long number = 0;
-        const std::string canonical_name = object.string_field("canonical_name", "");
+        const std::string_view canonical_name = object.string_field("canonical_name", "");
         if (!object.uint_field("volume_number", &number) || number == 0 || canonical_name.empty()) {
             input.validation_error = "structured volume part requires volume_number and canonical_name";
             continue;
@@ -353,13 +360,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         }
     }
 
-    if (mode == "file_range") {
-        input.ranges = parse_ranges_from_objects(part_objects, entry_path);
-        if (input.ranges.empty()) {
-            input.validation_error = "file_range descriptor requires canonical parts with extents";
-        }
-    } else if (mode == "concat_ranges") {
-        const auto range_objects = descriptor.object_array_field("ranges");
+    if (mode == "concat_ranges") {
+        const auto range_objects = descriptor.array_field("ranges");
         input.ranges = parse_ranges_from_objects(range_objects, entry_path);
         if (input.ranges.empty()) input.validation_error = "concat_ranges descriptor requires ranges";
     }
@@ -406,8 +408,10 @@ WorkerRequest parse_worker_request(const std::string& request_frame) {
     request.dry_run = fields.bool_field("dry_run", false);
     request.password_verified = fields.bool_field("password_verified", false);
 
-    for (const auto& candidate : fields.string_array_field("password_candidates")) {
-        request.password_candidates.push_back(utf8_to_wide(candidate));
+    const auto candidates = fields.array_field("password_candidates");
+    request.password_candidates.reserve(candidates.size());
+    for (const auto candidate : candidates) {
+        request.password_candidates.push_back(utf8_to_wide(wire::Reader(candidate).text()));
     }
     request.archive_input = parse_archive_input_descriptor(fields);
     return request;

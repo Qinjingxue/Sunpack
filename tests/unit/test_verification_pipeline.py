@@ -193,6 +193,8 @@ def test_verification_pipeline_aggregates_completeness_and_decision(tmp_path):
     assert verification.completeness == 0.5
     assert verification.complete_files == 1
     assert verification.missing_files == 1
+    assert len(verification.file_observations) == 2
+    assert all(not step.file_observations for step in verification.steps)
     assert CALLS == ["unit_complete_observation", "unit_missing_observation"]
 
 

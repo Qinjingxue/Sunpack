@@ -104,7 +104,10 @@ impl NativeOutputTrace {
 /// Decode a complete binary frame directly into native tables and a small envelope.
 #[pyfunction]
 pub(crate) fn parse_worker_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<PyDict>> {
-    let data = super::worker_wire::frame_payload(frame)?;
+    parse_worker_payload(py, super::worker_wire::frame_payload(frame)?)
+}
+
+fn parse_worker_payload(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyDict>> {
     let mut decoder = super::worker_wire::Decoder::new(data);
     let value = PySeed {
         py,
@@ -114,7 +117,7 @@ pub(crate) fn parse_worker_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<Py
     if !decoder.data.is_empty() {
         return Err(PyValueError::new_err("trailing worker value"));
     }
-    Ok(value.bind(py).cast::<PyDict>()?.clone().unbind())
+    Ok(value.into_bound(py).cast_into::<PyDict>()?.unbind())
 }
 
 /// A valid frame boundary permits a bad job body to be isolated. A broken
@@ -122,7 +125,7 @@ pub(crate) fn parse_worker_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<Py
 #[pyfunction]
 pub(crate) fn parse_worker_transport_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<PyDict>> {
     let data = super::worker_wire::frame_payload(frame)?;
-    match parse_worker_event(py, frame) {
+    match parse_worker_payload(py, data) {
         Ok(event) => Ok(event),
         Err(error) => {
             let job_id = super::worker_wire::Decoder::new(data)
@@ -216,8 +219,8 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let py = self.py;
         let dict = PyDict::new(py);
-        while let Some(key) = map.next_key::<String>()? {
-            match (self.scope, key.as_str()) {
+        while let Some(key) = map.next_key::<&str>()? {
+            match (self.scope, key) {
                 (Scope::Manifest, "rows") | (Scope::OutputTrace, "items") => {
                     return Err(de::Error::custom(
                         "worker result details must arrive in chunks",
@@ -257,7 +260,7 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
                 }
                 _ => {}
             }
-            let child = match (self.scope, key.as_str()) {
+            let child = match (self.scope, key) {
                 (Scope::Root, "verified_manifest") => Scope::Manifest,
                 (Scope::Root, "diagnostics") => Scope::Diagnostics,
                 (Scope::Diagnostics, "output_trace") => Scope::OutputTrace,
@@ -308,20 +311,20 @@ impl NativeWorkerResultAccumulator {
 
     /// True for a consumed chunk; result events are finalized in place.
     fn accept(&mut self, py: Python<'_>, payload: &Bound<'_, PyDict>) -> PyResult<bool> {
-        let kind = payload
+        let kind_value = payload
             .get_item("type")?
-            .ok_or_else(|| PyValueError::new_err("worker event type missing"))?
-            .extract::<String>()?;
-        if !matches!(kind.as_str(), "manifest_chunk" | "trace_chunk" | "result") {
+            .ok_or_else(|| PyValueError::new_err("worker event type missing"))?;
+        let kind = kind_value.cast::<PyString>()?.to_str()?;
+        if !matches!(kind, "manifest_chunk" | "trace_chunk" | "result") {
             return Ok(false);
         }
         if self.finished {
             return Err(PyValueError::new_err("worker data received after result"));
         }
-        let job_id = payload
+        let job_id_value = payload
             .get_item("job_id")?
-            .ok_or_else(|| PyValueError::new_err("worker job_id missing"))?
-            .extract::<String>()?;
+            .ok_or_else(|| PyValueError::new_err("worker job_id missing"))?;
+        let job_id = job_id_value.cast::<PyString>()?.to_str()?;
         if job_id != self.job_id {
             return Err(PyValueError::new_err("worker chunk belongs to another job"));
         }
@@ -346,11 +349,19 @@ impl NativeWorkerResultAccumulator {
             let mut chunk = chunk.extract::<PyRefMut<'_, WorkerChunk>>()?;
             match chunk.data.take() {
                 Some(ChunkData::Manifest(mut files)) if kind == "manifest_chunk" => {
-                    self.files.append(&mut files);
+                    if self.files.is_empty() {
+                        self.files = files;
+                    } else {
+                        self.files.append(&mut files);
+                    }
                     self.manifest_seq += 1;
                 }
                 Some(ChunkData::Trace(mut items)) if kind == "trace_chunk" => {
-                    self.items.append(&mut items);
+                    if self.items.is_empty() {
+                        self.items = items;
+                    } else {
+                        self.items.append(&mut items);
+                    }
                     self.trace_seq += 1;
                 }
                 _ => return Err(PyValueError::new_err("worker chunk data type mismatch")),

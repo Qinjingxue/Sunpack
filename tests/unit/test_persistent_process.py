@@ -42,6 +42,28 @@ def test_stop_frame_is_fragment_safe_idempotent_and_separate_from_password(tmp_p
     asyncio.run(scenario())
 
 
+def test_disconnect_during_prompt_flush_releases_input_waiter():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        errors = []
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        protocol = persistent_process._PipeRequestProtocol(
+            b"t" * 32, on_connected=lambda: None, on_closed=lambda: None,
+            on_completed=lambda: None, on_shutdown=lambda: None,
+        )
+        request = protocol._request_task = asyncio.create_task(protocol.read_input("", None))
+        assert await protocol.output_queue.get() == struct.pack("!BI", 3, 0)
+        # The transport took the prompt but has not yet flushed it.
+        protocol.connection_lost(None)
+        protocol.output_queue.task_done()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert protocol._input_waiter is None
+        assert not errors
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("mode", ["q", "password", "ctrl_prompt"])
 def test_console_controls_are_duplex_and_yield_stdin_to_prompts(tmp_path, mode):
     # Mock transports cannot catch synchronous Windows pipe IO serializing a

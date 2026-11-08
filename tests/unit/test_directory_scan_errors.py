@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sunpack_native import NativeDirectoryScanOptions, scan_directory_snapshot, classify_scan_targets, scan_watch_candidates
+from sunpack_native import NativeDirectoryScanOptions, classify_scan_targets, scan_watch_candidates
 
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.failures import FailureKind
@@ -83,7 +83,7 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
         filtered, raw = native.scan(str(root), None)
         assert filtered.scan_errors() == raw.scan_errors()
         assert len(raw.scan_errors()) == 1 and str(blocked) in raw.scan_errors()[0]
-        single = scan_directory_snapshot(str(blocked), None, [], [], [], [])
+        single, _ = native.scan(str(blocked), None)
         assert not single and len(single.scan_errors()) == 1
         state = RunState()
         tasks = ArchiveTaskScanner(config, state).scan_targets([str(root)], scan_session=DiscoveryScanSession(config=config,scope=DiscoveryScope(str(root),recursive=True)))

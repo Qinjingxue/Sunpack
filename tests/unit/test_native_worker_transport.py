@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack_native import NativeWorkerResultAccumulator, parse_worker_event
+from sunpack_native import NativeWorkerResultAccumulator
 
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
@@ -80,36 +80,46 @@ def test_completed_sync_future_releases_worker_and_queue(monkeypatch, outcome):
     runner = SevenZipRunner({}, shared_worker_holder=SimpleNamespace(get_or_start=lambda _: worker))
     future = runner.submit_attempt({"job_id": "job"})
     references = weakref.ref(worker), weakref.ref(worker.queue_capacity), weakref.ref(runner)
-    if outcome == "protocol_error":
-        worker._dispatch_event(_event("manifest_chunk", seq=1, rows=[_row()]), "job")
-    else:
-        if outcome == "cancelled":
-            future.cancel()
-        worker._dispatch_event(_event("result", status="ok"), "job")
-    worker._dispatch_event(_event("native_event", event="job_finished"), "job")
-    assert future.done() and not worker._async_jobs
-    if outcome != "cancelled":
-        assert (future.result().returncode == 0) == (outcome == "success")
-    del worker, runner
-    gc.collect()
-    assert all(reference() is None for reference in references)
+    # Refcounts should release the request at completion, even before a GC pass.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        if outcome == "protocol_error":
+            worker._dispatch_event(_event("manifest_chunk", seq=1, rows=[_row()]), "job")
+        else:
+            if outcome == "cancelled":
+                future.cancel()
+            worker._dispatch_event(_event("result", status="ok"), "job")
+        worker._dispatch_event(_event("native_event", event="job_finished"), "job")
+        assert future.done() and not worker._async_jobs
+        if outcome != "cancelled":
+            assert (future.result().returncode == 0) == (outcome == "success")
+        del worker, runner
+        assert all(reference() is None for reference in references)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
 
 @pytest.mark.parametrize("transport", ["sync", "async"])
 def test_worker_stderr_keeps_bounded_tail_and_drains_for_reuse(monkeypatch, transport):
     # Progress tests contain no stderr burst. Exercise the real pump while no
-    # job result drains it, including long lines that defeat a line-only cap.
+    # job result drains it, including a line larger than the async stream limit
+    # and a UTF-8 character split across two pipe reads.
     lines = [f"{index}:" + "x" * (8000 if index % 2 else 10) + "\n" for index in range(200)]
-    expected_tail = "".join(lines)[-4000:]
+    data = "".join(lines).encode()
+    block_size = 64 * 1024
+    data += b"x" * (block_size + (-len(data) - 1) % block_size) + "中\n".encode()
+    expected_tail = data.decode()[-4000:]
     if transport == "sync":
         monkeypatch.setattr(_NativeWorkerProcess, "_start", lambda self: None)
         worker = _NativeWorkerProcess("unused", None)
-        worker._pump_stderr(io.BytesIO("".join(lines).encode()))
+        worker._pump_stderr(io.BytesIO(data))
     else:
         async def pump():
             worker = _AsyncNativeWorkerProcess("unused", None)
-            stream = asyncio.StreamReader()
-            stream.feed_data("".join(lines).encode())
+            stream = asyncio.StreamReader(limit=4096)
+            stream.feed_data(data)
             stream.feed_eof()
             worker.process = SimpleNamespace(stderr=stream)
             await worker._pump_stderr()
@@ -280,7 +290,6 @@ def test_sync_bad_job_waits_for_native_finish_and_does_not_affect_other_jobs():
     payload = _event("manifest_chunk", "bad", seq=1, rows=[_row()])
     worker._dispatch_event(payload, "bad")
     assert "bad" in worker._async_jobs and not failures and not callbacks
-    assert worker._async_jobs["bad"]["cancel_requested"] is True
     assert parse_worker_event(sent[-1]) == {"worker_command": "cancel", "job_id": "bad"}
     good_result = _event("result", "good", status="ok")
     worker._dispatch_event(good_result, "good")
@@ -881,9 +890,9 @@ def test_sync_close_drains_before_shutdown_and_joins_all_readers(monkeypatch, br
         stdin, stdout = Input(), Output()
 
         class Stderr:
-            def __iter__(self):
+            def read1(self, size):
                 assert reader_gate.wait(3)
-                return iter(())
+                return b""
 
             def close(self):
                 pass

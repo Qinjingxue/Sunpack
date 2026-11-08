@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import uuid
+from codecs import getincrementaldecoder
 from collections import OrderedDict
 from concurrent.futures import Future
 from contextlib import nullcontext
@@ -24,6 +25,7 @@ from sunpack.core.support.runtime_cwd import runtime_working_directory
 
 _LOGGER = logging.getLogger(__name__)
 _WORKER_STREAM_LIMIT = 4 * 1024 * 1024
+_PIPE_BLOCK_BYTES = 64 * 1024
 
 
 def _is_job_finished(payload: Any) -> bool:
@@ -109,104 +111,30 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
     return environment
 
 
-# native 侧的空间事件名（space_blocked / space_status / space_resumed），与 Python 内部状态名
-# state["space_waiting"] 刻意不同名。
-_SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
 _MEMORY_EVENTS = frozenset({"memory_blocked", "memory_resumed"})
-_SPACE_JOB_STATES = frozenset({"queued", "admitted", "running", "output_closed"})
-_KNOWN_JOB_EVENTS = frozenset(
-    {
-        "job_queued",
-        "job_admitted",
-        "job_started",
-        "job_finished",
-        "extract_started",
-        "result",
-        *_SPACE_EVENTS,
-        *_MEMORY_EVENTS,
-    }
-)
-
-# `_apply_native_event_to_job_state()` 的三种结果，其中 STALE 的过期空间事件不得向下游转发。
-_SPACE_NOT_APPLICABLE = "not_space"
-_SPACE_ACCEPTED = "accepted"
-_SPACE_STALE = "stale"
+_RESOURCE_EPISODES = {
+    "space_blocked": "space_episode",
+    "space_status": "space_episode",
+    "space_resumed": "space_episode",
+    "memory_blocked": "memory_episode",
+    "memory_resumed": "memory_episode",
+}
 
 
-def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> bool:
-    """把空间事件折进 job 等待状态，不写 job 生命周期状态。
-
-    native 在 gate 锁外发送事件，resumed 可能先于同一 episode 的 blocked 到达；
-    返回 False 表示该事件已过期，dispatcher 必须丢弃该事件。
-    """
-
-    try:
-        episode = int(payload.get("episode_id") or 0)
-    except (TypeError, ValueError):
-        episode = 0
-    latest = int(state.get("space_episode") or 0)
-    if episode < latest:
-        return False  # 更早的 episode，丢弃
-    if episode > latest:
-        state["space_episode"] = episode
-        state["space_resumed_seen"] = False
-
-    if event == "space_resumed":
-        state["space_resumed_seen"] = True
-        state["space_waiting"] = False
+def _is_stale_resource_event(state: dict[str, Any], payload: dict) -> bool:
+    """Resource callbacks can arrive out of order after the gate lock is released."""
+    event = payload.get("event")
+    if not isinstance(event, str) or (key := _RESOURCE_EPISODES.get(event)) is None:
+        return False
+    episode = payload.get("episode_id")
+    if not isinstance(episode, int):
+        return False
+    latest, resumed = state.get(key, (0, False))
+    if episode < latest or (episode == latest and resumed):
         return True
-    if state.get("space_resumed_seen"):
-        return False  # stale：同一 episode 已恢复过
-    if event == "space_blocked":
-        state["space_waiting"] = True
-        state["space_blocked_volume_key"] = str(payload.get("volume_key") or "")
-        try:
-            state["space_blocked_win32_error"] = int(payload.get("win32_error") or 0)
-        except (TypeError, ValueError):
-            state["space_blocked_win32_error"] = 0
-    return True
-
-
-def _apply_native_event_to_job_state(
-    state: dict[str, Any], payload: dict, logger: Any = None
-) -> str:
-    """返回 `_SPACE_NOT_APPLICABLE` / `_SPACE_ACCEPTED` / `_SPACE_STALE`。
-
-    非空间事件仍按既有语义写入 `state["state"] = event.removeprefix("job_")`。
-    """
-
-    if not isinstance(payload, dict):
-        return _SPACE_NOT_APPLICABLE
-    event = str(payload.get("event") or "")
-    if payload.get("type") == "result":
-        state["state"] = "result_received"
-        return _SPACE_NOT_APPLICABLE
-    if not event:
-        if logger is not None and payload.get("type"):
-            logger.debug("sevenzip_worker unknown event type: %s", payload.get("type"))
-        return _SPACE_NOT_APPLICABLE
-    if event in _SPACE_EVENTS:
-        return (
-            _SPACE_ACCEPTED
-            if _on_space_event(state, event, payload)
-            else _SPACE_STALE
-        )
-    if event in _MEMORY_EVENTS:
-        episode = int(payload.get("episode_id") or 0)
-        latest = int(state.get("memory_episode") or 0)
-        if episode < latest or (episode == latest and state.get("memory_resumed_seen")):
-            return _SPACE_STALE
-        state["memory_episode"] = episode
-        state["memory_waiting"] = event == "memory_blocked"
-        state["memory_resumed_seen"] = event == "memory_resumed"
-        return _SPACE_ACCEPTED
-    if payload.get("type") == "native_memory":
-        return _SPACE_NOT_APPLICABLE
-    if payload.get("type") == "progress" and event not in _KNOWN_JOB_EVENTS:
-        if logger is not None:
-            logger.debug("sevenzip_worker unknown progress event: %s", event)
-    state["state"] = event.removeprefix("job_")
-    return _SPACE_NOT_APPLICABLE
+    if episode > latest or event.endswith("_resumed"):
+        state[key] = (episode, event.endswith("_resumed"))
+    return False
 
 
 class _NativeWorkerProcess:
@@ -266,13 +194,10 @@ class _NativeWorkerProcess:
         The stdout dispatcher is the only reader of the worker's pipe; the native process owns extraction concurrency.
         """
         state = {
-            "state": "submitted",
             "on_event": on_event,
             "on_error": on_error,
-            "cancel_requested": False,
             "completion_lock": threading.Lock(),
             "accumulator": NativeWorkerResultAccumulator(job_id),
-            "worker_epoch": self.worker_epoch,
         }
         with self._dispatch_lock:
             if self._closing:
@@ -322,7 +247,7 @@ class _NativeWorkerProcess:
         broken = False
         try:
             decoder = NativeWorkerFrameDecoder()
-            while block := stream.read1(64 * 1024):
+            while block := stream.read1(_PIPE_BLOCK_BYTES):
                 events = decoder.feed(block)
                 del block
                 for payload in events:
@@ -349,71 +274,67 @@ class _NativeWorkerProcess:
                 self._fail_async_job(job_id, state, str(state.get("callback_error") or failure))
             self.queue_capacity.flush()
 
-    def _dispatch_event(self, payload: Any, job_id: str) -> None:
+    def _dispatch_event(self, payload: dict[str, Any], job_id: str) -> None:
         with self._dispatch_lock:
             async_state = self._async_jobs.get(job_id) if job_id else None
-            forward = True
-            if async_state is not None and isinstance(payload, dict):
-                # 空间事件表达的是等待状态，绝不能写进 job_state["state"]（会让 watch_memory / 状态读取失真）。
-                if (
-                    _apply_native_event_to_job_state(async_state, payload, _LOGGER)
-                    == _SPACE_STALE
-                ):
-                    forward = False
-        if forward and async_state is not None:
-            completed = False
-            cancel_job = False
-            callback_error = str(async_state.get("callback_error") or "")
-            with async_state["completion_lock"]:
-                with self._dispatch_lock:
-                    if self._async_jobs.get(job_id) is not async_state:
+            if async_state is None or _is_stale_resource_event(async_state, payload):
+                return
+        terminal = _is_job_finished(payload)
+        completed = False
+        cancel_job = False
+        callback_error = async_state.get("callback_error")
+        with async_state["completion_lock"]:
+            with self._dispatch_lock:
+                if self._async_jobs.get(job_id) is not async_state:
+                    return
+            # Completion callbacks can publish results or resubmit from
+            # another thread immediately. Retire terminal registrations
+            # before handing off ownership, just as _fail_async_job does.
+            if terminal:
+                self._finish_async_job(job_id, expected=async_state)
+            try:
+                if callback_error:
+                    completed = terminal
+                else:
+                    if payload.get("type") == "protocol_error":
+                        raise ValueError(payload["message"])
+                    if async_state["accumulator"].accept(payload):
                         return
-                # Completion callbacks can publish results or resubmit from
-                # another thread immediately. Retire terminal registrations
-                # before handing off ownership, just as _fail_async_job does.
-                if _is_job_finished(payload):
-                    self._finish_async_job(job_id, expected=async_state)
-                try:
-                    if callback_error:
-                        completed = _is_job_finished(payload)
-                    else:
-                        if payload.get("type") == "protocol_error":
-                            raise ValueError(payload["message"])
-                        if async_state["accumulator"].accept(payload):
-                            return
-                        callback = async_state["on_event"]
-                        completed = bool(callback(payload))
-                        if _is_job_finished(payload) and not completed:
-                            raise ValueError("sevenzip_worker finished without a result")
-                except Exception as exc:
-                    callback_error = f"sevenzip_worker job protocol/callback failed: {exc}"
-                    async_state["callback_error"] = callback_error
-                    async_state.pop("accumulator", None)
-                    completed = _is_job_finished(payload)
-                    cancel_job = not completed
-                    if cancel_job and not async_state["cancel_requested"]:
-                        async_state["cancel_requested"] = True
-                if completed:
-                    self._finish_async_job(job_id, expected=async_state)
-            if cancel_job:
-                try:
-                    self.cancel(job_id)
-                except Exception:
-                    self.abort()
-            if completed and callback_error:
-                try:
-                    async_state["on_error"](callback_error)
-                except Exception:
-                    pass
+                    callback = async_state["on_event"]
+                    completed = bool(callback(payload))
+                    if terminal and not completed:
+                        raise ValueError("sevenzip_worker finished without a result")
+            except Exception as exc:
+                callback_error = f"sevenzip_worker job protocol/callback failed: {exc}"
+                async_state["callback_error"] = callback_error
+                async_state.pop("accumulator", None)
+                completed = terminal
+                cancel_job = not completed
+            if completed and not terminal:
+                self._finish_async_job(job_id, expected=async_state)
+        if cancel_job:
+            try:
+                self.cancel(job_id)
+            except Exception:
+                self.abort()
+        if completed and callback_error:
+            try:
+                async_state["on_error"](callback_error)
+            except Exception:
+                pass
 
     def _pump_stderr(self, stream) -> None:
+        decoder = getincrementaldecoder("utf-8")("replace")
         try:
-            for line in stream:
+            while block := stream.read1(_PIPE_BLOCK_BYTES):
                 with self._stderr_lock:
-                    self._stderr.append(line.decode("utf-8", "replace"))
-                del line
+                    self._stderr.append(decoder.decode(block))
+                del block
         except Exception:
             pass
+        finally:
+            with self._stderr_lock:
+                self._stderr.append(decoder.decode(b"", final=True))
 
     def take_stderr(self) -> list[str]:
         with self._stderr_lock:
@@ -580,8 +501,6 @@ class _AsyncNativeWorkerProcess:
             "on_error": on_error,
             "finished": asyncio.get_running_loop().create_future(),
             "accumulator": NativeWorkerResultAccumulator(job_id),
-            "cancel_requested": False,
-            "state": "submitted",
         }
         try:
             await self.send(payload)
@@ -598,11 +517,8 @@ class _AsyncNativeWorkerProcess:
             await self.process.stdin.drain()
 
     async def cancel(self, job_id: str) -> None:
-        state = self._jobs.get(job_id)
-        if state is None:
+        if job_id not in self._jobs:
             return
-        if not state["cancel_requested"]:
-            state["cancel_requested"] = True
         await self.send(encode_worker_frame({"worker_command": "cancel", "job_id": job_id}))
 
     async def cancel_and_wait(self, job_id: str) -> None:
@@ -657,7 +573,7 @@ class _AsyncNativeWorkerProcess:
         broken = False
         try:
             decoder = NativeWorkerFrameDecoder()
-            while block := await self.process.stdout.read(64 * 1024):
+            while block := await self.process.stdout.read(_PIPE_BLOCK_BYTES):
                 events = decoder.feed(block)
                 del block
                 for payload in events:
@@ -681,14 +597,15 @@ class _AsyncNativeWorkerProcess:
 
     async def _dispatch_event(self, payload: dict[str, Any]) -> None:
         # Chunk data stays in Rust and never reaches job callbacks.
-        job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
-        if isinstance(payload, dict) and payload.get("type") == "worker_ready":
+        job_id = str(payload.get("job_id") or "")
+        kind = payload.get("type")
+        if kind == "worker_ready":
             self.handshake = dict(payload)
             self.handshake["worker_pid"] = int(getattr(self.process, "pid", 0) or 0)
             if self._ready is not None and not self._ready.done():
                 self._ready.set_result(self.handshake)
             return
-        if isinstance(payload, dict) and payload.get("type") == "process_mode_ack":
+        if kind == "process_mode_ack":
             self.handshake["process_mode"] = str(payload.get("mode") or "normal")
             self.handshake["process_mode_applied"] = bool(payload.get("applied"))
             waiter = self._process_mode_waiter
@@ -700,14 +617,11 @@ class _AsyncNativeWorkerProcess:
             if job_id and _is_job_finished(payload):
                 self.queue_capacity.release(job_id)
             return
-        # 空间事件必须在写 state["state"] = event.removeprefix("job_") 之前识别，否则 job 生命周期状态会被污染。
-        if (
-            _apply_native_event_to_job_state(state, payload, _LOGGER)
-            == _SPACE_STALE
-        ):
+        if _is_stale_resource_event(state, payload):
             return
+        terminal = _is_job_finished(payload)
         if state.get("callback_error"):
-            if _is_job_finished(payload):
+            if terminal:
                 self._fail_job(job_id, state, state["callback_error"])
                 self.queue_capacity.release(job_id)
             return
@@ -721,7 +635,7 @@ class _AsyncNativeWorkerProcess:
         except Exception as exc:
             state["callback_error"] = f"sevenzip_worker job protocol/callback failed: {exc}"
             state.pop("accumulator", None)
-            if _is_job_finished(payload):
+            if terminal:
                 self._fail_job(job_id, state, state["callback_error"])
             else:
                 try:
@@ -729,18 +643,20 @@ class _AsyncNativeWorkerProcess:
                 except Exception:
                     await self.abort()
             completed = False
-        if completed and _is_job_finished(payload):
+        if completed and terminal:
             self._finish_job(job_id, state)
-        elif _is_job_finished(payload) and not state.get("callback_error"):
+        elif terminal and not state.get("callback_error"):
             self._fail_job(job_id, state, "sevenzip_worker finished without a result")
-        if _is_job_finished(payload):
+        if terminal:
             self.queue_capacity.release(job_id)
 
     async def _pump_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
-        while line := await self.process.stderr.readline():
-            self._stderr.append(line.decode("utf-8", "replace"))
-            del line
+        decoder = getincrementaldecoder("utf-8")("replace")
+        while block := await self.process.stderr.read(_PIPE_BLOCK_BYTES):
+            self._stderr.append(decoder.decode(block))
+            del block
+        self._stderr.append(decoder.decode(b"", final=True))
 
     def _finish_job(self, job_id: str, expected: dict[str, Any]) -> dict[str, Any] | None:
         state = self._jobs.get(job_id)
@@ -775,7 +691,7 @@ class _AsyncNativeWorkerProcess:
             if asyncio.current_task() is self._stdout_task:
                 # A protocol error can leave StreamReader paused above its
                 # limit. Consume the dead worker's tail so wait() can see EOF.
-                while await self.process.stdout.read(64 * 1024):
+                while await self.process.stdout.read(_PIPE_BLOCK_BYTES):
                     pass
             await self.process.wait()
         self._fail_all_jobs(message)
@@ -852,6 +768,120 @@ class _AsyncNativeWorkerHolder:
             self._worker = None
         if worker is not None:
             await worker.close()
+
+
+class _WorkerAttempt:
+    """Own a request and its diagnostics until the native terminal event."""
+
+    __slots__ = (
+        "runner", "worker", "request", "job_id", "task", "completion",
+        "schedule_retry", "frame", "stderr", "progress", "result", "cancelled",
+    )
+
+    def __init__(
+        self,
+        runner: "SevenZipRunner",
+        worker: _NativeWorkerProcess | _AsyncNativeWorkerProcess,
+        request: dict,
+        job_id: str,
+        task: ArchiveTask | None,
+        completion: Future | asyncio.Future,
+        schedule_retry: Callable[["_WorkerAttempt"], None] | None,
+    ):
+        self.runner = runner
+        self.worker = worker
+        self.request = request
+        self.job_id = job_id
+        self.task = task
+        self.completion = completion
+        self.schedule_retry = schedule_retry
+        self.frame = encode_worker_frame(request)
+        self.stderr = StdioHistory()
+        self.progress = ProgressHistory()
+        self.result: dict[str, Any] | None = None
+        self.cancelled = False
+
+    def complete(self, process: subprocess.CompletedProcess) -> None:
+        if not self.completion.done():
+            self.completion.set_result(process)
+
+    def can_resubmit(self) -> bool:
+        if self.cancelled or self.completion.done():
+            # The queue already granted a slot. Transfer it if cancellation
+            # won while the resubmission was in transit.
+            self.worker.queue_capacity.release(self.job_id)
+            return False
+        if not self.worker.is_alive():
+            self.on_error("sevenzip_worker exited before job completion")
+            return False
+        return True
+
+    def resubmit(self) -> None:
+        self.schedule_retry(self)
+
+    def on_event(self, event: dict[str, Any]) -> bool:
+        event.setdefault("worker_epoch", self.worker.worker_epoch)
+        kind = event.get("type")
+        if kind == "progress" or (kind == "native_memory" and event.get("event") in _MEMORY_EVENTS):
+            self.progress.append(event)
+            if kind == "native_memory":
+                self.runner._emit_native_event(self.task, event)
+            self.runner._emit_progress(self.task, event)
+        elif kind in {"native_cpu", "native_memory", "native_event"}:
+            self.runner._emit_native_event(self.task, event)
+            if _is_job_finished(event) and self.result is not None:
+                result, self.result = self.result, None
+                if (
+                    not self.cancelled
+                    and result.get("retryable")
+                    and result.get("native_status") == "backpressure"
+                ):
+                    if self.schedule_retry is None:
+                        self.on_error("native worker backpressure requires an event loop")
+                    else:
+                        self.worker.queue_capacity.park(
+                            self.job_id,
+                            self.resubmit,
+                            completion=self.completion,
+                            other_jobs_active=self.worker.has_other_jobs(self.job_id),
+                        )
+                else:
+                    self.complete(self.runner._completed_process(
+                        [self.worker.worker_path],
+                        0 if result.get("status") == "ok" else 1,
+                        "",
+                        self.stderr.text(),
+                        request_payload=self.request,
+                        result_payload=result,
+                        progress_events=self.progress,
+                    ))
+                return True
+        elif kind == "result":
+            self.stderr.extend(self.worker.take_stderr())
+            self.result = event
+        return False
+
+    def on_error(self, message: str) -> None:
+        failure_kind = (
+            "process_io" if "job protocol/callback failed" in message
+            else "worker_lost"
+            if "exited before job completion" in message or not self.worker.is_alive()
+            else "process_io"
+        )
+        self.complete(self.runner._completed_process(
+            [self.worker.worker_path],
+            -101,
+            "",
+            message,
+            request_payload=self.request,
+            process_failure={
+                "failure_stage": "worker_communication",
+                "failure_kind": failure_kind,
+                "worker_epoch": self.worker.worker_epoch,
+                "message": message,
+            },
+            progress_events=self.progress,
+        ))
 
 
 class SevenZipRunner:
@@ -972,126 +1002,29 @@ class SevenZipRunner:
         try:
             worker = await self._async_worker_holder_or_create().get_or_start(startupinfo)
             result_future.add_done_callback(lambda _: worker.queue_capacity.discard(job_id))
-            prepared_job["worker_epoch"] = worker.worker_epoch
-            stderr_lines = StdioHistory()
-            progress_events = ProgressHistory()
-            pending_result: subprocess.CompletedProcess | None = None
-            pending_payload: dict[str, Any] | None = None
-            cancelled = False
-            payload_frame = encode_worker_frame(prepared_job)
 
-            def complete(value: subprocess.CompletedProcess) -> None:
-                if not result_future.done():
-                    result_future.set_result(value)
-
-            async def resubmit_after_backpressure() -> None:
-                if cancelled or result_future.done():
-                    # The wakeup was already removed from the queue. Transfer
-                    # its unused slot even if cancellation won after dispatch.
-                    worker.queue_capacity.release(job_id)
-                    return
-                if not worker.is_alive():
-                    on_error("sevenzip_worker exited before job completion")
+            async def retry(attempt: _WorkerAttempt) -> None:
+                if not attempt.can_resubmit():
                     return
                 try:
                     await worker.submit(
-                        payload_frame,
-                        job_id,
-                        on_event=on_event,
-                        on_error=on_error,
+                        attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
                     )
                 except Exception as exc:
-                    on_error(f"native worker retry failed: {exc}")
+                    attempt.on_error(f"native worker retry failed: {exc}")
 
-            def on_event(value: dict[str, Any]) -> bool:
-                nonlocal pending_result, pending_payload
-                if value:
-                    value.setdefault("worker_epoch", worker.worker_epoch)
-                if value and value.get("type") == "progress":
-                    progress_events.append(value)
-                    self._emit_progress(task, value)
-                    return False
-                if value and value.get("type") == "native_memory":
-                    self._emit_native_event(task, value)
-                    if value.get("event") in _MEMORY_EVENTS:
-                        progress_events.append(value)
-                        self._emit_progress(task, value)
-                    return False
-                if value and value.get("type") == "native_cpu":
-                    self._emit_native_event(task, value)
-                    return False
-                if value and value.get("type") == "native_event":
-                    self._emit_native_event(task, value)
-                    if value.get("event") != "job_finished" or pending_result is None:
-                        return False
-                    if (
-                        not cancelled
-                        and isinstance(pending_payload, dict)
-                        and pending_payload.get("retryable")
-                        and pending_payload.get("native_status") == "backpressure"
-                    ):
-                        pending_result = None
-                        pending_payload = None
-                        worker.queue_capacity.park(
-                            job_id,
-                            lambda: worker.spawn_resubmission(resubmit_after_backpressure()),
-                            completion=result_future,
-                            other_jobs_active=worker.has_other_jobs(job_id),
-                        )
-                        return True
-                    complete(pending_result)
-                    pending_result = None
-                    pending_payload = None
-                    return True
-                if value and value.get("type") == "cancel_ack":
-                    return False
-                if value and value.get("type") == "result":
-                    stderr_lines.extend(worker.take_stderr())
-                    pending_result = self._completed_process(
-                        [worker.worker_path],
-                        0 if value.get("status") == "ok" else 1,
-                        "",
-                        stderr_lines.text(),
-                        request_payload=prepared_job,
-                        result_payload=value,
-                        progress_events=progress_events,
-                    )
-                    pending_payload = value
-                    return False
-                return False
+            def schedule_retry(attempt: _WorkerAttempt) -> None:
+                worker.spawn_resubmission(retry(attempt))
 
-            def on_error(message: str) -> None:
-                failure_kind = (
-                    "process_io" if "job protocol/callback failed" in message
-                    else "worker_lost" if not worker.is_alive()
-                    else "process_io"
-                )
-                complete(self._completed_process(
-                    [worker.worker_path],
-                    -101,
-                    "",
-                    message,
-                    request_payload=prepared_job,
-                    process_failure={
-                        "failure_stage": "worker_communication",
-                        "failure_kind": failure_kind,
-                        "worker_epoch": worker.worker_epoch,
-                        "message": message,
-                    },
-                    progress_events=progress_events,
-                ))
-
+            attempt = _WorkerAttempt(self, worker, prepared_job, job_id, task, result_future, schedule_retry)
             submission = asyncio.create_task(worker.submit(
-                payload_frame,
-                job_id,
-                on_event=on_event,
-                on_error=on_error,
+                attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
             ))
             try:
                 await asyncio.shield(submission)
                 return await asyncio.shield(result_future)
             except asyncio.CancelledError:
-                cancelled = True
+                attempt.cancelled = True
                 worker.queue_capacity.discard(job_id)
 
                 async def finish_cancel() -> None:
@@ -1173,124 +1106,27 @@ class SevenZipRunner:
             # concurrent.futures keeps done callbacks for the Future's whole
             # lifetime. Release the queue reference when this one has run.
             future.add_done_callback(retire_queue)
-            prepared_job["worker_epoch"] = worker.worker_epoch
-            stderr_lines = StdioHistory()
-            progress_events = ProgressHistory()
-            pending_result: subprocess.CompletedProcess | None = None
-            pending_result_payload: dict[str, Any] | None = None
-            payload = encode_worker_frame(prepared_job)
 
-            def on_event(payload_value: dict[str, Any]) -> bool:
-                nonlocal pending_result, pending_result_payload
-                if payload_value:
-                    payload_value.setdefault("worker_epoch", worker.worker_epoch)
-                if payload_value and payload_value.get("type") == "progress":
-                    progress_events.append(payload_value)
-                    self._emit_progress(task, payload_value)
-                    return False
-                if payload_value and payload_value.get("type") == "native_memory":
-                    self._emit_native_event(task, payload_value)
-                    if payload_value.get("event") in _MEMORY_EVENTS:
-                        progress_events.append(payload_value)
-                        self._emit_progress(task, payload_value)
-                    return False
-                if payload_value and payload_value.get("type") == "native_cpu":
-                    self._emit_native_event(task, payload_value)
-                    return False
-                if payload_value and payload_value.get("type") == "native_event":
-                    self._emit_native_event(task, payload_value)
-                    if payload_value.get("event") == "job_finished" and pending_result is not None:
-                        if (
-                            isinstance(pending_result_payload, dict)
-                            and pending_result_payload.get("retryable")
-                            and pending_result_payload.get("native_status") == "backpressure"
-                        ):
-                            pending_result = None
-                            pending_result_payload = None
-
-                            def retry_submission() -> None:
-                                if future.done():
-                                    worker.queue_capacity.release(job_id)
-                                    return
-                                if not worker.is_alive():
-                                    on_error("sevenzip_worker exited before job completion")
-                                    return
-                                try:
-                                    worker.submit_async(
-                                        payload,
-                                        job_id,
-                                        on_event=on_event,
-                                        on_error=on_error,
-                                    )
-                                except Exception as exc:
-                                    on_error(f"native worker retry failed: {exc}")
-
-                            if self._event_loop is None:
-                                on_error("native worker backpressure requires an event loop")
-                                return True
-                            event_loop = self._event_loop
-                            # Terminal dispatch retires the old registration
-                            # before invoking this callback.
-                            worker.queue_capacity.park(
-                                job_id,
-                                lambda: event_loop.call_soon_threadsafe(retry_submission),
-                                completion=future,
-                                other_jobs_active=worker.has_other_jobs(job_id),
-                            )
-                            return True
-                        complete(pending_result)
-                        pending_result = None
-                        pending_result_payload = None
-                        return True
-                    return False
-                if payload_value and payload_value.get("type") == "cancel_ack":
-                    return False
-                if payload_value and payload_value.get("type") == "result":
-                    returncode = 0 if payload_value.get("status") == "ok" else 1
-                    stderr_lines.extend(worker.take_stderr())
-                    pending_result = self._completed_process(
-                        [worker.worker_path],
-                        returncode,
-                        "",
-                        stderr_lines.text(),
-                        request_payload=prepared_job,
-                        result_payload=payload_value,
-                        progress_events=progress_events,
+            def retry(attempt: _WorkerAttempt) -> None:
+                if not attempt.can_resubmit():
+                    return
+                try:
+                    worker.submit_async(
+                        attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
                     )
-                    pending_result_payload = payload_value
-                    return False
-                return False
+                except Exception as exc:
+                    attempt.on_error(f"native worker retry failed: {exc}")
 
-            def on_error(message: str) -> None:
-                with worker._dispatch_lock:
-                    job_state = (worker._async_jobs.get(job_id) or {}).get("state", "unknown")
-                failure_kind = (
-                    "process_io" if "job protocol/callback failed" in message
-                    else "worker_lost"
-                    if "exited before job completion" in message or not worker.is_alive()
-                    else "process_io"
-                )
-                complete(self._completed_process(
-                    [worker.worker_path],
-                    -101,
-                    "",
-                    message,
-                    request_payload=prepared_job,
-                    process_failure={
-                        "failure_stage": "worker_communication",
-                        "failure_kind": failure_kind,
-                        "worker_epoch": worker.worker_epoch,
-                        "job_state": job_state,
-                        "message": message,
-                    },
-                    progress_events=progress_events,
-                ))
+            event_loop = self._event_loop
 
+            def schedule_retry(attempt: _WorkerAttempt) -> None:
+                event_loop.call_soon_threadsafe(retry, attempt)
+
+            attempt = _WorkerAttempt(
+                self, worker, prepared_job, job_id, task, future, schedule_retry if event_loop is not None else None,
+            )
             worker.submit_async(
-                payload,
-                job_id,
-                on_event=on_event,
-                on_error=on_error,
+                attempt.frame, job_id, on_event=attempt.on_event, on_error=attempt.on_error,
             )
         except Exception as exc:
             process_failure = {

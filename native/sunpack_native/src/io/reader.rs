@@ -1452,16 +1452,18 @@ impl ByteSource for MultiVolumeSource {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
 struct BlockKey {
-    identity: FileIdentity,
+    // A reopened physical file gets a new generation even if its metadata
+    // is unchanged. Only the release index needs its canonical path.
+    source_id: u64,
     index: u64,
 }
 
 impl BlockKey {
     fn new(source: &FileSource, index: u64) -> Self {
         Self {
-            identity: source.cache_identity(),
+            source_id: source.cache_id,
             index,
         }
     }
@@ -1479,10 +1481,13 @@ struct CacheEntry {
     generation: u64,
 }
 
-// At least an entry, a lookup key and a queue record remain resident even
-// when a small file or a truncated read contributes no payload bytes.
-const CACHE_BLOCK_METADATA_BYTES: usize =
-    size_of::<CacheEntry>() + size_of::<BlockKey>() + size_of::<(BlockKey, u64)>();
+// Small or empty blocks also own metadata. Charge the cleanup index per
+// block even when several blocks share its canonical path and set.
+const CACHE_BLOCK_METADATA_BYTES: usize = size_of::<CacheEntry>()
+    + size_of::<BlockKey>()
+    + size_of::<(BlockKey, u64)>()
+    + size_of::<(u64, CachedSource)>()
+    + size_of::<u64>();
 
 struct CacheQueue {
     order: VecDeque<(BlockKey, u64)>,
@@ -1509,10 +1514,15 @@ impl CacheQueue {
 
 struct CacheShard {
     entries: HashMap<BlockKey, CacheEntry>,
-    by_identity: HashMap<FileIdentity, HashSet<u64>>,
+    by_source: HashMap<u64, CachedSource>,
     hot: CacheQueue,
     general: CacheQueue,
     generation: u64,
+}
+
+struct CachedSource {
+    path: PathBuf,
+    indices: HashSet<u64>,
 }
 
 struct HandleEntry {
@@ -1551,7 +1561,7 @@ impl CacheShard {
     fn new(hot_capacity: usize, general_capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            by_identity: HashMap::new(),
+            by_source: HashMap::new(),
             hot: CacheQueue::new(hot_capacity),
             general: CacheQueue::new(general_capacity),
             generation: 0,
@@ -1565,18 +1575,28 @@ impl CacheShard {
         }
     }
 
-    fn insert(&mut self, key: BlockKey, data: Arc<[u8]>, tier: CacheTier) -> (Arc<[u8]>, u64) {
+    fn insert(
+        &mut self,
+        key: BlockKey,
+        path: &Path,
+        data: Arc<[u8]>,
+        tier: CacheTier,
+    ) -> (Arc<[u8]>, u64) {
         if let Some(existing) = self.entries.get(&key) {
             return (Arc::clone(&existing.data), 0);
         }
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        self.by_identity
-            .entry(key.identity.clone())
-            .or_default()
+        self.by_source
+            .entry(key.source_id)
+            .or_insert_with(|| CachedSource {
+                path: path.to_path_buf(),
+                indices: HashSet::new(),
+            })
+            .indices
             .insert(key.index);
         self.entries.insert(
-            key.clone(),
+            key,
             CacheEntry {
                 data: Arc::clone(&data),
                 tier,
@@ -1606,14 +1626,11 @@ impl CacheShard {
         queue.bytes -= entry.data.len();
         queue.stale += usize::from(leave_order_entry);
 
-        let remove_identity = if let Some(indices) = self.by_identity.get_mut(&key.identity) {
-            indices.remove(&key.index);
-            indices.is_empty()
-        } else {
-            false
-        };
-        if remove_identity {
-            self.by_identity.remove(&key.identity);
+        if let Some(source) = self.by_source.get_mut(&key.source_id) {
+            source.indices.remove(&key.index);
+            if source.indices.is_empty() {
+                self.by_source.remove(&key.source_id);
+            }
         }
         Some(entry)
     }
@@ -1623,7 +1640,7 @@ impl CacheShard {
         // obsolete LRU queue keys are compacted amortized so targeted release
         // does not turn back into a full-cache scan.
         for queue in [&mut self.hot, &mut self.general] {
-            if self.entries.is_empty() {
+            if queue.order.len() == queue.stale {
                 queue.order.clear();
                 queue.stale = 0;
             } else if queue.stale >= CACHE_ORDER_COMPACT_STALE_MIN {
@@ -1640,7 +1657,7 @@ impl CacheShard {
         // Release empty allocations and shrink large sparse indexes while
         // unrelated readers keep their entries and borrowed data.
         crate::collections::trim_map(&mut self.entries);
-        crate::collections::trim_map(&mut self.by_identity);
+        crate::collections::trim_map(&mut self.by_source);
     }
 }
 
@@ -1691,23 +1708,15 @@ impl ReaderManager {
             let mut shard = shard
                 .lock()
                 .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-            let identities = shard
-                .by_identity
-                .keys()
-                .filter(|identity| path_is_under_roots(&identity.path, roots))
-                .cloned()
+            let source_ids = shard
+                .by_source
+                .iter()
+                .filter_map(|(&id, source)| path_is_under_roots(&source.path, roots).then_some(id))
                 .collect::<Vec<_>>();
-            for identity in identities {
-                let indices = shard
-                    .by_identity
-                    .get(&identity)
-                    .map(|indices| indices.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                for index in indices {
-                    let key = BlockKey {
-                        identity: identity.clone(),
-                        index,
-                    };
+            for source_id in source_ids {
+                let source = shard.by_source.remove(&source_id).unwrap();
+                for index in source.indices {
+                    let key = BlockKey { source_id, index };
                     if let Some(entry) = shard.remove_entry(&key, true) {
                         removed_entries += 1;
                         removed_bytes += entry.data.len();
@@ -1854,7 +1863,7 @@ impl ReaderManager {
                     let len = BLOCK_SIZE.min(source.len().saturating_sub(offset) as usize);
                     let result = source
                         .with_file(|file| read_file_at(file, offset, len, &self.metrics))
-                        .and_then(|data| self.insert_block(key.clone(), Arc::from(data), tier));
+                        .and_then(|data| self.insert_block(source, key, Arc::from(data), tier));
                     let finish_result = self.finish_block_load(source, index, &load);
                     return match result {
                         Ok(data) => {
@@ -1896,6 +1905,7 @@ impl ReaderManager {
 
     fn insert_block(
         &self,
+        source: &FileSource,
         key: BlockKey,
         data: Arc<[u8]>,
         tier: CacheTier,
@@ -1904,7 +1914,7 @@ impl ReaderManager {
         let mut shard = self.cache_shards[shard_index]
             .lock()
             .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-        let (block, evictions) = shard.insert(key, data, tier);
+        let (block, evictions) = shard.insert(key, &source.identity.path, data, tier);
         if evictions != 0 {
             self.metrics
                 .evictions
@@ -1926,7 +1936,7 @@ impl ReaderManager {
             hot_bytes += shard.hot.bytes;
             general_bytes += shard.general.bytes;
             capacity += shard.entries.capacity()
-                + shard.by_identity.capacity()
+                + shard.by_source.capacity()
                 + shard.hot.order.capacity()
                 + shard.general.order.capacity();
         }
@@ -2868,13 +2878,17 @@ mod tests {
         let source = manager().open_file(&path).unwrap();
         let budget = 2 * CACHE_BLOCK_METADATA_BYTES + 1;
         let mut shard = CacheShard::new(budget, budget);
+        let source_path = source.identity.path.as_path();
         for (start, tier) in [(0, CacheTier::Hot), (3, CacheTier::General)] {
             let first = BlockKey::new(&source, start);
             let second = BlockKey::new(&source, start + 1);
             let third = BlockKey::new(&source, start + 2);
-            assert_eq!(shard.insert(first.clone(), Arc::from([]), tier).1, 0);
-            assert_eq!(shard.insert(second.clone(), Arc::from([b'x']), tier).1, 0);
-            assert_eq!(shard.insert(third.clone(), Arc::from([]), tier).1, 1);
+            assert_eq!(shard.insert(first, source_path, Arc::from([]), tier).1, 0);
+            assert_eq!(
+                shard.insert(second, source_path, Arc::from([b'x']), tier).1,
+                0
+            );
+            assert_eq!(shard.insert(third, source_path, Arc::from([]), tier).1, 1);
             assert!(!shard.entries.contains_key(&first));
             assert!(shard.entries.contains_key(&second));
             assert!(shard.entries.contains_key(&third));
@@ -2894,14 +2908,16 @@ mod tests {
         let mut shard = CacheShard::new(usize::MAX, usize::MAX);
         let mut keys = Vec::new();
         for generation in 1..=1024 {
-            let mut key = BlockKey::new(&source, 0);
-            key.identity.reader_generation = generation;
+            let key = BlockKey {
+                source_id: generation,
+                index: 0,
+            };
             let tier = if generation % 2 == 0 {
                 CacheTier::Hot
             } else {
                 CacheTier::General
             };
-            shard.insert(key.clone(), Arc::clone(&payload), tier);
+            shard.insert(key, &source.identity.path, Arc::clone(&payload), tier);
             keys.push(key);
         }
         let live = keys.pop().unwrap();
@@ -2910,7 +2926,7 @@ mod tests {
         }
         shard.compact_stale_orders();
         assert_eq!(shard.entries.len(), 1);
-        assert!(shard.entries.capacity() <= 256 && shard.by_identity.capacity() <= 256);
+        assert!(shard.entries.capacity() <= 256 && shard.by_source.capacity() <= 256);
         assert!(shard.hot.order.capacity() <= 256 && shard.general.order.capacity() <= 256);
         assert!(Arc::ptr_eq(&shard.entries[&live].data, &payload));
         shard.remove_entry(&live, true).unwrap();
@@ -2918,7 +2934,7 @@ mod tests {
         assert_eq!(shard.hot.bytes + shard.general.bytes, 0);
         assert_eq!(
             shard.entries.capacity()
-                + shard.by_identity.capacity()
+                + shard.by_source.capacity()
                 + shard.hot.order.capacity()
                 + shard.general.order.capacity(),
             0
@@ -3208,7 +3224,7 @@ mod tests {
             .unwrap();
         let key = BlockKey::new(&source, 0);
         manager()
-            .insert_block(key, Arc::from(block), cache_tier(&source, 0))
+            .insert_block(&source, key, Arc::from(block), cache_tier(&source, 0))
             .unwrap();
         manager().finish_block_load(&source, 0, &load).unwrap();
 
@@ -3413,7 +3429,12 @@ mod tests {
         let current = manager().open_file(&path).unwrap();
         assert_eq!(token, current.identity.generation_token());
         manager()
-            .insert_block(old_key, Arc::from(&b"new!"[..]), CacheTier::Hot)
+            .insert_block(
+                &old_source,
+                old_key,
+                Arc::from(&b"new!"[..]),
+                CacheTier::Hot,
+            )
             .unwrap();
         assert_eq!(current.read_at(0, 4).unwrap(), b"last");
         assert_ne!(old_source.cache_identity(), current.cache_identity());

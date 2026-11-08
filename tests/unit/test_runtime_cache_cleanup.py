@@ -19,6 +19,7 @@ from sunpack.core.support.runtime_cache_cleanup import (
     runtime_cache_stats,
 )
 from sunpack.runtime.cli.runtime_host import RuntimeHost
+from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
@@ -149,7 +150,12 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     watcher._arm_idle_cache_cleanup()
     watcher._reset_idle_cache_cleanup()
     watcher._cache_cleanup_deadline = 0
-    watcher._store_pending_locked("busy", object())
+    with watcher._lock:
+        watcher._add_pending_locked(
+            WatchCandidate(str(tmp_path / "busy"), 10, 1.0, "file", 1),
+            last_event_at=0,
+            quiet_seconds=0,
+        )
     _TEST_LOOP.run_until_complete(watcher._maybe_clear_idle_caches())
     assert engine.clear_calls == 1
 

@@ -53,7 +53,7 @@ class VerificationPipeline:
         issues: list[VerificationIssue] = []
         methods_run: list[str] = []
         steps: list[VerificationStep] = []
-        file_observations: list[FileVerificationObservation] = []
+        observations_by_path: dict[str, FileVerificationObservation] = {}
         completeness_hints: list[float] = []
         upper_bound_hints: list[float] = []
         content_hints: list[str] = []
@@ -84,7 +84,7 @@ class VerificationPipeline:
                 step = method.verify(evidence, method_config)
             methods_run.append(step.method or method_name)
             issues.extend(step.issues)
-            file_observations.extend(step.file_observations)
+            _merge_observations(observations_by_path, step.file_observations)
             if step.completeness_hint is not None:
                 completeness_hints.append(_clamp01(float(step.completeness_hint)))
             if step.recoverable_upper_bound_hint is not None:
@@ -97,9 +97,14 @@ class VerificationPipeline:
                 verification_strengths.append(step.verification_strength)
             if step.decision_hint != DECISION_NONE:
                 decision_hints.append(step.decision_hint)
-            steps.append(step if step.method else replace(step, method=method_name))
+            # The result owns a single merged set of per-file observations.
+            if step.file_observations or not step.method:
+                step = replace(step, method=step.method or method_name, file_observations=[])
+            steps.append(step)
 
         with _phase(phase_timer, f"{phase_prefix}_build_result"):
+            file_observations = list(observations_by_path.values())
+            observations_by_path.clear()
             return self._build_result(
                 methods_run=methods_run,
                 issues=issues,
@@ -128,7 +133,6 @@ class VerificationPipeline:
         decision_hints: list[str],
         evidence: VerificationEvidence,
     ) -> VerificationResult:
-        file_observations = _dedupe_observations(file_observations)
         archive_coverage = _archive_coverage_summary(issues, file_observations)
         output_quality = compute_output_quality(
             evidence,
@@ -520,7 +524,7 @@ _STRUCTURAL_DAMAGE_FLAGS = {
 def _container_integrity_from_evidence(evidence: VerificationEvidence) -> str:
     flags = _collect_container_flags(
         evidence.analysis_facts,
-        evidence.archive_input_analysis,
+        evidence.archive_input.analysis,
     )
     if flags & _STRUCTURAL_DAMAGE_FLAGS:
         return CONTAINER_INTEGRITY_STRUCTURALLY_DAMAGED
@@ -696,8 +700,10 @@ def _coverage_from_observations(file_observations: list[FileVerificationObservat
     )
 
 
-def _dedupe_observations(file_observations: list[FileVerificationObservation]) -> list[FileVerificationObservation]:
-    by_path: dict[str, FileVerificationObservation] = {}
+def _merge_observations(
+    by_path: dict[str, FileVerificationObservation],
+    file_observations: list[FileVerificationObservation],
+) -> None:
     for item in file_observations:
         key = (item.archive_path or item.path).replace("\\", "/")
         if not key:
@@ -729,7 +735,6 @@ def _dedupe_observations(file_observations: list[FileVerificationObservation]) -
             issues=issues,
             details={**other.details, **chosen.details, "verification_methods": methods},
         )
-    return list(by_path.values())
 
 
 def _state_rank(state: str) -> int:

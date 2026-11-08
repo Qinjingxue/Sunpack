@@ -3,7 +3,7 @@
 //! Built from the worker's native output trace (or manifest rows) plus a
 //! scan of the output directory. Python reads aggregates and bounded pages.
 
-use crate::scan::directory::{scan_output_inventory_impl, NativeWorkerManifest, OutputFileRecord};
+use crate::scan::directory::{NativeOutputInventory, NativeWorkerManifest, OutputFileRecord};
 use crate::scan::worker_event::{NativeOutputTrace, OutputTraceItem};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -38,7 +38,6 @@ struct ProgressFile {
     path: String,
     archive_path: String,
     status: FileStatus,
-    source_round: u32,
     bytes_written: u64,
     expected_size: Option<u64>,
     crc_ok: Option<bool>,
@@ -181,9 +180,9 @@ impl NativeProgressManifest {
                 row.set_item("path", &item.path)?;
                 row.set_item("archive_path", &item.archive_path)?;
                 row.set_item("status", item.status.as_str())?;
-                row.set_item("source_round", item.source_round)?;
                 row.set_item("bytes_written", item.bytes_written)?;
                 row.set_item("expected_size", item.expected_size)?;
+                row.set_item("progress", item.progress())?;
                 row.set_item("crc_ok", item.crc_ok)?;
                 row.set_item("failure_stage", &item.failure_stage)?;
                 row.set_item("failure_kind", &item.failure_kind)?;
@@ -348,7 +347,7 @@ pub(crate) fn complete_progress_manifest(
 /// rows, then add output files the worker did not report.
 #[pyfunction]
 #[pyo3(signature = (
-    archive, out_dir, round_index, trace, rows, worker_ok,
+    archive, out_dir, trace, rows, inventory, worker_ok,
     failure_stage, failure_kind, worker_status, native_status,
     files_written, bytes_written
 ))]
@@ -356,9 +355,9 @@ pub(crate) fn build_progress_manifest(
     py: Python<'_>,
     archive: String,
     out_dir: String,
-    round_index: u32,
     trace: Option<PyRef<'_, NativeOutputTrace>>,
     rows: Option<PyRef<'_, NativeWorkerManifest>>,
+    inventory: PyRef<'_, NativeOutputInventory>,
     worker_ok: bool,
     failure_stage: String,
     failure_kind: String,
@@ -374,6 +373,7 @@ pub(crate) fn build_progress_manifest(
         Some(_) => None,
         None => rows.map(|value| Arc::clone(value.records())),
     };
+    let output_files = Arc::clone(inventory.records());
     let document = py.detach(move || {
         let mut files = Vec::new();
         if let Some(items) = trace {
@@ -381,16 +381,12 @@ pub(crate) fn build_progress_manifest(
                 items
                     .iter()
                     .filter(|item| !item.is_dir)
-                    .map(|item| file_from_trace(item, &out_dir, round_index)),
+                    .map(|item| file_from_trace(item, &out_dir)),
             );
         } else if let Some(records) = rows {
-            files.extend(
-                records
-                    .iter()
-                    .map(|item| file_from_row(item, &out_dir, round_index)),
-            );
+            files.extend(records.iter().map(|item| file_from_row(item, &out_dir)));
         }
-        merge_untraced_files(&mut files, &out_dir, round_index, worker_ok);
+        merge_untraced_files(&mut files, &output_files, &out_dir, worker_ok);
         let summary = Summary::of(&files);
         let files_written = if files_written > 0 {
             files_written
@@ -421,7 +417,7 @@ pub(crate) fn build_progress_manifest(
     }
 }
 
-fn file_from_trace(item: &OutputTraceItem, out_dir: &str, round_index: u32) -> ProgressFile {
+fn file_from_trace(item: &OutputTraceItem, out_dir: &str) -> ProgressFile {
     let status = match (item.failed, item.bytes_written > 0) {
         (false, _) => FileStatus::Complete,
         (true, true) => FileStatus::Partial,
@@ -441,7 +437,6 @@ fn file_from_trace(item: &OutputTraceItem, out_dir: &str, round_index: u32) -> P
         path: output_path_text(output, out_dir),
         archive_path: archive_path_text(source, out_dir),
         status,
-        source_round: round_index,
         bytes_written: item.bytes_written,
         expected_size: Some(item.expected_size),
         crc_ok: None,
@@ -451,7 +446,7 @@ fn file_from_trace(item: &OutputTraceItem, out_dir: &str, round_index: u32) -> P
     }
 }
 
-fn file_from_row(item: &OutputFileRecord, out_dir: &str, round_index: u32) -> ProgressFile {
+fn file_from_row(item: &OutputFileRecord, out_dir: &str) -> ProgressFile {
     let status = match item.status {
         0 | 1 => FileStatus::Complete,
         2 => FileStatus::Failed,
@@ -461,7 +456,6 @@ fn file_from_row(item: &OutputFileRecord, out_dir: &str, round_index: u32) -> Pr
         path: output_path_text(item.output_path.as_deref().unwrap_or(&item.path), out_dir),
         archive_path: archive_path_text(&item.path, out_dir),
         status,
-        source_round: round_index,
         bytes_written: item.bytes_written,
         expected_size: Some(item.size),
         crc_ok: item.crc_ok,
@@ -473,8 +467,8 @@ fn file_from_row(item: &OutputFileRecord, out_dir: &str, round_index: u32) -> Pr
 
 fn merge_untraced_files(
     files: &mut Vec<ProgressFile>,
+    output_files: &[OutputFileRecord],
     out_dir: &str,
-    round_index: u32,
     worker_ok: bool,
 ) {
     let seen: HashSet<String> = files
@@ -482,8 +476,7 @@ fn merge_untraced_files(
         .filter(|item| !item.path.is_empty())
         .map(|item| item.path.clone())
         .collect();
-    let inventory = scan_output_inventory_impl(out_dir);
-    for record in inventory.records().iter() {
+    for record in output_files {
         let path = match &record.abs_path {
             Some(path) => windows_path_text(path),
             None => output_path_text(&record.path, out_dir),
@@ -499,7 +492,6 @@ fn merge_untraced_files(
             } else {
                 FileStatus::Unverified
             },
-            source_round: round_index,
             bytes_written: record.size,
             expected_size: None,
             crc_ok: None,

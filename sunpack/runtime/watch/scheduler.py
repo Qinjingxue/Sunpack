@@ -112,11 +112,12 @@ class WatchRunResult:
 
 
 @dataclass(slots=True)
-class _ActiveCandidateState:
+class _PendingCandidate:
+    candidate: WatchCandidate
     last_event_at: float
     quiet_seconds: float
+    epoch: int
     generation: int = 1
-    epoch: int = 0
 
 
 @dataclass(slots=True)
@@ -279,14 +280,13 @@ class WatchScheduler:
         self._watch_rearm: set[str] = set()
         self._usn_checkpoint_pending = False
         self._observed_watches = {}
-        self._pending: dict[str, WatchCandidate] = {}
-        # All pending mutations use the helpers below under _lock. Keep every
-        # spelling of a path so a normalized source claim retires all aliases.
+        self._pending: dict[str, _PendingCandidate] = {}
+        # Membership changes hold _lock and keep every path spelling so a
+        # normalized source claim can retire all aliases.
         self._pending_by_key: dict[str, set[str]] = {}
         self._inflight_requests: list[_ActivePipelineRequest] = []
         self._inflight_path_counts: dict[str, int] = {}
         self._completion_batches: set[asyncio.Future] = set()
-        self._active_states: dict[str, _ActiveCandidateState] = {}
         self._active_epoch = 0
         # Incremental ready index. Entries are invalidated lazily by active
         # lifecycle epoch + generation, avoiding heap delete/search.
@@ -643,7 +643,8 @@ class WatchScheduler:
             # queue_recovery_batch takes the state lock first. Keep the scheduler
             # snapshot stable only while building the transaction, never over IO.
             with self._lock:
-                yield from self._pending.values()
+                for pending in self._pending.values():
+                    yield pending.candidate
         if cursor_updates:
             self.state.queue_recovery_batch(candidates(), cursor_updates)
         if self._catalog.error:
@@ -967,7 +968,6 @@ class WatchScheduler:
                 self._clipboard_monitor.volume_changed = None
                 self._pending.clear()
                 self._pending_by_key.clear()
-                self._active_states.clear()
                 self._ready_heap.clear()
                 self._quiet_trackers.clear()
                 self._active_claims.clear()
@@ -1174,29 +1174,35 @@ class WatchScheduler:
             count = self._inflight_path_counts.get(key, 0)
             if count <= 1:
                 self._inflight_path_counts.pop(key, None)
-                state = self._active_states.get(path)
+                state = self._pending.get(path)
                 if state is not None:
                     self._schedule_active_locked(path, state, path_key_value=key)
             else:
                 self._inflight_path_counts[key] = count - 1
 
-    def _new_active_state_locked(
+    def _add_pending_locked(
         self,
+        candidate: WatchCandidate,
         *,
         last_event_at: float,
         quiet_seconds: float,
-    ) -> _ActiveCandidateState:
+    ) -> _PendingCandidate:
         self._active_epoch += 1
-        return _ActiveCandidateState(
+        state = _PendingCandidate(
+            candidate,
             last_event_at=last_event_at,
             quiet_seconds=quiet_seconds,
             epoch=self._active_epoch,
         )
+        path = candidate.path
+        self._pending_by_key.setdefault(absolute_path_key(path), set()).add(path)
+        self._pending[path] = state
+        return state
 
     def _schedule_active_locked(
         self,
         path: str,
-        state: _ActiveCandidateState,
+        state: _PendingCandidate,
         *,
         path_key_value: str | None = None,
     ) -> None:
@@ -1217,14 +1223,14 @@ class WatchScheduler:
 
     def _compact_ready_heap_locked(self) -> None:
         count = len(self._ready_heap)
-        if count <= 64 or count <= len(self._active_states) * 2:
+        if count <= 64 or count <= len(self._pending) * 2:
             return
         # Later deadlines can accumulate behind an unchanged live head.
         # Compact from queued entries so already dequeued admissions stay out.
         current = {}
         for entry in self._ready_heap:
             _, epoch, generation, key, path = entry
-            active = self._active_states.get(path)
+            active = self._pending.get(path)
             if (active is not None and active.epoch == epoch
                     and active.generation == generation and key not in self._inflight_path_counts):
                 current[path] = entry
@@ -1234,7 +1240,7 @@ class WatchScheduler:
     def _next_ready_entry_locked(self) -> tuple[float, int, int, str, str] | None:
         while self._ready_heap:
             deadline, epoch, generation, key, path = self._ready_heap[0]
-            state = self._active_states.get(path)
+            state = self._pending.get(path)
             if (
                 state is None
                 or state.epoch != epoch
@@ -1370,7 +1376,6 @@ class WatchScheduler:
                 self._cache_cleanup_deadline = None
                 self._pending.clear()
                 self._pending_by_key.clear()
-                self._active_states.clear()
                 self._ready_heap.clear()
                 self._inflight_path_counts.clear()
             from sunpack.runtime.cli.runtime_state import runtime_host
@@ -1438,7 +1443,7 @@ class WatchScheduler:
                     self._source_probes.clear()
                 if probe.recheck:
                     with self._lock:
-                        state = self._active_states.get(probe.path)
+                        state = self._pending.get(probe.path)
                         if state is not None:
                             self._schedule_active_locked(probe.path, state)
                             recheck = True
@@ -1511,7 +1516,7 @@ class WatchScheduler:
                     return
                 previous = self._candidate_baseline_locked(candidate.path) or previous_hint
                 change_kind = _candidate_change_kind(previous, candidate)
-                active = self._active_states.get(candidate.path)
+                active = self._pending.get(candidate.path)
                 active_deadline = active.last_event_at + active.quiet_seconds if active is not None else now
                 promote = event_type == "initial_scan" and active is not None
                 needs_queue = active is None or promote
@@ -1548,27 +1553,28 @@ class WatchScheduler:
                     return
                 if metadata_only:
                     self._accept_metadata_observation_locked(candidate, now)
-                    state = self._active_states.get(candidate.path)
+                    state = self._pending.get(candidate.path)
                     if state is None or not close_ready:
                         return
                     state.last_event_at = now
                     state.quiet_seconds = 0.0
                     state.generation += 1
                 else:
-                    state = self._active_states.get(candidate.path)
-                    self._store_pending_locked(candidate.path, candidate)
+                    state = self._pending.get(candidate.path)
                     if state is None:
                         retry_is_unchanged = password_retry or (
                             _crash_recovery and change_kind != _CandidateChangeKind.CONTENT_CHANGED)
                         active_quiet_seconds = 0.0 if retry_is_unchanged else self._observe_candidate_activity(
                             candidate, now, new_file=previous is not None and previous.file_id != candidate.file_id)
-                        state = self._new_active_state_locked(last_event_at=now, quiet_seconds=active_quiet_seconds)
-                        self._active_states[candidate.path] = state
+                        state = self._add_pending_locked(
+                            candidate, last_event_at=now, quiet_seconds=active_quiet_seconds,
+                        )
                         became_active = True
                     else:
                         active_quiet_seconds = self._observe_candidate_activity(
                             candidate, now, content_changed=True,
                             new_file=previous is not None and previous.file_id != candidate.file_id)
+                        state.candidate = candidate
                         state.last_event_at = now
                         state.quiet_seconds = active_quiet_seconds
                         state.generation += 1
@@ -1584,18 +1590,8 @@ class WatchScheduler:
             )
         self._wake_service()
 
-    def _store_pending_locked(self, path: str, candidate: WatchCandidate) -> None:
-        if path not in self._pending:
-            key = absolute_path_key(path)
-            self._pending_by_key.setdefault(key, set()).add(path)
-        self._pending[path] = candidate
-
-    def _remove_pending_locked(
-        self, path: str,
-    ) -> WatchCandidate | None:
-        candidate = self._pending.pop(path, None)
-        if candidate is not None:
-            self._active_states.pop(path, None)
+    def _remove_pending_locked(self, path: str) -> None:
+        if self._pending.pop(path, None) is not None:
             key = absolute_path_key(path)
             paths = self._pending_by_key[key]
             paths.remove(path)
@@ -1605,8 +1601,6 @@ class WatchScheduler:
                     # pop/del retain an empty dict's peak table allocation.
                     self._pending_by_key.clear()
                     self._pending.clear()
-                    self._active_states.clear()
-        return candidate
 
     def _defer_claimed_path_locked(self, path: str) -> bool:
         normalized = os.path.abspath(path)
@@ -1671,11 +1665,9 @@ class WatchScheduler:
                     retired_count += len(aliases)
                     for candidate_path in aliases:
                         self._pending.pop(candidate_path)
-                        self._active_states.pop(candidate_path, None)
                 if not self._pending_by_key:
                     self._pending_by_key.clear()
                     self._pending.clear()
-                    self._active_states.clear()
         self.log.write(
             "pipeline_sources_claimed",
             path=path,
@@ -1832,34 +1824,43 @@ class WatchScheduler:
             self._scan_options_for(scope).catalog_update(self._catalog, scope.native, normalized, recursive)
         # Observe presence outside the publication gate. The snapshot objects
         # are rechecked before retirement so late deletes cannot erase arrivals.
-        if _recorded_file_presence(normalized) is not False and not recursive:
+        if not recursive and _recorded_file_presence(normalized) is not False:
             return
+        normalized_key = absolute_path_key(normalized)
         with self._claim_gate, self._lock:
-            claimed = any(_paths_match(claim_path, normalized, recursive=recursive)
-                          for claim_path in self._active_claims)
-            inflight_owned = claimed or any(
-                _paths_match(request.candidate.path, normalized, recursive=recursive)
-                for request in self._inflight_requests)
-            snapshots = [(mapping, [(key, value) for key, value in mapping.items()
-                                    if _paths_match(key, normalized, recursive=recursive)])
-                         for mapping in (self._pending, self._quiet_trackers)]
-        missing = {key for _, rows in snapshots for key, _ in rows
+            if recursive:
+                inflight_owned = any(
+                    path_key_is_under(key, normalized_key)
+                    for owners in (self._active_claims, self._inflight_path_counts)
+                    for key in owners
+                )
+                aliases = (
+                    path
+                    for key, paths in self._pending_by_key.items()
+                    if path_key_is_under(key, normalized_key)
+                    for path in paths
+                )
+            else:
+                inflight_owned = normalized_key in self._active_claims or normalized_key in self._inflight_path_counts
+                aliases = self._pending_by_key.get(normalized_key, ())
+            pending = {path: self._pending[path].candidate for path in aliases}
+            trackers = {key: value for key, value in self._quiet_trackers.items()
+                        if _paths_match(key, normalized, recursive=recursive)}
+        missing = {key for key in pending.keys() | trackers.keys()
                    if _recorded_file_presence(key) is False}
-        pending_paths = []
+        pending_removed = 0
         with self._claim_gate, self._lock:
-            for mapping, rows in snapshots:
-                for key, value in rows:
-                    if (key not in missing or mapping.get(key) is not value
-                            or absolute_path_key(key) in self._source_probes):
-                        continue
-                    if mapping is self._pending:
-                        self._remove_pending_locked(key)
-                        pending_paths.append(key)
-                    else:
-                        mapping.pop(key, None)
-                if not mapping:
-                    mapping.clear()
-        with self._claim_gate, self._lock:
+            for key in missing:
+                if absolute_path_key(key) in self._source_probes:
+                    continue
+                current = self._pending.get(key)
+                if current is not None and current.candidate is pending.get(key):
+                    self._remove_pending_locked(key)
+                    pending_removed += 1
+                if key in trackers and self._quiet_trackers.get(key) is trackers[key]:
+                    self._quiet_trackers.pop(key)
+            if not self._quiet_trackers:
+                self._quiet_trackers.clear()
             self._catalog.forget_observation(normalized, recursive=recursive, missing_only=True)
         pending_record = self.state.pending_work_for_path(normalized)
         recovery_armed = bool(pending_record and (pending_record.active_outputs or pending_record.committed_roots))
@@ -1873,11 +1874,11 @@ class WatchScheduler:
             path=normalized,
             recursive=recursive,
             forgotten=forgotten,
-            pending_removed=len(pending_paths),
+            pending_removed=pending_removed,
         )
         if not recursive:
             self.retry_missing_volume_peers(normalized)
-        if pending_paths:
+        if pending_removed:
             self._wake_service()
 
     def _wake_service(self) -> None:
@@ -1921,11 +1922,9 @@ class WatchScheduler:
                 _, epoch, generation, _, path = heapq.heappop(self._ready_heap)
                 if path in due_paths:
                     continue
-                state = self._active_states.get(path)
-                candidate = self._pending.get(path)
+                state = self._pending.get(path)
                 if (
                     state is None
-                    or candidate is None
                     or state.epoch != epoch
                     or state.generation != generation
                 ):
@@ -1933,7 +1932,7 @@ class WatchScheduler:
                 due_paths.add(path)
                 due.append((
                     path,
-                    candidate,
+                    state.candidate,
                     epoch,
                     generation,
                     state.quiet_seconds,
@@ -1955,7 +1954,7 @@ class WatchScheduler:
                     if not self._source_probe_valid(probe):
                         return False
                     with self._lock:
-                        state = self._active_states.get(path)
+                        state = self._pending.get(path)
                         return state is not None and state.epoch == epoch and state.generation == generation
 
             try:
@@ -2019,7 +2018,7 @@ class WatchScheduler:
 
     def _drop_active(self, path: str, epoch: int, generation: int) -> None:
         with self._lock:
-            state = self._active_states.get(path)
+            state = self._pending.get(path)
             if (
                 state is None
                 or state.epoch != epoch
@@ -2043,15 +2042,15 @@ class WatchScheduler:
         content_changed: bool = True,
     ) -> None:
         with self._lock:
-            state = self._active_states.get(path)
+            state = self._pending.get(path)
             if (
                 state is None
                 or state.epoch != epoch
                 or state.generation != generation
             ):
                 return
-            previous = self._pending.get(path)
-            self._store_pending_locked(path, candidate)
+            previous = state.candidate
+            state.candidate = candidate
             self._remember_observation_locked(candidate)
             state.last_event_at = now
             learned_quiet_seconds = self._observe_candidate_activity(
@@ -2059,7 +2058,7 @@ class WatchScheduler:
                 now,
                 content_changed=content_changed,
                 learn_interval=False,
-                new_file=previous is not None and previous.file_id != candidate.file_id,
+                new_file=previous.file_id != candidate.file_id,
             )
             state.quiet_seconds = min(learned_quiet_seconds, self.boundary_confirmation_seconds)
             state.generation += 1
@@ -2073,14 +2072,14 @@ class WatchScheduler:
         candidate: WatchCandidate,
     ) -> bool:
         with self._lock:
-            state = self._active_states.get(path)
+            state = self._pending.get(path)
             if (
                 state is None
                 or state.epoch != epoch
                 or state.generation != generation
             ):
                 return False
-            self._store_pending_locked(path, candidate)
+            state.candidate = candidate
             self._remember_observation_locked(candidate)
             self._observe_candidate_activity(candidate, time.monotonic(), content_changed=False)
             return True
@@ -2112,18 +2111,15 @@ class WatchScheduler:
 
     def _candidate_baseline_locked(self, path: str) -> WatchCandidate | NativeWatchObservation | None:
         normalized = os.path.abspath(path)
-        return (
-            self._pending.get(normalized)
-            or self._pending.get(path)
-            or self._catalog.observation(normalized)
-        )
+        state = self._pending.get(normalized) or self._pending.get(path)
+        return state.candidate if state is not None else self._catalog.observation(normalized)
 
     def _accept_metadata_observation_locked(self, candidate: WatchCandidate, now: float) -> None:
         self._remember_observation_locked(candidate)
-        state = self._active_states.get(candidate.path)
+        state = self._pending.get(candidate.path)
         if state is not None:
-            self._store_pending_locked(candidate.path, candidate)
-        if candidate.path in self._active_states or candidate.path in self._quiet_trackers:
+            state.candidate = candidate
+        if state is not None or candidate.path in self._quiet_trackers:
             self._observe_candidate_activity(candidate, now, content_changed=False)
 
     def _observe_candidate_activity(

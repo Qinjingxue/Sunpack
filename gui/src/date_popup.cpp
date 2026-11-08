@@ -1,6 +1,7 @@
 #include "date_popup.hpp"
 #include "presentation.hpp"
 #include "motion.hpp"
+#include "page_value.hpp"
 #include "date_popup_uix.h"
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -11,11 +12,6 @@
 namespace spg {
 namespace {
 constexpr UINT DispatchDate = WM_APP + 0x404;
-Json state(UiPage page, const char* key) {
-    char* text=ui_page_get_json(page,key);
-    if(!text) throw std::runtime_error("uiBindingFailed");
-    std::string value(text); ui_page_free(text); return parse_json(value);
-}
 void set(UiPage page,const char* key,const Json& value) {
     auto text=value.dump();
     if(ui_page_set_json(page,key,text.c_str())!=0) throw std::runtime_error("uiBindingFailed");
@@ -160,7 +156,7 @@ void DatePopup::notify(bool cancel) {
 }
 void DatePopup::dispatch() {
     motion::VisualBatch visual(window_);
-    auto requests=state(page_,"requests"); set(page_,"requests",Json::array()); ui_page_set_bool(page_,"dispatch",false);
+    auto requests=page_value(page_,"requests",true); set(page_,"requests",Json::array()); ui_page_set_bool(page_,"dispatch",false);
     if(cancelled_ || closing_) return;
     for(auto& request:requests) {
         auto op=request.at("op").get<std::string>();
@@ -177,7 +173,7 @@ void DatePopup::dispatch() {
     }
 }
 std::string DatePopup::value() const {
-    auto text=range_datetime_text(date_).substr(0,10)+" "+state(page_,"time").get<std::string>();
+    auto text=range_datetime_text(date_).substr(0,10)+" "+page_value(page_,"time",true).get<std::string>();
     SYSTEMTIME parsed{};
     if(!range_datetime(text,parsed)) throw std::runtime_error("rangeDate");
     return text;

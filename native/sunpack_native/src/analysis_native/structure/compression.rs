@@ -135,6 +135,19 @@ impl StructuralStreamKind {
             None
         }
     }
+
+    fn validate(
+        self,
+        reader: &ManagedReader,
+        limit: u64,
+    ) -> Result<StructureValidation, crate::scan::compression_stream::ValidationError> {
+        match self {
+            Self::Gzip => validate_gzip_structure(reader, 0, limit),
+            Self::Bzip2 => validate_bzip2_structure(reader, 0, limit),
+            Self::Xz => validate_xz_structure_exact(reader, 0, limit),
+            Self::Zstd => validate_zstd_structure(reader, 0, limit),
+        }
+    }
 }
 
 const IDENTITY_PROBE_MAX_BYTES: u64 = 64 * 1024;
@@ -630,58 +643,31 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
 
 fn inspect_structural_stream(
     py: Python<'_>,
-    path: &str,
-    file_size: u64,
+    reader: &ManagedReader,
     kind: StructuralStreamKind,
 ) -> PyResult<Py<PyDict>> {
-    let reader = py
-        .detach(|| ManagedReader::open(path))
-        .map_err(crate::io::resource_error::to_py_error)?;
-    let (format, ext, magic, fields, cost) = match kind {
-        StructuralStreamKind::Gzip => (
-            "gzip",
-            ".gz",
-            b"\x1f\x8b".as_slice(),
-            GZIP_FIELDS,
-            "compressed_token_linear",
-        ),
-        StructuralStreamKind::Bzip2 => (
-            "bzip2",
-            ".bz2",
-            b"BZh".as_slice(),
-            BZIP2_FIELDS,
-            "compressed_bitstream_linear",
-        ),
-        StructuralStreamKind::Xz => (
-            "xz",
-            ".xz",
-            XZ_MAGIC,
-            XZ_FIELDS,
-            "metadata_linear_payload_skipped",
-        ),
+    let file_size = reader.len();
+    let (format, ext, fields, cost) = match kind {
+        StructuralStreamKind::Gzip => ("gzip", ".gz", GZIP_FIELDS, "compressed_token_linear"),
+        StructuralStreamKind::Bzip2 => {
+            ("bzip2", ".bz2", BZIP2_FIELDS, "compressed_bitstream_linear")
+        }
+        StructuralStreamKind::Xz => ("xz", ".xz", XZ_FIELDS, "metadata_linear_payload_skipped"),
         StructuralStreamKind::Zstd => (
             "zstd",
             ".zst",
-            ZSTD_MAGIC,
             ZSTD_FIELDS,
             "block_header_linear_payload_skipped",
         ),
     };
-    let head = py.detach(|| reader.read_cached_at(0, magic.len()))?;
-    let magic_matched = head.starts_with(magic);
-    let d = compression_base(py, format, ext, magic_matched)?;
+    let d = compression_base(py, format, ext, true)?;
     for field in fields {
         d.set_item(*field, "not_decoded")?;
     }
     d.set_item("validation_scope", "complete_structure")?;
     d.set_item("validation_cost", cost)?;
     d.set_item("file_size", file_size)?;
-    let validation = py.detach(|| match kind {
-        StructuralStreamKind::Gzip => validate_gzip_structure(&reader, 0, file_size),
-        StructuralStreamKind::Bzip2 => validate_bzip2_structure(&reader, 0, file_size),
-        StructuralStreamKind::Xz => validate_xz_structure_exact(&reader, 0, file_size),
-        StructuralStreamKind::Zstd => validate_zstd_structure(&reader, 0, file_size),
-    });
+    let validation = py.detach(|| kind.validate(reader, file_size));
     let structure = match validation {
         Ok(value) => value,
         Err(error) => {
@@ -742,8 +728,7 @@ fn project_structural_validation(
 
 fn apply_structural_contract(
     d: &Bound<'_, PyDict>,
-    path: &str,
-    file_size: u64,
+    reader: &ManagedReader,
     validation_limit: u64,
     kind: StructuralStreamKind,
     // End offset of the prefix the eager decoder checked; integrity is only
@@ -751,16 +736,8 @@ fn apply_structural_contract(
     integrity_verified_end: Option<u64>,
     damage_flags: &mut Vec<&'static str>,
 ) -> PyResult<()> {
-    let reader = match d.py().detach(|| ManagedReader::open(path)) {
-        Ok(value) => value,
-        Err(error) => return Err(crate::io::resource_error::to_py_error(error)),
-    };
-    let validation = d.py().detach(|| match kind {
-        StructuralStreamKind::Gzip => validate_gzip_structure(&reader, 0, validation_limit),
-        StructuralStreamKind::Bzip2 => validate_bzip2_structure(&reader, 0, validation_limit),
-        StructuralStreamKind::Xz => validate_xz_structure_exact(&reader, 0, validation_limit),
-        StructuralStreamKind::Zstd => validate_zstd_structure(&reader, 0, validation_limit),
-    });
+    let file_size = reader.len();
+    let validation = d.py().detach(|| kind.validate(reader, validation_limit));
     match validation {
         Ok(structure) => {
             let trailing = file_size.saturating_sub(structure.end_offset);
@@ -854,17 +831,10 @@ fn hex_bytes(value: &[u8]) -> String {
     value.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn inspect_gzip(
-    py: Python<'_>,
-    path: &str,
-    _header: &[u8],
-    file_size: u64,
-) -> PyResult<Py<PyDict>> {
-    if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Gzip);
-    }
+fn inspect_gzip(py: Python<'_>, reader: &ManagedReader) -> PyResult<Py<PyDict>> {
+    let file_size = reader.len();
     let data = py
-        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .detach(|| reader.read_all())
         .map_err(crate::io::resource_error::to_py_error)?;
     let d = compression_base(py, "gzip", ".gz", data.starts_with(b"\x1f\x8b"))?;
     let mut damage_flags = Vec::new();
@@ -1090,17 +1060,10 @@ fn bzip_huffman_summary(data: &[u8], start_bit: usize) -> String {
     format!("groups={groups};truncated")
 }
 
-fn inspect_bzip2(
-    py: Python<'_>,
-    path: &str,
-    _header: &[u8],
-    file_size: u64,
-) -> PyResult<Py<PyDict>> {
-    if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Bzip2);
-    }
+fn inspect_bzip2(py: Python<'_>, reader: &ManagedReader) -> PyResult<Py<PyDict>> {
+    let file_size = reader.len();
     let data = py
-        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .detach(|| reader.read_all())
         .map_err(crate::io::resource_error::to_py_error)?;
     let magic = data.starts_with(b"BZh") && data.get(3).is_some_and(|v| b"123456789".contains(v));
     let d = compression_base(py, "bzip2", ".bz2", magic)?;
@@ -1193,8 +1156,7 @@ fn inspect_bzip2(
     }
     apply_structural_contract(
         &d,
-        path,
-        file_size,
+        reader,
         file_size,
         StructuralStreamKind::Bzip2,
         decode_ok.then_some(marker_boundary as u64),
@@ -1487,12 +1449,10 @@ mod xz_bounds_tests {
     }
 }
 
-fn inspect_xz(py: Python<'_>, path: &str, _header: &[u8], file_size: u64) -> PyResult<Py<PyDict>> {
-    if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Xz);
-    }
+fn inspect_xz(py: Python<'_>, reader: &ManagedReader) -> PyResult<Py<PyDict>> {
+    let file_size = reader.len();
     let data = py
-        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .detach(|| reader.read_all())
         .map_err(crate::io::resource_error::to_py_error)?;
     let d = compression_base(py, "xz", ".xz", data.starts_with(XZ_MAGIC))?;
     let mut damage_flags = Vec::new();
@@ -1690,8 +1650,7 @@ fn inspect_xz(py: Python<'_>, path: &str, _header: &[u8], file_size: u64) -> PyR
     }
     apply_structural_contract(
         &d,
-        path,
-        file_size,
+        reader,
         (after_footer + aligned_padding) as u64,
         StructuralStreamKind::Xz,
         None,
@@ -1725,17 +1684,10 @@ fn little_uint(data: &[u8]) -> u64 {
         .fold(0u64, |v, (i, b)| v | ((*b as u64) << (8 * i)))
 }
 
-fn inspect_zstd(
-    py: Python<'_>,
-    path: &str,
-    _header: &[u8],
-    file_size: u64,
-) -> PyResult<Py<PyDict>> {
-    if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Zstd);
-    }
+fn inspect_zstd(py: Python<'_>, reader: &ManagedReader) -> PyResult<Py<PyDict>> {
+    let file_size = reader.len();
     let data = py
-        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .detach(|| reader.read_all())
         .map_err(crate::io::resource_error::to_py_error)?;
     let d = compression_base(py, "zstd", ".zst", data.starts_with(ZSTD_MAGIC))?;
     let mut damage_flags = Vec::new();
@@ -1916,8 +1868,7 @@ fn inspect_zstd(
     }
     apply_structural_contract(
         &d,
-        path,
-        file_size,
+        reader,
         file_size,
         StructuralStreamKind::Zstd,
         None,

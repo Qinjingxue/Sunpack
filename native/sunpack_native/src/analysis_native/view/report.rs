@@ -4,6 +4,9 @@
 // segment boundaries, selection, and the extraction segment plan. Python only
 // projects the returned report into its task contracts.
 
+use crate::analysis_native::structure::{
+    has_compression_stream_header, inspect_compression_stream_reader,
+};
 use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::reader::FileIdentity;
 use pyo3::types::PyTuple;
@@ -934,20 +937,20 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         if let Some(structure) = &self.stream_structure {
             return Ok(structure.clone());
         }
-        let structure = if stream_family(&self.view.reader.read_at(0, 32).unwrap_or_default()) {
-            Some(match self.view.reader.file_identity().ok() {
-                Some(identity) => stream_structure_cached(self.py, identity, &self.view.path)?,
-                None => crate::analysis_native::inspect_compression_stream_structure(
-                    self.py,
-                    &self.view.path,
-                )?
-                .into_bound(self.py),
-            })
-        } else {
-            // No compression family can match; the requested-format mismatch
-            // projection never reads the structure result.
-            None
-        };
+        let reader = &self.view.reader;
+        let header = self.py.detach(|| reader.read_cached_at(0, 32)).ok();
+        let structure =
+            if let Some(header) = header.filter(|head| has_compression_stream_header(head)) {
+                Some(match reader.file_identity().ok() {
+                    Some(identity) => stream_structure_cached(self.py, identity, reader, &header)?,
+                    None => inspect_compression_stream_reader(self.py, reader, &header)?
+                        .into_bound(self.py),
+                })
+            } else {
+                // No compression family can match; the requested-format mismatch
+                // projection never reads the structure result.
+                None
+            };
         self.stream_structure = Some(structure.clone());
         Ok(structure)
     }
@@ -1468,14 +1471,6 @@ fn zip_local_header_recovery<'py>(
     ))
 }
 
-fn stream_family(head: &[u8]) -> bool {
-    head.starts_with(b"\x1f\x8b")
-        || head.starts_with(BZIP2)
-        || head.starts_with(XZ)
-        || head.starts_with(ZSTD)
-        || crate::formats::lz4::leading(head)
-}
-
 fn stream_observation<'py>(
     py: Python<'py>,
     raw: Bound<'py, PyDict>,
@@ -1927,7 +1922,8 @@ fn stream_structure_cache() -> &'static Mutex<VecDeque<StreamStructureEntry>> {
 fn stream_structure_cached<'py>(
     py: Python<'py>,
     identity: FileIdentity,
-    path: &str,
+    reader: &ManagedReader,
+    header: &[u8],
 ) -> PyResult<Bound<'py, PyDict>> {
     let cancellation = Cancellation::current();
     cancellation.check()?;
@@ -1952,7 +1948,10 @@ fn stream_structure_cached<'py>(
             .detach(|| {
                 slot.get_or_init(&cancellation, || {
                     Python::attach(|py| {
-                        crate::analysis_native::inspect_compression_stream_structure(py, path)
+                        // Keep the original physical source without holding
+                        // transient stream windows in the view's request cache.
+                        let reader = reader.with_config(ReaderConfig::default());
+                        inspect_compression_stream_reader(py, &reader, header)
                     })
                 })
             })

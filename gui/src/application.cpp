@@ -1,5 +1,6 @@
 #include "application.hpp"
 #include "motion.hpp"
+#include "page_value.hpp"
 #include "presentation.hpp"
 #include "range_editor.hpp"
 #include "tag_collection.hpp"
@@ -55,11 +56,6 @@ UiThemeMode system_theme() {
     RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
         L"AppsUseLightTheme",RRF_RT_REG_DWORD,nullptr,&light,&size);
     return light?UI_THEME_LIGHT:UI_THEME_DARK;
-}
-Json page_value(UiPage page,const char* name) {
-    char* value=ui_page_get_json(page,name);
-    if(!value) return Json();
-    std::string text(value); ui_page_free(value); return parse_json(text);
 }
 // The window already owns the tree. Register only the child used by the C API.
 ui::Widget* find_widget(ui::UiWindowImpl* owner,const std::string& id) {

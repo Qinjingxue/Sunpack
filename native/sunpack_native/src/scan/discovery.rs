@@ -1,9 +1,8 @@
 use crate::analysis_native::volume_anchor::CheapAnchor;
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
-    build_native_candidate_groups_from_snapshot,
-    build_native_candidate_groups_from_snapshot_cached, collect_relation_cache,
-    resolve_embedded_volumes, NativeRelationGroup, RelationCache,
+    build_native_candidate_groups_from_snapshot, collect_relation_cache, resolve_embedded_volumes,
+    NativeRelationGroup, RelationCache,
 };
 use crate::scan::directory::{
     filesystem_logical_name, filesystem_route_name, DirectorySnapshotTable,
@@ -167,7 +166,7 @@ impl NativeCandidateTable {
         }
         // Password resolution can introduce candidates after filesystem routing.
         // Borrow their original rows; no new enumeration, analysis or file I/O.
-        for &row in &snapshot.rows {
+        for &row in snapshot.rows.iter() {
             if pending.remove(&path_key(&snapshot.table.paths[row])) {
                 self.rows
                     .push(Candidate::File(Arc::clone(&snapshot.table), row));
@@ -189,33 +188,27 @@ impl NativeCandidateTable {
         &self,
         raw: &NativeDirectorySnapshot,
         filtered: &NativeDirectorySnapshot,
+        targeted: Option<&NativeDirectorySnapshot>,
         passwords: Option<&[(String, String)]>,
         cached: Option<&RelationCache>,
     ) -> Vec<NativeRelationGroup> {
-        let selection = self
-            .targets
-            .as_ref()
-            .and_then(|targets| targets.select(filtered))
-            .unwrap_or_else(|| {
-                if self.filesystem_routed {
-                    filtered.file_route_view(FILE_ROUTE_RELATIONS)
-                } else {
-                    filtered.view(filtered.rows.clone())
-                }
-            });
+        let routed_view = (targeted.is_none() && self.filesystem_routed)
+            .then(|| filtered.file_route_view(FILE_ROUTE_RELATIONS));
+        let selection = targeted.or(routed_view.as_ref()).unwrap_or(filtered);
         let mut groups =
-            build_native_candidate_groups_from_snapshot_cached(raw, &selection, passwords, cached);
-        if self.filesystem_routed {
-            let routed: HashSet<_> = selection
+            build_native_candidate_groups_from_snapshot(raw, selection, passwords, cached);
+        // Only an explicit selection can nominate files on other routes.
+        // Relations can claim them as parts, but ordinary results stay on
+        // their original route.
+        if let Some(targeted) = targeted {
+            let routed: HashSet<_> = targeted
                 .rows
                 .iter()
-                .filter(|&&row| selection.table.file_routes[row] == FILE_ROUTE_RELATIONS)
-                .map(|&row| path_key(&selection.table.paths[row]))
+                .filter(|&&row| targeted.table.file_routes[row] == FILE_ROUTE_RELATIONS)
+                .map(|&row| path_key(&targeted.table.paths[row]))
                 .collect();
             groups.retain(|group| match group {
-                NativeRelationGroup::Ordinary(..) => {
-                    routed.contains(&path_key(group.candidate_data().entry_path))
-                }
+                NativeRelationGroup::Ordinary(row, _) => routed.contains(&row.path_key),
                 _ => true,
             });
         }
@@ -526,7 +519,7 @@ impl NativeEmbeddedBatch {
             if stems.is_empty() {
                 continue;
             }
-            for &row in &snapshot.rows {
+            for &row in snapshot.rows.iter() {
                 if !snapshot.table.relation_member_eligible[row] {
                     continue;
                 }
@@ -586,7 +579,7 @@ impl NativeEmbeddedBatch {
             .iter()
             .filter(|_| !candidates.is_empty())
         {
-            for &row in &snapshot.rows {
+            for &row in snapshot.rows.iter() {
                 let key = path_key(&snapshot.table.paths[row]);
                 if candidates.contains_key(&key)
                     && !pending_keys.contains(&key)
@@ -752,7 +745,7 @@ impl NativeEmbeddedBatch {
             .collect();
         if !peers.is_empty() {
             for snapshot in sources {
-                for &row in &snapshot.rows {
+                for &row in snapshot.rows.iter() {
                     if !snapshot.table.relation_member_eligible[row] {
                         continue;
                     }
@@ -821,6 +814,7 @@ impl NativeCandidateTable {
                 raw_snapshot,
                 filtered_snapshot,
                 path_passwords.as_deref(),
+                None,
             )
         });
         self.rows.extend(
@@ -828,8 +822,7 @@ impl NativeCandidateTable {
                 .into_iter()
                 .map(|group| Candidate::Relation(Box::new(group))),
         );
-        self.relation_sources
-            .push(raw_snapshot.view(raw_snapshot.rows.clone()));
+        self.relation_sources.push(raw_snapshot.share_rows());
         Ok(())
     }
 
@@ -846,11 +839,17 @@ impl NativeCandidateTable {
         py.detach(|| {
             self.filesystem_routed = true;
             self.targets = targets.map(FileTargets::new);
-            let groups = self.relation_groups(raw_snapshot, filtered_snapshot, None, None);
             let selected = self
                 .targets
                 .as_ref()
                 .and_then(|targets| targets.select(filtered_snapshot));
+            let groups = self.relation_groups(
+                raw_snapshot,
+                filtered_snapshot,
+                selected.as_ref(),
+                None,
+                None,
+            );
             let filtered_snapshot = selected.as_ref().unwrap_or(filtered_snapshot);
             self.rows
                 .reserve(groups.len() + filtered_snapshot.rows.len());
@@ -859,7 +858,7 @@ impl NativeCandidateTable {
                     .into_iter()
                     .map(|group| Candidate::Relation(Box::new(group))),
             );
-            for &row in &filtered_snapshot.rows {
+            for &row in filtered_snapshot.rows.iter() {
                 if !filtered_snapshot.table.is_dirs[row]
                     && filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
                 {
@@ -869,8 +868,7 @@ impl NativeCandidateTable {
             }
             self.retain_targets();
             self.append_speculative_files(raw_snapshot);
-            self.relation_sources
-                .push(raw_snapshot.view(raw_snapshot.rows.clone()));
+            self.relation_sources.push(raw_snapshot.share_rows());
         });
         Ok(())
     }
@@ -937,7 +935,17 @@ impl NativeCandidateTable {
                 .as_ref()
                 .map(|(raw, filtered)| (raw, filtered))
                 .unwrap_or((raw_snapshot, filtered_snapshot));
-            let groups = self.relation_groups(raw, filtered, Some(&path_passwords), Some(&cached));
+            let selected = self
+                .targets
+                .as_ref()
+                .and_then(|targets| targets.select(filtered));
+            let groups = self.relation_groups(
+                raw,
+                filtered,
+                selected.as_ref(),
+                Some(&path_passwords),
+                Some(&cached),
+            );
             self.rows.retain(|row| matches!(row, Candidate::File(..)));
             let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
             replacement.extend(
@@ -1224,9 +1232,17 @@ impl NativeCandidateTable {
         cancellation.check()?;
         // Preserve the former stage order: filesystem residuals, Relations
         // residuals, then Detection residuals.
+        let has_path_constraints =
+            !claimed.is_empty() || !blocked.is_empty() || !speculative.is_empty();
         for (index, row) in self.rows.iter().enumerate() {
             if let Candidate::File(table, file_index) = row {
                 let residual = table.file_routes[*file_index] == FILE_ROUTE_RESIDUAL;
+                if !has_path_constraints {
+                    if residual {
+                        routes.embedded.push(index);
+                    }
+                    continue;
+                }
                 if !residual && speculative.is_empty() {
                     continue;
                 }
@@ -1329,13 +1345,15 @@ impl NativeCandidateTable {
         // supply all eligible peers; primary decisions have been projected.
         let relation_cache = self.relation_cache();
         let mut claimed_ranges = HashMap::new();
-        let scanned_paths = ids
-            .iter()
-            .map(|&index| path_key(self.rows[index].embedded_source().0))
-            .collect();
+        let mut scanned_paths = None;
         for index in routes.resolved_relations() {
             if let Candidate::Relation(group) = &self.rows[index] {
-                group.collect_source_ranges(&scanned_paths, &mut claimed_ranges);
+                let scanned_paths = scanned_paths.get_or_insert_with(|| {
+                    ids.iter()
+                        .map(|&index| path_key(self.rows[index].embedded_source().0))
+                        .collect()
+                });
+                group.collect_source_ranges(scanned_paths, &mut claimed_ranges);
                 // Candidate membership is a lease, not exclusive ownership.
                 // Independent heads may need the same peer domains.
                 // The confirmed head is not an alternative peer. A genuinely

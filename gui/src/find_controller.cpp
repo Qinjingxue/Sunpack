@@ -1,4 +1,5 @@
 #include "find_controller.hpp"
+#include "page_value.hpp"
 #include "tag_collection.hpp"
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
@@ -6,11 +7,6 @@
 
 namespace spg {
 namespace {
-Json value(UiPage page,const char* key) {
-    char* data=ui_page_get_json(page,key);
-    if(!data) return Json();
-    auto result=parse_json(data); ui_page_free(data); return result;
-}
 bool shown(ui::Widget* widget) {
     for(auto* p=widget;p;p=p->Parent()) if(!p->visible) return false;
     return widget!=nullptr;
@@ -40,9 +36,27 @@ FindController::~FindController() {
 }
 void FindController::Refresh(const char* scope) {
     for(auto& s:searches_) {
-        if(!visible(s)) clear_matches(s);
-        else if(!scope || std::string_view(scope)==s.scope) refresh(s);
+        if(visible(s)) {
+            if(!scope || std::string_view(scope)==s.scope) refresh(s);
+            continue;
+        }
+        if(!s.matches.empty()) clear_matches(s);
+        if(s.targets.capacity()) {
+            if(!s.hits.empty()) s.saved=selection(s);
+            release_results(s);
+        }
     }
+}
+FindController::Selection FindController::selection(const Search& s) {
+    const auto& hit=s.hits[s.current];
+    const auto& target=s.targets[hit.target];
+    return {target.id,target.tag,target.ranges[hit.range].start};
+}
+void FindController::release_results(Search& s) {
+    decltype(s.targets)().swap(s.targets);
+    decltype(s.hits)().swap(s.hits);
+    decltype(s.ticks)().swap(s.ticks);
+    decltype(s.byId)().swap(s.byId);
 }
 void FindController::clear_matches(Search& s) {
     s.matchIndex.clear(); s.matches.clear(); s.matchBytes=0; s.matchIndex.rehash(0);
@@ -73,28 +87,25 @@ std::vector<ui::TextHighlight> FindController::match(Search& s,const std::string
     return ranges;
 }
 void FindController::refresh(Search& s) {
-    std::string oldId; int oldTag=-1; uint32_t oldStart=0;
-    if(!s.hits.empty()) { auto h=s.hits[s.current]; auto& t=s.targets[h.target]; oldId=t.id; oldTag=t.tag; oldStart=t.ranges[h.range].start; }
     auto argument=Json(s.scope).dump();
     if(ui_page_call_json(page_,"searchSources",argument.c_str())!=0) throw std::runtime_error("uiBindingFailed");
-    auto snapshot=value(page_,"searchSnapshot");
+    auto snapshot=page_value(page_,"searchSnapshot",true);
     ui_page_set_json(page_,"searchSnapshot","null"); // Never retain a duplicate of the reactive rows.
     auto query=fold_search(snapshot.at("query").get_ref<const std::string&>());
     bool changed=s.query!=query;
+    auto old=s.hits.empty()?std::move(s.saved):selection(s);
+    s.saved={};
     if(changed || query.empty()) clear_matches(s);
     if(changed) s.pending=0;
     s.before=snapshot.value("before",false); s.after=snapshot.value("after",false);
     s.query=std::move(query); s.targets.clear(); s.hits.clear(); s.byId.clear(); s.ticks.clear();
     s.current=0; s.geometry=~uint64_t(0); s.extent=-1; s.revision=++revision_;
-    if(s.query.empty()) {
-        decltype(s.targets)().swap(s.targets); decltype(s.hits)().swap(s.hits);
-        decltype(s.ticks)().swap(s.ticks); s.byId.rehash(0);
-    }
+    if(s.query.empty()) release_results(s);
     if(!s.query.empty()) for(auto& source:snapshot.at("targets")) {
         Target target{source.at("id").get<std::string>(),source.at("row").get<int>(),source.at("tag").get<int>()};
         target.ranges=match(s,source.at("text").get_ref<const std::string&>());
         for(size_t i=0;i<target.ranges.size();++i) {
-            if(!changed && target.id==oldId && target.tag==oldTag && target.ranges[i].start==oldStart) s.current=s.hits.size();
+            if(!changed && target.id==old.id && target.tag==old.tag && target.ranges[i].start==old.start) s.current=s.hits.size();
             s.hits.push_back({s.targets.size(),i});
         }
         if(!target.ranges.empty()) { s.byId[target.id].targets.push_back(s.targets.size()); s.targets.push_back(std::move(target)); }

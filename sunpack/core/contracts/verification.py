@@ -43,7 +43,7 @@ class VerificationIssue:
     actual: Any = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FileVerificationObservation:
     path: str
     state: str = "unverified"

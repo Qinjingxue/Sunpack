@@ -139,7 +139,6 @@ fn run_service() -> windows_service::Result<()> {
 
 fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
     let journals = Arc::new(JournalDispatcher::new()?);
-    let active_leases = Arc::new(AtomicUsize::new(0));
     let connected_clients = Arc::new(AtomicUsize::new(0));
     let ever_had_lease = Arc::new(AtomicBool::new(false));
     let state_changed = &journals.state_changed;
@@ -149,11 +148,10 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
     let result = (|| {
         loop {
             workers.retain(|worker: &thread::JoinHandle<()>| !worker.is_finished());
-            let leases = active_leases.load(Ordering::Acquire);
             let clients = connected_clients.load(Ordering::Acquire);
             let had_lease = ever_had_lease.load(Ordering::Acquire);
             // Before the first lease, only an explicit stop proves nobody will use us.
-            if had_lease && leases == 0 && clients == 0 {
+            if had_lease && clients == 0 {
                 break;
             }
 
@@ -195,7 +193,6 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
                 first_instance = false;
                 connected_clients.fetch_add(1, Ordering::AcqRel);
                 let worker_journals = Arc::clone(&journals);
-                let worker_leases = Arc::clone(&active_leases);
                 let worker_clients = Arc::clone(&connected_clients);
                 let worker_ever_had_lease = Arc::clone(&ever_had_lease);
                 let worker_stop_event = stop_event as isize;
@@ -204,9 +201,7 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
                     let _ = serve_client(
                         pipe,
                         worker_stop_event as HANDLE,
-                        worker_state_changed as HANDLE,
                         worker_journals,
-                        &worker_leases,
                         &worker_ever_had_lease,
                     );
                     worker_clients.fetch_sub(1, Ordering::AcqRel);
@@ -233,12 +228,11 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
 fn serve_client(
     pipe: OwnedHandle,
     stop_event: HANDLE,
-    state_changed: HANDLE,
     journals: Arc<JournalDispatcher>,
-    active_leases: &AtomicUsize,
     ever_had_lease: &AtomicBool,
 ) -> io::Result<()> {
-    let mut lease = LeaseGuard::new(active_leases, ever_had_lease, state_changed);
+    // A lease belongs to this connection and ends with it.
+    let mut leased = false;
     // Requests on one connection are serial. Each operation drains before
     // returning, so its event can be reused for the entire connection.
     let io_event = OwnedHandle::event()?;
@@ -262,7 +256,7 @@ fn serve_client(
         };
         let release = request.opcode == Opcode::Release;
         let response = if !request_shape_is_valid(&request)
-            || (request.opcode != Opcode::Hello && !lease.active)
+            || (request.opcode != Opcode::Hello && !leased)
         {
             (
                 Response {
@@ -272,8 +266,9 @@ fn serve_client(
                 Vec::new(),
             )
         } else {
-            if request.opcode == Opcode::Hello {
-                lease.acquire();
+            if !leased {
+                ever_had_lease.store(true, Ordering::Release);
+                leased = true;
             }
             let mut query = Vec::new();
             if request.opcode == Opcode::ReadDirectoriesChanges {
@@ -342,46 +337,6 @@ fn request_shape_is_valid(request: &Request) -> bool {
                 && request.file_id_len == 0
                 && request.previous_usn > 0
                 && request.current_usn > request.previous_usn
-        }
-    }
-}
-
-struct LeaseGuard<'a> {
-    counter: &'a AtomicUsize,
-    ever_had_lease: &'a AtomicBool,
-    state_changed: HANDLE,
-    active: bool,
-}
-
-impl<'a> LeaseGuard<'a> {
-    fn new(
-        counter: &'a AtomicUsize,
-        ever_had_lease: &'a AtomicBool,
-        state_changed: HANDLE,
-    ) -> Self {
-        Self {
-            counter,
-            ever_had_lease,
-            state_changed,
-            active: false,
-        }
-    }
-
-    fn acquire(&mut self) {
-        if !self.active {
-            self.ever_had_lease.store(true, Ordering::Release);
-            self.counter.fetch_add(1, Ordering::AcqRel);
-            self.active = true;
-            unsafe { SetEvent(self.state_changed) };
-        }
-    }
-}
-
-impl Drop for LeaseGuard<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            self.counter.fetch_sub(1, Ordering::AcqRel);
-            unsafe { SetEvent(self.state_changed) };
         }
     }
 }

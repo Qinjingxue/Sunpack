@@ -1,6 +1,6 @@
-from sunpack.pipeline.extraction.progress import iter_progress_files
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.error_classification import classify_verification_error
+from sunpack.pipeline.verification.methods._output_stats import progress_observations
 from sunpack.pipeline.verification.registry import register_verification_method
 from sunpack.core.contracts.verification import (
     DECISION_ACCEPT_PARTIAL,
@@ -40,7 +40,7 @@ class ExtractionExitSignalMethod:
                         )
                     ],
                 )
-            observations = _observations_from_manifest(evidence)
+            observations = progress_observations(evidence, self.name, include_failure_details=True)
             partial_outputs = bool(result.partial_outputs or observations)
             error_class = _error_class(result.diagnostics, evidence.progress_manifest)
             content_integrity = error_class.content_integrity
@@ -144,41 +144,6 @@ def _error_class(diagnostics: dict, manifest):
     return classify_verification_error(failure_kind, failure_stage)
 
 
-def _observations_from_manifest(evidence: VerificationEvidence) -> list[FileVerificationObservation]:
-    observations: list[FileVerificationObservation] = []
-    for item in iter_progress_files(evidence.progress_manifest):
-        state = str(item.get("status") or "unverified")
-        expected = item.get("expected_size")
-        bytes_written = int(item.get("bytes_written", 0) or 0)
-        progress = None
-        if expected not in {None, "", 0}:
-            try:
-                progress = min(1.0, max(0.0, bytes_written / int(expected)))
-            except (TypeError, ValueError, ZeroDivisionError):
-                progress = None
-        elif state == "complete":
-            progress = 1.0
-        elif state == "failed":
-            progress = 0.0
-        elif state == "partial":
-            progress = 0.5
-        observations.append(FileVerificationObservation(
-            path=str(item.get("path") or item.get("archive_path") or ""),
-            archive_path=str(item.get("archive_path") or ""),
-            state=state if state in {"complete", "partial", "failed", "missing", "unverified"} else "unverified",
-            method="extraction_exit_signal",
-            bytes_written=bytes_written,
-            expected_size=_optional_int(expected),
-            progress=progress,
-            details={
-                "failure_stage": item.get("failure_stage"),
-                "failure_kind": item.get("failure_kind"),
-                "message": item.get("message"),
-            },
-        ))
-    return observations
-
-
 def _manifest_completeness(manifest, observations: list[FileVerificationObservation]) -> float:
     if observations:
         total = 0.0
@@ -206,12 +171,3 @@ def _recoverable_upper_bound(manifest, observations: list[FileVerificationObserv
     if recoverable <= 0 and observations:
         recoverable = sum(1 for item in observations if item.state in {"complete", "partial", "unverified"})
     return min(1.0, max(0.0, recoverable / total))
-
-
-def _optional_int(value) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

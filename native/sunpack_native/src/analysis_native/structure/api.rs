@@ -25,10 +25,7 @@ pub(crate) fn inspect_zip_local_header(
 
 #[pyfunction]
 #[pyo3(signature = (path))]
-pub(crate) fn inspect_zip_eocd_structure(
-    py: Python<'_>,
-    path: &str,
-) -> PyResult<Py<PyDict>> {
+pub(crate) fn inspect_zip_eocd_structure(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
     let mut result = zip_eocd_empty(py, "")?;
     let Ok(reader) = ManagedReader::open(path) else {
         result.set_item("error", "os_error")?;
@@ -380,12 +377,21 @@ pub(crate) fn inspect_zip_structure_graph(
 }
 
 #[pyfunction]
-pub(crate) fn inspect_seven_zip_structure(py:Python<'_>,path:&str)->PyResult<Py<PyDict>> {
-    let reader=match ManagedReader::open(path) {Ok(reader)=>reader,Err(_)=>return Ok(seven_empty(py,"os_error")?.unbind())};
-    let view=crate::analysis_native::AnalysisBinaryView{path:path.to_owned(),reader,closed:false};
-    let result=view.probe_seven_zip(py,0)?.into_bound(py);
-    let valid=result.get_item("magic_matched")?.is_some_and(|value|value.is_truthy().unwrap_or(false));
-    result.set_item("detected_ext",if valid {".7z"} else {""})?;
+pub(crate) fn inspect_seven_zip_structure(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
+    let reader = match ManagedReader::open(path) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(seven_empty(py, "os_error")?.unbind()),
+    };
+    let view = crate::analysis_native::AnalysisBinaryView {
+        path: path.to_owned(),
+        reader,
+        closed: false,
+    };
+    let result = view.probe_seven_zip(py, 0)?.into_bound(py);
+    let valid = result
+        .get_item("magic_matched")?
+        .is_some_and(|value| value.is_truthy().unwrap_or(false));
+    result.set_item("detected_ext", if valid { ".7z" } else { "" })?;
     Ok(result.unbind())
 }
 
@@ -434,7 +440,7 @@ pub(crate) fn inspect_rar_structure(
         }
     }
     if data.starts_with(RAR4_SIGNATURE) && data.len() >= RAR4_SIGNATURE.len() + 7 {
-        let read_size = file_size.min((u16::MAX as u64)*2+RAR4_SIGNATURE.len() as u64);
+        let read_size = file_size.min((u16::MAX as u64) * 2 + RAR4_SIGNATURE.len() as u64);
         if data.len() < read_size as usize {
             data.resize(read_size as usize, 0);
             if let Err(fault) = seek_field(
@@ -460,7 +466,7 @@ pub(crate) fn inspect_rar_structure(
         }
     } else if data.starts_with(RAR5_SIGNATURE) {
         if read_vint(&data, RAR5_SIGNATURE.len() + 4).is_some() {
-            let read_size = file_size.min((1u64<<21)*2+RAR5_SIGNATURE.len() as u64+16);
+            let read_size = file_size.min((1u64 << 21) * 2 + RAR5_SIGNATURE.len() as u64 + 16);
             if data.len() < read_size as usize {
                 data.resize(read_size as usize, 0);
                 if let Err(fault) = seek_field(
@@ -616,12 +622,7 @@ pub(crate) fn inspect_tar_header_structure(
             "tar"
         },
     )?;
-    enrich_tar_semantics(
-        &result,
-        &mut file,
-        start_offset,
-        archive_end,
-    )?;
+    enrich_tar_semantics(&result, &mut file, start_offset, archive_end)?;
     Ok(result.unbind())
 }
 
@@ -695,22 +696,37 @@ pub(crate) fn inspect_compression_stream_structure(
     let Ok(reader) = py.detach(|| ManagedReader::open(path)) else {
         return compression_empty(py, "os_error", "", "", false);
     };
-    let file_size = reader.len();
     let header = py.detach(|| reader.read_cached_at(0, 32))?;
-    if let Some(kind) = StructuralStreamKind::from_header(&header) {
+    inspect_compression_stream_reader(py, &reader, &header)
+}
+
+pub(crate) fn inspect_compression_stream_reader(
+    py: Python<'_>,
+    reader: &ManagedReader,
+    header: &[u8],
+) -> PyResult<Py<PyDict>> {
+    if let Some(kind) = StructuralStreamKind::from_header(header) {
+        if reader.len() > EAGER_STREAM_INTEGRITY_MAX_BYTES {
+            return inspect_structural_stream(py, reader, kind);
+        }
         return match kind {
-            StructuralStreamKind::Gzip => inspect_gzip(py, path, &header, file_size),
-            StructuralStreamKind::Bzip2 => inspect_bzip2(py, path, &header, file_size),
-            StructuralStreamKind::Xz => inspect_xz(py, path, &header, file_size),
-            StructuralStreamKind::Zstd => inspect_zstd(py, path, &header, file_size),
+            StructuralStreamKind::Gzip => inspect_gzip(py, reader),
+            StructuralStreamKind::Bzip2 => inspect_bzip2(py, reader),
+            StructuralStreamKind::Xz => inspect_xz(py, reader),
+            StructuralStreamKind::Zstd => inspect_zstd(py, reader),
         };
     }
-    if crate::formats::lz4::leading(&header) {
-        let index = py.detach(|| crate::formats::lz4::walk(&reader, 0, file_size));
+    if crate::formats::lz4::leading(header) {
+        let file_size = reader.len();
+        let index = py.detach(|| crate::formats::lz4::walk(reader, 0, file_size));
         if index.frames == 0 && matches!(index.error, "" | "lz4_magic_not_found") {
             return compression_empty(py, "ambiguous_skippable_stream", "", "", false);
         }
         return Ok(index.to_dict(py, file_size)?.unbind());
     }
     compression_empty(py, "compression_stream_magic_not_found", "", "", false)
+}
+
+pub(crate) fn has_compression_stream_header(header: &[u8]) -> bool {
+    StructuralStreamKind::from_header(header).is_some() || crate::formats::lz4::leading(header)
 }

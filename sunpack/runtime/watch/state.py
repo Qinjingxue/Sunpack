@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass, field, replace
 import os
 import threading
 import time
-import traceback
 import weakref
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -33,6 +32,7 @@ DEFAULT_JOURNAL_COMPACT_RECORDS = 8192
 DEFAULT_JOURNAL_COMPACT_BYTES = 8 * 1024 * 1024
 DEFAULT_JOURNAL_HARD_BYTES = 256 * 1024 * 1024
 _recorded_file_presence = NativeWatchState.file_presence
+_CHECKPOINT_SEQUENCE_GAP = "cannot checkpoint a WatchStateStore that does not own the full sequence prefix"
 
 
 class WatchStateJournalError(RuntimeError):
@@ -192,10 +192,10 @@ class WatchStateStore:
         self._compaction_due = False
         self._checkpoint_running = False
         self._checkpoint_requested = False
-        self._checkpoint_error: BaseException | None = None
+        self._checkpoint_error: tuple[type[OSError] | type[RuntimeError], str] | None = None
         self._journal_retirement_pending = False
         self._retirement_callback = retirement_callback
-        self._persistence_fault: BaseException | None = None
+        self._persistence_fault: str | None = None
         self._snapshot_exists = False
         self._external_sequence_gap = False
         try:
@@ -355,7 +355,8 @@ class WatchStateStore:
                 self._checkpoint_condition.wait()
             self._raise_persistence_fault_locked()
             if self._checkpoint_error is not None:
-                raise self._checkpoint_error
+                error_type, message = self._checkpoint_error
+                raise error_type(message)
 
     def flush(self) -> None:
         """Flush all journal operations submitted before this call."""
@@ -507,9 +508,7 @@ class WatchStateStore:
                 self._external_sequence_gap = True
             if self._external_sequence_gap:
                 if force:
-                    self._checkpoint_error = RuntimeError(
-                        "cannot checkpoint a WatchStateStore that does not own the full sequence prefix"
-                    )
+                    self._checkpoint_error = (RuntimeError, _CHECKPOINT_SEQUENCE_GAP)
                     self._checkpoint_condition.notify_all()
                 return
         if self._checkpoint_running:
@@ -565,9 +564,7 @@ class WatchStateStore:
                     return
                 if (self._path_coordinator.next_sequence - 1) != self._applied_seq:
                     self._external_sequence_gap = True
-                    self._checkpoint_error = RuntimeError(
-                        "cannot checkpoint a WatchStateStore that does not own the full sequence prefix"
-                    )
+                    self._checkpoint_error = (RuntimeError, _CHECKPOINT_SEQUENCE_GAP)
                     self._checkpoint_running = False
                     self._checkpoint_condition.notify_all()
                     return
@@ -584,17 +581,16 @@ class WatchStateStore:
                     )
                 self._checkpoint_requested = False
 
-            error: BaseException | None = None
+            error = None
             try:
                 if seal_ticket is not None:
                     seal_ticket.wait()
                 self._write_snapshot_view(view)
                 retirement_pending = self._retire_segments_through(boundary)
             except BaseException as exc:
-                error = exc
-                # Keep the failure and stack, not completed writer frames whose
-                # locals own the captured native snapshot and its old records.
-                traceback.clear_frames(exc.__traceback__)
+                # Saved failures can outlive the operation. Holding an exception
+                # here would also retain its traceback, including caller locals.
+                error = (OSError if isinstance(exc, OSError) else RuntimeError, str(exc))
             finally:
                 del view
 
@@ -613,10 +609,9 @@ class WatchStateStore:
                     self._checkpoint_error = error
                     self._update_compaction_due_locked()
                     if self._journal_bytes >= self._hard_compact_bytes:
-                        self._persistence_fault = RuntimeError(
-                            "Watch state checkpoint failed at the journal safety limit"
+                        self._persistence_fault = (
+                            f"Watch state checkpoint failed at the journal safety limit: {error[1]}"
                         )
-                        self._persistence_fault.__cause__ = error
 
                 self._checkpoint_condition.notify_all()
                 if error is not None:
@@ -703,21 +698,21 @@ class WatchStateStore:
                 self._checkpoint_error is not None
                 and self._journal_bytes >= self._hard_compact_bytes
             ):
-                self._persistence_fault = RuntimeError(
-                    "Watch state journal reached its safety limit after checkpoint failure"
+                self._persistence_fault = (
+                    f"Watch state journal reached its safety limit after checkpoint failure: "
+                    f"{self._checkpoint_error[1]}"
                 )
-                self._persistence_fault.__cause__ = self._checkpoint_error
                 self._checkpoint_condition.notify_all()
 
     def _on_journal_error(self, error: BaseException) -> None:
         with self._checkpoint_condition:
             if self._persistence_fault is None:
-                self._persistence_fault = error
+                self._persistence_fault = str(error)
             self._checkpoint_condition.notify_all()
 
     def _raise_persistence_fault_locked(self) -> None:
         if self._persistence_fault is not None:
-            raise RuntimeError("Watch state persistence is unavailable") from self._persistence_fault
+            raise RuntimeError(f"Watch state persistence is unavailable: {self._persistence_fault}")
 
     def commit_runtime(self, operations, *, durable=False, admit=None):
         with self._state_lock:

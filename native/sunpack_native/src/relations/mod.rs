@@ -29,7 +29,7 @@ use scope::{RelationScopeIndex, RelationSource};
 #[derive(Debug, Clone)]
 pub(crate) struct RelationInput {
     path: String,
-    path_key: String,
+    pub(crate) path_key: String,
     name: String,
     size: Option<u64>,
     relation_member_eligible: bool,
@@ -411,40 +411,7 @@ pub(crate) fn relations_parse_numbered_volume(
         .transpose()?)
 }
 
-#[pyfunction]
-#[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords=None))]
-pub(crate) fn relations_build_candidate_groups_from_snapshot(
-    py: Python<'_>,
-    raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
-    filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
-    path_passwords: Option<Vec<(String, String)>>,
-) -> PyResult<Vec<Py<PyDict>>> {
-    let raw_snapshot = &*raw_snapshot;
-    let filtered_snapshot = &*filtered_snapshot;
-    let groups = py.detach(|| {
-        build_native_candidate_groups_from_snapshot(
-            raw_snapshot,
-            filtered_snapshot,
-            path_passwords.as_deref(),
-        )
-    });
-    groups.into_iter().map(|group| group.to_dict(py)).collect()
-}
-
 pub(crate) fn build_native_candidate_groups_from_snapshot(
-    raw_snapshot: &NativeDirectorySnapshot,
-    filtered_snapshot: &NativeDirectorySnapshot,
-    path_passwords: Option<&[(String, String)]>,
-) -> Vec<NativeRelationGroup> {
-    build_native_candidate_groups_from_snapshot_cached(
-        raw_snapshot,
-        filtered_snapshot,
-        path_passwords,
-        None,
-    )
-}
-
-pub(crate) fn build_native_candidate_groups_from_snapshot_cached(
     raw_snapshot: &NativeDirectorySnapshot,
     filtered_snapshot: &NativeDirectorySnapshot,
     path_passwords: Option<&[(String, String)]>,

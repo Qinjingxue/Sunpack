@@ -1,15 +1,8 @@
-"""Python 侧空间事件消费。
-
-被测路径：纯状态机（确定性、无进程）与假 worker 走完整 asyncio 分发路径。
-
-两条关键回归：native 在 gate 锁外发送事件，resumed(ep) 可能先于 blocked(ep) 到达，
-不得把 space_waiting 永久置回 True；job 生命周期状态不得被空间事件污染。
-"""
+"""Verify resource-event ordering and disk monitoring configuration."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from pathlib import Path
 
@@ -19,8 +12,7 @@ from tests.helpers.archive_tasks import make_archive_task
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _apply_native_environment,
-    _apply_native_event_to_job_state,
-    _on_space_event,
+    _is_stale_resource_event,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -46,14 +38,6 @@ def _space_event(event: str, episode: int = 3, **extra) -> dict:
     }
     payload.update(extra)
     return payload
-
-
-def _running_state(**overrides) -> dict:
-    state = {
-        "state": "running",
-    }
-    state.update(overrides)
-    return state
 
 
 def _task(archive: Path):
@@ -95,51 +79,6 @@ def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_
     return runner
 
 
-def test_space_event_reaches_callback_without_polluting_job_state():
-    from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _SPACE_ACCEPTED
-
-    for event in ("space_blocked", "space_status", "space_resumed"):
-        state = _running_state()
-        outcome = _apply_native_event_to_job_state(state, _space_event(event))
-        assert outcome == _SPACE_ACCEPTED, event
-        assert state["state"] == "running", event
-
-
-def test_only_job_events_write_the_lifecycle_state():
-    state = _running_state()
-    _apply_native_event_to_job_state(state, {"type": "progress", "event": "job_started"})
-    assert state["state"] == "started"
-    state = _running_state()
-    _apply_native_event_to_job_state(state, {"type": "progress", "event": "job_finished"})
-    assert state["state"] == "finished"
-    state = _running_state()
-    _apply_native_event_to_job_state(state, {"type": "result", "job_id": "x"})
-    assert state["state"] == "result_received"
-
-
-def test_multiple_jobs_on_the_same_volume_are_all_suspended():
-    states = [_running_state() for _ in range(2)]
-    for index, state in enumerate(states):
-        _on_space_event(
-            state, "space_blocked", _space_event("space_blocked", job_id=f"job-{index}")
-        )
-    assert all(state["space_waiting"] is True for state in states)
-
-
-def test_space_events_never_imply_a_result():
-    state = _running_state()
-    for event in ("space_blocked", "space_status", "space_resumed", "space_status"):
-        _apply_native_event_to_job_state(state, _space_event(event))
-        assert state["state"] != "result_received"
-
-
-def test_volume_key_shape_is_lowercase_without_trailing_backslash():
-    payload = _space_event("space_blocked")
-    key = payload["volume_key"]
-    assert key.startswith("\\\\?\\volume{")
-    assert not key.endswith("\\")
-
-
 def test_space_poll_intervals_environment_mapping():
     environment = _apply_native_environment(
         {},
@@ -173,105 +112,16 @@ def test_advanced_config_only_exposes_space_poll_intervals():
     assert int(worker["space_status_report_interval_ms"]) >= 1000
 
 
-def test_unknown_native_events_are_logged(caplog):
-    with caplog.at_level("DEBUG"):
-        state = _running_state()
-        _apply_native_event_to_job_state(
-            state, {"type": "native_unknown", "job_id": "x"}, __import__("logging").getLogger("t")
-        )
-        _apply_native_event_to_job_state(
-            state, {"type": "progress", "event": "mystery_event"}, __import__("logging").getLogger("t")
-        )
-    assert any("native_unknown" in record.message for record in caplog.records)
-    assert any("mystery_event" in record.message for record in caplog.records)
-
-
-def test_leftover_space_waiting_does_not_block_job_completion():
-    state = _running_state()
-    _on_space_event(state, "space_blocked", _space_event("space_blocked"))
-    assert state["space_waiting"] is True
-    # 没有 space_resumed 也必须有终态路径：result 事件照常生效。
-    _apply_native_event_to_job_state(state, {"type": "result", "job_id": "job-1"})
-    assert state["state"] == "result_received"
-
-
-def test_stale_blocked_after_resumed_is_rejected():
-    state = _running_state()
-    _on_space_event(state, "space_resumed", _space_event("space_resumed", episode=3))
-    assert state["space_waiting"] is False
-    # 锁外乱序：blocked(ep3) 后到，必须被拒绝。
-    _on_space_event(state, "space_blocked", _space_event("space_blocked", episode=3))
-    assert state["space_waiting"] is False
-    _on_space_event(state, "space_status", _space_event("space_status", episode=3))
-    assert state["space_waiting"] is False
-
-
-def test_stale_status_after_resumed_is_rejected():
-    state = _running_state()
-    _on_space_event(state, "space_blocked", _space_event("space_blocked", episode=7))
-    _on_space_event(state, "space_resumed", _space_event("space_resumed", episode=7))
-    _on_space_event(state, "space_status", _space_event("space_status", episode=7))
-    assert state["space_waiting"] is False
-
-
-def test_old_episode_events_are_dropped():
-    state = _running_state()
-    _on_space_event(state, "space_blocked", _space_event("space_blocked", episode=5))
-    assert state["space_waiting"] is True
-    _on_space_event(state, "space_blocked", _space_event("space_blocked", episode=4))
-    assert state["space_episode"] == 5
-    _on_space_event(state, "space_resumed", _space_event("space_resumed", episode=4))
-    assert state["space_waiting"] is True  # 旧 episode 的 resumed 不得清除等待
-
-
-def test_new_episode_resets_resumed_seen():
-    state = _running_state()
-    _on_space_event(state, "space_blocked", _space_event("space_blocked", episode=1))
-    _on_space_event(state, "space_resumed", _space_event("space_resumed", episode=1))
-    _on_space_event(state, "space_blocked", _space_event("space_blocked", episode=2))
-    assert state["space_waiting"] is True
-    assert state["space_resumed_seen"] is False
-
-
-def test_on_space_event_reports_acceptance():
-    """`_on_space_event` 的返回值是全系统唯一的 stale 判定。"""
-
-    from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
-        _SPACE_ACCEPTED,
-        _SPACE_NOT_APPLICABLE,
-        _SPACE_STALE,
-    )
-
-    state = _running_state()
-    # 非空间事件 → NOT_APPLICABLE（交给既有 job 状态机）
-    assert (
-        _apply_native_event_to_job_state(state, {"type": "progress", "event": "job_started"})
-        == _SPACE_NOT_APPLICABLE
-    )
-    assert state["state"] == "started"
-    assert (
-        _apply_native_event_to_job_state(state, _space_event("space_blocked", episode=3))
-        == _SPACE_ACCEPTED
-    )
-    assert state["space_waiting"] is True
-    assert (
-        _apply_native_event_to_job_state(state, _space_event("space_resumed", episode=3))
-        == _SPACE_ACCEPTED
-    )
-    assert state["space_waiting"] is False
-    assert (
-        _apply_native_event_to_job_state(state, _space_event("space_blocked", episode=3))
-        == _SPACE_STALE
-    )
-    assert (
-        _apply_native_event_to_job_state(state, _space_event("space_status", episode=3))
-        == _SPACE_STALE
-    )
-    assert (
-        _apply_native_event_to_job_state(state, _space_event("space_resumed", episode=2))
-        == _SPACE_STALE
-    )
-    assert state["space_waiting"] is False, "stale 事件绝不能改变等待状态"
+def test_new_space_episode_accepts_status_and_discards_previous_episode():
+    # The worker end-to-end tests exercise same-episode reordering. An earlier
+    # resume/status must also be ignored after a new blocking episode starts.
+    state = {}
+    assert not _is_stale_resource_event(state, _space_event("space_blocked", episode=2))
+    assert not _is_stale_resource_event(state, _space_event("space_resumed", episode=2))
+    assert not _is_stale_resource_event(state, _space_event("space_status", episode=3))
+    assert _is_stale_resource_event(state, _space_event("space_resumed", episode=2))
+    assert _is_stale_resource_event(state, _space_event("space_status", episode=2))
+    assert not _is_stale_resource_event(state, _space_event("space_blocked", episode=3))
 
 
 @pytest.mark.parametrize("resource", ["space", "memory"])

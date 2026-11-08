@@ -969,7 +969,7 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
             count = len(calls)
             second._watch_handler.dispatch(FileCreatedEvent(str(live)))
             assert len(calls) == count
-            generation = second._active_states[str(live)].generation
+            generation = second._pending[str(live)].generation
 
             def racing_changes(*args):
                 paths = changes(*args)
@@ -982,7 +982,7 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
             assert len(calls) == count + 1
             assert {str(live), str(missed)} <= set(second._pending)
             assert str(late) not in second._pending
-            assert second._active_states[str(live)].generation == generation
+            assert second._pending[str(live)].generation == generation
             boundary = second.state.watch_cursor(volume)["next_usn"]
             assert boundary > before
             assert second._usn_checkpoint_pending and second.next_delay_seconds() == 0

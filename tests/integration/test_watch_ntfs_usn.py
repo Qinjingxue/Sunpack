@@ -152,7 +152,7 @@ def test_duplicate_noise_does_not_restart_generation_but_overwrite_does(tmp_path
 
     for event_type in ("modified", "created", "unknown") * 100:
         watcher.enqueue(str(archive), event_type=event_type)
-    assert watcher._active_states[str(archive)].generation == 1
+    assert watcher._pending[str(archive)].generation == 1
 
     with archive.open("r+b") as stream:
         stream.seek(0)
@@ -161,12 +161,12 @@ def test_duplicate_noise_does_not_restart_generation_but_overwrite_does(tmp_path
         os.fsync(stream.fileno())
     os.utime(archive, ns=(original_mtime_ns, original_mtime_ns))
     watcher.enqueue(str(archive), event_type="modified")
-    changed_generation = watcher._active_states[str(archive)].generation
+    changed_generation = watcher._pending[str(archive)].generation
 
     for _ in range(300):
         watcher.enqueue(str(archive), event_type="modified")
     assert changed_generation == 2
-    assert watcher._active_states[str(archive)].generation == changed_generation
+    assert watcher._pending[str(archive)].generation == changed_generation
 
 
 def test_restoring_an_older_mtime_does_not_restart_content_quiet_window(tmp_path):
@@ -174,14 +174,14 @@ def test_restoring_an_older_mtime_does_not_restart_content_quiet_window(tmp_path
     archive.write_bytes(b"A" * 256 * 1024)
     watcher = _watcher(tmp_path)
     watcher.enqueue(str(archive), event_type="created")
-    baseline_event_at = watcher._active_states[str(archive)].last_event_at
+    baseline_event_at = watcher._pending[str(archive)].last_event_at
 
     stat = archive.stat()
     restored_mtime_ns = stat.st_mtime_ns - 60_000_000_000
     os.utime(archive, ns=(stat.st_atime_ns, restored_mtime_ns))
     watcher.enqueue(str(archive), event_type="modified")
 
-    assert watcher._active_states[str(archive)].last_event_at == baseline_event_at
+    assert watcher._pending[str(archive)].last_event_at == baseline_event_at
 
 
 def test_slow_writes_busy_handle_move_and_event_storm_reach_ready(tmp_path):
@@ -206,11 +206,11 @@ def test_slow_writes_busy_handle_move_and_event_storm_reach_ready(tmp_path):
         watcher.notify_path_departed(str(temporary))
         watcher.enqueue(str(final), event_type="moved", src_path=str(temporary))
         time.sleep(0.05)
-        baseline_generation = watcher._active_states[str(final)].generation
+        baseline_generation = watcher._pending[str(final)].generation
 
         for event_type in ("modified", "unknown", "created") * 200:
             watcher.enqueue(str(final), event_type=event_type)
-        assert watcher._active_states[str(final)].generation == baseline_generation
+        assert watcher._pending[str(final)].generation == baseline_generation
 
         time.sleep(0.3)
         ready = watcher._pop_ready(time.monotonic())

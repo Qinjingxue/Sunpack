@@ -42,7 +42,7 @@ impl<'a> Decoder<'a> {
             return Err(invalid("worker object expected"));
         }
         while self.data.first() != Some(&0) {
-            let key = String::deserialize(&mut *self)?;
+            let key = <&str>::deserialize(&mut *self)?;
             if key == "job_id" {
                 return String::deserialize(&mut *self);
             }

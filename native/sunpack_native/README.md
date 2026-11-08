@@ -34,8 +34,8 @@ Smoke test:
 tests to confirm the extension was imported.
 
 
-`scan_directory_snapshot(...)` walks a directory tree, applies every built-in
-filesystem filter, and returns one `NativeDirectorySnapshot`. Entry data stays
+`NativeDirectoryScanOptions.scan(...)` walks a directory tree, applies the configured
+filesystem filters, and returns filtered and raw `NativeDirectorySnapshot` views. Entry data stays
 in four native columns (`path`, `is_dir`, `size`, and `mtime_ns`); the normal
 scan path does not create per-entry Python dictionaries, `Path` objects, or
 `FileEntry` objects. Custom filters must be expressible through native scan

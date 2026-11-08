@@ -527,8 +527,10 @@ class _PipeRequestProtocol(asyncio.Protocol):
         self._buffer.clear()
         self._payload = None
         self._output_queue.close()
-        if self._input_waiter is not None and not self._input_waiter.done():
-            self._input_waiter.set_exception(ConnectionError("persistent pipe client disconnected"))
+        waiter, self._input_waiter = self._input_waiter, None
+        self._input_size = None
+        if waiter is not None and not waiter.done():
+            waiter.set_exception(ConnectionError("persistent pipe client disconnected"))
         if self._request_task is not None and not self._request_task.done() and not self._request_finishing:
             self._request_task.cancel()
         if self._output_task is not None and not self._output_task.done():
@@ -727,10 +729,20 @@ class _PipeRequestProtocol(asyncio.Protocol):
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[str] = loop.create_future()
         self._input_waiter = waiter
-        await self.send_frame(struct.pack("!BI", 3, 0))
-        await self.flush_output()
-        self._parse_input()
-        return await waiter
+        try:
+            await self.send_frame(struct.pack("!BI", 3, 0))
+            await self.flush_output()
+            self._parse_input()
+            return await waiter
+        finally:
+            if self._input_waiter is waiter:
+                self._input_waiter = None
+                self._input_size = None
+            if waiter.done() and not waiter.cancelled():
+                # Disconnect may fail the waiter before the prompt frame flushes.
+                waiter.exception()
+            else:
+                waiter.cancel()
 
     async def _finish_after_output(self) -> None:
         if self._output_task is not None and not self._output_task.done():

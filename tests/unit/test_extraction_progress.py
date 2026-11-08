@@ -1,3 +1,4 @@
+from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from sunpack.pipeline.extraction.progress import (
     build_extraction_progress_manifest,
     iter_progress_files,
@@ -15,7 +16,7 @@ def _trace_result(items, **fields):
 def test_progress_manifest_preserves_archive_path_and_numbered_output_path(tmp_path):
     manifest = build_extraction_progress_manifest(
         archive=str(tmp_path / "source.zip"),
-        out_dir=str(tmp_path / "out"),
+        output_inventory=collect_output_inventory(str(tmp_path / "out")),
         diagnostics={"result": _trace_result([{
             "path": "report.txt",
             "output_path": "report(1).txt",
@@ -34,7 +35,7 @@ def test_progress_manifest_classifies_trace_items_and_skips_directories(tmp_path
     out_dir = tmp_path / "out"
     manifest = build_extraction_progress_manifest(
         archive="a.7z",
-        out_dir=str(out_dir),
+        output_inventory=collect_output_inventory(str(out_dir)),
         diagnostics={"result": _trace_result([
             {"path": "dir", "is_dir": True},
             {"path": "dir/ok.bin", "bytes_written": 4, "expected_size": 4},
@@ -69,7 +70,7 @@ def test_progress_manifest_from_worker_rows_keeps_complete_bytes_written(tmp_pat
     )
     manifest = build_extraction_progress_manifest(
         archive=str(tmp_path / "source.zip"),
-        out_dir=str(tmp_path / "out"),
+        output_inventory=collect_output_inventory(str(tmp_path / "out")),
         diagnostics={"result": result},
     )
 
@@ -86,10 +87,14 @@ def test_progress_manifest_adds_untraced_output_files(tmp_path):
     (out_dir / ".sunpack").mkdir(parents=True)
     (out_dir / "traced.txt").write_bytes(b"abc")
     (out_dir / ".sunpack" / "extraction_manifest.json").write_bytes(b"hello")
+    inventory = collect_output_inventory(str(out_dir))
+    # A new scan would see different sizes. The manifest uses the inventory
+    # that was already captured for downstream verification.
+    (out_dir / ".sunpack" / "extraction_manifest.json").write_bytes(b"changed after snapshot")
 
     manifest = build_extraction_progress_manifest(
         archive="a.zip",
-        out_dir=str(out_dir),
+        output_inventory=inventory,
         diagnostics={"result": _trace_result(
             [{"path": "traced.txt", "bytes_written": 3, "expected_size": 3}],
             status="failed",
@@ -118,7 +123,7 @@ def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):
 
     manifest = build_extraction_progress_manifest(
         archive="a.zip",
-        out_dir=str(tmp_path / "out"),
+        output_inventory=collect_output_inventory(str(tmp_path / "out"), result),
         diagnostics={"result": result},
     )
 

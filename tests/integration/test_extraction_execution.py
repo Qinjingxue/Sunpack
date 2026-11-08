@@ -257,6 +257,7 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertTrue(result.partial_outputs)
+            self.assertEqual(result.output_inventory.stats.file_count, 2)
             self.assertTrue(good_path.exists())
             self.assertTrue(partial_path.exists())
             self.assertFalse((out_dir / ".sunpack" / "extraction_manifest.json").exists())

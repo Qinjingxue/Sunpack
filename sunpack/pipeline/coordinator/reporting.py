@@ -58,7 +58,6 @@ class RunReporter:
         self._use_color = self._interactive and os.environ.get("NO_COLOR") is None
         self._panel_row_index: dict[int, int] = {}
         self._task_rows: dict[int, dict[str, Any]] = {}
-        self._last_streamed_progress: dict[int, int] = {}
         self._last_render_at = 0.0
         self._work_broker = work_broker
         self._request_id = request_id
@@ -85,7 +84,6 @@ class RunReporter:
                 return
             for task in tasks:
                 parent_lineage = self._lineage_for_path(str(getattr(task, "main_path", "") or ""))
-                self._last_streamed_progress.pop(id(task), None)
                 self._task_rows[id(task)] = {
                     "name": _task_name(task),
                     "depth": depth,
@@ -152,7 +150,7 @@ class RunReporter:
         if not self._lock.acquire(blocking=False):
             return
         try:
-            self._task_progress(task, event)
+            self._task_progress_locked(task, event)
         except BlockingIOError:
             # The final report is lossless and uses the blocking broker path.
             pass
@@ -162,9 +160,7 @@ class RunReporter:
     def _resource_progress(self, task: Any, event: dict[str, Any]) -> None:
         # Broker workers may wait for the reporter and output; the loop must not.
         with self._lock:
-            row = self._task_rows.get(id(task))
-            if row is not None:
-                self._task_progress(task, event)
+            self._task_progress_locked(task, event)
 
     async def _drain_resource_progress(self) -> None:
         while self._pending_resource_progress:
@@ -193,22 +189,24 @@ class RunReporter:
                 self._resource_progress_task = None
                 self._pending_resource_progress.clear()
 
-    def _task_progress(self, task: Any, event: dict[str, Any]) -> None:
+    def _task_progress_locked(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
+            return
+        task_id = id(task)
+        row = self._task_rows.get(task_id)
+        if row is None:
             return
         name = str(event.get("event") or "")
         if name in {"memory_blocked", "memory_resumed"}:
-            row = self._task_rows.get(id(task))
-            if row is not None:
-                row["memory_blocked"] = name == "memory_blocked"
-                self._restore_progress_locked(row)
-                if self._interactive:
-                    self._render_panel_locked(force=True, task_id=id(task))
-                else:
-                    self._print(self._format_task_row(row))
+            row["memory_blocked"] = name == "memory_blocked"
+            self._restore_progress_locked(row)
+            if self._interactive:
+                self._render_panel_locked(force=True, task_id=task_id)
+            else:
+                self._print(self._format_task_row(row))
             return
         if name in _SPACE_EVENTS:
-            self._space_progress(task, name, event)
+            self._space_progress_locked(task, row, name, event)
             return
         if event.get("type") != "progress":
             return
@@ -219,77 +217,56 @@ class RunReporter:
             return
         known = total > 0
         progress = min(1.0, completed / total) if known else 0.0
-        with self._lock:
-            task_id = id(task)
-            row = self._task_rows.get(task_id)
-            if row is None:
-                return
-            old_percent = int(float(row.get("progress", 0.0)) * 100) if row.get("progress_known") else None
+        old_percent = int(row["progress"] * 100) if self._interactive and row["progress_known"] else None
+        old_state = row["state"]
+        row["progress"] = progress
+        row["progress_known"] = known
+        row["completed_bytes"] = completed
+        row["total_bytes"] = total
+        if row.get("space_blocked") or row.get("memory_blocked"):
+            return
+        row["state"] = "extracting"
+        if self._interactive:
             new_percent = int(progress * 100) if known else None
-            old_state = row.get("state")
-            # 磁盘满暂停期间不得把状态改回 extracting：暂停是"等待"，不是进度。
-            if row.get("space_blocked") or row.get("memory_blocked"):
-                self._remember_progress_locked(row, progress, completed, total)
-                return
-            row.update({
-                "state": "extracting",
-                "progress": progress,
-                "progress_known": known,
-                "completed_bytes": completed,
-                "total_bytes": total,
-            })
-            if self._interactive:
-                if new_percent != old_percent or old_state != "extracting":
-                    self._render_panel_locked(force=False, task_id=task_id)
-            else:
-                # One indeterminate line until a known total arrives; determinate
-                # progress remains throttled to 10% increments.
-                last_percent = self._last_streamed_progress.get(task_id, -10)
-                if not known:
-                    if last_percent != -1:
-                        self._last_streamed_progress[task_id] = -1
-                        self._print(self._format_task_row(row))
-                else:
-                    displayed_percent = (new_percent // 10) * 10
-                    if last_percent < 0 or displayed_percent >= last_percent + 10:
-                        self._last_streamed_progress[task_id] = displayed_percent
-                        self._print(self._format_task_row(row))
+            if new_percent != old_percent or old_state != "extracting":
+                self._render_panel_locked(force=False, task_id=task_id)
+        else:
+            # Stream one indeterminate line, then throttle known progress to 10% steps.
+            last_percent = row.get("streamed_percent", -10)
+            displayed_percent = (int(progress * 100) // 10) * 10 if known else -1
+            if (known and (last_percent < 0 or displayed_percent >= last_percent + 10)) or (
+                not known and last_percent != -1
+            ):
+                row["streamed_percent"] = displayed_percent
+                self._print(self._format_task_row(row))
 
     # Transport filters stale episodes; only retain the visible state here.
-    def _space_progress(self, task: Any, event: str, payload: dict[str, Any]) -> None:
-        with self._lock:
-            row = self._task_rows.get(id(task))
-            if row is None:
-                return
-            if event == "space_resumed":
-                row["space_blocked"] = False
-                row["detail"] = ""
-                self._restore_progress_locked(row)
-                if self._interactive:
-                    self._render_panel_locked(force=True, task_id=id(task))
-                else:
-                    self._print(self._format_task_row(row))
-                return
-
-            row["space_blocked"] = True
+    def _space_progress_locked(
+        self, task: Any, row: dict[str, Any], event: str, payload: dict[str, Any],
+    ) -> None:
+        if event == "space_resumed":
+            row["space_blocked"] = False
+            row["detail"] = ""
             self._restore_progress_locked(row)
-            if event == "space_status":
-                previous_detail = row.get("detail", "")
-                row["detail"] = self._space_status_detail(payload)
-            else:
-                row["detail"] = ""
             if self._interactive:
                 self._render_panel_locked(force=True, task_id=id(task))
-            elif not self._interactive and event == "space_blocked":
-                if row.get("memory_blocked"):
-                    self._print(self._format_task_row(row))
-                else:
-                    self._print(self.i18n.t(
-                        "report.disk_paused", name=_task_name(task),
-                        free=_format_bytes(int(payload.get("free_bytes") or 0)),
-                    ))
-            elif event == "space_status" and previous_detail != row["detail"]:
+            else:
                 self._print(self._format_task_row(row))
+            return
+
+        row["space_blocked"] = True
+        self._restore_progress_locked(row)
+        previous_detail = row["detail"]
+        row["detail"] = self._space_status_detail(payload) if event == "space_status" else ""
+        if self._interactive:
+            self._render_panel_locked(force=True, task_id=id(task))
+        elif event == "space_blocked" and not row.get("memory_blocked"):
+            self._print(self.i18n.t(
+                "report.disk_paused", name=_task_name(task),
+                free=_format_bytes(int(payload.get("free_bytes") or 0)),
+            ))
+        elif event == "space_blocked" or previous_detail != row["detail"]:
+            self._print(self._format_task_row(row))
 
     def _space_status_detail(self, payload: dict[str, Any]) -> str:
         # 卷查询失败（拔盘 / UNC 断开 / 权限变化）必须与"空间不足"可区分。
@@ -299,14 +276,6 @@ class RunReporter:
                 error=str(payload.get("volume_query_error") or 0),
             )
         return ""
-
-    def _remember_progress_locked(
-        self, row: dict[str, Any], progress: float, completed: int, total: int
-    ) -> None:
-        row["progress"] = progress
-        row["progress_known"] = total > 0
-        row["completed_bytes"] = completed
-        row["total_bytes"] = total
 
     def _restore_progress_locked(self, row: dict[str, Any]) -> None:
         row["state"] = "memory_paused" if row.get("memory_blocked") else ("disk_paused" if row.get("space_blocked") else "extracting")
@@ -362,10 +331,8 @@ class RunReporter:
             # The terminal already owns the rendered row. Keep ancestry only
             # by output path for recursive discovery, never by completed task.
             self._task_rows.pop(id(task), None)
-            self._last_streamed_progress.pop(id(task), None)
             if not self._task_rows:
                 self._task_rows.clear()
-                self._last_streamed_progress.clear()
                 self._panel_row_index.clear()
 
     def relocate_outputs(self, result: DirectoryFlattenResult) -> None:

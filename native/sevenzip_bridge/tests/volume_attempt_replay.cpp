@@ -16,6 +16,21 @@ bool injected = false;
 void require(bool condition, const char* message) {
     if (!condition) { std::cerr << message << '\n'; std::exit(2); }
 }
+
+void check_final_results(const std::ostringstream& output, unsigned expected_count, std::string_view expected_status = {}) {
+    std::istringstream frames(output.str());
+    std::string payload;
+    unsigned count = 0;
+    while (wire::read(frames, payload)) {
+        const wire::ObjectView frame(payload);
+        if (frame.string_field("type") != "result") continue;
+        ++count;
+        if (!expected_status.empty()) {
+            require(frame.string_field("native_status") == expected_status, "request emitted an unexpected final status");
+        }
+    }
+    require(count == expected_count, "request emitted an unexpected number of final results");
+}
 }
 
 void* operator new(std::size_t size) {
@@ -65,8 +80,8 @@ void request_recovery(const std::filesystem::path& archive, bool after_failure, 
     auto code = run_request(request, nullptr, job.cancel);
     std::cout.rdbuf(previous);
     require(injected, "did not reach cursor enumeration");
-    require(code == kMemoryRetry && output.str().find("\"type\":\"result\"") == std::string::npos,
-            "withdrawal emitted a final cancellation");
+    require(code == kMemoryRetry, "withdrawal did not request a retry");
+    check_final_results(output, 0);
     require(replay.volumes.attempts == (after_failure ? 1 : 0), "withdrawal counted an unfinished candidate");
     manager.end(job);
     std::atomic<bool> canceled{user_cancel};
@@ -82,16 +97,13 @@ void request_recovery(const std::filesystem::path& archive, bool after_failure, 
     code = run_request(request, nullptr, job.cancel);
     std::cout.rdbuf(previous);
     if (user_cancel) {
-        require(code == -101 && output.str().find("\"native_status\":\"cancelled\"") != std::string::npos,
-                "user cancellation was mistaken for resource retry");
+        require(code == -101, "user cancellation was mistaken for resource retry");
     } else {
         if (code != 0) std::cerr << output.str();
         require(code == 0 && replay.volumes.selected == std::vector<std::size_t>{0, 1}, "replay lost the valid composition");
         require(replay.volumes.attempts == (after_failure ? 2 : 1), "replay repeated a rejected composition");
     }
-    const auto result = output.str().find("\"type\":\"result\"");
-    require(result != std::string::npos && output.str().find("\"type\":\"result\"", result + 1) == std::string::npos,
-            "request emitted more than one final result");
+    check_final_results(output, 1, user_cancel ? "cancelled" : "ok");
     manager.end(job);
 }
 

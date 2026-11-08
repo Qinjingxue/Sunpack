@@ -25,10 +25,7 @@ class VerificationEvidence:
     archive_input: ArchiveInputDescriptor
     password: str | None
     analysis_facts: dict[str, Any] = field(default_factory=dict)
-    extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
     worker_result: dict[str, Any] = field(default_factory=dict)
-    worker_native_diagnostics: dict[str, Any] = field(default_factory=dict)
-    progress_manifest: NativeProgressManifest | None = None
     _output_inventory_cache: OutputInventory | None = field(default=None, init=False, repr=False, compare=False)
     _file_observation_owner: str = field(default="", init=False, repr=False, compare=False)
     _archive_input_manifest_cache: ArchiveInputManifest | None = field(default=None, init=False, repr=False, compare=False)
@@ -42,8 +39,8 @@ class VerificationEvidence:
         return self.extraction_result.out_dir
 
     @property
-    def archive_input_analysis(self) -> dict[str, Any]:
-        return dict(self.archive_input.analysis)
+    def progress_manifest(self) -> NativeProgressManifest | None:
+        return self.extraction_result.progress_manifest_payload
 
     @property
     def selected_codepage(self) -> str | None:
@@ -66,24 +63,15 @@ def build_verification_evidence(
             password = knowledge_view.archive_password(task)
     with _phase(phase_timer, f"{phase_prefix}_archive_input"):
         archive_input = extraction_result.logical_input.descriptor if extraction_result.logical_input else task.archive_input()
-        extraction_diagnostics = dict(extraction_result.diagnostics or {})
     with _phase(phase_timer, f"{phase_prefix}_analysis_facts"):
         analysis_facts = _analysis_facts_from_task(task)
-    with _phase(phase_timer, f"{phase_prefix}_diagnostics"):
-        worker_result = _worker_result(extraction_diagnostics)
-        worker_native_diagnostics = _worker_native_diagnostics(worker_result)
-    with _phase(phase_timer, f"{phase_prefix}_progress_manifest"):
-        progress_manifest = extraction_result.progress_manifest_payload
     return VerificationEvidence(
         task=task,
         extraction_result=extraction_result,
         archive_input=archive_input,
         password=password,
         analysis_facts=analysis_facts,
-        extraction_diagnostics=extraction_diagnostics,
-        worker_result=worker_result,
-        worker_native_diagnostics=worker_native_diagnostics,
-        progress_manifest=progress_manifest,
+        worker_result=extraction_result.diagnostics.get("result", {}),
     )
 
 
@@ -97,16 +85,6 @@ def _analysis_facts_from_task(task: ArchiveTask) -> dict[str, Any]:
     if isinstance(segment, dict):
         output.setdefault("segment", dict(segment))
     return output
-
-
-def _worker_result(diagnostics: dict[str, Any]) -> dict[str, Any]:
-    result = diagnostics.get("result", {})
-    return result
-
-
-def _worker_native_diagnostics(worker_result: dict[str, Any]) -> dict[str, Any]:
-    diagnostics = worker_result.get("diagnostics", {})
-    return diagnostics
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

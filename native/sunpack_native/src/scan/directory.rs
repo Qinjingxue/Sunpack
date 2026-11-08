@@ -49,7 +49,7 @@ const FORMAT_REJECT_TAR: u32 = 1 << 3;
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeDirectorySnapshot {
     pub(crate) table: Arc<DirectorySnapshotTable>,
-    pub(crate) rows: Vec<usize>,
+    pub(crate) rows: Arc<Vec<usize>>,
     buckets: OnceLock<HashMap<String, Vec<usize>>>,
 }
 
@@ -57,7 +57,15 @@ impl NativeDirectorySnapshot {
     pub(crate) fn view(&self, rows: Vec<usize>) -> Self {
         Self {
             table: Arc::clone(&self.table),
-            rows,
+            rows: Arc::new(rows),
+            buckets: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn share_rows(&self) -> Self {
+        Self {
+            table: Arc::clone(&self.table),
+            rows: Arc::clone(&self.rows),
             buckets: OnceLock::new(),
         }
     }
@@ -79,7 +87,7 @@ impl NativeDirectorySnapshot {
         let rows = (0..table.paths.len()).collect();
         Self {
             table,
-            rows,
+            rows: Arc::new(rows),
             buckets: OnceLock::new(),
         }
     }
@@ -100,12 +108,12 @@ impl NativeDirectorySnapshot {
             Self {
                 buckets: OnceLock::new(),
                 table: Arc::clone(&table),
-                rows: filtered_rows,
+                rows: Arc::new(filtered_rows),
             },
             Self {
                 buckets: OnceLock::new(),
                 table,
-                rows: raw_rows,
+                rows: Arc::new(raw_rows),
             },
         )
     }
@@ -149,18 +157,15 @@ impl NativeDirectorySnapshot {
     }
 
     pub(crate) fn without_path_keys(&self, excluded: &HashSet<String>) -> Self {
-        Self {
-            table: Arc::clone(&self.table),
-            rows: self
-                .rows
+        self.view(
+            self.rows
                 .iter()
                 .copied()
                 .filter(|&row| {
                     !excluded.contains(&crate::path_keys::path_key(&self.table.paths[row]))
                 })
                 .collect(),
-            buckets: OnceLock::new(),
-        }
+        )
     }
 }
 
@@ -580,7 +585,7 @@ impl NativeDirectorySnapshot {
         };
         let buckets = self.buckets.get_or_init(|| {
             let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
-            for &row in &self.rows {
+            for &row in self.rows.iter() {
                 if !self.table.is_dirs[row] {
                     buckets
                         .entry(stem(&self.table.paths[row]))
@@ -590,11 +595,7 @@ impl NativeDirectorySnapshot {
             }
             buckets
         });
-        Self {
-            table: Arc::clone(&self.table),
-            rows: buckets.get(&stem(seed)).cloned().unwrap_or_default(),
-            buckets: OnceLock::new(),
-        }
+        self.view(buckets.get(&stem(seed)).cloned().unwrap_or_default())
     }
 
     fn scan_errors(&self) -> Vec<DirectoryReadError> {
@@ -618,7 +619,7 @@ impl NativeDirectorySnapshot {
         let mut is_dirs = Vec::with_capacity(self.rows.len());
         let mut sizes = Vec::with_capacity(self.rows.len());
         let mut mtimes_ns = Vec::with_capacity(self.rows.len());
-        for &row in &self.rows {
+        for &row in self.rows.iter() {
             paths.push(self.table.paths[row].clone());
             is_dirs.push(self.table.is_dirs[row]);
             sizes.push(self.table.sizes[row]);
@@ -631,7 +632,7 @@ impl NativeDirectorySnapshot {
         let mut paths = Vec::new();
         let mut sizes = Vec::new();
         let mut mtimes_ns = Vec::new();
-        for &row in &self.rows {
+        for &row in self.rows.iter() {
             if self.table.is_dirs[row] {
                 continue;
             }
@@ -645,7 +646,7 @@ impl NativeDirectorySnapshot {
     fn parent_directories(&self) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut directories = Vec::new();
-        for &row in &self.rows {
+        for &row in self.rows.iter() {
             if self.table.is_dirs[row] {
                 continue;
             }
@@ -671,7 +672,7 @@ impl NativeDirectorySnapshot {
         let mut paths = Vec::new();
         let mut sizes = Vec::new();
         let mut mtimes_ns = Vec::new();
-        for &row in &self.rows {
+        for &row in self.rows.iter() {
             if self.table.is_dirs[row] {
                 continue;
             }
@@ -1180,29 +1181,6 @@ fn scan_snapshots_with_options(
     Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
 }
 
-#[pyfunction]
-#[pyo3(signature = (root_path, max_depth, blacklist_rules, size_ranges, mtime_ranges, whitelist_rules))]
-pub(crate) fn scan_directory_snapshot(
-    py: Python<'_>,
-    root_path: &str,
-    max_depth: Option<usize>,
-    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
-    size_ranges: Vec<NumericRangeTuple>,
-    mtime_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
-) -> PyResult<Py<NativeDirectorySnapshot>> {
-    let options =
-        DirectoryScanOptions::new(blacklist_rules, size_ranges, mtime_ranges, whitelist_rules)?;
-    let snapshot = py.detach(|| {
-        let (mut records, errors) =
-            scan_directory_impl::<false>(root_path, max_depth, &options, false, None, None)?
-                .into_filtered();
-        populate_relation_anchors(&mut records);
-        Ok::<_, PyErr>(NativeDirectorySnapshot::from_records(records, errors))
-    })?;
-    Py::new(py, snapshot)
-}
-
 /// Filesystem target classification only; archive analysis remains in discovery.
 #[pyfunction]
 pub(crate) fn classify_scan_targets(
@@ -1229,22 +1207,6 @@ pub(crate) fn classify_scan_targets(
         }
         (kinds, errors.into_messages())
     })
-}
-
-#[pyfunction]
-#[pyo3(signature = (root_path, max_depth, blacklist_rules, size_ranges, mtime_ranges, whitelist_rules))]
-pub(crate) fn scan_directory_snapshots(
-    py: Python<'_>,
-    root_path: &str,
-    max_depth: Option<usize>,
-    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
-    size_ranges: Vec<NumericRangeTuple>,
-    mtime_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
-) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-    let options =
-        DirectoryScanOptions::new(blacklist_rules, size_ranges, mtime_ranges, whitelist_rules)?;
-    scan_snapshots_with_options(py, root_path, max_depth, &options)
 }
 
 #[pyfunction]

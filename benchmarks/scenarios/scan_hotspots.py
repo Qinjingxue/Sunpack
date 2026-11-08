@@ -278,7 +278,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     import sunpack.pipeline.discovery.relations.scheduler as relations_scheduler
     import sunpack.pipeline.discovery.relations.internal.group_builder as group_builder
 
-    recorder.wrap(directory_scanner, "_NATIVE_SCAN_DIRECTORY_SNAPSHOT", "native.scan_directory_snapshot")
     recorder.wrap(directory_scanner.DirectoryScanner, "scan", "filesystem.DirectoryScanner.scan")
     recorder.wrap(directory_scanner.DirectoryScanner, "_scan_native", "filesystem.DirectoryScanner._scan_native")
     recorder.wrap(directory_scanner.DirectoryScanner, "_apply_ordered_filters", "filesystem.apply_ordered_filters")

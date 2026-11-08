@@ -248,7 +248,6 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
-    scheduler._active_states = {}
     scheduler._quiet_trackers = {}
     scheduler._quiet_policy = SimpleNamespace()
     scheduler.state = SimpleNamespace(
@@ -354,13 +353,14 @@ def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
     scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
-    scheduler._active_states = {}
     scheduler._quiet_trackers = {}
-    scheduler._inflight_requests = [SimpleNamespace(candidate=_candidate(source))]
+    with scheduler._lock:
+        scheduler._register_inflight_request_locked(SimpleNamespace(candidate=_candidate(source)))
     scheduler.state = state
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
     scheduler._wake_callback = None
 
+    source.unlink()
     scheduler.notify_path_departed(str(source))
 
     assert state.pending_work_for_path(str(source)) is not None
@@ -378,7 +378,6 @@ def test_departed_unowned_path_is_still_forgotten(tmp_path):
     scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
-    scheduler._active_states = {}
     scheduler._quiet_trackers = {}
     scheduler._inflight_requests = []
     scheduler.state = state
@@ -436,7 +435,6 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
-    scheduler._active_states = {}
     scheduler._quiet_trackers = {}
     scheduler._quiet_policy = SimpleNamespace()
 
@@ -479,7 +477,6 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
         scheduler_module._candidate_for_event_path = monkeypatch_target
 
     assert scheduler._pending == {}
-    assert scheduler._active_states == {}
 
 
 def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):

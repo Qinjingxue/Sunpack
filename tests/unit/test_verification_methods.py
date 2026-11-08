@@ -13,6 +13,7 @@ from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
 from tests.helpers.worker_events import worker_result, worker_trace_item
+from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest
 
 
@@ -255,7 +256,7 @@ def test_output_presence_uses_worker_manifest_progress_as_completeness(tmp_path)
     partial.write_bytes(b"12345")
     manifest = build_extraction_progress_manifest(
         archive=str(archive),
-        out_dir=str(out_dir),
+        output_inventory=collect_output_inventory(str(out_dir)),
         diagnostics={
             "result": worker_result(
                 status="failed",

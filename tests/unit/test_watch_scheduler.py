@@ -671,7 +671,6 @@ def _indexed_scheduler_for_test():
     watcher._claims_by_owner = {}
     watcher._inflight_requests = []
     watcher._inflight_path_counts = {}
-    watcher._active_states = {}
     watcher._active_epoch = 0
     watcher._ready_heap = []
     watcher._closed = False
@@ -713,9 +712,8 @@ def test_source_claim_index_retires_all_path_spellings_without_pending_scan():
     unrelated = os.path.abspath("unrelated.disguised")
     for spelling in (*aliases, unrelated):
         candidate = WatchCandidate(spelling, 10, 1.0, "file", 1)
-        watcher._store_pending_locked(spelling, candidate)
-        watcher._store_pending_locked(spelling, candidate)  # Metadata replacement.
-        watcher._active_states[spelling] = scheduler_module._ActiveCandidateState(0, 0)
+        state = watcher._add_pending_locked(candidate, last_event_at=0, quiet_seconds=0)
+        state.candidate = WatchCandidate(spelling, 10, 2.0, "file", 2)
     watcher._pending = _NoScanDict(watcher._pending)
 
     watcher._claim_pipeline_sources("owner", (path, path.upper()))
@@ -723,10 +721,10 @@ def test_source_claim_index_retires_all_path_spellings_without_pending_scan():
     assert len(watcher._pending) == 1
     assert watcher._pending.get(unrelated) is not None
     assert watcher._pending_by_key == {scheduler_module.path_key(unrelated): {unrelated}}
-    assert all(spelling not in watcher._active_states for spelling in aliases)
+    assert all(spelling not in watcher._pending for spelling in aliases)
     watcher._remove_pending_locked(unrelated)
     assert watcher._pending_by_key == {}
-    assert watcher._remove_pending_locked(unrelated) is None
+    watcher._remove_pending_locked(unrelated)
 
 
 def test_source_claim_transfer_releases_only_current_owner_without_claim_scan():
@@ -764,7 +762,9 @@ def test_source_indexes_release_buckets_and_peak_tables_after_each_batch():
         paths = [os.path.abspath(f"batch-{batch}-source-{index}.disguised") for index in range(512)]
         with watcher._lock:
             for path in paths:
-                watcher._store_pending_locked(path, WatchCandidate(path, 10, 1.0, "file", 1))
+                watcher._add_pending_locked(
+                    WatchCandidate(path, 10, 1.0, "file", 1), last_event_at=0, quiet_seconds=0,
+                )
         pending_refs = [weakref.ref(bucket) for bucket in watcher._pending_by_key.values()]
         owners = [f"batch-{batch}-owner-{index}" for index in range(0, len(paths), 4)]
         for offset, owner in zip(range(0, len(paths), 4), owners):
@@ -873,7 +873,9 @@ def test_retire_claimed_paths_preserves_pending_alias_without_pending_scan():
     watcher = _claim_scheduler_for_test()
     first, second = (os.path.abspath(name) for name in ("source.001", "source.002"))
     candidate = WatchCandidate(first, 10, 1.0, "file", 1)
-    watcher._store_pending_locked(first.upper(), candidate)
+    watcher._add_pending_locked(
+        WatchCandidate(first.upper(), 10, 1.0, "file", 1), last_event_at=0, quiet_seconds=0,
+    )
     watcher._pending = _NoScanDict(watcher._pending)
     completed, cleared, matched = [], [], []
     watcher.state = SimpleNamespace(
@@ -894,18 +896,16 @@ def test_watch_ready_index_lazily_discards_stale_generations_without_mapping_sca
     watcher = _indexed_scheduler_for_test()
     path = os.path.abspath("stale-generation.zip")
     candidate = WatchCandidate(path, 10, 1.0, "file", 1)
-    state = scheduler_module._ActiveCandidateState(
+    state = watcher._add_pending_locked(
+        candidate,
         last_event_at=100.0,
         quiet_seconds=5.0,
     )
-    watcher._store_pending_locked(path, candidate)
-    watcher._active_states[path] = state
     with watcher._lock:
         watcher._schedule_active_locked(path, state)
         state.last_event_at = 110.0
         state.generation += 1
         watcher._schedule_active_locked(path, state)
-    watcher._active_states = _NoItemsDict(watcher._active_states)
     watcher._pending = _NoItemsDict(watcher._pending)
     monkeypatch.setattr(scheduler_module.time, "time", lambda: 100.0)
     monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 100.0)
@@ -922,15 +922,13 @@ def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
     path = os.path.abspath("ready.zip")
     candidate = WatchCandidate(path, 10, 1.0, "file", 1)
     with watcher._lock:
-        state = watcher._new_active_state_locked(
+        state = watcher._add_pending_locked(
+            candidate,
             last_event_at=100.0,
             quiet_seconds=1.0,
         )
-        watcher._store_pending_locked(path, candidate)
-        watcher._active_states[path] = state
         watcher._schedule_active_locked(path, state)
     watcher._pending = _NoItemsDict(watcher._pending)
-    watcher._active_states = _NoItemsDict(watcher._active_states)
     watcher._claim_gate = threading.RLock()
     watcher._active_claims = {}
     watcher.state = SimpleNamespace(
@@ -952,7 +950,6 @@ def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
     assert watcher._pop_ready(101.0) == [candidate]
     assert watcher._pending == {}
     assert watcher._pending_by_key == {}
-    assert watcher._active_states == {}
 
 
 def test_watch_ready_index_compacts_event_bursts_without_losing_live_candidates(monkeypatch):
@@ -964,17 +961,18 @@ def test_watch_ready_index_compacts_event_bursts_without_losing_live_candidates(
     candidates = {path: WatchCandidate(path, 10, 1.0, "file", 1) for path in paths}
     with watcher._lock:
         for index, path in enumerate(paths):
-            state = watcher._new_active_state_locked(last_event_at=100.0 + index, quiet_seconds=5.0)
-            watcher._store_pending_locked(path, candidates[path])
-            watcher._active_states[path] = state
+            state = watcher._add_pending_locked(
+                candidates[path], last_event_at=100.0 + index, quiet_seconds=5.0,
+            )
             watcher._schedule_active_locked(path, state)
-        recreated = watcher._new_active_state_locked(last_event_at=500.0, quiet_seconds=5.0)
-        watcher._active_states[paths[2]] = recreated
+        watcher._remove_pending_locked(paths[2])
+        recreated = watcher._add_pending_locked(
+            candidates[paths[2]], last_event_at=500.0, quiet_seconds=5.0,
+        )
         watcher._schedule_active_locked(paths[2], recreated)
         watcher._inflight_path_counts[scheduler_module.absolute_path_key(paths[3])] = 1
-        watcher._active_states = _NoItemsDict(watcher._active_states)
         watcher._pending = _NoItemsDict(watcher._pending)
-        busy = watcher._active_states[paths[1]]
+        busy = watcher._pending[paths[1]]
         for index in range(512):
             busy.last_event_at = 200.0 + index
             busy.generation += 1
@@ -983,9 +981,9 @@ def test_watch_ready_index_compacts_event_bursts_without_losing_live_candidates(
         assert len(watcher._ready_heap) <= 64
         retired = [os.path.abspath(f"claimed-{index}.002") for index in range(256)]
         for path in retired:
-            watcher._store_pending_locked(path, WatchCandidate(path, 10, 1.0, "file", 1))
-            state = watcher._new_active_state_locked(last_event_at=800.0, quiet_seconds=5.0)
-            watcher._active_states[path] = state
+            state = watcher._add_pending_locked(
+                WatchCandidate(path, 10, 1.0, "file", 1), last_event_at=800.0, quiet_seconds=5.0,
+            )
             watcher._schedule_active_locked(path, state)
 
     watcher._claim_pipeline_sources("claimed", retired)
@@ -1070,21 +1068,19 @@ def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(mo
     candidate = WatchCandidate(path, 10, 1.0, "file", 1)
 
     with watcher._lock:
-        first_state = watcher._new_active_state_locked(
+        first_state = watcher._add_pending_locked(
+            candidate,
             last_event_at=100.0,
             quiet_seconds=1.0,
         )
-        watcher._store_pending_locked(path, candidate)
-        watcher._active_states[path] = first_state
         watcher._schedule_active_locked(path, first_state)
         watcher._remove_pending_locked(path)
 
-        second_state = watcher._new_active_state_locked(
+        second_state = watcher._add_pending_locked(
+            candidate,
             last_event_at=100.0,
             quiet_seconds=5.0,
         )
-        watcher._store_pending_locked(path, candidate)
-        watcher._active_states[path] = second_state
         watcher._schedule_active_locked(path, second_state)
 
     watcher._drop_active(path, first_state.epoch, first_state.generation)
@@ -1106,11 +1102,8 @@ def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(m
     second_path = os.path.abspath("second.zip")
     first = WatchCandidate(first_path, 10, 1.0, "first", 1)
     second = WatchCandidate(second_path, 10, 1.0, "second", 1)
-    first_state = scheduler_module._ActiveCandidateState(100.0, 1.0)
-    second_state = scheduler_module._ActiveCandidateState(100.0, 2.0)
-    watcher._store_pending_locked(first_path, first)
-    watcher._store_pending_locked(second_path, second)
-    watcher._active_states.update({first_path: first_state, second_path: second_state})
+    first_state = watcher._add_pending_locked(first, last_event_at=100.0, quiet_seconds=1.0)
+    second_state = watcher._add_pending_locked(second, last_event_at=100.0, quiet_seconds=2.0)
     request = SimpleNamespace(candidate=first)
 
     with watcher._lock:
@@ -1141,7 +1134,7 @@ class WatchState:
 
     @staticmethod
     def assert_quiet_seconds(watcher, path: Path | str, *, minimum: float, maximum: float | None = None):
-        quiet_seconds = watcher._active_states[str(path)].quiet_seconds
+        quiet_seconds = watcher._pending[str(path)].quiet_seconds
         assert quiet_seconds >= minimum
         if maximum is not None:
             assert quiet_seconds <= maximum
@@ -1758,7 +1751,7 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
         stream.write(b"changed")
     clock.advance(1.0)
     watcher.enqueue(str(archive), event_type="modified")
-    clock.advance(watcher._active_states[str(archive)].quiet_seconds + 0.01)
+    clock.advance(watcher._pending[str(archive)].quiet_seconds + 0.01)
     final = _await(watcher.run_once())
 
     assert final.succeeded == 1
@@ -2027,7 +2020,7 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
     assert watcher.pending_count == 1
     assert _observation_version(watcher._catalog.observation(str(archive))) == _observation_version(content)
     engine.handles[0].complete_no_tasks()
-    clock.advance(watcher._active_states[str(archive)].quiet_seconds + 0.01)
+    clock.advance(watcher._pending[str(archive)].quiet_seconds + 0.01)
     assert _await(watcher.run_once()).processed == 1
     assert len(engine.handles) == 2
     engine.handles[1].complete_no_tasks()
@@ -2230,7 +2223,7 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
 
     assert logs.count("candidate_active") == 1
     assert watcher.pending_count == 1
-    assert watcher._active_states[str(archive)].generation == 1
+    assert watcher._pending[str(archive)].generation == 1
     assert _await(watcher.run_once()).processed == 1
 
 
@@ -2366,8 +2359,8 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
         wake_callback=lambda: wakeups.append("wake"),
     )
     watcher.enqueue(str(archive), event_type="created")
-    baseline = watcher._pending[str(archive)]
-    state = watcher._active_states[str(archive)]
+    baseline = watcher._pending[str(archive)].candidate
+    state = watcher._pending[str(archive)]
     tracker = watcher._quiet_trackers[str(archive)]
     generation = state.generation
     last_event_at = state.last_event_at
@@ -2395,7 +2388,7 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
 
     watcher.enqueue(str(archive), event_type="modified")
 
-    assert watcher._pending[str(archive)] == metadata
+    assert watcher._pending[str(archive)].candidate == metadata
     assert _observation_version(watcher._catalog.observation(str(archive))) == _observation_version(metadata)
     assert state.generation == generation
     assert state.last_event_at == last_event_at
@@ -2426,7 +2419,7 @@ def test_pending_close_wakes_admission_without_forgetting_cadence_or_trusting_re
     watcher = _watcher(tmp_path, wake_callback=lambda: wakeups.append(now[0]))
     try:
         watcher.enqueue(str(archive), event_type="created")
-        candidate = watcher._pending[str(archive)]
+        candidate = watcher._pending[str(archive)].candidate
         for _ in range(3):
             now[0] += 1.0
             candidate = replace(candidate, size=candidate.size + 1, mtime=candidate.mtime + 1,
@@ -2434,7 +2427,7 @@ def test_pending_close_wakes_admission_without_forgetting_cadence_or_trusting_re
                                 change_reasons_without_close=2, change_reasons_known=True)
             monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", lambda *_a, **_kw: candidate)
             watcher.enqueue(str(archive), event_type="modified")
-        state = watcher._active_states[str(archive)]
+        state = watcher._pending[str(archive)]
         tracker = watcher._quiet_trackers[str(archive)]
         learned = tracker.quiet_seconds
         assert learned > 0.1
@@ -3063,7 +3056,7 @@ def test_password_retry_relearns_quiet_when_failed_archive_changed(tmp_path, mon
     assert retried.processed == 0
     assert watcher.pending_count == 1
     # A real content observation supersedes the restored scalar immediately.
-    assert 0.01 < watcher._active_states[str(archive_path)].quiet_seconds < 0.02
+    assert 0.01 < watcher._pending[str(archive_path)].quiet_seconds < 0.02
     wall_clock.advance(0.02)
     assert _await(watcher.run_once()).failed == 1
 
@@ -3559,8 +3552,8 @@ def test_claim_during_probe_replays_new_generation_without_blocking_publication(
         from dataclasses import replace
 
         # Exercise the native probe for an already delayed pending candidate.
-        watcher._active_states[str(source)].quiet_seconds = 3600.0
-        previous = watcher._pending[str(source)]
+        watcher._pending[str(source)].quiet_seconds = 3600.0
+        previous = watcher._pending[str(source)].candidate
         closed = replace(previous, change_usn=previous.change_usn + 1,
                          change_reasons=0x80000000, change_reasons_known=True)
         candidate_for_path = scheduler_module._candidate_for_event_path
@@ -3611,7 +3604,7 @@ def test_claim_during_probe_replays_new_generation_without_blocking_publication(
             result = probe.result(timeout=10)
             if stage == "attempt":
                 assert result == []
-        assert watcher._pending[str(source)].size == len(b"new generation")
+        assert watcher._pending[str(source)].candidate.size == len(b"new generation")
         assert watcher.state.pending_work_for_path(str(source)).size == len(b"new generation")
         assert not watcher._source_probes
         assert [item.size for item in watcher._pop_ready(time.monotonic() + 200)] == [len(b"new generation")]
@@ -3783,7 +3776,7 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
     os.utime(archive_path, (original_mtime, original_mtime))
     events.emit(archive_path, event_type="modified")
 
-    quiet_seconds = watcher._active_states[str(archive_path)].quiet_seconds
+    quiet_seconds = watcher._pending[str(archive_path)].quiet_seconds
     assert quiet_seconds == 0.0  # one ambiguous gap does not establish a cadence
     events.run_after(0.0, processed=1)
 
@@ -3828,7 +3821,7 @@ def test_watch_scheduler_new_candidate_is_immediately_ready(tmp_path, monkeypatc
     events = WatchEvents(watcher, clock)
     events.emit(archive_path)
 
-    assert watcher._active_states[str(archive_path)].quiet_seconds == 0.0
+    assert watcher._pending[str(archive_path)].quiet_seconds == 0.0
     events.run_after(0.0, processed=1)
 
 
@@ -3856,7 +3849,7 @@ def test_watch_scheduler_preserves_phase_evidence_across_retirement_and_resets_f
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
 
-    assert watcher._active_states[str(archive_path)].quiet_seconds == 0.0
+    assert watcher._pending[str(archive_path)].quiet_seconds == 0.0
     events.run_after(0.0, processed=1)
     assert watcher._catalog.observation(str(archive_path)).pending_interval_seconds == pytest.approx(20.0)
 
@@ -3864,7 +3857,7 @@ def test_watch_scheduler_preserves_phase_evidence_across_retirement_and_resets_f
     archive_path.write_bytes(b"third--")
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
-    learned_quiet = watcher._active_states[str(archive_path)].quiet_seconds
+    learned_quiet = watcher._pending[str(archive_path)].quiet_seconds
     assert learned_quiet > 0.0
     assert watcher._quiet_trackers[str(archive_path)].cadence_seconds == pytest.approx(20.0)
     events.run_after(learned_quiet * 0.9, processed=0)
@@ -3874,14 +3867,14 @@ def test_watch_scheduler_preserves_phase_evidence_across_retirement_and_resets_f
     archive_path.write_bytes(b"fourth--")
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
-    assert watcher._active_states[str(archive_path)].quiet_seconds == pytest.approx(learned_quiet)
+    assert watcher._pending[str(archive_path)].quiet_seconds == pytest.approx(learned_quiet)
     events.run_after(learned_quiet + 0.01, processed=1)
 
     replacement = tmp_path / "replacement"
     replacement.write_bytes(b"replaced")
     os.replace(replacement, archive_path)
     events.emit(archive_path, event_type="modified")
-    assert watcher._active_states[str(archive_path)].quiet_seconds == 0.0
+    assert watcher._pending[str(archive_path)].quiet_seconds == 0.0
     events.run_after(0.0, processed=1)
 
 
@@ -3917,7 +3910,7 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
     archive_path.write_bytes(b"B" * (256 * 1024))
     os.utime(archive_path, (original_mtime, original_mtime))
     events.emit(archive_path, event_type="modified")
-    events.run_after(watcher._active_states[str(archive_path)].quiet_seconds + 0.01, processed=1)
+    events.run_after(watcher._pending[str(archive_path)].quiet_seconds + 0.01, processed=1)
     assert len(attempts) == 2
 
 

@@ -26,7 +26,20 @@ class StdioHistory:
     def append(self, text: str) -> None:
         if not text:
             return
+        if self._tail and not self._tail[-1].endswith("\n"):
+            partial = self._tail.pop()
+            self._chars -= len(partial)
+            text = partial + text
         text = text[-_STDIO_TAIL_CHARS:]
+        lines = text.rsplit("\n", _STDIO_TAIL_LINES + 1)
+        if len(lines) > _STDIO_TAIL_LINES + 1:
+            del lines[0]
+        for line in lines[:-1]:
+            self._append_line(line + "\n")
+        if lines[-1]:
+            self._append_line(lines[-1])
+
+    def _append_line(self, text: str) -> None:
         self._tail.append(text)
         self._chars += len(text)
         while self._chars > _STDIO_TAIL_CHARS or len(self._tail) > _STDIO_TAIL_LINES:

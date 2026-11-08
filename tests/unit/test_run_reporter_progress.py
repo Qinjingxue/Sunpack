@@ -67,7 +67,6 @@ def test_reporter_keeps_display_and_lineage_without_retaining_finished_inputs(tm
                 assert row["lineage"] == ("outer.zip",)
         reporter.task_finished(task, _outcome(root / ("outer" if depth == 1 else "inner")), depth)
         assert not reporter._task_rows
-        assert not reporter._last_streamed_progress
         assert not reporter._panel_row_index
         del task, snapshot
         gc.collect()

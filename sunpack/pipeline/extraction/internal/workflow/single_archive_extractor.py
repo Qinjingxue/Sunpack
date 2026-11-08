@@ -15,7 +15,7 @@ from sunpack.pipeline.extraction.internal.workflow.errors import classify_extrac
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import compact_success_worker_diagnostics, worker_result_payload
-from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, has_recoverable_partial_outputs
+from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, recoverable_partial_inventory
 from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.passwords.resolver import archive_structure_requires_password, archive_structure_password_state
@@ -281,7 +281,8 @@ class SingleArchiveExtractor:
                 with _phase(phase_timer, f"{phase_prefix}_output_stats_success"):
                     worker_result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
                     output_inventory = collect_output_inventory(out_dir, worker_result)
-                    compact_success_worker_diagnostics(diagnostics)
+                    if output_inventory.worker_inventory_complete:
+                        compact_success_worker_diagnostics(diagnostics)
                     output_stats = {
                         "file_count": output_inventory.stats.file_count,
                         "total_bytes": output_inventory.stats.total_size,
@@ -293,9 +294,8 @@ class SingleArchiveExtractor:
                     with _phase(phase_timer, f"{phase_prefix}_build_success_manifest"):
                         manifest_payload = build_extraction_progress_manifest(
                             archive=archive,
-                            out_dir=out_dir,
+                            output_inventory=output_inventory,
                             diagnostics=diagnostics,
-                            round_index=1,
                         )
                 return ExtractionResult(
                     success=True,
@@ -345,19 +345,16 @@ class SingleArchiveExtractor:
                     if failure.kind == FailureKind.PASSWORD_INCONCLUSIVE
                     else 0
                 )
-        with _phase(phase_timer, f"{phase_prefix}_recoverable_partial_check"):
-            recoverable_partial = (
-                failure.kind != FailureKind.PASSWORD_INCONCLUSIVE
-                and self.best_effort
-                and has_recoverable_partial_outputs(diagnostics, out_dir)
-            )
-        if recoverable_partial:
+        output_inventory = None
+        if self.best_effort and failure.kind != FailureKind.PASSWORD_INCONCLUSIVE:
+            with _phase(phase_timer, f"{phase_prefix}_recoverable_partial_check"):
+                output_inventory = recoverable_partial_inventory(diagnostics, out_dir)
+        if output_inventory is not None:
             with _phase(phase_timer, f"{phase_prefix}_build_partial_manifest"):
                 manifest_payload = build_extraction_progress_manifest(
                     archive=archive,
-                    out_dir=out_dir,
+                    output_inventory=output_inventory,
                     diagnostics=diagnostics,
-                    round_index=1,
                 )
             diagnostics["partial_outputs"] = True
             return self._failed(
@@ -369,6 +366,7 @@ class SingleArchiveExtractor:
                 diagnostics=diagnostics,
                 partial_outputs=True,
                 progress_manifest_payload=manifest_payload,
+                output_inventory=output_inventory,
             )
         self._cleanup_output(out_dir, OutputCleanupEvent.UNRECOVERABLE_FAILURE)
         return self._failed(
@@ -442,6 +440,7 @@ class SingleArchiveExtractor:
         diagnostics: dict | None = None,
         partial_outputs: bool = False,
         progress_manifest_payload: Any = None,
+        output_inventory: OutputInventory | None = None,
     ) -> ExtractionResult:
         diagnostic_payload = dict(diagnostics or {})
         if failure is not None:
@@ -458,6 +457,7 @@ class SingleArchiveExtractor:
             diagnostics=diagnostic_payload,
             partial_outputs=partial_outputs,
             progress_manifest_payload=progress_manifest_payload,
+            output_inventory=output_inventory,
         )
 
     def _localized_failure(self, failure: FailureInfo) -> str:
