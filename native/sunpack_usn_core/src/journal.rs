@@ -22,7 +22,8 @@ const USN_REASON_CLOSE: u32 = 0x8000_0000;
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 
 pub struct DirectoryChangesPage {
-    pub changes: Vec<(u32, String)>,
+    pub changes: BTreeSet<(u32, String)>,
+    pub payload_bytes: usize,
     pub next_usn: i64,
     pub journal_id: u64,
 }
@@ -265,7 +266,7 @@ fn query_journal(volume: HANDLE) -> io::Result<(u64, i64)> {
     query_journal_bounds(volume).map(|(journal, _, next)| (journal, next))
 }
 fn query_journal_bounds(volume: HANDLE) -> io::Result<(u64, i64, i64)> {
-    let mut output = vec![0u8; 80];
+    let mut output = [0u8; 80];
     let bytes_returned =
         device_io_control(volume, FSCTL_QUERY_USN_JOURNAL, null(), 0, &mut output)?;
     if bytes_returned < 32 {
@@ -378,11 +379,8 @@ fn scan_directories_page(
                 &mut changes,
                 &mut name_units,
             )?;
-            let added: usize = changes
-                .iter()
-                .filter(|change| !changed.contains(*change))
-                .map(|change| 8 + change.1.len())
-                .sum();
+            changes.retain(|change| !changed.contains(change));
+            let added: usize = changes.iter().map(|change| 8 + change.1.len()).sum();
             if added > MAX_DIRECTORY_RESPONSE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -401,7 +399,8 @@ fn scan_directories_page(
                     ));
                 }
                 return Ok(DirectoryChangesPage {
-                    changes: changed.into_iter().collect(),
+                    changes: changed,
+                    payload_bytes,
                     next_usn,
                     journal_id,
                 });
@@ -417,7 +416,8 @@ fn scan_directories_page(
         cursor = returned_next;
     }
     Ok(DirectoryChangesPage {
-        changes: changed.into_iter().collect(),
+        changes: changed,
+        payload_bytes,
         next_usn: end_usn,
         journal_id,
     })
@@ -887,13 +887,14 @@ mod tests {
             .unwrap();
             assert_eq!(page.journal_id, 42);
             assert!(page.next_usn > cursor && page.next_usn <= end_usn);
-            assert!(
+            assert_eq!(
                 page.changes
                     .iter()
                     .map(|(_, name)| 8 + name.len())
-                    .sum::<usize>()
-                    <= MAX_DIRECTORY_RESPONSE_BYTES
+                    .sum::<usize>(),
+                page.payload_bytes,
             );
+            assert!(page.payload_bytes <= MAX_DIRECTORY_RESPONSE_BYTES);
             actual.extend(page.changes);
             cursor = page.next_usn;
             pages += 1;

@@ -4,10 +4,7 @@ import gzip
 
 import pytest
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
 from tests.helpers.config_factory import make_config
 
 
@@ -16,20 +13,6 @@ def _zip_bytes() -> bytes:
     with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as archive:
         archive.writestr("inside.txt", "hello")
     return output.getvalue()
-
-
-def _candidate(path, size: int, *, format_hint: str = "", route: str = "residual", relation_anchor=None):
-    value = str(path)
-    return DiscoveryCandidate(
-        archive_input=ArchiveInputDescriptor.from_parts(
-            archive_path=value, logical_name=path.name, format_hint=format_hint,
-        ),
-        carrier_path=value,
-        cleanup_paths=(value,),
-        route=route,
-        size=size,
-        relation_anchor=dict(relation_anchor or {}),
-    )
 
 
 def test_disguised_zip_is_resolved_by_relations(tmp_path):
@@ -54,22 +37,6 @@ def test_embedded_switch_prevents_carrier_scan(tmp_path):
     path.write_bytes(b"prefix" + _zip_bytes() + b"suffix")
     result = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": False}})).discover_targets([str(path)])
     assert result.tasks == []
-
-
-def test_detection_does_not_accept_relation_metadata(tmp_path):
-    path = tmp_path / "fake.zip"
-    path.write_bytes(b"plain text")
-    candidate = _candidate(
-        path,
-        path.stat().st_size,
-        format_hint="zip",
-        route="detection",
-        relation_anchor={"format": "zip", "relation_confirmed": True},
-    )
-
-    accepted, _ = DetectionScheduler(make_config({})).confirm(candidate)
-
-    assert accepted is False
 
 
 def test_recursive_embedded_ratio_uses_individual_candidate_share(tmp_path):

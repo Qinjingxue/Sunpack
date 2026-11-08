@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
-    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES,
-    MAX_DIRECTORY_RESPONSE_BYTES, REQUEST_BYTES, RESPONSE_BYTES,
+    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, REQUEST_BYTES,
+    RESPONSE_BYTES,
 };
 use sunpack_usn_core::{JournalReader, PIPE_NAME, SERVICE_NAME};
 use windows_service::{
@@ -450,23 +450,23 @@ fn handle_request(
                         request.current_usn,
                     )
                 })
-                .and_then(|page| {
-                    for (index, name) in &page.changes {
+                .map(|page| {
+                    let count = page.changes.len() as u32;
+                    payload = Vec::with_capacity(page.payload_bytes);
+                    for (index, name) in page.changes {
                         payload.extend_from_slice(&index.to_le_bytes());
                         payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                         payload.extend_from_slice(name.as_bytes());
                     }
-                    if payload.len() > MAX_DIRECTORY_RESPONSE_BYTES {
-                        return Err(io::Error::other("USN recovery exceeded payload budget"));
-                    }
-                    Ok((
+                    debug_assert_eq!(payload.len(), page.payload_bytes);
+                    (
                         page.journal_id,
                         page.next_usn,
                         sunpack_usn_core::ChangeReasons {
                             all: payload.len() as u32,
-                            without_close: page.changes.len() as u32,
+                            without_close: count,
                         },
-                    ))
+                    )
                 })
         }
     };
@@ -478,7 +478,6 @@ fn handle_request(
             response.reasons_without_close = reasons.without_close;
         }
         Err(error) => {
-            payload.clear();
             response.win32_error = error.raw_os_error().unwrap_or(0) as u32;
             response.status =
                 if matches!(error.raw_os_error(), Some(1178) | Some(1179) | Some(1181)) {
@@ -487,10 +486,7 @@ fn handle_request(
                     Status::InvalidRequest
                 } else if error.kind() == io::ErrorKind::NotFound {
                     Status::NotFound
-                } else if error.to_string().contains("scan budget")
-                    || error.to_string().contains("payload budget")
-                    || error.to_string().contains("fallback scan")
-                {
+                } else if error.to_string().contains("fallback scan") {
                     Status::ScanLimit
                 } else if error.raw_os_error().is_some() {
                     Status::JournalUnavailable

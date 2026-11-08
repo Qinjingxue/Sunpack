@@ -285,7 +285,7 @@ fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<Option<&'static str>>
             )?;
         }
         let offset = (cursor - window_start) as usize;
-        let Some(record) = super::parse_central_directory_record(&window, offset, window.len())
+        let Some(record) = super::parse_central_directory_record(&window[offset..])
         else {
             return Ok(None);
         };

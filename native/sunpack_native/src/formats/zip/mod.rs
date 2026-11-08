@@ -5,11 +5,9 @@ pub(crate) mod zip64;
 pub(crate) use filename_encoding::analyze_zip_filename_encoding;
 
 include!("constants.rs");
-include!("directory/mod.rs");
 include!("directory/parse.rs");
 include!("directory/local.rs");
 include!("directory/eocd.rs");
-include!("directory/inspect.rs");
 
 /// APPNOTE 4.3.13 permits one digital signature after the directory entries.
 /// All directory consumers share this boundary check, including carrier scans.

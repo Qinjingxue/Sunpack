@@ -17,7 +17,7 @@ class RarFastVerifier:
         part_paths: list[str] | None = None,
         archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
-        normalized_passwords = list(passwords or [""])
+        normalized_passwords = passwords or [""]
         prepared = prepare_password_input(archive_path, part_paths=part_paths, archive_input=archive_input)
         if prepared.volumes is not None and prepared.volume_style in {
             "rar_part",

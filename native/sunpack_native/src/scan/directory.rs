@@ -665,35 +665,6 @@ impl NativeDirectorySnapshot {
         directories
     }
 
-    fn file_columns_for_directories(
-        &self,
-        directories: Vec<String>,
-    ) -> (Vec<String>, Vec<Option<u64>>, Vec<Option<u64>>) {
-        let directories: HashSet<String> = directories
-            .into_iter()
-            .map(|directory| directory.to_ascii_lowercase())
-            .collect();
-        let mut paths = Vec::new();
-        let mut sizes = Vec::new();
-        let mut mtimes_ns = Vec::new();
-        for &row in self.rows.iter() {
-            if self.table.is_dirs[row] {
-                continue;
-            }
-            let parent = Path::new(&self.table.paths[row])
-                .parent()
-                .map(|value| value.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            if !directories.contains(&parent) {
-                continue;
-            }
-            paths.push(self.table.paths[row].clone());
-            sizes.push(self.table.sizes[row]);
-            mtimes_ns.push(self.table.mtimes_ns[row]);
-        }
-        (paths, sizes, mtimes_ns)
-    }
-
     fn relation_anchor_rows(
         &self,
         py: Python<'_>,

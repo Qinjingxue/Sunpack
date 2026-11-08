@@ -6,12 +6,11 @@ from threading import RLock
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
-from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
 from sunpack.core.passwords.verifier import (
-    PasswordVerifierRegistry,
+    PasswordVerifierChain,
     RarFastVerifier,
     SevenZipFastVerifier,
     ZipFastVerifier,
@@ -66,13 +65,13 @@ class RelationsPasswordProber:
         self.password_store = password_store
         self.password_callback = password_callback
         self.scheduler = PasswordScheduler(
-            PasswordVerifierRegistry(
+            PasswordVerifierChain(
                 # RAR first: this prober exists for header-encrypted RAR5
                 # files.  The ZIP bounded verifier returns a terminal
                 # "needs_volume_or_tail_damaged" verdict for renamed/non-ZIP
                 # inputs, which would otherwise shadow the RAR password check.
-                fast_verifiers=[RarFastVerifier(), ZipFastVerifier(), SevenZipFastVerifier()],
-            ).build(),
+                (RarFastVerifier(), ZipFastVerifier(), SevenZipFastVerifier()),
+            ),
             cache=_shared_attempt_cache(),
         )
 
@@ -92,8 +91,6 @@ class RelationsPasswordProber:
         # snapshot, including departures before the first native borrow.
         if not path or not stat.S_ISREG(os.stat(path).st_mode):
             return None
-        probe_parts = list(part_paths) if part_paths is not None else [path]
-        fingerprint = build_archive_fingerprint(path, probe_parts, archive_input)
         candidates = PasswordCandidatePipeline.from_password_store(
             self.password_store,
             scope_path=scope_path,
@@ -102,7 +99,6 @@ class RelationsPasswordProber:
             archive_path=path,
             part_paths=list(part_paths) if part_paths is not None else None,
             archive_input=archive_input,
-            fingerprint=fingerprint,
             candidates=candidates,
         ))
         if result.status == PasswordSearchStatus.FOUND and result.password:

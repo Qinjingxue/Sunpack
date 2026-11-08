@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <new>
@@ -193,11 +194,6 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
     input.open_mode = mode;
     input.format_hint = utf8_to_wide(descriptor.string_field("format_hint", ""));
 
-    const wire::ObjectView analysis = descriptor.object_field("analysis");
-    const wire::ObjectView execution_analysis = analysis.object_field("execution");
-    input.analyzed_missing_volume_evidence =
-        execution_analysis.string_field("missing_volume_evidence", "");
-
     const auto attempts = descriptor.object_field("volume_attempts");
     if (attempts.valid()) {
         auto& plan = input.volume_attempts;
@@ -258,7 +254,15 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
                 return source.path.empty() || (source.has_end && source.end < source.start);
             })) { input.validation_error = "invalid volume attempt sources"; return input; }
         plan.prepare();
+        // A composition plan supplies every range and canonical name used
+        // during execution. The descriptor's fixed composition is redundant.
+        return input;
     }
+
+    const wire::ObjectView analysis = descriptor.object_field("analysis");
+    const wire::ObjectView execution_analysis = analysis.object_field("execution");
+    input.analyzed_missing_volume_evidence =
+        execution_analysis.string_field("missing_volume_evidence", "");
 
     struct ParsedPart {
         int number;
@@ -836,11 +840,9 @@ int run_request(
     auto last_progress_emit = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     unsigned int coalesced_progress_events = 0;
     bool extract_started = false;
-    auto progress_mutex = std::make_shared<std::mutex>();
     auto *cpu_job_context = sunpack::sevenzip::current_native_cpu_job_context();
     const bool volume_trials = !request.archive_input.volume_attempts.layouts.empty();
-    auto progress = [job_id, last_progress_emit, coalesced_progress_events, extract_started, progress_mutex, cpu_job_context, volume_trials](const ExtractProgressEvent& event) mutable {
-            std::lock_guard<std::mutex> lock(*progress_mutex);
+    auto progress = [&job_id, last_progress_emit, coalesced_progress_events, extract_started, cpu_job_context, volume_trials](const ExtractProgressEvent& event) mutable {
             if (volume_trials && event.event == "item_failed") return;
             const auto now = std::chrono::steady_clock::now();
             if (!extract_started && event.completed_bytes > 0) {
@@ -910,12 +912,14 @@ int run_request(
             }
             cursor.started = true;
         }
-        volume_replay->volume_attempt_active = true;
     }
     const auto& archive_input = volume_trials ? selected_input : request.archive_input;
     auto extract_with_password = [&](const std::wstring& selected_password) {
+        // The callback is synchronous and its emit() serializes calls. Each
+        // password/composition keeps its own progress counters on this stack.
+        auto attempt_progress = progress;
         return extract_archive(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
-            format_hint, selected_password, output_dir, codepage, progress, dry_run,
+            format_hint, selected_password, output_dir, codepage, std::ref(attempt_progress), dry_run,
             archive_input.canonical_names, open_mode == "native_volumes", shared_writer, cancel_token);
     };
 
@@ -1282,20 +1286,14 @@ public:
         std::size_t worker_count,
         std::uint64_t memory_reserve_bytes
     )
-        : memory_(memory_reserve_bytes, {}, [this] { writer_registry_->reclaim_idle_memory(); }),
-          writer_meters_(std::make_shared<sunpack::sevenzip::WriterMeters>()),
-          // The sink is owned solely by the executor and the long-lived gates: AsyncFileWriter never holds or resets it.
-          space_change_sink_(
+        : writer_config_(sunpack::sevenzip::configured_async_writer_config()),
+          writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
+              nullptr,
+              writer_config_,
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
                   on_space_transition(transition);
-              }),
-          // One environment snapshot supplies the same IOCP configuration to
-          // each independent per-volume facility.
-          writer_config_(sunpack::sevenzip::configured_async_writer_config()),
-          writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
-              writer_meters_,
-              writer_config_,
-              space_change_sink_)),
+              })),
+          memory_(memory_reserve_bytes, {}, [this] { writer_registry_->reclaim_idle_memory(); }),
           worker_count_(worker_count),
           queue_capacity_(4096),
           cpu_budget_(
@@ -2005,12 +2003,10 @@ private:
 
     std::vector<std::thread> workers_;
     std::thread monitor_thread_;
-    // Declaration order is destruction order reversed: meters, sink and config outlive writer_registry_, and space_monitor_ holds writer_registry_ and is destroyed before it.
-    sunpack::sevenzip::NativeMemoryManager memory_;
-    sunpack::sevenzip::WriterMetersPtr writer_meters_;
-    sunpack::sevenzip::VolumeSpaceChangeSink space_change_sink_;
     sunpack::sevenzip::AsyncWriterConfig writer_config_;
     sunpack::sevenzip::VolumeWriterRegistryPtr writer_registry_;
+    // The memory manager can reclaim idle writer buffers from the registry.
+    sunpack::sevenzip::NativeMemoryManager memory_;
     std::unique_ptr<sunpack::sevenzip::VolumeSpaceMonitor> space_monitor_;
 
     // Scheduler hot state: foreground/background queues preserve the existing

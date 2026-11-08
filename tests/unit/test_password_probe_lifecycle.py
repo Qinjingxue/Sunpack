@@ -69,7 +69,7 @@ def test_password_probe_releases_only_its_own_borrows(tmp_path, monkeypatch, mod
     ranges = [{'path': path, 'start': 13} for path in physical] if mode == 'ranges' else None
     style = 'rar_part' if module is rar_fast else 'zip_spanned'
     volumes = [{'path': path, 'volume_number': i} for i, path in enumerate(physical, 1)] if mode == 'volumes' else None
-    prepared = PasswordProbeInput(None, physical[0], ranges=ranges, volumes=volumes,
+    prepared = PasswordProbeInput(ranges=ranges, volumes=volumes,
         volume_style=style if volumes else '', volume_aware=bool(volumes),
         session_paths=tuple(physical if mode != 'file' else physical[:1]))
     monkeypatch.setattr(module, 'prepare_password_input', lambda *a, **k: prepared)

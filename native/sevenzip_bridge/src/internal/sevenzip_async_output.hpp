@@ -141,16 +141,6 @@ namespace sunpack::sevenzip
             std::size_t peak_active_data_writes = 0;
         };
 
-        struct Metrics
-        {
-            std::uint64_t accepted_bytes = 0;
-            std::uint64_t written_bytes = 0;
-            std::uint64_t discarded_bytes = 0;
-            std::uint64_t pending_bytes = 0;
-            std::uint64_t completed_files = 0;
-            std::uint64_t completed_jobs = 0;
-        };
-
         WriterMeterSnapshot snapshot_global_meters() const noexcept
         {
             return snapshot_counters(meters_->counters);
@@ -853,19 +843,6 @@ namespace sunpack::sevenzip
         UInt64 accepted_bytes(const FileStatePtr &file) const noexcept
         {
             return file ? file->accepted_bytes.load(std::memory_order_relaxed) : 0;
-        }
-
-        Metrics snapshot_metrics() const noexcept
-        {
-            const auto meters = snapshot_counters(meters_->counters);
-            return Metrics{
-                meters.accepted_bytes,
-                meters.written_bytes,
-                meters.discarded_bytes,
-                meters.pending_bytes,
-                meters.completed_files,
-                meters.completed_jobs,
-            };
         }
 
         bool is_quiescent() const noexcept

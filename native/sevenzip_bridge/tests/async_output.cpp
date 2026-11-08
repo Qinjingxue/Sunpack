@@ -105,7 +105,7 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     }
 
     const auto snapshot = writer.snapshot_file(file);
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     const DWORD attributes = GetFileAttributesW((directory / L"parallel.bin").c_str());
     SetFileAttributesW((directory / L"parallel.bin").c_str(), FILE_ATTRIBUTE_NORMAL);
     if (snapshot.failed || !snapshot.closed || snapshot.accepted_bytes != expected.size() ||
@@ -242,7 +242,7 @@ bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
         return false;
     }
     const auto snapshot = writer.snapshot_file(file);
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     // A permanently failed buffer is accounted as discarded, not left as a
     // permanent accepted/written gap.
     if (metrics.pending_bytes != 0 || metrics.discarded_bytes != 1 ||
@@ -287,7 +287,7 @@ bool cancelled_job_returns_pending_to_zero(const std::filesystem::path& director
     producer.join();
     if (!began) return false;
 
-    const auto mid = writer.snapshot_metrics();
+    const auto mid = writer.snapshot_global_meters();
     if (mid.accepted_bytes == 0 || mid.accepted_bytes > payload_size ||
         mid.accepted_bytes != mid.written_bytes + mid.discarded_bytes + mid.pending_bytes) {
         std::cerr << "cancelled mid accounting: accepted=" << mid.accepted_bytes
@@ -301,7 +301,7 @@ bool cancelled_job_returns_pending_to_zero(const std::filesystem::path& director
         return false;
     }
     const HRESULT result = writer.finish_job(job);
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     if (result == S_OK) {
         return false;
     }
@@ -336,7 +336,7 @@ bool successful_job_leaves_pending_at_zero(const std::filesystem::path& director
     if (writer.finish_job(job) != S_OK) {
         return false;
     }
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     if (metrics.pending_bytes != 0 || metrics.discarded_bytes != 0 ||
         metrics.written_bytes != payload_size ||
         metrics.accepted_bytes != metrics.written_bytes + metrics.discarded_bytes + metrics.pending_bytes) {
@@ -376,7 +376,7 @@ bool cleanup_survives_allocation_failure(const std::filesystem::path& directory)
     // files and preserve the sibling, even if no snapshot can be allocated.
     reject_cleanup_allocations = true;
     writer.cancel_job(first);
-    const auto cancelled = writer.snapshot_metrics();
+    const auto cancelled = writer.snapshot_global_meters();
     reject_cleanup_allocations = false;
     if (writer.finish_job(first) != E_ABORT || cancelled.pending_bytes != files.size() / 2) {
         std::cerr << "allocation failure left cancelled output staged\n";
@@ -388,7 +388,7 @@ bool cleanup_survives_allocation_failure(const std::filesystem::path& directory)
     reject_cleanup_allocations = true;
     writer.finish();
     reject_cleanup_allocations = false;
-    const auto finished = writer.snapshot_metrics();
+    const auto finished = writer.snapshot_global_meters();
     for (const auto& file : files) if (!writer.snapshot_file(file).closed) return false;
     const std::weak_ptr released = files.front();
     for (auto& file : files) file.reset();
@@ -781,6 +781,21 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         }
     }
     registry.shutdown();
+
+    // Zero idle timeout must reclaim the facility immediately even for
+    // persistent physical volumes. The history can still keep its state.
+    config.idle_timeout = std::chrono::milliseconds::zero();
+    VolumeWriterRegistry immediate(meters, config);
+    {
+        auto lease = immediate.acquire("volume-immediate");
+        persistent_writer = lease.writer_pointer();
+    }
+    if (!immediate.next_reap_deadline() ||
+        immediate.reap_idle() != std::vector<std::string>{"volume-immediate"} ||
+        immediate.volume_count() != 1 || !persistent_writer.expired()) {
+        std::cerr << "zero idle timeout retained a physical writer facility\n";
+        return false;
+    }
     return true;
 }
 

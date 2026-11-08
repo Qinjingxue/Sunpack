@@ -1,7 +1,7 @@
 import struct
 import zipfile
 
-from sunpack_native import AnalysisBinaryView, inspect_zip_directory_consistency, inspect_zip_structure_graph
+from sunpack_native import AnalysisBinaryView
 
 from sunpack.core.analysis import ArchiveAnalyzer
 
@@ -13,14 +13,12 @@ def _zip_path(tmp_path):
     return path
 
 
-def test_zip_capabilities_preserve_detection_and_graph_payloads(tmp_path):
+def test_zip_analysis_validates_local_and_central_directory_records(tmp_path):
     path = _zip_path(tmp_path)
 
     local = dict(AnalysisBinaryView(str(path)).probe_zip_local_header(0))
     report = ArchiveAnalyzer().analyze(str(path))
     eocd = next(item for item in report.evidences if item.format == "zip").details
-    consistency = dict(inspect_zip_directory_consistency(str(path), 128))
-    graph = dict(inspect_zip_structure_graph(str(path), 128))
 
     assert local["plausible"] is True
     assert local["compression_method"] == 8
@@ -29,9 +27,6 @@ def test_zip_capabilities_preserve_detection_and_graph_payloads(tmp_path):
     assert eocd["local_header_links_ok"] is True
     assert eocd["boundary_confidence"] == "high"
     assert report.best_selected.format == "zip"
-    assert consistency["error"] == ""
-    assert consistency["cd_parseable"] is True
-    assert {"nodes", "edges", "violations", "relation_violations", "explanations", "summary"} <= graph.keys()
 
 
 def test_zip_local_header_uses_supported_method_table(tmp_path):
@@ -88,7 +83,3 @@ def test_large_directory_analysis_does_not_retain_the_walk_in_shared_cache(tmp_p
     assert all(result["plausible"] for result in results)
     assert all(result["central_directory_entries_checked"] == 12000 for result in results)
     assert retained_bytes() - before < len(body)
-    # Diagnostic presentation limits do not truncate the full directory count.
-    details = inspect_zip_directory_consistency(str(paths[0]), 3)
-    assert details["cd_entries_parseable"] == 12000
-    assert details["cd_entries_checked"] == 3

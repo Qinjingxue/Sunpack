@@ -86,13 +86,13 @@ def test_password_key_tracks_missing_volume_arrival_and_generation(tmp_path):
     archive = tmp_path / "disguised.001"
     part = tmp_path / "disguised.002"
     archive.write_bytes(b"first")
-    before = build_archive_fingerprint(str(archive), [str(part)]).key
-    assert before == build_archive_fingerprint(str(archive), [str(part)]).key
+    before = build_archive_fingerprint(str(archive), [str(part)])
+    assert before == build_archive_fingerprint(str(archive), [str(part)])
     part.write_bytes(b"second")
-    arrived = build_archive_fingerprint(str(archive), [str(part)]).key
+    arrived = build_archive_fingerprint(str(archive), [str(part)])
     assert arrived != before
     part.write_bytes(b"replacement volume")
-    assert build_archive_fingerprint(str(archive), [str(part)]).key != arrived
+    assert build_archive_fingerprint(str(archive), [str(part)]) != arrived
 
 
 def test_password_key_separates_top_level_ranges_and_concat_order(tmp_path):
@@ -100,7 +100,7 @@ def test_password_key_separates_top_level_ranges_and_concat_order(tmp_path):
     archive.write_bytes(b"carrier")
 
     def key(descriptor):
-        return build_archive_fingerprint(str(archive), archive_input=descriptor).key
+        return build_archive_fingerprint(str(archive), archive_input=descriptor)
 
     assert key({"open_mode": "file_range", "parts": [{"path": str(archive), "start": 0, "end": 3}]}) != key(
         {"open_mode": "file_range", "parts": [{"path": str(archive), "start": 3, "end": 6}]})

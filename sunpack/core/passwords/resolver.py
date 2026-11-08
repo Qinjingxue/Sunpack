@@ -114,7 +114,7 @@ class PasswordResolver:
                 return self._confirmation_resolution(
                     archive_key,
                     "",
-                    fingerprint.key,
+                    fingerprint,
                     candidate_passwords=("",),
                     candidate_evidence="empty_password_direct",
                 )
@@ -143,7 +143,7 @@ class PasswordResolver:
             return self._confirmation_resolution(
                 archive_key,
                 candidate_passwords[0],
-                fingerprint.key,
+                fingerprint,
                 encrypted=True if password_state == "required" else None,
                 candidate_evidence=search.extraction_candidate_evidence,
                 candidate_passwords=candidate_passwords,

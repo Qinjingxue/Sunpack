@@ -270,8 +270,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     import sunpack.pipeline.coordinator.discovery as discovery
     import sunpack.pipeline.coordinator.scan_session as scan_session
     import sunpack.pipeline.coordinator.target_scan as target_scan
-    import sunpack.pipeline.discovery.detection.confirmation as detection_confirmation
-    import sunpack.pipeline.discovery.detection.scheduler as detection_scheduler
     import sunpack.pipeline.discovery.embedded.discovery as embedded_discovery
     import sunpack.pipeline.coordinator.task_provider as task_provider
     import sunpack.pipeline.coordinator.task_scan as task_scan
@@ -291,8 +289,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
 
     recorder.wrap(target_scan, "build_candidates_for_targets", "coordinator.build_candidates")
     recorder.wrap(target_scan, "build_native_table_for_targets", "coordinator.build_native_table")
-    recorder.wrap(detection_scheduler.DetectionScheduler, "confirm", "detection.confirm_candidate")
-    recorder.wrap(detection_confirmation.FormatConfirmation, "confirm", "detection.confirm_stage")
     recorder.wrap(embedded_discovery.EmbeddedDiscovery, "discover_many_native", "embedded.discover")
     recorder.wrap(discovery.ArchiveDiscoveryPipeline, "discover_native", "discovery.compose_native")
 

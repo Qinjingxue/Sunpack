@@ -14,11 +14,6 @@ class ConfigField:
     normalize: Normalizer
     owner: str
 
-    @property
-    def dotted_path(self) -> str:
-        return ".".join(self.path)
-
-
 CONFIG_FIELD_PROVIDER_MODULES = (
     "sunpack.core.config.fields.cli",
     "sunpack.core.config.fields.coordinator",

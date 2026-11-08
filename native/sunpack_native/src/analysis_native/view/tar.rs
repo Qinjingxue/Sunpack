@@ -24,27 +24,6 @@ fn u64_le(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
-fn tar_header_plausible(header: &[u8]) -> (bool, &'static str, u64, bool) {
-    if header.len() < TAR_BLOCK_SIZE {
-        return (false, "short_tar_header", 0, false);
-    }
-    let Some(stored_checksum) = parse_octal(&header[148..156]) else {
-        return (false, "invalid_checksum_field", 0, false);
-    };
-    let Some(member_size) = parse_octal(&header[124..136]) else {
-        return (false, "invalid_size_field", 0, false);
-    };
-    if stored_checksum != tar_checksum(header) {
-        return (false, "checksum_mismatch", 0, false);
-    }
-    (
-        true,
-        "",
-        member_size,
-        matches!(&header[257..263], b"ustar\x00" | b"ustar "),
-    )
-}
-
 fn parse_octal(field: &[u8]) -> Option<u64> {
     crate::formats::tar::number(field)
 }
@@ -59,15 +38,13 @@ struct TarHeaderIdentity {
     numeric_fields_valid: bool,
     typeflag_valid: bool,
     payload_in_range: bool,
-    plausible: bool,
-    error: &'static str,
+    validated_size: Result<u64, &'static str>,
 }
 
 fn tar_header_identity(header: &[u8], offset: u64, file_size: u64) -> TarHeaderIdentity {
     let stored_checksum = parse_octal(&header[148..156]);
     let member_size = parse_octal(&header[124..136]);
     let computed_checksum = tar_checksum(header);
-    let (plausible, error, _, _) = tar_header_plausible(header);
     let ustar_magic = matches!(&header[257..263], b"ustar\x00" | b"ustar ");
     TarHeaderIdentity {
         stored_checksum: stored_checksum.unwrap_or(0),
@@ -89,8 +66,11 @@ fn tar_header_identity(header: &[u8], offset: u64, file_size: u64) -> TarHeaderI
                 .saturating_add(tar_padding(size))
                 <= file_size
         }),
-        plausible,
-        error,
+        validated_size: crate::formats::tar::checked_header_size(
+            stored_checksum,
+            member_size,
+            computed_checksum,
+        ),
     }
 }
 

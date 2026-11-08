@@ -60,7 +60,6 @@ struct ReplayFile {
 };
 struct ExtractionReplay {
     VolumeAttemptCursor volumes;
-    bool volume_attempt_active = false;
     bool volume_password_uncertain = false;
     bool volume_password_ambiguous = false;
     // Request-owned read receipts distinguish fixed-input damage from a
@@ -69,7 +68,7 @@ struct ExtractionReplay {
     std::unordered_set<std::wstring> uncertain_paths;
     std::atomic<bool> uncertain_read{false};
     void observe_volume_read(std::uint64_t offset, std::uint32_t size, const std::wstring* physical = nullptr) {
-        if (!volume_attempt_active || !size || uncertain_read.load(std::memory_order_relaxed)) return;
+        if (!volumes.started || !size || uncertain_read.load(std::memory_order_relaxed)) return;
         bool intersects = false;
         if (physical) intersects = uncertain_paths.find(*physical) != uncertain_paths.end();
         else {

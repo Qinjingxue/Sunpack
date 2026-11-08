@@ -334,13 +334,13 @@ def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_
     )
     prober = RelationsPasswordProber(store)
     calls = {"count": 0}
-    original_verify = prober.scheduler.verifier.verify_fast_batch
+    original_verify = prober.scheduler.verifier.verify_batch
 
     def counting_verify(archive_path, passwords, **kwargs):
         calls["count"] += 1
         return original_verify(archive_path, passwords, **kwargs)
 
-    prober.scheduler.verifier.verify_fast_batch = counting_verify
+    prober.scheduler.verifier.verify_batch = counting_verify
     assert prober.resolve_file(group.head_path).password == "secret"
     assert calls["count"] == 1
 

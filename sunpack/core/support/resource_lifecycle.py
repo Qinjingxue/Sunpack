@@ -120,10 +120,6 @@ class FileIdentity:
             is_directory=bool(directory),
         )
 
-    @classmethod
-    def promotion_root(cls, path: os.PathLike[str] | str) -> "FileIdentity":
-        return cls.from_path(path, directory=True)
-
     def same_file(self, other: "FileIdentity") -> bool:
         if (
             self.device is not None

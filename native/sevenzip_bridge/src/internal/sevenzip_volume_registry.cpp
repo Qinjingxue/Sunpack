@@ -98,32 +98,17 @@ namespace sunpack::sevenzip
 
     void VolumeWriterRegistry::release(const std::string &key) noexcept
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(key);
+        if (found == entries_.end())
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto found = entries_.find(key);
-            if (found == entries_.end())
-            {
-                return;
-            }
-            Entry &entry = found->second;
-            if (entry.leases != 0)
-            {
-                --entry.leases;
-            }
-            if (entry.leases == 0)
-            {
-                const auto now = std::chrono::steady_clock::now();
-                if (entry.state && entry.state->persistent)
-                {
-                    entry.reap_deadline = config_.idle_timeout > std::chrono::milliseconds::zero()
-                                              ? now + config_.idle_timeout
-                                              : std::chrono::steady_clock::time_point{};
-                }
-                else
-                {
-                    entry.reap_deadline = now;
-                }
-            }
+            return;
+        }
+        Entry &entry = found->second;
+        if (entry.leases != 0 && --entry.leases == 0)
+        {
+            const auto idle_timeout = entry.state->persistent ? config_.idle_timeout : std::chrono::milliseconds::zero();
+            entry.reap_deadline = std::chrono::steady_clock::now() + idle_timeout;
         }
     }
 

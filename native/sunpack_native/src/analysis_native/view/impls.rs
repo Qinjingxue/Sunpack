@@ -658,6 +658,7 @@ impl AnalysisBinaryView {
         let mut checked = 0usize;
         let mut zero_blocks = 0usize;
         let mut tar_state = crate::formats::tar::TarState::default();
+        let mut last_ustar = None;
         if start_offset.saturating_add(TAR_BLOCK_SIZE as u64) > size {
             let fault = ReadFault::short_read(
                 "read_record",
@@ -743,46 +744,49 @@ impl AnalysisBinaryView {
                 result.set_item("fuzzy_typeflag_valid", identity.typeflag_valid)?;
                 result.set_item("fuzzy_payload_in_range", identity.payload_in_range)?;
             }
-            let (ok, error, member_size, ustar) = first_identity.map_or_else(
-                || tar_header_plausible(&header),
-                |identity| {
-                    (
-                        identity.plausible,
-                        identity.error,
-                        identity.member_size,
-                        identity.ustar_magic,
-                    )
-                },
+            let member_size = first_identity.map_or_else(
+                || crate::formats::tar::header_size(&header),
+                |identity| identity.validated_size,
             );
-            if !ok {
-                result.set_item("entries_checked", checked)?;
-                result.set_item("error", error)?;
-                let flag = match header[156] {
-                    b'x' | b'g' => "pax_header_bad",
-                    b'L' | b'K' => "gnu_longname_bad",
-                    b'S' => "sparse_header_bad",
-                    _ if error == "checksum_mismatch" => "tar_checksum_bad",
-                    _ => "tar_metadata_bad",
-                };
-                result.set_item("damage_flags", PyList::new(py, [flag])?)?;
-                if checked > 0 {
-                    result.set_item("plausible", true)?;
-                    result.set_item("entry_walk_ok", true)?;
-                    result.set_item("segment_end", py.None())?;
-                    result.set_item("boundary_confidence", "none")?;
-                    result.set_item(
-                        "evidence",
-                        PyList::new(py, ["tar:header_checksum", "tar:block_walk_prefix"])?,
-                    )?;
+            let member_size = match member_size {
+                Ok(size) => size,
+                Err(error) => {
+                    result.set_item("entries_checked", checked)?;
+                    result.set_item("error", error)?;
+                    let flag = match header[156] {
+                        b'x' | b'g' => "pax_header_bad",
+                        b'L' | b'K' => "gnu_longname_bad",
+                        b'S' => "sparse_header_bad",
+                        _ if error == "checksum_mismatch" => "tar_checksum_bad",
+                        _ => "tar_metadata_bad",
+                    };
+                    result.set_item("damage_flags", PyList::new(py, [flag])?)?;
+                    if checked > 0 {
+                        result.set_item("plausible", true)?;
+                        result.set_item("entry_walk_ok", true)?;
+                        result.set_item("segment_end", py.None())?;
+                        result.set_item("boundary_confidence", "none")?;
+                        result.set_item(
+                            "evidence",
+                            PyList::new(py, ["tar:header_checksum", "tar:block_walk_prefix"])?,
+                        )?;
+                    }
+                    return Ok(result);
                 }
-                return Ok(result);
-            }
+            };
             let record = py.detach(|| {
-                tar_state.advance(&header, cursor, size, false, &mut |start, length| {
-                    self.reader
-                        .read_cached_at(start, length)
-                        .map(|data| data.to_vec())
-                })
+                tar_state.advance_validated(
+                    &header,
+                    member_size,
+                    cursor,
+                    size,
+                    false,
+                    &mut |start, length| {
+                        self.reader
+                            .read_cached_at(start, length)
+                            .map(|data| data.to_vec())
+                    },
+                )
             });
             let next_cursor = match record {
                 Ok(record) => record.next,
@@ -824,20 +828,24 @@ impl AnalysisBinaryView {
             };
             checked += 1;
             cursor = next_cursor;
-            result.set_item(
-                "evidence",
-                PyList::new(
-                    py,
-                    [
-                        "tar:header_checksum",
-                        if ustar {
-                            "tar:ustar_magic"
-                        } else {
-                            "tar:v7_header"
-                        },
-                    ],
-                )?,
-            )?;
+            let ustar = matches!(&header[257..263], b"ustar\x00" | b"ustar ");
+            if last_ustar != Some(ustar) {
+                last_ustar = Some(ustar);
+                result.set_item(
+                    "evidence",
+                    PyList::new(
+                        py,
+                        [
+                            "tar:header_checksum",
+                            if ustar {
+                                "tar:ustar_magic"
+                            } else {
+                                "tar:v7_header"
+                            },
+                        ],
+                    )?,
+                )?;
+            }
         }
         if checked > 0 && cursor == size {
             result.set_item("plausible", true)?;

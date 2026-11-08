@@ -61,8 +61,8 @@ def _watcher(tmp_path, *, config=None, roots=None, root_entries=None, **override
 
 
 def test_failed_watch_initialization_releases_wal_without_publishing_outputs(tmp_path, monkeypatch):
+    from sunpack.core.support.path_keys import absolute_path_key
     from sunpack.runtime.watch.journal_commit import journal_stats
-    from sunpack.runtime.watch.state import _state_path_key
 
     def fail_signature(*_args):
         raise OSError("cannot persist password signature")
@@ -76,7 +76,7 @@ def test_failed_watch_initialization_releases_wal_without_publishing_outputs(tmp
 
     # The startup error retains the constructor traceback during these checks.
     assert failure.value.__traceback__ is not None
-    assert not journal_stats(_state_path_key(tmp_path / "state.snapshot"))["registered"]
+    assert not journal_stats(absolute_path_key(tmp_path / "state.snapshot"))["registered"]
     assert reservations.watch_outputs is None
 
 

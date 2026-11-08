@@ -14,8 +14,6 @@ namespace sunpack::sevenzip
 
         constexpr std::size_t kDefaultBufferCount = 64;
         constexpr std::size_t kMaxBufferCount = 256;
-        constexpr unsigned long long kDefaultIdleTimeoutMs = 20000;
-        constexpr unsigned long long kMaxIdleTimeoutMs = 24ULL * 60ULL * 60ULL * 1000ULL;
 
         std::size_t configured_size(
             const wchar_t *name,
@@ -38,26 +36,6 @@ namespace sunpack::sevenzip
             return static_cast<std::size_t>(parsed);
         }
 
-        unsigned long long configured_ull(
-            const wchar_t *name,
-            unsigned long long fallback,
-            unsigned long long maximum) noexcept
-        {
-            wchar_t text[32]{};
-            const DWORD length = GetEnvironmentVariableW(name, text, static_cast<DWORD>(std::size(text)));
-            if (length == 0 || length >= std::size(text))
-            {
-                return fallback;
-            }
-            wchar_t *end = nullptr;
-            const unsigned long long parsed = std::wcstoull(text, &end, 10);
-            if (end == text || *end != L'\0' || parsed > maximum)
-            {
-                return fallback;
-            }
-            return parsed;
-        }
-
         bool configured_flag(const wchar_t *name) noexcept
         {
             wchar_t text[8]{};
@@ -77,11 +55,11 @@ namespace sunpack::sevenzip
         config.buffer_count = configured_size(
             L"SUNPACK_ASYNC_WRITER_BUFFERS", kDefaultBufferCount, 4, kMaxBufferCount);
         config.write_through = configured_flag(L"SUNPACK_ASYNC_WRITER_WRITE_THROUGH");
-        const unsigned long long idle_seconds = configured_ull(
+        const auto idle_seconds = configured_size(
             L"SUNPACK_ASYNC_WRITER_IDLE_SECONDS",
-            kDefaultIdleTimeoutMs / 1000ULL,
-            kMaxIdleTimeoutMs / 1000ULL);
-        config.idle_timeout = std::chrono::milliseconds(idle_seconds * 1000ULL);
+            static_cast<std::size_t>(std::chrono::duration_cast<std::chrono::seconds>(config.idle_timeout).count()),
+            0, 24 * 60 * 60);
+        config.idle_timeout = std::chrono::seconds(idle_seconds);
 
         config.space_poll_interval = std::chrono::milliseconds(configured_size(
             L"SUNPACK_VOLUME_SPACE_POLL_MS", 1000, 50, 60000));

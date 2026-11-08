@@ -20,17 +20,6 @@ pub(crate) enum Blob {
     Memory(Vec<u8>),
     Mapped(Mapping),
 }
-impl Blob {
-    /// Diagnostic slice-based parsers can borrow a file mapping rather than
-    /// copying the entire archive (including payload) into committed heap.
-    pub(crate) fn open_read_only(path: &str) -> io::Result<Self> {
-        let file = TrackedFile::open_reader(path, "analysis_mapping")?;
-        if file.metadata()?.len() == 0 {
-            return Ok(Self::Memory(Vec::new()));
-        }
-        Ok(Self::Mapped(Mapping::new(&file, false)?))
-    }
-}
 impl Deref for Blob {
     type Target = [u8];
     fn deref(&self) -> &[u8] {

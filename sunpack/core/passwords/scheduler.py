@@ -13,12 +13,11 @@ from typing import Literal
 from sunpack.core.passwords.cache import PasswordAttemptCache
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.job import PasswordJob
-from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifier, PasswordVerifierRegistry
+from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifier, PasswordVerifierChain
 from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.core.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
 from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.core.passwords.verifier.enc_fast import EncFastVerifier
-from sunpack.core.passwords.verifier.input import PasswordProbeInput
 from sunpack.core.support.archive_sessions import archive_session_scope
 from sunpack.core.support.work_context import CURRENT_CANCELLATION
 
@@ -104,10 +103,9 @@ class PasswordScheduler:
 
     @classmethod
     def with_fast_verifiers(cls) -> "PasswordScheduler":
-        registry = PasswordVerifierRegistry(
-            fast_verifiers=[ZipFastVerifier(), RarFastVerifier(), SevenZipFastVerifier(), EncFastVerifier()],
-        )
-        return cls(registry.build())
+        return cls(PasswordVerifierChain((
+            ZipFastVerifier(), RarFastVerifier(), SevenZipFastVerifier(), EncFastVerifier(),
+        )))
 
     @archive_session_scope()
     @_cancellable_password_job
@@ -119,7 +117,7 @@ class PasswordScheduler:
             job.part_paths,
             archive_input=job.archive_input,
         )
-        cached_success = self.cache.get_success(fingerprint.key)
+        cached_success = self.cache.get_success(fingerprint)
         if cached_success is not None and _allows_cached_password(job, cached_success):
             result = PasswordSearchResult(
                 password=cached_success,
@@ -147,7 +145,7 @@ class PasswordScheduler:
                 _raise_if_cancelled()
                 password = _candidate_value(candidate)
                 candidates_seen += 1
-                if self.cache.has_negative(fingerprint.key, password):
+                if self.cache.has_negative(fingerprint, password):
                     skipped += 1
                     self._emit_progress(job, PasswordProgressEvent(
                         stage="skipped_cached_negative",
@@ -159,7 +157,7 @@ class PasswordScheduler:
                     continue
                 batch.append(password)
                 if len(batch) >= batch_size:
-                    outcome = self._verify_batch(job, fingerprint.key, batch, attempts, started_at, candidates_seen, skipped)
+                    outcome = self._verify_batch(job, fingerprint, batch, attempts, started_at, candidates_seen, skipped)
                     attempts = outcome.attempts
                     last_result = outcome.test_result
                     last_error = outcome.error_text
@@ -173,7 +171,7 @@ class PasswordScheduler:
                     batch = []
 
             if batch:
-                outcome = self._verify_batch(job, fingerprint.key, batch, attempts, started_at, candidates_seen, skipped)
+                outcome = self._verify_batch(job, fingerprint, batch, attempts, started_at, candidates_seen, skipped)
                 attempts = outcome.attempts
                 last_result = outcome.test_result
                 last_error = outcome.error_text
@@ -213,7 +211,7 @@ class PasswordScheduler:
             job.part_paths,
             archive_input=job.archive_input,
         )
-        cached_success = self.cache.get_success(fingerprint.key)
+        cached_success = self.cache.get_success(fingerprint)
         if cached_success is not None and _allows_cached_password(job, cached_success):
             result = PasswordSearchResult(
                 password=cached_success,
@@ -243,7 +241,7 @@ class PasswordScheduler:
                         if password in seen:
                             continue
                         seen.add(password)
-                    if self.cache.has_negative(fingerprint.key, password):
+                    if self.cache.has_negative(fingerprint, password):
                         skipped += 1
                         continue
                     candidates_seen += 1
@@ -274,17 +272,17 @@ class PasswordScheduler:
             attempts = 0
             while batch := list(islice(candidates, batch_size)):
                 _raise_if_cancelled()
-                verification = _call_fast_verifier(
-                    self.verifier,
+                verification = self.verifier.verify_batch(
                     job.archive_path,
                     batch,
                     part_paths=job.part_paths,
                     archive_input=job.probe_input or job.archive_input,
                 )
                 _raise_if_cancelled()
-                attempts += max(0, min(int(verification.attempts or 0), len(batch)))
+                tested_count = max(0, min(int(verification.attempts or 0), len(batch)))
+                attempts += tested_count
                 if verification.status == "not_required":
-                    self.cache.remember_success(fingerprint.key, "")
+                    self.cache.remember_success(fingerprint, "")
                     result = PasswordSearchResult(
                         password="",
                         status=PasswordSearchStatus.UNENCRYPTED,
@@ -295,11 +293,10 @@ class PasswordScheduler:
                     self._emit_finished(job, result, started_at, candidates_seen, skipped)
                     return result
                 matched_indices = _valid_matched_indices(verification, len(batch))
-                tested_count = max(0, min(int(verification.attempts or 0), len(batch)))
                 if verification.status == "match" and matched_indices:
                     matched = batch[matched_indices[0]]
                     if not verification.final_confirmation_required:
-                        self.cache.remember_success(fingerprint.key, matched)
+                        self.cache.remember_success(fingerprint, matched)
                         result = PasswordSearchResult(
                             password=matched,
                             status=PasswordSearchStatus.FOUND,
@@ -312,7 +309,7 @@ class PasswordScheduler:
                     matched_set = set(matched_indices)
                     inconclusive.extend(batch[index] for index in matched_indices)
                     self.cache.remember_negative_batch(
-                        fingerprint.key,
+                        fingerprint,
                         [
                             batch[index]
                             for index in range(tested_count)
@@ -330,7 +327,7 @@ class PasswordScheduler:
                         inconclusive_evidence = ""
                     continue
                 if verification.status == "no_match":
-                    self.cache.remember_negative_batch(fingerprint.key, batch[:tested_count])
+                    self.cache.remember_negative_batch(fingerprint, batch[:tested_count])
                     if tested_count < len(batch):
                         inconclusive.extend(batch[tested_count:])
                     continue
@@ -543,32 +540,6 @@ def _valid_matched_indices(verification: PasswordBatchVerification, batch_size: 
         for index in raw
         if 0 <= int(index) < batch_size
     ))
-
-
-
-
-def _call_fast_verifier(
-    verifier: PasswordVerifier,
-    archive_path: str,
-    passwords: list[str],
-    *,
-    part_paths: list[str] | None = None,
-    archive_input: dict | PasswordProbeInput | None = None,
-):
-    fast = getattr(verifier, "verify_fast_batch", None)
-    if not callable(fast):
-        return PasswordBatchVerification(
-            ok=False,
-            status="unknown_needs_final_verifier",
-            attempts=0,
-            error_text="bounded password verifier is unavailable",
-        )
-    return fast(
-        archive_path,
-        passwords,
-        part_paths=part_paths,
-        archive_input=archive_input,
-    )
 
 
 def _allows_cached_password(job: PasswordJob, password: str) -> bool:

@@ -106,9 +106,6 @@ can use the ZIP handler's default filename decoding.
 The module also exposes lightweight structure inspectors used by the detection
 pipeline:
 
-- `inspect_zip_eocd_structure`
-- `inspect_rar_structure`
-- `inspect_tar_header_structure`
 - `inspect_compression_stream_structure`
 - `inspect_pe_overlay_structure`
 

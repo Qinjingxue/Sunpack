@@ -93,15 +93,6 @@ def get_resource_path(filename: str) -> Path:
     return writable_data_dir() / filename
 
 
-def get_7z_path() -> str:
-    for root in candidate_resource_roots():
-        for relative in tuple(tool_dir / "7z.exe" for tool_dir in tool_dir_candidates()) + (Path("7z.exe"),):
-            seven_z = root / relative
-            if seven_z.exists():
-                return str(seven_z)
-    raise FileNotFoundError("Required bundled 7z.exe was not found under tools\\ or the application root.")
-
-
 def get_sevenzip_bridge_worker_path() -> str:
     # Build scripts stage the worker alongside the matching runtime. A raw
     # build directory may contain a different architecture or wire schema.

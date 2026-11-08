@@ -6,7 +6,6 @@ import threading
 import time
 from typing import Any
 
-from sunpack.core.support.path_keys import case_key
 from sunpack.core.support.path_map import PathMap
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import DirectoryFlattenResult, RunSummary, OutcomeKind
@@ -129,10 +128,10 @@ class RunReporter:
                 return
 
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
+        if self.quiet:
+            return
         name = str(event.get("event") or "")
         if name in _SPACE_EVENTS or name in {"memory_blocked", "memory_resumed"}:
-            if self.quiet:
-                return
             if self._work_broker is None:
                 self._resource_progress(task, event)
             else:
@@ -296,7 +295,7 @@ class RunReporter:
             partial = kind == OutcomeKind.PARTIAL_SUCCESS
             if success and out_dir:
                 lineage = (*parent_lineage, name)
-                self._output_lineages[_absolute_key(out_dir)] = lineage
+                self._output_lineages[out_dir] = lineage
                 if depth == 1:
                     self._top_level_outputs.setdefault(out_dir, out_dir)
 
@@ -413,17 +412,11 @@ class RunReporter:
         print(value, file=self.stderr if error else self.stdout, flush=True)
 
     def _lineage_for_path(self, path: str) -> tuple[str, ...]:
-        if not path:
-            return ()
-        candidate = _absolute_key(path)
-        while True:
-            lineage = self._output_lineages.get(candidate)
-            if lineage is not None:
-                return lineage
-            parent = os.path.dirname(candidate)
-            if parent == candidate:
-                return ()
-            candidate = parent
+        lineage = ()
+        if path and self._output_lineages:
+            for _, ancestor_lineage in self._output_lineages.ancestors(path):
+                lineage = ancestor_lineage
+        return lineage
 
     def _update_task_locked(
         self,
@@ -556,10 +549,6 @@ class RunReporter:
 def _task_name(task: Any) -> str:
     path = str(getattr(task, "main_path", "") or "")
     return os.path.basename(path) or str(getattr(task, "logical_name", "") or path or "archive")
-
-
-def _absolute_key(path: str) -> str:
-    return case_key(os.path.abspath(os.path.normpath(path)))
 
 
 def _terminal_supports_updates(stream: Any) -> bool:

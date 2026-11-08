@@ -108,7 +108,7 @@ def test_password_cache_uses_each_physical_generation(tmp_path, replace, source,
     else:
         _change(changed, replace)
     after = build_archive_fingerprint(str(main), parts, descriptor)
-    assert before.key != after.key
+    assert before != after
     assert get_archive_session(str(changed)).read_at(0, 4) == b"new!"
     verifier.password = "new-password"
     result = scheduler.plan_for_extraction(PasswordJob(str(main), part_paths=parts, archive_input=descriptor, candidates=["new-password"]))

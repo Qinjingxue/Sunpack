@@ -58,7 +58,7 @@ class DirectorySnapshot:
             )
 
         native_snapshot = build(entries)
-        raw_native_snapshot = build(entries if raw_entries is None else raw_entries)
+        raw_native_snapshot = native_snapshot if raw_entries is None or raw_entries is entries else build(raw_entries)
         return cls.from_native(root_path, native_snapshot, raw_native_snapshot)
 
     def __len__(self) -> int:
@@ -91,17 +91,6 @@ class DirectorySnapshot:
 
     def parent_directories(self) -> list[str]:
         return self._native_snapshot.parent_directories()
-
-    def file_entries_for_directories(self, directories: set[str]) -> list[FileEntry]:
-        if not directories:
-            return []
-        paths, sizes, mtimes_ns = (
-            self._native_snapshot.file_columns_for_directories(list(directories))
-        )
-        return [
-            FileEntry(path=Path(path), is_dir=False, size=size, mtime_ns=mtime_ns)
-            for path, size, mtime_ns in zip(paths, sizes, mtimes_ns)
-        ]
 
     def iter_relation_anchor_rows(self) -> Iterator[tuple[str, int | None, dict]]:
         return iter(self._native_snapshot.relation_anchor_rows())

@@ -22,16 +22,6 @@ namespace sunpack::sevenzip
         std::atomic<std::uint64_t> pending_bytes{0};
         std::atomic<std::uint64_t> completed_files{0};
         std::atomic<std::uint64_t> completed_jobs{0};
-
-        void reset() noexcept
-        {
-            accepted_bytes.store(0, std::memory_order_relaxed);
-            written_bytes.store(0, std::memory_order_relaxed);
-            discarded_bytes.store(0, std::memory_order_relaxed);
-            pending_bytes.store(0, std::memory_order_relaxed);
-            completed_files.store(0, std::memory_order_relaxed);
-            completed_jobs.store(0, std::memory_order_relaxed);
-        }
     };
 
     struct WriterMeters

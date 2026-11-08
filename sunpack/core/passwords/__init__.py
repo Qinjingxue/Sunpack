@@ -1,6 +1,6 @@
 from sunpack.core.passwords.cache import PasswordAttemptCache
 from sunpack.core.passwords.candidates import PasswordCandidate, PasswordCandidatePipeline
-from sunpack.core.passwords.fingerprint import ArchiveFingerprint, build_archive_fingerprint
+from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.internal.builtin import DEFAULT_BUILTIN_PASSWORDS, merge_watch_clipboard_passwords
 from sunpack.core.passwords.internal.clipboard import read_clipboard_passwords
 from sunpack.core.passwords.internal.lists import dedupe_passwords, parse_password_lines
@@ -15,7 +15,6 @@ from sunpack.core.passwords.verifier import (
     PasswordBatchVerification,
     PasswordVerifier,
     PasswordVerifierChain,
-    PasswordVerifierRegistry,
     RarFastVerifier,
     SevenZipFastVerifier,
     VerifierStatus,
@@ -24,7 +23,6 @@ from sunpack.core.passwords.verifier import (
 
 
 __all__ = [
-    "ArchiveFingerprint",
     "build_archive_fingerprint",
     "DEFAULT_BUILTIN_PASSWORDS",
     "dedupe_passwords",
@@ -46,7 +44,6 @@ __all__ = [
     "PasswordStore",
     "PasswordVerifier",
     "PasswordVerifierChain",
-    "PasswordVerifierRegistry",
     "RarFastVerifier",
     "read_password_file",
     "read_clipboard_passwords",

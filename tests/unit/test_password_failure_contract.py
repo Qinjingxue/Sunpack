@@ -203,8 +203,5 @@ class _StaticVerifier:
     def verify_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
         return self.result
 
-    verify_fast_batch = verify_batch
-
-
 def _task(path):
     return make_archive_task(path, key=str(path))

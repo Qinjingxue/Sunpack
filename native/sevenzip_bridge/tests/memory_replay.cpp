@@ -245,7 +245,7 @@ void sparse_replay(const std::filesystem::path &directory) {
     std::ifstream input(receipt.path, std::ios::binary);
     const std::vector<unsigned char> actual((std::istreambuf_iterator<char>(input)), {});
     require(actual == expected, "replayed holes have incorrect data or offsets");
-    require(writer->snapshot_metrics().written_bytes == 128 * 1024, "confirmed ranges were written twice");
+    require(writer->snapshot_global_meters().written_bytes == 128 * 1024, "confirmed ranges were written twice");
     require(receipt.complete && receipt.written.bytes() == expected.size(), "replay receipt lost a completed interval");
 }
 
@@ -298,7 +298,7 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
     cpu.release(1);
     manager.end(memory);
     require(cpu.reserved_credits() == 0, "a memory waiter retained CPU credits");
-    require(writer->snapshot_metrics().pending_bytes == 0, "disk retry retained output buffers after revoke");
+    require(writer->snapshot_global_meters().pending_bytes == 0, "disk retry retained output buffers after revoke");
     // One outstanding space failure enters the existing probe path. Normal
     // successful IO deliberately bypasses gate bookkeeping altogether.
     writer->set_write_fault_for_test(ERROR_DISK_FULL, 1);

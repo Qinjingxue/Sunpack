@@ -768,7 +768,7 @@ required = [
     'batch_file_head_facts', 'authorize_nested_candidates',
     'profile_directory_scan', 'list_regular_files_in_directory',
     'scan_embedded_archives',
-    'analyze_zip_filename_encoding', 'inspect_zip_eocd_structure',
+    'analyze_zip_filename_encoding', 'AnalysisBinaryView',
     'inspect_pe_overlay_structure',
     'watch_broker_acquire', 'watch_broker_release',
     'watch_broker_is_connected', 'watch_broker_ping_seconds',

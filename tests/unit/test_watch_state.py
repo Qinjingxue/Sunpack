@@ -10,6 +10,7 @@ import pytest
 
 from tests.helpers.binary_wal import header, frame, frames
 import sunpack.runtime.watch.state as watch_state_module
+from sunpack.core.support.path_keys import absolute_path_key
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import (
     WatchStateJournalError,
@@ -300,7 +301,7 @@ def test_snapshot_missing_required_field_is_rejected(tmp_path):
         WatchStateStore(str(state_path))
     # Retaining the startup exception/traceback must not retain native ownership.
     assert error.value.__traceback__ is not None
-    assert not journal_stats(watch_state_module._state_path_key(state_path))["registered"]
+    assert not journal_stats(absolute_path_key(state_path))["registered"]
 
 
 def test_journal_operation_with_unexpected_field_is_rejected(tmp_path):

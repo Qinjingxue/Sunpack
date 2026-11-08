@@ -354,15 +354,18 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         for(auto& run:runs) if(run->position>=0 && (!selected || run->key()>selected->key())) selected=run.get();
         if(!selected) break;
         auto cursor=selected->key(); auto record=selected->current;
-        if(!matches_entry(record)) { selected->previous(); continue; }
+        // The unordered live run already applied both filters in its bounded
+        // selection. Decode again only when the row fits on the page.
+        if(!selected->filtered && !matches_entry(record)) { selected->previous(); continue; }
+        const bool check_value=filter_values && !selected->filtered;
         Json value;
-        if(filter_values) {
+        if(check_value) {
             value=selected->value(packed,raw);
             if(!matches_value(value)) { selected->previous(); continue; }
         }
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
-        if(!filter_values) value=selected->value(packed,raw);
+        if(!check_value) value=selected->value(packed,raw);
         auto row=project_task(value,root_index,language,labels);
         if(!row.value.is_null() && ids.insert(row.value.at("id").get_ref<const std::string&>()).second) {
             needs_sort|=row.timestamp>previous_timestamp;

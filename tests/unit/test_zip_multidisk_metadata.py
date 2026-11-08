@@ -1,12 +1,7 @@
 import struct
 
 import pytest
-from sunpack_native import (
-    AnalysisBinaryView,
-    inspect_zip_directory_consistency,
-    inspect_zip_eocd_structure,
-    inspect_zip_structure_graph,
-)
+from sunpack_native import AnalysisBinaryView
 
 from sunpack.core.analysis import AnalysisRequest, ArchiveAnalyzer
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
@@ -66,7 +61,7 @@ def test_zip_probe_maps_spanned_disk_relative_offsets(tmp_path, zip64):
 
 @pytest.mark.parametrize("layout", ["plain", "carrier", "split_carrier"])
 @pytest.mark.parametrize("invalid_field", [None, "locator", "size", "offset", "sum"])
-def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, invalid_field):
+def test_zip64_bounds_are_shared_by_analysis_and_manifest(tmp_path, layout, invalid_field):
     # Unique coverage: malformed ZIP64 declarations must not become plausible
     # through carrier scanning or split mapping. Normal archive tests cannot
     # catch that false acceptance; these tiny fixtures cost only bounded reads.
@@ -114,16 +109,6 @@ def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, in
     assert probe["plausible"] is (invalid_field is None)
     assert probe["error"] == expected_error
 
-    if layout == "plain":
-        for inspect in (
-            inspect_zip_eocd_structure,
-            inspect_zip_directory_consistency,
-            inspect_zip_structure_graph,
-        ):
-            assert dict(inspect(str(path)) if inspect is inspect_zip_eocd_structure else inspect(str(path), 16))["error"] == expected_error
-        if invalid_field is None:
-            assert inspect_zip_directory_consistency(str(path), 16)["zip64_consistency"]["zip64_eocd_present"]
-            assert inspect_zip_structure_graph(str(path), 16)["summary"]["zip64_eocd_present"]
     if layout == "split_carrier":
         # The ZIP64 fields themselves straddle a raw split boundary.
         split = len(prefix) + zip64_offset + 43

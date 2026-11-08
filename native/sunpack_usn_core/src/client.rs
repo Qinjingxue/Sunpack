@@ -190,22 +190,18 @@ pub fn broker_read_root_changes(
 ) -> io::Result<Vec<String>> {
     let (file_id, _) = parse_file_id(root_file_id)?;
     let (journal, _) = broker_volume_cursor(volume_guid)?;
-    broker_read_directories_changes(volume_guid, journal, &[file_id], start_usn, end_usn)
-        .map(|changes| changes.into_iter().map(|(_, name)| name).collect())
-}
-
-pub fn broker_read_directories_changes(
-    volume: &str,
-    journal: u64,
-    directories: &[[u8; FILE_ID_BYTES]],
-    start: i64,
-    end: i64,
-) -> io::Result<Vec<(usize, String)>> {
     let mut changes = std::collections::BTreeSet::new();
-    broker_for_each_directory_change(volume, journal, directories, start, end, |index, name| {
-        changes.insert((index, name.to_owned()));
-        Ok(())
-    })?;
+    broker_for_each_directory_change(
+        volume_guid,
+        journal,
+        &[file_id],
+        start_usn,
+        end_usn,
+        |_, name| {
+            changes.insert(name.to_owned());
+            Ok(())
+        },
+    )?;
     Ok(changes.into_iter().collect())
 }
 

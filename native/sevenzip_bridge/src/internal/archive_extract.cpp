@@ -336,7 +336,7 @@ namespace sunpack::sevenzip
         // signature search. A wrong handler must not scan the whole archive
         // before the right one gets its turn. Keep search for carrier fallback.
         const UInt64 start_only = 0;
-        const bool bounded_composition = current_extraction_replay && current_extraction_replay->volume_attempt_active;
+        const bool bounded_composition = current_extraction_replay && current_extraction_replay->volumes.started;
         for (std::size_t attempt_index = 0; attempt_index < formats.size() * (bounded_composition ? 1 : 2); ++attempt_index)
         {
             if (cancel_token && cancel_token->load(std::memory_order_acquire)) {

@@ -166,7 +166,8 @@ def test_eocd_signatures_in_comments_preserve_planned_password_input(tmp_path, l
     else:
         task = direct_file_task(str(archive), all_parts=parts or [str(archive)])
     ArchiveInputPlanningStage(config).plan_task(task)
-    descriptor = (task.password_probe_input or task.archive_input()).to_dict()
+    archive_input = task.password_probe_input or task.archive_input()
+    descriptor = archive_input.to_dict()
     if layout == "carrier":
         assert descriptor["open_mode"] == "file_range"
         part, = descriptor["parts"]
@@ -174,6 +175,6 @@ def test_eocd_signatures_in_comments_preserve_planned_password_input(tmp_path, l
     else:
         assert "zip_eocd_offset" in descriptor.get("analysis", {}), descriptor
     outcome = ZipFastVerifier().verify_batch(str(archive), ["wrong", password],
-        part_paths=parts or None, archive_input=descriptor)
+        part_paths=parts or None, archive_input=archive_input)
     assert outcome.status == "match", outcome
     assert 1 in outcome.matched_indices

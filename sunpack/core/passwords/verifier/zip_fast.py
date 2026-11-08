@@ -17,10 +17,9 @@ class ZipFastVerifier:
         part_paths: list[str] | None = None,
         archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
-        normalized_passwords = list(passwords or [""])
-        analysis = (archive_input or {}).get("analysis") or {}
-        eocd_offset = analysis.get("zip_eocd_offset")
+        normalized_passwords = passwords or [""]
         prepared = prepare_password_input(archive_path, part_paths=part_paths, archive_input=archive_input)
+        eocd_offset = prepared.zip_eocd_offset
         if prepared.volumes is not None and prepared.volume_style == "zip_spanned":
             with prepared.borrow_sessions() as sessions:
                 outcome = zip_fast_verify_passwords_from_volumes(prepared.volumes, normalized_passwords, eocd_offset, sessions=sessions)

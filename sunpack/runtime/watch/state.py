@@ -9,7 +9,7 @@ import weakref
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from sunpack.core.support.path_keys import case_key, absolute_path_key, path_key_is_under
+from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under
 from sunpack_native import NativeWatchState, NativeWatchOperations, watch_path_key
 from sunpack.core.platform.windows.file_mutex import file_mutex
 
@@ -74,12 +74,7 @@ _STATE_PATH_COORDINATORS_GUARD = threading.Lock()
 _STATE_PATH_COORDINATORS: weakref.WeakValueDictionary[str, _StatePathCoordinator] = weakref.WeakValueDictionary()
 
 
-def _state_path_key(path: Path) -> str:
-    return case_key(os.path.abspath(str(path)))
-
-
-def _state_path_coordinator(path: Path) -> _StatePathCoordinator:
-    key = _state_path_key(path)
+def _state_path_coordinator(key: str) -> _StatePathCoordinator:
     with _STATE_PATH_COORDINATORS_GUARD:
         coordinator = _STATE_PATH_COORDINATORS.get(key)
         if coordinator is None:
@@ -169,13 +164,13 @@ class WatchStateStore:
         scopes=(),
     ):
         self.path = Path(path)
-        self._path_coordinator = _state_path_coordinator(self.path)
+        self._writer_stream = absolute_path_key(self.path)
+        self._path_coordinator = _state_path_coordinator(self._writer_stream)
         self._state_lock = self._path_coordinator.state_lock
         self._checkpoint_condition = threading.Condition(self._state_lock)
         self._compact_records = max(1, int(compact_records))
         self._compact_bytes = max(1, int(compact_bytes))
         self._hard_compact_bytes = max(self._compact_bytes, int(hard_compact_bytes))
-        self._writer_stream = _state_path_key(self.path)
         self._journal_stream = open_state_stream(self._writer_stream)
         self._closing = False
         self._closed = False

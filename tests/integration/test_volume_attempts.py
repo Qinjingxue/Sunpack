@@ -57,6 +57,9 @@ def _ambiguous_case(tmp_path, archive_format="7z", password=None, carrier=False)
 def test_attempt_plan_survives_passwords_carrier_ranges_and_serialization(tmp_path, archive_format, carrier, password):
     case, paths, config, task = _ambiguous_case(tmp_path, archive_format, password, carrier)
     descriptor = next(node.descriptor for node in task.inputs if node.descriptor.volume_attempts)
+    worker_input = descriptor.to_worker_input()
+    assert "volume_attempts" in worker_input
+    assert {"parts", "ranges", "analysis"}.isdisjoint(worker_input)
     restored = ArchiveInputDescriptor.from_dict(descriptor.to_dict())
     assert restored.same_retry_input(descriptor)
     assert restored.with_path_mapping(lambda p: p).same_retry_input(descriptor)
@@ -69,7 +72,7 @@ def test_attempt_plan_survives_passwords_carrier_ranges_and_serialization(tmp_pa
     assert all(node.descriptor.volume_attempts is None for node in task.inputs)
     assert not any("(1)" in path.name for path in output.rglob("*"))
     if password:
-        request = {"job_id": "wrong-password", "archive_input": descriptor.to_dict(),
+        request = {"job_id": "wrong-password", "archive_input": worker_input,
                    "output_dir": str(tmp_path / "wrong-password"), "password": "wrong"}
         run = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
                              input=encode_worker_frame(request), capture_output=True)

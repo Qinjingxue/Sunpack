@@ -52,7 +52,7 @@ pub(crate) fn visit_relation_directory(
             return Ok(false);
         }
         let full = reader.read_cached_at(cursor, len)?;
-        let Some(record) = super::parse_central_directory_record(&full, 0, full.len()) else {
+        let Some(record) = super::parse_central_directory_record(&full) else {
             return Ok(false);
         };
         let Some(values) = super::zip64::central_entry_values(&full, record.extra) else {
@@ -116,7 +116,7 @@ pub(crate) fn relation_local_key(
         return Ok(None);
     };
     let bytes = reader.read_cached_at(offset, len)?;
-    let Some(local) = super::parse_local_header(&bytes, 0) else {
+    let Some(local) = super::parse_local_header(&bytes) else {
         return Ok(None);
     };
     // Central-directory encryption may deliberately mask local names.
@@ -125,11 +125,11 @@ pub(crate) fn relation_local_key(
     }
     let mut central = [0u8; 46];
     central[20..28].copy_from_slice(&bytes[18..26]);
-    let Some(values) = super::zip64::central_entry_values(&central, &local.extra) else {
+    let Some(values) = super::zip64::central_entry_values(&central, local.extra) else {
         return Ok(None);
     };
     Ok(Some(RelationLocalKey {
-        name: local.name,
+        name: local.name.to_vec(),
         fields: RelationLocalFields::new(
             local.method,
             local.flags,
@@ -170,7 +170,7 @@ pub(crate) fn relation_member_end(
         return Ok(None);
     }
     let bytes = reader.read_cached_at(start, len)?;
-    let Some(local) = super::parse_local_header(&bytes, 0) else {
+    let Some(local) = super::parse_local_header(&bytes) else {
         return Ok(None);
     };
     if local.name != record.name || local.method != record.method || local.flags != record.flags {
@@ -180,9 +180,8 @@ pub(crate) fn relation_member_end(
         return Ok(Some(end));
     }
     let descriptor = reader.read_cached_at(end, (limit - end).min(24) as usize)?;
-    Ok(super::descriptor_at_impl(
+    Ok(super::matching_descriptor_len(
         &descriptor,
-        0,
         record.crc32,
         values.compressed,
         values.uncompressed,

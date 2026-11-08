@@ -10,7 +10,7 @@ from io import BytesIO
 
 import pytest
 
-from sunpack_native import inspect_rar_structure, probe_rar_bytes, scan_embedded_archives
+from sunpack_native import AnalysisBinaryView, probe_rar_bytes, scan_embedded_archives
 from sunpack.core.analysis.embedded.result import embedded_scan_prepass
 from sunpack.core.analysis.engine import AnalysisEngine
 from sunpack.core.analysis.view import SharedBinaryView
@@ -107,10 +107,14 @@ def test_rar5_oversized_second_header_vint_does_not_panic(tmp_path):
         + _rar5_oversized_size_vint_block()
     )
 
-    result = dict(inspect_rar_structure(str(archive)))
+    view = AnalysisBinaryView(str(archive))
+    try:
+        result = view.probe_rar(0)
+    finally:
+        view.close()
 
     assert result["magic_matched"] is True
-    assert result["error"] == "rar5_second_header_size_vint_too_long"
+    assert result["error"] == "rar5_header_size_vint_too_long"
 
 
 def test_rar5_extra_area_larger_than_header_does_not_panic(tmp_path):
@@ -120,10 +124,14 @@ def test_rar5_extra_area_larger_than_header_does_not_panic(tmp_path):
         + _rar5_impossible_extra_area_block()
     )
 
-    result = dict(inspect_rar_structure(str(archive)))
+    view = AnalysisBinaryView(str(archive))
+    try:
+        result = view.probe_rar(0)
+    finally:
+        view.close()
 
     assert result["magic_matched"] is True
-    assert result["format"] == "rar"
+    assert result["strong_accept"] is False
 
 
 def test_rar5_probe_rejects_overflowing_block_fields():
@@ -147,10 +155,9 @@ def test_rar5_probe_rejects_overflowing_block_fields():
         assert not observation["strong_accept"]
 
 
-def test_rar4_large_packed_sizes_agree_across_native_analysis_paths(tmp_path):
-    # Carrier extraction alone bypasses the standalone inspectors. This small
-    # matrix uniquely catches high-word/truncated-header errors in those paths;
-    # removing it leaves the single-file analysis APIs untested for large RAR4.
+def test_rar4_large_packed_sizes_preserve_archive_boundaries(tmp_path):
+    # This matrix catches high-word/truncated-header errors in RAR4
+    # boundary detection and routing.
     import struct
 
     def block(kind, flags, body=b""):
@@ -172,8 +179,6 @@ def test_rar4_large_packed_sizes_agree_across_native_analysis_paths(tmp_path):
         assert observation["end_block_found"] == complete, name
         report = AnalysisEngine().analyze_path(str(path))
         assert any(item.format == "rar" for item in report.selected) == complete, name
-        structure = inspect_rar_structure(str(path))
-        assert bool(structure["second_block_ok"]) == complete, name
 
 
 def test_clean_whole_input_formats_use_structure_evidence(tmp_path):

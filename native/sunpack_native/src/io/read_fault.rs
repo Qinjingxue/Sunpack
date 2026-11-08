@@ -177,10 +177,7 @@ impl ReadFault {
         diagnostic.set_item("os_error", self.os_error)?;
         diagnostic.set_item("detail", &self.detail)?;
         diagnostic.set_item("possible_missing_volume", self.possible_missing_volume())?;
-        output.set_item("read_error", diagnostic)?;
-        output.set_item("error_field", self.field)?;
-        output.set_item("possible_missing_volume", self.possible_missing_volume())?;
-        Ok(())
+        output.set_item("read_error", diagnostic)
     }
 
     pub(crate) fn write_python_with_damage_flags(

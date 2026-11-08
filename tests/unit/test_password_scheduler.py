@@ -15,20 +15,23 @@ from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchSt
 from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
 
 
-def test_fast_verifier_receives_archive_input_and_does_not_retry_type_errors():
+def test_fast_verifier_receives_archive_input_and_does_not_retry_type_errors(tmp_path):
     calls = []
-    descriptor = {"open_mode": "file_range", "format_hint": "7z"}
+    archive = tmp_path / "carrier.blob"
+    archive.write_bytes(b"archive")
+    path = str(archive)
+    descriptor = ArchiveInputDescriptor(path, format_hint="7z")
 
     class Verifier:
-        def verify_fast_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
+        def verify_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
             calls.append((archive_path, passwords, part_paths, archive_input))
             raise TypeError("archive_input processing failed")
 
     with pytest.raises(TypeError, match="archive_input processing failed"):
-        password_scheduler_module._call_fast_verifier(
-            Verifier(), "carrier.blob", ["secret"], part_paths=["carrier.blob"], archive_input=descriptor,
-        )
-    assert calls == [("carrier.blob", ["secret"], ["carrier.blob"], descriptor)]
+        PasswordScheduler(Verifier()).plan_for_extraction(PasswordJob(
+            archive_path=path, part_paths=[path], archive_input=descriptor, candidates=["secret"],
+        ))
+    assert calls == [(path, ["secret"], [path], descriptor)]
 
 
 class FakeVerifier:
@@ -137,7 +140,7 @@ def test_password_fingerprint_separates_embedded_ranges(tmp_path):
         },
     )
 
-    assert first.key != second.key
+    assert first != second
 
 
 def test_password_attempt_cache_bounds_successes_and_negative_attempts():
@@ -176,7 +179,7 @@ def test_password_scheduler_does_not_cache_weak_fast_match_as_success(tmp_path):
     assert result.status == PasswordSearchStatus.INCONCLUSIVE
     assert result.password is None
     assert result.extraction_candidates == ("collision",)
-    assert scheduler.cache.get_success(build_archive_fingerprint(str(archive)).key) is None
+    assert scheduler.cache.get_success(build_archive_fingerprint(str(archive))) is None
 
 
 def test_production_scheduler_uses_only_bounded_fast_verifiers(
@@ -274,7 +277,7 @@ def test_single_enc_candidate_uses_extraction_confirmation_and_cache(tmp_path, m
         archive_path=str(archive), archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=str(archive)),
         candidates=PasswordCandidatePipeline.from_values(["secret", "secret"]),
     )
-    key = build_archive_fingerprint(str(archive), archive_input=descriptor).key
+    key = build_archive_fingerprint(str(archive), archive_input=descriptor)
 
     result = scheduler.plan_for_extraction(job)
     assert result.status == PasswordSearchStatus.INCONCLUSIVE
@@ -300,7 +303,7 @@ def test_single_enc_candidate_after_negative_cache_filtering(tmp_path):
     scheduler = PasswordScheduler(FakeVerifier("secret"))
     descriptor = {"format_hint": "enc"}
     scheduler.remember_extraction_rejection(
-        build_archive_fingerprint(str(archive), archive_input=descriptor).key, "bad",
+        build_archive_fingerprint(str(archive), archive_input=descriptor), "bad",
     )
     result = scheduler.plan_for_extraction(PasswordJob(
         archive_path=str(archive), archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=str(archive)),
@@ -358,7 +361,7 @@ def test_extraction_plan_accepts_not_required_fast_result(tmp_path):
     assert cached.stopped_reason == "cache_hit"
     assert scheduler.cache.get_success(build_archive_fingerprint(
         str(archive), archive_input=job.archive_input,
-    ).key) == ""
+    )) == ""
     assert fast.batches == [["", "secret"]]
 
 
@@ -385,7 +388,7 @@ def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
     assert result.password is None
     assert result.extraction_candidates == ("collision", "secret")
     assert result.extraction_candidate_evidence == "zipcrypto_header_byte"
-    assert scheduler.cache.has_negative(build_archive_fingerprint(str(archive), archive_input={"format_hint": "zip"}).key, "rejected") is True
+    assert scheduler.cache.has_negative(build_archive_fingerprint(str(archive), archive_input={"format_hint": "zip"}), "rejected") is True
 
 
 @pytest.mark.parametrize("prefix", [[], ["proven-bad"]])
@@ -412,7 +415,7 @@ def test_extraction_plan_caches_only_tested_prefix_before_weak_match(tmp_path, p
     result = scheduler.plan_for_extraction(job)
     fingerprint = build_archive_fingerprint(
         str(archive), archive_input=job.archive_input,
-    ).key
+    )
 
     assert result.extraction_candidates == ("collision", "secret")
     assert scheduler.cache.has_negative(fingerprint, "proven-bad") is bool(prefix)
@@ -478,5 +481,5 @@ def test_password_scheduler_reports_backend_failure_instead_of_exhausted(tmp_pat
 
     assert result.status == PasswordSearchStatus.BACKEND_UNAVAILABLE
     assert verifier.batches == [["one"]]
-    key = build_archive_fingerprint(str(archive)).key
+    key = build_archive_fingerprint(str(archive))
     assert not scheduler.cache.has_negative(key, "one")

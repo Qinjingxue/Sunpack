@@ -1,8 +1,6 @@
-use crate::formats::rar::read_vint;
-use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
-use crate::io::reader::{ManagedReader, SourceCursor};
+use crate::io::read_fault::{FieldLocation, ReadFault};
+use crate::io::reader::ManagedReader;
 use crc32fast::hash as crc32;
-use memchr::memmem;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::io::Read;
@@ -10,7 +8,5 @@ use std::io::Read;
 include!("constants.rs");
 include!("api.rs");
 include!("common.rs");
-include!("rar.rs");
-include!("tar.rs");
 include!("compression.rs");
 include!("util.rs");

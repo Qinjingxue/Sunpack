@@ -226,13 +226,15 @@ class ArchiveInputDescriptor:
             object.__setattr__(self, "parts", ordered)
             object.__setattr__(self, "entry_path", next((part.path for part in ordered if part.volume_number == 1), ordered[0].path))
 
-    def _physical_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _physical_payload(self, payload: dict[str, Any], *, for_worker: bool = False) -> dict[str, Any]:
         payload["entry_path"] = self.entry_path
         payload["open_mode"] = self.open_mode
         if self.format_hint:
             payload["format_hint"] = self.format_hint
         if self.volume_attempts is not None:
             payload["volume_attempts"] = self.volume_attempts.to_dict()
+            if for_worker:
+                return payload
         if self.parts:
             payload["parts"] = [part.to_dict() for part in self.parts]
         if self.open_mode == "concat_ranges":
@@ -240,7 +242,9 @@ class ArchiveInputDescriptor:
         return payload
 
     def to_worker_input(self) -> dict[str, Any]:
-        payload = self._physical_payload({})
+        payload = self._physical_payload({}, for_worker=True)
+        if self.volume_attempts is not None:
+            return payload
         execution = self.analysis.get("execution")
         evidence = execution.get("missing_volume_evidence") if isinstance(execution, dict) else None
         if isinstance(evidence, str) and evidence:

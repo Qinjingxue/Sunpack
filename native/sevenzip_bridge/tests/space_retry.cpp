@@ -154,7 +154,7 @@ struct Harness {
         const bool ready =
             wait_until([this] { return gate->phase() == VolumeSpacePhase::Ready; }, timeout);
         if (!issued || !ready) {
-            const auto metrics = writer->snapshot_metrics();
+            const auto metrics = writer->snapshot_global_meters();
             std::uint64_t free_now = 0;
             std::uint64_t total = 0;
             const bool queried = gate->query_free_bytes(&free_now, &total);
@@ -233,7 +233,7 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
     check(writer.current_error(job) == S_OK, "R-2: 暂停期间 job 必须没有错误");
     check(!job->terminal_requested.load(), "R-2: 暂停期间 terminal_requested 必须仍是 false");
     // R-3 记账不变量（暂停期间）
-    const auto paused = writer.snapshot_metrics();
+    const auto paused = writer.snapshot_global_meters();
     check(paused.discarded_bytes == 0, "R-3: 暂停期间 discarded 必须为 0");
     check(paused.accepted_bytes == paused.written_bytes + paused.discarded_bytes +
                                         paused.pending_bytes,
@@ -256,7 +256,7 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
     check(writer.finish_job(job) == S_OK, "R-5: 恢复后 job 必须成功完成");
 
     // R-5 恢复后数据完整
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.written_bytes == kPayload, "R-5: written 必须等于 payload 大小");
     check(metrics.accepted_bytes == kPayload, "R-5: accepted 必须等于 payload 大小");
     check(metrics.discarded_bytes == 0, "R-5: 成功路径不得产生 discarded");
@@ -314,7 +314,7 @@ void r4_producer_backpressure(const std::filesystem::path &directory) {
     std::this_thread::sleep_for(300ms);
     check(!producer_returned.load(),
           "R-4: 暂停期间预算用尽后 write() 必须阻塞（producer 反压成立）");
-    const auto paused = writer.snapshot_metrics();
+    const auto paused = writer.snapshot_global_meters();
     check(paused.pending_bytes > 0, "R-4: 暂停期间 pending 必须保持非零");
 
     writer.set_write_fault_for_test(ERROR_DISK_FULL, 0);
@@ -325,7 +325,7 @@ void r4_producer_backpressure(const std::filesystem::path &directory) {
     writer.record_operation_result(file, 0);
     writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-4: 恢复后 job 必须成功");
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.written_bytes == kPayload && metrics.pending_bytes == 0,
           "R-4: 恢复后必须全部落盘且 pending 归零");
     check(read_file(path) == payload, "R-4: 数据必须逐字节完整");
@@ -357,7 +357,7 @@ void r7_cancel_pierces_pause(const std::filesystem::path &directory) {
 
     check(result != S_OK, "R-7: 取消后 finish_job 必须返回非 S_OK");
     check(elapsed < 1s, "R-7: 取消必须能穿透暂停（1s 内返回）");
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.pending_bytes == 0, "R-7: 取消后 pending 必须归零");
     check(metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
           "R-7: 取消后必须保持 accepted == written + discarded");
@@ -426,7 +426,7 @@ void r11a_no_volume_gate_data_failure(const std::filesystem::path &directory) {
     check(writer.current_error(job) != S_OK, "R-11a: 副作用 2 —— job->first_error 必须置位");
     check(job->terminal_requested.load(),
           "R-11a: 副作用 2b —— terminal_requested 必须同步置位（gate 谓词依赖它）");
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.discarded_bytes == kPayload,
           "R-11a: 副作用 3 —— discarded 必须按剩余字节增长");
     check(metrics.pending_bytes == 0, "R-11a: 副作用 3b —— pending 必须归零");
@@ -510,13 +510,13 @@ void r14_terminal_records_discarded(const std::filesystem::path &directory) {
           "R-14: 写入必须被接受");
     check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-14: 必须进入暂停");
 
-    const auto paused = writer.snapshot_metrics();
+    const auto paused = writer.snapshot_global_meters();
     check(paused.written_bytes == kMib, "R-14: 第 1 个 buffer 必须已完整落盘");
     check(paused.discarded_bytes == 0, "R-14: 暂停期间 discarded 必须仍为 0");
 
     writer.cancel_job(job);
     check(writer.finish_job(job) != S_OK, "R-14: 取消后 job 必须失败");
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.discarded_bytes == kMib,
           "R-14: 已 dequeue 的 buffer 剩余字节必须**恰好补记一次**（1 MiB）");
     check(metrics.pending_bytes == 0, "R-14: pending 必须归零");
@@ -693,7 +693,7 @@ void r18_permanent_failure_records_discarded(const std::filesystem::path &direct
           "R-18: 写入必须被接受");
     check(writer.finish_job(job) != S_OK, "R-18: 永久错误必须让 job 失败");
 
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.written_bytes == kMib, "R-18: 第 1 个 buffer 必须落盘");
     check(metrics.discarded_bytes == kMib,
           "R-18: PermanentFailure 路径必须补记剩余字节（早期版本这里没人记账）");
@@ -722,7 +722,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
         check(writer.finish_job(job) == S_OK, "R-19: ① 干净写入必须成功");
-        check(writer.snapshot_metrics().discarded_bytes == 0, "R-19: ① Succeeded 必须记 0 次");
+        check(writer.snapshot_global_meters().discarded_bytes == 0, "R-19: ① Succeeded 必须记 0 次");
     }
     // ② PermanentFailure → 增量 remaining
     {
@@ -737,7 +737,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
         writer.finish_job(job);
-        check(writer.snapshot_metrics().discarded_bytes == 1 * kMib,
+        check(writer.snapshot_global_meters().discarded_bytes == 1 * kMib,
               "R-19: ② PermanentFailure 必须恰好记一次 remaining");
     }
     // ③ Terminal → 增量 remaining
@@ -755,7 +755,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-19: ③ 必须进入暂停");
         writer.cancel_job(job);
         writer.finish_job(job);
-        check(writer.snapshot_metrics().discarded_bytes == 1 * kMib,
+        check(writer.snapshot_global_meters().discarded_bytes == 1 * kMib,
               "R-19: ③ Terminal 必须恰好记一次 remaining");
     }
     // ④ SpaceFailure（gate 存在）→ 增量 0（骨架内部重试，不退出、不记账）
@@ -771,11 +771,11 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
         check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-19: ④ 必须进入暂停");
-        check(writer.snapshot_metrics().discarded_bytes == 0,
+        check(writer.snapshot_global_meters().discarded_bytes == 0,
               "R-19: ④ gate 存在时的 SpaceFailure 必须记 0 次");
         check(harness.release_probe_and_wait_ready(), "R-19: ④ 恢复");
         check(writer.finish_job(job) == S_OK, "R-19: ④ 恢复后成功");
-        const auto metrics = writer.snapshot_metrics();
+        const auto metrics = writer.snapshot_global_meters();
         check(metrics.discarded_bytes == 0 && metrics.pending_bytes == 0,
               "R-19: ④ 全程不得产生 discarded，且没有双重记账");
     }
@@ -815,7 +815,7 @@ void r9_flush_space_error(const std::filesystem::path &directory) {
     check(snapshot.closed, "R-9: 恢复后文件必须已关闭");
     check(!snapshot.failed, "R-9: 恢复后文件不得是失败状态");
     check(open_calls.load() == 1, "R-9: flush 重试不得重新打开文件（同 handle）");
-    check(writer.snapshot_metrics().completed_files == 1, "R-9: 必须计入 completed_files");
+    check(writer.snapshot_global_meters().completed_files == 1, "R-9: 必须计入 completed_files");
     check(read_file(path) == payload, "R-9: 数据必须完整");
     check(harness.log->count(VolumeSpaceTransition::Kind::Resumed) == 1,
           "R-9: 恢复必须产生一条 space_resumed");
@@ -950,7 +950,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         check(writer.current_error(job) != S_OK, "R-11b: ① open 失败必须置 job->first_error");
         check(open_calls.load() == 1,
               "R-11b: ① open 失败必须只尝试一次（open_attempted 的\"不再尝试\"语义）");
-        const auto metrics = writer.snapshot_metrics();
+        const auto metrics = writer.snapshot_global_meters();
         check(metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
               "R-11b: ① 记账不变量必须保持");
         check(metrics.discarded_bytes == 1,
@@ -987,7 +987,7 @@ void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) 
         check(snapshot.failed && snapshot.win32_error == ERROR_DISK_FULL,
               "R-11b: ② flush 失败必须置 file->failed 并记录原始码");
         check(writer.current_error(job) != S_OK, "R-11b: ② 必须置 job->first_error");
-        const auto metrics = writer.snapshot_metrics();
+        const auto metrics = writer.snapshot_global_meters();
         check(metrics.discarded_bytes == 0,
               "R-11b: ② Flush 路径**不得**增长 discarded（剩余字节由 writer_loop 收尾）");
         check(metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
@@ -1116,7 +1116,7 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
           "R-22: 部分成功后的空间失败必须让卷进入暂停");
 
     // 暂停期间：已确认落盘的前缀必须恰好被记账一次。
-    const auto paused = writer.snapshot_metrics();
+    const auto paused = writer.snapshot_global_meters();
     check(paused.written_bytes == kChunk,
           "R-22: 暂停期间 written 必须等于已确认落盘的前缀（256 KiB）");
     check(paused.accepted_bytes == kPayload, "R-22: accepted 必须仍是完整 payload");
@@ -1130,7 +1130,7 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
     writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-22: 恢复后 job 必须成功");
 
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.written_bytes == kPayload,
           "R-22: written 必须**恰好**等于 payload —— 多一字节就说明前缀被重复记账");
     check(metrics.accepted_bytes == kPayload, "R-22: accepted 必须等于 payload");
@@ -1173,7 +1173,7 @@ void r24_cancel_queued_retry(const std::filesystem::path &directory) {
     check(harness.release_probe_and_wait_ready(), "R-24: other job must still recover");
     check(writer.finish_job(a) == S_OK, "R-24: uncancelled job must succeed");
     check(read_file(directory / L"r24-a.bin") == payload, "R-24: recovered bytes must match");
-    const auto metrics = writer.snapshot_metrics();
+    const auto metrics = writer.snapshot_global_meters();
     check(metrics.pending_bytes == 0 && metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
           "R-24: all accepted bytes must be settled exactly once");
 }
@@ -1198,7 +1198,7 @@ void r25_cancel_blocked_producer(const std::filesystem::path &directory) {
         check(writer.finish_job(job) != S_OK, "R-25: cancelled producer job must fail");
         check(std::chrono::steady_clock::now() - start < 1s,
               "R-25: cancel/shutdown must release a producer holding the file mutex");
-        const auto metrics = writer.snapshot_metrics();
+        const auto metrics = writer.snapshot_global_meters();
         check(metrics.pending_bytes == 0 && metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
               "R-25: blocked producer cancellation must settle all bytes");
     }

@@ -107,7 +107,7 @@ def test_multivolume_7z_missing_tail_reports_missing_volume(tmp_path):
     raw = evidence.details
 
     assert raw["error"] == "next_header_out_of_range"
-    assert raw["possible_missing_volume"] is True
+    assert raw["read_error"]["possible_missing_volume"] is True
     assert "missing_volume" in raw["damage_flags"]
     assert raw["read_error"]["field"] == "7z.next_header"
     assert "missing_volume" in evidence.segments[0].damage_flags

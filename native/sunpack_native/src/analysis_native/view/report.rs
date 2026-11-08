@@ -1894,13 +1894,11 @@ pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
                 return false;
             }
             let identity = tar_header_identity(&header, 0, reader.len());
-            identity.plausible
+            identity.validated_size.is_ok()
                 && identity.name_nonempty
                 && identity.numeric_fields_valid
                 && identity.typeflag_valid
                 && identity.payload_in_range
-                && identity.stored_checksum == identity.computed_checksum
-                && identity.error.is_empty()
         }
         "gzip" | "bzip2" | "xz" | "zstd" | "lz4" => {
             crate::analysis_native::confirm_compression_format_identity_native(path, format)

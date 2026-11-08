@@ -14,8 +14,8 @@ _VOLUME_CALLBACK_STYLES = frozenset({
 
 @dataclass(slots=True)
 class PasswordProbeInput:
-    source: dict | None
-    path: str
+    format_hint: str = ""
+    zip_eocd_offset: int | None = None
     ranges: list[dict] | None = None
     volumes: list[dict] | None = None
     volume_style: str = ""
@@ -23,9 +23,6 @@ class PasswordProbeInput:
     session_paths: tuple[str, ...] = ()
     _stack: ExitStack | None = field(default=None, repr=False)
     _sessions: tuple | None = field(default=None, repr=False)
-
-    def get(self, key, default=None):
-        return self.source.get(key, default) if self.source is not None else default
 
     @contextmanager
     def scope(self):
@@ -58,7 +55,7 @@ def prepare_password_input(
     if isinstance(archive_input, PasswordProbeInput):
         return archive_input
     if not archive_input:
-        return PasswordProbeInput(archive_input, archive_path, volume_aware=bool(part_paths), session_paths=(archive_path,))
+        return PasswordProbeInput(volume_aware=bool(part_paths), session_paths=(archive_path,))
     descriptor = (archive_input if isinstance(archive_input, ArchiveInputDescriptor) else
                   ArchiveInputDescriptor.from_dict(archive_input, archive_path=archive_path, part_paths=part_paths))
     path = descriptor.entry_path or archive_path
@@ -80,7 +77,11 @@ def prepare_password_input(
             ranges = [extent.to_dict() for extent in extents]
     physical = volumes if volume_aware and volumes else ranges
     return PasswordProbeInput(
-        {"format_hint": descriptor.format_hint, "analysis": descriptor.analysis},
-        path, ranges, volumes, descriptor.volume_style, volume_aware,
-        tuple(item["path"] for item in physical) if physical else (path,),
+        format_hint=descriptor.format_hint,
+        zip_eocd_offset=descriptor.analysis.get("zip_eocd_offset"),
+        ranges=ranges,
+        volumes=volumes,
+        volume_style=descriptor.volume_style,
+        volume_aware=volume_aware,
+        session_paths=tuple(item["path"] for item in physical) if physical else (path,),
     )

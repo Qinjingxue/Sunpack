@@ -26,7 +26,7 @@ class SevenZipFastVerifier:
                 error_text="7z volume set requires the volume-aware bounded verifier",
             )
         ranges = prepared.ranges
-        normalized_passwords = list(passwords or [""])
+        normalized_passwords = passwords or [""]
         with prepared.borrow_sessions() as sessions:
             outcome = (
                 seven_zip_fast_verify_passwords_from_ranges(ranges, normalized_passwords, sessions=sessions)

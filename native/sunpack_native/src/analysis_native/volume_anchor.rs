@@ -803,9 +803,7 @@ fn probe_zip_reader(
     base: u64,
 ) -> bool {
     let eocd = crate::formats::zip::find_eocd_record(tail, true);
-    let trailing = eocd.is_some_and(|e| {
-        e.offset + 22 + usize::from(u16_le(tail, e.offset + 20).unwrap_or(0)) < tail.len()
-    });
+    let trailing = eocd.is_some_and(|e| e.end < tail.len());
     let original = trailing.then(|| out.clone());
     if let Some(eocd) = eocd {
         let record = &tail[eocd.offset..eocd.offset + 22];

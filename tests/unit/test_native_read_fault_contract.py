@@ -101,5 +101,4 @@ def test_tar_missing_end_blocks_at_physical_eof_is_noncanonical_boundary(tmp_pat
     assert result["segment_end"] == 512
     assert result["boundary_confidence"] == "medium"
     assert result.get("read_error") is None
-    assert result.get("possible_missing_volume") is not True
     assert "missing_end_block" in result["damage_flags"]

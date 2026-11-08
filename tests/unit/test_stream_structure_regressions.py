@@ -8,7 +8,7 @@ import time
 
 import pytest
 import zstandard
-from sunpack_native import inspect_compression_stream_structure, inspect_tar_header_structure
+from sunpack_native import AnalysisBinaryView, inspect_compression_stream_structure
 
 
 def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carving(tmp_path):
@@ -133,12 +133,16 @@ def test_concatenated_tar_is_aligned_to_the_archive_start_inside_a_carrier(tmp_p
     path = tmp_path / "carrier.bin"
     path.write_bytes(body)
 
-    result = inspect_tar_header_structure(str(path), prefix, len(body))
+    view = AnalysisBinaryView(str(path))
+    try:
+        first = view.probe_tar(prefix)
+        second = view.probe_tar(first["segment_end"])
+    finally:
+        view.close()
 
-    assert result["archive.concatenated"] is True
-    assert result["archive.concatenated_offset"] == prefix + 2048
-    assert result["archive.trailing_data"] == 0
-    assert "trailing_junk" not in result["damage_flags"]
+    assert first["walk_complete"] and second["walk_complete"]
+    assert first["segment_end"] == prefix + 2048
+    assert second["segment_end"] == len(body)
 
 
 def test_multistream_bzip2_is_not_trailing_junk_or_falsely_verified(tmp_path):

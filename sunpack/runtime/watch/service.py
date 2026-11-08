@@ -31,9 +31,6 @@ SERVICE_STATE = "state.snapshot"
 WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
 # Optional columns: ``<input root> | <output root> | <deep_detect> | <initial_scanned>``.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
-CONTROL_STOP = "stop"
-CONTROL_SCHEDULER_WAKEUP = "scheduler_wakeup"
-
 
 
 @dataclass(frozen=True)
@@ -390,7 +387,7 @@ class WatchService:
         self._stop_requested = False
         self._last_logged_pending = 0
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._control_queue: asyncio.Queue[str | None] | None = None
+        self._scheduler_wakeup = asyncio.Event()
         self._scheduler_wakeup_lock = threading.Lock()
         self._scheduler_wakeup_pending = False
         self._broker_acquired = False
@@ -426,8 +423,6 @@ class WatchService:
                 roots=self.roots,
                 once=once,
             )
-            if self._control_queue is None:
-                self._control_queue = asyncio.Queue()
             async with self._reload_lock:
                 await self._clean_non_ntfs_roots(self.config, self.service_config)
                 await self._start_scheduler()
@@ -439,67 +434,51 @@ class WatchService:
                 await self.scheduler.run_once()
                 return 0
             self._start_config_observer()
-            next_scheduler_run: float | None = 0.0
             active_scheduler_ref = None
             while not self._stop_requested:
-                # Schedule against the event-loop clock so wall-clock changes
-                # cannot perturb pending work or asyncio timers.
-                now = self._loop.time()
+                next_scheduler_run = None
                 if self.scheduler is not None:
                     if active_scheduler_ref is None or self.scheduler is not active_scheduler_ref():
                         # An idle service can outlive its last scheduler.
                         active_scheduler_ref = weakref.ref(self.scheduler)
-                        next_scheduler_run = 0.0
                         self._last_logged_pending = 0
-                    if next_scheduler_run is not None and now >= next_scheduler_run:
-                        try:
-                            result = await self.scheduler.run_once()
-                            if self._should_log_scheduler_tick(result):
-                                self.log.write(
-                                    "scheduler_tick",
-                                    processed=result.processed,
-                                    succeeded=result.succeeded,
-                                    failed=result.failed,
-                                    pending=result.pending,
-                                    errors=result.errors,
-                                )
-                        except Exception as exc:
-                            self.log.write("scheduler_error", error=str(exc), error_type=type(exc).__name__)
-                        finally:
-                            # The next scheduler wake may be hours away.
-                            result = None
-                        now = self._loop.time()
-                        delay = self.scheduler.next_delay_seconds() if self.scheduler is not None else None
-                        next_scheduler_run = None if delay is None else now + delay
-                    sleep_seconds = None if next_scheduler_run is None else max(0.0, next_scheduler_run - now)
-                else:
-                    sleep_seconds = None
-                if sleep_seconds is None:
-                    # Every input that can make an idle scheduler runnable has
-                    # a control event: filesystem changes, password changes,
-                    # config reloads, pipeline completions, and service stop.
-                    # Do not wake four times per second merely to re-check an
-                    # empty scheduler.
-                    control_event = await self._control_queue.get()
-                else:
                     try:
-                        control_event = await asyncio.wait_for(
-                            self._control_queue.get(),
-                            timeout=max(0.0, sleep_seconds),
-                        )
-                    except asyncio.TimeoutError:
-                        control_event = None
-                if control_event == CONTROL_SCHEDULER_WAKEUP:
-                    # Consume before running again: an event that arrives during
-                    # the next tick must be able to request another tick.
-                    with self._scheduler_wakeup_lock:
-                        self._scheduler_wakeup_pending = False
+                        result = await self.scheduler.run_once()
+                        if self._should_log_scheduler_tick(result):
+                            self.log.write(
+                                "scheduler_tick",
+                                processed=result.processed,
+                                succeeded=result.succeeded,
+                                failed=result.failed,
+                                pending=result.pending,
+                                errors=result.errors,
+                            )
+                    except Exception as exc:
+                        self.log.write("scheduler_error", error=str(exc), error_type=type(exc).__name__)
+                    finally:
+                        # The next scheduler wake may be hours away.
+                        result = None
                     if self.scheduler is not None:
-                        # A completed request is still inflight until the next
-                        # tick harvests it, so run even if no deadline is due.
-                        next_scheduler_run = self._loop.time()
-                elif control_event == CONTROL_STOP:
-                    self._stop_requested = True
+                        delay = self.scheduler.next_delay_seconds()
+                        if delay is not None:
+                            next_scheduler_run = self._loop.time() + delay
+                if self._stop_requested:
+                    break
+                # A deadline and a producer wake both make a tick runnable.
+                # An already set wake needs neither a timer nor a child task.
+                timer = (
+                    self._loop.call_at(next_scheduler_run, self._scheduler_wakeup.set)
+                    if next_scheduler_run is not None and not self._scheduler_wakeup.is_set()
+                    else None
+                )
+                try:
+                    await self._scheduler_wakeup.wait()
+                finally:
+                    if timer is not None:
+                        timer.cancel()
+                with self._scheduler_wakeup_lock:
+                    self._scheduler_wakeup.clear()
+                    self._scheduler_wakeup_pending = False
             return 0
         except Exception as exc:
             self._startup_error = exc
@@ -538,6 +517,7 @@ class WatchService:
                         self._broker_acquired = False
                 self._stop_toast_host()
             with self._scheduler_wakeup_lock:
+                self._scheduler_wakeup.clear()
                 self._scheduler_wakeup_pending = False
             self.log.write("service_stopped", state_dir=self.state_dir)
             await asyncio.to_thread(self.log.close)
@@ -621,12 +601,16 @@ class WatchService:
         }
 
     def request_stop(self) -> None:
+        if self._stop_requested:
+            return
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(setattr, self, "_stop_requested", True)
+            self._loop.call_soon_threadsafe(self._signal_stop)
         else:
             self._stop_requested = True
-        if self._loop is not None and self._control_queue is not None:
-            self._loop.call_soon_threadsafe(self._control_queue.put_nowait, CONTROL_STOP)
+
+    def _signal_stop(self) -> None:
+        self._stop_requested = True
+        self._scheduler_wakeup.set()
 
     def request_reload(self) -> None:
         with self._config_wakeup_lock:
@@ -826,17 +810,13 @@ class WatchService:
 
     def _wake_scheduler(self) -> None:
         with self._scheduler_wakeup_lock:
-            loop, queue = self._loop, self._control_queue
-            if loop is None or queue is None or self._scheduler_wakeup_pending:
+            loop = self._loop
+            if loop is None or self._stop_requested or self._scheduler_wakeup_pending:
                 return
             # One wake covers all currently published scheduler state.
-            # Bound both cross-thread callbacks and queued wake tokens.
             self._scheduler_wakeup_pending = True
             try:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    CONTROL_SCHEDULER_WAKEUP,
-                )
+                loop.call_soon_threadsafe(self._scheduler_wakeup.set)
             except BaseException:
                 self._scheduler_wakeup_pending = False
                 raise

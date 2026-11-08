@@ -1,23 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterable
 
 from sunpack.core.passwords.verifier.base import PasswordBatchVerification, PasswordVerifier
 from sunpack.core.passwords.verifier.input import PasswordProbeInput, prepare_password_input
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-
-
-@dataclass
-class PasswordVerifierRegistry:
-    fast_verifiers: list[PasswordVerifier] = field(default_factory=list)
-
-    def add_fast(self, verifier: PasswordVerifier) -> None:
-        self.fast_verifiers.append(verifier)
-
-    def build(self) -> PasswordVerifier:
-        if len(self.fast_verifiers) == 1:
-            return self.fast_verifiers[0]
-        return PasswordVerifierChain(list(self.fast_verifiers))
 
 
 class PasswordVerifierChain:
@@ -28,8 +15,17 @@ class PasswordVerifierChain:
     confirmation of weak candidates.
     """
 
-    def __init__(self, fast_verifiers: list[PasswordVerifier]):
-        self.fast_verifiers = list(fast_verifiers)
+    def __init__(self, fast_verifiers: Iterable[PasswordVerifier]):
+        self._fast_verifiers = tuple(fast_verifiers)
+        by_format: dict[str, list[PasswordVerifier]] = {}
+        for verifier in self._fast_verifiers:
+            format_hint = _normalize_archive_format(str(getattr(verifier, "format_hint", "")))
+            by_format.setdefault(format_hint, []).append(verifier)
+        self._generic_verifiers = tuple(by_format.pop("", ()))
+        self._preferred_verifiers = {
+            format_hint: (*verifiers, *self._generic_verifiers)
+            for format_hint, verifiers in by_format.items()
+        }
 
     prepare_input = staticmethod(prepare_password_input)
 
@@ -41,37 +37,12 @@ class PasswordVerifierChain:
         part_paths: list[str] | None = None,
         archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
-        return self._run_fast_verifiers(
-            archive_path,
-            passwords,
-            part_paths=part_paths,
-            archive_input=archive_input,
+        preferred = _preferred_archive_format(archive_input)
+        verifiers = (
+            self._preferred_verifiers.get(preferred, self._generic_verifiers)
+            if preferred else self._fast_verifiers
         )
-
-    def verify_fast_batch(
-        self,
-        archive_path: str,
-        passwords: list[str],
-        *,
-        part_paths: list[str] | None = None,
-        archive_input: dict | PasswordProbeInput | None = None,
-    ) -> PasswordBatchVerification:
-        return self.verify_batch(
-            archive_path,
-            passwords,
-            part_paths=part_paths,
-            archive_input=archive_input,
-        )
-
-    def _run_fast_verifiers(
-        self,
-        archive_path: str,
-        passwords: list[str],
-        *,
-        part_paths: list[str] | None = None,
-        archive_input: dict | PasswordProbeInput | None = None,
-    ) -> PasswordBatchVerification:
-        for verifier in self._ordered_fast_verifiers(archive_path, archive_input):
+        for verifier in verifiers:
             outcome = verifier.verify_batch(
                 archive_path,
                 passwords,
@@ -88,36 +59,14 @@ class PasswordVerifierChain:
             error_text="no bounded password verifier accepted archive",
         )
 
-    def _ordered_fast_verifiers(
-        self,
-        archive_path: str,
-        archive_input: dict | PasswordProbeInput | None = None,
-    ) -> list[PasswordVerifier]:
-        preferred = _preferred_archive_format(archive_input)
-        if not preferred:
-            return list(self.fast_verifiers)
-        matching = [
-            verifier
-            for verifier in self.fast_verifiers
-            if _normalize_archive_format(str(getattr(verifier, "format_hint", ""))) == preferred
-        ]
-        generic = [
-            verifier
-            for verifier in self.fast_verifiers
-            if not _normalize_archive_format(str(getattr(verifier, "format_hint", "")))
-        ]
-        return matching + [verifier for verifier in generic if verifier not in matching]
 
-
-def _preferred_archive_format(archive_input: dict | PasswordProbeInput | None = None) -> str:
-    if isinstance(archive_input, ArchiveInputDescriptor):
+def _preferred_archive_format(archive_input: ArchiveInputDescriptor | dict | PasswordProbeInput | None) -> str:
+    if isinstance(archive_input, (ArchiveInputDescriptor, PasswordProbeInput)):
         return _normalize_archive_format(archive_input.format_hint)
     if archive_input is not None:
-        hinted = _normalize_archive_format(
+        return _normalize_archive_format(
             str(archive_input.get("format_hint") or archive_input.get("format") or "")
         )
-        if hinted:
-            return hinted
     return ""
 
 
