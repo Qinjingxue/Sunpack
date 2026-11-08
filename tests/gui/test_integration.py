@@ -632,10 +632,7 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
 
     def rows():
         log.flush()
-        result = _state_projection(log.path)["tasks"]["rows"]
-        for row in result:
-            row.pop("sortSequence")  # Replay-local tie breaker, not identity.
-        return result
+        return _state_projection(log.path)["tasks"]["rows"]
 
     def compact():
         # Drain first, then exceed the obsolete-byte threshold in a single

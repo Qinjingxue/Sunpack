@@ -1597,8 +1597,10 @@ private:
         auto *self = static_cast<NativeJobExecutor *>(context);
         if (self) {
             // NativeCpuBudget calls this only on a saturated->available edge,
-            // so no per-release queue hint is needed here.
-            self->condition_.notify_one();
+            // and its atomic update is outside the queue mutex. Synchronize
+            // with the waiter's predicate check before delivering that edge.
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            if (!self->queues_empty_locked()) self->condition_.notify_one();
         }
     }
 
@@ -1863,8 +1865,14 @@ private:
                 job = pop_next_job_locked();
                 active_jobs_ += 1;
                 admitted_jobs = active_jobs_;
-                wake_next_job =
-                    !queues_empty_locked() && cpu_budget_.can_acquire_base();
+                if (queues_empty_locked()) {
+                    // On canceling shutdown the first broadcast can reach
+                    // idle workers before a parked job is requeued. Removing
+                    // that last job makes the exit predicate true for all.
+                    if (stopping_ && parked_jobs_ == 0) condition_.notify_all();
+                } else {
+                    wake_next_job = cpu_budget_.can_acquire_base();
+                }
             }
 
             // Hand admission forward one worker at a time when multiple

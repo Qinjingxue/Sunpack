@@ -192,10 +192,10 @@ def _run_python_phase(
             rows.append(_python_sample("python-after-engine-close", traced=True))
 
         asyncio.run(run_rounds())
-        from sunpack_native import release_reader_handles_under
+        from sunpack_native import release_reader_resources_under_roots
 
-        release_reader_handles_under(str(workspace.root))
-        rows.append(_python_sample("python-after-reader-handle-release", traced=True))
+        release_reader_resources_under_roots([str(workspace.root)])
+        rows.append(_python_sample("python-after-reader-resource-release", traced=True))
     finally:
         try:
             asyncio.run(persistent_runtime.close_persistent_runtime())

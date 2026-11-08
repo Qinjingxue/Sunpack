@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from sunpack.core.support.archive_knowledge_projection import inspection_prepass
 from sunpack.core.support.collections import clamp01 as _clamp01
 from dataclasses import replace
 from typing import Any, Callable
@@ -522,8 +523,15 @@ _STRUCTURAL_DAMAGE_FLAGS = {
 
 
 def _container_integrity_from_evidence(evidence: VerificationEvidence) -> str:
+    prepass = inspection_prepass(evidence.task)
+    segment = None
+    if "segment" not in prepass:
+        candidate = evidence.task.knowledge().get("source.selected_segment.segment")
+        if isinstance(candidate, dict):
+            segment = candidate
     flags = _collect_container_flags(
-        evidence.analysis_facts,
+        prepass,
+        segment,
         evidence.archive_input.analysis,
     )
     if flags & _STRUCTURAL_DAMAGE_FLAGS:

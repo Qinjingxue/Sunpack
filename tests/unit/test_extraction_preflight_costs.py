@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.async_batch import run_extract, stub_worker_attempt
-from tests.helpers.archive_tasks import make_archive_task, merge_task_knowledge
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 
@@ -34,14 +34,7 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
     archive = tmp_path / "encrypted.zip"
     archive.write_bytes(b"dummy")
     output = tmp_path / "out"
-    task = merge_task_knowledge(make_archive_task(archive, format_hint="zip"), {"format": {"zip": {"structure": {
-        "plausible": True,
-        "central_directory_present": True,
-        "central_directory_walk_ok": True,
-        "central_directory_encrypted_entries": 1,
-        "encryption_scan_complete": True,
-        "password_required": True,
-    }}}})
+    task = make_archive_task(archive, format_hint="zip", analysis={"password_required": True})
     worker_result = {
         "type": "result",
         "status": "failed",

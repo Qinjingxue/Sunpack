@@ -1011,8 +1011,18 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         assert replayed["volume_attempts"] == 2 and replayed["volume_selection"]["sources"] == [0, 2]
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "changed")["failure_kind"] == "input_changed"
         assert next((tmp_path / "large-2").iterdir()).read_bytes() == b"memory replay" * 100
-        send({"worker_command": "shutdown"})
-        process.wait(timeout=10)
+        # A protocol failure cancels a parked job. The final job leaving the
+        # queue must also let the other execution lanes exit their wait.
+        # Force an OS denial even if the allocator still has the high-headroom
+        # sample from the preceding replay.
+        capacity(48)
+        send({"job_id": "shutdown-parked", "archive_input": ArchiveInputDescriptor.from_parts(
+            archive_path=str(archive), format_hint="xz").to_dict(), "output_dir": str(tmp_path / "shutdown-parked")})
+        until(lambda event: event.get("job_id") == "shutdown-parked" and event.get("event") == "memory_blocked")
+        process.stdin.write(b"invalid!")
+        process.stdin.flush()
+        assert until(lambda event: event.get("job_id") == "shutdown-parked" and event.get("type") == "result")["native_status"] == "cancelled"
+        assert process.wait(timeout=10) == 2
     finally:
         if process.poll() is None:
             process.terminate()

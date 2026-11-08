@@ -24,7 +24,6 @@ class VerificationEvidence:
     extraction_result: ExtractionResult
     archive_input: ArchiveInputDescriptor
     password: str | None
-    analysis_facts: dict[str, Any] = field(default_factory=dict)
     worker_result: dict[str, Any] = field(default_factory=dict)
     _output_inventory_cache: OutputInventory | None = field(default=None, init=False, repr=False, compare=False)
     _file_observation_owner: str = field(default="", init=False, repr=False, compare=False)
@@ -63,28 +62,13 @@ def build_verification_evidence(
             password = knowledge_view.archive_password(task)
     with _phase(phase_timer, f"{phase_prefix}_archive_input"):
         archive_input = extraction_result.logical_input.descriptor if extraction_result.logical_input else task.archive_input()
-    with _phase(phase_timer, f"{phase_prefix}_analysis_facts"):
-        analysis_facts = _analysis_facts_from_task(task)
     return VerificationEvidence(
         task=task,
         extraction_result=extraction_result,
         archive_input=archive_input,
         password=password,
-        analysis_facts=analysis_facts,
         worker_result=extraction_result.diagnostics.get("result", {}),
     )
-
-
-def _analysis_facts_from_task(task: ArchiveTask) -> dict[str, Any]:
-    prepass = knowledge_view.inspection_prepass(task)
-    selected = knowledge_view.selected_format(task)
-    segment = knowledge_view.get(task, "source.selected_segment.segment", {})
-    output = dict(prepass)
-    if selected:
-        output.setdefault("selected_format", selected)
-    if isinstance(segment, dict):
-        output.setdefault("segment", dict(segment))
-    return output
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

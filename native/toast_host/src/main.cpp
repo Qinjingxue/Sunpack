@@ -424,10 +424,11 @@ public:
         SYSTEMTIME now{}; GetSystemTime(&now);
         queue_.push_back({std::move(kind),reason,now}); wake_.notify_one();
     }
-    ~DiagnosticLog() {
+    void stop() noexcept {
         { std::lock_guard<std::mutex> lock(mutex_); stopping_=true; wake_.notify_one(); }
-        thread_.join();
+        if (thread_.joinable()) thread_.join();
     }
+    ~DiagnosticLog() { stop(); }
 };
 
 std::wstring hex_encode(std::wstring_view value) {
@@ -728,7 +729,7 @@ std::wstring progress_xml(const Snapshot& snapshot) {
 
 class ToastPresenter {
 public:
-    explicit ToastPresenter(std::shared_ptr<DiagnosticLog> diagnostic_log)
+    explicit ToastPresenter(std::weak_ptr<DiagnosticLog> diagnostic_log)
         : notifier_(ToastNotificationManager::CreateToastNotifier(kAppId)),
           diagnostic_log_(std::move(diagnostic_log)) {}
 
@@ -781,10 +782,9 @@ private:
     }
 
     void observe_dismissal(const ToastNotification& toast, std::string_view kind) {
-        if (!diagnostic_log_) return;
-        const std::weak_ptr<DiagnosticLog> log = diagnostic_log_;
+        if (diagnostic_log_.expired()) return;
         const std::string kind_name(kind);
-        toast.Dismissed([log, kind_name](
+        toast.Dismissed([log = diagnostic_log_, kind_name](
             const ToastNotification&,
             const ToastDismissedEventArgs& args
         ) noexcept {
@@ -872,7 +872,7 @@ private:
     }
 
     winrt::Windows::UI::Notifications::ToastNotifier notifier_{nullptr};
-    std::shared_ptr<DiagnosticLog> diagnostic_log_;
+    std::weak_ptr<DiagnosticLog> diagnostic_log_;
     ToastNotification progress_popup_{nullptr};
     std::wstring progress_tag_;
 };
@@ -885,6 +885,12 @@ struct ToastContext {
     std::shared_ptr<DiagnosticLog> diagnostic_log;
     std::unique_ptr<ToastPresenter> presenter;
     DWORD owner_thread = GetCurrentThreadId();
+    ~ToastContext() {
+        presenter.reset();
+        // A dismissal callback may have locked its weak reference already.
+        // Drain on the owning thread even if that callback still owns the log.
+        if (diagnostic_log) diagnostic_log->stop();
+    }
 };
 
 template <typename Work>
@@ -974,11 +980,15 @@ int self_test() {
             ~TemporaryLog() { if(path[0]) DeleteFileW(path); }
         } temporary;
         if(!GetTempPathW(MAX_PATH,directory) || !GetTempFileNameW(directory,L"spt",0,temporary.path)) return 7;
+        auto callback_log = std::make_shared<DiagnosticLog>(temporary.path);
         {
-            DiagnosticLog log(temporary.path);
-            log.submit("progress",ToastDismissalReason::UserCanceled);
-            log.submit("success",ToastDismissalReason::TimedOut);
+            ToastContext context;
+            context.diagnostic_log = callback_log;
+            callback_log->submit("progress",ToastDismissalReason::UserCanceled);
+            callback_log->submit("final",ToastDismissalReason::TimedOut);
         }
+        callback_log->submit("late",ToastDismissalReason::ApplicationHidden);
+        callback_log.reset();
         HANDLE file=CreateFileW(temporary.path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
         if(file==INVALID_HANDLE_VALUE) return 8;
         char bytes[2048]{}; DWORD count=0;

@@ -70,7 +70,7 @@ namespace sunpack::sevenzip
 
         struct BoundedPasswordProbeSelection
         {
-            std::vector<UInt32> indices;
+            std::optional<UInt32> index;
             bool item_count_known = false;
             UInt32 item_count = 0;
             bool encrypted = false;
@@ -122,7 +122,7 @@ namespace sunpack::sevenzip
             }
             const auto &selected = selection.encrypted ? encrypted : regular;
             if (!selected) return selection;
-            selection.indices = {selected->index};
+            selection.index = selected->index;
             return selection;
         }
 
@@ -154,7 +154,7 @@ namespace sunpack::sevenzip
         {
             auto *raw_callback = new ExtractCallback(password);
             CMyComPtr<IArchiveExtractCallback> callback(raw_callback);
-            if (selection.indices.empty())
+            if (!selection.index)
             {
                 const auto disposition = empty_bounded_password_probe_disposition(
                     selection.item_count_known, selection.item_count, encryption_evidence);
@@ -174,8 +174,7 @@ namespace sunpack::sevenzip
             }
             else
             {
-                hr = archive->Extract(selection.indices.data(),
-                    static_cast<UInt32>(selection.indices.size()), kTestMode, callback);
+                hr = archive->Extract(&*selection.index, 1, kTestMode, callback);
             }
             operation = raw_callback->operation_result();
             encryption_evidence = encryption_evidence || raw_callback->password_requested();

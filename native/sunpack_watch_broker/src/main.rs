@@ -254,7 +254,6 @@ fn serve_client(
             let _ = write_overlapped(pipe.raw(), stop_event, io_event.raw(), &response.encode());
             break;
         };
-        let release = request.opcode == Opcode::Release;
         let response = if !request_shape_is_valid(&request)
             || (request.opcode != Opcode::Hello && !leased)
         {
@@ -302,9 +301,6 @@ fn serve_client(
                 IoResult::Completed(_) | IoResult::Disconnected | IoResult::Stopped => break,
             }
         }
-        if release {
-            break;
-        }
     }
     unsafe {
         DisconnectNamedPipe(pipe.raw());
@@ -314,7 +310,7 @@ fn serve_client(
 
 fn request_shape_is_valid(request: &Request) -> bool {
     match request.opcode {
-        Opcode::Hello | Opcode::Ping | Opcode::Release => {
+        Opcode::Hello | Opcode::Ping => {
             request.volume_guid.is_empty()
                 && request.file_id_len == 0
                 && request.previous_usn == 0
@@ -436,7 +432,7 @@ fn handle_request(
     let mut response = Response::ok(request.request_id);
     let mut payload = Vec::new();
     let result: io::Result<(u64, i64, sunpack_usn_core::ChangeReasons)> = match request.opcode {
-        Opcode::Hello | Opcode::Ping | Opcode::Release => Ok((0, 0, Default::default())),
+        Opcode::Hello | Opcode::Ping => Ok((0, 0, Default::default())),
         Opcode::ProbeVolume => journals
             .with_reader(request.volume_guid, JournalReader::probe_volume)
             .map(|(journal_id, next_usn)| (journal_id, next_usn, Default::default())),
@@ -895,7 +891,6 @@ mod tests {
         for _ in 0..16 {
             let mut next = connect(&name);
             request(&mut next, Opcode::Hello);
-            request(&mut owner, Opcode::Release);
             owner = next;
         }
         let mut unleased = connect(&name);
@@ -909,14 +904,12 @@ mod tests {
             Response::decode(&response).unwrap().status,
             Status::InvalidRequest
         );
-        request(&mut owner, Opcode::Release);
         drop(owner);
         assert_eq!(
             server.done.recv_timeout(Duration::from_millis(20)),
             Err(RecvTimeoutError::Timeout)
         );
         request(&mut unleased, Opcode::Hello);
-        request(&mut unleased, Opcode::Release);
         drop(unleased);
         server
             .done

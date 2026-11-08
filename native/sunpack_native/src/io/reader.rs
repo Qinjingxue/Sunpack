@@ -21,7 +21,7 @@ thread_local! {
 
 const BLOCK_SIZE: usize = 64 * 1024;
 const DEFAULT_SHARED_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const CACHE_SHARDS: usize = 64;
+const CACHE_SHARDS: usize = u64::BITS as usize;
 const HOT_CACHE_FRACTION: usize = 4;
 const HOT_EDGE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HANDLE_CAPACITY: usize = 256;
@@ -1046,9 +1046,27 @@ impl FileIdentity {
 struct FileSource {
     identity: FileIdentity,
     cache_id: u64,
+    cached_shards: AtomicU64,
     file: RwLock<Option<TrackedFile>>,
     closed: AtomicBool,
     block_loads: Mutex<HashMap<u64, Arc<BlockLoad>>>,
+}
+
+impl Drop for FileSource {
+    fn drop(&mut self) {
+        // Blocks are keyed by this source's generation, so no future reader
+        // can reuse them once the last handle or in-flight reader is gone.
+        let mut shards = *self.cached_shards.get_mut();
+        while shards != 0 {
+            let index = shards.trailing_zeros() as usize;
+            shards &= shards - 1;
+            if let Ok(mut shard) = manager().cache_shards[index].lock() {
+                if shard.remove_source(self.cache_id).0 != 0 {
+                    shard.compact_stale_orders();
+                }
+            }
+        }
+    }
 }
 
 struct BlockLoad {
@@ -1616,6 +1634,19 @@ impl CacheShard {
         Some(entry)
     }
 
+    fn remove_source(&mut self, source_id: u64) -> (usize, usize) {
+        let Some(source) = self.by_source.remove(&source_id) else {
+            return (0, 0);
+        };
+        let mut removed_bytes = 0;
+        let count = source.indices.len();
+        for index in source.indices {
+            let key = BlockKey { source_id, index };
+            removed_bytes += self.remove_entry(&key, true).unwrap().data.len();
+        }
+        (count, removed_bytes)
+    }
+
     fn compact_stale_orders(&mut self) {
         // Cache payloads and byte counters are removed synchronously. Only
         // obsolete LRU queue keys are compacted amortized so targeted release
@@ -1644,6 +1675,19 @@ impl CacheShard {
 
 impl ReaderManager {
     fn clear_resources(&self) -> io::Result<(usize, usize, usize)> {
+        let mut handles = self
+            .handles
+            .lock()
+            .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
+        let entries = std::mem::take(&mut handles.entries);
+        let retired = std::mem::take(&mut handles.order);
+        drop(handles);
+        drop(retired);
+        for entry in entries.values() {
+            entry.source.close()?;
+        }
+        // A retired handle cannot publish a block after its close. Keep the
+        // Arc until the cache sweep accounts for the source's released bytes.
         let mut removed_entries = 0usize;
         let mut removed_bytes = 0usize;
         for shard in &self.cache_shards {
@@ -1657,19 +1701,7 @@ impl ReaderManager {
             drop(shard);
             drop(retired);
         }
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        let removed_handles = handles.entries.len();
-        let entries = std::mem::take(&mut handles.entries);
-        let retired = std::mem::take(&mut handles.order);
-        drop(handles);
-        drop(retired);
-        for entry in entries.into_values() {
-            entry.source.close()?;
-        }
-        Ok((removed_handles, removed_entries, removed_bytes))
+        Ok((entries.len(), removed_entries, removed_bytes))
     }
 
     fn release_resources_under_roots(
@@ -1679,39 +1711,6 @@ impl ReaderManager {
         if roots.is_empty() {
             return Ok((0, 0, 0));
         }
-
-        let mut removed_entries = 0usize;
-        let mut removed_bytes = 0usize;
-        for shard in &self.cache_shards {
-            let mut shard = shard
-                .lock()
-                .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-            let source_ids = shard
-                .by_source
-                .iter()
-                .filter_map(|(&id, source)| path_is_under_roots(&source.path, roots).then_some(id))
-                .collect::<Vec<_>>();
-            for source_id in source_ids {
-                let source = shard.by_source.remove(&source_id).unwrap();
-                for index in source.indices {
-                    let key = BlockKey { source_id, index };
-                    if let Some(entry) = shard.remove_entry(&key, true) {
-                        removed_entries += 1;
-                        removed_bytes += entry.data.len();
-                    }
-                }
-            }
-            shard.compact_stale_orders();
-        }
-        let removed_handles = self.release_handles_under_roots(roots)?;
-        Ok((removed_handles, removed_entries, removed_bytes))
-    }
-
-    fn release_handles_under_roots(&self, roots: &[PathBuf]) -> io::Result<usize> {
-        if roots.is_empty() {
-            return Ok(0);
-        }
-
         let mut handles = self
             .handles
             .lock()
@@ -1725,11 +1724,28 @@ impl ReaderManager {
         crate::collections::trim_map(&mut handles.entries);
         crate::collections::trim_deque(&mut handles.order);
         drop(handles);
-        let removed = sources.len();
-        for source in sources {
+        for source in &sources {
             source.close()?;
         }
-        Ok(removed)
+        let mut removed_entries = 0usize;
+        let mut removed_bytes = 0usize;
+        for shard in &self.cache_shards {
+            let mut shard = shard
+                .lock()
+                .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
+            let source_ids = shard
+                .by_source
+                .iter()
+                .filter_map(|(&id, source)| path_is_under_roots(&source.path, roots).then_some(id))
+                .collect::<Vec<_>>();
+            for source_id in source_ids {
+                let (entries, bytes) = shard.remove_source(source_id);
+                removed_entries += entries;
+                removed_bytes += bytes;
+            }
+            shard.compact_stale_orders();
+        }
+        Ok((sources.len(), removed_entries, removed_bytes))
     }
 
     fn open_file(&self, path: &Path) -> io::Result<Arc<FileSource>> {
@@ -1749,11 +1765,14 @@ impl ReaderManager {
         let source = Arc::new(FileSource {
             identity,
             cache_id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            cached_shards: AtomicU64::new(0),
             file: RwLock::new(Some(file)),
             closed: AtomicBool::new(false),
             block_loads: Mutex::new(HashMap::new()),
         });
-        handles.insert(Arc::clone(&source));
+        let retired = handles.insert(Arc::clone(&source));
+        drop(handles);
+        drop(retired);
         self.metrics.opens.fetch_add(1, Ordering::Relaxed);
         Ok(source)
     }
@@ -1823,9 +1842,10 @@ impl ReaderManager {
                     self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
                     let offset = index * BLOCK_SIZE as u64;
                     let len = BLOCK_SIZE.min(source.len().saturating_sub(offset) as usize);
-                    let result = source
-                        .with_file(|file| read_file_at(file, offset, len, &self.metrics))
-                        .and_then(|data| self.insert_block(source, key, Arc::from(data), tier));
+                    let result = source.with_file(|file| {
+                        let data = read_file_at(file, offset, len, &self.metrics)?;
+                        self.insert_block(source, key, Arc::from(data), tier)
+                    });
                     let finish_result = self.finish_block_load(source, index, &load);
                     return match result {
                         Ok(data) => {
@@ -1876,6 +1896,9 @@ impl ReaderManager {
         let mut shard = self.cache_shards[shard_index]
             .lock()
             .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
+        source
+            .cached_shards
+            .fetch_or(1 << shard_index, Ordering::Relaxed);
         let (block, evictions) = shard.insert(key, &source.identity.path, data, tier);
         if evictions != 0 {
             self.metrics
@@ -1921,13 +1944,14 @@ impl HandlePool {
         Some(source)
     }
 
-    fn insert(&mut self, source: Arc<FileSource>) {
+    fn insert(&mut self, source: Arc<FileSource>) -> Option<HandleEntry> {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let path = source.identity.path.clone();
         // Replace the pooled source for this path. Active readers retain
         // their own Arc and continue reading the old generation independently.
-        self.entries
+        let mut retired = self
+            .entries
             .insert(path.clone(), HandleEntry { source, generation });
         self.order.push_back((path, generation));
         while self.entries.len() > self.capacity {
@@ -1937,11 +1961,12 @@ impl HandlePool {
             if let std::collections::hash_map::Entry::Occupied(entry) = self.entries.entry(old_path)
             {
                 if entry.get().generation == old_generation {
-                    entry.remove();
+                    retired = Some(entry.remove());
                 }
             }
         }
         self.compact_order();
+        retired
     }
 
     fn compact_order(&mut self) {
@@ -2073,12 +2098,6 @@ pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
 }
 
 #[pyfunction]
-pub(crate) fn release_reader_handles_under(path: &str) -> PyResult<usize> {
-    let root = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-    Ok(manager().release_handles_under_roots(std::slice::from_ref(&root))?)
-}
-
-#[pyfunction]
 pub(crate) fn release_reader_resources_under_roots(
     py: Python<'_>,
     paths: Vec<String>,
@@ -2102,11 +2121,14 @@ pub(crate) fn invalidate_reader_path(path: &Path) {
     let Some(manager) = MANAGER.get() else { return };
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut handles = manager.handles.lock().unwrap_or_else(|e| e.into_inner());
-    if handles.entries.remove(&path).is_some() {
+    let retired = handles.entries.remove(&path);
+    if retired.is_some() {
         // Do not close a source used by an older request. Its late block loads
         // carry its source id and cannot repopulate the new source's cache.
         handles.compact_order();
     }
+    drop(handles);
+    drop(retired);
 }
 
 fn manager() -> &'static ReaderManager {
@@ -3379,6 +3401,15 @@ mod tests {
         assert_ne!(old_source.cache_identity(), current.cache_identity());
         assert!(!old_source.closed.load(Ordering::Acquire));
         assert_eq!(third.read_all().unwrap(), b"new!");
+        // The superseded source stays reusable only while an older reader
+        // can still address its blocks. Retiring its final borrow must free
+        // them without a cache-pressure event or releasing the current file.
+        assert!(manager().contains_block(&old_key).unwrap());
+        drop(old_source);
+        drop(second);
+        drop(third);
+        assert!(!manager().contains_block(&old_key).unwrap());
+        assert_eq!(current.read_at(0, 4).unwrap(), b"last");
         std::fs::remove_file(path).unwrap();
     }
 }

@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge, write_evidence
 
 
@@ -77,7 +76,7 @@ def test_archive_knowledge_evidence_retention_and_detached_exports():
     assert evidence[-1]["provenance"]["source_layer"] == "analysis"
 
 
-def test_archive_knowledge_commit_revision_and_current_projections(tmp_path):
+def test_archive_knowledge_commit_revision(tmp_path):
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"abc")
     task = make_archive_task(archive_path, format_hint="zip")
@@ -89,7 +88,7 @@ def test_archive_knowledge_commit_revision_and_current_projections(tmp_path):
     commit_task_knowledge(task, knowledge)
 
     assert int(task.knowledge().get("_meta.revision", 0) or 0) > first_revision
-    assert knowledge_view.zip_runtime_facts(task)["structure"]["has_data_descriptor"] is True
+    assert task.knowledge().get("format.zip.structure.has_data_descriptor") is True
 
 
 def test_archive_knowledge_commit_reuses_unchanged_branches_and_isolates_working_copy(tmp_path):

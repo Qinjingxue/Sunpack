@@ -105,15 +105,10 @@ pub fn broker_acquire() -> io::Result<()> {
     let mut state = state
         .lock()
         .map_err(|_| io::Error::other("broker client state poisoned"))?;
-    if state.leases > 0 {
-        if state.connection.is_none() {
-            state.connection = Some(connect_and_hello()?);
-        }
-        state.leases += 1;
-        return Ok(());
+    if state.connection.is_none() {
+        state.connection = Some(connect_and_hello()?);
     }
-    state.connection = Some(connect_and_hello()?);
-    state.leases = 1;
+    state.leases += 1;
     Ok(())
 }
 
@@ -128,11 +123,9 @@ pub fn broker_release() -> io::Result<()> {
         return Ok(());
     }
     state.leases -= 1;
-    if state.leases > 0 {
-        return Ok(());
-    }
-    if let Some(mut connection) = state.connection.take() {
-        let _ = connection.transact(&Request::simple(Opcode::Release, next_request_id()));
+    if state.leases == 0 {
+        // Disconnecting ends the server-side lease, including on process exit.
+        state.connection = None;
     }
     Ok(())
 }

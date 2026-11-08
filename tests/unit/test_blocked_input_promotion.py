@@ -106,7 +106,7 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         submission = SimpleNamespace(targets=(PipelineTarget(str(outer)),), request_id="request", origin=origin)
         ownership = _RequestResults(submission, {})
         ownership.remember_results([TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(tmp_path / "out"))])
-        ownership.remember_tasks([task])
+        ownership.remember_task(task)
         # Snapshot survives removal of the original top-level archive.
         outer.unlink()
         original = TargetRunResult(str(inner), OutcomeKind.FAILURE,

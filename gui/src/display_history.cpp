@@ -203,12 +203,13 @@ bool matches(const Json& value,const std::wstring& query,const std::string& time
     }
     return false;
 }
-Json project_task(const Json& value,const RootIndex& roots,const std::string& language,
-    std::unordered_map<std::string,std::string>& labels,size_t sequence) {
+struct TaskRow { Json value; double timestamp=0; };
+TaskRow project_task(const Json& value,const RootIndex& roots,const std::string& language,
+    std::unordered_map<std::string,std::string>& labels) {
     auto input=value.find("path"), event_name=value.find("event");
-    if(input==value.end() || !input->is_string() || event_name==value.end() || !event_name->is_string()) return Json();
+    if(input==value.end() || !input->is_string() || event_name==value.end() || !event_name->is_string()) return {};
     const auto& path=input->get_ref<const std::string&>();
-    if(path.empty()) return Json();
+    if(path.empty()) return {};
     const auto& event=event_name->get_ref<const std::string&>();
     const char* status;
     const char* tone;
@@ -222,7 +223,7 @@ Json project_task(const Json& value,const RootIndex& roots,const std::string& la
         label=status="taskSucceeded"; tone="success";
     } else if(event=="failed_terminal" || event=="partial_rejected") {
         label=status="taskFailed"; tone="failure";
-    } else return Json();
+    } else return {};
     auto translate=[&](const std::string& key) -> const std::string& {
         auto [at,inserted]=labels.try_emplace(key);
         if(inserted) at->second=tr(key,language);
@@ -264,11 +265,11 @@ Json project_task(const Json& value,const RootIndex& roots,const std::string& la
             if(output.is_string() && !output.get_ref<const std::string&>().empty()) outputs.push_back(output);
     const auto ts=value.find("ts");
     const auto timestamp=ts!=value.end() && ts->is_number()?ts->get<double>():std::numeric_limits<double>::quiet_NaN();
-    return {{"id",std::move(id)},{"name",utf8(source.filename().wstring())},{"directory",utf8(source.parent_path().wstring())},
+    return {{{"id",std::move(id)},{"name",utf8(source.filename().wstring())},{"directory",utf8(source.parent_path().wstring())},
         {"path",std::move(display_path)},{"root",indexed_root(path_key(source),roots)},{"status",status},
         {"statusText",translate(label)},{"time",task_time(timestamp)},{"statusTone",tone},{"parts",std::move(parts)},
-        {"error",std::move(error)},{"errorType",std::move(error_type)},{"outputs",std::move(outputs)},
-        {"sortTimestamp",std::isfinite(timestamp)?timestamp:0.0},{"sortSequence",sequence}};
+        {"error",std::move(error)},{"errorType",std::move(error_type)},{"outputs",std::move(outputs)}},
+        std::isfinite(timestamp)?timestamp:0.0};
 }
 
 }
@@ -301,8 +302,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         return time_match;
     };
     auto root_text=folded(view.task_root); std::replace(root_text.begin(),root_text.end(),L'/',L'\\'); auto root_bits=filter(root_text);
-    Json rows=Json::array();
-    auto& projected=rows.get_ref<Json::array_t&>();
+    std::vector<TaskRow> projected;
     projected.reserve(PageRows);
     std::unordered_set<std::string> ids;
     std::unordered_map<std::string,std::string> labels;
@@ -363,11 +363,10 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         if(projected.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !projected.empty())) { more=true; break; }
         // These are independent snapshots. Keep the first card for each ID.
         if(!filter_values) value=selected->value(packed,raw);
-        auto row=project_task(value,root_index,language,labels,PageRows-projected.size());
-        if(!row.is_null() && ids.insert(row.at("id").get_ref<const std::string&>()).second) {
-            const auto timestamp=row.at("sortTimestamp").get<double>();
-            needs_sort|=timestamp>previous_timestamp;
-            previous_timestamp=timestamp;
+        auto row=project_task(value,root_index,language,labels);
+        if(!row.value.is_null() && ids.insert(row.value.at("id").get_ref<const std::string&>()).second) {
+            needs_sort|=row.timestamp>previous_timestamp;
+            previous_timestamp=row.timestamp;
             projected.push_back(std::move(row));
         }
         bytes+=record.raw?record.raw:PageBytes; last=std::move(cursor); selected->previous();
@@ -378,9 +377,12 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     for(const auto& run:runs) run->validate();
     // The disk index already orders by microseconds. Distinct display
     // timestamps in the same index tick can still require a page-local sort.
-    if(needs_sort) std::sort(projected.begin(),projected.end(),[](const Json& a,const Json& b) {
-        return a["sortTimestamp"]!=b["sortTimestamp"]?a["sortTimestamp"]>b["sortTimestamp"]:a["sortSequence"]>b["sortSequence"];
+    if(needs_sort) std::stable_sort(projected.begin(),projected.end(),[](const TaskRow& a,const TaskRow& b) {
+        return a.timestamp>b.timestamp;
     });
+    Json::array_t rows;
+    rows.reserve(projected.size());
+    for(auto& row:projected) rows.push_back(std::move(row.value));
     const auto count=projected.size();
     return {{"rows",std::move(rows)},{"total",count},{"hasMore",more},{"dropped",manifest.value("dropped",uint64_t(0))},
         {"next",more && last?Json({std::get<0>(*last),std::get<1>(*last),std::get<2>(*last)}).dump():std::string()}};

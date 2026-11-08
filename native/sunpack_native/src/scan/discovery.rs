@@ -37,10 +37,7 @@ impl Candidate {
                     .as_ref()
                     .map(|a| a.anchor().map_or(PeState::None, |a| a.pe_state)),
             ),
-            Self::Relation(group) => (
-                group.candidate_data().entry_path,
-                group.entry_anchor().map(|a| a.pe_state),
-            ),
+            Self::Relation(group) => (group.entry_path(), group.entry_anchor().map(|a| a.pe_state)),
         }
     }
 }
@@ -146,7 +143,7 @@ impl NativeCandidateTable {
                 _ => None,
             })
             .flat_map(|group| {
-                let head = group.candidate_data().entry_path;
+                let head = group.entry_path();
                 group
                     .speculative_paths()
                     .filter(move |path| *path != head)
@@ -451,13 +448,24 @@ impl NativeEmbeddedBatch {
         offset: usize,
         limit: usize,
     ) -> PyResult<Vec<(usize, Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>)>> {
-        let jobs: Vec<_> = groups
-            .iter()
-            .enumerate()
-            .flat_map(|(group, (_, batch))| batch.ids.iter().map(move |&index| (group, index)))
-            .skip(offset)
-            .take(limit)
-            .collect();
+        let mut jobs = Vec::new();
+        let mut skip = offset;
+        for (group, (_, batch)) in groups.iter().enumerate() {
+            if jobs.len() == limit {
+                break;
+            }
+            if skip >= batch.ids.len() {
+                skip -= batch.ids.len();
+                continue;
+            }
+            let take = (limit - jobs.len()).min(batch.ids.len() - skip);
+            jobs.extend(
+                batch.ids[skip..skip + take]
+                    .iter()
+                    .map(|&index| (group, index)),
+            );
+            skip = 0;
+        }
         let borrowed: Vec<_> = groups
             .iter()
             .map(|(table, batch)| (&**table, &**batch))
@@ -741,7 +749,7 @@ impl NativeEmbeddedBatch {
         let mut peers: HashMap<String, HashSet<String>> = groups
             .iter()
             .filter(|g| speculative(g))
-            .map(|g| (stem(g.candidate_data().entry_path), HashSet::new()))
+            .map(|g| (stem(g.entry_path()), HashSet::new()))
             .collect();
         if !peers.is_empty() {
             for snapshot in sources {
@@ -766,7 +774,7 @@ impl NativeEmbeddedBatch {
             groups.retain(|g| {
                 !speculative(g)
                     || peers
-                        .get(&stem(g.candidate_data().entry_path))
+                        .get(&stem(g.entry_path()))
                         .is_some_and(|p| p.len() > 1)
             });
         }
@@ -1346,6 +1354,7 @@ impl NativeCandidateTable {
         let relation_cache = self.relation_cache();
         let mut claimed_ranges = HashMap::new();
         let mut scanned_paths = None;
+        let mut seen_facts = HashSet::new();
         for index in routes.resolved_relations() {
             if let Candidate::Relation(group) = &self.rows[index] {
                 let scanned_paths = scanned_paths.get_or_insert_with(|| {
@@ -1353,12 +1362,12 @@ impl NativeCandidateTable {
                         .map(|&index| path_key(self.rows[index].embedded_source().0))
                         .collect()
                 });
-                group.collect_source_ranges(scanned_paths, &mut claimed_ranges);
+                group.collect_source_ranges(scanned_paths, &mut claimed_ranges, &mut seen_facts);
                 // Candidate membership is a lease, not exclusive ownership.
                 // Independent heads may need the same peer domains.
                 // The confirmed head is not an alternative peer. A genuinely
                 // new slice in that carrier re-enters via anchor_paths above.
-                let head = group.candidate_data().entry_path;
+                let head = group.entry_path();
                 for path in group.speculative_paths().filter(|path| *path != head) {
                     excluded.remove(&path_key(path));
                 }

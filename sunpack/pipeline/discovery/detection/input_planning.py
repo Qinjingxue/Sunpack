@@ -59,11 +59,7 @@ class ArchiveInputPlanningStage:
             report_path=task.main_path,
         )
         prepass = knowledge_view.inspection_prepass(task)
-        initial_prepass = (
-            dict(prepass)
-            if isinstance(prepass, dict) and prepass.get("full_scan_complete")
-            else None
-        )
+        initial_prepass = prepass if prepass.get("full_scan_complete") else None
         return self.analyzer.analyze(
             source,
             AnalysisRequest(

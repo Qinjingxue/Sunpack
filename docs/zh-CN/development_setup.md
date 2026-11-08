@@ -85,7 +85,7 @@ watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨�
 
 - `native/sunpack_usn_core` 是 Windows-only Rust crate，包含卷标识、Journal 探测、有限范围的 USN reason 读取以及命名管道客户端协议。
 - `native/sunpack_watch_broker` 编译为 `sunpack-watch-broker.exe`，以 Windows service 运行，持有卷级 Journal 访问能力。
-- watch 启动时先取得一个进程级 lease。第一个 lease 负责按需启动服务并建立本地 named pipe 连接；同一进程中的后续 lease 复用连接；最后一个 lease 释放时向服务发送释放请求。
+- watch 启动时先取得一个进程级 lease。第一个 lease 负责按需启动服务并建立本地 named pipe 连接，同一进程中的后续 lease 复用连接，最后一个 lease 释放时关闭连接。
 - 服务按需启动。第一个客户端在 5 秒内未连接时服务退出；最后一个 lease 释放后等待 1 秒再退出。每个服务最多保留 64 个客户端和 64 个卷上下文。
 
 标准身份为：

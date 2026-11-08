@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from itertools import chain
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, TextIO
 
@@ -1495,7 +1496,7 @@ class _RequestRuntime:
                 apply_input_retry(task, retry_failure, task.runtime.get("input_generation", ()),
                                   password_changed=self.config.get("retry_password_changed", True))
 
-            ownership.remember_tasks([task])
+            ownership.remember_task(task)
             # Admission already confirmed the physical generation under the
             # task lease. Discovery may predate a copy's final timestamp or a
             # volume arrival; never overwrite admission with that older version.
@@ -1544,7 +1545,7 @@ class _RequestRuntime:
                 ))
                 self._replace_target_result(result, updated)
                 result = updated
-            ownership.remember_tasks([task])  # Missing-volume retry may adopt a complete family.
+            ownership.remember_task(task)  # Missing-volume retry may adopt a complete family.
             if result.failure is not None and task.runtime.get("discovery_scope") is not None:
                 result.failure.details["discovery_scope"] = task.runtime["discovery_scope"].to_record()
             promoted = False
@@ -1655,7 +1656,7 @@ class _RequestRuntime:
                 with self.context.lock:
                     self.context.add_target_result(result)
                     self.context.processed_keys.add(task.key)
-                ownership.remember_tasks([task])
+                ownership.remember_task(task)
                 ownership.remember_results([result])
             active_output = task.runtime.pop("watch_active_output", None)
             if active_output is not None:
@@ -2010,15 +2011,15 @@ class _RequestResults:
         self._output_targets = PathMap()
         self._exact_targets: dict[str, PipelineTarget] = {}
         self._directory_targets: dict[str, PipelineTarget] = {}
-        self._claimed_paths: list[str] = []
+        self._claimed_groups: list[tuple[str, ...]] = []
         self._task_paths: dict[str, tuple[str, ...]] = {}
-        self._target_input_dirs = {
-            path_key(target.path): os.path.abspath(target.path if os.path.isdir(target.path) else os.path.dirname(target.path))
-            for target in submission.targets
-        }
+        self._target_input_dirs: dict[str, str] = {}
         for target in submission.targets:
-            self._exact_targets.setdefault(path_key(target.path), target)
-            if os.path.isdir(target.path):
+            key = path_key(target.path)
+            is_directory = os.path.isdir(target.path)
+            self._exact_targets.setdefault(key, target)
+            self._target_input_dirs[key] = os.path.abspath(target.path if is_directory else os.path.dirname(target.path))
+            if is_directory:
                 key = resolved_path_key(target.path)
                 previous = self._directory_targets.get(key)
                 if previous is None or len(target.path) > len(previous.path):
@@ -2036,14 +2037,16 @@ class _RequestResults:
         self._task_paths.pop(path_key(old_path), None)
         self._task_paths[path_key(task.main_path)] = tuple(task.cleanup_parts or task.all_parts or [task.main_path])
 
-    def remember_tasks(self, tasks) -> None:
-        for task in tasks:
-            target = self._target_for_path(task.main_path)
-            paths = tuple(task.all_parts or [task.main_path])
-            key = path_key(task.main_path)
-            self._task_targets[key] = target
-            self._claimed_paths.extend(paths)
+    def remember_task(self, task: ArchiveTask) -> None:
+        key = path_key(task.main_path)
+        paths = tuple(task.all_parts or [task.main_path])
+        self._task_targets[key] = self._target_for_path(task.main_path)
+        previous = self._task_paths.get(key)
+        if previous == paths:
+            paths = previous
+        else:
             self._task_paths[key] = paths
+        self._claimed_groups.append(paths)
 
     def remember_results(self, results) -> None:
         for result in results:
@@ -2112,7 +2115,7 @@ class _RequestResults:
             ),
             discovery=PipelineDiscovery(
                 entry_paths=tuple(target.path for target in self.submission.targets),
-                claimed_paths=tuple(dict.fromkeys(self._claimed_paths)),
+                claimed_paths=tuple(dict.fromkeys(chain.from_iterable(self._claimed_groups))),
                 blocked_paths=tuple(dict.fromkeys(blocked_paths)),
             ),
             recent_passwords=tuple(recent_passwords),

@@ -47,6 +47,17 @@ struct RelationProposal {
     companions: Vec<String>,
 }
 
+impl RelationProposal {
+    fn entry_path(&self) -> &str {
+        &self
+            .volumes
+            .iter()
+            .find(|(_, number)| *number == 1)
+            .unwrap_or(&self.volumes[0])
+            .0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalStatus {
     Valid,
@@ -141,7 +152,6 @@ impl<'a> RelationCandidateData<'a> {
             NativeRelationGroup::Ordinary(row, _) => Cow::Owned(
                 self.parsed
                     .as_ref()
-                    .filter(|_| self.is_split)
                     .map(logical_name_from_parsed)
                     .unwrap_or_else(|| get_logical_name(&row.name, true)),
             ),
@@ -156,7 +166,6 @@ impl<'a> RelationCandidateData<'a> {
             NativeRelationGroup::Ordinary(_, _) => self
                 .parsed
                 .as_ref()
-                .filter(|_| self.is_split)
                 .map(|parsed| {
                     let format = if self.format_hint.is_empty() {
                         parsed.family
@@ -199,13 +208,20 @@ impl NativeRelationGroup {
         matches!(self, Self::Proposal(validation) if validation.status == ProposalStatus::Inconclusive)
     }
 
+    pub(crate) fn entry_path(&self) -> &str {
+        match self {
+            Self::Ordinary(row, _) => &row.path,
+            Self::Proposal(validation) => validation.proposal.entry_path(),
+        }
+    }
+
     pub(crate) fn entry_anchor(&self) -> Option<&VolumeAnchor> {
         match self {
             Self::Ordinary(row, _) => row.anchor.as_ref(),
             Self::Proposal(validation) => validation
                 .facts
                 .anchors
-                .get(&path_key(self.candidate_data().entry_path)),
+                .get(&path_key(validation.proposal.entry_path())),
         }
     }
 
@@ -263,15 +279,19 @@ impl NativeRelationGroup {
         &self,
         paths: &HashSet<String>,
         ranges: &mut HashMap<String, Vec<(u64, u64)>>,
+        seen_facts: &mut HashSet<*const RelationCache>,
     ) {
-        let mut record = |key: String, start: u64, end: Option<u64>| {
-            if paths.contains(&key) {
+        let mut record = |key: &str, start: u64, end: Option<u64>| {
+            if paths.contains(key) {
                 // Even an unbounded chunk owns its already known anchor,
                 // but cannot suppress a different anchor later in the file.
                 let end = end.unwrap_or_else(|| start.saturating_add(1));
-                let extents = ranges.entry(key).or_default();
-                if !extents.contains(&(start, end)) {
-                    extents.push((start, end));
+                if let Some(extents) = ranges.get_mut(key) {
+                    if !extents.contains(&(start, end)) {
+                        extents.push((start, end));
+                    }
+                } else {
+                    ranges.insert(key.to_owned(), vec![(start, end)]);
                 }
             }
         };
@@ -279,22 +299,20 @@ impl NativeRelationGroup {
             Self::Proposal(validation) => {
                 if let Some(plan) = &validation.attempts {
                     for source in &plan.sources {
-                        record(path_key(&source.path), source.start, source.proven_end);
+                        record(&path_key(&source.path), source.start, source.proven_end);
                     }
-                } else {
+                } else if seen_facts.insert(Arc::as_ptr(&validation.facts)) {
+                    // Multiple proposals can borrow the same bucket of anchors.
+                    // Only ordered attempts carry proposal-specific ranges.
                     for (path, a) in &validation.facts.anchors {
-                        record(
-                            path.clone(),
-                            a.structure_offset.unwrap_or(0),
-                            a.proven_extent_end(),
-                        );
+                        record(path, a.structure_offset.unwrap_or(0), a.proven_extent_end());
                     }
                 }
             }
             Self::Ordinary(row, _) => {
                 if let Some(a) = &row.anchor {
                     record(
-                        row.path_key.clone(),
+                        &row.path_key,
                         a.structure_offset.unwrap_or(0),
                         a.proven_extent_end(),
                     );
@@ -306,22 +324,18 @@ impl NativeRelationGroup {
     pub(crate) fn candidate_data(&self) -> RelationCandidateData<'_> {
         match self {
             Self::Ordinary(row, confirmed) => {
-                let parsed = (!confirmed)
+                let anchor = row.anchor.as_ref();
+                let parsed = (!confirmed && anchor.is_some_and(anchor_has_split_identity))
                     .then(|| parse_relation_numbered_volume(&row.name))
                     .flatten();
-                let hypothesis = !confirmed
-                    && parsed.is_some()
-                    && row.anchor.as_ref().is_some_and(anchor_has_split_identity);
-                let format_hint = row.anchor.as_ref().map(|a| a.format.as_str()).unwrap_or("");
-                let anchor = row.anchor.as_ref();
                 RelationCandidateData {
                     group: self,
+                    is_split: parsed.is_some(),
                     parsed,
                     entry_path: &row.path,
-                    format_hint,
+                    format_hint: anchor.map(|a| a.format.as_str()).unwrap_or(""),
                     companions: &[],
                     carrier_path: &row.path,
-                    is_split: hypothesis,
                     needs_password: anchor.is_some_and(|a| a.needs_password),
                     multivolume: anchor.is_some_and(|a| a.multivolume),
                     relation_confirmed: *confirmed,
@@ -334,22 +348,18 @@ impl NativeRelationGroup {
             }
             Self::Proposal(validation) => {
                 let proposal = &validation.proposal;
-                let head = proposal
-                    .volumes
-                    .iter()
-                    .find(|(_, number)| *number == 1)
-                    .unwrap_or(&proposal.volumes[0]);
+                let entry_path = proposal.entry_path();
                 RelationCandidateData {
                     group: self,
                     parsed: None,
-                    entry_path: &head.0,
+                    entry_path,
                     format_hint: &proposal.format,
                     companions: &proposal.companions,
                     carrier_path: proposal
                         .companions
                         .first()
                         .map(String::as_str)
-                        .unwrap_or(&head.0),
+                        .unwrap_or(entry_path),
                     is_split: true,
                     needs_password: validation.status == ProposalStatus::NeedsPassword,
                     multivolume: true,
@@ -1127,13 +1137,8 @@ fn validation_relation_confirmed(validation: &ProposalValidation) -> bool {
 
 fn proposal_to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResult<Py<PyDict>> {
     let proposal = &validation.proposal;
-    let head = proposal
-        .volumes
-        .iter()
-        .find(|(_, number)| *number == 1)
-        .unwrap_or(&proposal.volumes[0]);
-    let head_path = &head.0;
-    let head_anchor = validation.facts.anchors.get(&path_key(&head_path));
+    let head_path = proposal.entry_path();
+    let head_anchor = validation.facts.anchors.get(&path_key(head_path));
     let split_family = proposal_split_family(proposal, &validation.facts.anchors);
     let relation = FileRelationNative {
         filename: basename(head_path).to_string(),

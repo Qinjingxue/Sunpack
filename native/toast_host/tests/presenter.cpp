@@ -84,7 +84,7 @@ int main() {
         snapshot.progress_mode = ProgressMode::determinate;
         snapshot.actions.push_back({ActionKind::cancel_batch, L"Stop", L"first"});
         {
-            ToastPresenter presenter(nullptr);
+            ToastPresenter presenter({});
             presenter.show(snapshot, 1);
             const auto original = toast_test::banner;
             snapshot.progress_value = 0.5;

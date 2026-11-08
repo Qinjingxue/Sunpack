@@ -45,11 +45,7 @@ class ArchiveTask:
         if not descriptor.entry_path:
             raise ValueError("ArchiveTask requires an archive input entry path")
         self.carrier_path = str(self.carrier_path or descriptor.entry_path)
-        self.cleanup_parts = list(dedupe_values([
-            *descriptor.part_paths(),
-            *self.cleanup_parts,
-            self.carrier_path,
-        ]))
+        self._merge_cleanup_parts(descriptor)
         if not self.key:
             self.key = descriptor.entry_path
         self._knowledge = ArchiveKnowledge()
@@ -80,7 +76,7 @@ class ArchiveTask:
             carrier_path=carrier_path or descriptor.entry_path,
             cleanup_parts=list(cleanup_paths),
             initial_discovery_source=discovery_source,
-            discovery_evidence=dict(discovery_evidence or {}),
+            discovery_evidence=discovery_evidence,
             initial_inputs=logical_inputs,
             initial_discovery_reason=discovery_reason,
             discovery_failure=discovery_failure,
@@ -105,11 +101,13 @@ class ArchiveTask:
 
     @property
     def all_parts(self) -> list[str]:
-        return list(dedupe_values(path for node in self.inputs for path in node.source_paths))
+        if len(self.inputs) == 1:
+            return self.inputs[0].descriptor.part_paths()
+        return dedupe_values(path for node in self.inputs for path in node.descriptor.part_paths())
 
     def set_inputs(self, inputs: tuple[LogicalArchiveInput, ...]) -> None:
         self.inputs = inputs
-        self.cleanup_parts = list(dedupe_values([*self.cleanup_parts, *self.all_parts]))
+        self.cleanup_parts = dedupe_values([*self.cleanup_parts, *self.all_parts])
 
     def archive_input(self) -> ArchiveInputDescriptor:
         return self._archive_input
@@ -122,14 +120,17 @@ class ArchiveTask:
 
     def set_archive_input(self, descriptor: ArchiveInputDescriptor) -> None:
         previous = self._archive_input
-        self.cleanup_parts = list(dedupe_values([
-            *descriptor.part_paths(),
-            *self.cleanup_parts,
-            self.carrier_path,
-        ]))
+        self._merge_cleanup_parts(descriptor)
         self._archive_input = descriptor
         if len(self.inputs) == 1 and self.inputs[0].descriptor is previous:
             self.inputs = (replace(self.inputs[0], descriptor=descriptor),)
+
+    def _merge_cleanup_parts(self, descriptor: ArchiveInputDescriptor) -> None:
+        self.cleanup_parts = dedupe_values([
+            *descriptor.part_paths(),
+            *self.cleanup_parts,
+            self.carrier_path,
+        ])
 
     def select_volumes(self, node: LogicalArchiveInput, descriptor: ArchiveInputDescriptor) -> None:
         """Commit the worker's winning composition; release unused candidates."""
@@ -199,7 +200,7 @@ class ArchiveTask:
             "discovery": {
                 "source": discovery_source,
                 "reason": discovery_reason,
-                "evidence": dict(discovery_evidence),
+                "evidence": discovery_evidence,
             },
         }, source_layer="contracts", source_module="archive_task")
         if initial_inputs:

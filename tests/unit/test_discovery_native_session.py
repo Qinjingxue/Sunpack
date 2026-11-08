@@ -45,6 +45,29 @@ def test_shared_embedded_pages_preserve_root_and_candidate_order(monkeypatch):
     assert [result.traces for result in results] == [list(batch) for _, batch in scans]
 
 
+def test_native_embedded_page_crosses_root_after_offset(tmp_path):
+    import gzip
+    from sunpack_native import NativeEmbeddedBatch
+
+    # The Python paging test mocks the native slice. Four real carriers expose
+    # dropped or duplicated candidates when a native page crosses an empty root.
+    config = make_config()
+    groups = []
+    carrier = b"prefix" + gzip.compress(b"payload") + b"suffix"
+    for root, count in enumerate((2, 0, 2)):
+        directory = tmp_path / str(root)
+        directory.mkdir()
+        for index in range(count):
+            (directory / f"carrier{index}.opaque").write_bytes(carrier)
+        table = build_native_table_for_targets([str(directory)], config=config)
+        groups.append((table, table.prepare_embedded(table.resolve())))
+
+    rows = NativeEmbeddedBatch.scan_pages(groups, 1, 2)
+
+    assert [(group, [(index, status) for index, status, _, _ in batch])
+            for group, batch in rows] == [(0, [(1, 1)]), (2, [(0, 1)])]
+
+
 def test_independent_file_requests_keep_full_context_and_observe_disguised_volume_changes(tmp_path):
     """Guard the scope/freshness contract when optimizing repeated file requests.
 

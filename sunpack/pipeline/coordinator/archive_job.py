@@ -10,7 +10,6 @@ from sunpack.core.contracts.content_recovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
-from sunpack.pipeline.coordinator.verification_stage import verify_and_project
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.knowledge import write_extraction_result
@@ -342,7 +341,7 @@ class ArchiveJobExecutor:
             write_extraction_result(task, result)
             if not result.success:
                 self._report_task_status(task, "error", str(result.error or ""))
-                verification = verify_and_project(self.verifier, task, result)
+                verification = self.verifier.verify(task, result)
                 current_outcome = ArchiveJobOutcome(
                     result=result,
                     verification=verification,
@@ -369,7 +368,7 @@ class ArchiveJobExecutor:
 
             # Verification observes this extraction once. Failed verification
             # is a result, not a reason to run the same extraction again.
-            verification = verify_and_project(self.verifier, task, result)
+            verification = self.verifier.verify(task, result)
             return ArchiveJobOutcome(result=result, verification=verification, attempts=1)
 
     def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:

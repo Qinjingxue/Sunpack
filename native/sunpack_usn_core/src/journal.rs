@@ -88,21 +88,9 @@ impl JournalReader {
         self.with_volume(|volume, volume_guid| {
             let (journal_id, next_usn) =
                 query_or_create_journal(|| query_journal(volume), || create_journal(volume_guid))?;
-            let request = read_usn_journal_request(next_usn, journal_id);
             let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
-            let bytes_returned = device_io_control(
-                volume,
-                FSCTL_READ_USN_JOURNAL,
-                &request as *const _ as *const c_void,
-                std::mem::size_of::<ReadUsnJournalData>() as u32,
-                &mut output,
-            )?;
-            if bytes_returned < 8 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated USN journal reply",
-                ));
-            }
+            let bytes_returned = read_journal_page(volume, journal_id, next_usn, &mut output)?;
+            split_journal_reply(&output, bytes_returned)?;
             Ok((journal_id, next_usn))
         })
     }
@@ -306,17 +294,54 @@ fn read_directories_changes_from_volume(
         directories,
         start_usn,
         end_usn,
-        |cursor, output| {
-            let request = read_usn_journal_request(cursor, journal_id);
-            device_io_control(
-                volume,
-                FSCTL_READ_USN_JOURNAL,
-                &request as *const _ as *const c_void,
-                std::mem::size_of::<ReadUsnJournalData>() as u32,
-                output,
-            )
-        },
+        |cursor, output| read_journal_page(volume, journal_id, cursor, output),
     )
+}
+
+fn read_journal_page(
+    volume: HANDLE,
+    journal_id: u64,
+    cursor: i64,
+    output: &mut [u8],
+) -> io::Result<usize> {
+    let request = read_usn_journal_request(cursor, journal_id);
+    device_io_control(
+        volume,
+        FSCTL_READ_USN_JOURNAL,
+        &request as *const _ as *const c_void,
+        std::mem::size_of::<ReadUsnJournalData>() as u32,
+        output,
+    )
+}
+
+fn split_journal_reply(output: &[u8], bytes_returned: usize) -> io::Result<(i64, &[u8])> {
+    if bytes_returned < 8 || bytes_returned > output.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated USN journal reply",
+        ));
+    }
+    let next = i64::from_le_bytes(output[..8].try_into().unwrap());
+    Ok((next, &output[8..bytes_returned]))
+}
+
+fn next_journal_record<'a>(records: &mut &'a [u8]) -> io::Result<&'a [u8]> {
+    if records.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated USN journal record",
+        ));
+    }
+    let length = u32::from_le_bytes(records[..4].try_into().unwrap()) as usize;
+    if length < 8 || length > records.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid USN journal record",
+        ));
+    }
+    let (record, remaining) = records.split_at(length);
+    *records = remaining;
+    Ok(record)
 }
 
 // Resume at the USN of an entire unconsumed record, never at the next buffer.
@@ -342,30 +367,9 @@ fn scan_directories_page(
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     while cursor < end_usn {
         let bytes_returned = read(cursor, &mut output)?;
-        if bytes_returned < 8 || bytes_returned > output.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated USN journal reply",
-            ));
-        }
-        let returned_next = i64::from_le_bytes(output[..8].try_into().unwrap());
-        let mut offset = 8;
-        while offset < bytes_returned {
-            if offset + 8 > bytes_returned {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated USN journal record",
-                ));
-            }
-            let length =
-                u32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as usize;
-            if length < 8 || length > bytes_returned - offset {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid USN journal record",
-                ));
-            }
-            let record = &output[offset..offset + length];
+        let (returned_next, mut records) = split_journal_reply(&output, bytes_returned)?;
+        while !records.is_empty() {
+            let record = next_journal_record(&mut records)?;
             record_directory_changes(
                 record,
                 &parents,
@@ -404,7 +408,6 @@ fn scan_directories_page(
             }
             payload_bytes += added;
             changed.extend(changes.drain(..));
-            offset += length;
         }
         if returned_next <= cursor {
             return Err(io::Error::other(
@@ -521,33 +524,12 @@ fn read_change_reasons_from_volume(
     let mut found = false;
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     while next_usn <= current_usn {
-        let request = read_usn_journal_request(next_usn, journal_id);
-        let bytes_returned = device_io_control(
-            volume,
-            FSCTL_READ_USN_JOURNAL,
-            &request as *const _ as *const c_void,
-            std::mem::size_of::<ReadUsnJournalData>() as u32,
-            &mut output,
-        )?;
-        if bytes_returned < 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated USN journal reply",
-            ));
-        }
-        let returned_next = i64::from_le_bytes(output[0..8].try_into().unwrap());
-        let mut offset = 8usize;
-        while offset + 8 <= bytes_returned {
-            let record_length =
-                u32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as usize;
-            if record_length < 8 || offset + record_length > bytes_returned {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid USN journal record",
-                ));
-            }
+        let bytes_returned = read_journal_page(volume, journal_id, next_usn, &mut output)?;
+        let (returned_next, mut records) = split_journal_reply(&output, bytes_returned)?;
+        while !records.is_empty() {
+            let record = next_journal_record(&mut records)?;
             if let Some(reason) = record_change_reason(
-                &output[offset..offset + record_length],
+                record,
                 expected_file_id,
                 expected_file_id_len,
                 previous_usn,
@@ -556,7 +538,6 @@ fn read_change_reasons_from_volume(
                 found = true;
                 reasons.observe(reason);
             }
-            offset += record_length;
         }
         if returned_next <= next_usn {
             return Err(io::Error::other("USN observation made no progress"));

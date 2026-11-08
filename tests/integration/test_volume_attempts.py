@@ -457,8 +457,8 @@ def test_callback_volume_sharing_error_is_not_candidate_exhaustion(tmp_path):
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     plan = task.archive_input().volume_attempts
     locked = plan.sources[plan.layouts[0][1].choices[0]].path
-    from sunpack_native import release_reader_handles_under
-    release_reader_handles_under(str(case.archive_dir))
+    from sunpack_native import release_reader_resources_under_roots
+    release_reader_resources_under_roots([str(case.archive_dir)])
     handle = kernel.CreateFileW(locked, 0x80000000, 0, None, 3, 0, None)
     assert handle != wintypes.HANDLE(-1).value
     try:

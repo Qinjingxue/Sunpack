@@ -49,7 +49,6 @@ def test_verification_finishes_without_cleanup_or_reextraction(
 ):
     verification = VerificationResult(decision_hint=decision)
     monkeypatch.setattr(archive_job, "write_extraction_result", lambda _task, _result: None)
-    monkeypatch.setattr(archive_job, "verify_and_project", lambda _verifier, _task, _result: verification)
     cleanup_calls = []
     monkeypatch.setattr(
         archive_job,
@@ -58,6 +57,7 @@ def test_verification_finishes_without_cleanup_or_reextraction(
     )
 
     executor = _executor(allow_partial=allow_partial)
+    executor.verifier.verify = lambda _task, _result: verification
     task = SimpleNamespace(runtime={})
     result = ExtractionResult(
         success=True, out_dir=str(tmp_path / "out"), partial_outputs=allow_partial,

@@ -371,20 +371,24 @@ void Application::schedule_task_range() {
 void Application::apply_pending() {
     Json patch;
     { std::lock_guard<std::mutex> lock(mutex_); patch=std::move(pending_); pending_=Json::object(); notified_=false; }
-    auto reset_scroll=patch.value("resetScroll",Json::array()); patch.erase("resetScroll");
-    auto password_delta_patch=patch.value("passwordDelta",Json()); patch.erase("passwordDelta");
-    Json task_snapshot;
-    if(patch.contains("tasks")) { task_snapshot=std::move(patch["tasks"]); patch.erase("tasks"); }
+    auto take=[&](const char* key) {
+        auto at=patch.find(key);
+        if(at==patch.end()) return Json();
+        auto value=std::move(at.value());
+        patch.erase(at);
+        return value;
+    };
+    auto reset_scroll=take("resetScroll");
+    auto password_delta_patch=take("passwordDelta");
+    auto task_snapshot=take("tasks");
     VisualBatch visual(window_);
-    auto ack=patch.value("saveAck",Json()); patch.erase("saveAck");
+    auto ack=take("saveAck");
     const bool cell_ack=!ack.is_null() && (ack["job"]["kind"]=="passwords" || ack["job"]["kind"]=="roots");
     if(cell_ack) acknowledge_save(ack);
-    Json password_snapshot;
-    if(patch.contains("passwords")) { password_snapshot=std::move(patch["passwords"]); patch.erase("passwords"); }
-    Json directory_snapshot;
-    if(patch.contains("directories")) { directory_snapshot=std::move(patch["directories"]); patch.erase("directories"); }
+    auto password_snapshot=take("passwords");
+    auto directory_snapshot=take("directories");
     if(patch.contains("fields")) bind_controls(patch["fields"]);
-    auto action=patch.value("actionError",Json()); patch.erase("actionError");
+    auto action=take("actionError");
     for(auto it=patch.begin();it!=patch.end();++it) {
         auto text=it.value().dump();
         if(ui_page_set_json(page_,it.key().c_str(),text.c_str())!=0) throw std::runtime_error("uiBindingFailed");

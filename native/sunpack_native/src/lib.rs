@@ -122,10 +122,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        io::reader::release_reader_handles_under,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
         io::reader::release_reader_resources_under_roots,
         m
     )?)?;

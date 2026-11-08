@@ -85,7 +85,7 @@ watch uses the NTFS USN Journal to determine whether file contents have changed 
 
 - `native/sunpack_usn_core` is a Windows-only Rust crate containing volume identification, Journal probing, bounded USN reason reads, and the named pipe client protocol.
 - `native/sunpack_watch_broker` compiles to `sunpack-watch-broker.exe` and runs as a Windows service, holding volume-level Journal access.
-- At startup, watch first acquires a process-level lease. The first lease starts the service on demand and establishes a local named pipe connection; later leases in the same process reuse the connection; when the last lease is released, a release request is sent to the service.
+- At startup, watch acquires a process-level lease. The first lease starts the service on demand and establishes a local named pipe connection. Later leases in the same process reuse the connection. Releasing the last lease closes the connection.
 - The service starts on demand. It exits if the first client has not connected within 5 seconds; after the last lease is released it waits 1 second before exiting. Each service keeps at most 64 clients and 64 volume contexts.
 
 The standard identities are:

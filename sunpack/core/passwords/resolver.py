@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
 from dataclasses import replace
+from typing import TYPE_CHECKING
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
 from sunpack.core.support.archive_formats import canonical_format
 from sunpack.core.support.archive_sessions import archive_session_scope
 
-from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.job import PasswordJob
@@ -15,149 +14,41 @@ from sunpack.core.passwords.result import PasswordResolution, PasswordResolution
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
 from sunpack.core.passwords.session import PasswordSession
 
+if TYPE_CHECKING:
+    from sunpack.core.contracts.tasks import ArchiveTask
 
-def _selected_structure_format(knowledge: ArchiveKnowledge, descriptor, probe_input) -> str:
-    values = (
-        getattr(probe_input, "format_hint", ""),
-        knowledge.get("inspection.summary.format"),
-        descriptor.format_hint if descriptor is not None else "",
+
+def _selected_structure_format(
+    descriptor: ArchiveInputDescriptor, probe_input: ArchiveInputDescriptor | None,
+) -> str:
+    hint = canonical_format(
+        (probe_input.format_hint if probe_input is not None else "") or descriptor.format_hint,
+        unknown="",
     )
-    hint = next(
-        (
-            str(value or "").strip().lower().lstrip(".")
-            for value in values
-            if str(value or "").strip()
-        ),
-        "",
-    )
-    if hint in {"zip", "jar", "docx", "xlsx", "apk"}:
+    if hint in {"jar", "docx", "xlsx", "apk"}:
         return "zip"
-    if hint in {"7z", "sevenzip", "seven_zip"}:
-        return "7z"
-    if hint in {"rar", "rar4", "rar5"}:
+    if hint in {"rar4", "rar5"}:
         return "rar"
-    if hint == "tar":
-        return "tar"
-    if canonical_format(hint, unknown="") in {"gzip", "bzip2", "xz", "zstd", "lz4"}:
-        return "compression"
-    return ""
+    return hint
 
 
-def _structure_facts(knowledge: ArchiveKnowledge, selected_format: str):
-    candidates = (
-        ("rar", ("format.rar.structure",)),
-        ("zip", ("format.zip.structure",)),
-        ("7z", ("format.7z.structure",)),
-        ("tar", ("format.tar.structure",)),
-        ("compression", ("format.compression.structure", "compression.stream_structure")),
-    )
-    for fmt, paths in candidates:
-        if selected_format and fmt != selected_format:
-            continue
-        for path in paths:
-            value = knowledge.get(path)
-            if isinstance(value, dict):
-                yield fmt, value
-                break
-
-
-def _validated_format_password_state(fmt: str, structure: dict) -> str:
-    explicit = str(structure.get("password_state") or "").strip().lower()
-    if explicit in {"required", "not_required"}:
-        return explicit
-
-    password_required = bool(structure.get("password_required"))
-    if fmt == "rar":
-        if structure.get("strong_accept") and password_required:
-            return "required"
-        if (
-            structure.get("strong_accept")
-            and structure.get("header_crc_ok")
-            and "password_required" in structure
-            and not password_required
-            and not structure.get("header_encrypted")
-        ):
-            return "not_required"
-        return "unknown"
-
-    if fmt == "zip":
-        try:
-            encrypted_entries = int(
-                structure.get("central_directory_encrypted_entries") or 0
-            )
-        except (TypeError, ValueError):
-            encrypted_entries = 0
-        structurally_valid = bool(
-            structure.get("plausible")
-            and structure.get("central_directory_present")
-            and structure.get("central_directory_walk_ok")
-        )
-        if password_required and structurally_valid and encrypted_entries > 0:
-            return "required"
-        if (
-            not password_required
-            and structure.get("encryption_scan_complete")
-            and structurally_valid
-        ):
-            return "not_required"
-        return "unknown"
-
-    if fmt == "7z":
-        structurally_valid = bool(
-            structure.get("strong_accept")
-            or (
-                structure.get("next_header_crc_ok")
-                and structure.get("next_header_nid_valid")
-            )
-        )
-        if (
-            password_required
-            and structurally_valid
-            and structure.get("encryption_scan_complete", True)
-        ):
-            return "required"
-        if (
-            not password_required
-            and structure.get("encryption_scan_complete")
-            and structurally_valid
-        ):
-            return "not_required"
-
-    if fmt in {"tar", "compression"}:
-        return "not_required"
-    return "unknown"
-
-
-def archive_structure_password_state(task: Any | None) -> str:
+def archive_structure_password_state(task: ArchiveTask | None) -> str:
     """Return the bounded password state for one structured archive input."""
     if task is None:
         return "unknown"
 
-    descriptor = _archive_input_descriptor(task)
-    if descriptor is not None:
-        if descriptor.format_hint == "enc":
-            return "required"
-        analysis = descriptor.analysis if isinstance(descriptor.analysis, dict) else {}
-        if analysis.get("password_required"):
-            return "required"
+    descriptor = task.archive_input()
+    if descriptor.format_hint == "enc" or descriptor.analysis.get("password_required"):
+        return "required"
 
-    knowledge = _knowledge(task)
-    evidence = knowledge.get("discovery.evidence", {})
+    evidence = task.knowledge().get("discovery.evidence", {})
     if isinstance(evidence, dict) and evidence.get("needs_password"):
         return "required"
 
-    active_format = _selected_structure_format(knowledge, descriptor, getattr(task, "password_probe_input", None))
-    if active_format in {"tar", "compression"}:
+    active_format = _selected_structure_format(descriptor, task.password_probe_input)
+    if active_format in {"tar", "gzip", "bzip2", "xz", "zstd", "lz4"}:
         return "not_required"
-
-    state = "unknown"
-    for fmt, structure in _structure_facts(knowledge, active_format):
-        candidate = _validated_format_password_state(fmt, structure)
-        if candidate == "required":
-            return candidate
-        if candidate == "not_required":
-            state = candidate
-    return state
+    return "unknown"
 
 
 class PasswordResolver:
@@ -178,12 +69,12 @@ class PasswordResolver:
     def resolve(
         self,
         archive_path: str,
-        task: Any | None = None,
+        task: ArchiveTask | None = None,
         part_paths: list[str] | None = None,
         archive_key: str = "",
         scope_path: str = "",
     ) -> PasswordResolution:
-        archive_key = archive_key or _archive_key(task) or archive_path
+        archive_key = archive_key or (task.key if task is not None else archive_path)
         password = self.password_session.get_resolved(archive_key)
         if password is not None:
             return PasswordResolution(
@@ -340,15 +231,13 @@ class PasswordResolver:
         )
 
     @staticmethod
-    def _archive_input_for_password_probe(task: Any | None) -> ArchiveInputDescriptor | None:
+    def _archive_input_for_password_probe(task: ArchiveTask | None) -> ArchiveInputDescriptor | None:
         if task is None:
             return None
-        probe_input = getattr(task, "password_probe_input", None)
-        descriptor = _archive_input_descriptor(task)
+        probe_input = task.password_probe_input
+        descriptor = task.archive_input()
         selected_input = probe_input or descriptor
-        if selected_input is None:
-            return None
-        selected_format = _selected_structure_format(_knowledge(task), descriptor, probe_input)
+        selected_format = _selected_structure_format(descriptor, probe_input)
         if selected_format in {"zip", "rar", "7z"} and selected_format != selected_input.format_hint:
             return replace(selected_input, format_hint=selected_format)
         return selected_input
@@ -399,30 +288,3 @@ class PasswordResolver:
             error_text=search.error_text,
             encrypted=encrypted,
         )
-
-
-def _knowledge(task: Any) -> ArchiveKnowledge:
-    if hasattr(task, "knowledge") and callable(task.knowledge):
-        return task.knowledge()
-    return ArchiveKnowledge()
-
-
-def _archive_input_descriptor(task: Any):
-    if hasattr(task, "archive_input") and callable(task.archive_input):
-        try:
-            return task.archive_input()
-        except (TypeError, ValueError, AttributeError):
-            return None
-    return None
-
-
-def _archive_key(task: Any | None) -> str:
-    if task is None:
-        return ""
-    value = str(getattr(task, "key", "") or "")
-    if value:
-        return value
-    descriptor = _archive_input_descriptor(task)
-    if descriptor is None:
-        return ""
-    return str(descriptor.logical_name or descriptor.entry_path or "")

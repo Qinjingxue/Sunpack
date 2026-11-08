@@ -1433,7 +1433,7 @@ void tag_config(Application& app,const fs::path& dir) {
 void task_card_details(Application& app) {
     auto saved=state(app.page(),"tasks"), fixture=saved, saved_texts=state(app.page(),"texts");
     auto row=fixture["rows"][0], sibling=row;
-    sibling["id"]="details-sibling"; sibling["sortTimestamp"]=0; sibling["sortSequence"]=0;
+    sibling["id"]="details-sibling";
     fixture["rows"].push_back(sibling); fixture["total"]=fixture["rows"].size();
     assert(ui_page_set_json(app.page(),"tasks",fixture.dump().c_str())==0);
     auto id=row["id"].get<std::string>();

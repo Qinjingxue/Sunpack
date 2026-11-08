@@ -2291,6 +2291,27 @@ def test_watch_scheduler_uses_each_roots_recursive_flag(tmp_path, monkeypatch, r
     _await(watcher.stop())
 
 
+def test_directory_arrivals_scan_separate_nested_watch_scopes_in_one_tick(tmp_path):
+    # Startup scans do not exercise deduplication of live directory arrivals.
+    # Both inputs must be discovered when the outer scope excludes the nested root.
+    root = tmp_path / "in"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    watcher = _watcher(tmp_path, root_entries=[
+        WatchRootEntry(str(root), recursive=True),
+        WatchRootEntry(str(nested)),
+    ])
+    try:
+        _write_zip(root / "outer.zip")
+        _write_zip(nested / "inner.zip")
+        watcher.notify_directory_arrived(str(root))
+        watcher.notify_directory_arrived(str(nested))
+        result = _await(watcher.run_once())
+        assert result.processed + result.pending == 2
+    finally:
+        _await(watcher.aclose())
+
+
 def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "in"

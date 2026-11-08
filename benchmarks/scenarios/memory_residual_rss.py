@@ -105,9 +105,9 @@ def main() -> int:
             rows.append(sample("after-engine-close"))
 
         asyncio.run(run_batches())
-        from sunpack_native import release_reader_handles_under
-        release_reader_handles_under(str(root))
-        rows.append(sample("after-reader-handle-release"))
+        from sunpack_native import release_reader_resources_under_roots
+        release_reader_resources_under_roots([str(root)])
+        rows.append(sample("after-reader-resource-release"))
         print(render_report(report_from_payload("memory.residual-rss", rows)))
     finally:
         try:

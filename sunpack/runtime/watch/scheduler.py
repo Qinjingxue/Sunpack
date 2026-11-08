@@ -442,8 +442,10 @@ class WatchScheduler:
         from sunpack.runtime.cli.runtime_state import server_runtime_active
         if not server_runtime_active() and os.path.isdir(password_dir):
             desired[(password_dir, False)] = None
+        changed_keys = tuple(absolute_path_key(path) for path in changed)
         for key, watch in list(self._observed_watches.items()):
-            if key not in desired or any(_paths_match(key[0], path, recursive=True) for path in changed):
+            watched_path = absolute_path_key(key[0]) if changed_keys else ""
+            if key not in desired or any(path_key_is_under(watched_path, path) for path in changed_keys):
                 self._observer.unschedule(watch)
                 del self._observed_watches[key]
         for key in desired:
@@ -497,14 +499,21 @@ class WatchScheduler:
 
     def _scan_initial_roots(self, roots: list[str]) -> list[str]:
         completed = []
+        covered_by_scope = {}
         for root in roots:
-            matched = self._matching_root_key(absolute_path_key(root))
+            key = absolute_path_key(root)
+            matched = self._matching_root_key(key)
             if matched is None or not os.path.exists(root):
+                continue
+            # An enclosing scan excludes separately configured nested roots.
+            covered = covered_by_scope.setdefault(matched, [])
+            if any(path_key_is_under(key, parent) for parent in covered):
                 continue
             paths, errors = self._scan_candidate_paths(root, self.scopes[matched])
             for path in paths:
                 self.enqueue(path, event_type="initial_scan")
             if not errors:
+                covered.append(key)
                 completed.append(root)
         # Initial-scan admissions use the existing asynchronous WAL writer;
         # flush once for the batch before the service marks roots scanned.
@@ -1030,12 +1039,11 @@ class WatchScheduler:
             self._directory_pending.clear()
         if rearm and self._started:
             await self.pipeline_engine.work_broker.run("watch_rearm", "watch", self._refresh_directory_watches, rearm, request_id="watch")
-        covered = []
-        for directory in directories:
-            if not any(_is_relative_to(directory,parent) for parent in covered):
-                await self.pipeline_engine.work_broker.run("watch_directory", directory,
-                    self._scan_initial_roots, [directory], request_id="watch", origin="watch")
-                covered.append(directory)
+        if directories:
+            await self.pipeline_engine.work_broker.run(
+                "watch_directory", "watch", self._scan_initial_roots, directories,
+                request_id="watch", origin="watch",
+            )
         with self._lock:
             checkpoint = self._usn_checkpoint_pending
         if checkpoint:
@@ -1055,10 +1063,16 @@ class WatchScheduler:
         result = await self._harvest_completed_requests()
         with self._lock:
             available = max(0, self.pipeline_engine.work_broker.max_pending_jobs - len(self._inflight_requests))
-        ready = await self.pipeline_engine.work_broker.run(
-            "watch_admission", "watch", self._prepare_ready, available,
-            request_id="watch", origin="watch",
-        )
+            now = time.monotonic()
+            next_ready = self._next_ready_entry_locked() if available else None
+            due = (next_ready is not None and next_ready[0] <= now
+                   or self._password_retry_at is not None and self._password_retry_at <= now)
+        ready = []
+        if due:
+            ready = await self.pipeline_engine.work_broker.run(
+                "watch_admission", "watch", self._prepare_ready, available,
+                request_id="watch", origin="watch",
+            )
         if ready and not checkpoint:
             # Admissions are already durable. Cover the whole event burst once
             # before starting this batch, including candidates still waiting.
@@ -1873,8 +1887,11 @@ class WatchScheduler:
                 inflight_owned = normalized_key in self._active_claims or normalized_key in self._inflight_path_counts
                 aliases = self._pending_by_key.get(normalized_key, ())
             pending = {path: self._pending[path].candidate for path in aliases}
-            trackers = {key: value for key, value in self._quiet_trackers.items()
-                        if _paths_match(key, normalized, recursive=recursive)}
+            trackers = {}
+            for path, tracker in self._quiet_trackers.items():
+                key = absolute_path_key(path)
+                if key == normalized_key or (recursive and path_key_is_under(key, normalized_key)):
+                    trackers[path] = tracker
         missing = {key for key in pending.keys() | trackers.keys()
                    if _recorded_file_presence(key) is False}
         pending_removed = 0
@@ -2979,14 +2996,6 @@ def _nearest_existing_directory(path: str) -> str | None:
 
 def _is_relative_to(path: str, root: str) -> bool:
     return path_key_is_under(absolute_path_key(path), absolute_path_key(root))
-
-
-def _paths_match(path: str, expected: str, *, recursive: bool) -> bool:
-    normalized = os.path.abspath(path)
-    expected = os.path.abspath(expected)
-    return case_key(normalized) == case_key(expected) or (
-        recursive and _is_relative_to(normalized, expected)
-    )
 
 
 def _response_claimed_paths(response: PipelineResponse, fallback_path: str) -> list[str]:
