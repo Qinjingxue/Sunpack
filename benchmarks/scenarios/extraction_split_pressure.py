@@ -648,18 +648,6 @@ def run_batch_cases(pressure_cases: list[PressureCase]) -> list[dict]:
         move_case_files_to_batch(pressure_case, batch_dir)
 
     scan_config = archive_pressure_config(passwords=PASSWORD_TRY_LIST)
-    # A request owns one TaskResourceScope. Per-output promotion must not
-    # quiesce unrelated archive jobs that are still entering their
-    # password verifier, which makes the benchmark fail before it can emit a
-    # report.  This acceptance batch is a mixed-directory correctness probe;
-    # native concurrency is covered by the worker scheduling benchmarks, so
-    # keep this probe serial and let it record expected/unexpected outcomes.
-    worker_config = scan_config.setdefault("performance", {}).setdefault("worker", {})
-    worker_config.update(
-        {
-            "thread_capacity": 1,
-        }
-    )
     started = time.perf_counter()
     scan_results = ScanOrchestrator(scan_config).scan(str(batch_dir))
     scan_seconds = time.perf_counter() - started

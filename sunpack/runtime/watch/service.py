@@ -107,13 +107,11 @@ def _normalize_scan_roots(roots) -> list[str]:
 
 
 def _config_without_tray(config: dict) -> dict:
-    result = deepcopy(config)
-    watch = result.get("watch")
-    if isinstance(watch, dict):
-        watch.pop("tray_enabled", None)
-    runtime = result.get("runtime")
-    if isinstance(runtime, dict):
-        runtime.pop("process_mode", None)
+    result = dict(config)
+    for section, excluded_key in (("watch", "tray_enabled"), ("runtime", "process_mode")):
+        values = config.get(section)
+        if isinstance(values, dict) and excluded_key in values:
+            result[section] = {key: value for key, value in values.items() if key != excluded_key}
     return result
 
 
@@ -595,7 +593,7 @@ class WatchService:
             raise self._startup_error
 
     async def reload(self) -> bool:
-        return await self._reload_config()
+        return await asyncio.shield(self._queue_config_reload())
 
     async def add_roots(
         self,
@@ -956,15 +954,7 @@ class WatchService:
         self._config_reload_pending = True
         if self._config_reload_task is None:
             self._config_reload_task = self._track_configuration_task(self._drain_config_reloads())
-            self._config_reload_task.add_done_callback(self._config_reload_finished)
         return self._config_reload_task
-
-    def _config_reload_finished(self, task: asyncio.Task) -> None:
-        # Normally cleared by the coroutine; also cover rejection at shutdown
-        # before the operation starts under the transaction lock.
-        if self._config_reload_task is task:
-            self._config_reload_task = None
-            self._config_reload_pending = False
 
     async def _drain_config_reloads(self) -> bool:
         result = False
@@ -982,9 +972,6 @@ class WatchService:
         finally:
             self._config_reload_task = None
             self._config_reload_pending = False
-
-    async def _reload_config(self) -> bool:
-        return await asyncio.shield(self._queue_config_reload())
 
     def _start_configuration_change(self, operation) -> asyncio.Task:
         async def apply():
@@ -1004,6 +991,11 @@ class WatchService:
 
     def _configuration_finished(self, task: asyncio.Task) -> None:
         self._configuration_tasks.discard(task)
+        # The coroutine usually clears this itself. A task cancelled before
+        # its first step still needs to release the reload slot.
+        if self._config_reload_task is task:
+            self._config_reload_task = None
+            self._config_reload_pending = False
         if not task.cancelled():
             error = task.exception()
             if error is not None:

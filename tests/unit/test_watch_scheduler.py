@@ -1146,9 +1146,6 @@ class CapturingNotificationSink:
     def suppressed(self, request_id):
         self.events.append(("suppressed", request_id))
 
-    def aborted(self, request_id):
-        self.events.append(("aborted", request_id))
-
 
 def _summary_pipeline_engine():
     return FakePipelineEngine(
@@ -3966,8 +3963,7 @@ def test_failure_report_completion_uses_broker_and_drains_before_cancellation(tm
 
         watcher._project_completion = project
 
-        def notify(action, *args):
-            assert action == "failed"
+        def notify(*args):
             assert threading.get_ident() != loop_thread
             token = CURRENT_CANCELLATION.get()
             assert token is not None
@@ -3979,7 +3975,7 @@ def test_failure_report_completion_uses_broker_and_drains_before_cancellation(tm
                 unsubscribe()
                 settled.set()
 
-        watcher._notify = notify
+        watcher.notification_sink = SimpleNamespace(failed=notify)
         response = loop.create_future()
         response.set_result(None)
         request = SimpleNamespace(task=response, cancellation_pending=None,
@@ -4017,15 +4013,18 @@ def test_terminal_report_does_not_materialize_failure_tree_or_large_formatted_er
     source.write_text("source")
     message = "诊断" * 100_000
     failure = FailureInfo(FailureKind.DAMAGED, "extraction", message, details={"diagnostic": message})
-    summary = RunSummary(target_results=(TargetRunResult(
-        str(source), OutcomeKind.FAILURE, error=message, failure=failure, failure_message="",
-    ),))
+    sibling = FailureInfo(FailureKind.DAMAGED, "extraction", message, details={"diagnostic": message})
+    summary = RunSummary(target_results=(
+        TargetRunResult(str(source), OutcomeKind.FAILURE, error=message, failure=failure),
+        TargetRunResult(str(tmp_path / "sibling"), OutcomeKind.FAILURE, error=message, failure=sibling),
+    ))
 
     def forbidden(*args):
         raise AssertionError("Do not eagerly materialize report diagnostics")
 
     monkeypatch.setattr(RunSummary, "failed_tasks", property(forbidden))
     monkeypatch.setattr(FailureInfo, "to_dict", forbidden)
+    monkeypatch.setattr(FailureInfo, "__eq__", forbidden)
     watcher = _watcher(tmp_path)
     notifications = []
     watcher._notify = lambda *args: notifications.append(args)
@@ -4045,5 +4044,6 @@ def test_terminal_report_does_not_materialize_failure_tree_or_large_formatted_er
         notification = next(item for item in notifications if item[0] == "failed")
         assert notification[2][0] is message
         assert notification[3][0]["details"] is failure.details
+        assert notification[3][1]["details"] is sibling.details
     finally:
         watcher._close_blocking()

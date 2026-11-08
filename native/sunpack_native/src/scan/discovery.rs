@@ -17,7 +17,7 @@ use pyo3::exceptions::PyIndexError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -962,15 +962,13 @@ impl NativeCandidateTable {
 
     fn dedupe(&mut self) {
         let mut positions: HashMap<String, usize> = HashMap::new();
-        let mut unique = Vec::with_capacity(self.rows.len());
-        for row in self.rows.drain(..) {
-            let (key, rank) = match &row {
-                Candidate::File(table, index) => {
-                    (path_key(&table.paths[*index]), (1u8, 0usize, 1usize))
-                }
+        let mut unique_len = 0;
+        for index in 0..self.rows.len() {
+            let key = match &self.rows[index] {
+                Candidate::File(table, index) => path_key(&table.paths[*index]),
                 Candidate::Relation(group) => {
                     let data = group.candidate_data();
-                    let key = if data.is_split {
+                    if data.is_split {
                         let parent = Path::new(data.entry_path)
                             .parent()
                             .unwrap_or_else(|| Path::new(""));
@@ -987,29 +985,26 @@ impl NativeCandidateTable {
                         )
                     } else {
                         path_key(data.entry_path)
-                    };
-                    let rank = (
-                        if data.is_split && !data.needs_password {
-                            2
-                        } else {
-                            1
-                        },
-                        if data.is_split { data.parts_len() } else { 0 },
-                        data.parts_len(),
-                    );
-                    (key, rank)
+                    }
                 }
             };
-            if let Some(&position) = positions.get(&key) {
-                if rank > candidate_rank(&unique[position]) {
-                    unique[position] = row;
+            match positions.entry(key) {
+                Entry::Occupied(existing) => {
+                    let position = *existing.get();
+                    if candidate_rank(&self.rows[index]) > candidate_rank(&self.rows[position]) {
+                        self.rows.swap(position, index);
+                    }
                 }
-            } else {
-                positions.insert(key, unique.len());
-                unique.push(row);
+                Entry::Vacant(slot) => {
+                    slot.insert(unique_len);
+                    if unique_len != index {
+                        self.rows.swap(unique_len, index);
+                    }
+                    unique_len += 1;
+                }
             }
         }
-        self.rows = unique;
+        self.rows.truncate(unique_len);
     }
 
     fn project(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {

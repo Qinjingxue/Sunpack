@@ -412,7 +412,11 @@ fn match_inventory_source(
     let detail_end = detail_offset.saturating_add(detail_limit);
     let mut mismatches = JsonArrayBuilder::default();
     let mut missing = JsonArrayBuilder::default();
-    let mut observations = Vec::with_capacity(detail_limit.min(expected.len()));
+    let mut observations = if include_observations {
+        Vec::with_capacity(detail_limit.min(expected.len().saturating_sub(detail_offset)))
+    } else {
+        Vec::new()
+    };
     let mut errors = JsonArrayBuilder::default();
     let mut mismatch_count = 0usize;
     let mut size_mismatch_count = 0usize;
@@ -518,11 +522,9 @@ fn match_inventory_source(
                         }
                     }
                     Err(error) => {
-                        if report_issues {
-                            errors.push(&error)?;
-                        }
                         coverage.missing_files += 1;
                         if report_issues {
+                            errors.push(&error)?;
                             missing.push(&item.path)?;
                         }
                         if emit {
@@ -566,7 +568,11 @@ fn match_inventory_source(
         } else {
             None
         };
-        let size_progress = size_progress(Some(actual_size), item.size);
+        let size_progress = if emit {
+            size_progress(Some(actual_size), item.size)
+        } else {
+            None
+        };
         let (state, progress) = if output.status == 2 {
             coverage.failed_files += 1;
             ("failed", size_progress.or(Some(0.0)))
@@ -598,19 +604,13 @@ fn match_inventory_source(
         } else if size_incomplete {
             coverage.partial_files += 1;
             ("partial", size_progress)
-        } else if let Some(expected_size) = item.size {
-            if item.has_crc && verify_crc && actual_crc.is_none() {
-                ("unverified", size_progress)
-            } else {
-                coverage.complete_files += 1;
-                coverage.complete_bytes = coverage.complete_bytes.saturating_add(expected_size);
-                ("complete", size_progress)
-            }
         } else if item.has_crc && verify_crc && actual_crc.is_none() {
             ("unverified", size_progress)
         } else {
             coverage.complete_files += 1;
-            coverage.complete_bytes = coverage.complete_bytes.saturating_add(actual_size);
+            coverage.complete_bytes = coverage
+                .complete_bytes
+                .saturating_add(item.size.unwrap_or(actual_size));
             ("complete", size_progress)
         };
 

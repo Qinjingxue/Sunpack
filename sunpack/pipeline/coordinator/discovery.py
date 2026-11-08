@@ -79,14 +79,20 @@ class ArchiveDiscoveryPipeline:
     @staticmethod
     def _merge_embedded(result, embedded_result) -> None:
         replaced = embedded_result.claimed_paths | embedded_result.blocked_paths
-        shared_candidates = any(node.descriptor.volume_attempts is not None
-            and any(path_key(path) in replaced for path in node.source_paths)
-            for task in result.tasks for node in task.inputs)
+        shared_candidates = False
         if replaced:
-            result.tasks = [task for task in result.tasks if not (
-                any(path_key(path) in replaced for path in task.cleanup_parts)
-                and not any(node.descriptor.volume_attempts is not None for node in task.inputs)
-            )]
+            retained = []
+            for task in result.tasks:
+                has_attempts = False
+                for node in task.inputs:
+                    if node.descriptor.volume_attempts is not None:
+                        has_attempts = True
+                        if shared_candidates or any(path_key(path) in replaced for path in node.source_paths):
+                            shared_candidates = True
+                            break
+                if has_attempts or not any(path_key(path) in replaced for path in task.cleanup_parts):
+                    retained.append(task)
+            result.tasks = retained
             result.claimed_paths.difference_update(replaced)
             result.blocked_paths.difference_update(replaced)
             result.traces = [trace for trace in result.traces if not (

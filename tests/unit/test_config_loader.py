@@ -228,12 +228,14 @@ def test_config_loader_normalizes_external_schema_once(tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "normalize_config", counted_validate)
     try:
         loader.clear_config_cache()
-        loader.load_raw_config_payload()
+        _, raw = loader.load_raw_config_payload()
+        raw["recursive_extract"] = "0"
         assert calls == []
         config = loader.load_config()
         assert len(calls) == 1
         assert config["recursive_extract"] == {"mode": "infinite"}
-        assert loader.load_config() == config
+        config["recursive_extract"]["mode"] = "modified"
+        assert loader.load_config()["recursive_extract"] == {"mode": "infinite"}
         assert len(calls) == 1
         assert loader.load_raw_config_payload()[1]["recursive_extract"] == "*"
     finally:

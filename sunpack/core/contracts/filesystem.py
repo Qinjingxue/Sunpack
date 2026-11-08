@@ -4,16 +4,6 @@ from pathlib import Path
 from typing import Any
 
 
-FILESYSTEM_ROUTE_RELATIONS = 1
-FILESYSTEM_ROUTE_DETECTION = 2
-FILESYSTEM_ROUTE_RESIDUAL = 3
-
-_FILESYSTEM_ROUTE_NAMES = {
-    FILESYSTEM_ROUTE_RELATIONS: "relations",
-    FILESYSTEM_ROUTE_DETECTION: "detection",
-    FILESYSTEM_ROUTE_RESIDUAL: "residual",
-}
-
 @dataclass
 class FileEntry:
     path: Path
@@ -102,11 +92,6 @@ class DirectorySnapshot:
     def parent_directories(self) -> list[str]:
         return self._native_snapshot.parent_directories()
 
-    def filesystem_candidate_specs(
-        self,
-    ) -> list[tuple[str, int | None, str, str, int, str]]:
-        return self._native_snapshot.filesystem_candidate_specs()
-
     def file_entries_for_directories(self, directories: set[str]) -> list[FileEntry]:
         if not directories:
             return []
@@ -117,23 +102,6 @@ class DirectorySnapshot:
             FileEntry(path=Path(path), is_dir=False, size=size, mtime_ns=mtime_ns)
             for path, size, mtime_ns in zip(paths, sizes, mtimes_ns)
         ]
-
-    def file_route_view(self, route: int) -> "DirectorySnapshot":
-        return DirectorySnapshot.from_native(
-            self.root_path,
-            self._native_snapshot.file_route_view(int(route)),
-            self._raw_native_snapshot,
-        )
-
-    def non_relation_file_routing_rows(self) -> Iterator[tuple[str, int | None, str, str, int]]:
-        paths, sizes, routes, formats, reject_masks = self._native_snapshot.non_relation_file_routing_columns()
-        return iter(zip(
-            paths,
-            sizes,
-            (_FILESYSTEM_ROUTE_NAMES.get(int(route), "residual") for route in routes),
-            formats,
-            reject_masks,
-        ))
 
     def iter_relation_anchor_rows(self) -> Iterator[tuple[str, int | None, dict]]:
         return iter(self._native_snapshot.relation_anchor_rows())

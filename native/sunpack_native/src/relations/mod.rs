@@ -68,11 +68,24 @@ pub(crate) struct ProposalValidation {
 
 impl ProposalValidation {
     fn part_paths(&self) -> impl Iterator<Item = &str> {
-        self.proposal
-            .volumes
+        let (volumes, sources) = match &self.attempts {
+            Some(plan) => (&[][..], plan.base_sources()),
+            None => (self.proposal.volumes.as_slice(), &[][..]),
+        };
+        volumes
             .iter()
             .map(|part| part.0.as_str())
+            .chain(sources.iter().map(|source| source.path.as_str()))
             .chain(self.unresolved.iter().map(String::as_str))
+    }
+
+    fn parts_len(&self) -> usize {
+        self.attempts
+            .as_ref()
+            .map_or(self.proposal.volumes.len(), |plan| {
+                plan.base_sources().len()
+            })
+            + self.unresolved.len()
     }
 }
 
@@ -119,9 +132,7 @@ impl<'a> RelationCandidateData<'a> {
     pub(crate) fn parts_len(&self) -> usize {
         match self.group {
             NativeRelationGroup::Ordinary(..) => 1,
-            NativeRelationGroup::Proposal(validation) => {
-                validation.proposal.volumes.len() + validation.unresolved.len()
-            }
+            NativeRelationGroup::Proposal(validation) => validation.parts_len(),
         }
     }
 
@@ -241,8 +252,11 @@ impl NativeRelationGroup {
             Self::Proposal(validation) => validation.attempts.as_ref(),
             _ => None,
         };
-        plan.into_iter()
-            .flat_map(|plan| plan.sources.iter().map(|source| source.path.as_str()))
+        plan.into_iter().flat_map(|plan| {
+            plan.base_sources()
+                .iter()
+                .map(|source| source.path.as_str())
+        })
     }
 
     pub(crate) fn collect_source_ranges(

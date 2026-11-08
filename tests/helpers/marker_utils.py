@@ -56,12 +56,15 @@ def marker_was_extracted(root: Path, marker_name: str, marker_text: str) -> bool
 
 def marker_scan_state(root: Path, marker_name: str, marker_text: str) -> str:
     candidate_exists = False
+    read_length = len(marker_text) + 1
 
     for path in safe_rglob(root, marker_name):
         try:
             with _open_marker_text(path) as reader:
-                if reader.read() == marker_text:
+                if reader.read(read_length) == marker_text:
                     return "found"
+        except UnicodeDecodeError:
+            continue
         except OSError:
             candidate_exists = True
             continue
@@ -74,7 +77,7 @@ def marker_scan_state(root: Path, marker_name: str, marker_text: str) -> str:
             continue
         try:
             with _open_marker_text(path) as reader:
-                if reader.read() == marker_text:
+                if reader.read(read_length) == marker_text:
                     return "found"
         except UnicodeDecodeError:
             continue

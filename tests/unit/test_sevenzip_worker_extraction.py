@@ -1066,7 +1066,6 @@ def test_native_worker_reports_cpu_credit_sizing_plan(credits, reserve):
     capacity = logical_processors
     assert handshake["sizing_mode"] == "dynamic"
     assert int(handshake["thread_capacity"]) == capacity
-    assert int(handshake["nominal_cpu_budget"]) == capacity
     assert handshake["memory_management"] == "commitment_replay"
     assert int(handshake["memory_reserve_bytes"]) == ((128 + 16 * capacity) * 1024**2)
 
@@ -1528,10 +1527,6 @@ def test_extraction_scheduler_uses_worker_for_concat_ranges(tmp_path, monkeypatc
 
 def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
     from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
-    from sunpack.pipeline.verification.methods._archive_output_match import (
-        archive_files_from_names,
-        coverage_from_native_inventory,
-    )
 
     worker = _require_worker_or_skip()
     archive = tmp_path / "windows-names.zip"
@@ -1577,14 +1572,11 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
     # No alternate data stream was created on a file named "12".
     assert not (out_dir / "logs" / "12").exists()
 
-    coverage, _ = coverage_from_native_inventory(
-        archive_files_from_names(list(entries)),
-        collect_output_inventory(str(out_dir)),
-        method="test",
-    )
-    assert coverage.missing_files == 0
-    assert coverage.failed_files == 0
-    assert coverage.matched_files == len(entries)
+    inventory = collect_output_inventory(str(out_dir))
+    coverage = inventory.verification_match([{"path": name} for name in entries])["coverage"]
+    assert coverage["missing_files"] == 0
+    assert coverage["failed_files"] == 0
+    assert coverage["matched_files"] == len(entries)
 
 
 def test_worker_manifest_protocol(subtests):

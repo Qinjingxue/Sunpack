@@ -216,7 +216,6 @@ def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, ph
     from ctypes import wintypes
     import gzip
     from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
-    from sunpack.core.contracts.failures import FailureKind
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
     path = tmp_path / ("stream.gz" if phase == "detection" else "fake.zip")
@@ -247,16 +246,13 @@ def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, ph
         provider = ArchiveTaskProvider(make_config({}))
         session = DiscoveryScanSession(config=provider.config)
         result = provider.discovery.embedded.discover_many_native([(table, batch)], session)[0]
-        provider._record_discovery_failures(result)
         if source_state == "departed":
-            assert not result.tasks and not result.traces and not provider.failed_candidate_failures
+            assert not result.tasks and not result.traces
         else:
             trace, = result.traces
             assert trace.reason == "embedded_scan_io_error" and trace.error
-            failure, = provider.failed_candidate_failures
             assert result.blocked_paths
-            assert failure.kind == FailureKind.FILESYSTEM_ERROR
-            assert failure.details["path"] == str(path) and failure.message == trace.error
+            assert trace.entry_path == str(path)
     finally:
         if handle is not None:
             assert kernel.CloseHandle(handle)

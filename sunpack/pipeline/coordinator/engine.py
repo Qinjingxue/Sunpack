@@ -854,8 +854,7 @@ class _PipelineServices:
     async def start(self) -> None:
         self.sevenzip_runner.bind_event_loop(asyncio.get_running_loop())
         handshake = await self.sevenzip_runner.start_asyncio()
-        initial_limit = int(handshake.get("initial_active_limit", 0) or handshake.get("thread_capacity", 1) or 1)
-        self.broker.configure_thread_capacity(initial_limit)
+        self.broker.configure_thread_capacity(int(handshake["thread_capacity"]))
 
     async def close(self, broker: AsyncWorkBroker) -> None:
         await self.sevenzip_runner.aclose()
@@ -1321,10 +1320,15 @@ class _RequestRuntime:
         if not roots:
             return True
         scanner = self.task_scanner if depth == 1 else self.recursive_scanner
-        if scan_session is None and depth == 1:
+        if scan_session is None:
             from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
-            scan_session = DiscoveryScanSession(config=scanner.config, scopes=DiscoveryScope.for_targets(roots, recursive=self.submission.recursive),
-                                                scope=self.submission.discovery_scope, catalog=self.submission.catalog)
+            if depth == 1:
+                scan_session = DiscoveryScanSession(
+                    config=scanner.config, scopes=DiscoveryScope.for_targets(roots, recursive=self.submission.recursive),
+                    scope=self.submission.discovery_scope, catalog=self.submission.catalog,
+                )
+            else:
+                scan_session = DiscoveryScanSession(config=scanner.config)
         await broker.run("report", "", self.reporter.scan_started, depth,
                          request_id=self.submission.request_id, cancellation=cancellation)
         discovered = await broker.run(
@@ -1340,7 +1344,7 @@ class _RequestRuntime:
         return await self._run_discovery_batch(
             discovered,
             roots=roots,
-            scan_session=scan_session or scanner.last_scan_session,
+            scan_session=scan_session,
             depth=depth,
             direct=False,
             ownership=ownership,
@@ -1366,7 +1370,7 @@ class _RequestRuntime:
             self.recursive_authorization.authorize_batch,
             tasks,
             roots,
-            scan_session or self.task_scanner.last_scan_session,
+            scan_session,
             depth=depth,
             request_id=self.submission.request_id,
             cancellation=cancellation,

@@ -119,6 +119,12 @@ struct VolumeAttemptCursor {
         used[selected[depth]] = 0;
         ++domain_remaining[slots[depth].domain];
     }
+    void skip_layout() {
+        for (auto source : selected) used[source] = 0;
+        ++layout;
+        digits.clear();
+        selected.clear();
+    }
     bool next(const VolumeAttemptPlan& plan, const std::atomic<bool>* cancel = nullptr) {
         if (plan.insufficient_sources) return false;
         while (layout < plan.layouts.size()) {

@@ -43,9 +43,6 @@ class _Sink:
     def suppressed(self, *args):
         self.actions.append(("suppressed", args))
 
-    def aborted(self, *args):
-        self.actions.append(("aborted", args))
-
 
 class _Runner:
     def __init__(self, _config):

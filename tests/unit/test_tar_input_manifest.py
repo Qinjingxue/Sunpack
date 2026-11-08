@@ -6,7 +6,7 @@ from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
 from sunpack.pipeline.verification.methods._archive_output_match import (
-    coverage_from_native_inventory,
+    match_archive_output,
 )
 
 
@@ -59,14 +59,14 @@ def test_tar_duplicate_members_preserve_history_and_worker_output_names(tmp_path
     out_dir.mkdir()
     (out_dir / "same.txt").write_bytes(b"old")
     (out_dir / "same(1).txt").write_bytes(b"replacement")
-    coverage, raw = coverage_from_native_inventory(
+    raw, _ = match_archive_output(
         manifest,
         collect_output_inventory(str(out_dir)),
         method="test",
     )
     assert raw["source"] == "native_output_inventory"
-    assert coverage.expected_files == 2
-    assert coverage.complete_files == 2
+    assert raw["coverage"]["expected_files"] == 2
+    assert raw["coverage"]["complete_files"] == 2
 
 
 def test_tar_pax_long_path_is_applied_to_target_member(tmp_path):

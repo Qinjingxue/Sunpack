@@ -548,7 +548,7 @@ def test_pipeline_broker_always_uses_automatic_capacity_and_internal_queue_limit
         services.broker = broker
 
         async def handshake():
-            return {"initial_active_limit": 7, "thread_capacity": 12}
+            return {"thread_capacity": 7}
 
         services.sevenzip_runner = SimpleNamespace(
             bind_event_loop=lambda loop: None, start_asyncio=handshake,

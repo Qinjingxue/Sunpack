@@ -77,9 +77,9 @@ uv run --locked python -m benchmarks extraction worker-read-patterns --runs 1 --
 uv run --locked python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --prefetch-window-kib 512 --prefetch-depth 2
 # Compare production-policy prefetch on/off in alternating order. Two 512 MiB members retain a meaningful solid-7z case.
 uv run --locked python -m benchmarks extraction worker-read-patterns --format tar --format rar-split --format 7z --7z-variant solid --large-files 2 --large-file-mib 512 --large-content random --runs 5 --prefetch compare
-uv run --locked python -m benchmarks extraction worker-small-file-scheduling --jobs 256 --clients 4 --capacities 1,2,4,8 --runs 3
+uv run --locked python -m benchmarks extraction worker-small-file-scheduling --jobs 256 --clients 4 --runs 3
 uv run --locked python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --runs 3 --warmups 1
-uv run --locked python -m benchmarks extraction worker-resource-pressure --modes cpu,io --capacities 1,2,4 --jobs 4
+uv run --locked python -m benchmarks extraction worker-resource-pressure --modes cpu,io --jobs 4
 uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
 uv run --locked python -m benchmarks watch cli-format-matrix --runs 3 --json-out benchmarks/results/watch-cli-format-matrix.json
 uv run --locked python -m benchmarks watch cli-format-matrix --format zipx --format lz4 --runs 3 --json-out benchmarks/results/watch-cli-zipx-lz4-baseline.json
@@ -310,7 +310,7 @@ only ZIPX and LZ4 in both CLI and watch commands.
 `extraction worker-small-file-scheduling` measures the worker-internal thread
 scheduler under a deliberately adversarial many-small-file workload. It creates
 one small ZIP per job and submits each request's full burst before the next
-request, then sweeps `--capacities` (native thread counts). Per run it records
+request. Per run it uses the selected worker's reported capacity and records
 throughput, observed active-job peak, time-weighted thread-capacity utilization,
 queue/service latency percentiles, queued-but-underutilized thread time,
 worker CPU/RSS/read/write utilization, early- and overall-admission Jain fairness,
@@ -352,8 +352,8 @@ apply per-engine environment overrides such as
 Run them as scripts (`python benchmarks/scenarios/worker_window_sweep.py --help`)
 because the sweep mutates source.
 `extraction worker-concurrency-ablation` decomposes the parallel worker deficit into
-single-variable ablations on the same cached 300 MiB corpus: per-volume writer width,
-shared buffer count, volume space gate, native CPU budget, and input prefetch, each
+single-variable ablations on the same cached 300 MiB corpus: shared buffer count
+and input prefetch, each
 optionally paired with concurrent `7z.exe` and with `--dry` (worker `dry_run` against
 `7z t`) to separate decode cost from output-write cost. It reports wall time, process
 CPU split, and per-job decoder credit grants.

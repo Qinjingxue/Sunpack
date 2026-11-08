@@ -62,6 +62,16 @@ impl NativeDirectorySnapshot {
         }
     }
 
+    pub(crate) fn file_route_view(&self, route: u8) -> Self {
+        self.view(
+            self.rows
+                .iter()
+                .copied()
+                .filter(|&row| self.table.file_routes[row] == route)
+                .collect(),
+        )
+    }
+
     fn from_records(records: Vec<DirectoryEntryRecord>, errors: DirectoryReadErrors) -> Self {
         let mut table = Self::build_table(records);
         table.scan_errors = errors.into_messages();
@@ -679,19 +689,6 @@ impl NativeDirectorySnapshot {
         (paths, sizes, mtimes_ns)
     }
 
-    pub(crate) fn file_route_view(&self, route: u8) -> Self {
-        Self {
-            buckets: OnceLock::new(),
-            table: Arc::clone(&self.table),
-            rows: self
-                .rows
-                .iter()
-                .copied()
-                .filter(|&row| !self.table.is_dirs[row] && self.table.file_routes[row] == route)
-                .collect(),
-        }
-    }
-
     fn relation_anchor_rows(
         &self,
         py: Python<'_>,
@@ -718,72 +715,6 @@ impl NativeDirectorySnapshot {
                 ))
             })
             .collect()
-    }
-
-    fn filesystem_candidate_specs(
-        &self,
-    ) -> Vec<(String, Option<u64>, String, String, u32, String)> {
-        let mut specs = Vec::with_capacity(self.rows.len());
-        for &row in &self.rows {
-            let route = self.table.file_routes[row];
-            if self.table.is_dirs[row] || route == FILE_ROUTE_RELATIONS {
-                continue;
-            }
-            let path = &self.table.paths[row];
-            let anchor = self.table.relation_anchors[row]
-                .as_ref()
-                .and_then(CheapAnchor::anchor);
-            specs.push((
-                path.clone(),
-                self.table.sizes[row],
-                filesystem_route_name(route).to_string(),
-                anchor
-                    .map(|value| value.format.to_ascii_lowercase())
-                    .unwrap_or_default(),
-                self.table.relation_anchors[row]
-                    .as_ref()
-                    .map(CheapAnchor::reject_mask)
-                    .unwrap_or(0),
-                filesystem_logical_name(path),
-            ));
-        }
-        specs
-    }
-
-    fn non_relation_file_routing_columns(
-        &self,
-    ) -> (
-        Vec<String>,
-        Vec<Option<u64>>,
-        Vec<u8>,
-        Vec<String>,
-        Vec<u32>,
-    ) {
-        let estimated = self.rows.len();
-        let mut paths = Vec::with_capacity(estimated);
-        let mut sizes = Vec::with_capacity(estimated);
-        let mut routes = Vec::with_capacity(estimated);
-        let mut formats = Vec::with_capacity(estimated);
-        let mut reject_masks = Vec::with_capacity(estimated);
-        for &row in &self.rows {
-            if self.table.is_dirs[row] || self.table.file_routes[row] == FILE_ROUTE_RELATIONS {
-                continue;
-            }
-            let anchor = self.table.relation_anchors[row]
-                .as_ref()
-                .and_then(CheapAnchor::anchor);
-            paths.push(self.table.paths[row].clone());
-            sizes.push(self.table.sizes[row]);
-            routes.push(self.table.file_routes[row]);
-            formats.push(anchor.map(|value| value.format.clone()).unwrap_or_default());
-            reject_masks.push(
-                self.table.relation_anchors[row]
-                    .as_ref()
-                    .map(CheapAnchor::reject_mask)
-                    .unwrap_or(0),
-            );
-        }
-        (paths, sizes, routes, formats, reject_masks)
     }
 }
 

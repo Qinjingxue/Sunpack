@@ -725,7 +725,7 @@ def test_watch_service_invalid_config_reload_preserves_running_service(tmp_path,
 
     monkeypatch.setattr(service, "_start_scheduler", start_scheduler)
 
-    _await(service._reload_config())
+    _await(service.reload())
 
     assert invalidated == [True]
     assert service.config is original_config

@@ -10,10 +10,11 @@ from sunpack.pipeline.verification.archive_input_manifest import (
 )
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.error_classification import classify_verification_error
-from sunpack.pipeline.verification.methods._archive_output_match import coverage_from_native_inventory
+from sunpack.pipeline.verification.methods._archive_output_match import match_archive_output
 from sunpack.pipeline.verification.methods._output_stats import output_inventory_for_evidence, should_emit_file_observations
 from sunpack.pipeline.verification.registry import register_verification_method
 from sunpack.core.contracts.verification import (
+    DECISION_NONE,
     DECISION_RETRY_EXTRACT,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
     CONTENT_INTEGRITY_UNKNOWN,
@@ -45,20 +46,12 @@ class ArchiveTestCrcMethod:
                 return _verified_manifest_result(self.name, archive_manifest, inventory)
             return VerificationStep(method=self.name, status="skipped")
 
-        emit_observations = should_emit_file_observations(evidence, self.name)
-        detail_limit = (
-            min(retained, 128)
-            if emit_observations
-            else 0
-        )
-        coverage_result, match_result = coverage_from_native_inventory(
+        match_result, observations = match_archive_output(
             archive_manifest,
             inventory,
             method=self.name,
             verify_crc=True,
-            basename_mode="unique",
-            include_observations=emit_observations,
-            detail_limit=detail_limit,
+            include_observations=should_emit_file_observations(evidence, self.name),
         )
 
         status = str(match_result.get("status") or "")
@@ -71,7 +64,7 @@ class ArchiveTestCrcMethod:
         size_mismatches = match_result["size_mismatches"]
         size_mismatch_count = int(match_result.get("size_mismatch_count", 0) or 0)
         missing_count = int(match_result["missing_count"])
-        coverage = dict(match_result.get("coverage") or {})
+        coverage = match_result["coverage"]
         if mismatch_count == 0 and size_mismatch_count == 0 and missing_count == 0:
             coverage = _promote_verified_manifest_coverage(coverage, archive_manifest, inventory)
 
@@ -115,8 +108,7 @@ class ArchiveTestCrcMethod:
             )
             issues.append(issue)
 
-        observations = coverage_result.observations
-        completeness = _coverage_float(coverage, "completeness", 1.0)
+        completeness = coverage["completeness"]
         content_integrity = _content_integrity(
             archive_manifest,
             mismatch_count=mismatch_count + size_mismatch_count,
@@ -136,37 +128,24 @@ class ArchiveTestCrcMethod:
             "crc_files_read": int(match_result.get("crc_files_read", 0) or 0),
         }
 
-        if not issues:
-            return VerificationStep(
-                method=self.name,
-                status="passed",
-                completeness_hint=completeness,
-                content_integrity_hint=content_integrity,
-                verification_strength=VERIFICATION_STRENGTH_CRC,
-                total_item_count=summary["total_item_count"],
-                verified_item_count=summary["verified_item_count"],
-                archive_walk_complete=summary["archive_walk_complete"],
-                file_observations=observations,
-                issues=[VerificationIssue(
-                    method=self.name,
-                    code="info.archive_output_coverage",
-                    message="Archive-state files were matched against extraction output",
-                    path=evidence.output_dir,
-                    expected=int(coverage.get("expected_files", retained) or 0),
-                    actual={**_coverage_actual(coverage, archive_manifest, evidence), **summary},
-                )],
-            )
+        failed = bool(issues)
         issues.append(VerificationIssue(
             method=self.name,
             code="info.archive_output_coverage",
             message="Archive-state files were matched against extraction output",
             path=evidence.output_dir,
-            expected=int(coverage.get("expected_files", retained) or 0),
-            actual={**_coverage_actual(coverage, archive_manifest, evidence), **summary},
+            expected=coverage["expected_files"],
+            actual={
+                **coverage,
+                "source_manifest": True,
+                "archive_type": archive_manifest.archive_type,
+                "content_integrity": _content_integrity(archive_manifest),
+                **summary,
+            },
         ))
         return VerificationStep(
             method=self.name,
-            status="failed",
+            status="failed" if failed else "passed",
             issues=issues,
             completeness_hint=completeness,
             content_integrity_hint=content_integrity,
@@ -174,8 +153,8 @@ class ArchiveTestCrcMethod:
             total_item_count=summary["total_item_count"],
             verified_item_count=summary["verified_item_count"],
             archive_walk_complete=summary["archive_walk_complete"],
-            recoverable_upper_bound_hint=completeness,
-            decision_hint=DECISION_RETRY_EXTRACT,
+            recoverable_upper_bound_hint=completeness if failed else None,
+            decision_hint=DECISION_RETRY_EXTRACT if failed else DECISION_NONE,
             file_observations=observations,
         )
 
@@ -242,29 +221,6 @@ class ArchiveTestCrcMethod:
         )
 
 
-def _coverage_actual(coverage: dict[str, Any], archive_manifest, evidence: VerificationEvidence) -> dict[str, Any]:
-    actual = {
-        "completeness": round(_coverage_float(coverage, "completeness", 1.0), 6),
-        "file_coverage": round(_coverage_float(coverage, "file_coverage", 1.0), 6),
-        "byte_coverage": round(_coverage_float(coverage, "byte_coverage", 1.0), 6),
-        "expected_files": int(coverage.get("expected_files", 0) or 0),
-        "matched_files": int(coverage.get("matched_files", 0) or 0),
-        "complete_files": int(coverage.get("complete_files", 0) or 0),
-        "partial_files": int(coverage.get("partial_files", 0) or 0),
-        "failed_files": int(coverage.get("failed_files", 0) or 0),
-        "missing_files": int(coverage.get("missing_files", 0) or 0),
-        "expected_bytes": int(coverage.get("expected_bytes", 0) or 0),
-        "matched_bytes": int(coverage.get("matched_bytes", 0) or 0),
-        "complete_bytes": int(coverage.get("complete_bytes", 0) or 0),
-    }
-    actual.update({
-        "source_manifest": True,
-        "archive_type": getattr(archive_manifest, "archive_type", ""),
-        "content_integrity": _content_integrity(archive_manifest),
-    })
-    return actual
-
-
 def _verified_manifest_result(method: str, archive_manifest, inventory) -> VerificationStep:
     file_count = int(archive_manifest.file_count or inventory.stats.file_count or 0)
     total_items = int(archive_manifest.item_count or file_count)
@@ -327,7 +283,6 @@ def _promote_verified_manifest_coverage(coverage: dict[str, Any], archive_manife
         "missing_files": 0,
         "matched_bytes": total_bytes,
         "complete_bytes": total_bytes,
-        "confidence": 1.0,
     })
     return promoted
 
@@ -350,13 +305,6 @@ def _content_integrity(
     ):
         return CONTENT_INTEGRITY_VERIFIED_COMPLETE
     return CONTENT_INTEGRITY_UNKNOWN
-
-
-def _coverage_float(coverage: dict[str, Any], key: str, default: float) -> float:
-    try:
-        return float(coverage.get(key, default))
-    except (TypeError, ValueError):
-        return default
 
 
 def _stream_receipt_result(method: str, evidence: VerificationEvidence) -> VerificationStep:

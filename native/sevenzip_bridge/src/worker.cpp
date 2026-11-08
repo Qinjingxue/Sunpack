@@ -36,7 +36,6 @@
 #include "internal/native_memory.hpp"
 #include "internal/extraction_replay.hpp"
 #include "internal/native_cpu_budget.hpp"
-#include "internal/native_worker_sizing.hpp"
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
 #include "internal/worker_pipeline_timing.hpp"
 #endif
@@ -478,7 +477,6 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
 }
 
 sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
-    const WorkerArchiveInput& archive_input,
     const sunpack::sevenzip::PasswordTestResult& probe,
     std::size_t candidate_count
 ) {
@@ -1129,6 +1127,7 @@ void select_volume_attempt(const WorkerArchiveInput& source,
         previous = slots[i].number;
     }
     input.archive_path = input.part_paths.front();
+    if (input.missing_volume_number) return;
     const auto total = source.volume_attempts.tail_totals.empty()
         ? source.volume_attempts.head_size_from_total
         : source.volume_attempts.tail_totals[cursor.selected.back()];
@@ -1381,7 +1380,7 @@ int run_request(
                 const auto probe = run_password_candidate_probe(archive_input, password_candidates);
                 if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
                     static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
-                    result = password_candidate_failure(archive_input, probe, password_candidates.size());
+                    result = password_candidate_failure(probe, password_candidates.size());
                 } else {
                     result = extract_with_password(password_candidates[probe.matched_index]);
                     result.password_candidate_batch = true;
@@ -1453,7 +1452,7 @@ int run_request(
                     rejected.backend_available = true;
                     rejected.attempts = static_cast<int>(password_candidates.size());
                     rejected.message = "wrong password";
-                    result = password_candidate_failure(archive_input, rejected, password_candidates.size());
+                    result = password_candidate_failure(rejected, password_candidates.size());
                 }
             }
         }
@@ -1486,6 +1485,9 @@ int run_request(
                     return slot.number == static_cast<unsigned int>(archive_input.missing_volume_number);
                 }); })) break;
         auto& cursor = volume_replay->volumes;
+        // Every composition of a sparse layout is missing the same slot.
+        // Slot 1 instead denotes a candidate-dependent carrier trim failure.
+        if (archive_input.missing_volume_number > 1) cursor.skip_layout();
         if (!cursor.next(request.archive_input.volume_attempts, cancel_token.get())) {
             if (cancel_token && cancel_token->load()) return cancelled_result(job_id);
             result.status = PasswordTestStatus::Damaged;
@@ -1626,17 +1628,15 @@ int run_request(
     return ok ? 0 : 1;
 }
 
-sunpack::sevenzip::NativeMachineResources native_machine_resources() noexcept {
-    sunpack::sevenzip::NativeMachineResources resources;
-    const unsigned hardware = std::thread::hardware_concurrency();
-    resources.logical_processors = hardware == 0 ? std::size_t{2} : hardware;
+std::size_t native_logical_processor_count() noexcept {
 #ifdef _WIN32
     const DWORD active_processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     if (active_processors != 0) {
-        resources.logical_processors = static_cast<std::size_t>(active_processors);
+        return static_cast<std::size_t>(active_processors);
     }
 #endif
-    return resources;
+    const unsigned hardware = std::thread::hardware_concurrency();
+    return hardware == 0 ? std::size_t{2} : hardware;
 }
 
 std::string requested_native_process_mode() {
@@ -1668,7 +1668,7 @@ bool apply_native_process_mode(const std::string& mode) noexcept {
 class NativeJobExecutor final {
 public:
     NativeJobExecutor(
-        const sunpack::sevenzip::NativeSizingPlan& sizing,
+        std::size_t worker_count,
         std::uint64_t memory_reserve_bytes
     )
         : memory_(memory_reserve_bytes, {}, [this] { writer_registry_->reclaim_idle_memory(); }),
@@ -1685,7 +1685,7 @@ public:
               writer_meters_,
               writer_config_,
               space_change_sink_)),
-          worker_count_((std::max)(std::size_t{1}, sizing.thread_capacity)),
+          worker_count_(worker_count),
           queue_capacity_(4096),
           cpu_budget_(
               worker_count_,
@@ -2464,15 +2464,12 @@ int run_message(
 int main() {
     const std::string requested_process_mode = requested_native_process_mode();
     const bool process_mode_applied = apply_native_process_mode(requested_process_mode);
-    const auto resources = native_machine_resources();
-    const auto sizing = sunpack::sevenzip::derive_native_sizing_plan(
-        resources);
-    const auto memory_reserve_bytes = sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(sizing.thread_capacity);
-    NativeJobExecutor executor(sizing, memory_reserve_bytes);
+    const auto worker_count = native_logical_processor_count();
+    const auto memory_reserve_bytes = sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(worker_count);
+    NativeJobExecutor executor(worker_count, memory_reserve_bytes);
     print_json_line(
-        "{\"type\":\"worker_ready\",\"sizing_mode\":\"dynamic\",\"logical_processors\":" + std::to_string(resources.logical_processors) +
-        ",\"thread_capacity\":" + std::to_string(sizing.thread_capacity) +
-        ",\"nominal_cpu_budget\":" + std::to_string(sizing.thread_capacity) +
+        "{\"type\":\"worker_ready\",\"sizing_mode\":\"dynamic\",\"logical_processors\":" + std::to_string(worker_count) +
+        ",\"thread_capacity\":" + std::to_string(worker_count) +
         ",\"memory_management\":\"commitment_replay\"" +
         ",\"memory_reserve_bytes\":" +
             std::to_string(memory_reserve_bytes) +

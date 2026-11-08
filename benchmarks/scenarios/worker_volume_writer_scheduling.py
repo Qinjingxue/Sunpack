@@ -38,6 +38,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
+from benchmarks.scenarios.sevenzip_worker_matrix import worker_thread_capacity
 from benchmarks.scenarios.worker_single_file_write import MIB, GIB, _create_archive
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.core.support.output_paths import resolve_output_volume_key
@@ -208,18 +209,11 @@ def _run_configuration(
     jobs: list[_Job],
     worker_path: Path,
     dll_path: Path,
-    thread_capacity: int,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     for job in jobs:
         _purge_file_cache(job.archive)
-    worker = _NativeWorkerProcess(
-        str(worker_path),
-        None,
-        {
-            "thread_capacity": thread_capacity,
-        },
-    )
+    worker = _NativeWorkerProcess(str(worker_path), None)
     try:
         for job in jobs:
             payload = json.dumps(
@@ -318,7 +312,6 @@ def main() -> int:
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--thread-capacity", type=int, default=4)
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--worker-path", type=Path)
     parser.add_argument("--results-root", type=Path)
@@ -330,8 +323,6 @@ def main() -> int:
         parser.error("--payload-mib must be at least 64 to stay out of the cached regime")
     if args.repeats < 1 or args.warmups < 0:
         parser.error("--repeats must be >= 1 and --warmups >= 0")
-    if args.thread_capacity < MIN_CONCURRENT_JOBS:
-        parser.error(f"--thread-capacity must be >= {MIN_CONCURRENT_JOBS}")
 
     worker_path = args.worker_path
     if worker_path is None:
@@ -342,6 +333,9 @@ def main() -> int:
     worker_path = worker_path.resolve()
     if not worker_path.is_file():
         parser.error(f"worker executable is unavailable: {worker_path}")
+    capacity = worker_thread_capacity(worker_path, timeout=args.timeout_seconds)
+    if capacity < MIN_CONCURRENT_JOBS:
+        parser.error(f"worker needs at least {MIN_CONCURRENT_JOBS} threads for the pair phase")
     try:
         dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
@@ -427,7 +421,6 @@ def main() -> int:
                     jobs=jobs,
                     worker_path=worker_path,
                     dll_path=dll_path,
-                    thread_capacity=args.thread_capacity,
                     timeout_seconds=args.timeout_seconds,
                 )
                 result["configuration"] = configuration
@@ -538,9 +531,9 @@ def main() -> int:
                 "payload_mib": args.payload_mib,
                 "repeats": args.repeats,
                 "warmups": args.warmups,
-                "thread_capacity": args.thread_capacity,
             },
             "environment": {
+                "worker_capacity": capacity,
                 "worker": str(worker_path),
                 "cpu_count": os.cpu_count(),
                 "topology": targets,

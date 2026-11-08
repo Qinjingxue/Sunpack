@@ -6,7 +6,6 @@
 #include "internal/sevenzip_status.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
-#include "internal/native_worker_sizing.hpp"
 #include "internal/sevenzip_callbacks.hpp"
 
 #include <filesystem>
@@ -319,19 +318,6 @@ bool check_cpu_budget_acquire_all_available() {
     return budget.reserved_credits() == 0;
 }
 
-bool check_native_sizing_tracks_logical_processors() {
-    using namespace sunpack::sevenzip;
-    const std::size_t cases[] = {0, 1, 2, 4, 8, 16, 32, 64, 128};
-    for (const std::size_t logical_processors : cases) {
-        const NativeMachineResources resources{logical_processors};
-        const auto plan = derive_native_sizing_plan(resources);
-        if (plan.thread_capacity != (std::max)(std::size_t{1}, logical_processors)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 }  // namespace
 #endif
 
@@ -380,10 +366,6 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_cpu_context_exchange_propagates_and_restores()) {
         std::cerr << "CPU context exchange check failed\n";
         return 32;
-    }
-    if (!check_native_sizing_tracks_logical_processors()) {
-        std::cerr << "native sizing logical-processor check failed\n";
-        return 13;
     }
 
 #endif

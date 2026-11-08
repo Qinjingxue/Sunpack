@@ -6,8 +6,9 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -45,37 +46,7 @@ class WatchNotificationSink(Protocol):
 
     def suppressed(self, request_id: str) -> None: ...
 
-    def aborted(self, request_id: str) -> None: ...
-
     def interrupted(self, request_id: str, errors: list[str]) -> None: ...
-
-
-class NullWatchNotificationSink:
-    def interrupted(self, request_id: str, errors: list[str]) -> None:
-        pass
-
-    def submitted(self, request_id: str, source_path: str) -> None:
-        pass
-
-    def progress(self, request_id: str, task: Any, event: dict[str, Any]) -> None:
-        pass
-
-    def succeeded(self, request_id: str, output_dirs: list[str], warnings: list[str] | None = None) -> None:
-        pass
-
-    def failed(
-        self,
-        request_id: str,
-        errors: list[str],
-        failure_payloads: Sequence[Mapping[str, Any]],
-    ) -> None:
-        pass
-
-    def suppressed(self, request_id: str) -> None:
-        pass
-
-    def aborted(self, request_id: str) -> None:
-        pass
 
 
 @dataclass(slots=True)
@@ -335,9 +306,6 @@ class WatchToastCoordinator:
             else:
                 self._schedule_finalize_if_drained_locked()
 
-    def aborted(self, request_id: str) -> None:
-        self.suppressed(request_id)
-
     def stop(self) -> None:
         with self._lock:
             self._closed = True
@@ -379,9 +347,7 @@ class WatchToastCoordinator:
             elif outcome == "success":
                 batch.succeeded += 1
                 batch.output_target = _common_output_target([batch.output_target, *(output_dirs or [])])
-                batch.warnings = _bounded_text(
-                    (value + "\n" for value in (batch.warnings, *(errors or [])) if value), 2048,
-                ).rstrip()
+                batch.warnings = _bounded_lines(chain((batch.warnings,), errors or ()), 2048)
             else:
                 batch.failed += 1
                 if batch.failure_details is None:
@@ -530,10 +496,11 @@ class WatchToastCoordinator:
         ))
 
     def _schedule_finalize_if_drained_locked(self) -> None:
-        if (not self._batch.completed or self._has_pending_batch_requests_locked()
+        if (self._finalize_timer is not None or not self._batch.completed
+                or self._has_pending_batch_requests_locked()
                 or self._batch.pending_appends or self._batch.finalizing):
             return
-        self._cancel_finalize_locked()
+        # Only visible batch activity invalidates the existing deadline.
         generation = self._finalize_generation
         timer = threading.Timer(self._debounce_seconds, self._finalize, args=(generation,))
         timer.daemon = True
@@ -557,16 +524,16 @@ class WatchToastCoordinator:
                     or owner.pending_appends or owner.finalizing):
                 return
             owner.finalizing = True
-            batch = replace(owner)
+            failed = owner.failed + int(owner.cleanup_failed)
+            details = owner.failure_details
+            write_report = (owner.failed or (owner.cleanup_failed and owner.succeeded)) and not owner.report_failed
         report_path = ""
         try:
             with owner.io_lock:
-                if (batch.failed or (batch.cleanup_failed and batch.succeeded)) and not batch.report_failed:
+                if write_report:
                     try:
                         with owner.cancellation.native_scope():
-                            report_path = self.report_store.write(
-                                batch.failure_details, batch.failed + int(batch.cleanup_failed),
-                            )
+                            report_path = self.report_store.write(details, failed)
                     except (Exception, asyncio.CancelledError):
                         with self._lock:
                             owner.report_failed = True
@@ -576,7 +543,7 @@ class WatchToastCoordinator:
                              and not owner.pending_appends
                              and not self._has_pending_batch_requests_locked())
                     if valid:
-                        self._publish_final_locked(batch, report_path)
+                        self._publish_final_locked(owner, report_path)
                         self._reset_batch_locked(clear=False)
                 if report_path and not valid:
                     self._discard_path(Path(report_path))
@@ -659,20 +626,21 @@ class WatchToastCoordinator:
             self._discard_path(batch.failure_details)
 
 
-def _bounded_text(parts: Iterable[str], limit: int) -> str:
-    if limit <= 0:
-        return ""
+def _bounded_lines(lines: Iterable[str], limit: int) -> str:
     chunks = []
     remaining = limit
-    for part in parts:
-        if len(part) > remaining:
-            chunks.append(part[:max(0, remaining - 1)] + "…")
+    for line in lines:
+        if not line:
+            continue
+        if len(line) >= remaining:
+            chunks.append(line[:remaining - 1] + "…")
             break
-        chunks.append(part)
-        remaining -= len(part)
+        chunks.append(line)
+        chunks.append("\n")
+        remaining -= len(line) + 1
         if not remaining:
             break
-    return "".join(chunks)
+    return "".join(chunks).rstrip()
 
 
 def _format_bytes(value: int) -> str:

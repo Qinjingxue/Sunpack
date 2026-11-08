@@ -7,14 +7,8 @@ import tarfile
 import zipfile
 from binascii import crc32
 
-from sunpack.core.contracts.filesystem import (
-    FILESYSTEM_ROUTE_DETECTION,
-    FILESYSTEM_ROUTE_RELATIONS,
-    FILESYSTEM_ROUTE_RESIDUAL,
-    DirectorySnapshot,
-)
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
-from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.config_factory import make_config
 
 
@@ -22,24 +16,11 @@ def _basename(path: str) -> str:
     return path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
 
 
-def _routing_by_name(snapshot):
-    routes = {
-        _basename(path): (route, format_hint)
-        for path, _size, route, format_hint, _reject_mask in snapshot.non_relation_file_routing_rows()
+def _routing_by_name(root):
+    return {
+        _basename(candidate.entry_path): (candidate.route, candidate.format_hint)
+        for candidate in build_candidates_for_targets([str(root)], config=make_config())
     }
-    relation_names = {
-        _basename(path)
-        for path, _size, _mtime in snapshot.file_route_view(
-            FILESYSTEM_ROUTE_RELATIONS
-        ).iter_file_columns()
-    }
-    anchors = {
-        _basename(path): anchor
-        for path, _size, anchor in snapshot.iter_relation_anchor_rows()
-    }
-    for name in relation_names:
-        routes[name] = ("relations", str((anchors.get(name) or {}).get("format") or ""))
-    return routes
 
 
 def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp_path):
@@ -63,31 +44,13 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
     split_name_path = tmp_path / "payload.7z.002"
     split_name_path.write_bytes(b"continuation bytes")
 
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
-    routes = _routing_by_name(snapshot)
+    routes = _routing_by_name(tmp_path)
 
     assert routes["empty.zip"] == ("relations", "zip")
     assert routes["payload.gz"] == ("detection", "gzip")
     assert routes["payload.tar"] == ("detection", "tar")
     assert routes["plain.bin"] == ("residual", "")
     assert routes["payload.7z.002"][0] == "residual"
-
-    relation_view = snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS)
-    detection_view = snapshot.file_route_view(FILESYSTEM_ROUTE_DETECTION)
-    residual_view = snapshot.file_route_view(FILESYSTEM_ROUTE_RESIDUAL)
-
-    assert {_basename(path) for path, _, _ in relation_view.iter_file_columns()} == {
-        "empty.zip",
-    }
-    assert {_basename(path) for path, _, _ in detection_view.iter_file_columns()} == {
-        "payload.gz",
-        "payload.tar",
-    }
-    assert {_basename(path) for path, _, _ in residual_view.iter_file_columns()} == {
-        "plain.bin",
-        "payload.7z.002",
-    }
-
 
 def test_filesystem_routes_by_structure_not_extension(tmp_path):
     disguised_zip = tmp_path / "movie.ISO"
@@ -97,8 +60,7 @@ def test_filesystem_routes_by_structure_not_extension(tmp_path):
     disguised_gzip = tmp_path / "payload.random"
     disguised_gzip.write_bytes(gzip.compress(b"payload"))
 
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
-    routes = _routing_by_name(snapshot)
+    routes = _routing_by_name(tmp_path)
 
     assert routes[disguised_zip.name] == ("relations", "zip")
     assert routes[disguised_gzip.name] == ("detection", "gzip")
@@ -112,26 +74,16 @@ def test_prefixed_and_suffixed_archive_carrier_stays_residual_for_embedded_scan(
     carrier = tmp_path / "carrier.data"
     carrier.write_bytes(b"invalid-prefix" + zip_buffer.getvalue() + b"invalid-suffix")
 
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
-    routes = _routing_by_name(snapshot)
+    routes = _routing_by_name(tmp_path)
 
     assert routes[carrier.name][0] == "residual"
 
 
-def test_discovery_candidate_projection_bypasses_legacy_routing_columns(tmp_path, monkeypatch):
+def test_discovery_candidate_projects_normalized_stream_name(tmp_path):
     payload = tmp_path / "payload.gz"
     payload.write_bytes(gzip.compress(b"payload"))
 
-    monkeypatch.setattr(
-        DirectorySnapshot,
-        "non_relation_file_routing_rows",
-        lambda _self: (_ for _ in ()).throw(
-            AssertionError("candidate generation must not materialize legacy routing columns")
-        ),
-    )
-
     session = DiscoveryScanSession(config=make_config({}))
-    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
     candidates = build_candidates_for_targets([str(tmp_path)], session=session)
 
     assert len(candidates) == 1
@@ -154,7 +106,6 @@ def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, mo
         ),
     )
 
-    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
     candidates = build_candidates_for_targets([str(tmp_path)], session=session)
 
     assert {candidate.route for candidate in candidates} == {"detection", "residual"}
@@ -179,15 +130,9 @@ def test_relations_anchor_view_recovers_unrouted_split_members_from_raw_snapshot
     second.write_bytes(archive[32:])
 
     session = DiscoveryScanSession(config=make_config({}))
-    snapshot = session.snapshot_for_directory(str(tmp_path))
-    routes = _routing_by_name(snapshot)
-
-    assert routes[first.name][0] == "relations"
-    assert routes[second.name][0] == "residual"
-
-    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
     candidates = build_candidates_for_targets([str(tmp_path)], session=session)
     split = next(candidate for candidate in candidates if candidate.is_split)
+    assert split.route == "relations"
     assert split.archive_input.part_paths() == [str(first), str(second)]
 
 
@@ -198,7 +143,6 @@ def test_main_scan_routes_only_native_container_candidates_through_relations(tmp
     (tmp_path / "plain.bin").write_bytes(b"ordinary file")
 
     session = DiscoveryScanSession(config=make_config({}))
-    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
     candidates = build_candidates_for_targets([str(tmp_path)], session=session)
     by_name = {
         _basename(candidate.entry_path): candidate

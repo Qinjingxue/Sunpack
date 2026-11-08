@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
+from benchmarks.scenarios.sevenzip_worker_matrix import worker_thread_capacity
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 
@@ -33,22 +34,6 @@ ADMISSION_CASE = {
     "blocker": "cpu-credit-budget",
     "expected_max_active": None,
 }
-
-
-def _parse_capacities(value: str) -> list[int]:
-    capacities: list[int] = []
-    for item in value.split(","):
-        try:
-            capacity = int(item.strip())
-        except ValueError as exc:
-            raise ValueError(f"invalid worker capacity {item!r}") from exc
-        if capacity < 1 or capacity > 32:
-            raise ValueError("worker capacities must be between 1 and 32")
-        if capacity not in capacities:
-            capacities.append(capacity)
-    if not capacities:
-        raise ValueError("at least one worker capacity is required")
-    return capacities
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -137,15 +122,7 @@ def _run_batch(
     lock = threading.Lock()
     done = threading.Condition(lock)
     started_at = time.perf_counter()
-    worker_config = {
-        "thread_capacity": capacity,
-    }
-    worker_config.update(worker_config_overrides or {})
-    worker = _NativeWorkerProcess(
-        str(worker_path),
-        None,
-        worker_config,
-    )
+    worker = _NativeWorkerProcess(str(worker_path), None, worker_config_overrides)
     worker_process = psutil.Process(worker.process.pid) if worker.process is not None else None
     sampler = ProcessSampler(interval_seconds=0.01)
     sampler.start()
@@ -451,7 +428,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark native worker scheduling for many small ZIP jobs.")
     parser.add_argument("--jobs", type=int, default=256)
     parser.add_argument("--clients", type=int, default=4)
-    parser.add_argument("--capacities", default="1,2,4,8", help="Comma-separated native worker thread capacities.")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--files-per-archive", type=int, default=8)
@@ -461,11 +437,6 @@ def main() -> int:
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
     args = parser.parse_args()
-    try:
-        capacities = _parse_capacities(args.capacities)
-        admission_cases = [dict(ADMISSION_CASE)]
-    except ValueError as exc:
-        parser.error(str(exc))
     if args.jobs < 1 or args.clients < 1 or args.jobs % args.clients:
         parser.error("--jobs must be positive and evenly divisible by --clients")
     if args.runs < 1 or args.warmups < 0 or args.files_per_archive < 1 or args.file_size_bytes < 1:
@@ -478,6 +449,7 @@ def main() -> int:
         parser.error(str(exc))
     if not worker_path.is_file():
         parser.error("native worker is unavailable")
+    capacity = worker_thread_capacity(worker_path, timeout=args.timeout_seconds)
 
     with BenchmarkWorkspace(SCENARIO, results_root=args.results_root, keep_workdir=args.keep_workdir) as workspace:
         corpus = _create_corpus(
@@ -488,42 +460,38 @@ def main() -> int:
         )
         rows: list[dict[str, Any]] = []
         trace_paths: list[str] = []
-        for admission_case in admission_cases:
-            for capacity in capacities:
-                for run in range(args.warmups + args.runs):
-                    measured = run >= args.warmups
-                    label = f"{admission_case['name']}-capacity-{capacity}-{'run' if measured else 'warmup'}-{run}"
-                    print(f"{label}: submitting {args.jobs} small-file jobs", flush=True)
-                    row, trace = _run_batch(
-                        workspace=workspace,
-                        worker_path=worker_path,
-                            corpus=corpus,
-                        capacity=capacity,
-                        client_count=args.clients,
-                        timeout_seconds=args.timeout_seconds,
-                        admission_case=admission_case,
-                        label=label,
-                    )
-                    if measured:
-                        row["run"] = run - args.warmups
-                        rows.append(row)
-                        trace_path = workspace.write_result_json(f"traces/{label}.json", trace)
-                        trace_paths.append(str(trace_path))
-                    shutil.rmtree(workspace.outputs / label, ignore_errors=True)
-                    print(
-                        f"  throughput={row['throughput_jobs_per_second']} jobs/s "
-                        f"utilization={row['thread_capacity_utilization']:.3f} "
-                        f"queued_underutil={row['queued_underutilization_ratio']:.3f} "
-                        f"peak_active={row['observed_peak_active_jobs']} passed={row['all_passed']}",
-                        flush=True,
-                    )
+        for run in range(args.warmups + args.runs):
+            measured = run >= args.warmups
+            label = f"{ADMISSION_CASE['name']}-capacity-{capacity}-{'run' if measured else 'warmup'}-{run}"
+            print(f"{label}: submitting {args.jobs} small-file jobs", flush=True)
+            row, trace = _run_batch(
+                workspace=workspace,
+                worker_path=worker_path,
+                corpus=corpus,
+                capacity=capacity,
+                client_count=args.clients,
+                timeout_seconds=args.timeout_seconds,
+                admission_case=ADMISSION_CASE,
+                label=label,
+            )
+            if measured:
+                row["run"] = run - args.warmups
+                rows.append(row)
+                trace_path = workspace.write_result_json(f"traces/{label}.json", trace)
+                trace_paths.append(str(trace_path))
+            shutil.rmtree(workspace.outputs / label, ignore_errors=True)
+            print(
+                f"  throughput={row['throughput_jobs_per_second']} jobs/s "
+                f"utilization={row['thread_capacity_utilization']:.3f} "
+                f"queued_underutil={row['queued_underutilization_ratio']:.3f} "
+                f"peak_active={row['observed_peak_active_jobs']} passed={row['all_passed']}",
+                flush=True,
+            )
         summary = _aggregate(rows)
         report = {
             "parameters": {
                 "jobs": args.jobs,
                 "clients": args.clients,
-                "capacities": capacities,
-                "admission_cases": [case["name"] for case in admission_cases],
                 "runs": args.runs,
                 "warmups": args.warmups,
                 "files_per_archive": args.files_per_archive,
@@ -531,6 +499,7 @@ def main() -> int:
             },
             "environment": {
                 "worker_path": str(worker_path),
+                "worker_capacity": capacity,
                 "cpu_count": os.cpu_count(),
                 "python": sys.version,
             },

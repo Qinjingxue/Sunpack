@@ -10,7 +10,7 @@ from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport
 from sunpack.core.analysis import ArchiveAnalyzer
 from sunpack.core.passwords.resolver import archive_structure_password_state
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
 from tests.helpers.native_build import sevenzip_artifact
@@ -117,10 +117,8 @@ def test_recovery_framing_damage_is_reported_as_damage(tmp_path):
 
 def test_discovery_is_extension_independent_and_planning_does_not_reanalyse():
     config = make_config()
-    snapshot = DirectoryScanner(str(DATA), config=config).scan()
-    routes = {Path(path).name: (route, fmt) for path, _size, route, fmt, _mask
-              in snapshot.non_relation_file_routing_rows()}
-    assert routes["algorithm_0.mov"] == ("detection", "enc")
+    candidate, = build_candidates_for_targets([str(DATA / "algorithm_0.mov")], config=config)
+    assert (candidate.route, candidate.format_hint) == ("detection", "enc")
     assert ArchiveAnalyzer.confirm_format_identity(str(DATA / "algorithm_0.mov"), "enc")
     assert not ArchiveAnalyzer.confirm_format_identity(str(DATA / "expected.zip"), "enc")
     task = make_archive_task(DATA / "algorithm_0.mov", format_hint="enc", discovery_source="detection")

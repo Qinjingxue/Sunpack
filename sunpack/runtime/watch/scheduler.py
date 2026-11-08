@@ -25,11 +25,6 @@ from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure,
 from sunpack.core.contracts.retry_targets import (
     failure_contains,
     failure_is_password,
-    result_error,
-    result_failure,
-    result_outcome,
-    result_path,
-    target_results,
 )
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 from sunpack.core.contracts.pipeline import PipelineResponse, PipelineTarget
@@ -50,7 +45,7 @@ from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_M
 from sunpack.runtime.watch.roots import WatchRootEntry, watch_path_available
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-from sunpack.runtime.watch.toast import NullWatchNotificationSink
+from sunpack.runtime.watch.toast import WatchNotificationSink
 from sunpack.core.i18n import I18nContext
 from sunpack.core.passwords.internal import builtin as builtin_passwords_module
 from sunpack.core.passwords.internal.builtin import password_file_source
@@ -203,7 +198,7 @@ class WatchScheduler:
         root_entries: Iterable[WatchRootEntry] | None = None,
         state_path: str,
         pipeline_engine=None,
-        notification_sink=None,
+        notification_sink: WatchNotificationSink | None = None,
         wake_callback: Callable[[], None] | None = None,
     ):
         self.config = config
@@ -291,7 +286,7 @@ class WatchScheduler:
         self._observer_resource = None
         self._started = False
         self._wake_callback = wake_callback
-        self.notification_sink = notification_sink or NullWatchNotificationSink()
+        self.notification_sink = notification_sink
         self._notification_error_actions: set[str] = set()
         self.runtime_cache_cleanup_idle_seconds = max(
             0.0,
@@ -1099,7 +1094,7 @@ class WatchScheduler:
             try:
                 single = await self._complete_candidate(request)
             except Exception as exc:
-                self._notify("aborted", request.notification_id)
+                self._notify("suppressed", request.notification_id)
                 single = WatchRunResult(processed=1, failed=1, errors=[str(exc)])
                 self.log.write(
                     "error",
@@ -2342,7 +2337,7 @@ class WatchScheduler:
                 tickets, stage="watch_completion", file_id=request.candidate.path,
             )
         for notification in notifications:
-            if notification[0] == "failed":
+            if notification[0] == "failed" and self.notification_sink is not None:
                 # The bounded native encoder owns these immutable completion
                 # views until it drains. Reuse stage admission and cancellation
                 # joining; never queue fire-and-forget diagnostic graphs.
@@ -2419,14 +2414,13 @@ class WatchScheduler:
                                     if not is_filesystem_scan_failure(failure)),
             )
 
-        results = target_results(summary)
+        results = summary.target_results
         target_result = _target_result_for_path(summary, candidate.path)
         if target_result is None and len(results) == 1:
             claimed_keys = {path_key(path) for path in claimed_paths}
             if path_key(candidate.path) in claimed_keys:
                 target_result = results[0]
-        outcome_kind = _summary_outcome_kind(summary, target_result)
-        direct_outcome = result_outcome(target_result) or outcome_kind
+        direct_outcome = _summary_outcome_kind(summary, target_result)
         target_output_dir = target_result.output_dir if target_result is not None else ""
         generated_output_dirs = dedupe_normalized_paths([
             *response.artifacts.shell_refresh_paths,
@@ -2437,26 +2431,20 @@ class WatchScheduler:
             str(target_output_dir or ""),
         ])
 
-        # Accepted recovery can retain a failure as diagnostic evidence. Only
-        # failed outcomes may create blockers or fail the Watch request.
-        failures = list(summary.scan_failures)
+        waiting_failures: list[FailureInfo] = []
+        recorded_password_failures: list[FailureInfo] = []
+        # Retry disposition belongs to the input result. Comparing FailureInfo
+        # values can traverse large diagnostics or conflate different inputs.
+        blocked_results: set[int] = set()
         for item in results:
-            failure = result_failure(item)
-            if result_outcome(item) == OutcomeKind.FAILURE and failure is not None and failure not in failures:
-                failures.append(failure)
-
-        waiting_failures: list = []
-        recorded_password_failures: list = []
-        retired_failures: list = []
-        for item in results:
-            failure = result_failure(item)
-            retry_path = result_path(item)
-            if result_outcome(item) != OutcomeKind.FAILURE or failure is None or not retry_path:
+            failure, retry_path = item.failure, item.input_path
+            if item.outcome_kind != OutcomeKind.FAILURE or failure is None or not retry_path:
                 continue
             missing = failure_contains(failure, FailureKind.MISSING_VOLUME)
             password = failure_is_password(failure)
             if not (missing or password):
                 continue
+            blocked_results.add(id(item))
             retry_candidate = _candidate_for_event_path(retry_path)
             if retry_candidate is None:
                 # A successful sibling family may have consumed this input
@@ -2464,7 +2452,6 @@ class WatchScheduler:
                 # Never resurrect a blocker for a deleted physical input.
                 self.state.prune_missing_records(retry_path)
                 self.log.write("task_retired", path=retry_path)
-                retired_failures.append(failure)
                 continue
             if self.pipeline_engine.completed_watch_family_output(
                 retry_path, deep_detect=request.deep_detect,
@@ -2473,7 +2460,6 @@ class WatchScheduler:
                 # This synchronous check and state update cannot be interleaved
                 # by another completion on the pipeline's event loop.
                 self.state.clear_entries([retry_path])
-                retired_failures.append(failure)
                 continue
             scope_dir = request.password_scope_dir or os.path.dirname(os.path.abspath(candidate.path))
             blockers = ([BLOCKER_MISSING_VOLUME] if missing else []) + ([BLOCKER_PASSWORD] if password else [])
@@ -2503,7 +2489,6 @@ class WatchScheduler:
                     and request.password_signature != self._password_signature_for_scope(scope_dir)
                 )
             if not published:
-                retired_failures.append(failure)
                 continue
             if retry_password:
                 self._mark_all_password_failures_dirty()
@@ -2518,48 +2503,40 @@ class WatchScheduler:
         if direct_outcome in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
             self._retire_claimed_paths(claimed_paths, request.candidate)
 
-        terminal_failures = [
-            failure
-            for failure in failures
-            if failure not in waiting_failures
-            and failure not in recorded_password_failures
-            and failure not in retired_failures
-        ]
-
+        terminal_failures = list(summary.scan_failures)
+        terminal_failure_ids = {id(failure) for failure in terminal_failures}
+        terminal_errors = []
+        candidate_key = path_key(candidate.path)
         # Only top-level groups have processing cards. Nested outcomes still
         # contribute to the request result and durable recovery blockers above.
         for item in results:
-            task_path = result_path(item)
-            if not task_path or path_key(task_path) not in request.top_level_keys:
+            if id(item) in blocked_results:
                 continue
-            if (path_key(task_path) == path_key(candidate.path)
-                    and not (waiting_failures or recorded_password_failures or retired_failures)):
+            outcome, failure = item.outcome_kind, item.failure
+            # Accepted recovery may retain a failure as diagnostic evidence.
+            if outcome == OutcomeKind.FAILURE and failure is not None:
+                failure_id = id(failure)
+                if failure_id not in terminal_failure_ids:
+                    terminal_failure_ids.add(failure_id)
+                    terminal_failures.append(failure)
+                terminal_errors.append(item.failure_message or item.error or _failure_message(
+                    failure, self.i18n.t("watch.failure.extraction_failed"),
+                ))
+            task_path = item.input_path
+            if not task_path:
                 continue
-            failure = result_failure(item)
-            if failure in waiting_failures or failure in recorded_password_failures or failure in retired_failures:
+            task_path_key = path_key(task_path)
+            if task_path_key not in request.top_level_keys or (task_path_key == candidate_key and not blocked_results):
                 continue
-            outcome = result_outcome(item)
             if outcome in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
                 self.log.write("done", path=task_path, owner=request.notification_id,
                                output_dirs=[item.output_dir] if item.output_dir else [])
             elif outcome == OutcomeKind.FAILURE:
                 self.log.write("failed_terminal", path=task_path, owner=request.notification_id,
-                               error_kind=failure.kind.value if failure is not None else "", error=result_error(item))
+                               error_kind=failure.kind.value if failure is not None else "", error=item.error)
 
         if terminal_failures:
             payloads = FailureReportPayloads(terminal_failures)
-            terminal_errors = []
-            for item in results:
-                failure = result_failure(item)
-                if result_outcome(item) != OutcomeKind.FAILURE or failure not in terminal_failures:
-                    continue
-                message = result_error(item) or _failure_message(
-                    failure,
-                    self.i18n.t("watch.failure.extraction_failed"),
-                )
-                # The pipeline already owns its formatted failure message.
-                # Reuse it rather than copy a potentially large diagnostic.
-                terminal_errors.append(item.failure_message or message)
             errors = terminal_errors or [
                 _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
                 for failure in terminal_failures
@@ -2591,7 +2568,7 @@ class WatchScheduler:
             ]
             return WatchRunResult(processed=1, failed=1, errors=errors)
 
-        if retired_failures and not summary.scan_failures:
+        if blocked_results and not summary.scan_failures:
             notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 
@@ -2600,7 +2577,7 @@ class WatchScheduler:
         # this event loop even for a structured report that never needs them.
         failed = [failure.message for failure in summary.scan_failures]
         failed.extend(item.failure_message or item.error for item in results
-                      if result_outcome(item) == OutcomeKind.FAILURE)
+                      if item.outcome_kind == OutcomeKind.FAILURE)
         if failed:
             # Unstructured failures cannot participate in an automatic wait.
             error = failed[0]
@@ -2667,8 +2644,11 @@ class WatchScheduler:
         return WatchRunResult(processed=1, succeeded=summary.success_count + summary.partial_success_count)
 
     def _notify(self, action: str, *args) -> None:
+        sink = self.notification_sink
+        if sink is None:
+            return
         try:
-            getattr(self.notification_sink, action)(*args)
+            getattr(sink, action)(*args)
         except Exception as exc:
             if action not in self._notification_error_actions:
                 self._notification_error_actions.add(action)

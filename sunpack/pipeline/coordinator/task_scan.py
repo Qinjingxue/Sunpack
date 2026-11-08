@@ -28,7 +28,6 @@ class ArchiveTaskScanner:
         self.context = context
         self.provider = ArchiveTaskProvider(config, detection_options=detection_options)
         self.config = self.provider.config
-        self.last_scan_session: DiscoveryScanSession | None = None
 
     def scan_root(self, scan_root: str) -> list[ArchiveTask]:
         return self.scan_targets([scan_root])
@@ -40,17 +39,9 @@ class ArchiveTaskScanner:
         scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
     ) -> list[ArchiveTask]:
-        scan_session = scan_session or DiscoveryScanSession(config=self.config)
-        self.last_scan_session = scan_session
-        tasks = self.provider.scan_targets(
-            scan_roots,
-            processed_keys=self.context.processed_keys,
-            scan_session=scan_session,
-            is_recursive_scan=is_recursive_scan,
-        )
-        self._record_provider_failures()
-        self.record_scan_errors(scan_session)
-        return tasks
+        return self.filter_processed_tasks(self.discover_targets(
+            scan_roots, scan_session=scan_session, is_recursive_scan=is_recursive_scan,
+        ))
 
     def scan_stage_result(
         self,
@@ -61,15 +52,20 @@ class ArchiveTaskScanner:
     ) -> StageResult:
         """Return discovery facts for reporting without changing extraction semantics."""
 
-        self.provider.failed_candidate_failures = []
         scan_session = scan_session or DiscoveryScanSession(config=self.config)
-        self.last_scan_session = scan_session
         result = self.provider.discover_targets(
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
         )
-        self._record_provider_failures()
+        self.context.record_failures(
+            (FailureInfo(
+                FailureKind.FILESYSTEM_ERROR, "embedded_boundary",
+                trace.error or "Unable to read archive input",
+                details={"path": trace.entry_path, "reason": trace.reason},
+            ) for trace in result.traces if trace.reason == "embedded_scan_io_error"),
+            self.config.get("cli", {}).get("language", "en"),
+        )
         self.record_scan_errors(scan_session)
         return result
 
@@ -80,16 +76,9 @@ class ArchiveTaskScanner:
         scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
     ) -> list[ArchiveTask]:
-        scan_session = scan_session or DiscoveryScanSession(config=self.config)
-        self.last_scan_session = scan_session
-        result = self.provider.discover_targets(
-            scan_roots,
-            scan_session=scan_session,
-            is_recursive_scan=is_recursive_scan,
-        )
-        self._record_provider_failures()
-        self.record_scan_errors(scan_session)
-        return result.tasks
+        return self.scan_stage_result(
+            scan_roots, scan_session=scan_session, is_recursive_scan=is_recursive_scan,
+        ).tasks
 
     def record_scan_errors(self, session: DiscoveryScanSession | None) -> None:
         if session is not None:
@@ -101,11 +90,6 @@ class ArchiveTaskScanner:
         return self.provider.filter_processed_tasks(
             tasks,
             processed_keys=self.context.processed_keys,
-        )
-
-    def _record_provider_failures(self) -> None:
-        self.context.record_failures(
-            self.provider.failed_candidate_failures, self.config.get("cli", {}).get("language", "en"),
         )
 
     def direct_file_tasks(self, file_paths: list[str]) -> list[ArchiveTask]:
@@ -125,10 +109,7 @@ class ArchiveTaskScanner:
                     path, OutcomeKind.FAILURE, failure=failure, error=failure.message, failure_message=failure.message,
                 ))
 
-        session = DiscoveryScanSession(config=self.config)
-        discovered = self.provider.discover_targets(normalized_paths, scan_session=session)
-        self._record_provider_failures()
-        self.record_scan_errors(session)
+        discovered = self.scan_stage_result(normalized_paths)
         covered = set(discovered.claimed_paths | discovered.blocked_paths)
         tasks.extend(self.provider.filter_processed_tasks(
             discovered.tasks,

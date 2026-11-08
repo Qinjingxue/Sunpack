@@ -43,17 +43,11 @@ from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _Nativ
 from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
 
 MIB = 1024 ** 2
-# (name, worker process_config, extra environment). The first entry is the
-# product default; every other entry changes exactly one input.
-VARIANTS: dict[str, tuple[dict, dict]] = {
-    "default": ({}, {}),
-    "buffers256": ({}, {"SUNPACK_ASYNC_WRITER_BUFFERS": "256"}),
-    "spacegate_off": ({}, {"SUNPACK_VOLUME_SPACE_GATE": "0"}),
-    "cap8": ({"thread_capacity": 8}, {}),
-    "cap16": ({"thread_capacity": 16}, {}),
-    "cap64": ({"thread_capacity": 64}, {}),
-    "prefetch_off": ({}, {"SUNPACK_SEVENZIP_PREFETCH": "0"}),
-    "no_job_inflight": ({}, {"SUNPACK_ABLATE_JOB_INFLIGHT": "1"}),
+# Every nondefault variant changes exactly one worker environment input.
+VARIANTS = {
+    "default": {},
+    "buffers256": {"SUNPACK_ASYNC_WRITER_BUFFERS": "256"},
+    "prefetch_off": {"SUNPACK_SEVENZIP_PREFETCH": "0"},
 }
 
 
@@ -213,18 +207,16 @@ def main():
                     for name in order:
                         tag = f"{case['format']}-{width}-{name}-{run}"
                         output = workspace.outputs / tag
-                        saved = {k: os.environ.get(k) for k in
-                                 ("SUNPACK_ASYNC_WRITER_BUFFERS", "SUNPACK_VOLUME_SPACE_GATE",
-                                  "SUNPACK_SEVENZIP_PREFETCH", "SUNPACK_ABLATE_JOB_INFLIGHT")}
+                        env = VARIANTS.get(name, {})
+                        saved = {key: os.environ.get(key) for key in env}
                         try:
                             if name == "cli":
                                 row = run_cli(seven, batch, output, width, args.timeout, args.dry)
                                 row["cpu_split"] = {"user_ms": 0.0, "kernel_ms": 0.0}
                                 row["threads"] = {}
                             else:
-                                config, env = VARIANTS[name]
                                 os.environ.update(env)
-                                worker = _NativeWorkerProcess(str(worker_path), None, dict(config))
+                                worker = _NativeWorkerProcess(str(worker_path), None)
                                 try:
                                     row = measure(worker, batch, output, width, dll, args.timeout,
                                                   name, args.dry)

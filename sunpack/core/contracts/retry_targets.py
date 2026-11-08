@@ -6,27 +6,7 @@ from dataclasses import replace
 from sunpack.core.support.path_keys import case_key, path_key
 from sunpack.core.contracts.input_plan import InputRecovery, recovery_blockers
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
-
-
-def target_results(summary: RunSummary) -> list[TargetRunResult]:
-    return list(summary.target_results)
-
-
-def result_path(result: TargetRunResult) -> str:
-    return result.input_path
-
-
-def result_failure(result: TargetRunResult | None) -> FailureInfo | None:
-    return result.failure if result is not None else None
-
-
-def result_error(result: TargetRunResult | None) -> str:
-    return result.error if result is not None else ""
-
-
-def result_outcome(result: TargetRunResult | None) -> OutcomeKind | None:
-    return result.outcome_kind if result is not None else None
+from sunpack.core.contracts.results import RunSummary, TargetRunResult
 
 
 def failure_contains(failure: FailureInfo | None, kind: FailureKind) -> bool:

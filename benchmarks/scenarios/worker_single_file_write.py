@@ -133,13 +133,7 @@ def _run_worker(
     if prefetch_archive:
         _prefetch_archive(archive, chunk_bytes=8 * MIB)
 
-    worker = _NativeWorkerProcess(
-        str(worker_path),
-        None,
-        {
-            "thread_capacity": 1,
-        },
-    )
+    worker = _NativeWorkerProcess(str(worker_path), None)
     sampler = ProcessSampler(interval_seconds=sample_interval)
     result: dict[str, Any] | None = None
     events: list[dict[str, Any]] = []

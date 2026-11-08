@@ -76,7 +76,7 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
     # Capture idle workers, including the cost of their full execution lanes.
     handshake = q.get(timeout=10)
     assert handshake['memory_reserve_bytes'] == reserve * 1024**2, handshake
-    assert handshake['nominal_cpu_budget'] == (capacity or jobs), handshake
+    assert handshake['thread_capacity'] == capacity, handshake
     time.sleep(.10)
     def set_limit(mib):
         box.limits.JobMemoryLimit = mib * 1024**2

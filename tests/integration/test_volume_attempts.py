@@ -108,6 +108,20 @@ def test_worker_attempts_emit_one_result_and_stop_on_independent_errors(tmp_path
     assert len(results) == 2 and not any(e.get("event") == "item_failed" for e in events)
     assert all(r["status"] == "ok" and r["volume_attempts"] == 2 for r in results)
 
+    # A known slot gap invalidates the whole layout even when the remaining
+    # slots have competing choices. The complete layout must run next.
+    plan = descriptor["volume_attempts"]
+    source_ids = {source["path"]: i for i, source in enumerate(plan["sources"])}
+    ordered = [source_ids[str(path)] for path in paths]
+    complete = [{**slot, "domain": i} for i, slot in enumerate(plan["layouts"][0]["slots"])]
+    sparse = [complete[0], {**complete[2], "domain": len(ordered)}, *complete[3:]]
+    recovered = invoke("sparse-first", {**descriptor, "volume_attempts": {**plan,
+        "minimum_size": 0,
+        "domains": [{"choices": [source]} for source in ordered] + [{"choices": ordered[1:3]}],
+        "layouts": [{"slots": sparse}, {"slots": complete}],
+    }})
+    assert recovered["status"] == "ok" and recovered["volume_attempts"] == 2, recovered
+
     # Corrupt the fixed start header after discovery. No rearrangement can
     # repair it; the worker must preserve the damage verdict after one trial.
     head = paths[0].read_bytes()

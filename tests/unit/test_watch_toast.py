@@ -128,7 +128,7 @@ def test_arrivals_during_stop_keep_controls_and_allow_finalization(tmp_path, lat
     # arrival order catches inherited stop UI and a final invisible retirement.
     # Reuse one small coordinator lifecycle, with no polling or fixed sleeps.
     host = _Host()
-    coordinator = _coordinator(host, str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), debounce_ms=60_000)
     try:
         first, late = _task(tmp_path / "first.zip"), _task(tmp_path / "late.zip")
         coordinator.submitted("first", first.main_path)
@@ -144,7 +144,12 @@ def test_arrivals_during_stop_keep_controls_and_allow_finalization(tmp_path, lat
             assert host.snapshots[-1].actions[0].kind == ToastActionKind.CANCEL_BATCH
             coordinator.succeeded("late", [])
         else:
+            # A burst of invisible completions cannot postpone the drained
+            # batch or keep creating timer threads for unchanged work.
+            timer = coordinator._finalize_timer
             coordinator.suppressed("late")
+            assert timer is not None and coordinator._finalize_timer is timer
+        coordinator._finalize(coordinator._finalize_generation)
         final = host.wait_for_terminal_snapshots()[-1]
         assert coordinator.i18n.t("interrupt.cleanup_failed" if errors else "interrupt.cleaned") in final.body
         if late_ready:
@@ -262,7 +267,7 @@ def test_disk_full_toast_shows_recovery_hint_and_resumes(tmp_path, language, tit
 def test_space_waits_are_released_for_every_request_exit(tmp_path):
     # Every exit must release its request state without clearing a sibling's
     # visible pause. Check the real notification and ownership, not a side index.
-    for finish in ("suppressed", "aborted", "failed", "succeeded", "interrupted", "replaced", "stop"):
+    for finish in ("suppressed", "failed", "succeeded", "interrupted", "replaced", "stop"):
         host = _Host()
         coordinator = _coordinator(host, str(tmp_path / "state"))
         tasks = {}
@@ -291,7 +296,7 @@ def test_space_waits_are_released_for_every_request_exit(tmp_path):
             assert host.snapshots[-1].title == coordinator.i18n.t("toast.progress.paused_title")
             coordinator.progress("second", tasks["second"], {"event": "space_resumed"})
             assert host.snapshots[-1].title == coordinator.i18n.t("toast.progress.title")
-            coordinator.aborted("second")
+            coordinator.suppressed("second")
         coordinator.stop()
         assert not coordinator._requests
 

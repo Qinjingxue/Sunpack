@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
+from benchmarks.scenarios.sevenzip_worker_matrix import worker_thread_capacity
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.core.support.resources import get_7z_path, get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
@@ -41,19 +42,6 @@ def _csv_values(value: str, allowed: tuple[str, ...], label: str) -> list[str]:
     if not selected:
         raise ValueError(f"at least one {label} is required")
     return selected
-
-
-def _capacities(value: str) -> list[int]:
-    result: list[int] = []
-    for item in value.split(","):
-        capacity = int(item.strip())
-        if not 1 <= capacity <= 32:
-            raise ValueError("capacities must be between 1 and 32")
-        if capacity not in result:
-            result.append(capacity)
-    if not result:
-        raise ValueError("at least one capacity is required")
-    return result
 
 
 def _write_payload(path: Path, size_mib: int, *, repetitive: bool) -> int:
@@ -133,9 +121,7 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
               case: dict[str, Any], capacity: int, jobs: int,
               timeout_seconds: float) -> dict[str, Any]:
     label = f"{case['mode']}-cap{capacity}"
-    worker = _NativeWorkerProcess(str(worker_path), None, {
-        "thread_capacity": capacity,
-    })
+    worker = _NativeWorkerProcess(str(worker_path), None)
     process = psutil.Process(worker.process.pid) if worker.process is not None else None
     sampler = ProcessSampler(interval_seconds=0.02)
     lock = threading.Lock()
@@ -241,7 +227,6 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stress native 7z worker CPU and IO scheduling.")
     parser.add_argument("--modes", default=",".join(MODES))
-    parser.add_argument("--capacities", default="1,2,4,8")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--cpu-source-mib", type=int, default=64)
     parser.add_argument("--io-source-mib", type=int, default=128)
@@ -253,7 +238,6 @@ def main() -> int:
     args = parser.parse_args()
     try:
         modes = _csv_values(args.modes, MODES, "mode")
-        capacities = _capacities(args.capacities)
     except (ValueError, TypeError) as exc:
         parser.error(str(exc))
     sizes = (args.cpu_source_mib, args.io_source_mib, args.dictionary_mib)
@@ -267,6 +251,7 @@ def main() -> int:
         parser.error(str(exc))
     if not worker_path.is_file() or not dll.is_file() or not seven_zip.is_file():
         parser.error("native worker, 7z.dll, or 7z.exe is unavailable")
+    capacity = worker_thread_capacity(worker_path, timeout=args.timeout_seconds)
 
     with BenchmarkWorkspace(SCENARIO, results_root=args.results_root, keep_workdir=args.keep_workdir) as workspace:
         cases: dict[str, dict[str, Any]] = {}
@@ -281,21 +266,20 @@ def main() -> int:
         for mode in modes:
             case = cases[mode]
             archives = _copy_jobs(workspace.corpus / "jobs", case, args.jobs)
-            for capacity in capacities:
-                print(f"running {mode}/capacity={capacity} ...", flush=True)
-                row = _run_case(
-                    workspace=workspace, worker_path=worker_path, archives=archives, case=case,
-                    capacity=capacity, jobs=args.jobs, timeout_seconds=args.timeout_seconds,
-                )
-                rows.append(row)
-                print(f"  elapsed={row['elapsed_seconds']:.2f}s host_cpu={row['host_cpu_utilization']} read={row['read_mib_per_second']}MiB/s rss={row['worker_rss_peak_mib']}MiB active={row['observed_peak_active_jobs']} passed={row['successful_jobs']}/{args.jobs}", flush=True)
+            print(f"running {mode}/capacity={capacity} ...", flush=True)
+            row = _run_case(
+                workspace=workspace, worker_path=worker_path, archives=archives, case=case,
+                capacity=capacity, jobs=args.jobs, timeout_seconds=args.timeout_seconds,
+            )
+            rows.append(row)
+            print(f"  elapsed={row['elapsed_seconds']:.2f}s host_cpu={row['host_cpu_utilization']} read={row['read_mib_per_second']}MiB/s rss={row['worker_rss_peak_mib']}MiB active={row['observed_peak_active_jobs']} passed={row['successful_jobs']}/{args.jobs}", flush=True)
             if not workspace.keep_workdir:
                 for path in archives:
                     path.unlink(missing_ok=True)
 
         report = {
-            "parameters": vars(args) | {"modes": modes, "capacities": capacities},
-            "environment": {"worker_path": str(worker_path), "seven_zip_path": str(seven_zip), "cpu_count": os.cpu_count(), "python": sys.version},
+            "parameters": vars(args) | {"modes": modes},
+            "environment": {"worker_path": str(worker_path), "worker_capacity": capacity, "seven_zip_path": str(seven_zip), "cpu_count": os.cpu_count(), "python": sys.version},
             "corpus": {mode: {key: value for key, value in case.items() if key != "template"} for mode, case in cases.items()},
             "results": rows,
             "summary": {"rows": len(rows), "all_jobs_completed": all(row["successful_jobs"] == args.jobs for row in rows)},

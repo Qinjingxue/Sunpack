@@ -343,9 +343,9 @@ async def pipeline_engine(
                 if _WORK_BROKER is engine.work_broker:
                     _WORK_BROKER = None
             else:
-                engine.reconfigure_request(copy.deepcopy(config))
+                engine.reconfigure_request(config)
     else:
-        engine.reconfigure_request(copy.deepcopy(config))
+        engine.reconfigure_request(config)
     yield engine
 
 

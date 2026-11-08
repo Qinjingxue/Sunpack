@@ -982,9 +982,8 @@ namespace sunpack::sevenzip
 #ifdef _WIN32
 
         
-        const std::vector<std::wstring> effective_part_paths =
-
-            part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
+        std::vector<std::wstring> fallback_paths;
+        if (part_paths.empty()) fallback_paths.push_back(archive_path);
 
         return extract_archive_internal(
 
@@ -993,7 +992,7 @@ namespace sunpack::sevenzip
 
             password,
 
-            effective_part_paths,
+            part_paths.empty() ? fallback_paths : part_paths,
 
             part_ranges,
 

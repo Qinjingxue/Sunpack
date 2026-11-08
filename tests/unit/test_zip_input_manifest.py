@@ -9,7 +9,7 @@ import pytest
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
-from sunpack.pipeline.verification.methods._archive_output_match import coverage_from_native_inventory
+from sunpack.pipeline.verification.methods._archive_output_match import match_archive_output
 
 
 def _zip_bytes(entries: dict[str, bytes], *, compression=zipfile.ZIP_DEFLATED) -> bytes:
@@ -175,15 +175,15 @@ def test_zip_manifest_view_matches_output_from_native_entries(tmp_path):
     (out_dir / "b" / "c.txt").write_bytes(b"cXc")
 
     manifest = archive_input_manifest(_input(path))
-    coverage, raw = coverage_from_native_inventory(
+    raw, _ = match_archive_output(
         manifest,
         collect_output_inventory(str(out_dir)),
         method="test",
         verify_crc=True,
     )
 
-    assert coverage.expected_files == 2
-    assert coverage.complete_files == 1
+    assert raw["coverage"]["expected_files"] == 2
+    assert raw["coverage"]["complete_files"] == 1
     assert raw["mismatch_count"] == 1
     assert raw["mismatches"][0]["path"] == "b/c.txt"
 

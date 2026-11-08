@@ -198,7 +198,7 @@ def test_catalog_head_facts_follow_metadata_and_observation_generations(tmp_path
     import gzip
     import os
     from concurrent.futures import ThreadPoolExecutor
-    from sunpack_native import NativeDirectoryScanOptions, NativeWatchState
+    from sunpack_native import NativeCandidateTable, NativeDirectoryScanOptions, NativeWatchState
     path = tmp_path / "same.photo"
     blob = gzip.compress(b"payload").ljust(128, b"\0")
     path.write_bytes(b"x" * 128)
@@ -209,7 +209,11 @@ def test_catalog_head_facts_follow_metadata_and_observation_generations(tmp_path
     def snapshot(_=None):
         return options.catalog_snapshot(catalog, scope.native, str(path))[1]
     def format_of(view):
-        return view.filesystem_candidate_specs()[0][3]
+        table = NativeCandidateTable()
+        table.append_directory(view, view)
+        kind, candidate = table.project(0)
+        assert kind == "file"
+        return candidate[3]
     try:
         assert not options.catalog_update(catalog, scope.native)
         catalog.remember_observation(str(path), 128, stamp / 1e9, "file-a", 10)

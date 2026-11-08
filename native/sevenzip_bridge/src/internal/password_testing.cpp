@@ -578,8 +578,10 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
+        std::vector<std::wstring> fallback_paths;
+        if (part_paths.empty()) fallback_paths.push_back(archive_path);
         return test_password_batch(archive_path,
-            part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths,
+            part_paths.empty() ? fallback_paths : part_paths,
             part_ranges, format_hint, passwords, password_count, canonical_names);
 
 #else

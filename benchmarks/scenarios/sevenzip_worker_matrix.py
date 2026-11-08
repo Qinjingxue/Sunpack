@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -37,6 +38,19 @@ SIZE_PROFILES: dict[str, dict[str, int]] = {
     "medium": {"small_files": 512, "large_files": 2, "large_file_mib": 16},
     "large": {"small_files": 2048, "large_files": 2, "large_file_mib": 32},
 }
+
+
+def worker_thread_capacity(worker_path: Path, *, timeout: float | None = None) -> int:
+    """Read the selected binary's capacity before starting measured jobs."""
+    completed = subprocess.run(
+        [str(worker_path)], input='{"worker_command":"shutdown","job_id":"shutdown"}\n',
+        capture_output=True, encoding="utf-8", check=True, timeout=timeout,
+    )
+    ready = json.loads(completed.stdout.partition("\n")[0])
+    capacity = ready.get("thread_capacity", 0) if isinstance(ready, dict) and ready.get("type") == "worker_ready" else 0
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError(f"Missing worker capacity from {worker_path}: {ready!r}")
+    return capacity
 
 
 def _parse_csv_values(values: list[str], allowed: set[str], option: str) -> list[str]:

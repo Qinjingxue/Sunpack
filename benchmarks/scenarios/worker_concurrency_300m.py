@@ -28,7 +28,7 @@ if str(ROOT) not in sys.path:
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler
 from benchmarks.scenarios.extraction_format_matrix import create_corpus
 from benchmarks.scenarios.worker_read_patterns import _build_cases
-from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _output_summary, _volume_paths
+from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _output_summary, _volume_paths, worker_thread_capacity
 from benchmarks.scenarios.worker_vs_7z_300m import DEFAULT_FORMATS, _collect_environment, _git_commit
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
@@ -233,7 +233,6 @@ def main():
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--format", action="append", choices=DEFAULT_FORMATS)
     parser.add_argument("--worker", type=Path)
-    parser.add_argument("--worker-capacity", type=int, help="Override native total CPU credits; default uses product defaults")
     parser.add_argument("--no-mixed", action="store_true", help="Only homogeneous format batches")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--prefetch", choices=("default", "on", "off"), default="default",
@@ -254,6 +253,7 @@ def main():
         os.environ.pop("SUNPACK_SEVENZIP_PREFETCH", None)
     else:
         os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if args.prefetch == "on" else "0"
+    worker_capacity = worker_thread_capacity(worker_path)
     with BenchmarkWorkspace("extraction.worker-concurrency-300m") as workspace:
         cases, corpus = prepare(workspace, args.cache_root.resolve())
         tar_bytes = next(_volume_paths(c["item"])[0].stat().st_size for c in cases if c["format"] == "tar")
@@ -264,7 +264,7 @@ def main():
             binaries[name] = {"path": str(path), "xxh128": fast_hash128_file(path)}
         report = {"source_commit": _git_commit(), "binaries": binaries, "environment": _collect_environment(workspace.root),
                   "corpus": corpus, "cases": cases, "concurrency": widths, "runs": args.runs,
-                  "worker_capacity": args.worker_capacity, "profile": args.profile, "dry_run": args.dry_run,
+                  "worker_capacity": worker_capacity, "profile": args.profile, "dry_run": args.dry_run,
                   "mixed_enabled": not args.no_mixed,
                   "prefetch": args.prefetch,
                   "complete": False,
@@ -289,8 +289,7 @@ def main():
         if not args.no_mixed:
             workloads.append(("mixed", cases * 2))
         for case_id, base in workloads:
-            config = {} if args.worker_capacity is None else {"thread_capacity": args.worker_capacity}
-            worker = _NativeWorkerProcess(str(worker_path), None, config)
+            worker = _NativeWorkerProcess(str(worker_path), None)
             try:
                 for width in widths:
                     if (case_id, width) in finished_batches:

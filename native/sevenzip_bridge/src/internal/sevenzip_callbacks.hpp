@@ -95,7 +95,7 @@ namespace sunpack::sevenzip
             std::wstring password,
             std::wstring archive_path = L"",
             std::vector<std::wstring> part_paths = {},
-            std::vector<std::wstring> canonical_names = {},
+            const std::vector<std::wstring> &canonical_names = {},
             InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
             std::shared_ptr<std::atomic<bool>> cancel_token = native_job_cancel_token(),
             const std::vector<ExtractInputRange> &part_ranges = {})
@@ -114,9 +114,9 @@ namespace sunpack::sevenzip
             {
                 for (std::size_t index = 0; index < part_paths_.size(); ++index)
                 {
-                    const std::wstring alias = lower_path(std::filesystem::path(canonical_names[index]).filename().wstring());
+                    std::wstring alias = lower_path(std::filesystem::path(canonical_names[index]).filename().wstring());
                     if (!alias.empty())
-                        volume_paths_[alias] = index;
+                        volume_paths_[std::move(alias)] = index;
                 }
                 return;
             }

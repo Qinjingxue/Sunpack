@@ -13,7 +13,7 @@ import pytest
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.contracts.results import OutcomeKind
-from sunpack.core.contracts.retry_targets import failure_contains, result_failure
+from sunpack.core.contracts.retry_targets import failure_contains
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.tool_config import get_optional_rar
@@ -178,7 +178,7 @@ def test_incomplete_rar5_set_is_reported_as_missing_volume(tmp_path, missing):
     # it must never silently disappear from discovery.
     assert len(results) == 1
     assert results[0].outcome_kind != OutcomeKind.COMPLETE_SUCCESS
-    assert failure_contains(result_failure(results[0]), FailureKind.MISSING_VOLUME)
+    assert failure_contains(results[0].failure, FailureKind.MISSING_VOLUME)
 
 
 def test_stream_and_detection_route_outputs_are_named_after_the_archive(tmp_path):

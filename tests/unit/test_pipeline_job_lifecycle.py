@@ -118,7 +118,6 @@ def test_batched_jobs_finish_independent_work_and_nested_batches_before_raising(
         runtime = object.__new__(_RequestRuntime)
         runtime.submission = NS(origin="foreground", request_id="batch")
         runtime.recursive_authorization = NS(authorize_batch=lambda tasks, *a, **k: NS(allowed_tasks=tasks, skipped=()))
-        runtime.task_scanner = NS(last_scan_session=None)
         runtime.context = NS(lock=threading.Lock(), policy_skips=[])
         runtime._claim_tasks = lambda tasks: tasks
         runtime.source_cleanup = NS(register=lambda tasks: None)
@@ -214,7 +213,6 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
         runtime = object.__new__(_RequestRuntime)
         runtime.submission = NS(origin="watch", request_id="claim", detection_options=EmbeddedOptions())
         runtime.recursive_authorization = NS(authorize_batch=lambda tasks, *a, **k: NS(allowed_tasks=tasks, skipped=()))
-        runtime.task_scanner = NS(last_scan_session=None)
         runtime.context = NS(lock=threading.Lock(), policy_skips=[])
         runtime._claim_tasks = lambda tasks: tasks
         runtime.source_cleanup = NS(register=lambda tasks: None)

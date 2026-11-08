@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 #[derive(Debug)]
 pub(super) struct VolumeAttempts {
     pub sources: Vec<AttemptSource>,
+    // Initial sources are in group path order, one per physical file. Carrier
+    // variants append ranges for those same paths without adding group members.
+    base_source_count: usize,
     pub layouts: Vec<Vec<(u32, Arc<Vec<usize>>)>>,
     pub head_size_from_total: Option<u64>,
     pub minimum_size: Option<u64>,
@@ -15,6 +18,10 @@ pub(super) struct VolumeAttempts {
 }
 
 impl VolumeAttempts {
+    pub(super) fn base_sources(&self) -> &[AttemptSource] {
+        &self.sources[..self.base_source_count]
+    }
+
     // PKZIP disk offsets are relative to each disk, not to the concatenated
     // archive. Reuse the unique mapping's geometry and represent each possible
     // common disk size with ordinary range/domain layouts (no second protocol).
@@ -208,6 +215,7 @@ pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts
     let head = &validation.facts.anchors[&path_key(&proposal.volumes[0].0)];
     let (head_size_from_total, minimum_size, trim) = head_geometry(head, &proposal.format);
     VolumeAttempts {
+        base_source_count: proposal.volumes.len(),
         sources: proposal
             .volumes
             .iter()
@@ -728,7 +736,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        sources.sort_unstable();
+        sources.sort_unstable_by_key(|i| (*i != head, *i));
         let positions: HashMap<_, _> = sources.iter().enumerate().map(|(n, i)| (*i, n)).collect();
         let remapped: HashMap<_, _> = domains
             .0
@@ -746,11 +754,6 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         };
         let facts = shared_facts.get_or_insert_with(|| proposal_facts(view, &[]));
         let mut proposal = materialize(view, assignment, logical, None, Some(facts)).unwrap();
-        proposal.unresolved = sources
-            .iter()
-            .filter(|i| **i != head)
-            .map(|i| view.rows[*i].path.clone())
-            .collect();
         // The head identity is confirmed; its volume composition remains a plan.
         // No speculative bytes are parsed again here.
         proposal.status = ProposalStatus::Valid;
@@ -772,6 +775,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             head_size_from_total,
             tail_totals,
             minimum_size,
+            base_source_count: sources.len(),
             sources: sources
                 .iter()
                 .map(|i| {

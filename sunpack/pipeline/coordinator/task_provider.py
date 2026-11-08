@@ -5,7 +5,6 @@ from typing import Any
 from sunpack.core.config.detection_view import discovery_run_config
 
 from sunpack.core.contracts.discovery import StageResult
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.discovery import ArchiveDiscoveryPipeline
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
@@ -30,7 +29,6 @@ class ArchiveTaskProvider:
         )
         self._relations = RelationsScheduler(config)
         self._retry_scan_options = None
-        self.failed_candidate_failures: list[FailureInfo] = []
 
     def discover_targets(
         self,
@@ -67,10 +65,10 @@ class ArchiveTaskProvider:
                 is_recursive_scan=is_recursive_scan,
             )
         for task in result.tasks:
-            task.runtime["discovery_scope"] = session.scope_for(task.main_path)
+            scope = session.scope_for(task.main_path)
+            task.runtime["discovery_scope"] = scope
             task.runtime["discovery_catalog"] = session.catalog
-            task.runtime["discovery_snapshot"] = session.snapshot_for_directory(session.scope_for(task.main_path).root)
-        self._record_discovery_failures(result)
+            task.runtime["discovery_snapshot"] = session.snapshot_for_directory(scope.root)
         return result
 
     def scan_targets(
@@ -81,7 +79,6 @@ class ArchiveTaskProvider:
         *,
         is_recursive_scan: bool = False,
     ) -> list[ArchiveTask]:
-        self.failed_candidate_failures = []
         discovered = self.discover_targets(
             scan_roots,
             scan_session=scan_session,
@@ -100,18 +97,6 @@ class ArchiveTaskProvider:
     ) -> list[ArchiveTask]:
         processed = processed_keys or set()
         return [task for task in tasks if task.key not in processed]
-
-    def _record_discovery_failures(self, result: StageResult) -> None:
-        for trace in result.traces:
-            if trace.reason != "embedded_scan_io_error":
-                continue
-            info = FailureInfo(
-                FailureKind.FILESYSTEM_ERROR, "embedded_boundary",
-                trace.error or "Unable to read archive input",
-                details={"path": trace.entry_path, "reason": trace.reason},
-            )
-            if info not in self.failed_candidate_failures:
-                self.failed_candidate_failures.append(info)
 
     def resolve_volume_once(self, current_paths: list[str], scope, *, format_hint: str = "", catalog=None, snapshot=None):
         from sunpack.core.contracts.filesystem import DirectorySnapshot

@@ -294,7 +294,7 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     recorder.wrap(target_scan, "build_native_table_for_targets", "coordinator.build_native_table")
     recorder.wrap(detection_scheduler.DetectionScheduler, "confirm", "detection.confirm_candidate")
     recorder.wrap(detection_confirmation.FormatConfirmation, "confirm", "detection.confirm_stage")
-    recorder.wrap(embedded_discovery.EmbeddedDiscovery, "discover", "embedded.discover")
+    recorder.wrap(embedded_discovery.EmbeddedDiscovery, "discover_many_native", "embedded.discover")
     recorder.wrap(discovery.ArchiveDiscoveryPipeline, "discover_native", "discovery.compose_native")
 
     recorder.wrap(task_provider.ArchiveTaskProvider, "discover_targets", "task_provider.discover_targets")
@@ -353,9 +353,7 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
 
         orchestrator = ScanOrchestrator(config)
         result = orchestrator.scan_targets([target_path])
-        session = getattr(orchestrator.task_scanner, "last_scan_session", None)
         extra["tasks"] = len(result)
-        extra["scan_session"] = summarize_scan_session(session)
         return result, extra
 
     raise ValueError(f"Unsupported mode: {mode}")

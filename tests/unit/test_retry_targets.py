@@ -5,7 +5,7 @@ import pytest
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
-from sunpack.core.contracts.retry_targets import merge_latest_results, password_retry_paths, result_outcome
+from sunpack.core.contracts.retry_targets import merge_latest_results, password_retry_paths
 
 
 @pytest.mark.parametrize("mode", ["file", "file_range", "concat_ranges", "native_volumes", "sfx_with_volumes"])
@@ -99,7 +99,7 @@ def test_latest_result_ledger_keeps_unrelated_terminal_failure(tmp_path):
     latest = {}
     merge_latest_results(latest, first)
     merge_latest_results(latest, second)
-    outcomes = {Path(item.input_path).name: result_outcome(item) for item in latest.values()}
+    outcomes = {Path(item.input_path).name: item.outcome_kind for item in latest.values()}
     assert outcomes == {
         "outer.zip": OutcomeKind.COMPLETE_SUCCESS,
         "password.zip": OutcomeKind.COMPLETE_SUCCESS,

@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
+from benchmarks.scenarios.sevenzip_worker_matrix import worker_thread_capacity
 from benchmarks.scenarios.worker_single_file_write import (
     MEMBER_NAME,
     MIB,
@@ -274,7 +275,6 @@ def _run_phase(
     targets: list[dict[str, Any]],
     worker_path: Path,
     dll_path: Path,
-    thread_capacity: int,
     timeout_seconds: float,
     sample_interval: float,
     prefetch: bool,
@@ -283,13 +283,7 @@ def _run_phase(
     if prefetch:
         for target in targets:
             _prefetch_archive(Path(target["archive"]), chunk_bytes=8 * MIB)
-    worker = _NativeWorkerProcess(
-        str(worker_path),
-        None,
-        {
-            "thread_capacity": thread_capacity,
-        },
-    )
+    worker = _NativeWorkerProcess(str(worker_path), None)
     sampler = ProcessSampler(interval_seconds=sample_interval)
     runs: list[_JobRun] = []
     top_level_before: dict[str, set[str]] = {}
@@ -658,7 +652,6 @@ def main() -> int:
             "separates a working per-volume layout from the pipeline's own ceiling"
         ),
     )
-    parser.add_argument("--thread-capacity", type=int, default=8)
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--sample-interval", type=float, default=0.01)
     parser.add_argument(
@@ -685,8 +678,6 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmups >= 0")
     if args.payload_gib <= 0:
         parser.error("--payload-gib must be positive")
-    if args.thread_capacity < MIN_CONCURRENT_JOBS:
-        parser.error(f"--thread-capacity must be >= {MIN_CONCURRENT_JOBS} for the pair phase")
 
     worker_path = args.worker_path
     if worker_path is None:
@@ -697,6 +688,9 @@ def main() -> int:
     worker_path = worker_path.resolve()
     if not worker_path.is_file():
         parser.error(f"worker executable is unavailable: {worker_path}")
+    capacity = worker_thread_capacity(worker_path, timeout=args.timeout_seconds)
+    if capacity < MIN_CONCURRENT_JOBS:
+        parser.error(f"worker needs at least {MIN_CONCURRENT_JOBS} threads for the pair phase")
     try:
         dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
@@ -799,7 +793,6 @@ def main() -> int:
                     ],
                     worker_path=worker_path,
                     dll_path=dll_path,
-                    thread_capacity=args.thread_capacity,
                     timeout_seconds=args.timeout_seconds,
                     sample_interval=args.sample_interval,
                     prefetch=True,
@@ -837,7 +830,6 @@ def main() -> int:
                 targets=pair_targets,
                 worker_path=worker_path,
                 dll_path=dll_path,
-                thread_capacity=args.thread_capacity,
                 timeout_seconds=args.timeout_seconds,
                 sample_interval=args.sample_interval,
                 prefetch=True,
@@ -883,7 +875,6 @@ def main() -> int:
                 targets=control_targets,
                 worker_path=worker_path,
                 dll_path=dll_path,
-                thread_capacity=args.thread_capacity,
                 timeout_seconds=args.timeout_seconds,
                 sample_interval=args.sample_interval,
                 prefetch=True,
@@ -918,11 +909,11 @@ def main() -> int:
                 "small_job_mib": args.small_job_mib,
                 "runs": args.runs,
                 "warmups": args.warmups,
-                "thread_capacity": args.thread_capacity,
                 "timeout_seconds": args.timeout_seconds,
                 "sample_interval": args.sample_interval,
             },
             "environment": {
+                "worker_capacity": capacity,
                 "worker": str(worker_path),
                 "cpu_count": os.cpu_count(),
                 "python": sys.version,

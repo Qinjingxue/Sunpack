@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import threading
 from typing import Any
@@ -21,11 +22,16 @@ ADVANCED_CONFIG_FILENAME = "sunpack_advanced_config.json"
 OVERRIDES_ENV_VAR = "SUNPACK_CONFIG_OVERRIDES"
 
 
+@dataclass(slots=True)
+class _ConfigSnapshot:
+    signature: tuple[Any, ...]
+    path: Path
+    raw: dict[str, Any]
+    normalized: dict[str, Any] | None = None
+
+
 _CONFIG_CACHE_LOCK = threading.RLock()
-_CONFIG_CACHE_SIGNATURE: tuple[Any, ...] | None = None
-_CONFIG_CACHE_VALUE: dict[str, Any] | None = None
-_CONFIG_CACHE_RAW_VALUE: dict[str, Any] | None = None
-_CONFIG_CACHE_PATH: Path | None = None
+_CONFIG_CACHE: _ConfigSnapshot | None = None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -175,26 +181,31 @@ def load_raw_config_payload(
     request_cwd: str | Path | None = None, *, refresh: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     """Load the merged external payload without schema initialization or validation."""
-    global _CONFIG_CACHE_SIGNATURE, _CONFIG_CACHE_VALUE, _CONFIG_CACHE_RAW_VALUE, _CONFIG_CACHE_PATH
+    if refresh:
+        simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
+        advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
+        return _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
+    snapshot = _config_snapshot(request_cwd)
+    return snapshot.path, copy.deepcopy(snapshot.raw)
+
+
+def _config_snapshot(request_cwd: str | Path | None) -> _ConfigSnapshot:
+    global _CONFIG_CACHE
     simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
     advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
-    if refresh:
-        return _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
     signature = (_config_file_signature(simple_path), _config_file_signature(advanced_path), _override_signature())
     with _CONFIG_CACHE_LOCK:
-        if (
-            signature == _CONFIG_CACHE_SIGNATURE
-            and _CONFIG_CACHE_RAW_VALUE is not None
-            and _CONFIG_CACHE_PATH is not None
-        ):
-            return _CONFIG_CACHE_PATH, copy.deepcopy(_CONFIG_CACHE_RAW_VALUE)
+        previous = _CONFIG_CACHE
+        if previous is not None and previous.signature == signature:
+            return previous
     config_path, config = _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
+    snapshot = _ConfigSnapshot(signature, config_path, config)
     with _CONFIG_CACHE_LOCK:
-        _CONFIG_CACHE_SIGNATURE = signature
-        _CONFIG_CACHE_VALUE = None
-        _CONFIG_CACHE_RAW_VALUE = copy.deepcopy(config)
-        _CONFIG_CACHE_PATH = config_path
-    return config_path, config
+        if _CONFIG_CACHE is previous:
+            _CONFIG_CACHE = snapshot
+        elif _CONFIG_CACHE is not None and _CONFIG_CACHE.signature == signature:
+            return _CONFIG_CACHE
+    return snapshot
 
 
 def _config_file_signature(path: Path | None) -> tuple[str, int, int] | None:
@@ -227,12 +238,9 @@ def config_source_key(request_cwd: str | Path | None = None) -> tuple[str | None
 
 
 def clear_config_cache() -> None:
-    global _CONFIG_CACHE_SIGNATURE, _CONFIG_CACHE_VALUE, _CONFIG_CACHE_RAW_VALUE, _CONFIG_CACHE_PATH
+    global _CONFIG_CACHE
     with _CONFIG_CACHE_LOCK:
-        _CONFIG_CACHE_SIGNATURE = None
-        _CONFIG_CACHE_VALUE = None
-        _CONFIG_CACHE_RAW_VALUE = None
-        _CONFIG_CACHE_PATH = None
+        _CONFIG_CACHE = None
 
 
 def normalize_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -244,24 +252,20 @@ def normalize_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def load_config(request_cwd: str | Path | None = None) -> dict[str, Any]:
     """Read the external configuration required to run the pipeline."""
-    global _CONFIG_CACHE_SIGNATURE, _CONFIG_CACHE_VALUE, _CONFIG_CACHE_RAW_VALUE, _CONFIG_CACHE_PATH
-    simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
-    advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
-    signature = (_config_file_signature(simple_path), _config_file_signature(advanced_path), _override_signature())
+    global _CONFIG_CACHE
+    snapshot = _config_snapshot(request_cwd)
     with _CONFIG_CACHE_LOCK:
-        if signature == _CONFIG_CACHE_SIGNATURE and _CONFIG_CACHE_VALUE is not None:
-            return copy.deepcopy(_CONFIG_CACHE_VALUE)
-        cached_raw = copy.deepcopy(_CONFIG_CACHE_RAW_VALUE) if signature == _CONFIG_CACHE_SIGNATURE else None
-        cached_path = _CONFIG_CACHE_PATH
-    if cached_raw is None:
-        config_path, config = _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
-    else:
-        config_path, config = cached_path, cached_raw
-    raw_for_cache = copy.deepcopy(config)
-    normalized = normalize_config_payload(config)
-    with _CONFIG_CACHE_LOCK:
-        _CONFIG_CACHE_SIGNATURE = signature
-        _CONFIG_CACHE_VALUE = copy.deepcopy(normalized)
-        _CONFIG_CACHE_RAW_VALUE = raw_for_cache
-        _CONFIG_CACHE_PATH = config_path
-    return normalized
+        normalized = snapshot.normalized
+    if normalized is None:
+        # Normalization builds a separate tree. Keep the raw snapshot for CLI
+        # settings and validate outside the cache lock.
+        try:
+            normalized = normalize_config_payload(snapshot.raw)
+        except ConfigError:
+            with _CONFIG_CACHE_LOCK:
+                if _CONFIG_CACHE is snapshot and snapshot.normalized is None:
+                    _CONFIG_CACHE = None
+            raise
+        with _CONFIG_CACHE_LOCK:
+            snapshot.normalized = normalized
+    return copy.deepcopy(normalized)
