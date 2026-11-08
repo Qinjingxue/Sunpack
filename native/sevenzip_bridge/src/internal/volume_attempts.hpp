@@ -23,9 +23,19 @@ struct VolumeAttemptPlan {
     std::vector<unsigned long long> tail_totals;
     std::vector<std::vector<std::size_t>> domains;
     std::vector<std::vector<VolumeAttemptSlot>> layouts;
+    std::vector<std::size_t> minimum_slots;
     std::vector<VolumeSlotVariation> variation;
     std::vector<unsigned long long> domain_capacity;
     bool insufficient_sources = false;
+    std::vector<unsigned char> feasible_layouts;
+
+    std::size_t minimum_slots_for(std::size_t layout) const {
+        return minimum_slots.empty() || !minimum_slots[layout] ? layouts[layout].size() : minimum_slots[layout];
+    }
+    std::size_t domain_for(std::size_t layout, std::size_t count, std::size_t ordinal) const {
+        const auto& slots = layouts[layout];
+        return slots[ordinal + 1 == count ? slots.size() - 1 : ordinal].domain;
+    }
 
     // The plan is immutable after parsing. Summarize domains once, then merge
     // by ordinal AND slot number across layouts (paths alone lose slice identity).
@@ -38,6 +48,29 @@ struct VolumeAttemptPlan {
             needed = source.has_end ? needed - (std::min)(needed, source.end - source.start) : 0;
         }
         insufficient_sources = needed != 0;
+        // Union each layout's reachable domains once, counting each source at
+        // most once. A family uses the maximum prefix's union: shortening can
+        // only remove sources, so this remains a conservative bound.
+        feasible_layouts.assign(layouts.size(), 1);
+        if (minimum_size && !insufficient_sources) {
+            std::vector<std::size_t> seen_source(sources.size()), seen_domain(domains.size());
+            for (std::size_t l = 0; l < layouts.size(); ++l) {
+                auto missing = minimum_size;
+                for (const auto& slot : layouts[l]) {
+                    if (!missing) break;
+                    if (seen_domain[slot.domain] == l + 1) continue;
+                    seen_domain[slot.domain] = l + 1;
+                    for (auto source : domains[slot.domain]) {
+                        if (seen_source[source] == l + 1) continue;
+                        seen_source[source] = l + 1;
+                        const auto& range = sources[source];
+                        missing = range.has_end ? missing - (std::min)(missing, range.end - range.start) : 0;
+                        if (!missing) break;
+                    }
+                }
+                feasible_layouts[l] = missing == 0;
+            }
+        }
         std::vector<VolumeSlotVariation> summaries;
         summaries.reserve(domains.size());
         domain_capacity.clear();
@@ -75,6 +108,10 @@ struct VolumeAttemptPlan {
         for (std::size_t i = shortest->size(); i < variation.size(); ++i) {
             variation[i].variable = variation[i].variable_length = true;
         }
+        for (std::size_t l = 0; l < layouts.size(); ++l)
+            if (minimum_slots_for(l) < layouts[l].size())
+                for (std::size_t i = minimum_slots_for(l) - 1; i < variation.size(); ++i)
+                    variation[i].variable = variation[i].variable_length = true;
         if (!variation.empty() && (head_size_from_total || !tail_totals.empty()))
             variation.front().variable = variation.front().variable_length = true;
     }
@@ -83,7 +120,7 @@ struct VolumeAttemptPlan {
 // Iterative DFS keeps only one injective composition. No product, attempt
 // limit, recursion stack or archive/decoder object survives a retry.
 struct VolumeAttemptCursor {
-    std::size_t layout = 0, attempts = 0;
+    std::size_t layout = 0, attempts = 0, slot_count = 0;
     std::vector<std::size_t> digits, selected;
     std::vector<unsigned char> used;
     std::vector<unsigned long long> remaining, suffix_capacity;
@@ -115,54 +152,66 @@ struct VolumeAttemptCursor {
         }
         return true;
     }
-    void unselect(const std::vector<VolumeAttemptSlot>& slots, std::size_t depth) {
+    void unselect(const VolumeAttemptPlan& plan, std::size_t depth) {
         used[selected[depth]] = 0;
-        ++domain_remaining[slots[depth].domain];
+        ++domain_remaining[plan.domain_for(layout, slot_count, depth)];
     }
     void skip_layout() {
         for (auto source : selected) used[source] = 0;
         ++layout;
+        slot_count = 0;
         digits.clear();
         selected.clear();
+    }
+    void advance(const VolumeAttemptPlan& plan) {
+        if (slot_count > plan.minimum_slots_for(layout)) --slot_count;
+        else { ++layout; slot_count = 0; }
+        digits.clear(); selected.clear();
     }
     bool next(const VolumeAttemptPlan& plan, const std::atomic<bool>* cancel = nullptr) {
         if (plan.insufficient_sources) return false;
         while (layout < plan.layouts.size()) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+            if (!plan.feasible_layouts[layout]) { skip_layout(); continue; }
             const auto& slots = plan.layouts[layout];
+            if (!slot_count) slot_count = slots.size();
             std::size_t depth = 0;
             if (digits.empty()) {
                 // Only domains referenced by this layout can be read below.
                 for (const auto& slot : slots) domain_remaining[slot.domain] = 0;
                 shared_domains.clear();
-                for (const auto& slot : slots)
-                    if (++domain_remaining[slot.domain] == 2) shared_domains.push_back(slot.domain);
-                if (!shared_domains_fit(plan, 0, plan.domains.size())) { ++layout; continue; }
+                for (std::size_t i = 0; i < slot_count; ++i) {
+                    const auto domain = plan.domain_for(layout, slot_count, i);
+                    if (++domain_remaining[domain] == 2) shared_domains.push_back(domain);
+                }
+                if (!shared_domains_fit(plan, 0, plan.domains.size())) { advance(plan); continue; }
                 if (plan.minimum_size) {
-                    suffix_capacity.assign(slots.size() + 1, 0);
-                    for (std::size_t i = slots.size(); i-- > 0;)
+                    suffix_capacity.assign(slot_count + 1, 0);
+                    for (std::size_t i = slot_count; i-- > 0;)
                         suffix_capacity[i] = suffix_capacity[i + 1] + (std::min)(
-                            plan.minimum_size - suffix_capacity[i + 1], plan.domain_capacity[slots[i].domain]);
+                            plan.minimum_size - suffix_capacity[i + 1], plan.domain_capacity[plan.domain_for(layout, slot_count, i)]);
                     // Even the largest independent choices cannot supply the
                     // declared bytes. Discard the whole subtree without I/O.
-                    if (suffix_capacity[0] < plan.minimum_size) { ++layout; continue; }
-                    remaining.assign(slots.size() + 1, 0);
+                    if (suffix_capacity[0] < plan.minimum_size) { advance(plan); continue; }
+                    remaining.assign(slot_count + 1, 0);
                     remaining[0] = plan.minimum_size;
                 }
-                digits.assign(slots.size(), 0);
-                selected.assign(slots.size(), plan.sources.size());
+                digits.assign(slot_count, 0);
+                selected.assign(slot_count, plan.sources.size());
             } else {
-                depth = slots.size() - 1;
-                unselect(slots, depth);
+                depth = slot_count - 1;
+                unselect(plan, depth);
                 ++digits[depth];
             }
             for (;;) {
                 if (cancel && cancel->load(std::memory_order_relaxed)) return false;
-                const auto& choices = plan.domains[slots[depth].domain];
+                const auto domain = plan.domain_for(layout, slot_count, depth);
+                const auto& choices = plan.domains[domain];
                 if (digits[depth] == choices.size()) {
                     digits[depth] = 0;
                     if (depth == 0) break;
                     --depth;
-                    unselect(slots, depth);
+                    unselect(plan, depth);
                     ++digits[depth];
                     continue;
                 }
@@ -180,33 +229,33 @@ struct VolumeAttemptCursor {
                 }
                 selected[depth] = source;
                 used[source] = 1;
-                --domain_remaining[slots[depth].domain];
-                if (!shared_domains_fit(plan, depth + 1, slots[depth].domain)) {
-                    unselect(slots, depth); ++digits[depth]; continue;
+                --domain_remaining[domain];
+                if (!shared_domains_fit(plan, depth + 1, domain)) {
+                    unselect(plan, depth); ++digits[depth]; continue;
                 }
-                if (++depth != slots.size()) { digits[depth] = 0; continue; }
+                if (++depth != slot_count) { digits[depth] = 0; continue; }
                 // Overlapping evidence tiers can denote the same composition.
                 // Membership in an earlier layout avoids an ever-growing seen set.
                 bool duplicate = false;
                 for (std::size_t old = 0; old < layout && !duplicate; ++old) {
                     const auto& previous = plan.layouts[old];
-                    if (previous.size() != slots.size()) continue;
+                    if (slot_count > previous.size() || slot_count < plan.minimum_slots_for(old)) continue;
                     duplicate = true;
-                    for (std::size_t i = 0; i < slots.size(); ++i)
+                    for (std::size_t i = 0; i < slot_count; ++i)
                         if (previous[i].number != slots[i].number || previous[i].name != slots[i].name) {
                             duplicate = false; break;
                         }
-                        else if (previous[i].domain != slots[i].domain) {
-                            const auto& domain = plan.domains[previous[i].domain];
+                        else if (plan.domain_for(old, slot_count, i) != plan.domain_for(layout, slot_count, i)) {
+                            const auto& domain = plan.domains[plan.domain_for(old, slot_count, i)];
                             if (std::find(domain.begin(), domain.end(), selected[i]) == domain.end()) {
                                 duplicate = false; break;
                             }
                         }
                 }
                 if (!duplicate) { ++attempts; return true; }
-                --depth; unselect(slots, depth); ++digits[depth];
+                --depth; unselect(plan, depth); ++digits[depth];
             }
-            ++layout; digits.clear(); selected.clear();
+            advance(plan);
         }
         return false;
     }

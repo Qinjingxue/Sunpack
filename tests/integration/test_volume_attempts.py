@@ -249,11 +249,13 @@ def _run_trial(tmp_path, descriptor, **kwargs):
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-@pytest.mark.parametrize("unnumbered_middle", [False, True, "mixed"])
+@pytest.mark.parametrize("unnumbered_middle", [False, True, "mixed", "noise", "noise-carrier"])
 def test_unnumbered_structural_tail_survives_ambiguous_middle_order(tmp_path, archive_format, unnumbered_middle):
     # A terminal proven by format structure must not disappear just because
     # its filename has no number. Existing gap cases keep a numbered terminal.
-    case, paths, config, _ = _ambiguous_case(tmp_path, archive_format)
+    carrier = unnumbered_middle == "noise-carrier"
+    password = "variable-layout" if carrier else None
+    case, paths, config, _ = _ambiguous_case(tmp_path, archive_format, carrier=carrier, password=password)
     paths[-1].rename(paths[-1].with_name("shared.tail.opaque"))
     if unnumbered_middle == "mixed":
         paths[0].rename(paths[0].with_name("shared.part1.opaque"))
@@ -262,10 +264,20 @@ def test_unnumbered_structural_tail_survives_ambiguous_middle_order(tmp_path, ar
     elif unnumbered_middle:
         for path, name in zip(paths[1:-1], ["beta", "alpha"]):
             path.rename(path.with_name(f"shared.{name}.opaque"))
+        if unnumbered_middle in ("noise", "noise-carrier"):
+            paths[0].rename(paths[0].with_name("shared.head.opaque"))
+            paths[0].with_name("shared.noise.opaque").write_bytes(b"unrelated" * 6000)
     tasks = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)]).tasks
     task = next(t for t in tasks if t.archive_input().volume_attempts)
-    final = _run_trial(tmp_path, task.archive_input())
+    final = _run_trial(tmp_path, task.archive_input(), password_candidates=["wrong", password] if password else [])
     assert final["status"] == "ok", final
+    selected = task.archive_input().select_volumes(final["volume_selection"])
+    assert len(selected.parts) == 4
+    assert task.archive_input().admits_selected_volumes(selected)
+    assert all(not path.endswith("shared.noise.opaque") for path in selected.part_paths())
+    if carrier:
+        assert selected.parts[0].extent.start > 0
+        assert selected.parts[0].extent.end < Path(selected.parts[0].path).stat().st_size
     assert next((tmp_path / "worker-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
 

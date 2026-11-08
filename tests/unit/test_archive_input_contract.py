@@ -136,7 +136,20 @@ def test_shared_plan_checkpoint_matches_full_extents_and_ordered_domains():
     assert not original.admits_selected_volumes(damaged)
     reordered = replace(plan, layouts=(tuple(replace(s, choices=tuple(reversed(s.choices))) for s in slots), plan.layouts[1]))
     assert plan != reordered  # Same membership, different attempt priority.
-    restricted = replace(plan, layouts=(tuple(replace(s, choices=(1,)) if s.number == 2 else s for s in slots),))
+    restricted = replace(plan, layouts=(tuple(replace(s, choices=(1,)) if s.number == 2 else s for s in slots),),
+                         minimum_slots=(0,))
     assert not replace(original, volume_attempts=restricted).admits_selected_volumes(winner)
     with pytest.raises(ValueError, match="unplanned"):
         restored.select_volumes({"layout": 0, "sources": [0, 3, 1, 2]})
+    # A compact family must round-trip and admit a shorter checkpoint without
+    # mistaking its terminal for the original interior domain at that ordinal.
+    family = replace(original, volume_attempts=replace(plan, minimum_slots=(2, 0)))
+    restored = ArchiveInputDescriptor.from_dict(json.loads(json.dumps(family.to_dict())))
+    assert family.same_retry_input(restored) and not original.same_retry_input(restored)
+    winner = restored.select_volumes({"layout": 0, "sources": [0, 2, 3]})
+    assert winner.parts[0].extent == InputExtent("head", 17, 107)
+    assert family.admits_selected_volumes(winner) and not original.admits_selected_volumes(winner)
+    with pytest.raises(ValueError, match="unplanned"):
+        restored.select_volumes({"layout": 0, "sources": [0, 2, 1]})
+    with pytest.raises(ValueError, match="unplanned length"):
+        restored.select_volumes({"layout": 0, "sources": [0]})

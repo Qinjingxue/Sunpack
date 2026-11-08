@@ -79,11 +79,20 @@ class VolumeAttemptPlan:
     head_size_from_total: int | None = None
     minimum_size: int | None = None
     tail_totals: tuple[tuple[int, int], ...] = ()
+    minimum_slots: tuple[int, ...] = ()
     _domains: tuple[tuple[int, ...], ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.sources or not self.layouts:
             raise ValueError("volume attempts require sources and layouts")
+        minimum_slots = self.minimum_slots or (0,) * len(self.layouts)
+        if len(minimum_slots) != len(self.layouts):
+            raise ValueError("volume attempt bounds must match layouts")
+        for layout, minimum in zip(self.layouts, minimum_slots):
+            if minimum and (minimum < 2 or minimum > len(layout)
+                            or any(slot.number != n for n, slot in enumerate(layout, 1))):
+                raise ValueError("invalid variable volume layout")
+        object.__setattr__(self, "minimum_slots", minimum_slots)
         domains = {}
         identities = {}
         layouts = []
@@ -117,6 +126,7 @@ class VolumeAttemptPlan:
             return True
         if (self.sources != other.sources or self.head_size_from_total != other.head_size_from_total
                 or self.minimum_size != other.minimum_size or self.tail_totals != other.tail_totals
+                or self.minimum_slots != other.minimum_slots
                 or len(self.layouts) != len(other.layouts)):
             return False
         compared = set()
@@ -140,6 +150,9 @@ class VolumeAttemptPlan:
                   "layouts": [{"slots": [{"number": slot.number, "canonical_name": slot.canonical_name,
                                           "domain": indexes[id(slot.choices)]} for slot in layout]}
                               for layout in self.layouts]}
+        for layout, minimum in zip(result["layouts"], self.minimum_slots):
+            if minimum:
+                layout["minimum_slots"] = minimum
         if self.head_size_from_total is not None:
             result["head_size_from_total"] = self.head_size_from_total
         if self.minimum_size is not None:
@@ -150,7 +163,18 @@ class VolumeAttemptPlan:
 
     def remap(self, mapper) -> "VolumeAttemptPlan":
         return VolumeAttemptPlan(tuple(InputExtent(mapper(s.path), s.start, s.end) for s in self.sources),
-                                 self.layouts, self.head_size_from_total, self.minimum_size, self.tail_totals)
+                                 self.layouts, self.head_size_from_total, self.minimum_size, self.tail_totals,
+                                 self.minimum_slots)
+
+    def slots_for(self, index: int, count: int) -> tuple[VolumeAttemptSlot, ...]:
+        """Materialize only the selected prefix, moving its terminal domain."""
+        layout = self.layouts[index]
+        if count == len(layout):
+            return layout
+        minimum = self.minimum_slots[index]
+        if not minimum or not minimum <= count < len(layout):
+            raise ValueError("volume selection has an unplanned length")
+        return (*layout[:count - 1], replace(layout[count - 1], choices=layout[-1].choices))
 
     @classmethod
     def from_dict(cls, raw: dict) -> "VolumeAttemptPlan":
@@ -160,7 +184,8 @@ class VolumeAttemptPlan:
                                                  domains[s["domain"]])
                                for s in layout["slots"]) for layout in raw["layouts"]),
                    raw.get("head_size_from_total"), raw.get("minimum_size"),
-                   tuple((pair["source"], pair["total"]) for pair in raw.get("tail_totals", ())))
+                   tuple((pair["source"], pair["total"]) for pair in raw.get("tail_totals", ())),
+                   tuple(layout.get("minimum_slots", 0) for layout in raw["layouts"]))
 
 
 @dataclass(frozen=True)
@@ -258,8 +283,8 @@ class ArchiveInputDescriptor:
         plan = self.volume_attempts
         if plan is None:
             raise ValueError("volume selection requires an attempt plan")
-        layout = plan.layouts[int(selection["layout"])]
         sources = tuple(int(i) for i in selection["sources"])
+        layout = plan.slots_for(int(selection["layout"]), len(sources))
         if len(sources) != len(layout) or len(set(sources)) != len(sources):
             raise ValueError("volume selection must cover each slot once")
         parts = []
@@ -294,8 +319,10 @@ class ArchiveInputDescriptor:
         # Index a shared domain once per checkpoint validation. These indexes
         # live only for this call; do not retain source paths in a global cache.
         domains = {}
-        for index, layout in enumerate(plan.layouts):
-            if len(layout) != len(selected.parts):
+        for index in range(len(plan.layouts)):
+            try:
+                layout = plan.slots_for(index, len(selected.parts))
+            except ValueError:
                 continue
             sources = []
             for slot, part in zip(layout, selected.parts):

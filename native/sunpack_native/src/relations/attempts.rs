@@ -12,6 +12,9 @@ pub(super) struct VolumeAttempts {
     // variants append ranges for those same paths without adding group members.
     base_source_count: usize,
     pub layouts: Vec<Vec<(u32, Arc<Vec<usize>>)>>,
+    // One maximum prefix and terminal domain represent every admitted length.
+    // Zero denotes an ordinary fixed layout.
+    pub minimum_slots: Vec<usize>,
     pub head_size_from_total: Option<u64>,
     pub minimum_size: Option<u64>,
     pub tail_totals: Vec<(usize, u64)>,
@@ -32,7 +35,10 @@ impl VolumeAttempts {
         let mut domains = Domains::default();
         let mut heads = HashMap::new();
         let mut filtered = HashMap::new();
-        for layout in std::mem::take(&mut self.layouts) {
+        for (layout, minimum) in std::mem::take(&mut self.layouts)
+            .into_iter()
+            .zip(std::mem::take(&mut self.minimum_slots))
+        {
             let mut interiors = HashMap::new();
             let mut sizes = None::<HashSet<u64>>;
             for (_, choices) in layout.iter().skip(1) {
@@ -131,12 +137,14 @@ impl VolumeAttempts {
                     && !self.layouts.contains(&trimmed)
                 {
                     self.layouts.push(trimmed);
+                    self.minimum_slots.push(minimum);
                 }
             }
             // Equal disk size is a geometry hypothesis, not format identity.
             // Retain the original for nonuniform disks and unpadded carriers.
             if !self.layouts.contains(&layout) {
                 self.layouts.push(layout);
+                self.minimum_slots.push(minimum);
             }
         }
         self
@@ -227,6 +235,7 @@ pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts
             .enumerate()
             .map(|(i, part)| (part.1, Arc::new(vec![i])))
             .collect()],
+        minimum_slots: vec![0],
         head_size_from_total,
         minimum_size,
         tail_totals: if trim && proposal.format == "zip" && proposal.style != "zip_spanned" {
@@ -446,28 +455,32 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             let unnamed_tail = indexes
                 .iter()
                 .any(|i| view.facts[i].has_next == Some(false) && numbers[i].is_empty());
+            let lower = indexes
+                .iter()
+                .filter(|i| view.facts[i].has_next != Some(false))
+                .flat_map(|i| numbers[i].iter().copied())
+                .max()
+                .unwrap_or(1)
+                .checked_add(1);
+            let upper = u32::try_from(
+                indexes
+                    .iter()
+                    .filter(|i| view.facts[i].has_next != Some(false))
+                    .count(),
+            )
+            .ok()
+            .and_then(|n| n.checked_add(1));
+            // Unnumbered same-stem members may be unrelated. Their count bounds
+            // the end; it never proves that all of them must be consumed.
+            let variable = unnamed_tail
+                && !spanned
+                && matches!(view.format, "7z" | "zip")
+                && lower.zip(upper).is_some_and(|(lo, hi)| lo < hi);
             let inferred_end = unnamed_tail
-                .then(|| {
-                    let last = indexes
-                        .iter()
-                        .filter(|i| view.facts[i].has_next != Some(false))
-                        .flat_map(|i| numbers[i].iter().copied())
-                        .max()
-                        .unwrap_or(1);
-                    if last > 1 {
-                        last.checked_add(1)
-                    } else {
-                        // With no numbered interior, keep the unnumbered members
-                        // as shared gap domains. Competing tails occupy one slot.
-                        u32::try_from(
-                            indexes
-                                .iter()
-                                .filter(|i| view.facts[i].has_next != Some(false))
-                                .count(),
-                        )
-                        .ok()
-                        .and_then(|n| n.checked_add(1))
-                    }
+                .then_some(if variable {
+                    upper
+                } else {
+                    lower.map(|lo| if lo == 2 { upper.unwrap_or(lo) } else { lo })
                 })
                 .flatten();
             let mut terminals: Vec<_> = indexes
@@ -478,26 +491,6 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                 .filter(|n| *n > 1)
                 .map(Some)
                 .collect();
-            if let Some(end) = inferred_end {
-                // A name-derived end is only a hypothesis. Unnumbered interior
-                // members may extend it, or may be alternatives for existing
-                // gaps. Keep every feasible length without multiplying domains.
-                let unnamed = indexes
-                    .iter()
-                    .filter(|i| view.facts[i].has_next != Some(false) && numbers[i].is_empty())
-                    .count();
-                let maximum = indexes
-                    .iter()
-                    .filter(|i| view.facts[i].has_next != Some(false))
-                    .count()
-                    + 1;
-                let last = (end as usize).saturating_add(unnamed).min(maximum);
-                terminals.extend(
-                    ((end as usize + 1)..=last)
-                        .filter_map(|n| u32::try_from(n).ok())
-                        .map(Some),
-                );
-            }
             terminals.sort_unstable();
             terminals.dedup();
             if terminals.is_empty() {
@@ -710,8 +703,51 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     }
                 }
                 let layout: Vec<_> = slots.into_iter().collect();
-                if !layouts.contains(&layout) {
-                    layouts.push(layout);
+                let minimum = if variable
+                    && candidate_terminal == upper
+                    && layout.iter().zip(1u32..).all(|((n, _), rank)| *n == rank)
+                {
+                    lower.unwrap() as usize
+                } else {
+                    0
+                };
+                if minimum != 0 {
+                    let mut family = layout.clone();
+                    let tails = &mut family.last_mut().unwrap().1;
+                    *tails = domains.intern(
+                        tails
+                            .iter()
+                            .copied()
+                            .filter(|i| numbers[i].is_empty())
+                            .collect(),
+                    );
+                    let all_unnamed = tails.as_ref() == layout.last().unwrap().1.as_ref();
+                    let has_tails = !tails.is_empty();
+                    // Preserve the full-length domain's priority before trying
+                    // shorter prefixes with only movable, unnumbered tails.
+                    if !all_unnamed
+                        && !layouts
+                            .iter()
+                            .any(|(old, bound)| *bound == 0 && old == &layout)
+                    {
+                        layouts.push((layout.clone(), 0));
+                    }
+                    if has_tails
+                        && !layouts
+                            .iter()
+                            .any(|(old, bound)| *bound == minimum && old == &family)
+                    {
+                        layouts.push((family, minimum));
+                    }
+                    // A numbered tail only belongs at its stated position;
+                    // keep its ordinary layout instead of moving it with the family.
+                    continue;
+                }
+                if !layouts
+                    .iter()
+                    .any(|(old, bound)| *bound == 0 && old == &layout)
+                {
+                    layouts.push((layout, 0));
                 }
             }
         }
@@ -720,7 +756,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
         }
         // Contiguous layouts get first chance; stable sort retains evidence
         // tier priority. Incomplete layouts remain useful for partial recovery.
-        layouts.sort_by_key(|layout| {
+        layouts.sort_by_key(|(layout, _)| {
             (
                 !layout
                     .iter()
@@ -782,9 +818,10 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
                     AttemptSource::new(&view.rows[*i].path, view.rows[*i].anchor.as_ref().unwrap())
                 })
                 .collect(),
+            minimum_slots: layouts.iter().map(|(_, minimum)| *minimum).collect(),
             layouts: layouts
                 .into_iter()
-                .map(|layout| {
+                .map(|(layout, _)| {
                     layout
                         .into_iter()
                         .map(|(n, choices)| (n, Arc::clone(&remapped[&Arc::as_ptr(&choices)])))
@@ -851,5 +888,6 @@ pub(super) fn to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResu
     result.set_item("sources", sources)?;
     result.set_item("domains", domains)?;
     result.set_item("layouts", layouts)?;
+    result.set_item("minimum_slots", &attempts.minimum_slots)?;
     Ok(result.unbind())
 }

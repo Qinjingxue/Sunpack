@@ -615,6 +615,14 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
                 slots.push_back(std::move(parsed));
             }
             if (slots.empty()) { input.validation_error = "empty volume attempt layout"; return input; }
+            unsigned long long minimum = 0;
+            const JsonObjectView raw(raw_layout);
+            raw.uint_field("minimum_slots", &minimum);
+            if (minimum && (minimum < 2 || minimum > slots.size() ||
+                    slots.back().number != slots.size())) {
+                input.validation_error = "invalid variable volume layout"; return input;
+            }
+            plan.minimum_slots.push_back(static_cast<std::size_t>(minimum));
             plan.layouts.push_back(std::move(slots));
         }
         if (plan.sources.empty() || plan.layouts.empty() ||
@@ -1112,12 +1120,13 @@ void select_volume_attempt(const WorkerArchiveInput& source,
                            const sunpack::sevenzip::VolumeAttemptCursor& cursor,
                            WorkerArchiveInput& input) {
     const auto& slots = source.volume_attempts.layouts[cursor.layout];
-    input.part_paths.resize(slots.size());
-    input.ranges.resize(slots.size());
-    input.canonical_names.resize(slots.size());
+    const auto count = cursor.selected.size();
+    input.part_paths.resize(count);
+    input.ranges.resize(count);
+    input.canonical_names.resize(count);
     input.missing_volume_number = 0;
     unsigned int previous = 0;
-    for (std::size_t i = 0; i < slots.size(); ++i) {
+    for (std::size_t i = 0; i < count; ++i) {
         const auto& range = source.volume_attempts.sources[cursor.selected[i]];
         input.part_paths[i] = range.path;
         input.ranges[i] = range;

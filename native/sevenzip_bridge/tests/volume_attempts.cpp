@@ -16,7 +16,15 @@ static std::vector<Composition> reference(const VolumeAttemptPlan& plan) {
     std::vector<Composition> result;
     std::set<Key> seen;
     for (std::size_t layout = 0; layout < plan.layouts.size(); ++layout) {
-        const auto& slots = plan.layouts[layout];
+        const auto& maximum = plan.layouts[layout];
+        const auto minimum = plan.minimum_slots.empty() || !plan.minimum_slots[layout]
+            ? maximum.size() : plan.minimum_slots[layout];
+        // Expand tiny reference families explicitly, independently of the
+        // production cursor's prefix/domain projection.
+        for (auto count = maximum.size(); count >= minimum; --count) {
+        auto slots = maximum;
+        slots.resize(count);
+        slots.back().domain = maximum.back().domain;
         std::vector<std::size_t> selected;
         auto visit = [&](auto&& self, unsigned long long needed) -> void {
             if (selected.size() == slots.size()) {
@@ -36,6 +44,7 @@ static std::vector<Composition> reference(const VolumeAttemptPlan& plan) {
             }
         };
         visit(visit, plan.minimum_size);
+        }
     }
     return result;
 }
@@ -80,6 +89,17 @@ int main() {
     insufficient.reserve(plan);
     if (insufficient.next(plan) || insufficient.attempts) return 4;
 
+    // Global capacity passes only because a large source belongs to a later
+    // layout. The first layout must be skipped without factorial backtracking.
+    plan.sources.push_back(plan.sources[0]);
+    plan.sources.back().end = plan.minimum_size;
+    plan.domains.push_back({12});
+    plan.layouts.push_back({slot(0, 1)});
+    plan.prepare();
+    VolumeAttemptCursor reachable;
+    reachable.reserve(plan);
+    if (!reachable.next(plan) || reachable.layout != 1 || reachable.next(plan)) return 5;
+
     // The large unsatisfiable layout must not obstruct a later valid layout.
     plan = {};
     plan.sources.resize(11);
@@ -118,6 +138,7 @@ int main() {
                 if (random() % 7 == 0) value.name += L"other";
                 layout.push_back(std::move(value));
             }
+            plan.minimum_slots.push_back(size > 1 && random() % 2 ? 2 + random() % (size - 1) : 0);
         }
         if (!compare(plan)) { std::cerr << "plan mismatch: " << trial << '\n'; return 3; }
     }

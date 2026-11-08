@@ -1080,6 +1080,45 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_terminal_family_stays_compact_and_keeps_numbered_tail_fixed() {
+        // Many optional members must not allocate one full slot list per end.
+        // A second, numbered tail must never migrate to the family's short ends.
+        let mut rows = vec![row("same.head", "7z", Some(1), false)];
+        for i in 0..=255 {
+            let name = format!(
+                "same.mid{}{}",
+                (b'a' + i / 26) as char,
+                (b'a' + i % 26) as char
+            );
+            rows.push(row(&name, "", None, false));
+        }
+        rows.push(row("same.tail", "7z", None, true));
+        rows.push(row("same.part258", "7z", None, true));
+        let groups = resolve(&rows);
+        let plan = groups[0].attempts.as_ref().unwrap();
+        assert!(plan.layouts.iter().map(Vec::len).sum::<usize>() <= 3 * rows.len());
+        let family = plan.minimum_slots.iter().position(|n| *n == 2).unwrap();
+        assert_eq!(plan.layouts[family].len(), 258);
+        assert!(plan.layouts[family]
+            .last()
+            .unwrap()
+            .1
+            .iter()
+            .all(|i| plan.sources[*i].path == "same.tail"));
+        assert!(plan
+            .layouts
+            .iter()
+            .zip(&plan.minimum_slots)
+            .any(|(layout, minimum)| *minimum == 0
+                && layout
+                    .last()
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|i| plan.sources[*i].path == "same.part258")));
+    }
+
+    #[test]
     fn repeated_seed_numbers_are_global_channels_not_a_seed_failure() {
         let rows = vec![
             row("same.build1.chunk1.bin", "7z", Some(1), false),
