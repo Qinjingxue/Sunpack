@@ -257,6 +257,9 @@ pub(crate) fn probe_volume_anchor_records_cheap(
     records: &[(&str, u64, Option<&CheapAnchorCell>)],
     root: Option<&str>,
 ) -> Vec<CheapAnchor> {
+    if records.is_empty() {
+        return Vec::new();
+    }
     // A conflicting promotion retains the original per-file error/retry path.
     let scope = root.and_then(|root| NativeReadScope::new(std::path::Path::new(root)).ok());
     cheap_fast_probe_pool().install(|| {
@@ -317,6 +320,9 @@ fn probe_volume_anchor_paths_with_depth(
     path_passwords: Option<&[(String, String)]>,
     depth: VolumeAnchorProbeDepth,
 ) -> Vec<VolumeAnchor> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
     let password_map: HashMap<String, &str> = path_passwords
         .map(|items| {
             items
@@ -329,11 +335,10 @@ fn probe_volume_anchor_paths_with_depth(
         paths
             .par_iter()
             .map(|path| {
-                probe_path(
-                    path,
-                    password_map.get(&crate::path_keys::path_key(path)).copied(),
-                    depth,
-                )
+                let password = (!password_map.is_empty())
+                    .then(|| password_map.get(&crate::path_keys::path_key(path)).copied())
+                    .flatten();
+                probe_path(path, password, depth)
             })
             .collect()
     })
@@ -397,17 +402,15 @@ fn probe_cheap_prefix(
     // detector.  The cheap pass only keeps structure that can itself seed
     // a split suspicion, plus the leading stream facts that prevent a
     // numbered ordinary archive from being mistaken for a volume.
-    if let Some(offset) = anchored_signature(prefix, RAR5)
+    if anchored_signature(prefix, RAR5)
         .or_else(|| anchored_signature(prefix, RAR4))
-        .filter(|offset| probe_rar(prefix, *offset, &mut result, password))
+        .is_some_and(|offset| probe_rar(prefix, offset, &mut result, password))
     {
-        let _ = offset;
         return result;
     }
-    if let Some(offset) = anchored_signature(prefix, SEVEN_ZIP)
-        .filter(|offset| probe_seven_zip(prefix, *offset, result.size, &mut result))
+    if anchored_signature(prefix, SEVEN_ZIP)
+        .is_some_and(|offset| probe_seven_zip(prefix, offset, result.size, &mut result))
     {
-        let _ = offset;
         return result;
     }
     if probe_zip_split_marker(prefix, &mut result) {

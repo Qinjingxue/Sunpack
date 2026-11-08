@@ -1431,25 +1431,19 @@ pub(crate) fn relations_resolve_volume_once(
         let mut visible_paths = current_paths.clone();
         visible_paths.extend(candidate_paths);
         let visible_paths = sorted_unique_paths(visible_paths);
-        if visible_paths.is_empty() {
-            return None;
-        }
         let anchors = probe_volume_anchor_paths_cheap(&visible_paths, None);
-        let anchor_by_path: HashMap<String, VolumeAnchor> = anchors
-            .into_iter()
-            .map(|anchor| (path_key(&anchor.path), anchor))
-            .collect();
+        // The indexed parallel probe returns one result per input in the
+        // original order, including failed reads.
         let rows: Vec<_> = visible_paths
-            .iter()
-            .map(|path| RelationInput {
-                path: path.clone(),
-                path_key: path_key(path),
-                name: basename(path).to_string(),
-                size: anchor_by_path
-                    .get(&path_key(path))
-                    .map(|anchor| anchor.size),
+            .into_iter()
+            .zip(anchors)
+            .map(|(path, anchor)| RelationInput {
+                path_key: path_key(&path),
+                name: basename(&path).to_string(),
+                path,
+                size: Some(anchor.size),
                 relation_member_eligible: true,
-                anchor: anchor_by_path.get(&path_key(path)).cloned(),
+                anchor: Some(anchor),
                 anchor_cell: None,
             })
             .collect();
@@ -1471,10 +1465,10 @@ pub(crate) fn relations_resolve_volume_once(
             if !format_hint.is_empty() && data.format_hint != format_hint {
                 continue;
             }
-            if current_paths.iter().all(|current| {
+            if filtered_keys.iter().all(|current| {
                 data.parts()
                     .chain(data.companions.iter().map(String::as_str))
-                    .any(|part| path_key(part) == path_key(current))
+                    .any(|part| path_key(part) == *current)
             }) {
                 return Some(group);
             }
@@ -1593,39 +1587,22 @@ fn get_logical_name(filename: &str, is_archive: bool) -> String {
         return logical_name_from_parsed(&parsed);
     }
     let regexes = regex_cache().acquire();
-    let zero_zip = regexes
+    if let Some(suffix) = regexes
         .zip_zero_numbered_suffix_re()
-        .replace(filename, "")
-        .to_string();
-    if zero_zip != filename {
-        return clean_logical_name(&zero_zip);
-    }
-
-    let second = regexes
-        .archive_numbered_suffix_re()
-        .replace(&zero_zip, "")
-        .to_string();
-    if second != zero_zip {
-        return clean_logical_name(&second);
-    }
-
-    let third = regexes
-        .plain_numeric_suffix_re()
-        .replace(&second, "")
-        .to_string();
-    if third != second {
-        return clean_logical_name(&third);
+        .find(filename)
+        .or_else(|| regexes.archive_numbered_suffix_re().find(filename))
+        .or_else(|| regexes.plain_numeric_suffix_re().find(filename))
+    {
+        return clean_logical_name(&filename[..suffix.start()]);
     }
 
     let (base, ext) = split_ext(filename);
-    let ext = ext.to_ascii_lowercase();
     if is_archive
-        || matches!(
-            ext.as_str(),
-            ".7z" | ".rar" | ".zip" | ".zipx" | ".gz" | ".bz2" | ".xz" | ".exe"
-        )
+        || [".7z", ".rar", ".zip", ".zipx", ".gz", ".bz2", ".xz", ".exe"]
+            .iter()
+            .any(|suffix| ext.eq_ignore_ascii_case(suffix))
     {
-        return clean_logical_name(&base);
+        return clean_logical_name(base);
     }
     clean_logical_name(filename)
 }
@@ -1682,12 +1659,12 @@ pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String>
         ".zip" => {
             keys.push(split_size_family_key("archive:numeric", path));
             keys.push(split_size_family_key("zip:zero-numbered", path));
-            keys.push(split_size_family_key("zip:spanned", &base));
+            keys.push(split_size_family_key("zip:spanned", base));
         }
-        ".zipx" => keys.push(split_size_family_key("zip:spanned", &base)),
+        ".zipx" => keys.push(split_size_family_key("zip:spanned", base)),
         ".rar" => {
             keys.push(split_size_family_key("archive:numeric", path));
-            keys.push(split_size_family_key("rar:oldstyle", &base));
+            keys.push(split_size_family_key("rar:oldstyle", base));
         }
         _ => {}
     }
@@ -2063,20 +2040,20 @@ pub(crate) fn first_dot_stem(name: &str) -> &str {
     name.split_once('.').map(|(stem, _)| stem).unwrap_or(name)
 }
 
-fn split_ext(filename: &str) -> (String, String) {
+fn split_ext(filename: &str) -> (&str, &str) {
     let basename_start = filename
         .rfind(['\\', '/'])
         .map(|index| index + 1)
         .unwrap_or(0);
     let basename = &filename[basename_start..];
     let Some(dot_in_base) = basename.rfind('.') else {
-        return (filename.to_string(), String::new());
+        return (filename, "");
     };
     if dot_in_base == 0 {
-        return (filename.to_string(), String::new());
+        return (filename, "");
     }
     let dot = basename_start + dot_in_base;
-    (filename[..dot].to_string(), filename[dot..].to_string())
+    filename.split_at(dot)
 }
 
 fn basename(path: &str) -> &str {

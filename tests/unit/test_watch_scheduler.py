@@ -2621,10 +2621,8 @@ def test_watch_scheduler_allows_shared_output_root(tmp_path, monkeypatch):
         },
     )
 
-    assert watcher.output_roots == {
-        scheduler_module.path_key(str(first_root)): str(output_root.resolve()),
-        scheduler_module.path_key(str(second_root)): str(output_root.resolve()),
-    }
+    assert watcher._output_root_for(str(first_root / "first.7z")) == str(output_root.resolve())
+    assert watcher._output_root_for(str(second_root / "second.7z")) == str(output_root.resolve())
 
 
 def test_watch_root_without_explicit_output_uses_archive_folder_default(tmp_path, monkeypatch):

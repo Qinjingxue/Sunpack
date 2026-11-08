@@ -1,8 +1,9 @@
 import threading
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Callable
-from sunpack_native import archive_input_slice
+from sunpack_native import archive_input_slices
 
 from sunpack.core.analysis import ArchiveAnalysisReport, ArchiveAnalyzer
 from sunpack.core.analysis.request import AnalysisCapability, AnalysisRequest, DEFAULT_ANALYSIS_CAPABILITIES
@@ -35,7 +36,7 @@ class ArchiveInputPlanningStage:
         self,
         config: dict[str, Any] | None = None,
     ):
-        self._report_cache: dict[tuple, ArchiveAnalysisReport] = {}
+        self._report_cache: OrderedDict[tuple, ArchiveAnalysisReport] = OrderedDict()
         self._report_cache_lock = threading.Lock()
         self.analyzer = ArchiveAnalyzer(config or {})
 
@@ -43,7 +44,7 @@ class ArchiveInputPlanningStage:
         with self._report_cache_lock:
             self._report_cache[cache_key] = report
             if len(self._report_cache) > _REPORT_CACHE_LIMIT:
-                self._report_cache.pop(next(iter(self._report_cache)))
+                self._report_cache.popitem(last=False)
 
     def clear_report_cache(self) -> None:
         """Release archive-specific reports after a completed request group."""
@@ -51,12 +52,7 @@ class ArchiveInputPlanningStage:
             self._report_cache.clear()
 
     def _report_cache_key(self, task: ArchiveTask) -> tuple:
-        return (
-            "source",
-            knowledge_view.source_fingerprint(task),
-            "discovery_confirmed",
-            _discovery_confirmed(task),
-        )
+        return knowledge_view.source_fingerprint(task), _discovery_confirmed(task)
 
     def plan_task(self, task: ArchiveTask) -> ArchiveAnalysisReport | None:
         report, _ = self._plan_task_to_tasks(task)
@@ -132,13 +128,8 @@ class ArchiveInputPlanningStage:
                 candidates = [password_candidate]
         selected_segment = candidates[0] if candidates else None
         with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
-            segment_payloads = self._extractable_segment_payloads(task, candidates)
+            segment_payloads, password_probe_input = self._project_segments(task.archive_input(), candidates)
         with _phase(phase_timer, f"{phase_prefix}_batched_write"):
-            password_probe_input = (
-                self._password_probe_input_for_segment(task, *selected_segment, segment_payloads)
-                if selected_segment is not None
-                else self._structured_volume_source(task)
-            )
             _write_plan_knowledge(
                 task,
                 report,
@@ -149,11 +140,6 @@ class ArchiveInputPlanningStage:
         with _phase(phase_timer, f"{phase_prefix}_state_update"):
             self._record_planning_input(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
         return [task]
-
-    @staticmethod
-    def _structured_volume_source(task: ArchiveTask) -> ArchiveInputDescriptor | None:
-        source_input = task.archive_input()
-        return source_input if len(source_input.parts) > 1 else None
 
     @staticmethod
     def _execution_analysis_for_report(
@@ -208,18 +194,42 @@ class ArchiveInputPlanningStage:
             for position, (evidence, segment) in enumerate(report.extractable_segments, start=1)
         ]
 
-    def _extractable_segment_payloads(
-        self,
-        task: ArchiveTask,
+    @staticmethod
+    def _project_segments(
+        source: ArchiveInputDescriptor,
         candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]],
-    ) -> list[LogicalArchiveInput]:
+    ) -> tuple[list[LogicalArchiveInput], ArchiveInputDescriptor | None]:
+        if not candidates:
+            return [], source if len(source.parts) > 1 else None
+        projected, probe = archive_input_slices(source.to_dict(), [
+            (evidence.format, segment.start_offset, segment.end_offset)
+            for evidence, segment, _ in candidates
+        ])
         payloads: list[LogicalArchiveInput] = []
-        for evidence, segment, index in candidates:
-            archive_input = self._archive_input_for_segment(task, evidence, segment)
-            if archive_input is None:
+        for (evidence, segment, index), row in zip(candidates, projected, strict=True):
+            if row is None:
                 continue
-            payloads.append(LogicalArchiveInput(archive_input, position=index))
-        return payloads
+            analysis = {
+                "status": evidence.status,
+                "damage_flags": list(segment.damage_flags),
+                "segment_source": "analysis",
+            }
+            analysis.update(_stream_execution_analysis(evidence, segment.start_offset))
+            analysis.update(_zip_password_analysis(evidence, segment.start_offset))
+            if evidence.details.get("password_required"):
+                analysis["password_required"] = True
+            descriptor = replace(ArchiveInputDescriptor.from_dict(row), analysis=analysis)
+            payloads.append(LogicalArchiveInput(descriptor, position=index))
+        if projected[0] is not None:
+            return payloads, payloads[0].descriptor
+        probe_input = None
+        if probe is not None:
+            evidence, segment, _ = candidates[0]
+            probe_input = replace(ArchiveInputDescriptor.from_dict(probe), analysis={
+                **source.analysis,
+                **_zip_password_analysis(evidence, segment.start_offset),
+            })
+        return payloads, probe_input
 
     @staticmethod
     def _password_required_embedded_segment(
@@ -229,47 +239,6 @@ class ArchiveInputPlanningStage:
             return None
         evidence, segment = report.password_segment
         return evidence, segment, 0
-
-    def _archive_input_for_segment(
-        self,
-        task: ArchiveTask,
-        evidence: ArchiveFormatEvidence,
-        segment: ArchiveSegment,
-    ) -> ArchiveInputDescriptor | None:
-        if segment.end_offset is None:
-            return None
-        projected = archive_input_slice(task.archive_input().to_dict(), evidence.format,
-                                        int(segment.start_offset), int(segment.end_offset))
-        if projected is None:
-            return None
-        segment_analysis = {
-            "status": evidence.status,
-            "damage_flags": list(segment.damage_flags),
-            "segment_source": "analysis",
-        }
-        segment_analysis.update(_stream_execution_analysis(evidence, segment.start_offset))
-        segment_analysis.update(_zip_password_analysis(evidence, segment.start_offset))
-        if evidence.details.get("password_required"):
-            segment_analysis["password_required"] = True
-        return replace(ArchiveInputDescriptor.from_dict(projected), analysis=segment_analysis)
-
-    def _password_probe_input_for_segment(
-        self, task: ArchiveTask, evidence: ArchiveFormatEvidence, segment: ArchiveSegment,
-        position: int,
-        inputs: list[LogicalArchiveInput],
-    ) -> ArchiveInputDescriptor | None:
-        for node in inputs:
-            # The plan position survives mapping logical offsets across volumes.
-            if node.position == position:
-                return node.descriptor
-        projected = archive_input_slice(task.archive_input().to_dict(), evidence.format,
-                                        int(segment.start_offset), segment.end_offset, probe=True)
-        if projected is None:
-            return None
-        return replace(ArchiveInputDescriptor.from_dict(projected), analysis={
-            **task.archive_input().analysis,
-            **_zip_password_analysis(evidence, segment.start_offset),
-        })
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

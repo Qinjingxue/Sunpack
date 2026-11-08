@@ -43,7 +43,7 @@ fn native_available() -> bool {
 
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(io::archive_state::archive_input_slice, m)?)?;
+    m.add_function(wrap_pyfunction!(io::archive_state::archive_input_slices, m)?)?;
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::append_failure_report, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::publish_failure_report, m)?)?;

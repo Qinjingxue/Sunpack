@@ -503,23 +503,54 @@ fn range_segment(path: &str, start: u64, end: Option<u64>) -> PyResult<Segment> 
     })
 }
 
-/// Project an analysis range onto the canonical physical layout once. All
-/// downstream consumers use the resulting extents, including bounded sources.
+type ProjectedInput = Option<Py<PyDict>>;
+
+/// Resolve the physical layout once for all selected analysis ranges.
 #[pyfunction]
-#[pyo3(signature = (source, format_hint, start, end=None, probe=false))]
-pub(crate) fn archive_input_slice(
+pub(crate) fn archive_input_slices(
     source: &Bound<'_, PyDict>,
-    format_hint: &str,
-    start: u64,
-    end: Option<u64>,
-    probe: bool,
-) -> PyResult<Option<Py<PyDict>>> {
-    let py = source.py();
+    slices: Vec<(String, u64, Option<u64>)>,
+) -> PyResult<(Vec<ProjectedInput>, ProjectedInput)> {
+    let Some((first_format, first_start, first_end)) = slices.first() else {
+        return Ok((Vec::new(), None));
+    };
     let segments = build_segments(source)?;
     let total = segments
         .iter()
         .try_fold(0u64, |sum, part| sum.checked_add(part.len()))
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("input size overflow"))?;
+    let projected = slices
+        .iter()
+        .map(|(format, start, end)| {
+            project_input_slice(source, &segments, total, format, *start, *end, false)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let probe = if projected[0].is_none() {
+        project_input_slice(
+            source,
+            &segments,
+            total,
+            first_format,
+            *first_start,
+            *first_end,
+            true,
+        )?
+    } else {
+        None
+    };
+    Ok((projected, probe))
+}
+
+fn project_input_slice(
+    source: &Bound<'_, PyDict>,
+    segments: &[Segment],
+    total: u64,
+    format_hint: &str,
+    start: u64,
+    end: Option<u64>,
+    probe: bool,
+) -> PyResult<ProjectedInput> {
+    let py = source.py();
     let Some(mut end) = end.or(probe.then_some(total)) else {
         return Ok(None);
     };

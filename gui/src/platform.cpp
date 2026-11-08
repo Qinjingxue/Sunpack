@@ -130,16 +130,25 @@ void atomic_write(const fs::path& p, const std::string& content) {
         }
     } catch (...) { std::error_code ec; fs::remove(temp, ec); throw; }
 }
-DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void(const fs::path&)> changed) {
+namespace {
+Handle directory_watch_event() {
+    const auto event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) win_error("opWatchDirectory");
+    return Handle(event);
+}
+}
+DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void(const fs::path&)> changed)
+    : stop_(directory_watch_event()) {
     auto target = resolve_path(directory), ancestor = target;
     while (!fs::is_directory(ancestor) && ancestor != ancestor.parent_path()) ancestor = ancestor.parent_path();
     bool subtree = ancestor != target;
     direct_=!subtree;
-    auto h = CreateFileW(ancestor.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
-    if (h == INVALID_HANDLE_VALUE) win_error("opWatchDirectory");
-    thread_ = std::thread([this, h, target, ancestor, subtree, changed = std::move(changed)] {
-        Handle dir(h), done(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    Handle dir(CreateFileW(ancestor.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr));
+    if (dir == INVALID_HANDLE_VALUE) win_error("opWatchDirectory");
+    const auto ready = directory_watch_event();
+    thread_ = std::thread([this, dir = std::move(dir), done = directory_watch_event(), ready = ready.value,
+        ancestor = std::move(ancestor), subtree, changed = std::move(changed)] {
         alignas(DWORD) char buffer[16384];
         bool armed=false;
         for (;;) {
@@ -147,9 +156,8 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
             ResetEvent(done);
             if (!ReadDirectoryChangesW(dir, buffer, sizeof(buffer), subtree,
                 FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                nullptr, &ov, nullptr)) { alive_=false; SetEvent(ready_); if(armed) changed({}); break; }
-            armed=true;
-            SetEvent(ready_);
+                nullptr, &ov, nullptr)) { alive_=false; if(armed) changed({}); else SetEvent(ready); break; }
+            if (!armed) { armed=true; SetEvent(ready); }
             HANDLE waits[] = {stop_, done};
             DWORD signal = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
             if (signal != WAIT_OBJECT_0 + 1) {
@@ -171,7 +179,7 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
             }
         }
     });
-    WaitForSingleObject(ready_,INFINITE);
+    WaitForSingleObject(ready,INFINITE);
     if(!alive_) { thread_.join(); throw std::runtime_error("watchNotificationsUnsupported"); }
 }
 DirectoryWatcher::~DirectoryWatcher() { SetEvent(stop_); if (thread_.joinable()) thread_.join(); }

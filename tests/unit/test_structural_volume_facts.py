@@ -4,8 +4,8 @@ import struct
 from pathlib import Path
 from zlib import crc32
 
-from sunpack.core.analysis.volume_anchor import probe_volume_anchor_paths
 from sunpack.pipeline.discovery.relations.scheduler import RelationsScheduler
+from sunpack_native import probe_volume_anchors
 
 
 def _vint(value):
@@ -50,14 +50,14 @@ def test_variable_headers_and_malformed_rar_numbers_do_not_lose_or_invent_identi
         path = tmp_path / name
         path.write_bytes(data)
         paths.append(str(path))
-    facts = probe_volume_anchor_paths(paths)
-    for path in paths:
-        fact = facts.get(path)
+    facts = probe_volume_anchors(paths)
+    for path, fact in zip(paths, facts, strict=True):
+        assert fact["path"] == path
         _, expected_format, expected_number = cases[Path(path).name]
-        assert (fact.format, fact.internal_volume_number) == (expected_format, expected_number)
-        assert fact.error == ""
+        assert (fact["format"], fact["internal_volume_number"]) == (expected_format, expected_number)
+        assert fact["error"] == ""
         if Path(path).name == "bad-zip-header":
-            assert fact.bytes_read <= 512 + 65_557
+            assert fact["bytes_read"] <= 512 + 65_557
 
 
 def test_zip_directory_numbers_override_names_and_keep_carrier_extent(tmp_path):
@@ -107,8 +107,8 @@ def test_zip64_long_comment_retains_terminal_number(tmp_path):
     end = struct.pack("<4s4H2LH", b"PK\x05\x06", 65535, 65535, 0, 0, 0, 0, 65535) + b"a" * 65535
     path = tmp_path / "terminal.opaque"
     path.write_bytes(prefix + end64 + locator + end)
-    fact = probe_volume_anchor_paths([str(path)]).get(str(path))
-    assert fact.error == "" and fact.internal_volume_number == 70001
+    [fact] = probe_volume_anchors([str(path)])
+    assert fact["error"] == "" and fact["internal_volume_number"] == 70001
 
 
 def test_seven_zip_next_header_constrains_names_and_checks_cross_volume_crc(tmp_path):

@@ -141,8 +141,8 @@ def test_bug_regression_idle_allocator_cleanup_preserves_active_owners(tmp_path)
         "sunpack.core.support.output_paths.os.path.exists",
         side_effect=lambda p: "(" not in p,
     ):
-        first = registry.reserve(default, "first", set())
-        second = registry.reserve(default, "second", set())
+        first = registry.reserve(default, "first")
+        second = registry.reserve(default, "second")
         assert first != second
         assert registry.clear_idle_cache() == {"skipped": True}
         registry.release("first")
@@ -152,7 +152,7 @@ def test_bug_regression_idle_allocator_cleanup_preserves_active_owners(tmp_path)
         assert report["families"] > 0
         assert report["slots"] == 0
         assert registry.clear_idle_cache() == {"families": 0, "slots": 0}
-        assert registry.reserve(default, "third", set()) == first
+        assert registry.reserve(default, "third") == first
         registry.release("third")
 
 
@@ -166,7 +166,7 @@ def test_bug_regression_engine_idle_cleanup_includes_output_allocator(
         "sunpack.core.support.output_paths.os.path.exists",
         side_effect=lambda p: "(" not in p,
     ):
-        registry.reserve(str(tmp_path / "archive"), "owner", set())
+        registry.reserve(str(tmp_path / "archive"), "owner")
         registry.release("owner")
 
     class Broker:

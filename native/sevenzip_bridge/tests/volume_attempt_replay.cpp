@@ -35,7 +35,7 @@ void operator delete(void* value, std::size_t) noexcept { std::free(value); }
 
 
 void request_recovery(const std::filesystem::path& archive, bool after_failure, bool user_cancel) {
-    NativeMemoryManager manager(0, [] { return NativeMemoryStatus{1LL << 30, 1ULL << 30, 0}; });
+    NativeMemoryManager manager(0, [] { return 1LL << 30; });
     NativeMemoryJob job(manager);
     manager.begin(job);
     NativeMemoryScope memory(&job);

@@ -6,6 +6,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <stdexcept>
 
@@ -21,6 +22,7 @@ struct Handle {
     ~Handle() { if (value && value != INVALID_HANDLE_VALUE) CloseHandle(value); }
     Handle(const Handle&) = delete;
     Handle& operator=(const Handle&) = delete;
+    Handle(Handle&& other) noexcept : value(std::exchange(other.value, INVALID_HANDLE_VALUE)) {}
     operator HANDLE() const { return value; }
 };
 std::string utf8(const std::wstring& value);
@@ -39,8 +41,7 @@ struct FileMutex {
 };
 // One outstanding overlapped request; cancellation joins before handles are closed.
 class DirectoryWatcher {
-    Handle stop_{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    Handle ready_{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    Handle stop_;
     std::atomic<bool> alive_{true};
     bool direct_ = false;
     std::thread thread_;

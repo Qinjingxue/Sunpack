@@ -1034,7 +1034,7 @@ void Application::work() {
                 if(flags&retry.first) { retry.second=ReadRetry{}; }
                 else if(retry.second.due<=Clock::now()) { flags|=retry.first; retry.second.due=Clock::time_point::max(); }
             }
-            bool tasks_changed=false,passwords_changed=false,dirs_changed=false,config_changed=false;
+            bool tasks_changed=false,passwords_changed=false,roots_changed=false,config_changed=false;
             bool task_page_requested=false;
             Json password_delta;
             Json edit_feedback=Json::object();
@@ -1113,22 +1113,18 @@ void Application::work() {
                                 retries.erase(Passwords);
                                 // A single replacement preserves ordering and filtered count
                                 // in the unfiltered saved-password view.
-                                const auto& edit=kind=="passwords"?p.at("edit"):Json::object();
+                                const auto edit=p.find("edit");
                                 if(!saved_passwords.record.is_null()) password_original=saved_passwords.record.dump();
-                                if(edit.value("operation",std::string())=="replace" &&
-                                   !saved_passwords.count_changed && !saved_passwords.record.is_null() &&
-                                   edit["values"].size()<=1 && view.password_query.empty() && view.password_scope=="@all" &&
+                                if(edit!=p.end() && edit->value("operation",std::string())=="replace" &&
+                                   !saved_passwords.count_changed && !password_original.empty() && !saved_passwords.record.contains("scopes") &&
+                                   edit->at("values").size()<=1 && view.password_query.empty() && view.password_scope=="@all" &&
                                    !passwords_changed && previous_patch.contains("passwords")) {
-                                    Json record={{"value",edit.value("value",std::string())}};
-                                    auto scopes=edit.value("scopes",Json::array());
-                                    if(!scopes.empty()) record["scopes"]=std::move(scopes);
-                                    auto projected=password_rows(Json{{"passwords",Json::array({std::move(record)})}},view,language);
-                                    if(!projected["rows"].empty())
-                                        password_delta={{"scope",view.password_scope},{"original",edit.at("original")},{"row",projected["rows"][0]}};
+                                    password_delta={{"scope",view.password_scope},{"original",edit->at("original")},
+                                        {"row",{{"value",saved_passwords.record.at("value")},{"original",password_original}}}};
                                 } else password_delta=Json();
                                 passwords_changed=true;
                             }
-                            if(section=="roots") { flags|=Roots; tasks_changed=dirs_changed=true; }
+                            if(section=="roots") flags|=Roots;
                         }
                         auto message=result["error"].get<std::string>();
                         edit_feedback["saveAck"]={{"job",p},{"ok",message.empty()},{"error",message}};
@@ -1178,14 +1174,14 @@ void Application::work() {
             };
             read(Config,"sunpack_config.json",last_config,config_read,[&](const std::string& text){
                 auto value=parse_json(text); if(!value.is_object()) throw std::runtime_error("configObjectRequired");
-                config=std::move(value); config_changed=dirs_changed=true;
+                config=std::move(value); config_changed=true;
             });
             read(Passwords,"builtin_passwords.json",last_passwords,passwords_read,[&](const std::string& text){
-                auto value=parse_json(text); validate_passwords(value); passwords=std::move(value); passwords_changed=dirs_changed=true;
+                auto value=parse_json(text); validate_passwords(value); passwords=std::move(value); passwords_changed=true;
             });
-            if(flags&Roots) {
-                read(Roots,"sunpack_watch_roots.txt",last_roots,roots_read,[&](const std::string& text){roots=parse_roots(text,dir); tasks_changed=dirs_changed=true;});
-            }
+            read(Roots,"sunpack_watch_roots.txt",last_roots,roots_read,[&](const std::string& text){
+                roots=parse_roots(text,dir); tasks_changed=roots_changed=true;
+            });
             auto log_dir=log_directory(dir);
             if(!log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
                 log_watcher.reset();
@@ -1284,10 +1280,10 @@ void Application::work() {
             if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
                 if(!password_delta.is_null() && !language_changed && previous_patch.contains("passwords"))
                     patch["passwordDelta"]=std::move(password_delta);
-                else patch["passwords"]=password_rows(passwords,view,language);
+                else patch["passwords"]=password_rows(passwords,view);
             }
             if(config_changed || language_changed || !previous_patch.contains("fields")) patch["fields"]=config_fields(config,last_config,language);
-            if(dirs_changed || !previous_patch.contains("directories")) patch["directories"]=directory_rows(roots,config);
+            if(roots_changed || !previous_patch.contains("directories")) patch["directories"]=directory_rows(roots);
             if(flags&Startup || !previous_patch.contains("startup")) {
                 try { auto state=read_startup(); patch["startup"]={{"enabled",state.enabled},{"command",state.command}}; errors.erase("startup"); }
                 catch(const std::exception& e){errors["startup"]=e.what();}

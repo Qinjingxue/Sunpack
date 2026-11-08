@@ -1928,7 +1928,7 @@ private:
             bool present = false;
         };
         JobExecution(sunpack::sevenzip::NativeMemoryManager &manager, const WorkerRequest &request) : memory(manager) {
-            std::unordered_set<std::wstring> seen;
+            std::unordered_set<std::wstring_view> seen;
             const auto remember = [&](const std::wstring &path) {
                 if (path.empty() || !seen.insert(path).second) return;
                 InputStamp stamp;
@@ -2350,14 +2350,14 @@ private:
                 print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + json_escape(job_id) +
                     "\",\"event\":\"memory_reclaimed\",\"required_bytes\":" + std::to_string(memory_job.required) + "}");
                 auto parked = std::make_shared<Job>(std::move(job));
-                const auto notice = [parked](bool blocked, const sunpack::sevenzip::NativeMemoryStatus &status, std::uint64_t needed) {
+                const auto notice = [parked](bool blocked, std::int64_t headroom, std::uint64_t needed) {
                     auto &episode = parked->execution->memory_episode;
                     if (blocked) ++episode;
                     print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + parked->metadata.escaped_job_id +
                         "\",\"event\":\"" + (blocked ? "memory_blocked" : "memory_resumed") +
                         "\",\"episode_id\":" + std::to_string(episode) +
                         ",\"required_bytes\":" + std::to_string(needed) +
-                        ",\"available_bytes\":" + std::to_string(status.available) + "}");
+                        ",\"available_bytes\":" + std::to_string((std::max)(headroom, std::int64_t{0})) + "}");
                 };
                 {
                     std::lock_guard<std::mutex> lock(mutex_);

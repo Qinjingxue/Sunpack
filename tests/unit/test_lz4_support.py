@@ -273,9 +273,9 @@ def test_prefix_carrier_is_a_strict_subrange_at_zero(fixtures, tmp_path):
     task = make_archive_task(path, format_hint="lz4")
     report = ArchiveInputPlanningStage({}).plan_task(task)
     assert len(report.extractable_segments) == 1
-    evidence, segment = report.extractable_segments[0]
+    _, segment = report.extractable_segments[0]
     assert segment.start_offset == 0 and segment.end_offset == path.stat().st_size - 29
-    descriptor = ArchiveInputPlanningStage({})._archive_input_for_segment(task, evidence, segment)
+    descriptor = task.inputs[0].descriptor
     assert descriptor.open_mode == "file_range"
     result = worker(descriptor, tmp_path / "prefix")
     assert result["status"] == "ok"

@@ -648,15 +648,14 @@ class _PipeRequestProtocol(asyncio.Protocol):
         exit_code: int | None = None
         started_at = time.monotonic()
         try:
-            control = (payload.get("argv") or [""])[0] == "--cancel-watch-batch"
-            if host is not None and not payload.get("shutdown") and not control:
+            command = (payload.get("argv") or ("",))[0]
+            if host is not None and not payload.get("shutdown") and command != "--cancel-watch-batch":
                 await host.foreground_started()
                 foreground_active = True
-                argv = list(payload.get("argv") or [])
                 host.log_event(
                     "foreground_request_started",
                     origin="foreground",
-                    command=str(argv[0] if argv else ""),
+                    command=str(command),
                     queue_ms=max(0.0, (started_at - self._connected_at) * 1000.0),
                 )
             await self.send_frame(_STREAM_MAGIC + _runtime_binary_build_id())

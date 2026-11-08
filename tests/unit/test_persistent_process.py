@@ -1357,7 +1357,7 @@ def test_persistent_runtime_concurrent_first_requests_share_worker_and_outputs(t
             assert worker.is_alive()
             output = str(tmp_path / "shared")
             reserved = [
-                engine._services.output_reservations.reserve(output, str(index), set())
+                engine._services.output_reservations.reserve(output, str(index))
                 for index, engine in enumerate(engines)
             ]
             assert reserved == [output, str(tmp_path / "shared(1)")]

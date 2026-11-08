@@ -829,13 +829,13 @@ int wmain(int argc,wchar_t** argv) {
         }
         report["task_display_cache_bytes"]=0; // No resident all-history model.
         measure("model_password_rows",[&]{
-            ensure(password_rows(backend_passwords,backend_view,"en").value("total",0)==options.passwords,"password projection count");
+            ensure(password_rows(backend_passwords,backend_view).value("total",0)==options.passwords,"password projection count");
         });
         measure("model_config_fields",[&]{
             ensure(config_fields(backend_config,backend_config_text,"en").size()==report["config_field_count"].get<size_t>(),"config projection count");
         });
         measure("model_directory_rows",[&]{
-            ensure(directory_rows(backend_roots,backend_config).size()==options.roots+1,"directory projection count");
+            ensure(directory_rows(backend_roots).size()==options.roots+1,"directory projection count");
         });
         report.update(summarize());
         fs::remove_all(dir);

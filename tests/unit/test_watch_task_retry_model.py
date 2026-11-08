@@ -532,7 +532,6 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
         watcher.root_entries[scheduler_module.path_key(str(ordinary_root))] = WatchRootEntry(
             str(ordinary_root), str(output), False,
         )
-        watcher.output_roots[scheduler_module.path_key(str(ordinary_root))] = str(output)
         outer = root / "outer.bin"
         ordinary = ordinary_root / "ordinary.bin"
         inner = root / "inner.bin"

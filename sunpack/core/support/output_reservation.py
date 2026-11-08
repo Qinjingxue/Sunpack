@@ -26,7 +26,7 @@ class OutputReservationRegistry:
         self._allocator = OutputPathAllocator()
         self.watch_outputs = None
 
-    def reserve(self, default_path: str, owner: str, local_reserved: set[str], *, reuse_existing: bool = False,
+    def reserve(self, default_path: str, owner: str, *, reuse_existing: bool = False,
                 input_path: str = "") -> str:
         input_key = resolved_path_key(input_path) if input_path else ""
         with self._lock:
@@ -47,20 +47,19 @@ class OutputReservationRegistry:
                 tail = os.path.relpath(key, ancestor)
                 base = self._ancestor_spelling(path, tail)
                 suffix = os.path.relpath(path, base)
-                base = self._allocator.next_available(base, self._reserved, local_reserved, is_directory=True)
+                base = self._allocator.next_available(base, self._reserved)
                 path = os.path.join(base, suffix)
                 physical_parent = resolved_path_key(os.path.dirname(path) or os.curdir)
                 break
             if not reuse_existing:
                 path = self._allocator.next_available(
-                    path, self._reserved, local_reserved, is_directory=True, physical_parent=physical_parent,
+                    path, self._reserved, physical_parent=physical_parent,
                 )
                 key = os.path.join(physical_parent, case_key(os.path.basename(path)))
-            if reuse_existing and (key in self._reserved or key in local_reserved):
+            if reuse_existing and key in self._reserved:
                 raise FileExistsError(f"output directory is already reserved: {path}")
             self._reserved.paths[key] = owner
             self._owner_paths.setdefault(owner, set()).add(key)
-            local_reserved.add(key)
             return path
 
     @staticmethod
@@ -95,7 +94,7 @@ class OutputReservationRegistry:
     def clear_idle_cache(self) -> dict[str, int | bool]:
         """Drop search history only when no request owns a reservation."""
         with self._lock:
-            if self._reserved.paths or self._owner_paths:
+            if self._owner_paths:
                 return {"skipped": True}
             return self._allocator.clear_cache()
 
@@ -110,13 +109,12 @@ def build_output_dir_resolver(
 ) -> Callable[[ArchiveTask], str]:
     """Resolve one collision-free output path for every task in a batch."""
     resolved_dirs: dict[int, str] = {}
-    reserved: set[str] = set()
     reservation_registry = reservation_registry or OutputReservationRegistry()
     for task in tasks:
         continued_dir = task.runtime.get("retry_output_dir")
         default_dir = continued_dir or default_output_dir_for_task(task)
         resolved_dirs[id(task)] = reservation_registry.reserve(
-            default_dir, owner, reserved, reuse_existing=bool(continued_dir),
+            default_dir, owner, reuse_existing=bool(continued_dir),
             input_path=task.main_path if nested else "",
         )
     return lambda task: resolved_dirs[id(task)]

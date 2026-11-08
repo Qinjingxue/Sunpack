@@ -73,12 +73,12 @@ def _check_hresult(result: int) -> None:
         raise OSError(f"Windows toast call failed (HRESULT 0x{result & 0xFFFFFFFF:08X})")
 
 
-@lru_cache(maxsize=None)
-def _load_library(path: str | None = None):
+@lru_cache(maxsize=1)
+def _load_library():
     # ctypes.CDLL releases the GIL during calls. Loading is deferred until watch
     # starts (or an explicit registration/activation bootstrap is requested).
     # Keep one module reference across watch reloads and late COM callbacks.
-    library = ctypes.CDLL(os.path.abspath(path or get_toast_library_path()))
+    library = ctypes.CDLL(os.path.abspath(get_toast_library_path()))
     signatures = {
         "create": [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
         "show": [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint64],
@@ -103,8 +103,8 @@ def self_test_toast() -> None:
 
 
 class _NativeToastPresenter:
-    def __init__(self, *, library_path=None, diagnostic_log_path=None):
-        self._library = _load_library(library_path)
+    def __init__(self, *, diagnostic_log_path=None):
+        self._library = _load_library()
         self._context = ctypes.c_void_p()
         executable, arguments = _activation_command()
         _check_hresult(self._library.sunpack_toast_create(
@@ -173,9 +173,8 @@ def handle_toast_argv(argv: list[str]) -> int | None:
 class ToastManager:
     """Coalesce watch snapshots and own WinRT on one thread in the main process."""
 
-    def __init__(self, *, library_path=None, diagnostic_log_path=None,
+    def __init__(self, *, diagnostic_log_path=None,
                  logger=None, presenter_factory=None):
-        self._library_path = library_path
         self._diagnostic_log_path = diagnostic_log_path
         self._update_interval = 0.05
         self._logger = logger
@@ -254,7 +253,6 @@ class ToastManager:
                     if presenter is None:
                         try:
                             presenter = self._presenter_factory(
-                                library_path=self._library_path,
                                 diagnostic_log_path=self._diagnostic_log_path,
                             )
                         except Exception as exc:

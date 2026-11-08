@@ -80,8 +80,10 @@ def test_shared_runtime_uses_cli_lifecycle(monkeypatch):
     assert entrypoint.main() == 23
     assert captured == {"early": ["--help"]}
 def test_nuitka_resource_lookup_starts_at_the_executable_directory(tmp_path, monkeypatch):
+    from sunpack.core.support import process_executable
+
     executable = tmp_path / "sunpack-runtime.exe"
     monkeypatch.setattr(resources, "current_process_executable", lambda: executable.resolve())
-    monkeypatch.setattr(resources, "__compiled__", object(), raising=False)
+    monkeypatch.setattr(process_executable, "__compiled__", object(), raising=False)
 
     assert executable.parent.resolve() == resources.candidate_resource_roots()[0]

@@ -7,12 +7,11 @@ from sunpack.pipeline.discovery.detection.input_planning import (
     ArchiveInputPlanningStage, _stream_execution_analysis,
 )
 from sunpack.pipeline.verification.error_classification import classify_verification_error
-from tests.helpers.archive_tasks import make_task_from_descriptor
 
 
 def test_stream_projection_selects_the_offset_plan_without_format_dispatch():
     first, second = {"frames": 1}, {"frames": 2}
-    evidence = ArchiveFormatEvidence("other-stream", .99, "extractable", details={
+    evidence = ArchiveFormatEvidence("other-stream", "extractable", details={
         "stream_plan": first, "stream_plans": {"0": first, "42": second},
     })
     assert _stream_execution_analysis(evidence, 42) == {"stream_plan": second}
@@ -41,14 +40,17 @@ def test_range_projection_uses_the_total_logical_length(tmp_path, sizes, start, 
         volume_style="numeric_suffix" if len(paths) > 1 else "",
         parts=[ArchiveInputPart(InputExtent(path), volume_number=i + 1, canonical_name=path)
                for i, path in enumerate(paths)])
-    task = make_task_from_descriptor(descriptor)
-    stage = ArchiveInputPlanningStage()
-    segment = ArchiveSegment(start, end, .99)
-    evidence = ArchiveFormatEvidence("gzip", .99, "extractable", [segment])
-    projected = stage._archive_input_for_segment(task, evidence, segment)
+    segment = ArchiveSegment(start, end)
+    evidence = ArchiveFormatEvidence("gzip", "extractable", [segment])
+    inputs, probe = ArchiveInputPlanningStage._project_segments(descriptor, [(evidence, segment, 1)])
     if expected is None:
-        assert projected is None
+        assert not inputs
+        if end is None:
+            assert probe.open_mode == "file_range"
+            assert probe.parts[0].extent == InputExtent(paths[-1], 0, sizes[-1])
     else:
+        projected = inputs[0].descriptor
+        assert probe is projected
         assert projected.open_mode == ("concat_ranges" if len(expected) > 1 else "file_range")
         ranges = projected.extents or [part.extent for part in projected.parts]
         assert [(item.start, item.end) for item in ranges] == expected

@@ -28,7 +28,7 @@ void admission_and_recovery() {
     NativeMemoryManager manager(0, [&] {
         auto room = capacity.load();
         for (auto *job : jobs) room -= job->committed;
-        return NativeMemoryStatus{room, static_cast<std::uint64_t>((std::max)(room, std::int64_t{0})), 0};
+        return room;
     });
     NativeMemoryJob large(manager), light(manager);
     jobs = {&large, &light};
@@ -103,7 +103,7 @@ void simultaneous_scaled_machine_budgets() {
         NativeMemoryManager manager(reserve, [&] {
             std::int64_t room = budget;
             for (const auto &job : jobs) room -= job->committed;
-            return NativeMemoryStatus{room, 0, reserve};
+            return room;
         });
         for (int i = 0; i < 8; ++i) jobs.push_back(std::make_unique<NativeMemoryJob>(manager));
         for (const auto &job : jobs) manager.begin(*job);
@@ -120,6 +120,28 @@ void simultaneous_scaled_machine_budgets() {
     }
 }
 
+void batched_waiter_admission() {
+    std::atomic<std::int64_t> capacity{0};
+    NativeMemoryManager manager(0, [&] { return capacity.load(); });
+    NativeMemoryJob first(manager), second(manager);
+    first.required = second.required = 24 * MiB;
+    std::atomic<bool> cancel{false};
+    std::promise<bool> first_paused, second_paused, first_admitted, second_admitted;
+    auto first_wait = first_paused.get_future(), second_wait = second_paused.get_future();
+    auto first_result = first_admitted.get_future(), second_result = second_admitted.get_future();
+    manager.park(first, cancel, [&](bool value) { first_admitted.set_value(value); },
+        [&](bool pause, const auto &, auto) { if (pause) first_paused.set_value(true); });
+    manager.park(second, cancel, [&](bool value) { second_admitted.set_value(value); },
+        [&](bool pause, const auto &, auto) { if (pause) second_paused.set_value(true); });
+    require(ready(first_wait) && ready(second_wait), "both replay requests must be waiting");
+    capacity = 40 * MiB;
+    manager.changed();
+    require(ready(first_result), "available capacity must admit the first waiter");
+    manager.stop();
+    require(!ready(second_result), "the first reservation must leave the second waiter parked until shutdown");
+    manager.end(first);
+}
+
 // Codec tests cannot distinguish a required dictionary from an earlier,
 // optional parallel buffer. This single scenario covers both restart gates
 // and the no-growth/no-spin invariant, without loading a large real archive.
@@ -127,7 +149,7 @@ void restart_working_set() {
     std::atomic<std::int64_t> capacity{128 * MiB};
     NativeMemoryJob *active = nullptr;
     NativeMemoryManager manager(0, [&] {
-        return NativeMemoryStatus{capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0), 0, 0};
+        return capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0);
     });
     NativeMemoryJob job(manager);
     active = &job;
@@ -230,7 +252,7 @@ void sparse_replay(const std::filesystem::path &directory) {
 void disk_and_memory(const std::filesystem::path &directory, bool memory_first) {
     std::atomic<std::int64_t> capacity{64 * MiB};
     NativeMemoryJob *active = nullptr;
-    NativeMemoryManager manager(0, [&] { return NativeMemoryStatus{capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0), 0, 0}; });
+    NativeMemoryManager manager(0, [&] { return capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0); });
     NativeMemoryJob memory(manager);
     active = &memory;
     auto state = make_volume_state("memory-disk", true);
@@ -321,6 +343,7 @@ int main() {
     std::filesystem::create_directories(directory);
     admission_and_recovery();
     simultaneous_scaled_machine_budgets();
+    batched_waiter_admission();
     restart_working_set();
     sparse_replay(directory);
     disk_and_memory(directory, true);

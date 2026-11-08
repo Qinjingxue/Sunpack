@@ -48,11 +48,10 @@ class _StatePathCoordinator:
         self.next_sequence = 1
         self.segment_start: int | None = None
 
-    def seed(self, last_seq: int, *, resume_segment: int | None = None) -> int:
+    def seed(self, last_seq: int, *, resume_segment: int | None = None) -> None:
         self.next_sequence = max(self.next_sequence, int(last_seq) + 1)
         if self.segment_start is None:
             self.segment_start = resume_segment if resume_segment is not None else int(last_seq) + 1
-        return self.segment_start
 
     def reserve(self, floor: int) -> tuple[int, int]:
         seq = max(self.next_sequence, int(floor) + 1)
@@ -61,17 +60,14 @@ class _StatePathCoordinator:
             self.segment_start = seq
         return seq, self.segment_start
 
-    def rotate(self, boundary: int) -> tuple[int, int] | None:
+    def rotate(self, boundary: int) -> int | None:
         if self.next_sequence - 1 != boundary:
             return None
-        old_start = self.current_segment(boundary + 1)
-        if old_start > boundary:
+        old_start = self.segment_start
+        if old_start is None or old_start > boundary:
             return None
         self.segment_start = boundary + 1
-        return old_start, self.segment_start
-
-    def current_segment(self, fallback: int) -> int:
-        return self.segment_start if self.segment_start is not None else fallback
+        return old_start
 
 
 _STATE_PATH_COORDINATORS_GUARD = threading.Lock()
@@ -117,11 +113,6 @@ class WatchPendingWork:
     output_identities: dict[str, str] = field(default_factory=dict)
     promoted_destinations: list[str] = field(default_factory=list)
 
-    @property
-    def fingerprint(self) -> str:
-        base = f"{self.path}|{self.size}|{self.mtime:.6f}"
-        return f"{base}|{self.file_id}|{self.change_usn}"
-
 
 @dataclass
 class WatchStateEntry:
@@ -144,11 +135,6 @@ class WatchStateEntry:
         return blocker in self.failure_payload.get("blockers", ())
 
     @property
-    def fingerprint(self) -> str:
-        base = f"{self.path}|{self.size}|{self.mtime:.6f}"
-        return f"{base}|{self.file_id}|{self.change_usn}"
-
-    @property
     def password_scope_dir(self) -> str:
         payload = self.failure_payload if isinstance(self.failure_payload, dict) else {}
         configured = str(payload.get("password_scope_dir") or "").strip()
@@ -157,6 +143,12 @@ class WatchStateEntry:
     @property
     def source_input_root(self) -> str:
         return str(self.failure_payload.get("source_input_root") or "")
+
+
+@dataclass(slots=True)
+class _SegmentStats:
+    records: int = 0
+    bytes: int = 0
 
 
 class WatchStateStore:
@@ -194,9 +186,7 @@ class WatchStateStore:
 
         self._checkpoint_seq = 0
         self._applied_seq = 0
-        self._active_segment_start = 1
-        self._segment_records: dict[int, int] = {}
-        self._segment_bytes: dict[int, int] = {}
+        self._segments: dict[int, _SegmentStats] = {}
         self._journal_records = 0
         self._journal_bytes = 0
         self._compaction_due = False
@@ -209,7 +199,7 @@ class WatchStateStore:
         self._snapshot_exists = False
         self._external_sequence_gap = False
         try:
-            self.load()
+            self._load()
             seed_state_stream(stream=self._writer_stream, seq=self._applied_seq)
         except BaseException:
             # A retained startup traceback must not own a native WAL stream.
@@ -236,11 +226,6 @@ class WatchStateStore:
         return int(self._native.entry_count)
 
     @property
-    def pending_work(self) -> dict[str, WatchPendingWork]:
-        """Materialized diagnostic view; production code uses the lookup methods."""
-        return {_path_key(item.path): item for item in self.pending_work_items()}
-
-    @property
     def entries(self) -> dict[str, WatchStateEntry]:
         """Materialized diagnostic view; production code uses the lookup methods."""
         return {_path_key(item.path): item for item in self.entry_items()}
@@ -249,7 +234,8 @@ class WatchStateStore:
     def journal_path(self) -> Path:
         with self._state_lock:
             self._ensure_open_locked()
-            start = self._path_coordinator.current_segment(self._active_segment_start)
+            start = self._path_coordinator.segment_start
+            assert start is not None
         return self._segment_path(start)
 
     def _segment_path(self, start_seq: int) -> Path:
@@ -290,15 +276,11 @@ class WatchStateStore:
             return None
         return value if value >= 1 else None
 
-    def load(self) -> None:
+    def _load(self) -> None:
         # A reader must see either the old snapshot plus its WAL, or the new
         # snapshot after retirement; never mix the two publication generations.
-        with self._state_lock:
-            self._ensure_open_locked()
-            coordinator = self._path_coordinator
+        coordinator = self._path_coordinator
         with coordinator.checkpoint_lock, self._state_lock:
-            self._ensure_open_locked()
-            self._reset_memory_locked()
             if self.path.exists():
                 try:
                     checkpoint_seq = self._native.load_snapshot(str(self.path))
@@ -313,9 +295,7 @@ class WatchStateStore:
                 self._applied_seq = self._checkpoint_seq
 
             resume_segment = self._load_journal_segments_locked()
-            self._active_segment_start = self._path_coordinator.seed(
-                self._applied_seq, resume_segment=resume_segment,
-            )
+            coordinator.seed(self._applied_seq, resume_segment=resume_segment)
             self._update_compaction_due_locked()
             self._journal_retirement_pending = self._retire_segments_through(
                 self._checkpoint_seq,
@@ -343,10 +323,10 @@ class WatchStateStore:
             if replay.records:
                 self._applied_seq = int(replay.applied_seq)
                 expected_seq = int(replay.expected_seq)
-                self._segment_records[segment_start] = int(replay.records)
-                self._segment_bytes[segment_start] = int(replay.bytes)
-                self._journal_records += int(replay.records)
-                self._journal_bytes += int(replay.bytes)
+                stats = _SegmentStats(int(replay.records), int(replay.bytes))
+                self._segments[segment_start] = stats
+                self._journal_records += stats.records
+                self._journal_bytes += stats.bytes
 
         # A live store has already chosen the active segment for this path.
         # On a fresh open, keep appending to the last recovered segment rather
@@ -431,8 +411,7 @@ class WatchStateStore:
             with self._checkpoint_condition:
                 self._closed = True
                 self._native.reset()
-                self._segment_records.clear()
-                self._segment_bytes.clear()
+                self._segments.clear()
                 self._retirement_callback = None
                 self._path_coordinator = None
                 self._checkpoint_condition.notify_all()
@@ -483,20 +462,6 @@ class WatchStateStore:
         """Apply operations that intentionally bypass the WAL."""
         self._ensure_open_locked()
         self._native.apply(self._native.decode_operations(operations))
-
-    def _reset_memory_locked(self) -> None:
-        self._native.reset()
-        self._checkpoint_seq = 0
-        self._applied_seq = 0
-        self._active_segment_start = 1
-        self._segment_records = {}
-        self._segment_bytes = {}
-        self._journal_records = 0
-        self._journal_bytes = 0
-        self._compaction_due = False
-        self._journal_retirement_pending = False
-        self._snapshot_exists = False
-        self._external_sequence_gap = False
 
     def _capture_snapshot_locked(self):
         # Records are immutable and shared, so the native view copies only the
@@ -608,20 +573,15 @@ class WatchStateStore:
                     return
                 boundary = self._applied_seq
                 view = self._capture_snapshot_locked()
-                rotation = self._path_coordinator.rotate(boundary)
-                if rotation is not None:
-                    old_start, new_start = rotation
-                    self._active_segment_start = new_start
+                old_start = self._path_coordinator.rotate(boundary)
+                if old_start is not None:
                     seal_ticket = submit_segment_seal(
                         stream=self._writer_stream,
                         old_path=str(self._segment_path(old_start)),
-                        new_path=str(self._segment_path(new_start)),
                         old_start=old_start,
                         boundary=boundary,
                         on_error=self._on_journal_error,
                     )
-                else:
-                    self._active_segment_start = self._path_coordinator.current_segment(boundary + 1)
                 self._checkpoint_requested = False
 
             error: BaseException | None = None
@@ -643,14 +603,10 @@ class WatchStateStore:
                     self._journal_retirement_pending = retirement_pending
                     self._snapshot_exists = True
                     self._checkpoint_seq = max(self._checkpoint_seq, boundary)
-                    retired_record_starts = [
-                        start for start in self._segment_records if start <= boundary
-                    ]
-                    for start in retired_record_starts:
-                        self._journal_records -= self._segment_records.pop(start, 0)
-                        self._journal_bytes -= self._segment_bytes.pop(start, 0)
-                    self._journal_records = max(0, self._journal_records)
-                    self._journal_bytes = max(0, self._journal_bytes)
+                    for start in [start for start in self._segments if start <= boundary]:
+                        stats = self._segments.pop(start)
+                        self._journal_records -= stats.records
+                        self._journal_bytes -= stats.bytes
                     self._checkpoint_error = None
                     self._update_compaction_due_locked()
                 else:
@@ -677,9 +633,9 @@ class WatchStateStore:
     def _protected_journal_starts_locked(self) -> set[int]:
         # A segment can start before the snapshot and still contain newer
         # records after a failed checkpoint. Replay counts protect that suffix.
-        return set(self._segment_records) | {
-            self._path_coordinator.current_segment(self._active_segment_start),
-        }
+        start = self._path_coordinator.segment_start
+        assert start is not None
+        return set(self._segments) | {start}
 
     def _retire_segments_through(self, boundary: int, *, protected_starts: set[int] | None = None) -> bool:
         pending = self._retire_snapshot_temps()
@@ -734,10 +690,12 @@ class WatchStateStore:
 
     def _on_journal_written(self, segment_start: int, byte_count: int) -> None:
         with self._state_lock:
-            self._segment_bytes[segment_start] = (
-                self._segment_bytes.get(segment_start, 0) + int(byte_count)
-            )
-            self._journal_bytes += int(byte_count)
+            stats = self._segments.get(segment_start)
+            # The native writer can seal the segment before this waiter resumes.
+            if stats is None:
+                return
+            stats.bytes += byte_count
+            self._journal_bytes += byte_count
             self._update_compaction_due_locked()
             if self._compaction_due:
                 self._request_checkpoint_locked()
@@ -819,7 +777,6 @@ class WatchStateStore:
         seq, segment_start = self._path_coordinator.reserve(previous_seq)
         if seq != previous_seq + 1:
             self._external_sequence_gap = True
-        self._active_segment_start = segment_start
         ticket = submit_state_transaction(
             stream=self._writer_stream,
             path=str(self._segment_path(segment_start)),
@@ -832,9 +789,10 @@ class WatchStateStore:
         )
         self._native.apply(decoded)
         self._applied_seq = seq
-        self._segment_records[segment_start] = (
-            self._segment_records.get(segment_start, 0) + 1
-        )
+        stats = self._segments.get(segment_start)
+        if stats is None:
+            stats = self._segments[segment_start] = _SegmentStats()
+        stats.records += 1
         self._journal_records += 1
         self._update_compaction_due_locked()
         if self._compaction_due:

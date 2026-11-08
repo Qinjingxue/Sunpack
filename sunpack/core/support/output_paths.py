@@ -3,7 +3,7 @@ import os
 import re
 from sunpack_native import output_name_component
 from collections import OrderedDict
-from collections.abc import Container, MutableSet
+from collections.abc import Container
 
 from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under, resolved_path_key, case_key
 from sunpack.core.contracts.tasks import ArchiveTask
@@ -120,9 +120,7 @@ class OutputPathAllocator:
         self,
         path: str,
         reserved: Container[str],
-        local_reserved: Container[str] = (),
         *,
-        is_directory: bool = False,
         physical_parent: str | None = None,
     ) -> str:
         candidate = os.path.normpath(path)
@@ -133,50 +131,39 @@ class OutputPathAllocator:
         if physical_parent is None:
             physical_parent = resolved_path_key(parent or os.curdir)
         key = os.path.join(physical_parent, case_key(name))
-        if key not in reserved and key not in local_reserved and not os.path.exists(candidate):
+        if key not in reserved and not os.path.exists(candidate):
             return candidate
 
-        stem, extension = (name, "") if is_directory else os.path.splitext(name)
-        match = re.fullmatch(r"(.*)\((\d+)\)", stem)
-        base_stem = stem if match is None else match.group(1)
+        match = re.fullmatch(r"(.*)\((\d+)\)", name)
+        base_name = name if match is None else match.group(1)
         start = 1 if match is None else int(match.group(2)) + 1
-        family = (os.path.join(physical_parent, case_key(base_stem + extension)), start)
+        family = (os.path.join(physical_parent, case_key(base_name)), start)
         numbers = self._numbers.get(family)
         if numbers is None:
             numbers = self._numbers[family] = _NumberedPaths(start)
             if len(self._numbers) > self._FAMILY_HISTORY_LIMIT:
                 _, evicted = self._numbers.popitem(last=False)
-                # Eviction retains actual reservations, but drops search-only
-                # references to other owners' paths.
+                # Reservations live in the caller's index. Retire all references
+                # to this search history, including its selected slots.
                 for observed_key in evicted.observed_slots:
                     slots = self._slots[observed_key]
                     slots.pop(evicted)
                     if not slots:
                         self._slots.pop(observed_key)
-                evicted.observed_slots.clear()
         else:
             self._numbers.move_to_end(family)
 
-        local_slots: list[int] = []
-        try:
-            while True:
-                index = numbers.take()
-                candidate = os.path.join(parent, f"{base_stem}({index}){extension}")
-                key = os.path.join(physical_parent, case_key(os.path.basename(candidate)))
-                # Cache shared and on-disk occupancy, but keep local exclusions
-                # available to other requests. Always check a selected slot live.
-                if key not in reserved and key in local_reserved:
-                    local_slots.append(index)
-                    continue
-                if key in reserved:
-                    self._slots.setdefault(key, {})[numbers] = index
-                    numbers.observed_slots.add(key)
-                elif not os.path.exists(candidate):
-                    self._slots.setdefault(key, {})[numbers] = index
+        while True:
+            index = numbers.take()
+            name = f"{base_name}({index})"
+            candidate = os.path.join(parent, name)
+            key = os.path.join(physical_parent, case_key(name))
+            occupied = key in reserved
+            if occupied or not os.path.exists(candidate):
+                self._slots.setdefault(key, {})[numbers] = index
+                numbers.observed_slots.add(key)
+                if not occupied:
                     return candidate
-        finally:
-            for index in local_slots:
-                numbers.release(index)
 
     def release(self, path_key: str) -> None:
         for numbers, index in self._slots.pop(path_key, {}).items():
@@ -188,11 +175,3 @@ class OutputPathAllocator:
         self._numbers.clear()
         self._slots.clear()
         return counts
-
-
-def next_available_path(path: str, reserved: MutableSet[str] | None = None) -> str:
-    """Return and optionally reserve an available browser-style alternative."""
-    candidate = OutputPathAllocator().next_available(path, reserved if reserved is not None else ())
-    if reserved is not None:
-        reserved.add(resolved_path_key(candidate))
-    return candidate

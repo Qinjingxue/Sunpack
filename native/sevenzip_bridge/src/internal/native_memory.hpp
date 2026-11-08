@@ -12,12 +12,6 @@
 
 namespace sunpack::sevenzip {
 
-struct NativeMemoryStatus {
-    std::int64_t headroom = 0; // after the worker reserve and unresident commit
-    std::uint64_t available = 0;
-    std::uint64_t reserve = 0;
-};
-
 class NativeMemoryManager;
 struct NativeMemoryJob final {
     explicit NativeMemoryJob(NativeMemoryManager &owner) : owner(owner) {}
@@ -37,8 +31,8 @@ struct NativeMemoryJob final {
 // One arbitrator per worker. No Python scheduling or per-codec memory policy.
 class NativeMemoryManager final {
 public:
-    using Query = std::function<NativeMemoryStatus()>;
-    using WaitNotice = std::function<void(bool, const NativeMemoryStatus &, std::uint64_t)>;
+    using Query = std::function<std::int64_t()>; // headroom after reserve and unresident commitment
+    using WaitNotice = std::function<void(bool, std::int64_t, std::uint64_t)>;
     static constexpr std::uint64_t small_workspace_bytes_per_credit = 16ULL << 20;
     // Fixed recovery room plus the measured small-workspace growth per CPU
     // credit. Use nominal capacity, not live credits: releasing an attempt
@@ -68,11 +62,12 @@ public:
     void *allocate(NativeMemoryJob &job, std::size_t size) noexcept;
     bool may_start_thread(NativeMemoryJob &job) noexcept;
     void released(NativeMemoryJob &job, void *address, std::size_t size) noexcept;
-    static NativeMemoryStatus query_windows(std::uint64_t reserve_bytes) noexcept;
+    static std::int64_t query_windows(std::uint64_t reserve_bytes) noexcept;
 
 private:
-    NativeMemoryStatus sample_locked(bool fresh = false);
-    void failed_locked(NativeMemoryJob &job, std::uint64_t required, const NativeMemoryStatus &status);
+    std::int64_t sample_locked(bool fresh = false);
+    std::int64_t sample_locked(bool fresh, std::uint64_t reserved);
+    void failed_locked(NativeMemoryJob &job, std::uint64_t required, std::int64_t headroom);
     void revoke_locked(NativeMemoryJob &job);
     void monitor();
     const std::uint64_t reserve_bytes_;
@@ -92,7 +87,7 @@ private:
     std::thread thread_;
     bool stopping_ = false;
     bool reclaim_requested_ = false;
-    NativeMemoryStatus cached_{};
+    std::int64_t cached_headroom_ = 0;
     ULONGLONG sampled_at_ = 0;
     std::atomic<bool> resample_{true};
 };

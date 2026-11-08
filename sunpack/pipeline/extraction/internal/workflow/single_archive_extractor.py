@@ -639,7 +639,6 @@ class SingleArchiveExtractor:
                 else segment_allocator.next_available(
                     os.path.join(out_dir, self._safe_segment_dir_name(descriptor.logical_name, position)),
                     segment_paths,
-                    is_directory=True,
                 )
             )
             segment_paths.add(resolved_path_key(segment_dir))

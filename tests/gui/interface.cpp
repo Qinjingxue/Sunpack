@@ -2903,7 +2903,7 @@ int wmain(int argc,wchar_t** argv) {
             std::string many_roots=utf8(dir.wstring())+"\n";
             for(int i=0;i<72;++i) many_roots+=utf8((dir/(L"Archive folder "+std::to_wstring(i))).wstring())+"\n";
             atomic_write(dir/"sunpack_watch_roots.txt",many_roots);
-            pump([&]{size_t count=0; for(auto& d:state(app.page(),"directories")) if(d["watch"]==true) ++count; return count==73;});
+            pump([&]{return state(app.page(),"directories").size()==73;});
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             ui_window_relayout(app.window());
             auto list_rect=rect(app,"directoryListScroll");

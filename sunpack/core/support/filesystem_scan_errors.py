@@ -19,35 +19,32 @@ class DirectoryErrorReport:
     """Bound pending raw diagnostics before their single coordinator handoff."""
 
     def __init__(self):
-        self.errors: list[tuple[str, str, str]] = []
-        self.keys: set[tuple[str, str, str]] = set()
-        self.omitted = 0
+        self._errors: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+        self._omitted = 0
 
     def extend(self, errors: Iterable[tuple[str, str, str]]) -> None:
         for error in errors:
             if error[0] == "report_omitted":
-                self.omitted += directory_error_count(error)
+                self._omitted += directory_error_count(error)
                 continue
             key = directory_error_key(error)
-            if key in self.keys:
+            if key in self._errors:
                 continue
-            if len(self.errors) < DIRECTORY_ERROR_REPORT_LIMIT:
-                self.keys.add(key)
-                self.errors.append(error)
+            if len(self._errors) < DIRECTORY_ERROR_REPORT_LIMIT:
+                self._errors[key] = error
             else:
-                self.omitted += directory_error_count(error)
+                self._omitted += directory_error_count(error)
 
     def take(self) -> list[tuple[str, str, str]]:
-        errors = self.errors
-        if self.omitted:
-            errors.append(("report_omitted", "", str(self.omitted)))
-        self.errors = []
-        self.keys.clear()
-        self.omitted = 0
+        errors = list(self._errors.values())
+        if self._omitted:
+            errors.append(("report_omitted", "", str(self._omitted)))
+        self._errors.clear()
+        self._omitted = 0
         return errors
 
     def __bool__(self) -> bool:
-        return bool(self.errors or self.omitted)
+        return bool(self._errors or self._omitted)
 
 
 def filesystem_scan_failure(error: tuple[str, str, str], language: str) -> FailureInfo:

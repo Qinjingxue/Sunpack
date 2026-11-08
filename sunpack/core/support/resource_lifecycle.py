@@ -806,16 +806,6 @@ def register_service_resource(
     )
 
 
-@contextlib.contextmanager
-def current_resource_operation() -> Iterator[None]:
-    scope = current_task_resource_scope()
-    if scope is None:
-        yield
-    else:
-        with scope.operation():
-            yield
-
-
 def resource_snapshot(
     roots: Iterable[os.PathLike[str] | str | FileIdentity] | None = None,
     *,
@@ -934,12 +924,6 @@ def _own_open_files_under(roots: Sequence[FileIdentity]) -> tuple[str, ...]:
         if any(identity.overlaps(root) for root in roots):
             matches.append(identity.path)
     return tuple(sorted(set(matches)))
-
-
-def audit_open_files(
-    roots: Iterable[os.PathLike[str] | str | FileIdentity],
-) -> tuple[str, ...]:
-    return _own_open_files_under(file_identities(roots, directories=True))
 
 
 def _begin_native_promotion(roots: Sequence[FileIdentity]) -> int | None:

@@ -705,18 +705,25 @@ std::wstring action_arguments(const Action& action) {
     return std::wstring(action.kind == ActionKind::cancel_batch ? L"cancel|" : action.kind == ActionKind::open_directory ? L"dir|" : L"log|") + hex_encode(action.target);
 }
 
+void append_actions_xml(std::wstring& xml, const std::vector<Action>& actions, bool progress) {
+    if (actions.empty()) return;
+    xml += L"<actions>";
+    for (const auto& action : actions) {
+        if (progress && action.kind != ActionKind::cancel_batch) continue;
+        xml += L"<action activationType=\"background\" content=\"";
+        xml += xml_escape(action.label);
+        xml += L"\" arguments=\"";
+        xml += action_arguments(action); // Fixed prefix and a hex-encoded target.
+        xml += L"\"/>";
+    }
+    xml += L"</actions>";
+}
+
 std::wstring progress_xml(const Snapshot& snapshot) {
     std::wstring xml = LR"(<toast launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual>)";
-    if (!snapshot.actions.empty()) {
-        xml += L"<actions>";
-        for (const auto& action : snapshot.actions) {
-            if (action.kind != ActionKind::cancel_batch) continue;
-            xml += L"<action activationType=\"background\" content=\"";
-            xml += xml_escape(action.label) + L"\" arguments=\"" + xml_escape(action_arguments(action)) + L"\"/>";
-        }
-        xml += L"</actions>";
-    }
-    return xml + L"</toast>";
+    append_actions_xml(xml, snapshot.actions, true);
+    xml += L"</toast>";
+    return xml;
 }
 
 class ToastPresenter {
@@ -809,7 +816,7 @@ private:
             if (updated == NotificationUpdateResult::Succeeded) {
                 return;
             }
-        } else if (!same_batch && !progress_tag_.empty()) {
+        } else if (!progress_tag_.empty()) {
             // A new batch arrived while an older progress notification was
             // still active. The old progress is stale and may be removed.
             clear();
@@ -852,17 +859,7 @@ private:
             xml += L"<text>" + xml_escape(snapshot.body) + L"</text>";
         }
         xml += L"</binding></visual>";
-        if (!snapshot.actions.empty()) {
-            xml += L"<actions>";
-            for (const auto& action : snapshot.actions) {
-                xml += L"<action activationType=\"background\" content=\"";
-                xml += xml_escape(action.label);
-                xml += L"\" arguments=\"";
-                xml += xml_escape(action_arguments(action));
-                xml += L"\"/>";
-            }
-            xml += L"</actions>";
-        }
+        append_actions_xml(xml, snapshot.actions, false);
         xml += L"</toast>";
         XmlDocument document;
         document.LoadXml(xml);

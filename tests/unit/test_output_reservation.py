@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import shutil
 import pytest
-from sunpack.core.support.output_paths import next_available_path
 from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 
 
@@ -19,19 +18,19 @@ def test_output_subtrees_isolate_jobs_but_allow_owned_recursion(tmp_path, child_
     owners = ("parent", "parent" if shared_request else "child")
     paths = [parent, child]
     for index in ((1, 0) if child_first else (0, 1)):
-        paths[index] = registry.reserve(paths[index], owners[index], set())
+        paths[index] = registry.reserve(paths[index], owners[index])
     roots = [Path(path) for path in paths]
     assert not roots[0].is_relative_to(roots[1]) and not roots[1].is_relative_to(roots[0])
     for root in roots:
         root.mkdir(parents=True)
         (root / "payload").write_text("kept", encoding="utf-8")
     generated = roots[0] / "inner.zip"
-    nested = registry.reserve(str(roots[0] / "inner"), owners[0], set(), input_path=str(generated))
+    nested = registry.reserve(str(roots[0] / "inner"), owners[0], input_path=str(generated))
     assert Path(nested).parent == roots[0]
-    foreign = registry.reserve(str(roots[0] / "foreign"), "foreign", set(), input_path=str(generated))
+    foreign = registry.reserve(str(roots[0] / "foreign"), "foreign", input_path=str(generated))
     assert not Path(foreign).is_relative_to(roots[0])
     with pytest.raises(FileExistsError):
-        registry.reserve(str(roots[0] / "continued"), "foreign", set(), reuse_existing=True)
+        registry.reserve(str(roots[0] / "continued"), "foreign", reuse_existing=True)
     shutil.rmtree(roots[0])
     assert (roots[1] / "payload").read_text(encoding="utf-8") == "kept"
     for owner in set((*owners, "foreign")):
@@ -58,15 +57,6 @@ def test_output_dir_resolver_disambiguates_duplicate_task_outputs(tmp_path):
 
     assert resolver(first) == str(tmp_path / "collision")
     assert resolver(second) == str(tmp_path / "collision(1)")
-
-
-def test_next_available_path_uses_browser_style_numbering(tmp_path):
-    original = tmp_path / "report.txt"
-    first = tmp_path / "report(1).txt"
-    original.touch()
-    first.touch()
-
-    assert next_available_path(str(original)) == str(tmp_path / "report(2).txt")
 
 
 def test_output_reservations_disambiguate_concurrent_requests_before_directories_exist(tmp_path):
@@ -110,31 +100,32 @@ def test_concurrent_formats_share_numbered_directory_family(tmp_path):
     for index in range(320):
         if str(index) != base_owner:
             registry.release(str(index))
-    assert registry.reserve(default, "reused", set()) == str(tmp_path / "release.v2(1)")
+    assert registry.reserve(default, "reused") == str(tmp_path / "release.v2(1)")
     registry.release("reused")
     registry.release(base_owner)
-    assert registry.reserve(default, "next", set()) == default
+    assert registry.reserve(default, "next") == default
 
 
 def test_evicted_numbering_history_preserves_active_owners_and_reuses_releases(tmp_path, monkeypatch):
     # Small same-family reservations do not exercise live references after LRU
-    # eviction. Check behavior, rather than the allocator's internal cache size.
+    # eviction. Old numbering hints must disappear even while owners stay live.
     import os
     import sunpack.core.support.output_paths as output_paths
     monkeypatch.setattr(output_paths.os.path, "exists", lambda path: os.path.basename(path) == "archive")
     registry = OutputReservationRegistry()
     base = str(tmp_path / "archive")
-    first = registry.reserve(base, "first", set())
-    second = registry.reserve(first, "second", set())
-    third = registry.reserve(base, "third", set())
+    first = registry.reserve(base, "first")
+    second = registry.reserve(first, "second")
+    third = registry.reserve(base, "third")
     assert (first, second, third) == tuple(str(tmp_path / f"archive({i})") for i in (1, 2, 3))
     for index in range(300):
-        registry.reserve(str(tmp_path / str(index) / "archive"), str(index), set())
+        registry.reserve(str(tmp_path / str(index) / "archive"), str(index))
+    assert len(registry._allocator._slots) == len(registry._allocator._numbers)
     registry.release("second")
-    assert registry.reserve(base, "reuse", set()) == second
+    assert registry.reserve(base, "reuse") == second
     registry.release("first")
     registry.release("third")
     registry.release("reuse")
     for index in range(300):
         registry.release(str(index))
-    assert registry.reserve(base, "next", set()) == first
+    assert registry.reserve(base, "next") == first

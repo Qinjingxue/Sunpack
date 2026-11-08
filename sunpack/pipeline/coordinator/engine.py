@@ -1933,7 +1933,7 @@ class _RequestRuntime:
             outputs = registry.watch_outputs
             owner = str(self.config.get("watch_owner_path") or "") if self.submission.origin == "watch" else ""
             work_path = (registry.reserve(output_dir + ".__sunpack_flatten_work__",
-                self.submission.request_id, set(), input_path=task.main_path) if registry.watch_outputs is not None else None)
+                self.submission.request_id, input_path=task.main_path) if outputs is not None else None)
             with promotion_barrier(
                 [output_dir],
                 cache_releasers=(release_archive_sessions_under_roots,),

@@ -25,7 +25,7 @@ export default {
       return rows.filter(r=>{let d=this.rootDraft(r);return r.id===this.rootCell||d.pending||d.error||!q||(d.input+' '+d.output).toLowerCase().includes(q);});
     },
     errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
-    shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
+    shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.path.toLowerCase().indexOf(q)>=0); },
     shownPasswords() {
       if(this.passwordHistory) return this.passwords.rows;
       // Keep the last snapshot mounted until its replacement arrives.
@@ -298,11 +298,11 @@ export default {
       let previous=this.rootNew.concat(this.rootRows),identities=new Map();
       for(let r of previous) if(r.original) identities.set(r.identity,r.id);
       for(let d of Object.values(this.rootDrafts)) if(d.original) identities.set(d.identity,d.id);
-      let rows=snapshot.filter(d=>d.watch).map(d=>({id:identities.get(d.id)||'root-'+(++this.rootNext),identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep,recursive:d.recursive}));
+      let rows=snapshot.map(d=>({id:identities.get(d.id)||'root-'+(++this.rootNext),identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep,recursive:d.recursive}));
       let order=new Map(previous.map((r,i)=>[r.id,i]));
       rows.sort((a,b)=>(order.has(a.id)?order.get(a.id):previous.length)-(order.has(b.id)?order.get(b.id):previous.length));
       let ids=new Set(rows.map(r=>r.id)); this.rootNew=this.rootNew.filter(r=>!ids.has(r.id)); this.rootRows=rows; this.directories=snapshot;
-      if(this.directorySelection&&!snapshot.some(d=>d.watch&&d.path===this.directorySelection)) this.selectDirectory('');
+      if(this.directorySelection&&!snapshot.some(d=>d.path===this.directorySelection)) this.selectDirectory('');
     },
     beginRoot(r,part) {
       if(this.rootCell===r.id&&this.rootPart===part) return;

@@ -379,6 +379,31 @@ def test_checkpoint_does_not_block_state_progress(tmp_path, monkeypatch):
     }
 
 
+def test_late_write_callback_does_not_recount_checkpointed_wal(tmp_path, monkeypatch):
+    state = WatchStateStore(str(tmp_path / "state.snapshot"), compact_bytes=1)
+    entered, release = Event(), Event()
+    account_written = state._on_journal_written
+
+    def paused_accounting(segment_start, byte_count):
+        entered.set()
+        assert release.wait(5)
+        account_written(segment_start, byte_count)
+
+    monkeypatch.setattr(state, "_on_journal_written", paused_accounting)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            writing = executor.submit(state.queue_active, _candidate(tmp_path / "queued.7z"))
+            try:
+                assert entered.wait(2)
+                state.save()
+            finally:
+                release.set()
+            writing.result(timeout=2)
+        assert not state.compact_if_needed()
+    finally:
+        state.close()
+
+
 def test_close_waits_for_existing_checkpoint_before_releasing_stream(tmp_path, monkeypatch):
     from sunpack.runtime.watch.journal_commit import journal_stats
 
@@ -526,7 +551,7 @@ def test_completed_work_is_not_retained_as_processed_history(tmp_path):
     state = WatchStateStore(str(state_path))
 
     state.record_attempt(str(archive), stat.st_size, stat.st_mtime, "device:inode")
-    assert state.pending_work
+    assert state.pending_work_count
     state.complete_work([str(archive)])
     state.save()
 

@@ -345,7 +345,7 @@ void roots(Fixture& f) {
     assert(path_key(L"C:/Data/")==path_key(L"c:\\data"));
     assert(!is_under(path_key(L"C:/Data2/a"),path_key(L"C:/Data")));
     for(int i=0;i<501;++i) all.entries.push_back({f.dir/std::to_wstring(i),"",false});
-    assert(directory_rows(all,Json::object()).size()==503);
+    assert(directory_rows(all).size()==503);
 }
 void batch_editing(Fixture& fixture) {
     auto dir=fixture.dir/"batch"; fs::create_directory(dir);

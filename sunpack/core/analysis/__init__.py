@@ -17,7 +17,6 @@ from sunpack.core.analysis.result import (
     ArchiveFormatEvidence,
     ArchiveSegment,
 )
-from sunpack.core.analysis.volume_anchor import VolumeAnchorEvidence, VolumeEvidenceIndex, probe_volume_anchor_paths
 
 __all__ = [
     "AnalysisStatus",
@@ -33,7 +32,4 @@ __all__ = [
     "FileAnalysisSource",
     "MultiVolumeAnalysisSource",
     "analysis_source",
-    "VolumeAnchorEvidence",
-    "VolumeEvidenceIndex",
-    "probe_volume_anchor_paths",
 ]

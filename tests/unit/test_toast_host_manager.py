@@ -227,7 +227,7 @@ def test_native_wrapper_passes_snapshot_and_closes_once(monkeypatch):
             calls.append(('destroy', context.value))
             return 0
 
-    monkeypatch.setattr(module, '_load_library', lambda _path: Library())
+    monkeypatch.setattr(module, '_load_library', Library)
     monkeypatch.setattr(module, '_activation_command', lambda: ('main.exe', '--toast-activated'))
     presenter = module._NativeToastPresenter(diagnostic_log_path='events.jsonl')
     presenter.show(b'a\0b', 7)

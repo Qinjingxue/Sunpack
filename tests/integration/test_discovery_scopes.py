@@ -656,7 +656,7 @@ def test_reserved_output_rejects_external_directory_before_registration(tmp_path
     registry = OutputReservationRegistry()
     registry.watch_outputs = outputs
     try:
-        output = Path(registry.reserve(str(root / "result"), "request", set()))
+        output = Path(registry.reserve(str(root / "result"), "request"))
         # An external process wins the filesystem race after memory reservation.
         output.mkdir()
         sentinel = output / "external.txt"

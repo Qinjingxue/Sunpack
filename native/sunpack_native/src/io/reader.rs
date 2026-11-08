@@ -3,7 +3,7 @@ use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::resource_lifecycle::TrackedFile;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -160,9 +160,6 @@ pub(crate) trait ByteSource: Send + Sync {
             .then(|| CachedSlice::from_vec(data))
             .into_iter()
             .collect())
-    }
-    fn prefetch(&self, _ranges: &[(u64, usize)]) -> io::Result<()> {
-        Ok(())
     }
     fn read_direct_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         self.read_at(offset, len)
@@ -650,15 +647,6 @@ impl ManagedReader {
         }
     }
 
-    /// Warms every fixed block touched by the supplied ranges. Overlapping
-    /// ranges are coalesced by the source before physical I/O.
-    pub(crate) fn prefetch(&self, ranges: &[(u64, usize)]) -> io::Result<()> {
-        if !self.shared_blocks {
-            return Ok(());
-        }
-        self.source.prefetch(ranges)
-    }
-
     pub(crate) fn stats(&self) -> io::Result<ReaderStats> {
         let mut stats = self.lock_inner()?.stats;
         stats.read_bytes = stats
@@ -799,12 +787,6 @@ impl NativeArchiveSession {
         self.ensure_open()?;
         let data = self.reader.read_cached_at(offset, len)?;
         Ok(PyBytes::new(py, data.as_slice()))
-    }
-
-    fn prefetch(&self, ranges: Vec<(u64, usize)>) -> PyResult<()> {
-        self.ensure_open()?;
-        self.reader.prefetch(&ranges)?;
-        Ok(())
     }
 
     #[pyo3(signature = (cache_bytes=67108864))]
@@ -1294,24 +1276,6 @@ impl ByteSource for FileSource {
         Ok(slices)
     }
 
-    fn prefetch(&self, ranges: &[(u64, usize)]) -> io::Result<()> {
-        self.ensure_open()?;
-        let mut blocks = BTreeSet::new();
-        for &(offset, len) in ranges {
-            if offset >= self.len() || len == 0 {
-                continue;
-            }
-            let len = len.min((self.len() - offset) as usize);
-            if len > MAX_CACHEABLE_READ_BYTES {
-                continue;
-            }
-            let first = offset / BLOCK_SIZE as u64;
-            let last = (offset + len as u64 - 1) / BLOCK_SIZE as u64;
-            blocks.extend(first..=last);
-        }
-        manager().prefetch_blocks(self, blocks.into_iter().collect())
-    }
-
     fn read_direct_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         self.ensure_open()?;
         if offset >= self.len() || len == 0 {
@@ -1479,30 +1443,6 @@ impl ByteSource for MultiVolumeSource {
         Ok(slices)
     }
 
-    fn prefetch(&self, ranges: &[(u64, usize)]) -> io::Result<()> {
-        let mut mapped: BTreeMap<usize, Vec<(u64, usize)>> = BTreeMap::new();
-        for &(offset, len) in ranges {
-            let end = offset.saturating_add(len as u64).min(self.len);
-            for index in self.overlapping(offset, end) {
-                let volume = &self.volumes[index];
-                let start = offset.max(volume.start);
-                let end = end.min(volume.end);
-                if start < end {
-                    // Keep per-volume batching and physical order without scanning
-                    // unrelated volumes or issuing empty prefetch calls.
-                    mapped
-                        .entry(index)
-                        .or_default()
-                        .push((start - volume.start, (end - start) as usize));
-                }
-            }
-        }
-        for (index, ranges) in mapped {
-            self.volumes[index].source.prefetch(&ranges)?;
-        }
-        Ok(())
-    }
-
     fn read_direct_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let len = len.min(self.len.saturating_sub(offset) as usize);
         let mut output = crate::io::resource_error::zeroed_bytes(len)?;
@@ -1539,18 +1479,40 @@ struct CacheEntry {
     generation: u64,
 }
 
+// At least an entry, a lookup key and a queue record remain resident even
+// when a small file or a truncated read contributes no payload bytes.
+const CACHE_BLOCK_METADATA_BYTES: usize =
+    size_of::<CacheEntry>() + size_of::<BlockKey>() + size_of::<(BlockKey, u64)>();
+
+struct CacheQueue {
+    order: VecDeque<(BlockKey, u64)>,
+    bytes: usize,
+    stale: usize,
+    capacity: usize,
+}
+
+impl CacheQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            bytes: 0,
+            stale: 0,
+            capacity,
+        }
+    }
+
+    fn over_budget(&self) -> bool {
+        let blocks = self.order.len() - self.stale;
+        self.bytes + blocks * CACHE_BLOCK_METADATA_BYTES > self.capacity
+    }
+}
+
 struct CacheShard {
     entries: HashMap<BlockKey, CacheEntry>,
     by_identity: HashMap<FileIdentity, HashSet<u64>>,
-    hot_order: VecDeque<(BlockKey, u64)>,
-    general_order: VecDeque<(BlockKey, u64)>,
-    hot_size: usize,
-    general_size: usize,
-    hot_stale: usize,
-    general_stale: usize,
+    hot: CacheQueue,
+    general: CacheQueue,
     generation: u64,
-    hot_capacity: usize,
-    general_capacity: usize,
 }
 
 struct HandleEntry {
@@ -1586,22 +1548,63 @@ struct ManagerMetrics {
 }
 
 impl CacheShard {
+    fn new(hot_capacity: usize, general_capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_identity: HashMap::new(),
+            hot: CacheQueue::new(hot_capacity),
+            general: CacheQueue::new(general_capacity),
+            generation: 0,
+        }
+    }
+
+    fn queue(&mut self, tier: CacheTier) -> &mut CacheQueue {
+        match tier {
+            CacheTier::Hot => &mut self.hot,
+            CacheTier::General => &mut self.general,
+        }
+    }
+
+    fn insert(&mut self, key: BlockKey, data: Arc<[u8]>, tier: CacheTier) -> (Arc<[u8]>, u64) {
+        if let Some(existing) = self.entries.get(&key) {
+            return (Arc::clone(&existing.data), 0);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.by_identity
+            .entry(key.identity.clone())
+            .or_default()
+            .insert(key.index);
+        self.entries.insert(
+            key.clone(),
+            CacheEntry {
+                data: Arc::clone(&data),
+                tier,
+                generation,
+            },
+        );
+        let queue = self.queue(tier);
+        queue.bytes += data.len();
+        queue.order.push_back((key, generation));
+
+        let mut evictions = 0;
+        while self.queue(tier).over_budget() {
+            let (key, generation) = self.queue(tier).order.pop_front().unwrap();
+            if self.entries.get(&key).map(|entry| entry.generation) != Some(generation) {
+                self.queue(tier).stale -= 1;
+                continue;
+            }
+            self.remove_entry(&key, false);
+            evictions += 1;
+        }
+        (data, evictions)
+    }
+
     fn remove_entry(&mut self, key: &BlockKey, leave_order_entry: bool) -> Option<CacheEntry> {
         let entry = self.entries.remove(key)?;
-        match entry.tier {
-            CacheTier::Hot => {
-                self.hot_size = self.hot_size.saturating_sub(entry.data.len());
-                if leave_order_entry {
-                    self.hot_stale += 1;
-                }
-            }
-            CacheTier::General => {
-                self.general_size = self.general_size.saturating_sub(entry.data.len());
-                if leave_order_entry {
-                    self.general_stale += 1;
-                }
-            }
-        }
+        let queue = self.queue(entry.tier);
+        queue.bytes -= entry.data.len();
+        queue.stale += usize::from(leave_order_entry);
 
         let remove_identity = if let Some(indices) = self.by_identity.get_mut(&key.identity) {
             indices.remove(&key.index);
@@ -1619,39 +1622,25 @@ impl CacheShard {
         // Cache payloads and byte counters are removed synchronously. Only
         // obsolete LRU queue keys are compacted amortized so targeted release
         // does not turn back into a full-cache scan.
-        if self.entries.is_empty() {
-            self.hot_order.clear();
-            self.general_order.clear();
-            self.hot_stale = 0;
-            self.general_stale = 0;
-        }
-        if self.hot_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
-            let entries = &self.entries;
-            let order = &mut self.hot_order;
-            order.retain(|(key, generation)| {
-                entries
-                    .get(key)
-                    .is_some_and(|entry| entry.generation == *generation)
-            });
-            self.hot_stale = 0;
-        }
-        if self.general_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
-            let entries = &self.entries;
-            let order = &mut self.general_order;
-            order.retain(|(key, generation)| {
-                entries
-                    .get(key)
-                    .is_some_and(|entry| entry.generation == *generation)
-            });
-            self.general_stale = 0;
+        for queue in [&mut self.hot, &mut self.general] {
+            if self.entries.is_empty() {
+                queue.order.clear();
+                queue.stale = 0;
+            } else if queue.stale >= CACHE_ORDER_COMPACT_STALE_MIN {
+                queue.order.retain(|(key, generation)| {
+                    self.entries
+                        .get(key)
+                        .is_some_and(|entry| entry.generation == *generation)
+                });
+                queue.stale = 0;
+            }
+            crate::collections::trim_deque(&mut queue.order);
         }
         // Targeted cleanup already runs outside the block-read hot path.
         // Release empty allocations and shrink large sparse indexes while
         // unrelated readers keep their entries and borrowed data.
         crate::collections::trim_map(&mut self.entries);
         crate::collections::trim_map(&mut self.by_identity);
-        crate::collections::trim_deque(&mut self.hot_order);
-        crate::collections::trim_deque(&mut self.general_order);
     }
 }
 
@@ -1664,18 +1653,9 @@ impl ReaderManager {
                 .lock()
                 .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
             removed_entries += shard.entries.len();
-            removed_bytes += shard.hot_size + shard.general_size;
-            let retired = (
-                std::mem::take(&mut shard.entries),
-                std::mem::take(&mut shard.by_identity),
-                std::mem::take(&mut shard.hot_order),
-                std::mem::take(&mut shard.general_order),
-            );
-            shard.hot_size = 0;
-            shard.general_size = 0;
-            shard.hot_stale = 0;
-            shard.general_stale = 0;
-            shard.generation = 0;
+            removed_bytes += shard.hot.bytes + shard.general.bytes;
+            let empty = CacheShard::new(shard.hot.capacity, shard.general.capacity);
+            let retired = std::mem::replace(&mut *shard, empty);
             drop(shard);
             drop(retired);
         }
@@ -1807,8 +1787,7 @@ impl ReaderManager {
         Ok(source)
     }
 
-    fn claim_block_load(&self, source: &FileSource, index: u64) -> io::Result<BlockLoadClaim> {
-        let key = BlockKey::new(source, index);
+    fn claim_block_load(&self, source: &FileSource, key: &BlockKey) -> io::Result<BlockLoadClaim> {
         let mut loads = source
             .block_loads
             .lock()
@@ -1817,15 +1796,15 @@ impl ReaderManager {
         // Recheck the cache while holding the load registry. A loader publishes
         // the block before removing its registry entry, so this closes the
         // cache-check/claim race without holding any lock across physical I/O.
-        if self.contains_block(&key)? {
+        if self.contains_block(key)? {
             return Ok(BlockLoadClaim::Cached);
         }
-        if let Some(load) = loads.get(&index) {
+        if let Some(load) = loads.get(&key.index) {
             return Ok(BlockLoadClaim::Waiting(Arc::clone(load)));
         }
 
         let load = Arc::new(BlockLoad::new());
-        loads.insert(index, Arc::clone(&load));
+        loads.insert(key.index, Arc::clone(&load));
         Ok(BlockLoadClaim::Owned(load))
     }
 
@@ -1854,34 +1833,6 @@ impl ReaderManager {
         Ok(())
     }
 
-    fn finish_block_loads(
-        &self,
-        source: &FileSource,
-        loads_to_finish: &[(u64, Arc<BlockLoad>)],
-    ) -> io::Result<()> {
-        let mut loads = match source.block_loads.lock() {
-            Ok(loads) => loads,
-            Err(_) => {
-                for (_, load) in loads_to_finish {
-                    load.finish();
-                }
-                return Err(io::Error::other("reader block-load lock poisoned"));
-            }
-        };
-        for (index, load) in loads_to_finish {
-            if loads
-                .get(index)
-                .is_some_and(|current| Arc::ptr_eq(current, load))
-            {
-                loads.remove(index);
-            }
-        }
-        for (_, load) in loads_to_finish {
-            load.finish();
-        }
-        Ok(())
-    }
-
     fn read_block(&self, source: &FileSource, index: u64) -> io::Result<Arc<[u8]>> {
         let key = BlockKey::new(source, index);
         let tier = cache_tier(source, index);
@@ -1891,7 +1842,7 @@ impl ReaderManager {
                 return Ok(block);
             }
 
-            match self.claim_block_load(source, index)? {
+            match self.claim_block_load(source, &key)? {
                 BlockLoadClaim::Cached => continue,
                 BlockLoadClaim::Waiting(load) => {
                     load.wait()?;
@@ -1918,93 +1869,6 @@ impl ReaderManager {
                 }
             }
         }
-    }
-
-    /// Loads adjacent missing blocks with one positional read. Batch prefetch
-    /// shares the same per-block load registry as `read_block`: this caller
-    /// claims only blocks that are not already cached or being loaded, merges
-    /// adjacent claimed blocks into range reads, and waits for overlapping
-    /// claims after its independent I/O has completed.
-    fn prefetch_blocks(&self, source: &FileSource, mut blocks: Vec<u64>) -> io::Result<()> {
-        blocks.sort_unstable();
-        blocks.dedup();
-
-        let mut owned = Vec::with_capacity(blocks.len());
-        let mut waiting = Vec::new();
-        for index in blocks {
-            match self.claim_block_load(source, index) {
-                Ok(BlockLoadClaim::Cached) => {}
-                Ok(BlockLoadClaim::Owned(load)) => owned.push((index, load)),
-                Ok(BlockLoadClaim::Waiting(load)) => waiting.push((index, load)),
-                Err(error) => {
-                    let _ = self.finish_block_loads(source, &owned);
-                    return Err(error);
-                }
-            }
-        }
-
-        let max_blocks = (MAX_CACHEABLE_READ_BYTES / BLOCK_SIZE).max(1);
-        let mut cursor = 0usize;
-        while cursor < owned.len() {
-            let range_start = cursor;
-            let start = owned[cursor].0;
-            cursor += 1;
-            while cursor < owned.len()
-                && owned[cursor].0 == owned[cursor - 1].0 + 1
-                && cursor - range_start < max_blocks
-            {
-                cursor += 1;
-            }
-            let end = owned[cursor - 1].0;
-            let offset = start * BLOCK_SIZE as u64;
-            let requested = ((end - start + 1) * BLOCK_SIZE as u64)
-                .min(source.len().saturating_sub(offset)) as usize;
-
-            let data = match source
-                .with_file(|file| read_file_at(file, offset, requested, &self.metrics))
-            {
-                Ok(data) => data,
-                Err(error) => {
-                    let _ = self.finish_block_loads(source, &owned[range_start..]);
-                    return Err(error);
-                }
-            };
-            self.metrics
-                .cache_misses
-                .fetch_add(end - start + 1, Ordering::Relaxed);
-
-            for index in start..=end {
-                let from = ((index - start) * BLOCK_SIZE as u64) as usize;
-                if from >= data.len() {
-                    break;
-                }
-                let to = (from + BLOCK_SIZE).min(data.len());
-                let key = BlockKey::new(source, index);
-                if let Err(error) =
-                    self.insert_block(key, Arc::from(&data[from..to]), cache_tier(source, index))
-                {
-                    let _ = self.finish_block_loads(source, &owned[range_start..]);
-                    return Err(error);
-                }
-            }
-
-            if let Err(error) = self.finish_block_loads(source, &owned[range_start..cursor]) {
-                let _ = self.finish_block_loads(source, &owned[cursor..]);
-                return Err(error);
-            }
-        }
-
-        for (index, load) in waiting {
-            load.wait()?;
-            let key = BlockKey::new(source, index);
-            if !self.contains_block(&key)? {
-                // The overlapping loader failed before publishing. Retry this
-                // block through the normal path so prefetch keeps its
-                // synchronous "ready on success" contract.
-                self.read_block(source, index)?;
-            }
-        }
-        Ok(())
     }
 
     fn contains_block(&self, key: &BlockKey) -> io::Result<bool> {
@@ -2040,64 +1904,13 @@ impl ReaderManager {
         let mut shard = self.cache_shards[shard_index]
             .lock()
             .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-        if let Some(existing) = shard.entries.get(&key) {
-            return Ok(Arc::clone(&existing.data));
+        let (block, evictions) = shard.insert(key, data, tier);
+        if evictions != 0 {
+            self.metrics
+                .evictions
+                .fetch_add(evictions, Ordering::Relaxed);
         }
-
-        shard.generation = shard.generation.wrapping_add(1);
-        let generation = shard.generation;
-        shard
-            .by_identity
-            .entry(key.identity.clone())
-            .or_default()
-            .insert(key.index);
-        shard.entries.insert(
-            key.clone(),
-            CacheEntry {
-                data: Arc::clone(&data),
-                tier,
-                generation,
-            },
-        );
-        match tier {
-            CacheTier::Hot => {
-                shard.hot_size += data.len();
-                shard.hot_order.push_back((key, generation));
-                while shard.hot_size > shard.hot_capacity {
-                    let Some((old_key, old_generation)) = shard.hot_order.pop_front() else {
-                        break;
-                    };
-                    let current_generation =
-                        shard.entries.get(&old_key).map(|entry| entry.generation);
-                    if current_generation != Some(old_generation) {
-                        shard.hot_stale = shard.hot_stale.saturating_sub(1);
-                        continue;
-                    }
-                    if shard.remove_entry(&old_key, false).is_some() {
-                        self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            CacheTier::General => {
-                shard.general_size += data.len();
-                shard.general_order.push_back((key, generation));
-                while shard.general_size > shard.general_capacity {
-                    let Some((old_key, old_generation)) = shard.general_order.pop_front() else {
-                        break;
-                    };
-                    let current_generation =
-                        shard.entries.get(&old_key).map(|entry| entry.generation);
-                    if current_generation != Some(old_generation) {
-                        shard.general_stale = shard.general_stale.saturating_sub(1);
-                        continue;
-                    }
-                    if shard.remove_entry(&old_key, false).is_some() {
-                        self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-        Ok(data)
+        Ok(block)
     }
 
     fn cache_totals(&self) -> io::Result<(usize, usize, usize, usize)> {
@@ -2110,12 +1923,12 @@ impl ReaderManager {
                 .lock()
                 .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
             entries += shard.entries.len();
-            hot_bytes += shard.hot_size;
-            general_bytes += shard.general_size;
+            hot_bytes += shard.hot.bytes;
+            general_bytes += shard.general.bytes;
             capacity += shard.entries.capacity()
                 + shard.by_identity.capacity()
-                + shard.hot_order.capacity()
-                + shard.general_order.capacity();
+                + shard.hot.order.capacity()
+                + shard.general.order.capacity();
         }
         Ok((entries, hot_bytes, general_bytes, capacity))
     }
@@ -2330,21 +2143,7 @@ fn manager() -> &'static ReaderManager {
         let shard_capacity = DEFAULT_SHARED_CACHE_BYTES / CACHE_SHARDS;
         let hot_capacity = shard_capacity / HOT_CACHE_FRACTION;
         let cache_shards = (0..CACHE_SHARDS)
-            .map(|_| {
-                Mutex::new(CacheShard {
-                    entries: HashMap::new(),
-                    by_identity: HashMap::new(),
-                    hot_order: VecDeque::new(),
-                    general_order: VecDeque::new(),
-                    hot_size: 0,
-                    general_size: 0,
-                    hot_stale: 0,
-                    general_stale: 0,
-                    generation: 0,
-                    hot_capacity,
-                    general_capacity: shard_capacity - hot_capacity,
-                })
-            })
+            .map(|_| Mutex::new(CacheShard::new(hot_capacity, shard_capacity - hot_capacity)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         ReaderManager {
@@ -2582,7 +2381,7 @@ mod tests {
     #[test]
     fn independent_reads_enter_the_source_concurrently_with_and_without_request_cache() {
         // Block each source read until every reader can enter. Existing block
-        // prefetch tests do not cover serializing the ManagedReader itself.
+        // block-cache tests do not cover serializing the ManagedReader itself.
         struct ConcurrentSource {
             entered: std::sync::mpsc::Sender<u64>,
             release: Arc<(Mutex<bool>, Condvar)>,
@@ -2776,7 +2575,6 @@ mod tests {
         assert_eq!(fault.actual, 2);
         assert_eq!(fault.source_len, data.len() as u64);
         assert!(fault.possible_missing_volume());
-        probe.prefetch(&[(0, data.len())]).unwrap();
         let mut cursor = probe.cursor();
         cursor.seek(SeekFrom::Start(3)).unwrap();
         let mut bytes = [0; 4];
@@ -3063,6 +2861,29 @@ mod tests {
     }
 
     #[test]
+    fn tiny_and_empty_blocks_charge_cache_budget() {
+        // Large-payload eviction tests cannot expose unlimited empty cache
+        // entries. Mix a tiny payload with an empty block at each tier's budget.
+        let path = temp_file("managed_reader_tiny_cache", b"x");
+        let source = manager().open_file(&path).unwrap();
+        let budget = 2 * CACHE_BLOCK_METADATA_BYTES + 1;
+        let mut shard = CacheShard::new(budget, budget);
+        for (start, tier) in [(0, CacheTier::Hot), (3, CacheTier::General)] {
+            let first = BlockKey::new(&source, start);
+            let second = BlockKey::new(&source, start + 1);
+            let third = BlockKey::new(&source, start + 2);
+            assert_eq!(shard.insert(first.clone(), Arc::from([]), tier).1, 0);
+            assert_eq!(shard.insert(second.clone(), Arc::from([b'x']), tier).1, 0);
+            assert_eq!(shard.insert(third.clone(), Arc::from([]), tier).1, 1);
+            assert!(!shard.entries.contains_key(&first));
+            assert!(shard.entries.contains_key(&second));
+            assert!(shard.entries.contains_key(&third));
+            assert_eq!(shard.queue(tier).bytes, 1);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn targeted_cache_cleanup_drops_peak_allocations_and_keeps_live_borrows() {
         // Existing release tests check bytes and ownership, but cannot see a
         // sparse shard's retained allocations. Keep this local so parallel
@@ -3070,19 +2891,7 @@ mod tests {
         let path = temp_file("managed_reader_cache_peak", b"payload");
         let source = manager().open_file(&path).unwrap();
         let payload: Arc<[u8]> = Arc::from(&b"payload"[..]);
-        let mut shard = CacheShard {
-            entries: HashMap::new(),
-            by_identity: HashMap::new(),
-            hot_order: VecDeque::new(),
-            general_order: VecDeque::new(),
-            hot_size: 0,
-            general_size: 0,
-            hot_stale: 0,
-            general_stale: 0,
-            generation: 0,
-            hot_capacity: usize::MAX,
-            general_capacity: usize::MAX,
-        };
+        let mut shard = CacheShard::new(usize::MAX, usize::MAX);
         let mut keys = Vec::new();
         for generation in 1..=1024 {
             let mut key = BlockKey::new(&source, 0);
@@ -3092,27 +2901,7 @@ mod tests {
             } else {
                 CacheTier::General
             };
-            shard
-                .by_identity
-                .insert(key.identity.clone(), HashSet::from([0]));
-            shard.entries.insert(
-                key.clone(),
-                CacheEntry {
-                    data: Arc::clone(&payload),
-                    tier,
-                    generation,
-                },
-            );
-            match tier {
-                CacheTier::Hot => {
-                    shard.hot_order.push_back((key.clone(), generation));
-                    shard.hot_size += payload.len();
-                }
-                CacheTier::General => {
-                    shard.general_order.push_back((key.clone(), generation));
-                    shard.general_size += payload.len();
-                }
-            }
+            shard.insert(key.clone(), Arc::clone(&payload), tier);
             keys.push(key);
         }
         let live = keys.pop().unwrap();
@@ -3122,16 +2911,16 @@ mod tests {
         shard.compact_stale_orders();
         assert_eq!(shard.entries.len(), 1);
         assert!(shard.entries.capacity() <= 256 && shard.by_identity.capacity() <= 256);
-        assert!(shard.hot_order.capacity() <= 256 && shard.general_order.capacity() <= 256);
+        assert!(shard.hot.order.capacity() <= 256 && shard.general.order.capacity() <= 256);
         assert!(Arc::ptr_eq(&shard.entries[&live].data, &payload));
         shard.remove_entry(&live, true).unwrap();
         shard.compact_stale_orders();
-        assert_eq!(shard.hot_size + shard.general_size, 0);
+        assert_eq!(shard.hot.bytes + shard.general.bytes, 0);
         assert_eq!(
             shard.entries.capacity()
                 + shard.by_identity.capacity()
-                + shard.hot_order.capacity()
-                + shard.general_order.capacity(),
+                + shard.hot.order.capacity()
+                + shard.general.order.capacity(),
             0
         );
         assert_eq!(&*payload, b"payload");
@@ -3228,12 +3017,9 @@ mod tests {
             second.to_string_lossy().into_owned(),
             empty.to_string_lossy().into_owned(),
         ];
-        // One coarse matrix covers all read modes, zero-length volumes, clipped
-        // EOF and out-of-order prefetch. Two nonempty volumes alone miss these.
+        // One coarse matrix covers all read modes, zero-length volumes
+        // and clipped EOF. Two nonempty volumes alone miss these.
         let source = MultiVolumeSource::open(&paths).unwrap();
-        source
-            .prefetch(&[(2, 5), (0, 0), (4, 100), (1, 2), (u64::MAX, 10)])
-            .unwrap();
         for offset in 0..=7u64 {
             for length in 0..=8usize {
                 let start = (offset as usize).min(6);
@@ -3387,84 +3173,15 @@ mod tests {
     }
 
     #[test]
-    fn batch_prefetch_coalesces_adjacent_blocks_into_one_physical_read() {
-        let data = vec![0x6bu8; BLOCK_SIZE * 3];
-        let path = temp_file("managed_reader_batch_prefetch", &data);
-        let reader = ManagedReader::open(&path).unwrap();
-        let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
-
-        let ranges = [(BLOCK_SIZE as u64 - 4, 8), ((BLOCK_SIZE * 2) as u64 - 4, 8)];
-        reader.prefetch(&ranges).unwrap();
-        let many = ranges
-            .iter()
-            .map(|&(offset, len)| reader.read_at(offset, len).unwrap())
-            .collect::<Vec<_>>();
-        let after = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
-
-        assert_eq!(many, vec![vec![0x6b; 8], vec![0x6b; 8]]);
-        assert_eq!(after - before, 1);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn batch_prefetch_skips_inflight_blocks_without_blocking_independent_ranges() {
-        let data = vec![0x7cu8; BLOCK_SIZE * 3];
-        let path = temp_file("managed_reader_batch_overlap", &data);
-        let source = manager().open_file(&path).unwrap();
-
-        let blocked_load = match manager().claim_block_load(&source, 1).unwrap() {
-            BlockLoadClaim::Owned(load) => load,
-            _ => panic!("test block should be newly claimed"),
-        };
-
-        let worker_source = Arc::clone(&source);
-        let handle = std::thread::spawn(move || {
-            let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
-            worker_source.prefetch(&[(0, BLOCK_SIZE * 3)]).unwrap();
-            let after = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
-            after - before
-        });
-
-        let first_key = BlockKey::new(&source, 0);
-        let third_key = BlockKey::new(&source, 2);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let first_ready = manager().contains_block(&first_key).unwrap();
-            let third_ready = manager().contains_block(&third_key).unwrap();
-            if first_ready && third_ready {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "independent prefetch ranges were serialized behind an overlapping block"
-            );
-            std::thread::yield_now();
-        }
-
-        let offset = BLOCK_SIZE as u64;
-        let block = source
-            .with_file(|file| read_file_at(file, offset, BLOCK_SIZE, &manager().metrics))
-            .unwrap();
-        let blocked_key = BlockKey::new(&source, 1);
-        manager()
-            .insert_block(blocked_key, Arc::from(block), cache_tier(&source, 1))
-            .unwrap();
-        manager()
-            .finish_block_load(&source, 1, &blocked_load)
-            .unwrap();
-
-        assert_eq!(handle.join().unwrap(), 2);
-        assert!(source.block_loads.lock().unwrap().is_empty());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn read_block_shares_an_existing_batch_load() {
+    fn read_block_shares_an_existing_load() {
         let data = vec![0x4du8; BLOCK_SIZE];
         let path = temp_file("managed_reader_read_overlap", &data);
         let source = manager().open_file(&path).unwrap();
 
-        let load = match manager().claim_block_load(&source, 0).unwrap() {
+        let load = match manager()
+            .claim_block_load(&source, &BlockKey::new(&source, 0))
+            .unwrap()
+        {
             BlockLoadClaim::Owned(load) => load,
             _ => panic!("test block should be newly claimed"),
         };
@@ -3504,13 +3221,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_batch_prefetch_releases_claimed_blocks() {
+    fn failed_read_releases_claimed_block() {
         let data = vec![0x31u8; BLOCK_SIZE * 2];
-        let path = temp_file("managed_reader_prefetch_error_cleanup", &data);
+        let path = temp_file("managed_reader_block_error_cleanup", &data);
         let source = manager().open_file(&path).unwrap();
         source.close().unwrap();
 
-        assert!(manager().prefetch_blocks(&source, vec![0, 1]).is_err());
+        assert!(manager().read_block(&source, 0).is_err());
         assert!(source.block_loads.lock().unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);

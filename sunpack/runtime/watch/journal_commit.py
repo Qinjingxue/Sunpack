@@ -30,31 +30,22 @@ class JournalTicket:
         self._segment_start = int(segment_start)
         self._on_written = on_written
         self._on_error = on_error
-        self._written_notified = False
-        self._error_notified = False
-        self.bytes_written = 0
 
     def _notify_error(self, error: BaseException) -> None:
-        if self._error_notified:
-            return
-        self._error_notified = True
-        if self._on_error is not None:
+        callback, self._on_error = self._on_error, None
+        if callback is not None:
             try:
-                self._on_error(error)
+                callback(error)
             except BaseException:
                 pass
 
     def wait(self) -> None:
         try:
-            if self._on_written is not None and not self._written_notified:
+            if self._on_written is not None:
                 self._native_ticket.wait_written()
-                self.bytes_written = int(self._native_ticket.bytes_written)
-                self._on_written(self._segment_start, self.bytes_written)
-                self._written_notified = True
+                self._on_written(self._segment_start, self._native_ticket.bytes_written)
+                self._on_written = None
             self._native_ticket.wait()
-            if not self._written_notified:
-                self.bytes_written = int(self._native_ticket.bytes_written)
-                self._written_notified = True
         except BaseException as exc:
             self._notify_error(exc)
             raise
@@ -91,16 +82,10 @@ def submit_segment_seal(
     *,
     stream: str,
     old_path: str,
-    new_path: str,
     old_start: int,
     boundary: int,
     on_error: Callable[[BaseException], None] | None = None,
 ) -> JournalTicket:
-    # The new segment is created lazily by the writer on its first append.  The
-    # sequence coordinator already switched all future transactions to it before
-    # this fence is submitted, so there is no correctness reason to open an empty
-    # file here.
-    del new_path
     native = _native_submit_seal(
         str(stream),
         str(old_path),

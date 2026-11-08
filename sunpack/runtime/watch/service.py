@@ -215,33 +215,9 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
     return entries
 
 
-def read_watch_root_outputs(
-    path: Path | None = None,
-) -> dict[str, str]:
-    """Every watch root mapped to its one absolute output root.
-
-    Keyed by the canonical input root; roots differing only by case share one entry, so the
-    last line that names a root wins.
-    """
-    return {
-        path_key(entry.input_root): entry.output_root
-        for entry in _read_watch_root_entries(path)
-        if entry.output_root
-    }
-
-
 def read_watch_roots(path: Path | None = None) -> list[str]:
     """The watched input roots, in their own casing and file order."""
-    roots: list[str] = []
-    seen: set[str] = set()
-    for entry in _read_watch_root_entries(path):
-        input_root = entry.input_root
-        key = path_key(input_root)
-        if key in seen:
-            continue
-        seen.add(key)
-        roots.append(input_root)
-    return roots
+    return [entry.input_root for entry in _read_watch_root_entries(path)]
 
 
 def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path: Path) -> Path:
@@ -512,6 +488,9 @@ class WatchService:
                                 )
                         except Exception as exc:
                             self.log.write("scheduler_error", error=str(exc), error_type=type(exc).__name__)
+                        finally:
+                            # The next scheduler wake may be hours away.
+                            result = None
                         delay = self._scheduler_next_delay()
                         next_scheduler_run = None if delay is None else now + delay
                     sleep_seconds = None if next_scheduler_run is None else max(0.0, next_scheduler_run - now)

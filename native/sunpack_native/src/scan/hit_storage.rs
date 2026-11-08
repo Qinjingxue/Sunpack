@@ -1581,6 +1581,7 @@ impl LeafWriter {
         self.leaves.push(plan.leaf);
         self.pending.drain(..n);
     }
+    #[cfg(test)]
     fn visit(&self, mut emit: impl FnMut(PackedHit)) {
         if self.prefix {
             for i in 0..self.seen {
@@ -1870,10 +1871,8 @@ impl HitBuffer {
             part.interior(hit, self.horizon);
         }
     }
-    // The diagnostic/capture visitor reuses the native codec decoder. It does
-    // not scan bytes again or introduce another archive-analysis path.
-    #[allow(dead_code)]
-    pub(super) fn visit(&self, mut emit: impl FnMut(RawHit)) {
+    #[cfg(test)]
+    fn visit(&self, mut emit: impl FnMut(RawHit)) {
         for part in &self.parts {
             part.writer.visit(|hit| emit(hit.unpack(self.base)));
             for key in &part.pending {

@@ -1,6 +1,5 @@
 import os
 import platform
-import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -69,19 +68,12 @@ def first_existing_path(paths: list[Path]) -> Path | None:
 def candidate_resource_roots(request_cwd: str | Path | None = None) -> list[Path]:
     roots: list[Path] = []
 
-    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+    if is_packaged_process():
         roots.append(current_process_executable().parent)
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            roots.append(resolve_resource_path(Path(meipass)))
 
     module_root = resolve_resource_path(Path(__file__)).parents[3]
     invocation_root = resolve_resource_path(Path(request_cwd) if request_cwd is not None else Path.cwd())
-    roots.extend([
-        module_root,
-        invocation_root,
-        invocation_root / "sunpack-2",
-    ])
+    roots.extend((module_root, invocation_root))
 
     return dedupe_paths(roots)
 
@@ -95,10 +87,6 @@ def tool_dir_candidates() -> tuple[Path, ...]:
     if machine in {"arm64", "aarch64"}:
         return (Path("tools-arm64"), Path("tools"))
     return (Path("tools"), Path("tools-x64"))
-
-
-def find_resource_path(filename: str) -> Path | None:
-    return first_existing_path(candidate_resource_paths(filename))
 
 
 def get_resource_path(filename: str) -> Path:

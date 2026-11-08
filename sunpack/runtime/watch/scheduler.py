@@ -209,22 +209,23 @@ class WatchScheduler:
                                   if (directory := _nearest_existing_directory(root)) is not None])
         # Explicit per-root output roots are resolved here.  A missing mapping means that the
         # pipeline should use its normal default beside the archive.
-        self.output_roots = {
+        normalized_outputs = {
             path_key(os.path.abspath(str(root))): os.path.abspath(os.path.expanduser(str(output)))
             for root, output in (output_roots or {}).items()
             if str(output or "").strip()
         }
-        self._validate_output_roots()
         configured_entries = {path_key(entry.input_root): entry for entry in root_entries or ()}
-        self.root_entries = {
-            path_key(root): WatchRootEntry(
+        self.root_entries = {}
+        for root in self.watch_roots:
+            key = path_key(root)
+            configured = configured_entries.get(key)
+            self.root_entries[key] = WatchRootEntry(
                 root,
-                self.output_roots.get(path_key(root)),
-                configured_entries[path_key(root)].deep_detect if path_key(root) in configured_entries else False,
-                recursive=configured_entries[path_key(root)].recursive if path_key(root) in configured_entries else False,
+                normalized_outputs.get(key),
+                configured.deep_detect if configured is not None else False,
+                recursive=configured.recursive if configured is not None else False,
             )
-            for root in self.watch_roots
-        }
+        self._validate_output_roots()
         self._scan_options = DirectoryScanner.compile_scan_options(config)
         from sunpack.core.config.detection_view import discovery_run_config
         self._deep_scan_options = (DirectoryScanner.compile_scan_options(
@@ -327,9 +328,9 @@ class WatchScheduler:
 
     def _validate_output_roots(self) -> None:
         resolved = [
-            (root, self.output_roots[path_key(root)])
-            for root in self.watch_roots
-            if path_key(root) in self.output_roots
+            (entry.input_root, entry.output_root)
+            for entry in self.root_entries.values()
+            if entry.output_root is not None
         ]
         for index, (first_root, first_output) in enumerate(resolved):
             for second_root, second_output in resolved[index + 1:]:
@@ -389,7 +390,8 @@ class WatchScheduler:
         self.log.write(
             "scheduler_started",
             roots=self.watch_roots,
-            output_roots=self.output_roots,
+            output_roots={key: entry.output_root for key, entry in self.root_entries.items()
+                          if entry.output_root is not None},
             recursive=any(entry.recursive for entry in self.root_entries.values()),
             pending=self.pending_count,
         )
@@ -2706,7 +2708,7 @@ class WatchScheduler:
         normalized = os.path.abspath(path)
         matched_root = _longest_matching_root(normalized, self.watch_roots)
         if matched_root is not None:
-            return self.output_roots.get(path_key(matched_root))
+            return self.root_entries[path_key(matched_root)].output_root
         return self._common_root_for(path)
 
     def _is_under_watched_root(self, path: str) -> bool:

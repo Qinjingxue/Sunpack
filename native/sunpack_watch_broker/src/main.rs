@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use sunpack_usn_core::protocol::{
-    Opcode, Request, Response, Status, REQUEST_BYTES, RESPONSE_BYTES,
+    Opcode, Request, Response, Status, FILE_ID_BYTES, MAX_DIRECTORY_QUERY_BYTES, REQUEST_BYTES,
+    RESPONSE_BYTES,
 };
 use sunpack_usn_core::{JournalReader, PIPE_NAME, SERVICE_NAME};
 use windows_service::{
@@ -246,31 +247,18 @@ fn serve_client(
         // A connected client may be descheduled between writes under load.
         // A clock is not evidence of disconnection; service stop and broken
         // pipes still end the pending overlapped read.
-        match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut request_bytes)? {
+        let request = match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut request_bytes)? {
             IoResult::Stopped | IoResult::Disconnected => break,
-            IoResult::Completed(size) if size == REQUEST_BYTES => {}
-            IoResult::Completed(_) => {
-                let response = Response {
-                    status: Status::InvalidRequest,
-                    ..Response::ok(0)
-                };
-                let _ =
-                    write_overlapped(pipe.raw(), stop_event, io_event.raw(), &response.encode());
-                break;
-            }
-        }
-
-        let request = match Request::decode(&request_bytes) {
-            Ok(request) => request,
-            Err(_) => {
-                let response = Response {
-                    status: Status::InvalidRequest,
-                    ..Response::ok(0)
-                };
-                let _ =
-                    write_overlapped(pipe.raw(), stop_event, io_event.raw(), &response.encode());
-                break;
-            }
+            IoResult::Completed(size) if size == REQUEST_BYTES => Request::decode(&request_bytes).ok(),
+            IoResult::Completed(_) => None,
+        };
+        let Some(request) = request else {
+            let response = Response {
+                status: Status::InvalidRequest,
+                ..Response::ok(0)
+            };
+            let _ = write_overlapped(pipe.raw(), stop_event, io_event.raw(), &response.encode());
+            break;
         };
         let release = request.opcode == Opcode::Release;
         let response = if !request_shape_is_valid(&request)
@@ -295,9 +283,8 @@ fn serve_client(
                     _ => break,
                 }
                 let length = u32::from_le_bytes(length) as usize;
-                if length < 24
-                    || length > sunpack_usn_core::protocol::MAX_DIRECTORY_QUERY_BYTES
-                    || (length - 8) % 16 != 0
+                if !(8 + FILE_ID_BYTES..=MAX_DIRECTORY_QUERY_BYTES).contains(&length)
+                    || (length - 8) % FILE_ID_BYTES != 0
                 {
                     break;
                 }
@@ -511,15 +498,12 @@ fn handle_request(
         Opcode::ReadDirectoriesChanges => {
             // serve_client validates the query frame before reading these bytes.
             let expected = u64::from_le_bytes(query[..8].try_into().unwrap());
-            let ids: Vec<[u8; 16]> = query[8..]
-                .chunks_exact(16)
-                .map(|id| id.try_into().unwrap())
-                .collect();
+            let (ids, _) = query[8..].as_chunks::<FILE_ID_BYTES>();
             journals
                 .with_reader(request.volume_guid, |journal| {
                     journal.read_directories_changes(
                         expected,
-                        &ids,
+                        ids,
                         request.previous_usn,
                         request.current_usn,
                     )

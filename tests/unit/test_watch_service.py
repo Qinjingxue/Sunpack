@@ -903,15 +903,10 @@ def test_watch_roots_file_resolves_relative_output_against_its_input_root(tmp_pa
     monkeypatch.chdir(working_dir)
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
 
-    root_outputs = service_module.read_watch_root_outputs()
-
-    assert root_outputs[service_module.path_key(str(watch_root.resolve()))] == str(
-        (watch_root / "extracted").resolve()
-    )
-    assert root_outputs[service_module.path_key(str(nested_root.resolve()))] == "D:\\Out"
-
-
-    assert root_outputs[service_module.path_key(str(working_dir.resolve()))] == str(working_dir.resolve())
+    entries = service_module.service_config_from(make_config({}))["root_entries"]
+    assert [entry.output_root for entry in entries] == [
+        str((watch_root / "extracted").resolve()), "D:\\Out", str(working_dir.resolve()),
+    ]
     assert service_module.read_watch_roots() == [str(watch_root.resolve()), str(nested_root.resolve()), str(working_dir.resolve())]
 
 
@@ -951,9 +946,8 @@ def test_input_only_line_leaves_output_unset_for_archive_folder_default(tmp_path
     roots_path.write_text(f"# comment\n\n{watch_root}\n", encoding="utf-8")
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
 
-    key = service_module.path_key(str(watch_root.resolve()))
-
-    assert service_module.read_watch_root_outputs() == {}
+    [entry] = service_module.service_config_from(make_config({}))["root_entries"]
+    assert entry.output_root is None
 
 
 @pytest.mark.parametrize("columns, enabled", [

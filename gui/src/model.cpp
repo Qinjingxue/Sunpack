@@ -41,9 +41,6 @@ std::string trim(std::string s) {
 bool contains_folded(const std::string& text, const std::wstring& folded_query) {
     return folded_query.empty() || fold_search(text).find(folded_query)!=std::wstring::npos;
 }
-bool contains(const std::string& text, const std::string& query) {
-    return query.empty() || contains_folded(text,fold_search(query));
-}
 bool absolute_windows(const std::string& value) {
     auto p = wide(value); std::replace(p.begin(), p.end(), L'/', L'\\');
     if (p.size() >= 3 && iswalpha(p[0]) && p[1] == L':' && p[2] == L'\\') return true;
@@ -602,17 +599,24 @@ fs::path task_directory(const Json& row) {
     if(exists(input.parent_path())) return input.parent_path();
     throw std::runtime_error("pathMissing");
 }
-Json password_rows(const Json& passwords,const View& v,const std::string& language) {
+Json password_rows(const Json& passwords,const View& v) {
     Json rows=Json::array();
-    if(v.password_scope=="@history") {
-        for(auto& p:passwords.value("clipboard_history",Json::array())) if(contains(p.get<std::string>(),v.password_query))
-            rows.push_back({{"id",std::to_string(rows.size())},{"value",p},{"original",""}});
-    } else {
-        const auto selected=v.password_scope=="@all"?std::wstring():scope_key(wide(v.password_scope));
-        for(auto& p:passwords.value("passwords",Json::array())) {
-            if(!password_matches_scope_key(p,selected)) continue;
-            if(!contains(p["value"].get<std::string>(),v.password_query)) continue;
-            rows.push_back({{"id",p.dump()+"#"+std::to_string(rows.size())},{"value",p["value"]},{"original",p.dump()}});
+    const bool history=v.password_scope=="@history";
+    const auto source=passwords.find(history?"clipboard_history":"passwords");
+    if(source!=passwords.end()) {
+        const auto query=fold_search(v.password_query);
+        if(history) {
+            for(const auto& p:*source) if(contains_folded(p.get_ref<const std::string&>(),query))
+                rows.push_back({{"id",std::to_string(rows.size())},{"value",p},{"original",""}});
+        } else {
+            const auto selected=v.password_scope=="@all"?std::wstring():scope_key(wide(v.password_scope));
+            for(const auto& p:*source) {
+                if(!password_matches_scope_key(p,selected)) continue;
+                const auto& value=p.at("value");
+                if(!contains_folded(value.get_ref<const std::string&>(),query)) continue;
+                // The UI assigns and preserves saved-row ids across snapshots.
+                rows.push_back({{"value",value},{"original",p.dump()}});
+            }
         }
     }
     const auto total=rows.size();
@@ -655,12 +659,12 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
     };
     walk(config,"",""); return rows;
 }
-Json directory_rows(const WatchRoots& roots,const Json&) {
+Json directory_rows(const WatchRoots& roots) {
     Json rows=Json::array();
     for(auto& r:roots.entries) {
         auto key=path_key(r.input);
         rows.push_back({{"id",utf8(key)},{"path",utf8(r.input.wstring())},{"name",utf8(r.input.filename().wstring())},
-            {"watch",true},{"output",r.output},{"effectiveOutput",r.output.empty()?utf8(r.input.wstring()):utf8(resolve_path(wide(r.output),r.input).wstring())},{"deep",r.deep},{"recursive",r.recursive}});
+            {"output",r.output},{"deep",r.deep},{"recursive",r.recursive}});
     }
     return rows;
 }
