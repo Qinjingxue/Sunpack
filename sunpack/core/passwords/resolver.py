@@ -9,6 +9,7 @@ from sunpack.core.support.archive_sessions import archive_session_scope
 
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
+from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
@@ -56,15 +57,13 @@ class PasswordResolver:
 
     def __init__(
         self,
-        password_tester,
+        password_store: PasswordStore,
         password_session: PasswordSession | None = None,
         password_scheduler: PasswordScheduler | None = None,
     ):
-        self.password_tester = password_tester
+        self.password_store = password_store
         self.password_session = password_session or PasswordSession()
-        self.password_scheduler = (
-            password_scheduler or password_tester.password_scheduler
-        )
+        self.password_scheduler = password_scheduler or PasswordScheduler.with_fast_verifiers()
 
     def resolve(
         self,
@@ -92,7 +91,7 @@ class PasswordResolver:
                 encrypted=False,
             )
 
-        has_candidates = self.password_tester.password_store.has_candidates(scope_path=scope_path)
+        has_candidates = self.password_store.has_candidates(scope_path=scope_path)
         if not has_candidates and password_state == "required":
             return PasswordResolution(
                 password=None,
@@ -137,7 +136,7 @@ class PasswordResolver:
                 encrypted=search.status == PasswordSearchStatus.FOUND,
             )
             if resolution.password:
-                self._promote_success(resolution.password)
+                self.password_store.remember_success(resolution.password)
             return resolution
         if search.extraction_candidates:
             candidate_passwords = tuple(search.extraction_candidates)
@@ -168,8 +167,7 @@ class PasswordResolver:
             resolution.fingerprint_key,
             password,
         )
-        if password:
-            self._promote_success(password)
+        self.password_store.remember_success(password)
 
     def reject_extraction_candidates(self, resolution: PasswordResolution) -> None:
         if not resolution.requires_extraction_confirmation:
@@ -194,7 +192,7 @@ class PasswordResolver:
         include_empty: bool = False,
     ) -> PasswordSearchResult:
         candidates = PasswordCandidatePipeline.from_password_store(
-            self.password_tester.password_store,
+            self.password_store,
             scope_path=scope_path,
             include_empty=include_empty,
         )
@@ -205,9 +203,6 @@ class PasswordResolver:
             fingerprint=fingerprint,
             candidates=candidates,
         ))
-
-    def _promote_success(self, password: str) -> None:
-        self.password_tester.add_recent_password(password)
 
     @staticmethod
     def _confirmation_resolution(

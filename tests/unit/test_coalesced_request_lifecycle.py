@@ -42,7 +42,7 @@ def test_coalesced_followers_keep_the_owner_result_without_owning_its_lifetime(
             monkeypatch.setattr(cancellation, 'subscribe', observe)
 
         class Runtime:
-            def __init__(self, services, submission, options, leases):
+            def __init__(self, services, submission, leases):
                 self.submission, self.leases = submission, leases
 
             async def execute_async(self, broker, cancellation):

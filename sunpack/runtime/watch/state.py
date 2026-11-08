@@ -459,10 +459,10 @@ class WatchStateStore:
         raw = self._native.entry(path)
         return WatchStateEntry(**raw) if raw is not None else None
 
-    def _apply_in_memory_locked(self, operations: list[dict[str, Any]]) -> None:
+    def _apply_in_memory_locked(self, operations: NativeWatchOperations) -> None:
         """Apply operations that intentionally bypass the WAL."""
         self._ensure_open_locked()
-        self._native.apply(self._native.decode_operations(operations))
+        self._native.apply(operations)
 
     def _capture_snapshot_locked(self):
         # Records are immutable and shared, so the native view copies only the
@@ -862,11 +862,12 @@ class WatchStateStore:
         with self._state_lock:
             if admit is not None and not admit():
                 return
-            operations = [self._queue_active_operation(
-                candidate, force=force, password_scope_dir=password_scope_dir,
-                source_input_root=source_input_root, internal_recovery=internal_recovery,
-                discovery_scope=discovery_scope, durable_owner=durable_owner,
-            )]
+            operations, _ = self._native.pending_operations(
+                [(self._pending_observation(candidate), source_input_root, discovery_scope)],
+                force=force, password_scope_dir=os.path.abspath(password_scope_dir) if password_scope_dir else "",
+                internal_recovery=internal_recovery,
+                durable_owner=durable_owner,
+            )
             if persist:
                 self._commit_operations_locked(operations, durable=durable)
             else:
@@ -875,40 +876,18 @@ class WatchStateStore:
     def queue_active_batch(self, candidates) -> None:
         """Publish one durable admission frontier before any batch task starts."""
         with self._state_lock:
-            operations = [self._queue_active_operation(
-                candidate, source_input_root=root, discovery_scope=scope,
-            ) for candidate, root, scope in candidates]
+            operations, _ = self._native.pending_operations(
+                (self._pending_observation(candidate), root, scope)
+                for candidate, root, scope in candidates
+            )
             self._commit_operations_locked(operations, durable=True)
 
-    def _queue_active_operation(
-        self, candidate, *, force=False, password_scope_dir="", source_input_root="",
-        internal_recovery=False, discovery_scope=None, durable_owner=False,
-    ) -> dict[str, Any]:
-        key = _path_key(candidate.path)
-        previous = self._pending_record(key)
-        pending = WatchPendingWork(
-            path=os.path.abspath(candidate.path),
-            size=int(candidate.size),
-            mtime=float(candidate.mtime),
-            file_id=str(getattr(candidate, "file_id", "") or ""),
-            change_usn=int(getattr(candidate, "change_usn", 0) or 0),
-            force=bool(force),
-            source_input_root=source_input_root or (previous.source_input_root if previous else ""),
-            password_scope_dir=os.path.abspath(
-                password_scope_dir
-                or (previous.password_scope_dir if previous else "")
-                or os.path.dirname(os.path.abspath(candidate.path))
-            ),
-            internal_recovery=bool(internal_recovery or (previous.internal_recovery if previous else False)),
-            discovery_scope=dict(discovery_scope or (previous.discovery_scope if previous else {})),
-            durable_owner=bool(durable_owner or (previous.durable_owner if previous else False)),
-            active_outputs=dict(previous.active_outputs if previous else {}),
-            committed_roots=list(previous.committed_roots if previous else []),
-            output_identities=dict(previous.output_identities if previous else {}),
-            completed_sources=list(previous.completed_sources if previous else []),
-            promoted_destinations=list(previous.promoted_destinations if previous else []),
+    @staticmethod
+    def _pending_observation(candidate) -> tuple[str, int, float, str, int]:
+        return (
+            os.path.abspath(candidate.path), candidate.size, candidate.mtime,
+            candidate.file_id, candidate.change_usn,
         )
-        return self._put_operation("pending_work", key, pending)
 
     def record_attempt(
         self,
@@ -923,35 +902,13 @@ class WatchStateStore:
         with self._state_lock:
             if admit is not None and not admit():
                 return
-            key = _path_key(path)
-            previous = self._pending_record(key)
-            pending = WatchPendingWork(
-                path=os.path.abspath(path),
-                size=size,
-                mtime=mtime,
-                file_id=file_id,
-                change_usn=int(change_usn),
-                force=False,
-                source_input_root=previous.source_input_root if previous else "",
-                password_scope_dir=(
-                    previous.password_scope_dir
-                    if previous
-                    else os.path.dirname(os.path.abspath(path))
-                ),
-                internal_recovery=bool(previous.internal_recovery if previous else False),
-                discovery_scope=dict(previous.discovery_scope if previous else {}),
-                durable_owner=bool(previous.durable_owner if previous else False),
-                active_outputs=dict(previous.active_outputs if previous else {}),
-                committed_roots=list(previous.committed_roots if previous else []),
-                output_identities=dict(previous.output_identities if previous else {}),
-                completed_sources=list(previous.completed_sources if previous else []),
-                promoted_destinations=list(previous.promoted_destinations if previous else []),
-            )
-            operations = [self._put_operation("pending_work", key, pending)]
-            if previous is not None and not previous.durable_owner:
-                self._apply_in_memory_locked(operations)
-            else:
+            operations, persist = self._native.pending_operations([
+                ((os.path.abspath(path), size, mtime, file_id, change_usn), "", None),
+            ])
+            if persist:
                 self._commit_operations_locked(operations)
+            else:
+                self._apply_in_memory_locked(operations)
 
     def pending_work_items(self) -> list[WatchPendingWork]:
         with self._state_lock:
@@ -1103,69 +1060,28 @@ class WatchStateStore:
             self._commit_operations_locked(operations, durable=True)
 
     def merge_watch_cursors(self, cursors: dict[str, dict[str, int]], *, durable: bool = True) -> None:
-        with self._state_lock:
-            merged = dict(self._native.watch_cursors())
-            for key, value in cursors.items():
-                if not isinstance(value, dict):
-                    continue
-                merged[str(key).lower()] = {
-                    "journal_id": int(value.get("journal_id", 0) or 0),
-                    "next_usn": int(value.get("next_usn", 0) or 0),
-                }
-            self._commit_operations_locked([
-                {"op": "set_watch_cursors", "value": merged},
-            ], durable=durable)
+        self.queue_recovery_batch((), cursors, durable=durable)
 
     def queue_recovery_batch(
         self,
         candidates: Iterable,
         cursors: dict[str, dict[str, int]],
+        *,
+        durable: bool = True,
     ) -> None:
         """Atomically cover a USN range and retain every recovered candidate."""
         with self._state_lock:
-            operations: list[dict[str, Any]] = []
-            for candidate in candidates:
-                key = _path_key(candidate.path)
-                previous = self._pending_record(key)
-                # A later checkpoint need not rewrite unchanged durable owners.
-                # The cursor's fsync also covers any preceding queued WAL writes.
-                if (previous is not None and previous.durable_owner
-                        and previous.size == int(candidate.size)
-                        and previous.mtime == float(candidate.mtime)
-                        and previous.file_id == str(getattr(candidate, "file_id", "") or "")
-                        and previous.change_usn == int(getattr(candidate, "change_usn", 0) or 0)):
-                    continue
-                pending = WatchPendingWork(
-                    path=os.path.abspath(candidate.path),
-                    size=int(candidate.size),
-                    mtime=float(candidate.mtime),
-                    file_id=str(getattr(candidate, "file_id", "") or ""),
-                    change_usn=int(getattr(candidate, "change_usn", 0) or 0),
-                    force=True,
-                    source_input_root=previous.source_input_root if previous else "",
-                    password_scope_dir=os.path.abspath(
-                        (previous.password_scope_dir if previous else "")
-                        or os.path.dirname(os.path.abspath(candidate.path))
-                    ),
-                    internal_recovery=bool(previous.internal_recovery if previous else False),
-                    discovery_scope=dict(previous.discovery_scope if previous else {}),
-                    durable_owner=True,
-                    active_outputs=dict(previous.active_outputs if previous else {}),
-                    committed_roots=list(previous.committed_roots if previous else []),
-                    output_identities=dict(previous.output_identities if previous else {}),
-                    completed_sources=list(previous.completed_sources if previous else []),
-                    promoted_destinations=list(previous.promoted_destinations if previous else []),
-                )
-                operations.append(self._put_operation("pending_work", key, pending))
-            merged = dict(self._native.watch_cursors())
-            for key, value in cursors.items():
-                if isinstance(value, dict):
-                    merged[str(key).lower()] = {
+            operations, _ = self._native.pending_operations(
+                ((self._pending_observation(candidate), "", None) for candidate in candidates),
+                force=True, durable_owner=True, cursors={
+                    str(key).lower(): {
                         "journal_id": int(value.get("journal_id", 0) or 0),
                         "next_usn": int(value.get("next_usn", 0) or 0),
                     }
-            operations.append({"op": "set_watch_cursors", "value": merged})
-            self._commit_operations_locked(operations, durable=True)
+                    for key, value in cursors.items() if isinstance(value, dict)
+                },
+            )
+            self._commit_operations_locked(operations, durable=durable)
 
     def watch_cursor(self, volume_key: str) -> dict[str, int] | None:
         with self._state_lock:

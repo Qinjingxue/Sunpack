@@ -769,7 +769,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
         monkeypatch.setattr(_AsyncNativeWorkerProcess, "_dispatch_event", observe_event)
 
         class Runtime:
-            def __init__(self, services, submission, options, leases):
+            def __init__(self, services, submission, leases):
                 self.submission, self.leases = submission, leases
 
             async def execute_async(self, broker, cancellation):
@@ -1130,8 +1130,7 @@ def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
 
 def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
-        build_worker_diagnostics,
-        compact_success_worker_diagnostics,
+        discard_worker_file_tables,
     )
 
     result = build_worker_result(
@@ -1143,10 +1142,9 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
             "inventory": [1, 1, 0, 3, 1],
         },
     )
-    diagnostics = build_worker_diagnostics(stdout="", stderr="", returncode=0, result_payload=result)
     assert "native_items" in result["diagnostics"]["output_trace"]
 
-    compact_success_worker_diagnostics(diagnostics)
+    discard_worker_file_tables(result)
 
     assert "native_items" not in result["diagnostics"]["output_trace"]
     assert "native_rows" not in result["verified_manifest"]
@@ -1527,8 +1525,10 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
         "trailing.": "dot",
         "con.txt": "device",
         "sub/NUL": "device-dir",
+        "tree/branch/leaf.txt": "nested",
     }
     with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("tree/branch/", "")
         for name, payload in entries.items():
             zf.writestr(name, payload)
     out_dir = tmp_path / "out"
@@ -1543,19 +1543,21 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert worker_result["status"] == "ok"
+    assert worker_result["verified_manifest"]["inventory"]["dir_count"] == 4
     expected_on_disk = {
         "logs/12_30.log": "stream",
         "a_b_c.txt": "wildcards",
         "trailing_": "dot",
         "_con.txt": "device",
         "sub/_NUL": "device-dir",
+        "tree/branch/leaf.txt": "nested",
     }
     written = {
         entry.name
         for entry in os.scandir(out_dir)
     } | {f"logs/{entry.name}" for entry in os.scandir(out_dir / "logs")} | {
         f"sub/{entry.name}" for entry in os.scandir(out_dir / "sub")
-    }
+    } | {f"tree/branch/{entry.name}" for entry in os.scandir(out_dir / "tree" / "branch")}
     assert set(expected_on_disk) <= written
     # Mapped names are ordinary Win32 names: plain paths can open them.
     for relative, content in expected_on_disk.items():

@@ -153,19 +153,12 @@ def worker_result_payload(completed: subprocess.CompletedProcess | None) -> dict
     return completed.worker_diagnostics["result"] if completed is not None else {}
 
 
-def compact_success_worker_diagnostics(diagnostics: dict[str, Any]) -> None:
-    """Drop transient native worker rows after the output inventory owns them."""
-    result = diagnostics.get("result", {})
-    if result.get("status") != "ok":
-        return
-    manifest = result.get("verified_manifest", {})
-    if not manifest.get("validated"):
-        return
-    inventory = manifest.get("inventory", {})
-    if not inventory.get("complete"):
-        return
-    manifest.pop("native_rows", None)
-    result.get("diagnostics", {}).get("output_trace", {}).pop("native_items", None)
+def discard_worker_file_tables(result: dict[str, Any]) -> None:
+    """Drop raw worker tables once the inventory and progress manifest are ready."""
+    if manifest := result.get("verified_manifest"):
+        manifest.pop("native_rows", None)
+    if (native := result.get("diagnostics")) and (trace := native.get("output_trace")):
+        trace.pop("native_items", None)
 
 
 def native_worker_manifest(result: dict[str, Any]) -> NativeWorkerManifest | None:
@@ -197,9 +190,7 @@ def _infer_process_failure(returncode: int | None, result: dict[str, Any], stder
             "failure_kind": "process_start",
             "message": message or "sevenzip_worker failed to start",
         }
-    if returncode in (-101, -102):
-        # Legacy negative codes are also used for actual transport failures.
-        # They do not prove a deadline expired or that the worker stalled.
+    if returncode == -101:
         return {
             "failure_stage": "worker_communication",
             "failure_kind": "process_io",

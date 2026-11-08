@@ -158,6 +158,9 @@ impl NativeDirectorySnapshot {
     }
 
     pub(crate) fn without_path_keys(&self, excluded: &HashSet<String>) -> Self {
+        if excluded.is_empty() {
+            return self.share_rows();
+        }
         self.view(
             self.rows
                 .iter()

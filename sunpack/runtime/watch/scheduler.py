@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
@@ -662,7 +662,8 @@ class WatchScheduler:
                 for pending in self._pending.values():
                     yield pending.candidate
         if cursor_updates:
-            self.state.queue_recovery_batch(candidates(), cursor_updates)
+            with closing(candidates()) as snapshot:
+                self.state.queue_recovery_batch(snapshot, cursor_updates)
         if self._catalog.error:
             self.log.write("catalog_persistence_failed", error=self._catalog.error)
         if startup or changed_paths or rebuilt:

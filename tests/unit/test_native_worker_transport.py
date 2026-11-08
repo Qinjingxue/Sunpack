@@ -527,14 +527,13 @@ def test_real_worker_large_results_are_assembled_for_interleaved_origins(many_it
         _assert_many_item_result(result)
 
 
-@pytest.mark.parametrize("returncode", [-101, -102])
-def test_legacy_negative_worker_codes_do_not_infer_timeout_or_stall(returncode):
+def test_worker_transport_failure_does_not_infer_timeout_or_stall():
     from sunpack.core.contracts.failures import FailureKind
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import attach_worker_diagnostics
     from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
 
     completed = attach_worker_diagnostics(
-        subprocess.CompletedProcess(["worker"], returncode, "", "broken worker connection")
+        subprocess.CompletedProcess(["worker"], -101, "", "broken worker connection")
     )
     assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "process_io"
     failure = classify_extract_failure(completed, completed.stderr)
@@ -565,8 +564,8 @@ def test_worker_transport_failure_detail_outweighs_legacy_code_and_archive_text(
     assert "named pipe disconnected unexpectedly" in failure.message
 
 
-@pytest.mark.parametrize("broken", [False, True])
-def test_async_close_drains_before_shutdown_and_joins_all_readers(broken):
+@pytest.mark.parametrize("outcome", ["success", "eof", "read_error"])
+def test_async_close_drains_before_shutdown_and_joins_all_readers(outcome):
     # Existing completion tests close only after jobs finish. This exercises
     # close with an active job, concurrent callers, EOF failure and pipe teardown.
     # Event gates make the ordering deterministic without timer sleeps.
@@ -607,14 +606,16 @@ def test_async_close_drains_before_shutdown_and_joins_all_readers(broken):
                             on_event=lambda event: event.get("event") == "job_finished",
                             on_error=errors.append)
         worker._stdout_task = asyncio.create_task(worker._dispatch_stdout())
-        worker._tasks = [worker._stdout_task, asyncio.create_task(tail_reader())]
+        worker._stderr_task = asyncio.create_task(tail_reader())
         closing = asyncio.create_task(worker.close())
         await asyncio.sleep(0)
         second = asyncio.create_task(worker.close())
         with pytest.raises(RuntimeError, match="closing"):
             await worker.submit('{}', "late", on_event=lambda event: False, on_error=errors.append)
         assert len(sent) == 1 and not closing.done()
-        if broken:
+        if outcome == "read_error":
+            reader.set_exception(OSError("stdout pipe failed"))
+        elif outcome == "eof":
             reader.feed_eof()
         else:
             reader.feed_data(encode_worker_frame({'type': 'native_event', 'job_id': 'active', 'event': 'job_finished'}))
@@ -627,9 +628,11 @@ def test_async_close_drains_before_shutdown_and_joins_all_readers(broken):
         assert not closing.done() and not second.done()
         reader_gate.set()
         await asyncio.wait_for(asyncio.gather(closing, second), 2)
-        assert bool(errors) == broken
-        assert not worker._jobs and not worker._tasks
-        assert sum(parse_worker_event(payload).get("worker_command") == "shutdown" for payload in sent) == (not broken)
+        assert bool(errors) == (outcome != "success")
+        if outcome == "read_error":
+            assert "stdout pipe failed" in errors[0]
+        assert not worker._jobs and worker._stdout_task is None and worker._stderr_task is None
+        assert sum(parse_worker_event(payload).get("worker_command") == "shutdown" for payload in sent) == (outcome == "success")
 
     asyncio.run(scenario())
 
@@ -648,7 +651,7 @@ def test_async_broken_pipe_above_reader_limit_reaches_process_exit():
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         worker._stdout_task = asyncio.create_task(worker._dispatch_stdout())
-        worker._tasks = [worker._stdout_task, asyncio.create_task(worker._pump_stderr())]
+        worker._stderr_task = asyncio.create_task(worker._pump_stderr())
         try:
             await asyncio.wait_for(asyncio.shield(worker._stdout_task), 3)
             assert worker.process.returncode is not None

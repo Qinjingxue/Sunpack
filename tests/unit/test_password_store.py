@@ -1,6 +1,6 @@
 import json
 from sunpack.core.passwords.internal.builtin import _parse_document
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.job import PasswordJob
@@ -121,60 +121,6 @@ def test_password_resolver_prefers_formal_password_probe_input():
     assert selected["parts"][0]["start"] == 4096
 
 
-class FakePasswordTester:
-    passwords = ["secret"]
-
-    def __init__(self):
-        self.test_without_password_calls = 0
-        self.search_calls = 0
-        self.password_store = PasswordStore.from_sources(cli_passwords=["secret", "fallback"], builtin_passwords=[])
-        self.password_scheduler = FakePasswordScheduler(self)
-
-    def add_recent_password(self, password):
-        self.password_store.remember_success(password)
-
-    def test_without_password(self, archive_path, part_paths=None):
-        self.test_without_password_calls += 1
-        return SimpleNamespace(status="no_match", message="encrypted")
-
-    def search_passwords(self, job: PasswordJob):
-        self.search_calls += 1
-        return PasswordSearchResult(password="secret", status=PasswordSearchStatus.FOUND, test_result=SimpleNamespace(returncode=0), error_text="")
-
-
-class FakeFailingPasswordTester(FakePasswordTester):
-    def test_without_password(self, archive_path, part_paths=None):
-        self.test_without_password_calls += 1
-        return SimpleNamespace(status="damaged", message="headers error")
-
-    def search_passwords(self, job: PasswordJob):
-        self.search_calls += 1
-        return PasswordSearchResult(password=None, status=PasswordSearchStatus.EXHAUSTED, test_result=SimpleNamespace(returncode=2), error_text="password rejected")
-
-
-class FakeDamagedPasswordTester(FakeFailingPasswordTester):
-    def search_passwords(self, job: PasswordJob):
-        self.search_calls += 1
-        return PasswordSearchResult(password=None, status=PasswordSearchStatus.DAMAGED, test_result=SimpleNamespace(returncode=2), error_text="headers error")
-
-
-class FakePasswordScheduler:
-    def __init__(self, tester):
-        self.tester = tester
-
-    def run(self, job: PasswordJob):
-        return self.tester.search_passwords(job)
-
-    def plan_for_extraction(self, job: PasswordJob):
-        return self.tester.search_passwords(job)
-
-    def remember_extraction_success(self, fingerprint_key, password):
-        pass
-
-    def remember_extraction_rejection(self, fingerprint_key, password):
-        pass
-
-
 class QueuePasswordScheduler:
     def __init__(self, candidate_evidence=""):
         self.planned = []
@@ -212,15 +158,13 @@ class RecordingNotRequiredFastVerifier:
 
 
 def test_password_resolver_submits_all_inconclusive_candidates_as_one_batch():
-    tester = FakePasswordTester()
-    tester.password_store = PasswordStore.from_sources(
+    store = PasswordStore.from_sources(
         cli_passwords=["user-password"],
         builtin_passwords=["builtin-password"],
     )
-    tester.passwords = tester.password_store.candidates()
     session = PasswordSession()
     scheduler = QueuePasswordScheduler(candidate_evidence="zipcrypto_header_byte")
-    resolver = PasswordResolver(tester, session, scheduler)
+    resolver = PasswordResolver(store, session, scheduler)
 
     first = resolver.resolve("large.rar", archive_key="archive-key")
 
@@ -229,24 +173,22 @@ def test_password_resolver_submits_all_inconclusive_candidates_as_one_batch():
     assert first.password == ""
     assert first.candidate_passwords == ("", "user-password", "builtin-password")
     assert first.requires_extraction_confirmation is True
-    assert tester.test_without_password_calls == 0
     assert session.get_resolved("archive-key") is None
 
     resolver.confirm_extraction(first, password="builtin-password")
 
     assert session.get_resolved("archive-key") == "builtin-password"
-    assert tester.password_store.recent_passwords == ["builtin-password"]
+    assert store.recent_passwords == ["builtin-password"]
 
 
 def test_password_resolver_routes_unknown_embedded_range_through_normal_scheduler():
-    tester = FakePasswordTester()
-    tester.password_store = PasswordStore.from_sources(
+    store = PasswordStore.from_sources(
         cli_passwords=["wrong-password"],
         builtin_passwords=[],
     )
     fast = RecordingNotRequiredFastVerifier()
     scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
-    resolver = PasswordResolver(tester, PasswordSession(), scheduler)
+    resolver = PasswordResolver(store, PasswordSession(), scheduler)
     bag = _task_with_knowledge("carrier.bin", {
         "source": {
             "password_probe_input": {
@@ -266,13 +208,8 @@ def test_password_resolver_routes_unknown_embedded_range_through_normal_schedule
 
 
 def test_password_resolver_unknown_without_candidates_skips_bounded_verifier():
-    tester = FakePasswordTester()
-    tester.password_store = PasswordStore.from_sources(
-        cli_passwords=[],
-        builtin_passwords=[],
-    )
     scheduler = QueuePasswordScheduler()
-    resolver = PasswordResolver(tester, PasswordSession(), scheduler)
+    resolver = PasswordResolver(PasswordStore(), PasswordSession(), scheduler)
     bag = _task_with_knowledge("carrier.bin", {
         "source": {
             "password_probe_input": {
@@ -295,9 +232,8 @@ def test_password_resolver_unknown_without_candidates_skips_bounded_verifier():
 
 
 def test_password_resolver_uses_active_embedded_format():
-    tester = FakePasswordTester()
     scheduler = QueuePasswordScheduler()
-    resolver = PasswordResolver(tester, PasswordSession(), scheduler)
+    resolver = PasswordResolver(PasswordStore.from_sources(cli_passwords=["secret"]), PasswordSession(), scheduler)
     bag = make_archive_task("carrier.bin", format_hint="zip")
     bag.password_probe_input = ArchiveInputDescriptor.from_dict({
         "entry_path": "carrier.bin", "open_mode": "file_range", "format_hint": "tar",
@@ -316,9 +252,8 @@ def test_password_resolver_uses_active_embedded_format():
 
 def test_password_resolver_skips_candidates_for_intrinsically_unencrypted_formats():
     for index, format_hint in enumerate(("tar", "gzip", "bzip2", "xz", "zstd")):
-        tester = FakePasswordTester()
         scheduler = QueuePasswordScheduler()
-        resolver = PasswordResolver(tester, PasswordSession(), scheduler)
+        resolver = PasswordResolver(PasswordStore.from_sources(cli_passwords=["secret"]), PasswordSession(), scheduler)
         bag = _task_with_knowledge("carrier.bin", {
             "source": {
                 "password_probe_input": {
@@ -344,16 +279,15 @@ def test_password_resolver_skips_candidates_for_intrinsically_unencrypted_format
 
 
 def test_password_resolver_uses_scoped_passwords_before_user_and_builtin():
-    tester = FakePasswordTester()
-    tester.password_store = PasswordStore.from_sources(
+    store = PasswordStore.from_sources(
         cli_passwords=["user-password"],
         clipboard_passwords=["clipboard-password"],
         builtin_passwords=["builtin-password"],
     )
     scheduler = QueuePasswordScheduler()
-    resolver = PasswordResolver(tester, PasswordSession(), scheduler)
+    resolver = PasswordResolver(store, PasswordSession(), scheduler)
 
-    tester.password_store.snapshot = _parse_document(json.dumps({"passwords": [
+    store.snapshot = _parse_document(json.dumps({"passwords": [
         {"value": "builtin-password"}, {"value": "directory-password", "scopes": ["D:/Work"]},
         {"value": "user-password", "scopes": ["D:/Work"]}
     ]}))[0]
@@ -364,13 +298,12 @@ def test_password_resolver_uses_scoped_passwords_before_user_and_builtin():
 
 
 def test_confirmed_password_is_promoted_across_already_planned_archives():
-    tester = FakePasswordTester()
-    tester.password_store = PasswordStore.from_sources(
+    store = PasswordStore.from_sources(
         cli_passwords=["wrong-a", "wrong-b", "shared-secret"],
         builtin_passwords=[],
     )
 
-    resolver = PasswordResolver(tester, PasswordSession(), QueuePasswordScheduler())
+    resolver = PasswordResolver(store, PasswordSession(), QueuePasswordScheduler())
     required = make_archive_task("sample.zip", format_hint="zip", analysis={"password_required": True})
     archive_a = resolver.resolve("first.unknown", task=required, archive_key="first")
     resolver.resolve("second.unknown", task=required, archive_key="second")
@@ -384,10 +317,9 @@ def test_confirmed_password_is_promoted_across_already_planned_archives():
 
 def test_hundreds_of_archives_reuse_confirmed_password_after_one_candidate_batch():
     passwords = [f"wrong-{index}" for index in range(499)] + ["shared-secret"]
-    tester = FakePasswordTester()
-    tester.password_store = PasswordStore.from_sources(cli_passwords=passwords, builtin_passwords=[])
+    store = PasswordStore.from_sources(cli_passwords=passwords)
 
-    resolver = PasswordResolver(tester, PasswordSession(), QueuePasswordScheduler())
+    resolver = PasswordResolver(store, PasswordSession(), QueuePasswordScheduler())
     required = make_archive_task("sample.zip", format_hint="zip", analysis={"password_required": True})
     resolution = resolver.resolve("archive-0.mixed", task=required, archive_key="archive-0")
     assert resolution.candidate_passwords == tuple(passwords)
@@ -413,21 +345,28 @@ def test_password_store_reads_structured_builtin_file(tmp_path):
 
 def test_required_password_lifecycle(subtests):
     cases = [
-        (FakePasswordTester, PasswordResolutionStatus.RESOLVED, "secret"),
-        (FakeFailingPasswordTester, PasswordResolutionStatus.CANDIDATES_EXHAUSTED, None),
-        (FakeDamagedPasswordTester, PasswordResolutionStatus.DAMAGED, None),
+        (PasswordSearchStatus.FOUND, PasswordResolutionStatus.RESOLVED, "secret"),
+        (PasswordSearchStatus.EXHAUSTED, PasswordResolutionStatus.CANDIDATES_EXHAUSTED, None),
+        (PasswordSearchStatus.DAMAGED, PasswordResolutionStatus.DAMAGED, None),
     ]
-    for tester_factory, expected_status, password in cases:
+    for search_status, expected_status, password in cases:
         with subtests.test(status=expected_status):
             task = make_archive_task("sample.zip", format_hint="zip", analysis={"password_required": True})
-            tester = tester_factory()
+            jobs = []
+
+            def plan(job):
+                jobs.append(job)
+                return PasswordSearchResult(password=password, status=search_status)
+
+            scheduler = QueuePasswordScheduler()
+            scheduler.plan_for_extraction = plan
             session = PasswordSession()
-            resolver = PasswordResolver(tester, session)
+            store = PasswordStore.from_sources(cli_passwords=["secret", "fallback"])
+            resolver = PasswordResolver(store, session, scheduler)
             result = resolver.resolve("sample.zip", task=task, archive_key="archive-key")
             assert result.password == password and result.status == expected_status
-            assert tester.test_without_password_calls == 0
-            assert tester.search_calls == 1
+            assert len(jobs) == 1
             if password is not None:
                 assert session.get_resolved("archive-key") == password
                 assert resolver.resolve("sample.zip", archive_key="archive-key").password == password
-                assert tester.search_calls == 1
+                assert len(jobs) == 1

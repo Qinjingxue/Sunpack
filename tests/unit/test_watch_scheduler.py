@@ -2743,9 +2743,7 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
         state_path=str(state_path),
     )
     stat = archive_path.stat()
-    first.state.queue_active(
-        SimpleNamespace(path=str(archive_path), size=stat.st_size, mtime=stat.st_mtime),
-    )
+    first.state.queue_active(WatchCandidate(str(archive_path), stat.st_size, stat.st_mtime))
     runs = []
 
     class FakePipelineRunner:

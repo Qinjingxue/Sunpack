@@ -127,8 +127,6 @@ def classify_extract_failure(
     if "unexpected end of archive" in err_lower or "unexpected end of data" in err_lower:
         return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "crc failed" in err_lower or "data error in encrypted file" in err_lower:
-        if is_split_archive:
-            return _failure(FailureKind.DAMAGED, "failure.damaged")
         return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "headers error" in err_lower or "data error" in err_lower:
         return _failure(FailureKind.DAMAGED, "failure.damaged")

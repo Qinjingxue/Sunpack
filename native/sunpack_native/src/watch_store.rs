@@ -260,7 +260,7 @@ impl PendingRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingRecord {
     path: String,
@@ -307,12 +307,18 @@ impl EntryRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, FromPyObject)]
 #[serde(deny_unknown_fields)]
+#[pyo3(from_item_all)]
 struct Cursor {
     journal_id: i128,
     next_usn: i128,
 }
+
+#[derive(FromPyObject)]
+struct PendingObservation(String, i64, f64, String, i64);
+
+type PendingUpdate<'py> = (PendingObservation, String, Option<Bound<'py, PyDict>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Collection {
@@ -771,6 +777,86 @@ impl NativeWatchState {
 
 #[pymethods]
 impl NativeWatchState {
+    /// Preserve output ownership while updating the input observation. The same
+    /// operations back in-memory queues, admissions and durable USN checkpoints.
+    #[pyo3(signature = (updates, *, force=false, password_scope_dir="", internal_recovery=false, durable_owner=false, cursors=None))]
+    fn pending_operations(
+        &self,
+        updates: &Bound<'_, PyAny>,
+        force: bool,
+        password_scope_dir: &str,
+        internal_recovery: bool,
+        durable_owner: bool,
+        cursors: Option<BTreeMap<String, Cursor>>,
+    ) -> PyResult<(NativeWatchOperations, bool)> {
+        let recovery_batch = cursors.is_some();
+        let mut operations = Vec::with_capacity(1);
+        let mut persist_attempt = false;
+        for update in updates.try_iter()? {
+            let (PendingObservation(path, size, mtime, file_id, change_usn), root, scope) =
+                update?.extract::<PendingUpdate<'_>>()?;
+            let key = crate::path_keys::path_key(&path);
+            let previous = {
+                let data = self.lock();
+                let previous = data.pending.get(&key);
+                // The cursor barrier also covers previously persisted observations.
+                if recovery_batch
+                    && previous.is_some_and(|record| {
+                        record.durable_owner
+                            && record.size == size
+                            && record.mtime == mtime
+                            && record.file_id == file_id
+                            && record.change_usn == change_usn
+                    })
+                {
+                    continue;
+                }
+                previous.cloned()
+            };
+            let previous = previous.as_deref();
+            persist_attempt |= previous.is_none_or(|record| record.durable_owner);
+            let mut record = previous.cloned().unwrap_or_default();
+            if !password_scope_dir.is_empty() {
+                record.password_scope_dir = password_scope_dir.to_owned();
+            } else if record.password_scope_dir.is_empty() {
+                record.password_scope_dir = Path::new(&path)
+                    .parent()
+                    .and_then(Path::to_str)
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+            if !root.is_empty() {
+                record.source_input_root = root;
+            }
+            if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
+                let Value::Object(scope) = py_to_json(scope.as_any())? else {
+                    return Err(invalid("expected a discovery scope object"));
+                };
+                record.discovery_scope = scope;
+            }
+            record.path = path;
+            record.size = size;
+            record.mtime = mtime;
+            record.file_id = file_id;
+            record.change_usn = change_usn;
+            record.force = force;
+            record.internal_recovery |= internal_recovery;
+            record.durable_owner |= durable_owner;
+            operations.push(Operation::PutPending(key, Arc::new(record)));
+        }
+        if let Some(cursors) = cursors {
+            let mut merged = self.lock().cursors.clone();
+            merged.extend(cursors);
+            operations.push(Operation::SetCursors(merged));
+        }
+        Ok((
+            NativeWatchOperations {
+                operations: Arc::new(Operations(operations)),
+            },
+            persist_attempt,
+        ))
+    }
+
     fn promotion_operation(
         &self,
         owner: &str,

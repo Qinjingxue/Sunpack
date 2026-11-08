@@ -107,7 +107,7 @@ class ExtractionExecutionTests(unittest.TestCase):
     def test_process_failures_are_terminal_without_reextraction(self):
         for returncode, stderr in (
             (8, "write error"),
-            (-102, "worker connection lost"),
+            (-101, "worker connection lost"),
             (-100, "7z process failed to start"),
         ):
             with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as tmp:
@@ -239,6 +239,8 @@ class ExtractionExecutionTests(unittest.TestCase):
             self.assertTrue(good_path.exists())
             self.assertTrue(partial_path.exists())
             self.assertFalse((out_dir / ".sunpack" / "extraction_manifest.json").exists())
+            output_trace = result.diagnostics["result"]["diagnostics"]["output_trace"]
+            self.assertNotIn("native_items", output_trace)
             manifest = result.progress_manifest_payload
             by_archive_path = {item["archive_path"]: item for item in manifest.file_page(0, 100)}
             self.assertEqual(by_archive_path["good.txt"]["status"], "complete")

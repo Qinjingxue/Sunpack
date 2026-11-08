@@ -317,9 +317,8 @@ impl NativeScanResult {
         else {
             return Ok(None);
         };
-        let facts = index.to_dict(py, self.file_size)?;
         let result = PyDict::new(py);
-        result.set_item("stream_plan", facts.get_item("stream_plan")?)?;
+        result.set_item("stream_plan", index.stream_plan(py)?)?;
         Ok(Some(result.unbind()))
     }
 
@@ -419,8 +418,7 @@ impl NativeScanResult {
                 row.set_item("eocd_offset", offset)?;
             }
             if let Some(index) = &candidate.lz4_index {
-                let facts = index.to_dict(py, self.file_size)?;
-                row.set_item("stream_plan", facts.get_item("stream_plan")?)?;
+                row.set_item("stream_plan", index.stream_plan(py)?)?;
                 row.set_item("error", index.error)?;
             }
             rows.append(row)?;

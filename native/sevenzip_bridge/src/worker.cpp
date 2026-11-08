@@ -94,7 +94,7 @@ struct WorkerArchiveInput {
     sunpack::sevenzip::VolumeAttemptPlan volume_attempts;
     std::wstring archive_path;
     std::wstring format_hint;
-    std::wstring open_mode;
+    std::string open_mode;
     std::vector<std::wstring> part_paths;
     std::vector<std::wstring> canonical_names;
     std::string analyzed_missing_volume_evidence;
@@ -190,7 +190,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
     const std::string_view entry_path = descriptor.string_field("entry_path", "");
     input.archive_path = utf8_to_wide(entry_path);
     const std::string_view mode = descriptor.string_field("open_mode", "file");
-    input.open_mode = utf8_to_wide(mode);
+    input.open_mode = mode;
     input.format_hint = utf8_to_wide(descriptor.string_field("format_hint", ""));
 
     const wire::ObjectView analysis = descriptor.object_field("analysis");
@@ -295,7 +295,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& reques
         }
         unsigned long long number = 0;
         const std::string_view canonical_name = object.string_field("canonical_name", "");
-        if (!object.uint_field("volume_number", &number) || number == 0 || canonical_name.empty()) {
+        if (!object.uint_field("volume_number", &number) || number == 0 || number > INT_MAX ||
+            canonical_name.empty()) {
             input.validation_error = "structured volume part requires volume_number and canonical_name";
             continue;
         }
@@ -575,24 +576,30 @@ std::string verified_manifest_wire(const std::string& job_id, const sunpack::sev
     unsigned int file_count = 0;
     unsigned long long total_size = 0;
     bool identity_paths = true;
-    std::unordered_set<std::wstring> directories;
+    // The writer already supplies safe relative paths with generic separators.
+    // Directory keys borrow that storage for the lifetime of this summary.
+    // A file implies all its parents, but an explicit directory only counts itself.
+    std::unordered_map<std::wstring_view, bool> directories;
     std::string row;
     row.reserve(256);
     for (const auto& item : result.output_trace.items) {
-        const std::filesystem::path output_path(item.output_path);
+        const std::wstring_view output_path(item.output_path);
         if (item.is_dir) {
-            if (!item.output_path.empty()) {
-                directories.insert(output_path.lexically_normal().generic_wstring());
-            }
+            if (!output_path.empty()) directories.try_emplace(output_path, false);
             continue;
         }
-        for (auto parent = output_path.parent_path(); !parent.empty(); parent = parent.parent_path()) {
-            directories.insert(parent.lexically_normal().generic_wstring());
+        auto parent = output_path;
+        for (auto separator = parent.rfind(L'/'); separator != std::wstring_view::npos;
+             separator = parent.rfind(L'/')) {
+            parent = parent.substr(0, separator);
+            auto& parents_counted = directories.try_emplace(parent, false).first->second;
+            if (parents_counted) break;
+            parents_counted = true;
         }
         ++file_count;
         total_size += item.bytes_written;
-        const bool identity_path =
-            std::filesystem::path(item.path).lexically_normal().generic_wstring() == output_path.lexically_normal().generic_wstring();
+        const bool identity_path = item.path == item.output_path ||
+            std::filesystem::path(item.path).lexically_normal().generic_wstring() == output_path;
         identity_paths = identity_paths && identity_path;
         row.clear();
         row += wire::array();
@@ -815,6 +822,7 @@ int run_request(
     const std::wstring& output_dir = request.output_dir;
     const std::wstring& password = request.password;
     const std::wstring& format_hint = request.archive_input.format_hint;
+    const std::string& open_mode = request.archive_input.open_mode;
     const std::wstring& codepage = request.codepage;
     const bool dry_run = request.dry_run;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
@@ -888,8 +896,6 @@ int run_request(
     auto* volume_replay = current_extraction_replay;
     WorkerArchiveInput selected_input;
     if (volume_trials) {
-        selected_input.open_mode = request.archive_input.open_mode;
-        selected_input.format_hint = request.archive_input.format_hint;
         auto& cursor = volume_replay->volumes;
         if (!cursor.started) {
             cursor.reserve(request.archive_input.volume_attempts);
@@ -909,8 +915,8 @@ int run_request(
     const auto& archive_input = volume_trials ? selected_input : request.archive_input;
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return extract_archive(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
-            archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run,
-            archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, cancel_token);
+            format_hint, selected_password, output_dir, codepage, progress, dry_run,
+            archive_input.canonical_names, open_mode == "native_volumes", shared_writer, cancel_token);
     };
 
     ExtractArchiveResult result;
@@ -999,7 +1005,7 @@ int run_request(
                 (replay && replay->candidate_output_owned);
             if (!direct_candidates) {
                 const auto probe = test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
-                    archive_input.format_hint, password_candidates.data(), password_candidates.size(), archive_input.canonical_names);
+                    format_hint, password_candidates.data(), password_candidates.size(), archive_input.canonical_names);
                 if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
                     static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
                     result = password_candidate_failure(probe, password_candidates.size());
@@ -1046,7 +1052,7 @@ int run_request(
                         !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
                         if (extraction_rejects_password(result) ||
                             test_password_batch(archive_input.archive_path, archive_input.part_paths, archive_input.ranges,
-                                archive_input.format_hint, &password_candidates[index], 1, archive_input.canonical_names).status == PasswordTestStatus::WrongPassword) {
+                                format_hint, &password_candidates[index], 1, archive_input.canonical_names).status == PasswordTestStatus::WrongPassword) {
                             result.status = PasswordTestStatus::WrongPassword;
                             result.encrypted = true;
                             result.wrong_password = true;
@@ -1217,7 +1223,7 @@ int run_request(
         wire::key("bytes_written") + wire::number(result.bytes_written) +
         volume_attempt_fields +
         wire::key("dry_run") + wire::boolean(dry_run) +
-        wire::key("open_mode") + wire::text(wide_to_utf8(archive_input.open_mode)) +
+        wire::key("open_mode") + wire::text(open_mode) +
         wire::key("archive_type") + wire::text(wide_to_utf8(result.archive_type)) +
         wire::key("requested_codepage") + wire::text(wide_to_utf8(result.requested_codepage)) +
         wire::key("applied_codepage") + wire::text(wide_to_utf8(result.applied_codepage)) +

@@ -6,8 +6,6 @@ from sunpack.runtime.cli.cli_types import CliCommandResult, CliPasswordSummary
 from sunpack.core.config.loader import apply_config_overrides
 from sunpack.core.config.schema import normalize_config_value
 from sunpack.core.config.detection_view import scan_filter_config, scan_filters_enabled
-from sunpack.core.config.cli_settings import load_cli_language_from_config
-from sunpack.core.i18n import I18nContext
 from sunpack.core.passwords import dedupe_passwords, PasswordStore, read_password_file
 from sunpack.core.passwords.internal.clipboard import read_clipboard_passwords
 from sunpack.core.passwords.internal.builtin import password_file_source
@@ -72,53 +70,11 @@ def resolve_common_root(paths: list[str]) -> str:
     return common_root or os.getcwd()
 
 
-def collect_cli_passwords(
-    args,
-    prompt_text: str | None = None,
-    input_prompt: str | None = None,
-) -> list[str]:
-    i18n = I18nContext(load_cli_language_from_config())
-    prompt_text = prompt_text or i18n.t("cli.password_prompt")
-    input_prompt = input_prompt or i18n.t("cli.password_input_prompt")
-    passwords = list(getattr(args, "password", []) or [])
-    if getattr(args, "password_file", None):
-        passwords = read_password_file(args.password_file, passwords)
-    else:
-        passwords = dedupe_passwords(passwords)
-    if getattr(args, "prompt_passwords", False):
-        passwords.extend(prompt_for_passwords(prompt_text=prompt_text, input_prompt=input_prompt))
-        return dedupe_passwords(passwords)
-    return passwords
-
-
 def collect_clipboard_passwords(config: dict | None) -> list[str]:
     password_config = config.get("passwords") if isinstance(config, dict) else {}
     if not isinstance(password_config, dict) or not bool(password_config.get("clipboard_passwords_enabled", False)):
         return []
     return read_clipboard_passwords()
-
-
-def prompt_for_passwords(
-    prompt_text: str | None = None,
-    input_prompt: str | None = None,
-) -> list[str]:
-    i18n = I18nContext(load_cli_language_from_config())
-    prompt_text = prompt_text or i18n.t("cli.password_prompt")
-    input_prompt = input_prompt or i18n.t("cli.password_input_prompt")
-    passwords = []
-    print(prompt_text, flush=True)
-    while True:
-        line = input(input_prompt)
-        # ``input()`` normally removes the line ending, but some Windows
-        # console hosts used by Explorer context-menu launches leave a bare
-        # carriage return behind.  That is still an empty submitted line, not
-        # a password.  Do not strip other whitespace: it may intentionally be
-        # part of a password.
-        line = line.rstrip("\r\n")
-        if not line:
-            break
-        passwords.append(line)
-    return dedupe_passwords(passwords)
 
 
 async def prompt_for_passwords_async(
@@ -131,6 +87,7 @@ async def prompt_for_passwords_async(
     passwords = []
     print(prompt_text, file=ctx.stdout, flush=True)
     while True:
+        # Windows console input can leave a bare CR. Preserve password spaces.
         line = (await ctx.readline(input_prompt)).rstrip("\r\n")
         if not line:
             break

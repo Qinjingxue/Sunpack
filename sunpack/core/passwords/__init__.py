@@ -1,4 +1,3 @@
-from sunpack.core.passwords.archive_tester import ArchivePasswordTester
 from sunpack.core.passwords.cache import PasswordAttemptCache
 from sunpack.core.passwords.candidates import PasswordCandidate, PasswordCandidatePipeline
 from sunpack.core.passwords.fingerprint import ArchiveFingerprint, build_archive_fingerprint
@@ -25,7 +24,6 @@ from sunpack.core.passwords.verifier import (
 
 
 __all__ = [
-    "ArchivePasswordTester",
     "ArchiveFingerprint",
     "build_archive_fingerprint",
     "DEFAULT_BUILTIN_PASSWORDS",

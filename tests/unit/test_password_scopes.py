@@ -63,8 +63,9 @@ def test_pipeline_pins_snapshot_without_reading_password_files_or_copying_tables
             snapshots = []
             user_passwords = []
             def capture(services, submission, *args):
-                snapshots.append(submission.password_store.snapshot)
-                user_passwords.append(submission.password_store.user_passwords)
+                store = submission.config["password_store"]
+                snapshots.append(store.snapshot)
+                user_passwords.append(store.user_passwords)
                 assert "password_snapshot" not in submission.config
                 runtime = factory(services, submission, *args)
                 execute = runtime.execute_async
@@ -72,7 +73,7 @@ def test_pipeline_pins_snapshot_without_reading_password_files_or_copying_tables
                     async def held(*args, **kwargs):
                         entered.set()
                         await release.wait()
-                        assert submission.password_store.snapshot is snapshot
+                        assert store.snapshot is snapshot
                         return await execute(*args, **kwargs)
                     runtime.execute_async = held
                 return runtime

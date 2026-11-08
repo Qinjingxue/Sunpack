@@ -610,29 +610,18 @@ fn seven_zip_aes_key_iv(
 
 const SEVEN_ZIP_KDF_CACHE_CAPACITY: usize = 256;
 
-#[derive(PartialEq, Eq)]
-struct SevenZipKdfCacheParameters {
+struct SevenZipKdfCacheEntry {
     cycles: u32,
     salt: Vec<u8>,
     password: Vec<u8>,
-}
-
-struct SevenZipKdfCacheEntry {
-    parameters: SevenZipKdfCacheParameters,
     key: [u8; 32],
-}
-
-impl SevenZipKdfCacheEntry {
-    fn wipe(&mut self) {
-        self.parameters.password.fill(0);
-        self.parameters.salt.fill(0);
-        self.key.fill(0);
-    }
 }
 
 impl Drop for SevenZipKdfCacheEntry {
     fn drop(&mut self) {
-        self.wipe();
+        self.password.fill(0);
+        self.salt.fill(0);
+        self.key.fill(0);
     }
 }
 
@@ -664,13 +653,8 @@ pub(crate) fn clear_seven_zip_kdf_cache() -> usize {
 
 fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
     check_password_cancellation()?;
-    if std::env::var_os("SUNPACK_DISABLE_7Z_KDF_CACHE").is_some() {
-        return derive_seven_zip_aes_key(cycles, salt, password);
-    }
     let matches = |entry: &SevenZipKdfCacheEntry| {
-        entry.parameters.cycles == cycles
-            && entry.parameters.salt.as_slice() == salt
-            && entry.parameters.password.as_slice() == password
+        entry.cycles == cycles && entry.salt == salt && entry.password == password
     };
     {
         let mut cache = seven_zip_kdf_cache()
@@ -697,12 +681,12 @@ fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result
     if cache.len() >= SEVEN_ZIP_KDF_CACHE_CAPACITY {
         cache.pop_back();
     }
-    let parameters = SevenZipKdfCacheParameters {
+    cache.push_front(SevenZipKdfCacheEntry {
         cycles,
         salt: salt.to_vec(),
         password: password.to_vec(),
-    };
-    cache.push_front(SevenZipKdfCacheEntry { parameters, key });
+        key,
+    });
     Ok(key)
 }
 

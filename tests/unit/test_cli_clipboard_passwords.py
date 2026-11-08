@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import sunpack.core.passwords.internal.clipboard as clipboard_module
@@ -41,7 +42,7 @@ def test_passwords_command_includes_config_enabled_clipboard_password(monkeypatc
         lambda *, max_chars: "\r\nfirst\n\nsecond\rfirst\r\n",
     )
 
-    code, result = passwords_command.handle(_password_args(), CliContext(language="en"))
+    code, result = asyncio.run(passwords_command.handle(_password_args(), CliContext(language="en")))
 
     assert code == 0
     assert result.summary["clipboard_password_count"] == 2

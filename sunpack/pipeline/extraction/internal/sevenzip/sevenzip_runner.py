@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import os
 import subprocess
 import time
@@ -21,7 +20,6 @@ from sunpack.core.support.output_paths import normalized_output_dir, resolve_out
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.core.support.runtime_cwd import runtime_working_directory
 
-_LOGGER = logging.getLogger(__name__)
 _WORKER_STREAM_LIMIT = 4 * 1024 * 1024
 _PIPE_BLOCK_BYTES = 64 * 1024
 
@@ -142,8 +140,8 @@ class _AsyncNativeWorkerProcess:
         self._send_lock = asyncio.Lock()
         self.queue_capacity = _NativeQueueCapacity()
         self._resubmissions: set[asyncio.Task] = set()
-        self._tasks: list[asyncio.Task] = []
         self._stdout_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
         self._closing = False
         self._shutdown_sent = False
         self._close_task: asyncio.Task | None = None
@@ -174,10 +172,7 @@ class _AsyncNativeWorkerProcess:
         assign_child_process(getattr(self.process, "pid", 0))
         self._ready = asyncio.get_running_loop().create_future()
         self._stdout_task = asyncio.create_task(self._dispatch_stdout(), name="sunpack-native-stdout")
-        self._tasks = [
-            self._stdout_task,
-            asyncio.create_task(self._pump_stderr(), name="sunpack-native-stderr"),
-        ]
+        self._stderr_task = asyncio.create_task(self._pump_stderr(), name="sunpack-native-stderr")
         try:
             # Startup is complete only after the handshake or a confirmed pipe/worker failure.
             # CPU starvation is not evidence that the worker failed.
@@ -299,7 +294,6 @@ class _AsyncNativeWorkerProcess:
             if broken or not self._shutdown_sent or self._jobs:
                 # Also abort if EOF interrupts a graceful drain.
                 await self.abort(failure)
-            self.queue_capacity.flush()
 
     async def _dispatch_event(self, payload: dict[str, Any]) -> None:
         # Chunk data stays in Rust and never reaches job callbacks.
@@ -397,7 +391,12 @@ class _AsyncNativeWorkerProcess:
             if asyncio.current_task() is self._stdout_task:
                 # A protocol error can leave StreamReader paused above its
                 # limit. Consume the dead worker's tail so wait() can see EOF.
-                while await self.process.stdout.read(_PIPE_BLOCK_BYTES):
+                try:
+                    while await self.process.stdout.read(_PIPE_BLOCK_BYTES):
+                        pass
+                except Exception:
+                    # A failed pipe has already disconnected. Its stored
+                    # read exception must not prevent settling active jobs.
                     pass
             await self.process.wait()
         self._fail_all_jobs(message)
@@ -430,9 +429,12 @@ class _AsyncNativeWorkerProcess:
             except (BrokenPipeError, ConnectionResetError):
                 pass
         # Readers own the pipe EOF and must finish, however long native teardown takes.
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        await asyncio.gather(
+            *(task for task in (self._stdout_task, self._stderr_task) if task is not None),
+            return_exceptions=True,
+        )
         self._stdout_task = None
+        self._stderr_task = None
         self.queue_capacity.flush()
         if self._resubmissions:
             await asyncio.gather(*tuple(self._resubmissions), return_exceptions=True)

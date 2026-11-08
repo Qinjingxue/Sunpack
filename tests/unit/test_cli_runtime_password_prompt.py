@@ -1,19 +1,33 @@
-from sunpack.runtime.cli.cli_runtime import prompt_for_passwords
+import asyncio
+import io
 
 
 def test_password_prompt_handles_windows_lines_and_preserves_spaces(monkeypatch, subtests):
+    from sunpack.runtime.cli import cli
+
+    monkeypatch.setattr(cli, "runtime_id_available", lambda: False)
     for terminator in ("", "\r", "\r\n"):
         with subtests.test(terminator=repr(terminator)):
             responses = iter(["secret", "crom\r", " secret ", terminator])
-            monkeypatch.setattr("builtins.input", lambda _prompt: next(responses))
-            assert prompt_for_passwords() == ["secret", "crom", " secret "]
+            stdout = io.StringIO()
+
+            async def read_request_input(_prompt):
+                return next(responses)
+
+            code = asyncio.run(cli.async_main(
+                ["passwords", "--ask-pw", "--no-builtin-pw"],
+                stdout=stdout,
+                stderr=io.StringIO(),
+                input_reader=read_request_input,
+            ))
+            assert code == 0
+            assert "['secret', 'crom', ' secret ']" in stdout.getvalue()
 
 
 def test_password_file_literals_and_async_collection(tmp_path, monkeypatch):
     # Prompt-only tests cannot find changed line semantics, lost ordering, or a
     # synchronous file load on the runtime loop. One small real-file lifecycle
     # covers these together, including a line crossing the native read buffer.
-    import asyncio
     import threading
     from types import SimpleNamespace
     import sunpack.runtime.cli.cli_runtime as runtime

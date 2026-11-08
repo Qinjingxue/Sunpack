@@ -356,8 +356,6 @@ class ResourceLease:
     def close(self) -> bool:
         return _release_resource(self._resource_id)
 
-    release = close
-
     def __enter__(self) -> "ResourceLease":
         return self
 

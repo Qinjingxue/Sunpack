@@ -492,23 +492,27 @@ pub(crate) fn resolve_embedded_volumes(
     excluded: &HashSet<String>,
     mut cache: RelationCache,
 ) -> Vec<NativeRelationGroup> {
-    let mut seen = HashSet::new();
-    if anchors.iter().any(|a| !seen.insert(path_key(&a.path))) {
+    let mut remaining = HashSet::new();
+    if anchors.iter().any(|a| !remaining.insert(path_key(&a.path))) {
         return resolve_shared_carrier_volumes(snapshots, anchors, excluded, cache);
     }
-    let selected: HashSet<_> = anchors.iter().map(|a| path_key(&a.path)).collect();
     cache
         .anchors
         .extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
     let mut output = Vec::new();
-    let mut remaining = selected;
     for snapshot in snapshots {
-        let keys: HashSet<_> = snapshot
-            .rows
-            .iter()
-            .map(|&i| path_key(&snapshot.table.paths[i]))
-            .filter(|key| remaining.contains(key))
-            .collect();
+        if remaining.is_empty() {
+            break;
+        }
+        let mut keys = HashSet::new();
+        for &row in snapshot.rows.iter() {
+            if let Some(key) = remaining.take(&path_key(&snapshot.table.paths[row])) {
+                keys.insert(key);
+                if remaining.is_empty() {
+                    break;
+                }
+            }
+        }
         if keys.is_empty() {
             continue;
         }
@@ -520,7 +524,6 @@ pub(crate) fn resolve_embedded_volumes(
             Some(&cache),
             None,
         ));
-        remaining.retain(|key| !keys.contains(key));
     }
     output
 }

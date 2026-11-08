@@ -50,7 +50,7 @@ from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_ORIGIN, CURRENT_CANCELLATION
 
 
-@dataclass
+@dataclass(slots=True)
 class _Submission:
     request_id: str
     targets: tuple[PipelineTarget, ...]
@@ -58,7 +58,6 @@ class _Submission:
     recursive: bool
     discovery_scope: Any
     catalog: Any
-    password_store: PasswordStore
     config: dict
     origin: str = "foreground"
     detection_options: EmbeddedOptions = EmbeddedOptions()
@@ -181,13 +180,12 @@ class PipelineEngine:
             }
         })
         detection_options = detection_options or EmbeddedOptions()
-        password_store = PasswordStore.from_sources(
+        request_config["password_store"] = PasswordStore.from_sources(
             cli_passwords=source.get("user_passwords"),
             clipboard_passwords=source.get("clipboard_passwords"),
             recent_passwords=self._recent_passwords,
             password_snapshot=password_snapshot,
         )
-        request_config["password_store"] = password_store
         request_config["password_scope_context"] = PasswordScopeContext(request_config.get("password_scope_dir", ""))
         submission = _Submission(
             request_id=uuid.uuid4().hex,
@@ -196,7 +194,6 @@ class PipelineEngine:
             recursive=recursive,
             discovery_scope=discovery_scope,
             catalog=catalog,
-            password_store=password_store,
             config=request_config,
             origin="watch" if str(origin).lower() == "watch" else "foreground",
             detection_options=detection_options,
@@ -217,7 +214,6 @@ class PipelineEngine:
                 runtime = self._request_runtime_factory(
                     self._services,
                     submission,
-                    submission.detection_options,
                     self._path_leases,
                 )
                 start_time = time.time()
@@ -1063,7 +1059,6 @@ class _RequestRuntime:
         self,
         services: _PipelineServices,
         submission: _Submission,
-        detection_options: EmbeddedOptions,
         path_leases: _PathLeaseRegistry,
     ):
         self.services = services
@@ -1093,6 +1088,7 @@ class _RequestRuntime:
             submission.request_id,
             notify=self._shell_updates.add,
         )
+        detection_options = submission.detection_options
         self.task_scanner = ArchiveTaskScanner(
             self.config,
             self.context,
@@ -1111,7 +1107,7 @@ class _RequestRuntime:
         request_runner.request_id = submission.request_id
         request_runner.origin = submission.origin
         self.extractor = ExtractionScheduler(
-            password_store=submission.password_store,
+            password_store=self.config["password_store"],
             output_config=self.config.get("output", {}),
             extraction_config={
                 **(self.config.get("extraction", {}) if isinstance(self.config.get("extraction"), dict) else {}),

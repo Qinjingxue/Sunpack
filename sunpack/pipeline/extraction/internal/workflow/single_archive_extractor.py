@@ -16,7 +16,7 @@ from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
-from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import compact_success_worker_diagnostics, worker_result_payload
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import discard_worker_file_tables, worker_result_payload
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, recoverable_partial_inventory
 from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
@@ -257,8 +257,6 @@ class SingleArchiveExtractor:
                 with _phase(phase_timer, f"{phase_prefix}_output_stats_success"):
                     worker_result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
                     output_inventory = collect_output_inventory(out_dir, worker_result)
-                    if output_inventory.worker_inventory_complete:
-                        compact_success_worker_diagnostics(diagnostics)
                     output_stats = {
                         "file_count": output_inventory.stats.file_count,
                         "total_bytes": output_inventory.stats.total_size,
@@ -266,13 +264,14 @@ class SingleArchiveExtractor:
                     self._fill_success_output_counts(diagnostics, output_stats)
                 self._log(self.i18n.t("extract.log.success", archive=archive))
                 manifest_payload = None
-                if diagnostics.get("result"):
+                if worker_result:
                     with _phase(phase_timer, f"{phase_prefix}_build_success_manifest"):
                         manifest_payload = build_extraction_progress_manifest(
                             archive=archive,
                             output_inventory=output_inventory,
                             diagnostics=diagnostics,
                         )
+                    discard_worker_file_tables(worker_result)
                 return ExtractionResult(
                     success=True,
                     out_dir=out_dir,
@@ -325,6 +324,7 @@ class SingleArchiveExtractor:
         if self.best_effort and failure.kind != FailureKind.PASSWORD_INCONCLUSIVE:
             with _phase(phase_timer, f"{phase_prefix}_recoverable_partial_check"):
                 output_inventory = recoverable_partial_inventory(diagnostics, out_dir)
+        manifest_payload = None
         if output_inventory is not None:
             with _phase(phase_timer, f"{phase_prefix}_build_partial_manifest"):
                 manifest_payload = build_extraction_progress_manifest(
@@ -333,18 +333,9 @@ class SingleArchiveExtractor:
                     diagnostics=diagnostics,
                 )
             diagnostics["partial_outputs"] = True
-            return self._failed(
-                out_dir,
-                error_msg,
-                failure=failure,
-                password_used=(None if failure.kind in {FailureKind.WRONG_PASSWORD, FailureKind.PASSWORD_INCONCLUSIVE} else correct_pwd),
-                selected_codepage=selected_codepage,
-                diagnostics=diagnostics,
-                partial_outputs=True,
-                progress_manifest_payload=manifest_payload,
-                output_inventory=output_inventory,
-            )
-        self._cleanup_output(out_dir, OutputCleanupEvent.UNRECOVERABLE_FAILURE)
+        discard_worker_file_tables(worker_result_payload(run_result))
+        if output_inventory is None:
+            self._cleanup_output(out_dir, OutputCleanupEvent.UNRECOVERABLE_FAILURE)
         return self._failed(
             out_dir,
             error_msg,
@@ -352,6 +343,9 @@ class SingleArchiveExtractor:
             password_used=(None if failure.kind in {FailureKind.WRONG_PASSWORD, FailureKind.PASSWORD_INCONCLUSIVE} else correct_pwd),
             selected_codepage=selected_codepage,
             diagnostics=diagnostics,
+            partial_outputs=output_inventory is not None,
+            progress_manifest_payload=manifest_payload,
+            output_inventory=output_inventory,
         )
 
 

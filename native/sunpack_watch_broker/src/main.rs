@@ -124,7 +124,7 @@ fn run_service() -> windows_service::Result<()> {
         process_id: None,
     })?;
 
-    let result = serve_watch_lifetimes(stop_event.raw());
+    let result = serve_watch_lifetimes(&stop_event);
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
@@ -137,98 +137,87 @@ fn run_service() -> windows_service::Result<()> {
     result.map_err(windows_service::Error::Winapi)
 }
 
-fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
-    let journals = Arc::new(JournalDispatcher::new()?);
-    let connected_clients = Arc::new(AtomicUsize::new(0));
-    let ever_had_lease = Arc::new(AtomicBool::new(false));
+fn serve_watch_lifetimes(stop_event: &OwnedHandle) -> io::Result<()> {
+    let journals = &JournalDispatcher::new()?;
+    let connected_clients = &AtomicUsize::new(0);
+    let ever_had_lease = &AtomicBool::new(false);
     let state_changed = &journals.state_changed;
-    let mut workers = Vec::new();
     let mut first_instance = true;
     let mut pending_accept: Option<PendingPipeAccept> = None;
-    let result = (|| {
-        loop {
-            workers.retain(|worker: &thread::JoinHandle<()>| !worker.is_finished());
-            let clients = connected_clients.load(Ordering::Acquire);
-            let had_lease = ever_had_lease.load(Ordering::Acquire);
-            // Before the first lease, only an explicit stop proves nobody will use us.
-            if had_lease && clients == 0 {
-                break;
-            }
+    thread::scope(|workers| {
+        let result = (|| {
+            loop {
+                let clients = connected_clients.load(Ordering::Acquire);
+                let had_lease = ever_had_lease.load(Ordering::Acquire);
+                // Before the first lease, only an explicit stop proves nobody will use us.
+                if had_lease && clients == 0 {
+                    break;
+                }
 
-            if clients < MAX_CONNECTED_CLIENTS as usize && pending_accept.is_none() {
-                pending_accept = Some(PendingPipeAccept::start(first_instance)?);
-            }
-            let timeout = journals
-                .reap_idle(Instant::now())?
-                .map_or(INFINITE, |deadline| {
-                    // Wait accepts whole milliseconds. Round up to avoid waking
-                    // repeatedly before the expiry can be observed.
-                    (deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis()
-                        + 1) as u32
-                });
-            let wait = if let Some(accept) = pending_accept.as_ref() {
-                let handles = [stop_event, accept.event(), state_changed.raw()];
-                unsafe {
-                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
+                if clients < MAX_CONNECTED_CLIENTS as usize && pending_accept.is_none() {
+                    pending_accept = Some(PendingPipeAccept::start(first_instance)?);
                 }
-            } else {
-                let handles = [stop_event, state_changed.raw()];
-                unsafe {
-                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
+                let timeout = journals
+                    .reap_idle(Instant::now())?
+                    .map_or(INFINITE, |deadline| {
+                        // Wait accepts whole milliseconds. Round up to avoid waking
+                        // repeatedly before the expiry can be observed.
+                        (deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis()
+                            + 1) as u32
+                    });
+                let wait = if let Some(accept) = pending_accept.as_ref() {
+                    let handles = [stop_event.raw(), accept.event(), state_changed.raw()];
+                    unsafe {
+                        WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
+                    }
+                } else {
+                    let handles = [stop_event.raw(), state_changed.raw()];
+                    unsafe {
+                        WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
+                    }
+                };
+                if wait == WAIT_OBJECT_0 {
+                    break;
                 }
-            };
-            if wait == WAIT_OBJECT_0 {
-                break;
+                if wait == WAIT_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                if wait == WAIT_TIMEOUT {
+                    continue;
+                }
+                if pending_accept.is_some() && wait == WAIT_OBJECT_0 + 1 {
+                    let pipe = pending_accept.take().unwrap().finish()?;
+                    first_instance = false;
+                    connected_clients.fetch_add(1, Ordering::AcqRel);
+                    // Drop the join handle immediately. The scope still waits for
+                    // clients on stop without retaining each finished OS handle.
+                    thread::Builder::new().spawn_scoped(workers, move || {
+                        let _ = serve_client(pipe, stop_event.raw(), journals, ever_had_lease);
+                        connected_clients.fetch_sub(1, Ordering::AcqRel);
+                        state_changed.signal();
+                    })?;
+                    continue;
+                }
+                let state_index = if pending_accept.is_some() { 2 } else { 1 };
+                if wait != WAIT_OBJECT_0 + state_index {
+                    return Err(io::Error::last_os_error());
+                }
             }
-            if wait == WAIT_FAILED {
-                return Err(io::Error::last_os_error());
-            }
-            if wait == WAIT_TIMEOUT {
-                continue;
-            }
-            if pending_accept.is_some() && wait == WAIT_OBJECT_0 + 1 {
-                let pipe = pending_accept.take().unwrap().finish()?;
-                first_instance = false;
-                connected_clients.fetch_add(1, Ordering::AcqRel);
-                let worker_journals = Arc::clone(&journals);
-                let worker_clients = Arc::clone(&connected_clients);
-                let worker_ever_had_lease = Arc::clone(&ever_had_lease);
-                let worker_stop_event = stop_event as isize;
-                let worker_state_changed = state_changed.raw() as isize;
-                workers.push(thread::Builder::new().spawn(move || {
-                    let _ = serve_client(
-                        pipe,
-                        worker_stop_event as HANDLE,
-                        worker_journals,
-                        &worker_ever_had_lease,
-                    );
-                    worker_clients.fetch_sub(1, Ordering::AcqRel);
-                    unsafe { SetEvent(worker_state_changed as HANDLE) };
-                })?);
-                continue;
-            }
-            let state_index = if pending_accept.is_some() { 2 } else { 1 };
-            if wait != WAIT_OBJECT_0 + state_index {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
-    })();
-    // Errors must stop and join clients too: they borrow both event handles.
-    unsafe { SetEvent(stop_event) };
-    drop(pending_accept);
-    for worker in workers {
-        let _ = worker.join();
-    }
-    result
+            Ok(())
+        })();
+        // Errors must wake blocked clients before the scope joins them.
+        stop_event.signal();
+        drop(pending_accept);
+        result
+    })
 }
 
 fn serve_client(
     pipe: OwnedHandle,
     stop_event: HANDLE,
-    journals: Arc<JournalDispatcher>,
+    journals: &JournalDispatcher,
     ever_had_lease: &AtomicBool,
 ) -> io::Result<()> {
     // A lease belongs to this connection and ends with it.
@@ -241,11 +230,14 @@ fn serve_client(
         // A connected client may be descheduled between writes under load.
         // A clock is not evidence of disconnection; service stop and broken
         // pipes still end the pending overlapped read.
-        let request = match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut request_bytes)? {
-            IoResult::Stopped | IoResult::Disconnected => break,
-            IoResult::Completed(size) if size == REQUEST_BYTES => Request::decode(&request_bytes).ok(),
-            IoResult::Completed(_) => None,
-        };
+        let request =
+            match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut request_bytes)? {
+                IoResult::Stopped | IoResult::Disconnected => break,
+                IoResult::Completed(size) if size == REQUEST_BYTES => {
+                    Request::decode(&request_bytes).ok()
+                }
+                IoResult::Completed(_) => None,
+            };
         let Some(request) = request else {
             let response = Response {
                 status: Status::InvalidRequest,
@@ -254,42 +246,41 @@ fn serve_client(
             let _ = write_overlapped(pipe.raw(), stop_event, io_event.raw(), &response.encode());
             break;
         };
-        let response = if !request_shape_is_valid(&request)
-            || (request.opcode != Opcode::Hello && !leased)
-        {
-            (
-                Response {
-                    status: Status::InvalidRequest,
-                    ..Response::ok(request.request_id)
-                },
-                Vec::new(),
-            )
-        } else {
-            if !leased {
-                ever_had_lease.store(true, Ordering::Release);
-                leased = true;
-            }
-            let mut query = Vec::new();
-            if request.opcode == Opcode::ReadDirectoriesChanges {
-                let mut length = [0u8; 4];
-                match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut length)? {
-                    IoResult::Completed(4) => {}
-                    _ => break,
+        let response =
+            if !request_shape_is_valid(&request) || (request.opcode != Opcode::Hello && !leased) {
+                (
+                    Response {
+                        status: Status::InvalidRequest,
+                        ..Response::ok(request.request_id)
+                    },
+                    Vec::new(),
+                )
+            } else {
+                if !leased {
+                    ever_had_lease.store(true, Ordering::Release);
+                    leased = true;
                 }
-                let length = u32::from_le_bytes(length) as usize;
-                if !(8 + FILE_ID_BYTES..=MAX_DIRECTORY_QUERY_BYTES).contains(&length)
-                    || (length - 8) % FILE_ID_BYTES != 0
-                {
-                    break;
+                let mut query = Vec::new();
+                if request.opcode == Opcode::ReadDirectoriesChanges {
+                    let mut length = [0u8; 4];
+                    match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut length)? {
+                        IoResult::Completed(4) => {}
+                        _ => break,
+                    }
+                    let length = u32::from_le_bytes(length) as usize;
+                    if !(8 + FILE_ID_BYTES..=MAX_DIRECTORY_QUERY_BYTES).contains(&length)
+                        || (length - 8) % FILE_ID_BYTES != 0
+                    {
+                        break;
+                    }
+                    query.resize(length, 0);
+                    match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut query)? {
+                        IoResult::Completed(size) if size == length => {}
+                        _ => break,
+                    }
                 }
-                query.resize(length, 0);
-                match read_overlapped(pipe.raw(), stop_event, io_event.raw(), &mut query)? {
-                    IoResult::Completed(size) if size == length => {}
-                    _ => break,
-                }
-            }
-            handle_request(&journals, request, &query)
-        };
+                handle_request(journals, request, &query)
+            };
         let (response, payload) = response;
         match write_overlapped(pipe.raw(), stop_event, io_event.raw(), &response.encode())? {
             IoResult::Completed(size) if size == RESPONSE_BYTES => {}
@@ -832,7 +823,7 @@ mod tests {
                 let worker_stop = Arc::clone(&stop);
                 let (tx, done) = mpsc::channel();
                 let thread = thread::spawn(move || {
-                    let result = serve_watch_lifetimes(worker_stop.raw());
+                    let result = serve_watch_lifetimes(&worker_stop);
                     let _ = tx.send(());
                     result
                 });

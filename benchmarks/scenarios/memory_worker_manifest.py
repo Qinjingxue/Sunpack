@@ -45,7 +45,7 @@ def run_native(count: int) -> dict[str, object]:
 
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
-        compact_success_worker_diagnostics,
+        discard_worker_file_tables,
     )
     from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 
@@ -92,7 +92,7 @@ def run_native(count: int) -> dict[str, object]:
     parsed_rss = max(parsed_rss, process.memory_info().rss)
     inventory = collect_output_inventory("C:/benchmark-output", payload)
     inventory_rss = process.memory_info().rss
-    compact_success_worker_diagnostics(diagnostics)
+    discard_worker_file_tables(diagnostics["result"])
     gc.collect()
     elapsed += time.perf_counter() - started
     steady_rss = process.memory_info().rss

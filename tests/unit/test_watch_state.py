@@ -10,6 +10,7 @@ import pytest
 
 from tests.helpers.binary_wal import header, frame, frames
 import sunpack.runtime.watch.state as watch_state_module
+from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import (
     WatchStateJournalError,
     WatchStateStore,
@@ -648,11 +649,8 @@ def test_active_work_persists_force_cause_for_restart(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"active")
     state = WatchStateStore(str(state_path))
-    candidate = type("Candidate", (), {
-        "path": str(archive),
-        "size": archive.stat().st_size,
-        "mtime": archive.stat().st_mtime,
-    })()
+    stat = archive.stat()
+    candidate = WatchCandidate(str(archive), stat.st_size, stat.st_mtime)
     state.queue_active(candidate, force=True)
     state.flush()
 

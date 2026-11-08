@@ -15,6 +15,41 @@ pub(crate) struct NativeDiscoveryScope {
 }
 
 impl NativeDiscoveryScope {
+    fn contains_key(&self, key: &str) -> bool {
+        if key == self.key {
+            return !self.excluded.contains(key);
+        }
+        let Some(relative) = key
+            .strip_prefix(&self.key)
+            .and_then(|p| p.strip_prefix('\\'))
+        else {
+            return false;
+        };
+        !self
+            .max_depth
+            .is_some_and(|depth| relative.bytes().filter(|c| *c == b'\\').count() > depth)
+            && !self.excludes_key(key)
+    }
+
+    fn excludes_key(&self, key: &str) -> bool {
+        if self.excluded.is_empty() {
+            return false;
+        }
+        let mut current = key.trim_end_matches('\\');
+        loop {
+            if self.excluded.contains(current) {
+                return true;
+            }
+            let Some((parent, _)) = current.rsplit_once('\\') else {
+                return false;
+            };
+            if parent.len() < self.key.len() {
+                return false;
+            }
+            current = parent;
+        }
+    }
+
     pub(crate) fn exclude_roots(&mut self, roots: impl Iterator<Item = String>) {
         self.excluded
             .extend(roots.map(|p| path_key(&p).trim_end_matches('\\').to_owned()));
@@ -54,25 +89,12 @@ impl NativeDiscoveryScope {
     }
 
     pub fn contains(&self, path: &str) -> bool {
-        let key = path_key(path);
-        if key == self.key {
-            return !self.excluded.contains(&key);
-        }
-        let Some(relative) = key
-            .strip_prefix(&self.key)
-            .and_then(|p| p.strip_prefix('\\'))
-        else {
-            return false;
-        };
-        !self
-            .max_depth
-            .is_some_and(|depth| relative.bytes().filter(|c| *c == b'\\').count() > depth)
-            && !self.excludes(path)
+        self.contains_key(&path_key(path))
     }
 
     pub fn intersects_output(&self, path: &str) -> bool {
         let key = path_key(path);
-        self.contains(path)
+        self.contains_key(&key)
             || self
                 .key
                 .strip_prefix(key.trim_end_matches('\\'))
@@ -80,20 +102,7 @@ impl NativeDiscoveryScope {
     }
 
     pub fn excludes(&self, path: &str) -> bool {
-        let key = path_key(path);
-        let mut current = key.trim_end_matches('\\');
-        loop {
-            if self.excluded.contains(current) {
-                return true;
-            }
-            let Some((parent, _)) = current.rsplit_once('\\') else {
-                return false;
-            };
-            if parent.len() < self.key.len() {
-                return false;
-            }
-            current = parent;
-        }
+        !self.excluded.is_empty() && self.excludes_key(&path_key(path))
     }
 }
 
