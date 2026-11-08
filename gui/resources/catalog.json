@@ -269,16 +269,16 @@
       "en": "App theme"
     },
     "contextMenu": {
-      "zh": "资源管理器右键菜单",
-      "en": "Explorer context menu"
+      "zh": "右键菜单",
+      "en": "Context menu"
     },
     "contextMenuOn": {
-      "zh": "开启右键菜单",
-      "en": "Enable context menu"
+      "zh": "开启",
+      "en": "Enable"
     },
     "contextMenuOff": {
-      "zh": "关闭右键菜单",
-      "en": "Disable context menu"
+      "zh": "关闭",
+      "en": "Disable"
     },
     "system": {
       "zh": "跟随系统",
@@ -1100,8 +1100,8 @@
         "en": "Process priority"
       },
       "description": {
-        "zh": "设置 Windows 进程调度优先级，不改变任务并发数或缓冲预算。",
-        "en": "Sets Windows process scheduling priority without changing task concurrency or buffer budgets."
+        "zh": "低优先级消耗内存等资源少，但会显著降低处理速度",
+        "en": "Lower priority uses less memory and other resources, but significantly slows down processing"
       },
       "options": [
         {
@@ -1149,25 +1149,21 @@
     },
     "/watch/clipboard_monitor_enabled": {
       "label": {
-        "zh": "保存剪贴板密码历史",
-        "en": "Save clipboard password history"
+        "zh": "剪贴板监听",
+        "en": "Clipboard monitoring"
       },
       "description": {
-        "zh": "Watch 将剪贴板历史明文保存到密码文件；关闭不会删除已有历史。普通配置值优先。",
-        "en": "Watch saves clipboard history as plaintext in the password file; disabling does not erase saved history. Ordinary settings take precedence."
+        "zh": "Watch模式下自动将剪贴板历史保存到密码文件",
+        "en": "Automatically save clipboard history to the password file in Watch mode"
       }
     },
     "/watch/clipboard_builtin_max_entries": {
       "label": {
-        "zh": "剪贴板历史上限",
+        "zh": "剪贴板监听保存条目上限",
         "en": "Clipboard history limit"
       },
       "min": 1,
-      "integer": true,
-      "description": {
-        "zh": "仅限制剪贴板历史条数，普通配置值优先于高级配置。",
-        "en": "Limits only clipboard history entries; ordinary settings override advanced settings."
-      }
+      "integer": true
     },
     "/watch/out_dir": {
       "label": {
@@ -1175,8 +1171,8 @@
         "en": "Default output folder"
       },
       "description": {
-        "zh": "“.” 表示输入目录旁，可按监控目录单独设置",
-        "en": "“.” means beside the input; each monitored folder can override it"
+        "zh": "“.” 表示输入目录旁",
+        "en": "“.” means beside the input"
       }
     },
     "/watch/tray_enabled": {
@@ -1187,39 +1183,35 @@
     },
     "/watch/toast_enabled": {
       "label": {
-        "zh": "桌面通知",
-        "en": "Desktop notifications"
+        "zh": "Windows桌面通知",
+        "en": "Windows desktop notifications"
       }
     },
     "/watch/toast_report_retention_days": {
       "label": {
-        "zh": "报告保留时间（天）",
-        "en": "Report retention (days)"
+        "zh": "Watch模式失败报告保留时间（天）",
+        "en": "Number of days to keep Watch-mode failure reports"
       },
       "min": 1,
-      "integer": true,
-      "description": {
-        "zh": "Toast详情失败报告的保留天数",
-        "en": "Number of days to keep Toast-details failure reports"
-      }
+      "integer": true
     },
     "/passwords/clipboard_passwords_enabled": {
       "label": {
-        "zh": "使用剪贴板密码",
-        "en": "Use clipboard passwords"
+        "zh": "CLI使用剪贴板密码",
+        "en": "CLI uses clipboard passwords"
       },
       "description": {
-        "zh": "CLI 是否读取当前剪贴板作为密码候选",
-        "en": "Whether the CLI reads the current clipboard as a password candidate"
+        "zh": "CLI 是否读取当前剪贴板内容作为密码",
+        "en": "Whether the CLI reads the current clipboard content as a password"
       }
     },
     "/extraction/content_requirement": {
       "label": {
-        "zh": "解压结果完整性要求",
-        "en": "Extraction result integrity requirement"
+        "zh": "解压完整性要求",
+        "en": "Extraction integrity requirement"
       },
       "description": {
-        "zh": "允许部分恢复可能误解压下载中文件，请仅在需尽力获取损坏文件的部分内容时使用。",
+        "zh": "允许部分恢复可能误解压下载中文件，请仅在需尽力获取损坏文件的部分内容时使用",
         "en": "Allowing partial recovery may extract unintended files from downloads. Use only when you need to recover partial content from damaged files."
       },
       "options": [
@@ -1357,8 +1349,8 @@
       "min": 1,
       "integer": true,
       "description": {
-        "zh": "保留最近指定天数的任务历史和事件，CLI 与监控模式共用。",
-        "en": "Retain task history and events for this many days, shared by CLI and Watch."
+        "zh": "保留最近指定天数的任务历史和事件",
+        "en": "Retain task history and events for this many days"
       }
     },
     "/filesystem/scan_filters/@blacklist/paths": {
