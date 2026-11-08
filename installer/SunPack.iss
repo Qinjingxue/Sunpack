@@ -73,6 +73,7 @@ english.TaskContextMenuFailed=Failed to register the sunpack folder context menu
 english.TaskContextMenuRemoveFailed=Failed to remove the existing sunpack context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
+english.PrepareDataUpgradeFailed=Could not safely prepare the SunPack data upgrade. Back up your data and check the installed version, configuration and folder access before retrying.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
 english.UninstallStopFailed=sunpack runtime processes or the Watch Broker service could not be stopped. Please restart Windows and run the uninstaller again.
 english.DataDirectoryPermissionsFailed=Failed to secure the SunPack data directory: %s
@@ -102,6 +103,7 @@ chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜�
 chinesesimplified.TaskContextMenuRemoveFailed=无法清理现有 sunpack 右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
+chinesesimplified.PrepareDataUpgradeFailed=无法安全准备 SunPack 数据升级。请先备份数据，再检查已安装版本号、配置和目录权限后重试。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
 chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Watch Broker 服务。请重启 Windows，然后重新运行卸载程序。
 chinesesimplified.DataDirectoryPermissionsFailed=无法设置 SunPack 数据目录权限：%s
@@ -118,12 +120,13 @@ Name: "contextmenu"; Description: "{cm:TaskContextMenu}"; GroupDescription: "{cm
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:GroupBackgroundWatch}"; Flags: unchecked
 
 [Files]
+; Keep preparation inputs first for early extraction with solid compression.
+Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
+Source: "{#SourceDir}\scripts\upgrade_config.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1,scripts\initialize_config_language.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "integration.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
-Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
-Source: "{#SourceDir}\scripts\upgrade_config.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
 Source: "{#SourceDir}\scripts\initialize_config_language.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
 Source: "{#SourceDir}\builtin_passwords.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 
@@ -451,42 +454,11 @@ begin
   end;
 end;
 
-function VersionBefore(const Version: string; const Minimum: Int64): Boolean;
-var
-  Packed: Int64;
-  Value: string;
-  Suffix: Integer;
-begin
-  Value := Trim(Version);
-  if Copy(Value, 1, 1) = 'v' then
-    Delete(Value, 1, 1);
-  { Development builds use the git-describe form 1.3.0-7-gabcdef0.
-    Compare its numeric base version instead of treating the suffix as an
-    unknown version and deleting current data during an upgrade. }
-  Suffix := Pos('-', Value);
-  if Suffix > 0 then
-    Delete(Value, Suffix, Length(Value));
-  { Missing or unversioned installations cannot provide current-format data. }
-  Result := True;
-  if StrToVersion(Value, Packed) then
-    Result := Packed < Minimum;
-end;
-
-function RequiresDataReset(const Version: string): Boolean;
-begin
-  Result := VersionBefore(Version, PackVersionComponents(1, 3, 0, 0));
-end;
-
 function InstalledVersion: string;
 begin
   RegQueryStringValue(HKLM64,
     'Software\Microsoft\Windows\CurrentVersion\Uninstall\{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1',
     'DisplayVersion', Result);
-end;
-
-function InstalledDataRequiresReset: Boolean;
-begin
-  Result := RequiresDataReset(InstalledVersion);
 end;
 
 function RemoveDataDirectory(const Path: string): Boolean;
@@ -502,47 +474,6 @@ begin
     'Software\Microsoft\Windows\CurrentVersion\Uninstall\{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1',
     'InstallLocation', Result) or (Trim(Result) = '') then
     Result := ExpandConstant('{app}');
-end;
-
-function RemoveInstalledData: Boolean;
-var
-  Command: string;
-  ResultCode: Integer;
-begin
-  { Preserve only editable roots/passwords, including when custom Watch data
-    overlaps the data directory. Remove other data in place without conversion. }
-  Command :=
-    '$ErrorActionPreference = ''Stop''; $state = ''''; ' +
-    '$data = ' + PowerShellSingleQuotedString(ExpandConstant('{commonappdata}\SunPack')) + '; ' +
-    '$keep = @((Join-Path $data ''sunpack_watch_roots.txt''), (Join-Path $data ''builtin_passwords.json'')); ' +
-    'function Remove-ResetData([string]$path) { ' +
-    '  if (-not (Test-Path -LiteralPath $path)) { return }; ' +
-    '  $item = Get-Item -LiteralPath $path -Force; ' +
-    '  if (-not $item.PSIsContainer -and $keep -contains $item.FullName) { return }; ' +
-    '  $prefix = $item.FullName.TrimEnd(''\'') + ''\''; ' +
-    '  if ($item.PSIsContainer -and @($keep | Where-Object { $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { ' +
-    '    foreach ($child in @(Get-ChildItem -LiteralPath $path -Force)) { Remove-ResetData $child.FullName }; ' +
-    '    if ([IO.Directory]::GetFileSystemEntries($path).Length -eq 0) { Remove-Item -LiteralPath $path -Force } ' +
-    '  } else { Remove-Item -LiteralPath $path -Recurse -Force } ' +
-    '}; ' +
-    'foreach ($file in @(' + PowerShellSingleQuotedString(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json') +
-    ', (Join-Path $data ''sunpack_config.json''))) { ' +
-    '  if (Test-Path -LiteralPath $file) { ' +
-    '    try { $config = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json; ' +
-    '      if ($null -ne $config.watch.state_dir) { $state = ([string]$config.watch.state_dir).Trim() } ' +
-    '    } catch { } ' +
-    '  } ' +
-    '}; ' +
-    'if ($state) { ' +
-    '  if ($state -eq ''~'') { $state = $env:USERPROFILE } ' +
-    '  elseif ($state.StartsWith(''~\'') -or $state.StartsWith(''~/'')) { $state = Join-Path $env:USERPROFILE $state.Substring(2) }; ' +
-    '  if (-not [IO.Path]::IsPathRooted($state)) { $state = Join-Path $data $state }; ' +
-    '  Remove-ResetData $state ' +
-    '}; Remove-ResetData $data';
-  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Command),
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  if Result then Result := ResultCode = 0;
 end;
 
 function ExistingLauncherPath: string;
@@ -728,9 +659,7 @@ var
   StartupTaskDefaultApplied: Boolean;
   ExistingWatchStateCaptured: Boolean;
   RestartWatchAfterUpgrade: Boolean;
-  ConfigBackupCaptured: Boolean;
-  ConfigMigrationApplied: Boolean;
-  ConfigInstallCompleted: Boolean;
+  UpgradePrepared: Boolean;
   InitializeLanguageOnInstall: Boolean;
 
 procedure RestoreWatchAfterUpgrade;
@@ -800,40 +729,25 @@ begin
     ApplyStartupTaskDefault;
 end;
 
-procedure CaptureConfigurationForUpgrade;
-var
-  UserConfig: string;
-begin
-  if ConfigBackupCaptured then Exit;
-  if FileExists(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json') then
-    if not FileCopy(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json',
-                    ExpandConstant('{tmp}\sunpack-advanced-backup.json'), False) then
-      RaiseException('Unable to capture SunPack Watch configuration before upgrade.');
-  if InstalledDataRequiresReset then begin ConfigBackupCaptured := True; Exit; end;
-  UserConfig := ExpandConstant('{commonappdata}\SunPack\sunpack_config.json');
-  if FileExists(UserConfig) then
-  begin
-    if not FileCopy(UserConfig, ExpandConstant('{tmp}\sunpack-user-backup.json'), False) then
-      RaiseException('Unable to capture SunPack configuration before upgrade.');
-  end;
-  ConfigBackupCaptured := True;
-end;
-
-procedure UpgradeConfigurationFields;
+function UpgradeConfigurationFields: Boolean;
 var
   Parameters: string;
   ResultCode: Integer;
 begin
+  { Prepare and validate retained data before replacing the old application.
+    The old advanced file is read-only; [Files] deploys its current template. }
+  ExtractTemporaryFile('upgrade_config.ps1');
+  ExtractTemporaryFile('sunpack-config-template.json');
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-    AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\upgrade_config.ps1')) +
+    AddQuotes(ExpandConstant('{tmp}\upgrade_config.ps1')) +
     ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json')) +
-    ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-advanced-backup.json'));
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-              Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    RaiseException('Unable to start SunPack configuration field upgrade.')
-  else if ResultCode <> 0 then
-    RaiseException(Format('SunPack configuration field upgrade failed (%d).', [ResultCode]));
-  ConfigMigrationApplied := True;
+    ' -TemplateConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-config-template.json')) +
+    ' -AdvancedConfig ' + AddQuotes(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json') +
+    ' -PreviousVersion ' + AddQuotes(InstalledVersion);
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+                 Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if Result then Result := ResultCode = 0;
+  if not Result then Log('SunPack upgrade preparation failed; old application files have not been removed.');
 end;
 
 procedure InitializeInstalledLanguage;
@@ -866,10 +780,6 @@ end;
 
 procedure DeinitializeSetup;
 begin
-  if ConfigMigrationApplied and not ConfigInstallCompleted then
-    if not FileCopy(ExpandConstant('{tmp}\sunpack-user-backup.json'),
-        ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'), False) then
-      Log('Unable to restore SunPack user configuration after installation failure.');
   CleanupInstallScripts;
 end;
 
@@ -892,20 +802,20 @@ begin
     Result := CustomMessage('PrepareBrokerRemoveFailed');
     Exit;
   end;
+  if not UpgradePrepared then
+  begin
+    InitializeLanguageOnInstall := not FileExists(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
+    if not UpgradeConfigurationFields then
+    begin
+      Result := CustomMessage('PrepareDataUpgradeFailed');
+      Exit;
+    end;
+    UpgradePrepared := True;
+  end;
   if not RemoveMachinePath(ExistingApplicationDirectory) then
   begin
     Result := CustomMessage('TaskAddToPathFailed');
     Exit;
-  end;
-  CaptureConfigurationForUpgrade;
-  if InstalledDataRequiresReset then
-  begin
-    Log('Resetting pre-1.3.0 or unversioned SunPack data, preserving Watch roots and builtin passwords.');
-    if not RemoveInstalledData then
-    begin
-      Result := CustomMessage('PrepareOldFilesRemoveFailed');
-      Exit;
-    end;
   end;
   if not RemoveDataDirectory(ExistingApplicationDirectory) or
      not RemoveDataDirectory(ExpandConstant('{app}')) then
@@ -913,7 +823,6 @@ begin
     Result := CustomMessage('PrepareOldFilesRemoveFailed');
     Exit;
   end;
-  InitializeLanguageOnInstall := not FileExists(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
   Result := '';
 end;
 
@@ -930,11 +839,9 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
-  if CurStep = ssDone then ConfigInstallCompleted := True;
   if CurStep = ssPostInstall then
   begin
     EnsureLocalizedEditableConfigFiles;
-    UpgradeConfigurationFields;
     InitializeInstalledLanguage;
     InstallBrokerService;
     if not RunInstallerIntegration('RegisterToast', ResultCode) then

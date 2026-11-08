@@ -9,10 +9,10 @@ import winreg
 from tests.helpers.installer import inno_compiler
 
 
-def test_installer_resets_pre_130_data_and_preserves_current_data(tmp_path, repo_root):
+def test_installer_applies_pre_140_policy_before_replacing_application(tmp_path, repo_root):
     # Runtime/ACL tests cannot catch version gating, selective cleanup or install
     # order. Without this harness those failures go undetected; one small build
-    # covers that independent boundary, including overlapping state directories.
+    # covers that independent boundary, including use of advanced settings before old app deletion.
     compiler = inno_compiler()
     source = (repo_root / "installer/SunPack.iss").read_text(encoding="utf-8-sig")
     registry_key = "Software\\SunPackInstallerTests\\" + uuid.uuid4().hex
@@ -21,10 +21,9 @@ def test_installer_resets_pre_130_data_and_preserves_current_data(tmp_path, repo
     for name in (
         "NormalizePathEntry", "PopPathEntry", "PathContains", "InstallerOwnsMachinePath",
         "PathWithoutEntry", "AddMachinePath", "RemoveMachinePath",
-        "PowerShellSingleQuotedString", "VersionBefore", "RequiresDataReset",
-        "InstalledVersion", "InstalledDataRequiresReset",
-        "RemoveDataDirectory", "ExistingApplicationDirectory", "RemoveInstalledData",
-        "ExistingLauncherPath", "CaptureConfigurationForUpgrade", "PrepareToInstall",
+        "PowerShellSingleQuotedString", "InstalledVersion",
+        "RemoveDataDirectory", "ExistingApplicationDirectory",
+        "ExistingLauncherPath", "UpgradeConfigurationFields", "PrepareToInstall",
     ):
         match = re.search(rf"^(?:function|procedure) {name}\b.*?^end;", source, re.M | re.S)
         assert match is not None, name
@@ -36,11 +35,16 @@ def test_installer_resets_pre_130_data_and_preserves_current_data(tmp_path, repo
                      and 'DestDir: "{commonappdata}' in line
                      and ('\\sunpack_config.json";' in line or '\\builtin_passwords.json";' in line)]
     assert len(default_files) == 2
+    temporary_files = [line.replace("{#SourceDir}", str(repo_root))
+                       for line in source.splitlines() if line.startswith('Source: "{#SourceDir}\\')
+                       and 'DestDir: "{tmp}' in line
+                       and ("upgrade_config.ps1" in line or "sunpack_config.json" in line)]
+    assert len(temporary_files) == 2
     harness = tmp_path / "reset.iss"
     harness.write_text(f"""
 [Setup]
 AppName=SunPack reset regression
-AppVersion=1.3.0
+AppVersion=1.4.0
 DefaultDirName={{tmp}}\\SunPackResetRegression
 PrivilegesRequired=lowest
 Uninstallable=no
@@ -51,12 +55,13 @@ CloseApplications=no
 OutputDir={tmp_path}
 OutputBaseFilename=reset
 [Files]
-{chr(10).join(default_files)}
+{chr(10).join(default_files + temporary_files)}
 Source: "{repo_root / 'sunpack_advanced_config.json'}"; DestDir: "{{app}}"; Flags: ignoreversion
 [CustomMessages]
 PrepareRuntimeRunning=Runtime still running
 PrepareBrokerRemoveFailed=Broker still running
 PrepareOldFilesRemoveFailed=Cannot remove old files
+PrepareDataUpgradeFailed=Cannot upgrade configuration
 TaskAddToPathFailed=Cannot update PATH
 [Code]
 const
@@ -66,8 +71,7 @@ const
 var
   StopStage: Integer;
   ExistingWatchStateCaptured, RestartWatchAfterUpgrade: Boolean;
-  ConfigBackupCaptured: Boolean;
-  InitializeLanguageOnInstall: Boolean;
+  InitializeLanguageOnInstall, UpgradePrepared: Boolean;
 procedure ApplyStartupTaskDefault;
 begin
 end;
@@ -100,60 +104,33 @@ end;
 """, encoding="utf-8-sig")
     result = subprocess.run([compiler, "/Qp", str(harness)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    defaults = {name: (repo_root / name).read_bytes()
-                for name in ("sunpack_config.json", "builtin_passwords.json")}
-    # The malformed-config case proves deletion needs no functioning old runtime
-    # or valid schema. The relocated case also resolves state from old defaults.
-    cases = (("v1.2.8", True, False, "separate"), ("v1.2.9", True, False, "separate"),
-             ("1.3.0", False, False, "separate"), ("1.10.0", False, False, "separate"),
-             (None, True, False, "separate"), ("1.2.8", True, True, "separate"),
-             ("invalid", True, False, "separate"),
-             ("v1.2.8-7-gabcdef0", True, False, "separate"),
-             ("1.2.9-7-gabcdef0-dirty", True, False, "separate"),
-             ("v1.3.0-7-gabcdef0", False, False, "separate"),
-             ("v1.3.1", False, False, "separate"),
-             ("1.2.8", True, False, "missing"),
-             ("1.2.8", True, False, "same"), ("1.2.8", True, False, "parent"))
+    cases = [("v1.2.9", True, False), ("v1.3.0", True, False),
+             ("v1.3.5-2-gabcdef0", True, False), ("1.4.0", False, False),
+             ("1.10.0", False, False), (None, False, True), ("invalid", False, True),
+             ("1.3.5", True, True)]
     try:
-        for index, (version, reset, stop_failure, layout) in enumerate(cases):
+        for index, (version, migrate, failure) in enumerate(cases):
             fixture = tmp_path / f"case {index} ' [data]"
-            app, data, custom = (fixture / name for name in ("app", "data", "custom ' [watch]"))
-            if layout == "same":
-                custom = data
-            elif layout == "parent":
-                data = custom / "data"
-            installed = fixture / "previous app" if index in (1, 3) else app
-            for directory in {app, data, custom, installed}:
-                (directory / "unknown" / "nested").mkdir(parents=True)
-                (directory / "unknown" / "nested" / "backup.bak").write_text("old", encoding="utf-8")
-            task_files = ["state.snapshot", "state.journal.00000000000000000001.wal",
-                          "state.journal.00000000000000000142.wal", "events.jsonl", "state.json",
-                          "state.journal.00000000000000000001.jsonl", "events.json"]
-            other_files = ["catalog.snapshot.bin", "catalog.wal.bin", "initial_scanned",
-                               "state.journal.not-a-sequence.wal"]
-            for directory in (data / ".sunpack_watch", custom):
-                directory.mkdir(exist_ok=True)
-                for name in task_files + other_files:
-                    (directory / name).write_text(name, encoding="utf-8")
-            # Names are only preserved at the top level of the data directory.
-            for name in ("sunpack_watch_roots.txt", "builtin_passwords.json"):
-                (data / "unknown" / name).write_text("discard", encoding="utf-8")
+            app, data, custom, installed = (fixture / name for name in
+                                            ("app", "data", "custom ' [watch]", "previous app"))
+            for directory in (app, data, custom, installed):
+                directory.mkdir(parents=True)
+                (directory / "unrelated.txt").write_bytes(b"user owned")
             (installed / "bin").mkdir()
-            (installed / "bin" / "sunpack.exe").write_text("stub", encoding="utf-8")
-            config = {"watch": {"state_dir": str(custom)}, "unknown": "keep current data"}
+            (installed / "bin/sunpack.exe").write_bytes(b"stub")
+            (custom / "state.snapshot").write_bytes(b"old state")
+            (data / ".sunpack_watch").mkdir()
+            (data / ".sunpack_watch/state.snapshot").write_bytes(b"old state")
+            config = {"cli": {"language": "en"}, "watch": {"tray_enabled": False}}
             (data / "sunpack_config.json").write_text(json.dumps(config), encoding="utf-8")
-            roots = "sunpack_watch_roots.txt"
-            (data / "builtin_passwords.json").write_text('{"passwords":[{"value":"私有密码"}]}', encoding="utf-8-sig")
-            (data / roots).write_text("# 保留注释\nC:\\Downloads | D:\\输出 | true | true | false\n", encoding="utf-8-sig")
-            if layout == "missing":
-                (data / roots).unlink()
-                (data / "builtin_passwords.json").unlink()
-            (installed / "sunpack_advanced_config.json").write_text(json.dumps(config), encoding="utf-8")
-            if index == 1:
-                # Advanced-only custom path and a broken user config are both supported cleanup inputs.
-                (data / "sunpack_config.json").write_text("{invalid}", encoding="utf-8")
-            originals = {name: (data / name).read_bytes() for name in (*defaults, roots)
-                         if (data / name).exists()}
+            (data / "builtin_passwords.json").write_bytes(b'{"passwords": []}\r\n')
+            (data / "sunpack_watch_roots.txt").write_bytes(
+                b"# keep\r\nC:\\Downloads | D:\\out | true | true | false\r\n")
+            (installed / "sunpack_advanced_config.json").write_text(json.dumps({
+                "watch": {"state_dir": str(custom), "toast_enabled": False}
+            }), encoding="utf-8")
+            originals = {str(p.relative_to(fixture)): p.read_bytes()
+                         for p in fixture.rglob("*") if p.is_file()}
             initial_path = f"C:\\unrelated;{installed};{installed / 'bin'}"
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, registry_key + r"\environment") as key:
                 winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, initial_path)
@@ -172,43 +149,39 @@ end;
             result = subprocess.run(
                 [str(harness.with_suffix(".exe")), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/SP-",
                  "/NORESTART", f"/DIR={app}", f"/Fixture={fixture}", f"/Data={data}",
-                 f"/AddPath={int(index != 2)}",
-                 f"/StopFailure={int(stop_failure)}", f"/LOG={log}"],
+                 f"/StopFailure={int(index == 7)}", f"/LOG={log}"],
                 capture_output=True, text=True,
             )
-            if stop_failure:
+            if failure:
                 assert result.returncode != 0
-                assert (app / "unknown/nested/backup.bak").is_file()
-                assert custom.is_dir()
                 assert not (fixture / "completed").exists()
+                for name, content in originals.items():
+                    assert (fixture / name).read_bytes() == content
             else:
                 assert result.returncode == 0, log.read_text(encoding="utf-8-sig", errors="replace")
                 assert (fixture / "completed").is_file()
-                assert not (app / "unknown").exists()
-                assert (app / "sunpack_advanced_config.json").read_bytes() == (repo_root / "sunpack_advanced_config.json").read_bytes()
-                if installed != app:
-                    assert not installed.exists()
-                assert custom.exists() is (not reset or layout in ("same", "parent"))
-                assert (data / "unknown").exists() is not reset
-                if reset:
-                    assert not (data / ".sunpack_watch").exists()
-                    assert not any((custom / name).exists() for name in task_files + other_files)
-                if not reset:
-                    for directory in (data / ".sunpack_watch", custom):
-                        assert all((directory / name).read_text(encoding="utf-8") == name
-                                   for name in task_files + other_files)
-            for name in defaults:
-                expected = defaults[name] if name not in originals or (
-                    name == "sunpack_config.json" and reset and not stop_failure
-                ) else originals[name]
-                assert (data / name).read_bytes() == expected
-            if roots in originals:
-                assert (data / roots).read_bytes() == originals[roots]
-            else:
-                assert not (data / roots).exists()
+                assert not installed.exists()
+                assert not (app / "unrelated.txt").exists()
+                assert (app / "sunpack_advanced_config.json").read_bytes() == (
+                    repo_root / "sunpack_advanced_config.json").read_bytes()
+                if migrate:
+                    updated = json.loads((data / "sunpack_config.json").read_text(encoding="utf-8-sig"))
+                    assert updated["cli"]["language"] == "en"
+                    assert updated["watch"]["tray_enabled"] is False
+                    # This value comes from the OLD install, proving the script
+                    # completed before that application's directory was deleted.
+                    assert updated["watch"]["toast_enabled"] is False
+                    assert {p.name for p in data.iterdir()} == {
+                        "sunpack_config.json", "builtin_passwords.json", "sunpack_watch_roots.txt"}
+                    assert not (custom / "state.snapshot").exists()
+                    assert (custom / "unrelated.txt").read_bytes() == b"user owned"
+                else:
+                    for name, content in originals.items():
+                        if name.split("\\", 1)[0].split("/", 1)[0] == "data" or name.startswith("custom "):
+                            assert (fixture / name).read_bytes() == content
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry_key + r"\environment") as key:
-                expected_path = initial_path if stop_failure else "C:\\unrelated" + (f";{app / 'bin'}" if index != 2 else "")
-                assert winreg.QueryValueEx(key, "Path")[0] == expected_path
+                expected = initial_path if failure else f"C:\\unrelated;{app / 'bin'}"
+                assert winreg.QueryValueEx(key, "Path")[0] == expected
     finally:
         for suffix in (r"\environment", r"\integration"):
             try:

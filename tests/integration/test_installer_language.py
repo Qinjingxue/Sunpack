@@ -66,6 +66,14 @@ def test_installer_initializes_language_before_context_menu_registration(repo_ro
     assert any("initialize_config_language.ps1\"; DestDir: \"{tmp}" in line and
                "deleteafterinstall" in line for line in installer.splitlines())
     post_install = installer.split("procedure CurStepChanged(CurStep: TSetupStep);", 1)[1]
-    assert post_install.index("UpgradeConfigurationFields;") < post_install.index(
-        "InitializeInstalledLanguage;"
-    ) < post_install.index("ApplySelectedContextMenuState;")
+    assert "UpgradeConfigurationFields" not in post_install
+    assert post_install.index("InitializeInstalledLanguage;") < post_install.index(
+        "ApplySelectedContextMenuState;"
+    )
+    prepare = installer.split("function PrepareToInstall", 1)[1].split("function InitializeUninstall", 1)[0]
+    assert prepare.index("StopExistingProcessesAndWait") < prepare.index(
+        "StopAndDeleteBrokerService"
+    ) < prepare.index("UpgradeConfigurationFields")
+    assert prepare.index("InitializeLanguageOnInstall := not FileExists(") < prepare.index(
+        "UpgradeConfigurationFields"
+    ) < prepare.index("RemoveMachinePath(ExistingApplicationDirectory)")
