@@ -52,12 +52,12 @@ def test_progress_tail_preserves_all_callbacks_and_total_count():
         worker_path = "test.exe"
         def take_stderr(self): return []
         def is_alive(self): return True
-        async def submit(self, _payload, job_id, *, on_line, **_kwargs):
+        async def submit(self, _payload, job_id, *, on_event, **_kwargs):
             for index in range(count):
-                on_line("", {"type": "progress", "job_id": job_id,
+                on_event({"type": "progress", "job_id": job_id,
                              "event": "item_done", "item_index": index})
-            on_line("", {"type": "result", "job_id": job_id, "status": "ok"})
-            on_line("", {"type": "native_event", "job_id": job_id, "event": "job_finished"})
+            on_event({"type": "result", "job_id": job_id, "status": "ok"})
+            on_event({"type": "native_event", "job_id": job_id, "event": "job_finished"})
     class Holder:
         async def get_or_start(self, _startupinfo): return Worker()
     runner = SevenZipRunner({}, shared_async_worker_holder=Holder())

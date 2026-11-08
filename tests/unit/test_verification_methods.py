@@ -1,3 +1,4 @@
+from sunpack_native import encode_worker_frame, parse_worker_event
 import json
 import zipfile
 
@@ -13,7 +14,7 @@ from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
 from tests.helpers.worker_events import worker_trace_item
-from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+from sunpack_native import parse_worker_event
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest
 
 
@@ -258,7 +259,7 @@ def test_output_presence_uses_worker_manifest_progress_as_completeness(tmp_path)
         archive=str(archive),
         out_dir=str(out_dir),
         diagnostics={
-            "result": parse_worker_json_line(json.dumps({
+            "result": parse_worker_event(encode_worker_frame({
                 "status": "failed",
                 "failure_stage": "item_extract",
                 "failure_kind": "checksum_error",

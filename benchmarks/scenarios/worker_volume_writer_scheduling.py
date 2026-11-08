@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.wintypes
+from sunpack_native import encode_worker_frame
 import json
 import os
 from pathlib import Path
@@ -170,11 +171,7 @@ class _Job:
         self.finished_ns = 0
         self.done = threading.Event()
 
-    def on_line(self, line: str) -> bool:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return False
+    def on_event(self, event: dict[str, Any]) -> bool:
         if not isinstance(event, dict):
             return False
         if event.get("type") == "result" and str(event.get("job_id") or "") == self.job_id:
@@ -216,19 +213,15 @@ def _run_configuration(
     worker = _NativeWorkerProcess(str(worker_path), None)
     try:
         for job in jobs:
-            payload = json.dumps(
-                {
+            payload = encode_worker_frame({
                     "job_id": job.job_id,
                     "archive_input": {"entry_path": str(job.archive), "open_mode": "file", "format_hint": "zip"},
                     "output_dir": str(job.output_dir),
                     "output_volume_key": resolve_output_volume_key(str(job.output_dir)),
                     "password": "",
                     "dry_run": False,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            worker.submit_async(payload, job.job_id, on_line=job.on_line, on_error=job.on_error)
+                })
+            worker.submit_async(payload, job.job_id, on_event=job.on_event, on_error=job.on_error)
         deadline = time.monotonic() + timeout_seconds
         for job in jobs:
             while not job.done.is_set():

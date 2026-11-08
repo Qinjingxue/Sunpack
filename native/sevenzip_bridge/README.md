@@ -64,3 +64,41 @@ Every job supplies the canonical `archive_input` descriptor and may carry an
 byte extents belong to that descriptor. The worker does not infer input shape
 from root-level path, format, or offset aliases. File, named-volume, and range
 stream adapters remain specialized below this shared protocol.
+
+## Binary pipe frames
+
+Both stdin and stdout use `SPBF` (four bytes), a little-endian `u32` payload
+length, and one typed object. There is no newline delimiter, JSON parser,
+protocol negotiation, or fallback. Deploy the worker and Rust extension together.
+Stderr remains diagnostic text.
+
+The codecs are `src/internal/worker_wire.hpp` and
+`../sunpack_native/src/scan/worker_wire.rs`. Python forwards bytes and receives
+decoded event envelopes; manifest rows and trace items stay in Rust throughout
+assembly and verification.
+
+| Tag | Value |
+| --- | --- |
+| 0 | Container end |
+| 1 | Null |
+| 2 / 3 | False / true |
+| 4 / 5 / 6 | Little-endian u64 / i64 / IEEE-754 f64 |
+| 7 / 8 | u32 byte length followed by UTF-8 text / raw bytes |
+| 9 | Array of typed values, terminated by tag 0 |
+| 10 | Object of text keys and typed values, terminated by tag 0 |
+| 11 / 12 | u8 / little-endian u32 |
+
+Nonnegative integers use the smallest supported width. Objects carry optional
+control/result fields without a second pass to count or size them. Per-file
+manifest rows have 14 positional columns (`WorkerRow` in `worker_event.rs`),
+with raw magic bytes and an empty output path when it equals the archive path.
+Trace rows use the 20 fields of `OutputTraceItem` in declaration order.
+
+Chunks target 512 KiB and retain job IDs, sequence numbers, and final count
+validation. A larger individual row gets its own frame. Chunking does not cap
+the total result. Output locking covers the complete frame, including its
+header; paired lifecycle events share that lock. Input buffers grow only as
+bytes arrive and are released after parsing. Readers accept split/coalesced
+frames and reject incomplete EOF. Malformed bodies with a recoverable job ID
+cancel only that job; invalid framing aborts the shared worker before failing
+its pending jobs. Graceful shutdown still drains admitted work.

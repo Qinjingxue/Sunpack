@@ -6,7 +6,7 @@ independent end-to-end coverage cheap; existing format tests cover codec details
 """
 import asyncio
 import io
-import json
+from sunpack_native import parse_worker_event
 import os
 from pathlib import Path
 import shutil
@@ -70,7 +70,7 @@ def test_shared_worker_keeps_concurrent_request_identity_after_refresh(tmp_path,
     sent = []
     original = _AsyncNativeWorkerProcess.send
     async def capture(worker, payload):
-        job = json.loads(payload)
+        job = parse_worker_event(payload)
         if job.get("stage") == "extract":
             sent.append((worker, job))
         await original(worker, payload)

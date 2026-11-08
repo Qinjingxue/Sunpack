@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gc
-import json
+from sunpack_native import encode_worker_frame
 import os
 import shutil
 import sys
@@ -144,25 +144,18 @@ def _run_worker_job(
     """Submit one job to the persistent worker and wait for its result.
 
     Mirrors the completion protocol used by the sevenzip-worker-matrix
-    scenario: the stdout dispatcher feeds lines to on_line, completion is
+    scenario: the stdout dispatcher feeds decoded envelopes to on_event, completion is
     signalled by the native ``job_finished`` event once the result arrived.
     """
-    payload = json.dumps(job, ensure_ascii=False, separators=(",", ":"))
+    payload = encode_worker_frame(job)
     job_id = str(job["job_id"])
     started = time.perf_counter_ns()
     result: dict[str, Any] | None = None
     failure: list[str] = []
     completed = threading.Event()
 
-    def on_line(line: str) -> bool:
+    def on_event(event: dict[str, Any]) -> bool:
         nonlocal result
-        text = str(line).strip()
-        if not text.startswith("{"):
-            return False
-        try:
-            event = json.loads(text)
-        except json.JSONDecodeError:
-            return False
         if not isinstance(event, dict):
             return False
         if event.get("type") == "result" and str(event.get("job_id") or "") == job_id:
@@ -176,7 +169,7 @@ def _run_worker_job(
         failure.append(str(message))
         completed.set()
 
-    worker.submit_async(payload, job_id, on_line=on_line, on_error=on_error)
+    worker.submit_async(payload, job_id, on_event=on_event, on_error=on_error)
     deadline = time.monotonic() + max(1.0, timeout_seconds)
     while not completed.is_set():
         remaining = deadline - time.monotonic()

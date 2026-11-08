@@ -1,5 +1,5 @@
 import ctypes
-import json
+from sunpack_native import encode_worker_frame
 import struct
 import subprocess
 import zlib
@@ -102,18 +102,15 @@ def test_worker_extracts_with_the_password_the_fast_verifier_accepts(tmp_path):
 
     result = subprocess.run(
         [worker],
-        input=json.dumps(
+        input=encode_worker_frame(
             {
                 "job_id": "gbk-password",
                 "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
                 "output_dir": str(out_dir),
                 "password": PASSWORD,
             },
-            ensure_ascii=False,
         ),
         capture_output=True,
-        text=True,
-        encoding="utf-8",
     )
 
     assert result.returncode == 0, result.stdout + result.stderr

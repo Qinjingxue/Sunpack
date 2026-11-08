@@ -102,9 +102,9 @@ def test_cancelled_backpressure_request_does_not_strand_other_requests(transport
                 asyncio.get_running_loop().call_soon(asyncio.create_task, coroutine)
 
             def finish(self, job_id, **result):
-                callback = self.jobs[job_id]["on_line"]
-                callback("", {"type": "result", "job_id": job_id, **result})
-                assert callback("", {"type": "native_event", "event": "job_finished", "job_id": job_id})
+                callback = self.jobs[job_id]["on_event"]
+                callback({"type": "result", "job_id": job_id, **result})
+                assert callback({"type": "native_event", "event": "job_finished", "job_id": job_id})
                 self.jobs.pop(job_id)
                 self.queue_capacity.release(job_id)
 
@@ -187,9 +187,9 @@ def test_backpressure_can_retry_past_legacy_limit_without_failing(transport):
                 asyncio.get_running_loop().create_task(coroutine)
 
             def finish(self, job_id, **result):
-                callback = self.jobs[job_id]["on_line"]
-                callback("", {"type": "result", "job_id": job_id, **result})
-                assert callback("", {"type": "native_event", "event": "job_finished", "job_id": job_id})
+                callback = self.jobs[job_id]["on_event"]
+                callback({"type": "result", "job_id": job_id, **result})
+                assert callback({"type": "native_event", "event": "job_finished", "job_id": job_id})
                 self.jobs.pop(job_id)
                 self.queue_capacity.release(job_id)
 

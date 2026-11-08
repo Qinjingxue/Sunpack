@@ -28,3 +28,58 @@ def worker_trace_item(**overrides):
     if "expected_size" in overrides and "has_expected_size" not in overrides:
         item["has_expected_size"] = True
     return item
+
+
+def worker_events(data):
+    from sunpack_native import NativeWorkerFrameDecoder
+    decoder = NativeWorkerFrameDecoder()
+    events = decoder.feed(data)
+    decoder.finish()
+    return events
+
+
+def read_worker_events(stream):
+    from sunpack_native import NativeWorkerFrameDecoder
+    decoder = NativeWorkerFrameDecoder()
+    while block := stream.read1(65536):
+        yield from decoder.feed(block)
+        decoder.check()
+    decoder.finish()
+
+
+def write_worker_script(path, steps):
+    """A real pipe peer controlled by request frames, without timing sleeps."""
+    import sys
+    from sunpack_native import encode_worker_frame
+    actions = [encode_worker_frame(step) if isinstance(step, dict) else step for step in steps]
+    script = path.with_suffix(".py")
+    script.write_text(
+        "import sys, struct\n"
+        "def exact(size):\n"
+        "    data = bytearray()\n"
+        "    while len(data) < size:\n"
+        "        block = sys.stdin.buffer.read(size-len(data))\n"
+        "        if not block: sys.exit(0)\n"
+        "        data.extend(block)\n"
+        "    return data\n"
+        f"for step in {actions!r}:\n"
+        "    if step is None:\n"
+        "        header = exact(8)\n"
+        "        assert header[:4] == b'SPBF'\n"
+        "        exact(struct.unpack('<I', header[4:])[0])\n"
+        "    elif isinstance(step, int): sys.exit(step)\n"
+        "    else:\n"
+        "        sys.stdout.buffer.write(step)\n"
+        "        sys.stdout.buffer.flush()\n", encoding="utf-8")
+    path.write_text(f'@"{sys.executable}" "{script}"\n', encoding="utf-8")
+    return path
+
+
+def worker_frames(data):
+    offset = 0
+    while offset < len(data):
+        assert data[offset:offset+4] == b"SPBF" and len(data)-offset >= 8
+        size = int.from_bytes(data[offset+4:offset+8], "little") + 8
+        assert size <= len(data)-offset
+        yield data[offset:offset+size]
+        offset += size

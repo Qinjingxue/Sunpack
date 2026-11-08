@@ -1,17 +1,16 @@
-//! Parse one sevenzip worker stdout line straight into Python objects.
+//! Parse one sevenzip worker binary frame straight into Python objects.
 //!
 //! Per-item manifest and trace chunks are decoded directly into Rust-owned
 //! tables. A job accumulator moves them into the final native_rows/native_items
 //! objects while only event envelopes and result summaries become Python dicts.
 
-use crate::scan::directory::{decode_hex_bytes, NativeWorkerManifest, OutputFileRecord};
+use crate::scan::directory::{NativeWorkerManifest, OutputFileRecord};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyString};
+use pyo3::types::{PyDict, PyList, PyString};
 use pyo3::IntoPyObjectExt;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
-use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
@@ -102,37 +101,44 @@ impl NativeOutputTrace {
     }
 }
 
-/// Parse one worker line (``bytes`` or ``str``); ``None`` when it is not a JSON object event.
+/// Decode a complete binary frame directly into native tables and a small envelope.
 #[pyfunction]
-pub(crate) fn parse_worker_event(
-    py: Python<'_>,
-    line: &Bound<'_, PyAny>,
-) -> PyResult<Option<Py<PyDict>>> {
-    let text: Cow<'_, str> = if let Ok(bytes) = line.cast::<PyBytes>() {
-        String::from_utf8_lossy(bytes.as_bytes())
-    } else {
-        line.cast::<PyString>()?.to_cow()?
-    };
-    let text = text.trim();
-    if !text.starts_with('{') {
-        return Ok(None);
-    }
-    let mut deserializer = serde_json::Deserializer::from_str(text);
-    let Ok(value) = PySeed {
+pub(crate) fn parse_worker_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<PyDict>> {
+    let data = super::worker_wire::frame_payload(frame)?;
+    let mut decoder = super::worker_wire::Decoder::new(data);
+    let value = PySeed {
         py,
         scope: Scope::Root,
     }
-    .deserialize(&mut deserializer) else {
-        return Ok(None);
-    };
-    if deserializer.end().is_err() {
-        return Ok(None);
+    .deserialize(&mut decoder)?;
+    if !decoder.data.is_empty() {
+        return Err(PyValueError::new_err("trailing worker value"));
     }
-    Ok(value
-        .bind(py)
-        .cast::<PyDict>()
-        .ok()
-        .map(|dict| dict.clone().unbind()))
+    Ok(value.bind(py).cast::<PyDict>()?.clone().unbind())
+}
+
+/// A valid frame boundary permits a bad job body to be isolated. A broken
+/// header/length cannot be routed safely and aborts the shared transport.
+#[pyfunction]
+pub(crate) fn parse_worker_transport_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<PyDict>> {
+    let data = super::worker_wire::frame_payload(frame)?;
+    match parse_worker_event(py, frame) {
+        Ok(event) => Ok(event),
+        Err(error) => {
+            let job_id = super::worker_wire::Decoder::new(data)
+                .routing_job_id()
+                .ok()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("unattributable worker protocol error: {error}"))
+                })?;
+            let event = PyDict::new(py);
+            event.set_item("type", "protocol_error")?;
+            event.set_item("job_id", job_id)?;
+            event.set_item("message", format!("malformed worker event: {error}"))?;
+            Ok(event.unbind())
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -165,7 +171,7 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
     type Value = Py<PyAny>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a JSON value")
+        formatter.write_str("a binary worker value")
     }
 
     fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
@@ -464,55 +470,6 @@ fn check_chunk_summary(
     Ok(())
 }
 
-/// The normal parser is single-pass. On a malformed event only, recover the
-/// top-level routing prefix without parsing the damaged per-item body again.
-#[pyfunction]
-pub(crate) fn parse_worker_transport_event(
-    py: Python<'_>,
-    line: &Bound<'_, PyAny>,
-) -> PyResult<Py<PyDict>> {
-    if let Some(payload) = parse_worker_event(py, line)? {
-        return Ok(payload);
-    }
-    let text = if let Ok(bytes) = line.cast::<PyBytes>() {
-        String::from_utf8_lossy(bytes.as_bytes())
-    } else {
-        line.cast::<PyString>()?.to_cow()?
-    };
-    let job_id = recover_job_id(&text)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| PyValueError::new_err("unattributable worker protocol error"))?;
-    let payload = PyDict::new(py);
-    payload.set_item("type", "protocol_error")?;
-    payload.set_item("job_id", job_id)?;
-    payload.set_item("message", "malformed worker event")?;
-    Ok(payload.unbind())
-}
-
-fn recover_job_id(text: &str) -> Option<String> {
-    let mut rest = text.trim_start().strip_prefix('{')?.trim_start();
-    loop {
-        let mut key = serde_json::Deserializer::from_str(rest).into_iter::<String>();
-        let name = key.next()?.ok()?;
-        rest = rest[key.byte_offset()..]
-            .trim_start()
-            .strip_prefix(':')?
-            .trim_start();
-        if name == "job_id" {
-            return serde_json::Deserializer::from_str(rest)
-                .into_iter::<String>()
-                .next()?
-                .ok();
-        }
-        let mut value = serde_json::Deserializer::from_str(rest).into_iter::<de::IgnoredAny>();
-        value.next()?.ok()?;
-        rest = rest[value.byte_offset()..]
-            .trim_start()
-            .strip_prefix(',')?
-            .trim_start();
-    }
-}
-
 /// One fixed 14-column array per regular file in the worker manifest.
 struct WorkerRows(Vec<OutputFileRecord>);
 
@@ -530,7 +487,7 @@ type WorkerRow = (
     u8,
     u8,
     u64,
-    String,
+    MagicBytes,
 );
 
 impl<'de> Deserialize<'de> for WorkerRows {
@@ -561,7 +518,7 @@ impl<'de> Deserialize<'de> for WorkerRows {
                         status,
                         has_mtime,
                         mtime_ns,
-                        magic_hex,
+                        magic,
                     ) = row;
                     files.push(OutputFileRecord {
                         index,
@@ -576,7 +533,7 @@ impl<'de> Deserialize<'de> for WorkerRows {
                         crc_ok: Some(crc_ok != 0),
                         status,
                         mtime_ns: (has_mtime != 0).then_some(mtime_ns),
-                        magic: decode_hex_bytes(&magic_hex).map_err(py_error)?,
+                        magic: magic.0,
                     });
                 }
                 Ok(WorkerRows(files))
@@ -584,5 +541,22 @@ impl<'de> Deserialize<'de> for WorkerRows {
         }
 
         deserializer.deserialize_seq(RowsVisitor)
+    }
+}
+
+struct MagicBytes(Vec<u8>);
+impl<'de> Deserialize<'de> for MagicBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = MagicBytes;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("worker magic bytes")
+            }
+            fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<MagicBytes, E> {
+                Ok(MagicBytes(bytes.to_vec()))
+            }
+        }
+        deserializer.deserialize_bytes(BytesVisitor)
     }
 }

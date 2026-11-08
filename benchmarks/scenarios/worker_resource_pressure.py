@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
+from sunpack_native import encode_worker_frame
 import os
 import shutil
 import subprocess
@@ -114,7 +114,7 @@ def _job_payload(*, job_id: str, archive: Path, output: Path) -> str:
         "output_dir": str(output),
         "password": "",
     }
-    return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    return encode_worker_frame(item)
 
 
 def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: list[Path],
@@ -135,11 +135,7 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
     before = _counters(process)
 
     def callback(job_id: str):
-        def on_line(line: str) -> bool:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                return False
+        def on_event(event: dict[str, Any]) -> bool:
             if not isinstance(event, dict):
                 return False
             with done:
@@ -154,7 +150,7 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
                     done.notify_all()
                     return True
             return False
-        return on_line
+        return on_event
 
     def timeout(job_id: str):
         def on_error(message: str) -> None:
@@ -172,7 +168,7 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
                 _job_payload(
                     job_id=job_id, archive=archives[index], output=workspace.outputs / label / job_id,
                 ),
-                job_id, on_line=callback(job_id), on_error=timeout(job_id),
+                job_id, on_event=callback(job_id), on_error=timeout(job_id),
             )
         deadline = time.monotonic() + timeout_seconds
         with done:

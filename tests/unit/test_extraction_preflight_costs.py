@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 from sunpack.core.contracts.failures import FailureKind
@@ -54,7 +53,7 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
     }
     completed = SimpleNamespace(
         returncode=2,
-        stdout=json.dumps(worker_result),
+        stdout="",
         stderr="",
         worker_diagnostics={"result": worker_result},
     )

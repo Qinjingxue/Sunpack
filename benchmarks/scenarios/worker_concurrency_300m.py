@@ -9,6 +9,7 @@ import argparse
 import ctypes
 from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
+from sunpack_native import encode_worker_frame
 import json
 import os
 from pathlib import Path
@@ -99,7 +100,7 @@ def run_worker(worker, cases, outputs, concurrency, dll, timeout, dry_run=False)
     started = time.perf_counter()
 
     def callbacks(job_id):
-        def on_line(_line, event):
+        def on_event(event):
             nonlocal active, max_active
             now = time.perf_counter()
             with condition:
@@ -125,7 +126,7 @@ def run_worker(worker, cases, outputs, concurrency, dll, timeout, dry_run=False)
                 failures[job_id] = message
                 pending.discard(job_id)
                 condition.notify_all()
-        return on_line, on_failure
+        return on_event, on_failure
 
     try:
         next_job = 0
@@ -139,15 +140,15 @@ def run_worker(worker, cases, outputs, concurrency, dll, timeout, dry_run=False)
                     job = _case_job(cases[next_job]["item"], job_id=job_id, output_dir=outputs / str(next_job), dll_path=dll)
                     job["output_volume_key"] = volume_key
                     job["dry_run"] = dry_run
-                    on_line, on_failure = callbacks(job_id)
+                    on_event, on_failure = callbacks(job_id)
                     pending.add(job_id)
-                    submissions.append((job, job_id, on_line, on_failure))
+                    submissions.append((job, job_id, on_event, on_failure))
                     next_job += 1
             # Pipe writes can block while the worker emits events; callbacks
             # must be free to acquire the condition and drain stdout meanwhile.
-            for job, job_id, on_line, on_failure in submissions:
-                worker.submit_async(json.dumps(job, ensure_ascii=False), job_id, on_line=on_line,
-                                    on_error=on_failure, parsed_events=True)
+            for job, job_id, on_event, on_failure in submissions:
+                worker.submit_async(encode_worker_frame(job), job_id, on_event=on_event,
+                                    on_error=on_failure)
             with condition:
                 if pending and (next_job == len(cases) or len(pending) >= concurrency):
                     remaining = timeout - (time.perf_counter() - started)

@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import ctypes
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import read_worker_events
 import json
 import os
 import shutil
@@ -351,7 +353,7 @@ class SpaceVhd:
 
 
 class WorkerSession:
-    """按行 JSON 协议驱动 sunpack_sevenzip_worker.exe。
+    """二进制帧协议驱动 sunpack_sevenzip_worker.exe。
 
     SevenZipRunner 会在自己的看门狗里取消 job，而这里要测的是 native 侧的行为，
     因此本文件直接说协议：写请求、读事件、按需 cancel / shutdown。
@@ -364,7 +366,6 @@ class WorkerSession:
         # 累积列表，不是消费式队列：drain 会丢掉同时到达的 result 事件。
         self._all: list[dict] = []
         self._lock = threading.Lock()
-        self._raw: list[str] = []
         self._reader: threading.Thread | None = None
 
     def __enter__(self) -> "WorkerSession":
@@ -375,9 +376,6 @@ class WorkerSession:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
             env=environment,
         )
         self._reader = threading.Thread(target=self._pump, daemon=True)
@@ -390,19 +388,13 @@ class WorkerSession:
 
     def _pump(self) -> None:
         assert self.process is not None and self.process.stdout is not None
-        for line in self.process.stdout:
-            self._raw.append(line)
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                with self._lock:
-                    self._all.append(payload)
+        for payload in read_worker_events(self.process.stdout):
+            with self._lock:
+                self._all.append(payload)
 
     def send(self, payload: dict) -> None:
         assert self.process is not None and self.process.stdin is not None
-        self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.process.stdin.write(encode_worker_frame(payload))
         self.process.stdin.flush()
 
     def close_stdin(self) -> None:

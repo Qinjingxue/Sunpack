@@ -1,8 +1,8 @@
-import json
+from sunpack_native import encode_worker_frame, parse_worker_event
 
 from sunpack_native import worker_manifest_from_rows
 
-from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+from sunpack_native import parse_worker_event
 from tests.helpers.worker_events import worker_trace_item
 from sunpack.pipeline.extraction.progress import (
     build_extraction_progress_manifest,
@@ -11,7 +11,7 @@ from sunpack.pipeline.extraction.progress import (
 
 
 def _trace_result(items, **fields):
-    return parse_worker_json_line(json.dumps({
+    return parse_worker_event(encode_worker_frame({
         "type": "result",
         **fields,
         "diagnostics": {
@@ -113,7 +113,7 @@ def test_progress_manifest_adds_untraced_output_files(tmp_path):
 
 
 def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):
-    result = parse_worker_json_line(json.dumps({
+    result = parse_worker_event(encode_worker_frame({
         "type": "result",
         "status": "ok",
         "bytes_written": 6,
@@ -121,8 +121,8 @@ def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):
             "validated": True,
             "inventory": [1, 2, 0, 6, 1],
             "rows": [
-                [0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, ""],
-                [1, "b.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, ""],
+                [0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, b''],
+                [1, "b.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, b''],
             ],
         },
     }))

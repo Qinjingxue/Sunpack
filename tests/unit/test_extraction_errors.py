@@ -1,4 +1,3 @@
-import json
 import subprocess
 from types import SimpleNamespace
 
@@ -106,9 +105,9 @@ def _worker_completed(payload: dict) -> subprocess.CompletedProcess:
     return attach_worker_diagnostics(subprocess.CompletedProcess(
         args=["sevenzip_worker"],
         returncode=1,
-        stdout=json.dumps(event),
+        stdout="",
         stderr="",
-    ))
+    ), result_payload=event)
 
 
 def test_memory_evidence_survives_damage_and_password_guesses():

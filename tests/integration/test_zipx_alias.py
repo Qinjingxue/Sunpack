@@ -1,4 +1,5 @@
-import json
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import worker_events
 import subprocess
 
 import pytest
@@ -95,13 +96,12 @@ def test_zipx_zstd_and_unsupported_methods_keep_zip_identity(tmp_path, method):
     output = tmp_path / "output"
     process = subprocess.run(
         [get_sevenzip_bridge_worker_path()],
-        input=json.dumps({"job_id": "zipx-method", "archive_path": str(archive),
+        input=encode_worker_frame({"job_id": "zipx-method", "archive_path": str(archive),
                           "output_dir": str(output), "archive_input": descriptor}),
-        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        capture_output=True, timeout=30,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    final = next(json.loads(line) for line in process.stdout.splitlines()
-                 if line.startswith("{") and json.loads(line).get("type") == "result")
+    final = next(event for event in worker_events(process.stdout) if event.get("type") == "result")
     if method == 93:
         assert process.returncode == 0, final
         assert final["status"] == "ok", final

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
+from sunpack_native import encode_worker_frame
 import math
 import os
 from pathlib import Path
@@ -98,17 +98,13 @@ def _job_payload(
     dll_path: Path,
     dry_run: bool,
 ) -> str:
-    return json.dumps(
-        {
+    return encode_worker_frame({
             "job_id": job_id,
             "archive_input": {"entry_path": str(archive), "open_mode": "file", "format_hint": "zip"},
             "output_dir": str(output_dir),
             "password": "",
             "dry_run": dry_run,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+        })
 
 
 def _run_worker(
@@ -148,12 +144,8 @@ def _run_worker(
         dry_run=dry_run,
     )
 
-    def on_line(line: str) -> bool:
+    def on_event(event: dict[str, Any]) -> bool:
         nonlocal result
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return False
         if not isinstance(event, dict):
             return False
         events.append(event)
@@ -174,7 +166,7 @@ def _run_worker(
     sampler.take()
     started = time.perf_counter_ns()
     try:
-        worker.submit_async(payload, job_id, on_line=on_line, on_error=on_error)
+        worker.submit_async(payload, job_id, on_event=on_event, on_error=on_error)
         deadline = time.monotonic() + timeout_seconds
         while not completed.is_set():
             remaining = deadline - time.monotonic()

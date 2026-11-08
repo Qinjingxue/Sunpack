@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
+from sunpack_native import encode_worker_frame, NativeWorkerFrameDecoder
 import os
 import shutil
 import statistics
@@ -43,10 +43,13 @@ SIZE_PROFILES: dict[str, dict[str, int]] = {
 def worker_thread_capacity(worker_path: Path, *, timeout: float | None = None) -> int:
     """Read the selected binary's capacity before starting measured jobs."""
     completed = subprocess.run(
-        [str(worker_path)], input='{"worker_command":"shutdown","job_id":"shutdown"}\n',
-        capture_output=True, encoding="utf-8", check=True, timeout=timeout,
+        [str(worker_path)], input=encode_worker_frame({"worker_command": "shutdown", "job_id": "shutdown"}),
+        capture_output=True, check=True, timeout=timeout,
     )
-    ready = json.loads(completed.stdout.partition("\n")[0])
+    decoder = NativeWorkerFrameDecoder()
+    events = decoder.feed(completed.stdout)
+    decoder.finish()
+    ready = events[0]
     capacity = ready.get("thread_capacity", 0) if isinstance(ready, dict) and ready.get("type") == "worker_ready" else 0
     if type(capacity) is not int or capacity < 1:
         raise ValueError(f"Missing worker capacity from {worker_path}: {ready!r}")
@@ -115,7 +118,7 @@ def _run_job(
     timeout_seconds: float,
     sampler: ProcessSampler,
 ) -> dict[str, Any]:
-    payload = json.dumps(job, ensure_ascii=False, separators=(",", ":"))
+    payload = encode_worker_frame(job)
     job_id = str(job["job_id"])
     cpu_before = _worker_cpu_ms(worker)
     sample_start = len(sampler.samples)
@@ -126,15 +129,8 @@ def _run_job(
     failure: list[str] = []
     completed = threading.Event()
 
-    def on_line(line: str) -> bool:
+    def on_event(event: dict[str, Any]) -> bool:
         nonlocal result
-        text = str(line).strip()
-        if not text.startswith("{"):
-            return False
-        try:
-            event = json.loads(text)
-        except json.JSONDecodeError:
-            return False
         if not isinstance(event, dict):
             return False
         events.append(event)
@@ -149,7 +145,7 @@ def _run_job(
         failure.append(str(message))
         completed.set()
 
-    worker.submit_async(payload, job_id, on_line=on_line, on_error=on_error)
+    worker.submit_async(payload, job_id, on_event=on_event, on_error=on_error)
     deadline = time.monotonic() + max(1.0, timeout_seconds)
     while not completed.is_set():
         remaining = deadline - time.monotonic()

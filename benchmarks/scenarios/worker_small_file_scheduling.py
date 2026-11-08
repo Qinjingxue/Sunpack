@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
+from sunpack_native import encode_worker_frame
 import os
 import psutil
 import shutil
@@ -78,17 +78,13 @@ def _job_payload(
     output_dir: Path,
     format_hint: str = "zip",
 ) -> str:
-    return json.dumps(
-        {
+    return encode_worker_frame({
             "job_id": job_id,
             "request_id": request_id,
             "archive_input": {"entry_path": str(archive), "open_mode": "file", "format_hint": format_hint},
             "output_dir": str(output_dir),
             "password": "",
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+        })
 
 
 def _run_batch(
@@ -146,11 +142,8 @@ def _run_batch(
     resource_before = process_counters(worker_process)
 
     def make_callback(job_id: str) -> Any:
-        def on_line(line: str) -> bool:
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                return False
+        def on_event(event: dict[str, Any]) -> bool:
+            payload = event
             if not isinstance(payload, dict):
                 return False
             now = time.perf_counter()
@@ -171,7 +164,7 @@ def _run_batch(
                     return True
             return False
 
-        return on_line
+        return on_event
 
     def on_error(job_id: str) -> Any:
         def record(message: str) -> None:
@@ -219,7 +212,7 @@ def _run_batch(
                         else str(corpus.get("format_hint") or "zip")
                     ),
                 )
-                worker.submit_async(payload, job_id, on_line=make_callback(job_id), on_error=on_error(job_id))
+                worker.submit_async(payload, job_id, on_event=make_callback(job_id), on_error=on_error(job_id))
         submission_finished_at = time.perf_counter()
         deadline = submission_finished_at + timeout_seconds
         with done:

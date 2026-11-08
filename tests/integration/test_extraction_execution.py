@@ -1,4 +1,4 @@
-import json
+from sunpack_native import encode_worker_frame, parse_worker_event
 import subprocess
 import tempfile
 import unittest
@@ -14,7 +14,6 @@ from sunpack.pipeline.extraction.internal.sevenzip.metadata import (
 )
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
     attach_worker_diagnostics,
-    parse_worker_json_line,
 )
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from tests.helpers.archive_tasks import make_archive_task
@@ -255,7 +254,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                         },
                     },
                 }
-                diagnostics["result"] = parse_worker_json_line(json.dumps(diagnostics["result"]))
+                diagnostics["result"] = parse_worker_event(encode_worker_frame(diagnostics["result"]))
                 return _completed(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             task = make_archive_task(archive_path)

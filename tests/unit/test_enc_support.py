@@ -1,12 +1,13 @@
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import worker_events
 """Official ENC vectors through the existing worker, discovery and verification."""
 import asyncio
-import json
 import os
 import shutil
 from pathlib import Path
 
 import pytest
-from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
+from sunpack_native import NativeWorkerResultAccumulator
 from sunpack.core.analysis import ArchiveAnalyzer
 from sunpack.core.passwords.resolver import archive_structure_password_state
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
@@ -35,13 +36,12 @@ def worker(path, output, candidates=("sunpack-test",), *, origin="foreground"):
                "archive_input": {"kind": "archive_input", "entry_path": str(path), "format_hint": "enc"},
                "output_dir": str(output), "password_candidates": list(candidates)}
     completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
-                               input=json.dumps(request, ensure_ascii=False), text=True,
-                               capture_output=True, encoding="utf-8", timeout=30,
+                               input=encode_worker_frame(request),
+                               capture_output=True,  timeout=30,
                                creationflags=subprocess.CREATE_NO_WINDOW)
     accumulator = NativeWorkerResultAccumulator(output.name)
     result = None
-    for line in completed.stdout.splitlines():
-        event = parse_worker_transport_event(line)
+    for event in worker_events(completed.stdout):
         if event:
             accumulator.accept(event)
             if event.get("type") == "result":
@@ -139,11 +139,11 @@ def test_shared_worker_interleaves_watch_cli_success_wrong_password_and_damage(t
             for i in range(16):
                 path = DATA / ("bad_mac.enc" if i % 4 == 3 else f"algorithm_{i % 10}.mov")
                 candidates = ["wrong1"] if i % 4 == 2 else ["sunpack-test"]
-                request = json.dumps({"job_id": str(i), "origin": "watch" if i % 2 else "foreground",
+                request = encode_worker_frame({"job_id": str(i), "origin": "watch" if i % 2 else "foreground",
                                       "archive_input": {"entry_path": str(path), "open_mode": "file", "format_hint": "enc"},
                                       "output_dir": str(tmp_path / str(i)), "password_candidates": candidates})
-                await process.submit(request, str(i), parsed_events=True,
-                                     on_line=lambda line, event: events.append(event) or event.get("event") == "job_finished",
+                await process.submit(request, str(i),
+                                     on_event=lambda event: events.append(event) or event.get("event") == "job_finished",
                                      on_error=lambda message: events.append({"error": message}))
                 finished.append(process._jobs[str(i)]["finished"])
             await asyncio.wait_for(asyncio.gather(*finished), 30)

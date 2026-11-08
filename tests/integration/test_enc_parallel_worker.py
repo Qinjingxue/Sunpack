@@ -1,6 +1,7 @@
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import worker_events
 """Independent SSE payloads exercise worker CPU credits and cipher backends."""
 import asyncio
-import json
 import os
 import shutil
 import subprocess
@@ -8,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from sunpack_native import parse_worker_transport_event
 from tests.helpers.native_fixture import file_inventory, native_fixture
 from tests.helpers.native_build import sevenzip_artifact
 
@@ -35,11 +35,10 @@ def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path
     if executor_threads:
         env["RAYON_NUM_THREADS"] = str(executor_threads)
     completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
-                               input=json.dumps(request), capture_output=True, text=True, encoding="utf-8",
+                               input=encode_worker_frame(request), capture_output=True,
                                timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
                                env=env)
-    events = [event for line in completed.stdout.splitlines()
-              if (event := parse_worker_transport_event(line))]
+    events = worker_events(completed.stdout)
     result = next(event for event in events if event.get("type") == "result")
     assert result["status"] == "ok" and result["verified_manifest"]["validated"], result
     expected = file_inventory(large_enc)["large.expected"]
@@ -49,7 +48,7 @@ def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path
     # all of them before this first extraction progress callback.
     assert cpu["decoder_cpu_credits"] == 1
     assert cpu["current_decoder_extra_credits"] == 0
-    handshake = json.loads(completed.stdout.splitlines()[0])
+    handshake = worker_events(completed.stdout)[0]
     assert cpu["peak_decoder_extra_credits"] == min(3, int(handshake["thread_capacity"]) - 1)
     assert not cpu["decoder_parallel"]
 
@@ -74,8 +73,8 @@ def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_p
                     request = {"job_id": job_id, "origin": "watch" if index % 2 else "foreground",
                                "archive_input": {"entry_path": str(path), "open_mode": "file", "format_hint": "enc"}, "password": password,
                                "output_dir": str(tmp_path / job_id)}
-                    await process.submit(json.dumps(request), job_id, parsed_events=True,
-                                         on_line=lambda line, event: events.append(event) or event.get("event") == "job_finished",
+                    await process.submit(encode_worker_frame(request), job_id,
+                                         on_event=lambda event: events.append(event) or event.get("event") == "job_finished",
                                          on_error=lambda message: events.append({"error": message}))
                     finished.append(process._jobs[job_id]["finished"])
                 await asyncio.wait_for(asyncio.gather(*finished), 30)
@@ -115,11 +114,10 @@ def test_enc_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path
                                  "open_mode": "concat_ranges", "format_hint": "enc", "ranges": ranges},
                "output_dir": str(tmp_path / "out"), "password_candidates": ["sunpack-test"]}
     completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
-                               input=json.dumps(request), capture_output=True, text=True, encoding="utf-8",
+                               input=encode_worker_frame(request), capture_output=True,
                                timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
                                env=os.environ.copy())
-    events = [event for line in completed.stdout.splitlines()
-              if (event := parse_worker_transport_event(line))]
+    events = worker_events(completed.stdout)
     result = next(event for event in events if event.get("type") == "result")
     if incomplete:
         assert result["native_status"] == "damaged" and not result["wrong_password"], result

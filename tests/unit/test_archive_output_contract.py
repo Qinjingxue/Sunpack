@@ -1,8 +1,8 @@
+from sunpack_native import encode_worker_frame
 """Cross-layer regressions that ordinary archive fixtures cannot exercise."""
 
 import asyncio
 import io
-import json
 import subprocess
 import tarfile
 import zipfile
@@ -44,12 +44,12 @@ def test_file_directory_collisions_share_worker_and_manifest_names(tmp_path, arc
     output = tmp_path / "out"
     completed = subprocess.run(
         [get_sevenzip_bridge_worker_path()],
-        input=json.dumps({
+        input=encode_worker_frame({
             "job_id": "collision",
             "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint=archive_format).to_dict(),
             "output_dir": str(output),
         }),
-        capture_output=True, text=True, encoding="utf-8", timeout=15,
+        capture_output=True,   timeout=15,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr

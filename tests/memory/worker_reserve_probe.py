@@ -11,6 +11,9 @@ from pathlib import Path
 import psutil
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import read_worker_events
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.platform.windows.process_job import (
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION_STRUCT as Limits, _kernel32,
 )
@@ -59,14 +62,13 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
         'SUNPACK_TEST_MEMORY_TRACE': str(trace) if trace_memory else ''} | (extra_env or {})
     error_file = (OUT / (label + '.stderr.txt')).open('w', encoding='utf-8')
     p = subprocess.Popen([str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error_file,
-        text=True, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW, env=env)
+        creationflags=subprocess.CREATE_NO_WINDOW, env=env)
     box.assign(p)
     events, results, edits = [], [], []
     q = queue.Queue()
     started = time.monotonic()
     def reader():
-        for line in p.stdout:
-            event = json.loads(line)
+        for event in read_worker_events(p.stdout):
             event['_tick'] = K.GetTickCount64()
             event['_t'] = round(time.monotonic() - started, 6)
             events.append(event)
@@ -85,11 +87,11 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
     decode_started = time.monotonic()
     for i in range(jobs):
         item = workloads[i % len(workloads)] if workloads else {'archive': archive, 'format': hint, 'password': password}
-        request = {'job_id': str(i), 'archive_path': str(item['archive']), 'format_hint': item['format'],
+        request = {'job_id': str(i), 'archive_input': ArchiveInputDescriptor.from_parts(archive_path=str(item['archive']), format_hint=item['format']).to_dict(),
             'output_dir': str(OUT / 'outputs' / label / str(i)), 'origin': 'watch' if i%2 else 'foreground',
             'output_volume_key': 'reserve-probe-' + str(i % volumes), 'dry_run': dry}
         if item.get('password'): request['password_candidates'] = [item['password']]
-        p.stdin.write(json.dumps(request) + '\n')
+        p.stdin.write(encode_worker_frame(request))
     p.stdin.flush()
     expanded = shrunk = restored = False
     shrink_time = 0
@@ -161,7 +163,7 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
         return report
     finally:
         if p.poll() is None: p.terminate(); p.wait(timeout=10)
-        (OUT/(label+'.events.jsonl')).write_text('\n'.join(json.dumps(e) for e in events))
+        (OUT/(label+'.events.jsonl')).write_text('\n'.join(json.dumps(e, default=str) for e in events))
         error_file.close()
         box.close()
 

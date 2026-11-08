@@ -1,15 +1,13 @@
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import worker_events
 """Real native fixtures: Python projects metadata; C++ generates binary inputs."""
 import asyncio
 import concurrent.futures
-import json
 import subprocess
 from pathlib import Path
 
 import pytest
-from sunpack_native import (
-    NativeWorkerResultAccumulator,
-    inspect_compression_stream_identity, parse_worker_transport_event,
-)
+from sunpack_native import NativeWorkerResultAccumulator, inspect_compression_stream_identity
 from sunpack.core.analysis.engine import AnalysisEngine
 from sunpack.core.analysis.embedded.result import embedded_scan_prepass
 from sunpack_native import scan_embedded_archives
@@ -42,14 +40,13 @@ def worker(descriptor, output):
     request = {"job_id": output.name, "archive_input": descriptor.to_dict(),
                "archive_path": descriptor.entry_path, "output_dir": str(output)}
     completed = subprocess.run(
-        [str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))], input=json.dumps(request),
-        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        [str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))], input=encode_worker_frame(request),
+        capture_output=True,   timeout=30,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     accumulator = NativeWorkerResultAccumulator(output.name)
     result = None
-    for line in completed.stdout.splitlines():
-        event = parse_worker_transport_event(line)
+    for event in worker_events(completed.stdout):
         if event:
             accumulator.accept(event)
             if event.get("type") == "result":
@@ -245,11 +242,11 @@ def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures,
             for i in range(16):
                 name = ("frame_7_15.lz4", "concat.bin", "bad_content.lz4", "unsupported_id_0.lz4")[i % 4]
                 descriptor = ArchiveInputDescriptor(entry_path=str(fixtures / name), format_hint="lz4")
-                request = json.dumps({"job_id": str(i), "origin": "watch" if i % 2 else "foreground",
+                request = encode_worker_frame({"job_id": str(i), "origin": "watch" if i % 2 else "foreground",
                     "archive_input": descriptor.to_dict(), "archive_path": descriptor.entry_path,
                     "output_dir": str(tmp_path / str(i))})
-                await process.submit(request, str(i), parsed_events=True,
-                    on_line=lambda line, event: events.append(event) or event.get("event") == "job_finished",
+                await process.submit(request, str(i),
+                    on_event=lambda event: events.append(event) or event.get("event") == "job_finished",
                     on_error=lambda message: events.append({"error": message}))
                 finished.append(process._jobs[str(i)]["finished"])
             await asyncio.wait_for(asyncio.gather(*finished), 30)

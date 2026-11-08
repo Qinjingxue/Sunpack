@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import json
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import worker_events
 import shutil
 import subprocess
 import zipfile
@@ -35,19 +36,13 @@ def _make_zip(path: Path) -> None:
 def _run_worker(worker: Path, payload: dict) -> dict:
     completed = subprocess.run(
         [str(worker)],
-        input=json.dumps(payload, ensure_ascii=False),
+        input=encode_worker_frame(payload),
         capture_output=True,
-        text=True,
-        encoding="utf-8",
         timeout=120,
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    results = [
-        json.loads(line)
-        for line in completed.stdout.splitlines()
-        if line.strip().startswith("{") and '"type":"result"' in line.replace(" ", "")
-    ]
+    results = [event for event in worker_events(completed.stdout) if event.get("type") == "result"]
     assert results, f"worker produced no result line: {completed.stdout!r} {completed.stderr!r}"
     return results[-1]
 

@@ -30,6 +30,9 @@
 #include <vector>
 
 #include "internal/sevenzip_status.hpp"
+#include "internal/worker_wire.hpp"
+#include <fcntl.h>
+#include <io.h>
 #include "internal/archive_operations.hpp"
 #include "internal/sevenzip_formats.hpp"
 #include "internal/sevenzip_sdk.hpp"
@@ -53,32 +56,6 @@ bool read_file_timing_enabled() noexcept {
         return value && value[0] == '1';
     }();
     return enabled;
-}
-
-std::string json_escape(const std::string& value) {
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (const unsigned char ch : value) {
-        switch (ch) {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if (ch < 0x20) {
-                std::ostringstream escaped;
-                escaped << "\\u"
-                        << std::uppercase << std::hex << std::setw(4) << std::setfill('0')
-                        << static_cast<int>(ch);
-                out += escaped.str();
-            } else {
-                out += static_cast<char>(ch);
-            }
-            break;
-        }
-    }
-    return out;
 }
 
 std::wstring utf8_to_wide(const std::string& value) {
@@ -114,326 +91,6 @@ std::string wide_to_utf8(const std::wstring& value) {
     return std::string(value.begin(), value.end());
 #endif
 }
-
-std::size_t skip_ws(std::string_view json, std::size_t pos) {
-    while (pos < json.size() && static_cast<unsigned char>(json[pos]) <= 0x20) {
-        ++pos;
-    }
-    return pos;
-}
-
-std::size_t json_string_end(std::string_view json, std::size_t quote_pos) {
-    if (quote_pos >= json.size() || json[quote_pos] != '"') {
-        return quote_pos;
-    }
-    bool escaped = false;
-    for (std::size_t pos = quote_pos + 1; pos < json.size(); ++pos) {
-        const char ch = json[pos];
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (ch == '\\') {
-            escaped = true;
-            continue;
-        }
-        if (ch == '"') {
-            return pos + 1;
-        }
-    }
-    return json.size();
-}
-
-std::size_t json_composite_end(std::string_view json, std::size_t start) {
-    int object_depth = 0;
-    int array_depth = 0;
-    for (std::size_t pos = start; pos < json.size();) {
-        const char ch = json[pos];
-        if (ch == '"') {
-            pos = json_string_end(json, pos);
-            continue;
-        }
-        if (ch == '{') {
-            ++object_depth;
-        } else if (ch == '}') {
-            --object_depth;
-        } else if (ch == '[') {
-            ++array_depth;
-        } else if (ch == ']') {
-            --array_depth;
-        }
-        ++pos;
-        if (object_depth == 0 && array_depth == 0) {
-            return pos;
-        }
-    }
-    return json.size();
-}
-
-std::size_t json_value_end(std::string_view json, std::size_t start) {
-    start = skip_ws(json, start);
-    if (start >= json.size()) {
-        return start;
-    }
-    if (json[start] == '"') {
-        return json_string_end(json, start);
-    }
-    if (json[start] == '{' || json[start] == '[') {
-        return json_composite_end(json, start);
-    }
-    std::size_t pos = start;
-    while (pos < json.size()) {
-        const char ch = json[pos];
-        if (ch == ',' || ch == '}' || ch == ']' || static_cast<unsigned char>(ch) <= 0x20) {
-            break;
-        }
-        ++pos;
-    }
-    return pos;
-}
-
-std::string decode_json_string(std::string_view token) {
-    if (token.size() < 2 || token.front() != '"' || token.back() != '"') {
-        return {};
-    }
-    std::string out;
-    out.reserve(token.size() - 2);
-    for (std::size_t pos = 1; pos + 1 < token.size(); ++pos) {
-        const char ch = token[pos];
-        if (ch != '\\' || pos + 2 >= token.size()) {
-            out.push_back(ch);
-            continue;
-        }
-        const char escaped = token[++pos];
-        switch (escaped) {
-        case 'b': out.push_back('\b'); break;
-        case 'f': out.push_back('\f'); break;
-        case 'n': out.push_back('\n'); break;
-        case 'r': out.push_back('\r'); break;
-        case 't': out.push_back('\t'); break;
-        case '"': out.push_back('"'); break;
-        case '\\': out.push_back('\\'); break;
-        case '/': out.push_back('/'); break;
-        default:
-            // Python sends worker requests with ensure_ascii=False. Preserve the
-            // previous protocol behaviour for uncommon escape forms instead of
-            // adding a second general-purpose JSON decoder here.
-            out.push_back(escaped);
-            break;
-        }
-    }
-    return out;
-}
-
-std::vector<std::string_view> json_array_values(std::string_view array_json) {
-    std::vector<std::string_view> values;
-    std::size_t pos = skip_ws(array_json, 0);
-    if (pos >= array_json.size() || array_json[pos] != '[') {
-        return values;
-    }
-    ++pos;
-    while (pos < array_json.size()) {
-        pos = skip_ws(array_json, pos);
-        if (pos >= array_json.size() || array_json[pos] == ']') {
-            break;
-        }
-        const std::size_t end = json_value_end(array_json, pos);
-        if (end <= pos) {
-            break;
-        }
-        values.push_back(array_json.substr(pos, end - pos));
-        pos = skip_ws(array_json, end);
-        if (pos < array_json.size() && array_json[pos] == ',') {
-            ++pos;
-        } else if (pos < array_json.size() && array_json[pos] != ']') {
-            break;
-        }
-    }
-    return values;
-}
-
-class JsonObjectView {
-public:
-    JsonObjectView() = default;
-
-    explicit JsonObjectView(std::string_view json) {
-        reset(json);
-    }
-
-    bool valid() const noexcept {
-        return valid_;
-    }
-
-    std::string string_field(
-        std::string_view key,
-        std::string_view fallback = {}
-    ) const {
-        const auto value = raw_field(key);
-        if (!value || value->size() < 2 || value->front() != '"') {
-            return std::string(fallback);
-        }
-        return decode_json_string(*value);
-    }
-
-    bool uint_field(std::string_view key, unsigned long long* value) const {
-        const auto raw = raw_field(key);
-        if (!raw) {
-            return false;
-        }
-        std::size_t pos = skip_ws(*raw, 0);
-        unsigned long long parsed = 0;
-        bool any = false;
-        while (pos < raw->size() && (*raw)[pos] >= '0' && (*raw)[pos] <= '9') {
-            any = true;
-            parsed = parsed * 10 + static_cast<unsigned long long>((*raw)[pos] - '0');
-            ++pos;
-        }
-        if (any && value) {
-            *value = parsed;
-        }
-        return any;
-    }
-
-    bool bool_field(std::string_view key, bool fallback = false) const {
-        const auto raw = raw_field(key);
-        if (!raw) {
-            return fallback;
-        }
-        const std::size_t pos = skip_ws(*raw, 0);
-        if (raw->substr(pos, 4) == "true") {
-            return true;
-        }
-        if (raw->substr(pos, 5) == "false") {
-            return false;
-        }
-        if (pos < raw->size() && (*raw)[pos] == '"') {
-            const std::string text = decode_json_string(raw->substr(pos));
-            return text == "true" || text == "1" || text == "yes";
-        }
-        return fallback;
-    }
-
-    JsonObjectView object_field(std::string_view key) const {
-        const auto raw = raw_field(key);
-        if (!raw) {
-            return {};
-        }
-        const std::size_t pos = skip_ws(*raw, 0);
-        if (pos >= raw->size() || (*raw)[pos] != '{') {
-            return {};
-        }
-        return JsonObjectView(raw->substr(pos));
-    }
-
-    std::vector<std::string> string_array_field(std::string_view key) const {
-        std::vector<std::string> values;
-        const auto raw = raw_field(key);
-        if (!raw) {
-            return values;
-        }
-        for (const auto item : json_array_values(*raw)) {
-            if (item.size() >= 2 && item.front() == '"' && item.back() == '"') {
-                values.push_back(decode_json_string(item));
-            }
-        }
-        return values;
-    }
-
-    std::vector<std::string_view> object_array_field(std::string_view key) const {
-        std::vector<std::string_view> values;
-        const auto raw = raw_field(key);
-        if (!raw) {
-            return values;
-        }
-        for (const auto item : json_array_values(*raw)) {
-            if (!item.empty() && item.front() == '{') {
-                values.push_back(item);
-            }
-        }
-        return values;
-    }
-
-    bool index_array_field(std::string_view key, std::vector<std::size_t>& values) const {
-        const auto raw = raw_field(key);
-        if (!raw || raw->empty() || raw->front() != '[') return false;
-        for (const auto item : json_array_values(*raw)) {
-            std::size_t value = 0;
-            if (item.empty()) return false;
-            for (const char digit : item) {
-                if (digit < '0' || digit > '9' || value > (SIZE_MAX - (digit - '0')) / 10) return false;
-                value = value * 10 + (digit - '0');
-            }
-            values.push_back(value);
-        }
-        return !values.empty();
-    }
-
-private:
-    struct Field {
-        std::string_view key;
-        std::string_view value;
-    };
-
-    void reset(std::string_view json) {
-        source_ = json;
-        fields_.clear();
-        valid_ = false;
-
-        std::size_t pos = skip_ws(source_, 0);
-        if (pos >= source_.size() || source_[pos] != '{') {
-            return;
-        }
-        ++pos;
-        while (pos < source_.size()) {
-            pos = skip_ws(source_, pos);
-            if (pos < source_.size() && source_[pos] == '}') {
-                valid_ = true;
-                return;
-            }
-            if (pos >= source_.size() || source_[pos] != '"') {
-                return;
-            }
-            const std::size_t key_end = json_string_end(source_, pos);
-            if (key_end <= pos + 1 || key_end > source_.size()) {
-                return;
-            }
-            const std::string_view key = source_.substr(pos + 1, key_end - pos - 2);
-            pos = skip_ws(source_, key_end);
-            if (pos >= source_.size() || source_[pos] != ':') {
-                return;
-            }
-            pos = skip_ws(source_, pos + 1);
-            const std::size_t value_end = json_value_end(source_, pos);
-            if (value_end <= pos) {
-                return;
-            }
-            fields_.push_back(Field{key, source_.substr(pos, value_end - pos)});
-            pos = skip_ws(source_, value_end);
-            if (pos < source_.size() && source_[pos] == ',') {
-                ++pos;
-                continue;
-            }
-            if (pos < source_.size() && source_[pos] == '}') {
-                valid_ = true;
-                return;
-            }
-            return;
-        }
-    }
-
-    std::optional<std::string_view> raw_field(std::string_view key) const {
-        for (const auto& field : fields_) {
-            if (field.key == key) {
-                return field.value;
-            }
-        }
-        return std::nullopt;
-    }
-
-    std::string_view source_;
-    std::vector<Field> fields_;
-    bool valid_ = false;
-};
 
 struct WorkerArchiveInput {
     sunpack::sevenzip::VolumeAttemptPlan volume_attempts;
@@ -530,8 +187,8 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
     using sunpack::sevenzip::ExtractInputRange;
     std::vector<ExtractInputRange> ranges;
     ranges.reserve(objects.size());
-    for (const auto object_json : objects) {
-        const JsonObjectView object(object_json);
+    for (const auto object_frame : objects) {
+        const wire::ObjectView object(object_frame);
         unsigned long long start = 0;
         unsigned long long end = 0;
         const bool has_start =
@@ -552,9 +209,9 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
     return ranges;
 }
 
-WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request) {
+WorkerArchiveInput parse_archive_input_descriptor(const wire::ObjectView& request) {
     WorkerArchiveInput input;
-    const JsonObjectView descriptor = request.object_field("archive_input");
+    const wire::ObjectView descriptor = request.object_field("archive_input");
     if (!descriptor.valid()) {
         input.validation_error = "archive_input descriptor is required";
         return input;
@@ -565,8 +222,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
     input.open_mode = utf8_to_wide(mode);
     input.format_hint = utf8_to_wide(descriptor.string_field("format_hint", ""));
 
-    const JsonObjectView analysis = descriptor.object_field("analysis");
-    const JsonObjectView execution_analysis = analysis.object_field("execution");
+    const wire::ObjectView analysis = descriptor.object_field("analysis");
+    const wire::ObjectView execution_analysis = analysis.object_field("execution");
     input.analyzed_missing_volume_evidence =
         execution_analysis.string_field("missing_volume_evidence", "");
 
@@ -578,7 +235,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
         plan.sources = parse_ranges_from_objects(attempts.object_array_field("sources"), "");
         for (auto raw : attempts.object_array_field("domains")) {
             std::vector<std::size_t> choices;
-            if (!JsonObjectView(raw).index_array_field("choices", choices) ||
+            if (!wire::ObjectView(raw).index_array_field("choices", choices) ||
                 std::any_of(choices.begin(), choices.end(), [&](auto i) { return i >= plan.sources.size(); })) {
                 input.validation_error = "invalid volume attempt domain"; return input;
             }
@@ -586,7 +243,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
         }
         for (auto raw : attempts.object_array_field("tail_totals")) {
             unsigned long long source = 0, total = 0;
-            const JsonObjectView entry(raw);
+            const wire::ObjectView entry(raw);
             if (!entry.uint_field("source", &source) || source >= plan.sources.size() ||
                 !entry.uint_field("total", &total) || !total) {
                 input.validation_error = "invalid volume tail total"; return input;
@@ -598,8 +255,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
             std::vector<sunpack::sevenzip::VolumeAttemptSlot> slots;
             unsigned long long previous = 0;
             std::unordered_set<std::wstring> names;
-            for (auto raw_slot : JsonObjectView(raw_layout).object_array_field("slots")) {
-                const JsonObjectView slot(raw_slot);
+            for (auto raw_slot : wire::ObjectView(raw_layout).object_array_field("slots")) {
+                const wire::ObjectView slot(raw_slot);
                 unsigned long long number = 0;
                 sunpack::sevenzip::VolumeAttemptSlot parsed;
                 parsed.name = utf8_to_wide(slot.string_field("canonical_name", ""));
@@ -616,7 +273,7 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
             }
             if (slots.empty()) { input.validation_error = "empty volume attempt layout"; return input; }
             unsigned long long minimum = 0;
-            const JsonObjectView raw(raw_layout);
+            const wire::ObjectView raw(raw_layout);
             raw.uint_field("minimum_slots", &minimum);
             if (minimum && (minimum < 2 || minimum > slots.size() ||
                     slots.back().number != slots.size())) {
@@ -645,8 +302,8 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
     std::vector<ParsedPart> structured_parts;
     input.part_paths.reserve(part_objects.size());
     if (structured) structured_parts.reserve(part_objects.size());
-    for (const auto object_json : part_objects) {
-        const JsonObjectView object(object_json);
+    for (const auto object_frame : part_objects) {
+        const wire::ObjectView object(object_frame);
         const std::string path = object.string_field("path", "");
         if (path.empty()) continue;
         if (!structured) {
@@ -725,15 +382,15 @@ struct WorkerRequest {
     WorkerArchiveInput archive_input;
 };
 
-WorkerRequest parse_worker_request(const std::string& request_json) {
-    const JsonObjectView json(request_json);
+WorkerRequest parse_worker_request(const std::string& request_frame) {
+    const wire::ObjectView fields(request_frame);
     WorkerRequest request;
-    request.worker_command = json.string_field("worker_command", "");
-    request.job_id = json.string_field("job_id", "");
-    request.request_id = json.string_field("request_id", "");
-    request.origin = json.string_field("origin", "foreground");
-    request.output_volume_key = json.string_field("output_volume_key", "");
-    request.process_mode = json.string_field("mode", "normal");
+    request.worker_command = fields.string_field("worker_command", "");
+    request.job_id = fields.string_field("job_id", "");
+    request.request_id = fields.string_field("request_id", "");
+    request.origin = fields.string_field("origin", "foreground");
+    request.output_volume_key = fields.string_field("output_volume_key", "");
+    request.process_mode = fields.string_field("mode", "normal");
 
     if (
         request.worker_command == "cancel" ||
@@ -743,33 +400,31 @@ WorkerRequest parse_worker_request(const std::string& request_json) {
         return request;
     }
 
-    request.output_dir = utf8_to_wide(json.string_field("output_dir", ""));
-    request.password = utf8_to_wide(json.string_field("password", ""));
-    request.codepage = utf8_to_wide(json.string_field("codepage", ""));
-    request.dry_run = json.bool_field("dry_run", false);
-    request.password_verified = json.bool_field("password_verified", false);
+    request.output_dir = utf8_to_wide(fields.string_field("output_dir", ""));
+    request.password = utf8_to_wide(fields.string_field("password", ""));
+    request.codepage = utf8_to_wide(fields.string_field("codepage", ""));
+    request.dry_run = fields.bool_field("dry_run", false);
+    request.password_verified = fields.bool_field("password_verified", false);
 
-    for (const auto& candidate : json.string_array_field("password_candidates")) {
+    for (const auto& candidate : fields.string_array_field("password_candidates")) {
         request.password_candidates.push_back(utf8_to_wide(candidate));
     }
-    request.archive_input = parse_archive_input_descriptor(json);
+    request.archive_input = parse_archive_input_descriptor(fields);
     return request;
 }
 
 std::mutex g_output_mutex;
 
-void print_json_line(const std::string& json) {
+void print_frame(const std::string& payload) {
     std::lock_guard<std::mutex> lock(g_output_mutex);
-    std::cout << json << "\n";
+    wire::write(std::cout, payload);
     std::cout.flush();
 }
 
-void print_json_lines(
-    const std::string& first,
-    const std::string& second
-) {
+void print_frames(const std::string& first, const std::string& second) {
     std::lock_guard<std::mutex> lock(g_output_mutex);
-    std::cout << first << "\n" << second << "\n";
+    wire::write(std::cout, first);
+    wire::write(std::cout, second);
     std::cout.flush();
 }
 
@@ -784,54 +439,43 @@ std::string hresult_hex(int value) {
     return stream.str();
 }
 
-std::string bytes_hex(const std::vector<unsigned char>& bytes) {
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(bytes.size() * 2);
-    for (const unsigned char value : bytes) {
-        result.push_back(digits[value >> 4]);
-        result.push_back(digits[value & 0x0f]);
-    }
-    return result;
-}
-
-std::string input_trace_json(const sunpack::sevenzip::ExtractInputTrace& trace) {
-    return std::string("{") +
-        "\"mode\":\"" + json_escape(wide_to_utf8(trace.mode)) +
-        "\",\"virtual_size\":" + std::to_string(trace.virtual_size) +
-        ",\"position\":" + std::to_string(trace.position) +
-        ",\"max_position_seen\":" + std::to_string(trace.max_position_seen) +
-        ",\"total_bytes_returned\":" + std::to_string(trace.total_bytes_returned) +
-        ",\"read_file_call_count\":" + std::to_string(trace.read_file_call_count) +
-        ",\"read_file_wall_ns\":" + std::to_string(trace.read_file_wall_ns) +
-        ",\"read_file_max_wall_ns\":" + std::to_string(trace.read_file_max_wall_ns) +
-        ",\"logical_read_call_count\":" + std::to_string(trace.logical_read_call_count) +
-        ",\"sequential_read_bytes\":" + std::to_string(trace.sequential_read_bytes) +
-        ",\"nonsequential_read_bytes\":" + std::to_string(trace.nonsequential_read_bytes) +
-        ",\"sequential_run_count\":" + std::to_string(trace.sequential_run_count) +
-        ",\"max_sequential_run_bytes\":" + std::to_string(trace.max_sequential_run_bytes) +
-        ",\"seek_count\":" + std::to_string(trace.seek_count) +
-        ",\"seek_forward_bytes\":" + std::to_string(trace.seek_forward_bytes) +
-        ",\"seek_backward_bytes\":" + std::to_string(trace.seek_backward_bytes) +
-        ",\"prefetch_enabled\":" + std::string(trace.prefetch_enabled ? "true" : "false") +
-        ",\"prefetch_hit_count\":" + std::to_string(trace.prefetch_hit_count) +
-        ",\"prefetch_miss_count\":" + std::to_string(trace.prefetch_miss_count) +
-        ",\"prefetch_invalidation_count\":" + std::to_string(trace.prefetch_invalidation_count) +
-        ",\"prefetch_consumer_wait_ns\":" + std::to_string(trace.prefetch_consumer_wait_ns) +
-        ",\"read_error\":" + std::string(trace.read_error ? "true" : "false") +
-        ",\"last_hresult\":" + std::to_string(trace.last_hresult) +
-        ",\"last_hresult_hex\":\"" + hresult_hex(trace.last_hresult) +
-        "\",\"last_win32_error\":" + std::to_string(trace.last_win32_error) +
-        ",\"last_read\":{\"virtual_offset\":" + std::to_string(trace.last_read_virtual_offset) +
-        ",\"source_path\":\"" + json_escape(wide_to_utf8(trace.last_source_path)) +
-        "\",\"source_offset\":" + std::to_string(trace.last_read_source_offset) +
-        ",\"range_index\":" + std::to_string(trace.last_range_index) +
-        ",\"requested\":" + std::to_string(trace.last_read_requested) +
-        ",\"returned\":" + std::to_string(trace.last_read_returned) +
-        "},\"last_seek\":{\"origin\":" + std::to_string(trace.last_seek_origin) +
-        ",\"offset\":" + std::to_string(trace.last_seek_offset) +
-        ",\"new_position\":" + std::to_string(trace.last_seek_new_position) +
-        "}}";
+std::string input_trace_wire(const sunpack::sevenzip::ExtractInputTrace& trace) {
+    return wire::object() +
+        wire::key("mode") + wire::text(wide_to_utf8(trace.mode)) +
+        wire::key("virtual_size") + wire::number(trace.virtual_size) +
+        wire::key("position") + wire::number(trace.position) +
+        wire::key("max_position_seen") + wire::number(trace.max_position_seen) +
+        wire::key("total_bytes_returned") + wire::number(trace.total_bytes_returned) +
+        wire::key("read_file_call_count") + wire::number(trace.read_file_call_count) +
+        wire::key("read_file_wall_ns") + wire::number(trace.read_file_wall_ns) +
+        wire::key("read_file_max_wall_ns") + wire::number(trace.read_file_max_wall_ns) +
+        wire::key("logical_read_call_count") + wire::number(trace.logical_read_call_count) +
+        wire::key("sequential_read_bytes") + wire::number(trace.sequential_read_bytes) +
+        wire::key("nonsequential_read_bytes") + wire::number(trace.nonsequential_read_bytes) +
+        wire::key("sequential_run_count") + wire::number(trace.sequential_run_count) +
+        wire::key("max_sequential_run_bytes") + wire::number(trace.max_sequential_run_bytes) +
+        wire::key("seek_count") + wire::number(trace.seek_count) +
+        wire::key("seek_forward_bytes") + wire::number(trace.seek_forward_bytes) +
+        wire::key("seek_backward_bytes") + wire::number(trace.seek_backward_bytes) +
+        wire::key("prefetch_enabled") + wire::boolean(trace.prefetch_enabled) +
+        wire::key("prefetch_hit_count") + wire::number(trace.prefetch_hit_count) +
+        wire::key("prefetch_miss_count") + wire::number(trace.prefetch_miss_count) +
+        wire::key("prefetch_invalidation_count") + wire::number(trace.prefetch_invalidation_count) +
+        wire::key("prefetch_consumer_wait_ns") + wire::number(trace.prefetch_consumer_wait_ns) +
+        wire::key("read_error") + wire::boolean(trace.read_error) +
+        wire::key("last_hresult") + wire::number(trace.last_hresult) +
+        wire::key("last_hresult_hex") + wire::text(hresult_hex(trace.last_hresult)) +
+        wire::key("last_win32_error") + wire::number(trace.last_win32_error) +
+        (wire::key("last_read") + wire::object() + wire::key("virtual_offset")) + wire::number(trace.last_read_virtual_offset) +
+        wire::key("source_path") + wire::text(wide_to_utf8(trace.last_source_path)) +
+        wire::key("source_offset") + wire::number(trace.last_read_source_offset) +
+        wire::key("range_index") + wire::number(trace.last_range_index) +
+        wire::key("requested") + wire::number(trace.last_read_requested) +
+        wire::key("returned") + wire::number(trace.last_read_returned) +
+        (wire::end() + wire::key("last_seek") + wire::object() + wire::key("origin")) + wire::number(trace.last_seek_origin) +
+        wire::key("offset") + wire::number(trace.last_seek_offset) +
+        wire::key("new_position") + wire::number(trace.last_seek_new_position) +
+        (wire::end() + wire::end());
 }
 
 // Bound each serialized event by bytes, including its routing envelope. The
@@ -839,27 +483,21 @@ std::string input_trace_json(const sunpack::sevenzip::ExtractInputTrace& trace) 
 class WorkerChunks {
 public:
     WorkerChunks(const std::string& job_id, const char* type, const char* field)
-        : prefix_("{\"type\":\"" + std::string(type) + "\",\"job_id\":\"" + json_escape(job_id) + "\",\"seq\":"),
+        : prefix_((wire::object() + wire::key("type")) + wire::text(type) + wire::key("job_id") + wire::text(job_id) + wire::key("seq")),
           field_(field) {
         buffer_.reserve(kChunkBytes);
     }
 
     void append(const std::string& row) {
-        const std::size_t envelope = prefix_.size() + 20 + field_.size() + 8;
-        if (envelope + row.size() > kChunkBytes) {
-            throw std::runtime_error("worker item exceeds the chunk byte limit");
-        }
+        // A single large row is its own frame; chunk size is a batching target.
         if (count_ && buffer_.size() + 1 + row.size() + 2 > kChunkBytes) {
             flush();
         }
         if (!count_) {
             buffer_ += prefix_;
-            buffer_ += std::to_string(seq_);
-            buffer_ += ",\"";
-            buffer_ += field_;
-            buffer_ += "\":[";
-        } else {
-            buffer_ += ',';
+            buffer_ += wire::number(seq_);
+            buffer_ += wire::key(field_);
+            buffer_ += wire::array();
         }
         buffer_ += row;
         ++count_;
@@ -873,8 +511,8 @@ public:
 private:
     void flush() {
         if (!count_) { return; }
-        buffer_ += "]}";
-        print_json_line(buffer_);
+        buffer_ += (wire::end() + wire::end());
+        print_frame(buffer_);
         ++seq_;
         count_ = 0;
         buffer_.clear();
@@ -888,84 +526,93 @@ private:
     std::size_t count_ = 0;
 };
 
-std::string output_item_trace_json(const sunpack::sevenzip::ExtractOutputItemTrace& item) {
-    return "{\"index\":" + std::to_string(item.index) +
-            ",\"path\":\"" + json_escape(wide_to_utf8(item.path)) +
-            "\",\"output_path\":\"" + json_escape(wide_to_utf8(item.output_path)) +
-            "\",\"is_dir\":" + std::string(item.is_dir ? "true" : "false") +
-            ",\"encrypted\":" + std::string(item.encrypted ? "true" : "false") +
-            ",\"bytes_written\":" + std::to_string(item.bytes_written) +
-            ",\"expected_size\":" + std::to_string(item.expected_size) +
-            ",\"has_expected_size\":" + std::string(item.has_expected_size ? "true" : "false") +
-            ",\"source_crc32\":" + std::to_string(item.source_crc32) +
-            ",\"has_source_crc32\":" + std::string(item.has_source_crc32 ? "true" : "false") +
-            ",\"output_crc32\":" + std::to_string(item.output_crc32) +
-            ",\"has_output_crc32\":" + std::string(item.has_output_crc32 ? "true" : "false") +
-            ",\"crc_verified\":" + std::string(item.crc_verified ? "true" : "false") +
-            ",\"operation_result\":" + std::to_string(item.operation_result) +
-            ",\"operation_result_name\":\"" + json_escape(sunpack::sevenzip::operation_result_name(item.operation_result)) +
-            "\",\"hresult\":" + std::to_string(item.hresult) +
-            ",\"hresult_hex\":\"" + hresult_hex(item.hresult) +
-            "\",\"win32_error\":" + std::to_string(item.win32_error) +
-            ",\"done\":" + std::string(item.done ? "true" : "false") +
-            ",\"failed\":" + std::string(item.failed ? "true" : "false") +
-            "}";
+void append_output_item_trace(std::string& row, const sunpack::sevenzip::ExtractOutputItemTrace& item) {
+    row.clear();
+    row += wire::array();
+    wire::append_number(row, item.index);
+    wire::append_text(row, wide_to_utf8(item.path));
+    wire::append_text(row, wide_to_utf8(item.output_path));
+    row.push_back(item.is_dir ? wire::kTrue : wire::kFalse);
+    row.push_back(item.encrypted ? wire::kTrue : wire::kFalse);
+    wire::append_number(row, item.bytes_written);
+    wire::append_number(row, item.expected_size);
+    row.push_back(item.has_expected_size ? wire::kTrue : wire::kFalse);
+    wire::append_number(row, item.source_crc32);
+    row.push_back(item.has_source_crc32 ? wire::kTrue : wire::kFalse);
+    wire::append_number(row, item.output_crc32);
+    row.push_back(item.has_output_crc32 ? wire::kTrue : wire::kFalse);
+    row.push_back(item.crc_verified ? wire::kTrue : wire::kFalse);
+    wire::append_number(row, item.operation_result);
+    wire::append_text(row, sunpack::sevenzip::operation_result_name(item.operation_result));
+    wire::append_number(row, item.hresult);
+    wire::append_text(row, hresult_hex(item.hresult));
+    wire::append_number(row, item.win32_error);
+    row.push_back(item.done ? wire::kTrue : wire::kFalse);
+    row.push_back(item.failed ? wire::kTrue : wire::kFalse);
+    row += wire::end();
 }
 
 std::size_t emit_output_trace_chunks(const std::string& job_id, const sunpack::sevenzip::ExtractOutputTrace& trace) {
     WorkerChunks chunks(job_id, "trace_chunk", "items");
-    for (const auto& item : trace.items) { chunks.append(output_item_trace_json(item)); }
+    std::string row;
+    row.reserve(256);
+    for (const auto& item : trace.items) {
+        append_output_item_trace(row, item);
+        chunks.append(row);
+    }
     return chunks.finish();
 }
 
-std::string output_trace_json(const sunpack::sevenzip::ExtractOutputTrace& trace, std::size_t chunk_count) {
-    return std::string("{") +
-        "\"total_bytes_written\":" + std::to_string(trace.total_bytes_written) +
-        ",\"current_item_index\":" + std::to_string(trace.current_item_index) +
-        ",\"current_item_path\":\"" + json_escape(wide_to_utf8(trace.current_item_path)) +
-        "\",\"current_item_bytes_written\":" + std::to_string(trace.current_item_bytes_written) +
-        ",\"last_write_size\":" + std::to_string(trace.last_write_size) +
-        ",\"last_hresult\":" + std::to_string(trace.last_hresult) +
-        ",\"last_hresult_hex\":\"" + hresult_hex(trace.last_hresult) +
-        "\",\"last_win32_error\":" + std::to_string(trace.last_win32_error) +
-        ",\"item_count\":" + std::to_string(trace.items.size()) +
-        ",\"chunk_count\":" + std::to_string(chunk_count) +
-        "}";
+std::string output_trace_wire(const sunpack::sevenzip::ExtractOutputTrace& trace, std::size_t chunk_count) {
+    return wire::object() +
+        wire::key("total_bytes_written") + wire::number(trace.total_bytes_written) +
+        wire::key("current_item_index") + wire::number(trace.current_item_index) +
+        wire::key("current_item_path") + wire::text(wide_to_utf8(trace.current_item_path)) +
+        wire::key("current_item_bytes_written") + wire::number(trace.current_item_bytes_written) +
+        wire::key("last_write_size") + wire::number(trace.last_write_size) +
+        wire::key("last_hresult") + wire::number(trace.last_hresult) +
+        wire::key("last_hresult_hex") + wire::text(hresult_hex(trace.last_hresult)) +
+        wire::key("last_win32_error") + wire::number(trace.last_win32_error) +
+        wire::key("item_count") + wire::number(trace.items.size()) +
+        wire::key("chunk_count") + wire::number(chunk_count) +
+        wire::end();
 }
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-std::string pipeline_timing_json(const sunpack::sevenzip::ExtractPipelineTiming& timing) {
-    return std::string("{") +
-        "\"pipeline_wall_ns\":" + std::to_string(timing.pipeline_wall_ns) +
-        ",\"input_active_ns\":" + std::to_string(timing.input_active_ns) +
-        ",\"compute_active_ns\":" + std::to_string(timing.compute_active_ns) +
-        ",\"compute_cpu_ns\":" + std::to_string(timing.compute_cpu_ns) +
-        ",\"output_active_ns\":" + std::to_string(timing.output_active_ns) +
-        ",\"input_compute_overlap_ns\":" + std::to_string(timing.input_compute_overlap_ns) +
-        ",\"input_output_overlap_ns\":" + std::to_string(timing.input_output_overlap_ns) +
-        ",\"compute_output_overlap_ns\":" + std::to_string(timing.compute_output_overlap_ns) +
-        ",\"all_overlap_ns\":" + std::to_string(timing.all_overlap_ns) +
-        ",\"any_overlap_ns\":" + std::to_string(timing.any_overlap_ns) +
-        ",\"idle_ns\":" + std::to_string(timing.idle_ns) +
-        ",\"prepare_output_directory_ns\":" + std::to_string(timing.prepare_output_directory_ns) +
-        ",\"prepare_format_candidates_ns\":" + std::to_string(timing.prepare_format_candidates_ns) +
-         ",\"prepare_handler_create_ns\":" + std::to_string(timing.prepare_handler_create_ns) +
-        ",\"prepare_stream_open_ns\":" + std::to_string(timing.prepare_stream_open_ns) +
-        ",\"prepare_archive_open_ns\":" + std::to_string(timing.prepare_archive_open_ns) +
-        ",\"prepare_item_probe_ns\":" + std::to_string(timing.prepare_item_probe_ns) +
-        ",\"prepare_callback_setup_ns\":" + std::to_string(timing.prepare_callback_setup_ns) +
-        ",\"prepare_output_finalize_ns\":" + std::to_string(timing.prepare_output_finalize_ns) +
-        ",\"prepare_archive_close_ns\":" + std::to_string(timing.prepare_archive_close_ns) +
-        "}";
+std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming& timing) {
+    return wire::object() +
+        wire::key("pipeline_wall_ns") + wire::number(timing.pipeline_wall_ns) +
+        wire::key("input_active_ns") + wire::number(timing.input_active_ns) +
+        wire::key("compute_active_ns") + wire::number(timing.compute_active_ns) +
+        wire::key("compute_cpu_ns") + wire::number(timing.compute_cpu_ns) +
+        wire::key("output_active_ns") + wire::number(timing.output_active_ns) +
+        wire::key("input_compute_overlap_ns") + wire::number(timing.input_compute_overlap_ns) +
+        wire::key("input_output_overlap_ns") + wire::number(timing.input_output_overlap_ns) +
+        wire::key("compute_output_overlap_ns") + wire::number(timing.compute_output_overlap_ns) +
+        wire::key("all_overlap_ns") + wire::number(timing.all_overlap_ns) +
+        wire::key("any_overlap_ns") + wire::number(timing.any_overlap_ns) +
+        wire::key("idle_ns") + wire::number(timing.idle_ns) +
+        wire::key("prepare_output_directory_ns") + wire::number(timing.prepare_output_directory_ns) +
+        wire::key("prepare_format_candidates_ns") + wire::number(timing.prepare_format_candidates_ns) +
+         wire::key("prepare_handler_create_ns") + wire::number(timing.prepare_handler_create_ns) +
+        wire::key("prepare_stream_open_ns") + wire::number(timing.prepare_stream_open_ns) +
+        wire::key("prepare_archive_open_ns") + wire::number(timing.prepare_archive_open_ns) +
+        wire::key("prepare_item_probe_ns") + wire::number(timing.prepare_item_probe_ns) +
+        wire::key("prepare_callback_setup_ns") + wire::number(timing.prepare_callback_setup_ns) +
+        wire::key("prepare_output_finalize_ns") + wire::number(timing.prepare_output_finalize_ns) +
+        wire::key("prepare_archive_close_ns") + wire::number(timing.prepare_archive_close_ns) +
+        wire::end();
 }
 #endif
 
-std::string verified_manifest_json(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result, bool validated) {
+std::string verified_manifest_wire(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result, bool validated) {
     WorkerChunks chunks(job_id, "manifest_chunk", "rows");
     unsigned int file_count = 0;
     unsigned long long total_size = 0;
     bool identity_paths = true;
     std::unordered_set<std::wstring> directories;
+    std::string row;
+    row.reserve(256);
     for (const auto& item : result.output_trace.items) {
         const std::filesystem::path output_path(item.output_path);
         if (item.is_dir) {
@@ -982,87 +629,88 @@ std::string verified_manifest_json(const std::string& job_id, const sunpack::sev
         const bool identity_path =
             std::filesystem::path(item.path).lexically_normal().generic_wstring() == output_path.lexically_normal().generic_wstring();
         identity_paths = identity_paths && identity_path;
-        chunks.append("[" + std::to_string(item.index) +
-            ",\"" + json_escape(wide_to_utf8(item.path)) +
-            "\",\"" + (identity_path ? std::string() : json_escape(wide_to_utf8(item.output_path))) +
-            "\"," + std::to_string(item.has_expected_size ? item.expected_size : item.bytes_written) +
-            "," + std::to_string(item.bytes_written) +
-            "," + std::string(item.has_source_crc32 ? "1" : "0") +
-            "," + std::to_string(item.source_crc32) +
-            "," + std::string(item.has_output_crc32 ? "1" : "0") +
-            "," + std::to_string(item.output_crc32) +
-            "," + std::string(item.crc_verified ? "1" : "0") +
-            "," + std::string(item.done ? "1" : item.failed ? "2" : "0") +
-            "," + std::string(item.has_mtime_ns ? "1" : "0") +
-            "," + std::to_string(item.mtime_ns) +
-            ",\"" + bytes_hex(item.magic) + "\"]");
+        row.clear();
+        row += wire::array();
+        wire::append_number(row, item.index);
+        wire::append_text(row, wide_to_utf8(item.path));
+        wire::append_text(row, identity_path ? std::string() : wide_to_utf8(item.output_path));
+        wire::append_number(row, item.has_expected_size ? item.expected_size : item.bytes_written);
+        wire::append_number(row, item.bytes_written);
+        wire::append_number(row, item.has_source_crc32 ? 1 : 0);
+        wire::append_number(row, item.source_crc32);
+        wire::append_number(row, item.has_output_crc32 ? 1 : 0);
+        wire::append_number(row, item.output_crc32);
+        wire::append_number(row, item.crc_verified ? 1 : 0);
+        wire::append_number(row, item.done ? 1 : item.failed ? 2 : 0);
+        wire::append_number(row, item.has_mtime_ns ? 1 : 0);
+        wire::append_number(row, item.mtime_ns);
+        wire::append_text(row, std::string_view(reinterpret_cast<const char*>(item.magic.data()), item.magic.size()), wire::kBytes);
+        row += wire::end();
+        chunks.append(row);
     }
     const auto chunk_count = chunks.finish();
     const bool inventory_complete = validated && result.output_inventory_complete && file_count == result.files_written;
-    return std::string("{") +
-        "\"source\":\"sevenzip_worker_extract\"" +
-        ",\"validated\":" + std::string(validated ? "true" : "false") +
-        ",\"item_count\":" + std::to_string(result.item_count) +
-        ",\"file_count\":" + std::to_string(file_count) +
-        ",\"inventory\":[" + std::string(inventory_complete ? "1" : "0") +
-        "," + std::to_string(file_count) +
-        "," + std::to_string(directories.size()) +
-        "," + std::to_string(total_size) +
-        "," + std::string(identity_paths ? "1" : "0") + "]" +
-        ",\"chunk_count\":" + std::to_string(chunk_count) + "}";
+    return wire::object() +
+        (wire::key("source") + wire::text("sevenzip_worker_extract")) +
+        wire::key("validated") + wire::boolean(validated) +
+        wire::key("item_count") + wire::number(result.item_count) +
+        wire::key("file_count") + wire::number(file_count) +
+        (wire::key("inventory") + wire::array()) + wire::number(inventory_complete ? 1 : 0) +
+        wire::number(file_count) +
+        wire::number(directories.size()) +
+        wire::number(total_size) +
+        wire::number(identity_paths ? 1 : 0) + wire::end() +
+        wire::key("chunk_count") + wire::number(chunk_count) + wire::end();
 }
 
-std::string handler_attempts_json(const std::vector<sunpack::sevenzip::ExtractHandlerAttempt>& attempts) {
-    std::string out = "[";
+std::string handler_attempts_wire(const std::vector<sunpack::sevenzip::ExtractHandlerAttempt>& attempts) {
+    std::string out = wire::array();
     for (std::size_t index = 0; index < attempts.size(); ++index) {
         const auto& attempt = attempts[index];
-        if (index) {
-            out += ",";
-        }
-        out += "{\"format\":\"" + json_escape(wide_to_utf8(attempt.format)) +
-            "\",\"created\":" + std::string(attempt.created ? "true" : "false") +
-            ",\"opened\":" + std::string(attempt.opened ? "true" : "false") +
-            ",\"create_hresult\":" + std::to_string(attempt.create_hresult) +
-            ",\"create_hresult_hex\":\"" + hresult_hex(attempt.create_hresult) +
-            "\",\"open_hresult\":" + std::to_string(attempt.open_hresult) +
-            ",\"open_hresult_hex\":\"" + hresult_hex(attempt.open_hresult) + "\"}";
+        out += (wire::object() + wire::key("format")) + wire::text(wide_to_utf8(attempt.format)) +
+            wire::key("created") + wire::boolean(attempt.created) +
+            wire::key("opened") + wire::boolean(attempt.opened) +
+            wire::key("create_hresult") + wire::number(attempt.create_hresult) +
+            wire::key("create_hresult_hex") + wire::text(hresult_hex(attempt.create_hresult)) +
+            wire::key("open_hresult") + wire::number(attempt.open_hresult) +
+            wire::key("open_hresult_hex") + wire::text(hresult_hex(attempt.open_hresult)) + wire::end();
     }
-    out += "]";
+    out += wire::end();
     return out;
 }
 
-std::string failed_item_json(const sunpack::sevenzip::ExtractArchiveResult& result) {
-    return std::string("{") +
-        "\"index\":" + std::to_string(result.failed_item_index) +
-        ",\"path\":\"" + json_escape(wide_to_utf8(result.failed_item)) +
-        "\",\"bytes_written\":" + std::to_string(result.failed_item_bytes_written) +
-        ",\"operation_result\":" + std::to_string(result.operation_result) +
-        ",\"operation_result_name\":\"" + json_escape(sunpack::sevenzip::operation_result_name(result.operation_result)) +
-        "\"}";
+std::string failed_item_wire(const sunpack::sevenzip::ExtractArchiveResult& result) {
+    return wire::object() +
+        wire::key("index") + wire::number(result.failed_item_index) +
+        wire::key("path") + wire::text(wide_to_utf8(result.failed_item)) +
+        wire::key("bytes_written") + wire::number(result.failed_item_bytes_written) +
+        wire::key("operation_result") + wire::number(result.operation_result) +
+        wire::key("operation_result_name") + wire::text(sunpack::sevenzip::operation_result_name(result.operation_result)) +
+        wire::end();
 }
 
-std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& result, std::size_t trace_chunks) {
-    return std::string("{") +
-        "\"failure_stage\":\"" + json_escape(result.failure_stage) +
-        "\",\"failure_kind\":\"" + json_escape(result.failure_kind) +
-        "\",\"hresult\":" + std::to_string(result.hresult) +
-        ",\"hresult_hex\":\"" + hresult_hex(result.hresult) +
-        "\",\"operation_result\":" + std::to_string(result.operation_result) +
-        ",\"operation_result_name\":\"" + json_escape(sunpack::sevenzip::operation_result_name(result.operation_result)) +
-        "\",\"missing_volume_suspected\":" + std::string(result.missing_volume_suspected ? "true" : "false") +
-        ",\"missing_volume_evidence\":\"" + json_escape(result.missing_volume_evidence) +
-        "\",\"missing_volume_name\":\"" + json_escape(wide_to_utf8(result.missing_volume_name)) +
-        "\",\"password_candidate_batch\":" + std::string(result.password_candidate_batch ? "true" : "false") +
-        ",\"password_candidate_direct\":" + std::string(result.password_candidate_direct ? "true" : "false") +
-        ",\"password_candidates_all_rejected\":" + std::string(result.password_candidates_all_rejected ? "true" : "false") +
-        ",\"password_candidate_count\":" + std::to_string(result.password_candidate_count) +
-        ",\"password_attempts\":" + std::to_string(result.password_attempts) +
-        ",\"matched_index\":" + std::to_string(result.matched_index) +
-        ",\"handler_attempts\":" + handler_attempts_json(result.handler_attempts) +
-        ",\"input_trace\":" + input_trace_json(result.input_trace) +
-        ",\"output_trace\":" + output_trace_json(result.output_trace, trace_chunks) +
-        ",\"failed_item\":" + failed_item_json(result) +
-        "}";
+std::string diagnostics_wire(const sunpack::sevenzip::ExtractArchiveResult& result, std::size_t trace_chunks) {
+    return wire::object() +
+        wire::key("failure_stage") + wire::text(result.failure_stage) +
+        wire::key("failure_kind") + wire::text(result.failure_kind) +
+        wire::key("hresult") + wire::number(result.hresult) +
+        wire::key("hresult_hex") + wire::text(hresult_hex(result.hresult)) +
+        wire::key("operation_result") + wire::number(result.operation_result) +
+        wire::key("operation_result_name") + wire::text(sunpack::sevenzip::operation_result_name(result.operation_result)) +
+        wire::key("missing_volume_suspected") + wire::boolean(result.missing_volume_suspected) +
+        wire::key("missing_volume_evidence") + wire::text(result.missing_volume_evidence) +
+        wire::key("missing_volume_name") + wire::text(wide_to_utf8(result.missing_volume_name)) +
+        wire::key("password_candidate_batch") + wire::boolean(result.password_candidate_batch) +
+        wire::key("password_candidate_direct") + wire::boolean(result.password_candidate_direct) +
+        wire::key("password_candidates_all_rejected") + wire::boolean(result.password_candidates_all_rejected) +
+        wire::key("password_candidate_count") + wire::number(result.password_candidate_count) +
+        wire::key("password_attempts") + wire::number(result.password_attempts) +
+        wire::key("matched_index") + wire::number(result.matched_index) +
+        wire::key("handler_attempts") + handler_attempts_wire(result.handler_attempts) +
+        wire::key("input_trace") + input_trace_wire(result.input_trace) +
+        wire::key("output_trace") + output_trace_wire(result.output_trace, trace_chunks) +
+        wire::key("failed_item") + failed_item_wire(result) +
+        wire::end();
 }
 
 }  // namespace
@@ -1088,11 +736,9 @@ int interrupted_result(const std::string& job_id) {
     // executor's persistent user token decides whether a parked job is canceled.
     const auto* memory = sunpack::sevenzip::current_native_memory_job();
     if (memory && memory->revoked.load(std::memory_order_acquire)) return kMemoryRetry;
-    print_json_line(
-        "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-        "\",\"status\":\"failed\",\"native_status\":\"cancelled\","
-        "\"failure_stage\":\"native_cancel\",\"failure_kind\":\"cancelled\","
-        "\"message\":\"native job was cancelled\"}");
+    print_frame(
+        (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+        (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("cancelled") + wire::key("failure_stage") + wire::text("native_cancel") + wire::key("failure_kind") + wire::text("cancelled") + wire::key("message") + wire::text("native job was cancelled") + wire::end()));
     return -101;
 }
 
@@ -1204,9 +850,9 @@ int run_request(
     if (auto *memory = current_native_memory_job(); memory && memory->revoked.load(std::memory_order_acquire))
         return kMemoryRetry;
     if (command == "shutdown") {
-        print_json_line(
-            "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"status\":\"ok\",\"native_status\":\"ok\",\"message\":\"worker shutdown\"}");
+        print_frame(
+            (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+            (wire::key("status") + wire::text("ok") + wire::key("native_status") + wire::text("ok") + wire::key("message") + wire::text("worker shutdown") + wire::end()));
         return 0;
     }
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
@@ -1221,9 +867,9 @@ int run_request(
     const bool dry_run = request.dry_run;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
     if (archive_path.empty() || (!dry_run && output_dir.empty())) {
-        print_json_line(
-            "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"status\":\"error\",\"category\":\"invalid_request\",\"message\":\"archive_path is required; output_dir is required unless dry_run is true\"}");
+        print_frame(
+            (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+            (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message") + wire::text("archive_path is required; output_dir is required unless dry_run is true") + wire::end()));
         return 2;
     }
 
@@ -1239,25 +885,25 @@ int run_request(
             const auto now = std::chrono::steady_clock::now();
             if (!extract_started && event.completed_bytes > 0) {
                 extract_started = true;
-                print_json_line(
-                    "{\"type\":\"progress\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"event\":\"extract_started\"" +
-                    ",\"completed_bytes\":" + std::to_string(event.completed_bytes) +
-                    ",\"total_bytes\":" + std::to_string(event.total_bytes) +
-                    ",\"item_index\":" + std::to_string(event.item_index) +
-                    ",\"item_path\":\"" + json_escape(wide_to_utf8(event.item_path)) +
-                    "\",\"coalesced_events\":" + std::to_string(coalesced_progress_events) + "}");
+                print_frame(
+                    (wire::object() + wire::key("type") + wire::text("progress") + wire::key("job_id")) + wire::text(job_id) +
+                    (wire::key("event") + wire::text("extract_started")) +
+                    wire::key("completed_bytes") + wire::number(event.completed_bytes) +
+                    wire::key("total_bytes") + wire::number(event.total_bytes) +
+                    wire::key("item_index") + wire::number(event.item_index) +
+                    wire::key("item_path") + wire::text(wide_to_utf8(event.item_path)) +
+                    wire::key("coalesced_events") + wire::number(coalesced_progress_events) + wire::end());
                 const auto cpu = cpu_job_context
                     ? cpu_job_context->snapshot()
                     : sunpack::sevenzip::NativeCpuJobSnapshot{};
-                print_json_line(
-                    "{\"type\":\"native_cpu\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"event\":\"decoder_started\"" +
-                    ",\"decoder_cpu_credits\":" + std::to_string(1 + cpu.current_extra_credits) +
-                    ",\"current_decoder_extra_credits\":" + std::to_string(cpu.current_extra_credits) +
-                    ",\"peak_decoder_extra_credits\":" + std::to_string(cpu.peak_extra_credits) +
-                    ",\"decoder_parallel\":" + std::string(cpu.current_extra_credits ? "true" : "false") +
-                    "}");
+                print_frame(
+                    (wire::object() + wire::key("type") + wire::text("native_cpu") + wire::key("job_id")) + wire::text(job_id) +
+                    (wire::key("event") + wire::text("decoder_started")) +
+                    wire::key("decoder_cpu_credits") + wire::number(1 + cpu.current_extra_credits) +
+                    wire::key("current_decoder_extra_credits") + wire::number(cpu.current_extra_credits) +
+                    wire::key("peak_decoder_extra_credits") + wire::number(cpu.peak_extra_credits) +
+                    wire::key("decoder_parallel") + wire::boolean(cpu.current_extra_credits) +
+                    wire::end());
             }
             const bool failure = event.event == "item_failed";
             const bool boundary = event.event == "total" ||
@@ -1268,23 +914,23 @@ int run_request(
                 ++coalesced_progress_events;
                 return;
             }
-            print_json_line(
-                "{\"type\":\"progress\",\"job_id\":\"" + json_escape(job_id) +
-                "\",\"event\":\"" + json_escape(event.event) +
-                "\",\"completed_bytes\":" + std::to_string(event.completed_bytes) +
-                ",\"total_bytes\":" + std::to_string(event.total_bytes) +
-                ",\"item_index\":" + std::to_string(event.item_index) +
-                ",\"item_path\":\"" + json_escape(wide_to_utf8(event.item_path)) +
-                "\",\"coalesced_events\":" + std::to_string(coalesced_progress_events) + "}");
+            print_frame(
+                (wire::object() + wire::key("type") + wire::text("progress") + wire::key("job_id")) + wire::text(job_id) +
+                wire::key("event") + wire::text(event.event) +
+                wire::key("completed_bytes") + wire::number(event.completed_bytes) +
+                wire::key("total_bytes") + wire::number(event.total_bytes) +
+                wire::key("item_index") + wire::number(event.item_index) +
+                wire::key("item_path") + wire::text(wide_to_utf8(event.item_path)) +
+                wire::key("coalesced_events") + wire::number(coalesced_progress_events) + wire::end());
             last_progress_emit = now;
             coalesced_progress_events = 0;
     };
 
     if (!request.archive_input.validation_error.empty()) {
-        print_json_line(
-            "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"status\":\"error\",\"category\":\"invalid_request\",\"message\":\"" +
-            json_escape(request.archive_input.validation_error) + "\"}");
+        print_frame(
+            (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+            (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message")) +
+            wire::text(request.archive_input.validation_error) + wire::end());
         return 2;
     }
     auto* volume_replay = current_extraction_replay;
@@ -1300,9 +946,8 @@ int run_request(
             const bool output_owned = dry_run ||
                 ((!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error);
             if (!output_owned) {
-                print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"status\":\"failed\",\"failure_stage\":\"output_prepare\",\"failure_kind\":\"output_filesystem\","
-                    "\"message\":\"volume composition trials require an empty output directory\"}");
+                print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                    (wire::key("status") + wire::text("failed") + wire::key("failure_stage") + wire::text("output_prepare") + wire::key("failure_kind") + wire::text("output_filesystem") + wire::key("message") + wire::text("volume composition trials require an empty output directory") + wire::end()));
                 return 2;
             }
             cursor.started = true;
@@ -1548,92 +1193,90 @@ int run_request(
     std::string volume_attempt_fields;
     if (volume_trials) {
         const auto& cursor = volume_replay->volumes;
-        volume_attempt_fields = ",\"volume_attempts\":" + std::to_string(cursor.attempts);
+        volume_attempt_fields = wire::key("volume_attempts") + wire::number(cursor.attempts);
         if (ok) {
-            volume_attempt_fields += ",\"volume_selection\":{\"layout\":" + std::to_string(cursor.layout) + ",\"sources\":[";
+            volume_attempt_fields += (wire::key("volume_selection") + wire::object() + wire::key("layout")) + wire::number(cursor.layout) + (wire::key("sources") + wire::array());
             for (std::size_t i = 0; i < cursor.selected.size(); ++i) {
-                if (i) volume_attempt_fields += ',';
-                volume_attempt_fields += std::to_string(cursor.selected[i]);
+                volume_attempt_fields += wire::number(cursor.selected[i]);
             }
-            volume_attempt_fields += "]}";
+            volume_attempt_fields += (wire::end() + wire::end());
         }
     }
-    const auto manifest_summary = verified_manifest_json(job_id, result, ok && !dry_run);
+    const auto manifest_summary = verified_manifest_wire(job_id, result, ok && !dry_run);
     const auto trace_chunks = (!ok || dry_run) ? emit_output_trace_chunks(job_id, result.output_trace) : 0;
     const std::string failure_fields = ok ? "" :
-        ",\"failure_stage\":\"" + json_escape(result.failure_stage) +
-        "\",\"failure_kind\":\"" + json_escape(result.failure_kind) +
-        "\",\"hresult\":" + std::to_string(result.hresult) +
-        ",\"hresult_hex\":\"" + hresult_hex(result.hresult) + "\"";
+        wire::key("failure_stage") + wire::text(result.failure_stage) +
+        wire::key("failure_kind") + wire::text(result.failure_kind) +
+        wire::key("hresult") + wire::number(result.hresult) +
+        wire::key("hresult_hex") + wire::text(hresult_hex(result.hresult));
     const std::string diagnostic_fields = (!ok || dry_run) ?
-        ",\"diagnostics\":" + diagnostics_json(result, trace_chunks) : "";
+        wire::key("diagnostics") + diagnostics_wire(result, trace_chunks) : "";
     const auto &sr = result.stream_receipt;
     const std::string stream_receipt_field = result.has_stream_receipt ?
-        ",\"stream_receipt\":{\"format\":\"" + json_escape(sr.format) + "\",\"input_bytes\":" + std::to_string(sr.input_bytes) +
-        ",\"output_bytes\":" + std::to_string(sr.output_bytes) + ",\"frames\":" + std::to_string(sr.frames) +
-        ",\"skippable_frames\":" + std::to_string(sr.skippable_frames) +
-        ",\"content_checked_frames\":" + std::to_string(sr.content_checked_frames) + ",\"block_checked_frames\":" + std::to_string(sr.block_checked_frames) +
-        ",\"error\":" + std::to_string(sr.error) + "}" : "";
+        (wire::key("stream_receipt") + wire::object() + wire::key("format")) + wire::text(sr.format) + wire::key("input_bytes") + wire::number(sr.input_bytes) +
+        wire::key("output_bytes") + wire::number(sr.output_bytes) + wire::key("frames") + wire::number(sr.frames) +
+        wire::key("skippable_frames") + wire::number(sr.skippable_frames) +
+        wire::key("content_checked_frames") + wire::number(sr.content_checked_frames) + wire::key("block_checked_frames") + wire::number(sr.block_checked_frames) +
+        wire::key("error") + wire::number(sr.error) + wire::end() : "";
     const std::string input_trace_field = read_file_timing_enabled() ?
-        ",\"input_trace\":" + input_trace_json(result.input_trace) : "";
+        wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
     const auto &output_trace = result.output_trace;
     const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?
-        ",\"metadata_warning\":{\"file_count\":" + std::to_string(output_trace.metadata_failed_files) +
-        ",\"directory_count\":" + std::to_string(output_trace.metadata_failed_directories) +
-        ",\"time_failure_count\":" + std::to_string(output_trace.metadata_failed_times) +
-        ",\"attribute_failure_count\":" + std::to_string(output_trace.metadata_failed_attributes) +
-        ",\"operation\":\"" + (output_trace.metadata_first_is_attributes ? "attributes" : "time") + "\"" +
-        ",\"first_item_index\":" + std::to_string(output_trace.metadata_first_item_index) +
-        ",\"first_item\":\"" + json_escape(wide_to_utf8(output_trace.metadata_first_item)) +
-        "\",\"win32_error\":" + std::to_string(output_trace.metadata_first_win32_error) + "}" : "";
+        (wire::key("metadata_warning") + wire::object() + wire::key("file_count")) + wire::number(output_trace.metadata_failed_files) +
+        wire::key("directory_count") + wire::number(output_trace.metadata_failed_directories) +
+        wire::key("time_failure_count") + wire::number(output_trace.metadata_failed_times) +
+        wire::key("attribute_failure_count") + wire::number(output_trace.metadata_failed_attributes) +
+        wire::key("operation") + wire::text((output_trace.metadata_first_is_attributes ? "attributes" : "time")) +
+        wire::key("first_item_index") + wire::number(output_trace.metadata_first_item_index) +
+        wire::key("first_item") + wire::text(wide_to_utf8(output_trace.metadata_first_item)) +
+        wire::key("win32_error") + wire::number(output_trace.metadata_first_win32_error) + wire::end() : "";
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
-        ",\"pipeline_timing\":" + pipeline_timing_json(result.pipeline_timing) : "";
+        wire::key("pipeline_timing") + pipeline_timing_wire(result.pipeline_timing) : "";
 #endif
-    print_json_line(
-        "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-        "\",\"status\":\"" + std::string(ok ? "ok" : "failed") +
-        "\",\"native_status\":\"" + json_escape(status_to_string(result.status)) +
-        "\",\"operation_result\":" + std::to_string(result.operation_result) +
-        ",\"operation_result_name\":\"" + json_escape(operation_result_name(result.operation_result)) +
-        "\"" +
-        ",\"encrypted\":" + std::string(result.encrypted ? "true" : "false") +
-        ",\"damaged\":" + std::string(result.damaged ? "true" : "false") +
-        ",\"checksum_error\":" + std::string(result.checksum_error ? "true" : "false") +
-        ",\"missing_volume\":" + std::string(result.missing_volume ? "true" : "false") +
-        ",\"missing_volume_suspected\":" + std::string(result.missing_volume_suspected ? "true" : "false") +
-        ",\"missing_volume_evidence\":\"" + json_escape(result.missing_volume_evidence) +
-        "\",\"missing_volume_name\":\"" + json_escape(wide_to_utf8(result.missing_volume_name)) +
-        "\",\"wrong_password\":" + std::string(result.wrong_password ? "true" : "false") +
-        ",\"password_rejected\":" + std::string(result.password_rejected ? "true" : "false") +
-        ",\"password_crc_proven\":" + std::string(result.password_crc_proven ? "true" : "false") +
-        ",\"password_crc_proven_items\":" + std::to_string(result.password_crc_proven_items) +
-        ",\"password_candidate_batch\":" + std::string(result.password_candidate_batch ? "true" : "false") +
-        ",\"password_candidate_direct\":" + std::string(result.password_candidate_direct ? "true" : "false") +
-        ",\"password_candidates_all_rejected\":" + std::string(result.password_candidates_all_rejected ? "true" : "false") +
-        ",\"password_candidate_count\":" + std::to_string(result.password_candidate_count) +
-        ",\"password_attempts\":" + std::to_string(result.password_attempts) +
-        ",\"matched_index\":" + std::to_string(result.matched_index) +
-        ",\"unsupported_method\":" + std::string(result.unsupported_method ? "true" : "false") +
-        ",\"item_count\":" + std::to_string(result.item_count) +
-        ",\"files_written\":" + std::to_string(result.files_written) +
-        ",\"dirs_written\":" + std::to_string(result.dirs_written) +
-        ",\"bytes_written\":" + std::to_string(result.bytes_written) +
+    print_frame(
+        (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+        wire::key("status") + wire::text(ok ? "ok" : "failed") +
+        wire::key("native_status") + wire::text(status_to_string(result.status)) +
+        wire::key("operation_result") + wire::number(result.operation_result) +
+        wire::key("operation_result_name") + wire::text(operation_result_name(result.operation_result)) +
+        wire::key("encrypted") + wire::boolean(result.encrypted) +
+        wire::key("damaged") + wire::boolean(result.damaged) +
+        wire::key("checksum_error") + wire::boolean(result.checksum_error) +
+        wire::key("missing_volume") + wire::boolean(result.missing_volume) +
+        wire::key("missing_volume_suspected") + wire::boolean(result.missing_volume_suspected) +
+        wire::key("missing_volume_evidence") + wire::text(result.missing_volume_evidence) +
+        wire::key("missing_volume_name") + wire::text(wide_to_utf8(result.missing_volume_name)) +
+        wire::key("wrong_password") + wire::boolean(result.wrong_password) +
+        wire::key("password_rejected") + wire::boolean(result.password_rejected) +
+        wire::key("password_crc_proven") + wire::boolean(result.password_crc_proven) +
+        wire::key("password_crc_proven_items") + wire::number(result.password_crc_proven_items) +
+        wire::key("password_candidate_batch") + wire::boolean(result.password_candidate_batch) +
+        wire::key("password_candidate_direct") + wire::boolean(result.password_candidate_direct) +
+        wire::key("password_candidates_all_rejected") + wire::boolean(result.password_candidates_all_rejected) +
+        wire::key("password_candidate_count") + wire::number(result.password_candidate_count) +
+        wire::key("password_attempts") + wire::number(result.password_attempts) +
+        wire::key("matched_index") + wire::number(result.matched_index) +
+        wire::key("unsupported_method") + wire::boolean(result.unsupported_method) +
+        wire::key("item_count") + wire::number(result.item_count) +
+        wire::key("files_written") + wire::number(result.files_written) +
+        wire::key("dirs_written") + wire::number(result.dirs_written) +
+        wire::key("bytes_written") + wire::number(result.bytes_written) +
         volume_attempt_fields +
-        ",\"dry_run\":" + std::string(dry_run ? "true" : "false") +
-        ",\"open_mode\":\"" + json_escape(wide_to_utf8(archive_input.open_mode)) +
-        "\",\"archive_type\":\"" + json_escape(wide_to_utf8(result.archive_type)) +
-        "\",\"requested_codepage\":\"" + json_escape(wide_to_utf8(result.requested_codepage)) +
-        "\",\"applied_codepage\":\"" + json_escape(wide_to_utf8(result.applied_codepage)) +
-        "\",\"filename_decoder\":\"" + json_escape(wide_to_utf8(result.filename_decoder)) +
-        "\",\"verified_manifest\":" + manifest_summary +
-        ",\"failed_item\":\"" + json_escape(wide_to_utf8(result.failed_item)) +
-        "\",\"message\":\"" + json_escape(result.message) + "\"" + metadata_warning_field +
+        wire::key("dry_run") + wire::boolean(dry_run) +
+        wire::key("open_mode") + wire::text(wide_to_utf8(archive_input.open_mode)) +
+        wire::key("archive_type") + wire::text(wide_to_utf8(result.archive_type)) +
+        wire::key("requested_codepage") + wire::text(wide_to_utf8(result.requested_codepage)) +
+        wire::key("applied_codepage") + wire::text(wide_to_utf8(result.applied_codepage)) +
+        wire::key("filename_decoder") + wire::text(wide_to_utf8(result.filename_decoder)) +
+        wire::key("verified_manifest") + manifest_summary +
+        wire::key("failed_item") + wire::text(wide_to_utf8(result.failed_item)) +
+        wire::key("message") + wire::text(result.message) + metadata_warning_field +
         failure_fields + input_trace_field
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
         + pipeline_timing_field
 #endif
-        + diagnostic_fields + stream_receipt_field + "}");
+        + diagnostic_fields + stream_receipt_field + wire::end());
     return ok ? 0 : 1;
 }
 
@@ -1738,7 +1381,7 @@ public:
         const std::string queued_event =
             request.job_id.empty()
                 ? std::string{}
-                : worker_event_json("job_queued", metadata, 0);
+                : worker_event_wire("job_queued", metadata, 0);
         const std::string job_id = request.job_id;
         bool rejected_for_capacity = false;
         {
@@ -1770,17 +1413,15 @@ public:
         }
 
         if (rejected_for_capacity) {
-            print_json_line(
-                "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                "\",\"status\":\"failed\",\"native_status\":\"backpressure\","
-                "\"retryable\":true,\"failure_stage\":\"native_admission\","
-                "\"failure_kind\":\"queue_capacity\",\"message\":\"native job queue is full\"}");
+            print_frame(
+                (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("backpressure") + wire::key("retryable") + wire::boolean(true) + wire::key("failure_stage") + wire::text("native_admission") + wire::key("failure_kind") + wire::text("queue_capacity") + wire::key("message") + wire::text("native job queue is full") + wire::end()));
             print_worker_event(job_id, "job_finished", metadata);
             return;
         }
 
         if (!queued_event.empty()) {
-            print_json_line(queued_event);
+            print_frame(queued_event);
         }
         condition_.notify_one();
     }
@@ -1828,8 +1469,8 @@ public:
                 std::lock_guard<std::mutex> lock(cancel_mutex_);
                 cancel_tokens_.erase(job_id);
             }
-            print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                "\",\"status\":\"cancelled\",\"native_status\":\"cancelled\",\"hresult\":-2147467260}");
+            print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                (wire::key("status") + wire::text("cancelled") + wire::key("native_status") + wire::text("cancelled") + wire::key("hresult") + wire::number(-2147467260) + wire::end()));
             print_worker_event(job_id, "job_finished", withdrawn->metadata);
             if (drained) drain_condition_.notify_all();
             return true;
@@ -1917,8 +1558,8 @@ private:
         // Lifecycle events reuse these fields four times per job. Escaping them
         // once at submission avoids repeated allocations/string walks on the
         // admission and completion hot paths.
-        std::string escaped_job_id;
-        std::string lifecycle_context_json;
+        std::string encoded_job_id;
+        std::string lifecycle_context_wire;
     };
 
     struct JobExecution {
@@ -1978,12 +1619,12 @@ private:
     static JobMetadata metadata_from_request(const WorkerRequest& request) noexcept {
         JobMetadata metadata;
         const auto &request_id = request.request_id.empty() ? request.job_id : request.request_id;
-        metadata.escaped_job_id = json_escape(request.job_id);
-        metadata.lifecycle_context_json =
-            ",\"request_id\":\"" + json_escape(request_id) +
-            "\",\"origin\":\"" + std::string(request.origin != "watch" ? "foreground" : "watch") +
-            "\",\"output_volume_key\":\"" + json_escape(request.output_volume_key) +
-            "\",\"requires_writer\":" + std::string(!request.dry_run ? "true" : "false");
+        metadata.encoded_job_id = wire::text(request.job_id);
+        metadata.lifecycle_context_wire =
+            wire::key("request_id") + wire::text(request_id) +
+            wire::key("origin") + wire::text(request.origin != "watch" ? "foreground" : "watch") +
+            wire::key("output_volume_key") + wire::text(request.output_volume_key) +
+            wire::key("requires_writer") + wire::boolean(!request.dry_run);
         return metadata;
     }
 
@@ -2020,17 +1661,17 @@ private:
         monitor_condition_.notify_one();
     }
 
-    std::string worker_event_json(
+    std::string worker_event_wire(
         const char* event,
         const JobMetadata& metadata,
         std::size_t active_jobs = 0
     ) const {
         return
-            "{\"type\":\"native_event\",\"job_id\":\"" + metadata.escaped_job_id +
-            "\",\"event\":\"" + event +
-            "\"" + metadata.lifecycle_context_json +
-            ",\"active_jobs\":" + std::to_string(active_jobs) +
-            "}";
+            (wire::object() + wire::key("type") + wire::text("native_event") + wire::key("job_id")) + metadata.encoded_job_id +
+            wire::key("event") + wire::text(event) +
+            metadata.lifecycle_context_wire +
+            wire::key("active_jobs") + wire::number(active_jobs) +
+            wire::end();
     }
 
     void print_worker_event(
@@ -2042,7 +1683,7 @@ private:
         if (job_id.empty()) {
             return;
         }
-        print_json_line(worker_event_json(
+        print_frame(worker_event_wire(
             event, metadata, active_jobs));
     }
 
@@ -2053,12 +1694,12 @@ private:
         if (job.request.job_id.empty()) {
             return;
         }
-        print_json_lines(
-            worker_event_json(
+        print_frames(
+            worker_event_wire(
                 "job_admitted",
                 job.metadata,
                 active_jobs),
-            worker_event_json(
+            worker_event_wire(
                 "job_started",
                 job.metadata,
                 active_jobs));
@@ -2081,9 +1722,9 @@ private:
         const char* event,
         const std::string& volume_key
     ) noexcept {
-        print_json_line(
-            "{\"type\":\"native_writer\",\"event\":\"" + std::string(event) +
-            "\",\"volume_key\":\"" + json_escape(volume_key) + "\"}");
+        print_frame(
+            (wire::object() + wire::key("type") + wire::text("native_writer") + wire::key("event")) + wire::text(event) +
+            wire::key("volume_key") + wire::text(volume_key) + wire::end());
     }
 
     // Space events go out on the `progress` channel, one per affected job, with a real job_id: both dispatchers drop events whose job_id is empty or unknown.
@@ -2114,16 +1755,16 @@ private:
         unsigned long query_error
     ) {
         std::string payload =
-            "{\"type\":\"progress\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"event\":\"" + event +
-            "\",\"volume_key\":\"" + json_escape(volume_key) +
-            "\",\"episode_id\":" + std::to_string(episode_id) +
-            ",\"win32_error\":" + std::to_string(win32_error) +
-            ",\"free_bytes\":" + std::to_string(free_bytes) +
-            ",\"pending_bytes\":" + std::to_string(pending_bytes) +
-            ",\"blocked_seconds\":" + std::to_string(blocked_seconds) +
-            ",\"volume_query_ok\":" + (query_ok ? "true" : "false") +
-            ",\"volume_query_error\":" + std::to_string(query_error) + "}";
+            (wire::object() + wire::key("type") + wire::text("progress") + wire::key("job_id")) + wire::text(job_id) +
+            wire::key("event") + wire::text(event) +
+            wire::key("volume_key") + wire::text(volume_key) +
+            wire::key("episode_id") + wire::number(episode_id) +
+            wire::key("win32_error") + wire::number(win32_error) +
+            wire::key("free_bytes") + wire::number(free_bytes) +
+            wire::key("pending_bytes") + wire::number(pending_bytes) +
+            wire::key("blocked_seconds") + wire::number(blocked_seconds) +
+            wire::key("volume_query_ok") + wire::boolean(query_ok) +
+            wire::key("volume_query_error") + wire::number(query_error) + wire::end();
         return payload;
     }
 
@@ -2132,7 +1773,7 @@ private:
     ) noexcept {
         const char* event = space_event_name(transition.kind);
         for (const auto& job_id : transition.job_ids) {
-            print_json_line(space_event_payload(
+            print_frame(space_event_payload(
                 event,
                 job_id,
                 transition.volume_key,
@@ -2164,7 +1805,7 @@ private:
         }
         const std::uint64_t episode_id = gate.episode_id();
         for (const auto& job_id : job_ids) {
-            print_json_line(space_event_payload(
+            print_frame(space_event_payload(
                 "space_status",
                 job_id,
                 transition_volume_key(state),
@@ -2306,9 +1947,8 @@ private:
                 try {
                     if (replaying && !job.cancel_token->load(std::memory_order_acquire) && !job.execution->inputs_unchanged()) {
                         code = 1;
-                        print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                            "\",\"status\":\"failed\",\"native_status\":\"error\",\"failure_kind\":\"input_changed\","
-                            "\"failure_stage\":\"native_replay\",\"message\":\"archive input changed while waiting for memory; rescan required\"}");
+                        print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                            (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end()));
                     } else if (!job.request.dry_run) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_->acquire(key);
@@ -2330,16 +1970,15 @@ private:
                     if (error.code() == std::errc::resource_unavailable_try_again) {
                         memory_.retry(memory_job);
                         code = kMemoryRetry;
-                        print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + json_escape(job_id) +
-                            "\",\"event\":\"memory_thread_resource_retry\",\"error_code\":" +
-                            std::to_string(error.code().value()) + "}");
+                        print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
+                            (wire::key("event") + wire::text("memory_thread_resource_retry") + wire::key("error_code")) +
+                            wire::number(error.code().value()) + wire::end());
                     }
                 } catch (...) { code = -100; }
             }
             if (code == -100) {
-                print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"status\":\"failed\",\"native_status\":\"error\",\"failure_kind\":\"native_exception\","
-                    "\"failure_stage\":\"native_execution\",\"message\":\"unexpected native execution exception\"}");
+                print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
+                    (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("native_exception") + wire::key("failure_stage") + wire::text("native_execution") + wire::key("message") + wire::text("unexpected native execution exception") + wire::end()));
             }
             // Pending output and decoder threads have drained. Parked tasks
             // retain neither dictionaries, writer leases nor execution threads.
@@ -2347,17 +1986,17 @@ private:
             memory_.end(memory_job);
             request_monitor_recheck();
             if (code == kMemoryRetry) {
-                print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"event\":\"memory_reclaimed\",\"required_bytes\":" + std::to_string(memory_job.required) + "}");
+                print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
+                    (wire::key("event") + wire::text("memory_reclaimed") + wire::key("required_bytes")) + wire::number(memory_job.required) + wire::end());
                 auto parked = std::make_shared<Job>(std::move(job));
                 const auto notice = [parked](bool blocked, std::int64_t headroom, std::uint64_t needed) {
                     auto &episode = parked->execution->memory_episode;
                     if (blocked) ++episode;
-                    print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + parked->metadata.escaped_job_id +
-                        "\",\"event\":\"" + (blocked ? "memory_blocked" : "memory_resumed") +
-                        "\",\"episode_id\":" + std::to_string(episode) +
-                        ",\"required_bytes\":" + std::to_string(needed) +
-                        ",\"available_bytes\":" + std::to_string((std::max)(headroom, std::int64_t{0})) + "}");
+                    print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + parked->metadata.encoded_job_id +
+                        wire::key("event") + wire::text((blocked ? "memory_blocked" : "memory_resumed")) +
+                        wire::key("episode_id") + wire::number(episode) +
+                        wire::key("required_bytes") + wire::number(needed) +
+                        wire::key("available_bytes") + wire::number((std::max)(headroom, std::int64_t{0})) + wire::end());
                 };
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -2448,8 +2087,8 @@ int run_message(
     if (command == "cancel") {
         const std::string& job_id = request.job_id;
         const bool accepted = executor.cancel(job_id);
-        print_json_line("{\"type\":\"cancel_ack\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"accepted\":" + std::string(accepted ? "true" : "false") + "}");
+        print_frame((wire::object() + wire::key("type") + wire::text("cancel_ack") + wire::key("job_id")) + wire::text(job_id) +
+            wire::key("accepted") + wire::boolean(accepted) + wire::end());
         return accepted ? 0 : 1;
     }
     if (command == "set_process_mode") {
@@ -2458,8 +2097,8 @@ int run_message(
             mode = "normal";
         }
         const bool applied = apply_native_process_mode(mode);
-        print_json_line("{\"type\":\"process_mode_ack\",\"mode\":\"" + mode +
-            "\",\"applied\":" + std::string(applied ? "true" : "false") + "}");
+        print_frame((wire::object() + wire::key("type") + wire::text("process_mode_ack") + wire::key("mode")) + wire::text(mode) +
+            wire::key("applied") + wire::boolean(applied) + wire::end());
         return applied ? 0 : 1;
     }
     if (command == "shutdown") {
@@ -2471,34 +2110,40 @@ int run_message(
 }
 
 int main() {
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    std::cerr.tie(nullptr);
     const std::string requested_process_mode = requested_native_process_mode();
     const bool process_mode_applied = apply_native_process_mode(requested_process_mode);
     const auto worker_count = native_logical_processor_count();
     const auto memory_reserve_bytes = sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(worker_count);
     NativeJobExecutor executor(worker_count, memory_reserve_bytes);
-    print_json_line(
-        "{\"type\":\"worker_ready\",\"sizing_mode\":\"dynamic\",\"logical_processors\":" + std::to_string(worker_count) +
-        ",\"thread_capacity\":" + std::to_string(worker_count) +
-        ",\"memory_management\":\"commitment_replay\"" +
-        ",\"memory_reserve_bytes\":" +
-            std::to_string(memory_reserve_bytes) +
-        ",\"process_mode\":\"" + requested_process_mode +
-        "\",\"process_mode_applied\":" + (process_mode_applied ? "true" : "false") + "}");
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        line.erase(line.begin(), std::find_if(line.begin(), line.end(), [](unsigned char ch) {
-            return ch > 0x20;
-        }));
-        if (line.empty()) {
-            continue;
+    print_frame(
+        (wire::object() + wire::key("type") + wire::text("worker_ready") + wire::key("sizing_mode") + wire::text("dynamic") + wire::key("logical_processors")) + wire::number(worker_count) +
+        wire::key("thread_capacity") + wire::number(worker_count) +
+        (wire::key("memory_management") + wire::text("commitment_replay")) +
+        wire::key("memory_reserve_bytes") +
+            wire::number(memory_reserve_bytes) +
+        wire::key("process_mode") + wire::text(requested_process_mode) +
+        wire::key("process_mode_applied") + wire::boolean(process_mode_applied) + wire::end());
+    std::string frame;
+    try {
+        while (wire::read(std::cin, frame)) {
+            WorkerRequest request = parse_worker_request(frame);
+            std::string().swap(frame);
+            const bool shutdown = request.worker_command == "shutdown";
+            const int code = run_message(std::move(request), executor);
+            if (shutdown) {
+                executor.stop(/*cancel_pending_jobs=*/false);
+                return code;
+            }
         }
-        WorkerRequest request = parse_worker_request(line);
-        const bool shutdown = request.worker_command == "shutdown";
-        const int code = run_message(std::move(request), executor);
-        if (shutdown) {
-            executor.stop(/*cancel_pending_jobs=*/false);
-            return code;
-        }
+    } catch (const std::exception& error) {
+        std::cerr << "worker protocol: " << error.what() << "\n";
+        executor.stop(/*cancel_pending_jobs=*/true);
+        return 2;
     }
     executor.stop(/*cancel_pending_jobs=*/false);
     return executor.had_job_failure() ? 1 : 0;

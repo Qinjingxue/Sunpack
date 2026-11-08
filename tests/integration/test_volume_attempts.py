@@ -6,6 +6,8 @@ These small real archives cover those failures together instead of testing
 individual implementation helpers.
 """
 import asyncio
+from sunpack_native import encode_worker_frame
+from tests.helpers.worker_events import worker_events
 import json
 from pathlib import Path
 import subprocess
@@ -72,8 +74,8 @@ def test_attempt_plan_survives_passwords_carrier_ranges_and_serialization(tmp_pa
         request = {"job_id": "wrong-password", "archive_input": descriptor.to_dict(),
                    "output_dir": str(tmp_path / "wrong-password"), "password": "wrong"}
         run = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
-                             input=json.dumps(request), text=True, capture_output=True)
-        final = next(json.loads(line) for line in run.stdout.splitlines() if json.loads(line).get("type") == "result")
+                             input=encode_worker_frame(request), capture_output=True)
+        final = next(event for event in worker_events(run.stdout) if event.get("type") == "result")
         assert not final["missing_volume"]
         if archive_format == "7z":
             assert final["volume_attempts"] == 1 and final["wrong_password"]
@@ -92,8 +94,8 @@ def test_worker_attempts_emit_one_result_and_stop_on_independent_errors(tmp_path
     def invoke(label, payload, **kwargs):
         output = tmp_path / label
         request = {"job_id": label, "archive_input": payload, "output_dir": str(output), **kwargs}
-        run = subprocess.run([worker], input=json.dumps(request), text=True, capture_output=True, check=False)
-        events = [json.loads(line) for line in run.stdout.splitlines()]
+        run = subprocess.run([worker], input=encode_worker_frame(request), capture_output=True, check=False)
+        events = worker_events(run.stdout)
         results = [e for e in events if e.get("type") == "result"]
         assert len(results) == 1, run.stdout + run.stderr
         assert not any(e.get("event") == "item_failed" for e in events)
@@ -102,8 +104,8 @@ def test_worker_attempts_emit_one_result_and_stop_on_independent_errors(tmp_path
     # Same plan, concurrent foreground/watch jobs: no process-global cursor.
     requests = [{"job_id": origin, "origin": origin, "archive_input": descriptor,
                  "output_dir": str(tmp_path / origin)} for origin in ("foreground", "watch")]
-    run = subprocess.run([worker], input="\n".join(map(json.dumps, requests)), text=True, capture_output=True)
-    events = [json.loads(line) for line in run.stdout.splitlines()]
+    run = subprocess.run([worker], input=b"".join(map(encode_worker_frame, requests)), capture_output=True)
+    events = worker_events(run.stdout)
     results = [e for e in events if e.get("type") == "result"]
     assert len(results) == 2 and not any(e.get("event") == "item_failed" for e in events)
     assert all(r["status"] == "ok" and r["volume_attempts"] == 2 for r in results)
@@ -161,9 +163,9 @@ def test_unnumbered_gap_domains_share_storage_and_backtrack_without_reusing_sour
     assert restored.same_retry_input(descriptor)
     assert restored.volume_attempts.layouts[0][1].choices is restored.volume_attempts.layouts[0][2].choices
     worker = str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))
-    run = subprocess.run([worker], input=json.dumps({"job_id": "shared", "archive_input": restored.to_dict(),
-        "output_dir": str(tmp_path / "shared-out")}), text=True, capture_output=True)
-    final = next(json.loads(line) for line in run.stdout.splitlines() if json.loads(line).get("type") == "result")
+    run = subprocess.run([worker], input=encode_worker_frame({"job_id": "shared", "archive_input": restored.to_dict(),
+        "output_dir": str(tmp_path / "shared-out")}), capture_output=True)
+    final = next(event for event in worker_events(run.stdout) if event.get("type") == "result")
     assert final["status"] == "ok" and final["volume_attempts"] == 3, final
     assert next((tmp_path / "shared-out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
@@ -241,9 +243,8 @@ def _run_trial(tmp_path, descriptor, **kwargs):
     request = {"job_id": "trial", "archive_input": descriptor.to_dict(),
                "output_dir": str(tmp_path / "worker-out"), **kwargs}
     run = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
-                         input=json.dumps(request), text=True, capture_output=True)
-    results = [event for line in run.stdout.splitlines()
-               if (event := json.loads(line)).get("type") == "result"]
+                         input=encode_worker_frame(request), capture_output=True)
+    results = [event for event in worker_events(run.stdout) if event.get("type") == "result"]
     assert len(results) == 1, run.stdout + run.stderr
     return results[0]
 

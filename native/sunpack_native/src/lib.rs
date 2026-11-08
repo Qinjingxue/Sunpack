@@ -236,12 +236,14 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_class::<scan::worker_event::NativeOutputTrace>()?;
+    m.add_class::<scan::worker_wire::NativeWorkerFrameDecoder>()?;
     m.add_class::<scan::worker_event::NativeWorkerResultAccumulator>()?;
     m.add_function(wrap_pyfunction!(
-        scan::worker_event::parse_worker_transport_event,
+        scan::worker_wire::encode_worker_frame,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_event, m)?)?;
+    m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_transport_event, m)?)?;
     m.add_class::<scan::progress_manifest::NativeProgressManifest>()?;
     m.add_function(wrap_pyfunction!(
         scan::progress_manifest::build_progress_manifest,

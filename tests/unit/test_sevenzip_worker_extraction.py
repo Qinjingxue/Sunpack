@@ -1,10 +1,11 @@
+from sunpack_native import encode_worker_frame, parse_worker_event
+from tests.helpers.worker_events import worker_events, read_worker_events, write_worker_script
 import asyncio
 import binascii
 import ctypes
 from ctypes import wintypes
 import gzip
 import io
-import json
 import lzma
 import os
 from pathlib import Path
@@ -32,8 +33,8 @@ from tests.helpers.tool_config import get_test_tools
 
 
 def _invoke_worker(worker, request, *, env=None, timeout=10):
-    return subprocess.run([worker], input=json.dumps(request, ensure_ascii=False),
-                          capture_output=True, text=True, encoding="utf-8", env=env, timeout=timeout)
+    return subprocess.run([worker], input=encode_worker_frame(request),
+                          capture_output=True, env=env, timeout=timeout)
 
 
 def _require_worker_or_skip():
@@ -549,12 +550,12 @@ def test_worker_duplicate_invalid_names_report_failure_without_spinning(tmp_path
     )
     for attempt in range(3):
         result = subprocess.run(
-            [worker], input=json.dumps({
+            [worker], input=encode_worker_frame({
                 "job_id": "invalid-name-regression",
                 "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
                 "output_dir": str(tmp_path / f"out-{attempt}"),
             }),
-            capture_output=True, text=True, encoding="utf-8", timeout=10,
+            capture_output=True,   timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         final = _worker_result(result.stdout)
@@ -634,7 +635,7 @@ def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp
     }
 
     result = _invoke_worker(worker, payload)
-    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
+    lines = worker_events(result.stdout)
     worker_result = next(item for item in lines if item.get("type") == "result")
 
     assert result.returncode != 0
@@ -706,10 +707,7 @@ def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
 
 def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path):
     worker = tmp_path / "exit_worker.cmd"
-    worker.write_text(
-        '@echo {"type":"worker_ready","process_mode":"normal","process_mode_applied":true}\r\n@set /p request=\r\n@exit /b 7\r\n',
-        encoding="utf-8",
-    )
+    write_worker_script(worker, [{"type": "worker_ready", "process_mode": "normal", "process_mode_applied": True}, None, 7])
     runner = SevenZipRunner({})
     runner.worker_path = str(worker)
 
@@ -736,24 +734,17 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
     from sunpack.pipeline.coordinator.engine import PipelineEngine
 
     worker = tmp_path / "cancel_worker.cmd"
-    ending = (
-        '@echo {"type":"result","job_id":"cancel-job","status":"failed"}\r\n'
-        '@echo {"type":"native_event","event":"job_finished","job_id":"cancel-job"}\r\n'
-        '@set /p shutdown=\r\n'
-        if completion == "job_finished"
-        else '@set /p ignored=\r\n' if completion == "worker_closed"
-        else '@exit /b 7\r\n'
-    )
-    worker.write_text(
-        '@echo {"type":"worker_ready","process_mode":"normal","process_mode_applied":true}\r\n'
-        '@set /p request=\r\n'
-        '@echo {"type":"native_event","event":"job_started","job_id":"cancel-job"}\r\n'
-        '@set /p cancellation=\r\n'
-        '@echo {"type":"cancel_ack","job_id":"cancel-job"}\r\n'
-        '@echo {"type":"native_event","event":"job_cancelling","job_id":"cancel-job"}\r\n'
-        '@set /p finish=\r\n' + ending,
-        encoding="utf-8",
-    )
+    ending = [
+        {"type": "result", "job_id": "cancel-job", "status": "failed"},
+        {"type": "native_event", "event": "job_finished", "job_id": "cancel-job"}, None,
+    ] if completion == "job_finished" else [None] if completion == "worker_closed" else [7]
+    write_worker_script(worker, [
+        {"type": "worker_ready", "process_mode": "normal", "process_mode_applied": True}, None,
+        {"type": "native_event", "event": "job_started", "job_id": "cancel-job"}, None,
+        {"type": "cancel_ack", "job_id": "cancel-job"},
+        {"type": "native_event", "event": "job_cancelling", "job_id": "cancel-job"}, None,
+        *ending,
+    ])
 
     async def scenario():
         runner = SevenZipRunner({})
@@ -795,7 +786,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
                 if completion == "worker_closed":
                     await native.abort()
                 else:
-                    await native.send('{"worker_command":"finish"}')
+                    await native.send(encode_worker_frame({"worker_command": "finish"}))
                 with pytest.raises(asyncio.CancelledError):
                     await asyncio.wait_for(request, 2)
                 await asyncio.wait_for(waiting, 2)
@@ -946,17 +937,17 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         limits.JobMemoryLimit = mib * 1024**2
         assert kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits))
     process = subprocess.Popen([str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW,
+                                 creationflags=subprocess.CREATE_NO_WINDOW,
                                env=os.environ.copy())
     events = queue.Queue()
     seen = []
     def read():
-        for line in process.stdout:
-            events.put(json.loads(line))
+        for event in read_worker_events(process.stdout):
+            events.put(event)
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     def send(value):
-        process.stdin.write(json.dumps(value) + "\n")
+        process.stdin.write(encode_worker_frame(value))
         process.stdin.flush()
     def until(predicate):
         deadline = time.monotonic() + 10
@@ -1050,16 +1041,13 @@ def test_native_worker_reports_cpu_credit_sizing_plan(credits, reserve):
         environment["SUNPACK_NATIVE_MEMORY_RESERVE_BYTES"] = str(reserve)
     completed = subprocess.run(
         [worker_path],
-        input='{"worker_command":"shutdown","job_id":"shutdown"}\n',
+        input=encode_worker_frame({"worker_command": "shutdown", "job_id": "shutdown"}),
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         env=environment,
         timeout=10,
         check=True,
     )
-    handshake = json.loads(completed.stdout.splitlines()[0])
+    handshake = worker_events(completed.stdout)[0]
 
     logical_processors = max(1, int(handshake["logical_processors"]))
     assert handshake["type"] == "worker_ready"
@@ -1071,38 +1059,32 @@ def test_native_worker_reports_cpu_credit_sizing_plan(credits, reserve):
 
 
 def test_worker_event_rejects_non_objects_and_malformed_rows():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
-
-    assert parse_worker_json_line(json.dumps({
-        "type": "result", "verified_manifest": {"rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]]},
-    })) == {}
-    assert parse_worker_json_line(json.dumps({
-        "type": "result", "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}]}},
-    })) == {}
-    assert parse_worker_json_line("not json") == {}
-    assert parse_worker_json_line("[1, 2]") == {}
-    assert parse_worker_json_line('{"type":"progress"} trailing') == {}
-    assert parse_worker_json_line(
-        '{"type":"result","verified_manifest":{"inventory":[1,1,0,3,1],"rows":[[0,"a.txt"]]}}'
-    ) == {}
-    assert parse_worker_json_line('{"type":"progress","completed_bytes":5}') == {
-        "type": "progress", "completed_bytes": 5,
-    }
+    for event in [
+        {"type": "result", "verified_manifest": {"rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b"abc"]]}},
+        {"type": "result", "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}]}}},
+        {"type": "result", "verified_manifest": {"inventory": [1,1,0,3,1], "rows": [[0,"a.txt"]]}},
+    ]:
+        with pytest.raises(ValueError):
+            parse_worker_event(encode_worker_frame(event))
+    frame = encode_worker_frame({"type": "progress", "completed_bytes": 5})
+    for malformed in [b"not a frame", frame[:-1], frame + b"trailing"]:
+        with pytest.raises(ValueError):
+            parse_worker_event(malformed)
+    assert parse_worker_event(frame) == {"type": "progress", "completed_bytes": 5}
 
 
 def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         native_worker_manifest,
-        parse_worker_json_line,
     )
 
-    result_payload = parse_worker_json_line(json.dumps({
+    result_payload = parse_worker_event(encode_worker_frame({
         "type": "result",
         "status": "ok",
         "verified_manifest": {
             "validated": True,
-            "rows": [[0, "source.txt", "output.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
+            "rows": [[0, "source.txt", "output.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b'abc']],
             "inventory": [1, 1, 0, 3, 0],
         },
     }))
@@ -1126,15 +1108,14 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         compact_success_worker_diagnostics,
-        parse_worker_json_line,
     )
 
-    result = parse_worker_json_line(json.dumps({
+    result = parse_worker_event(encode_worker_frame({
         "status": "ok",
         "verified_manifest": {
             "validated": True,
             "inventory": [1, 1, 0, 3, 1],
-            "rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
+            "rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, b'abc']],
         },
         "diagnostics": {
             "output_trace": {
@@ -1377,11 +1358,7 @@ def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit
     worker = tmp_path / "malformed_worker.cmd"
     # Emit malformed output after accepting a request. Exiting before the
     # handshake races with submission and legitimately reports process_io.
-    worker.write_text(
-        '@echo {"type":"worker_ready","process_mode":"normal","process_mode_applied":true}\r\n'
-        '@set /p request=\r\n@echo not-json\r\n@exit /b 2\r\n',
-        encoding="utf-8",
-    )
+    write_worker_script(worker, [{"type": "worker_ready", "process_mode": "normal", "process_mode_applied": True}, None, b"broken frame", 2])
     archive = tmp_path / "sample.7z"
     archive.write_bytes(b"not used")
     scheduler = ExtractionScheduler()
@@ -1409,13 +1386,10 @@ def _task(path, archive_input=None):
 
 
 def _worker_result(stdout: str) -> dict:
-    from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
+    from sunpack_native import NativeWorkerResultAccumulator, parse_worker_event
 
     accumulators = {}
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        payload = parse_worker_transport_event(line)
+    for payload in worker_events(stdout):
         job_id = payload.get("job_id")
         if payload["type"] not in {"manifest_chunk", "trace_chunk", "result"}:
             continue
@@ -1581,14 +1555,14 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
 
 def test_worker_manifest_protocol(subtests):
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
-        native_worker_manifest, parse_worker_json_line,
+        native_worker_manifest,
     )
     path = '目录/"quoted"\\name.txt'
-    fields = [("rows", [[0, path, "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, "616263"]]),
+    fields = [("rows", [[0, path, "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, b'abc']]),
               ("inventory", [1, 1, 0, 3, 1])]
     for order in (fields, fields[::-1]):
         with subtests.test(rows_first=order[0][0] == "rows"):
-            result = parse_worker_json_line(json.dumps({"type": "result", "verified_manifest": dict(order)}))
+            result = parse_worker_event(encode_worker_frame({"type": "result", "verified_manifest": dict(order)}))
             manifest = result["verified_manifest"]
             assert "rows" not in manifest and "files" not in manifest
             assert manifest["inventory"]["complete"] and manifest["inventory"]["identity_paths"]

@@ -1,12 +1,11 @@
 import subprocess
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import Any
 
 from sunpack_native import (
     NativeOutputTrace,
     NativeWorkerManifest,
-    parse_worker_event,
 )
 
 
@@ -90,11 +89,6 @@ def attach_worker_diagnostics(
     return completed
 
 
-def parse_worker_json_line(line: bytes | str) -> dict[str, Any]:
-    """Parse one worker event in Rust; per-item arrays become native tables."""
-    return parse_worker_event(line) or {}
-
-
 def build_worker_diagnostics(
     *,
     stdout: str,
@@ -108,16 +102,9 @@ def build_worker_diagnostics(
 ) -> dict[str, Any]:
     history = progress_events if isinstance(progress_events, ProgressHistory) else ProgressHistory()
     result = result_payload or {}
-    if result_payload is not None:
-        if not isinstance(progress_events, ProgressHistory):
-            for event in progress_events or ():
-                history.append(event)
-    else:
-        for event in _json_events(stdout):
-            if event.get("type") == "result":
-                result = event
-            elif event.get("type") == "progress":
-                history.append(event)
+    if not isinstance(progress_events, ProgressHistory):
+        for event in progress_events or ():
+            history.append(event)
     parsed_progress_events = history.snapshot()
     diagnostics: dict[str, Any] = {
         "source": "sevenzip_worker",
@@ -168,13 +155,6 @@ def compact_success_worker_diagnostics(diagnostics: dict[str, Any]) -> None:
     result.get("diagnostics", {}).get("output_trace", {}).pop("native_items", None)
 
 
-def _json_events(text: str) -> Iterator[dict[str, Any]]:
-    for line in (text or "").splitlines():
-        payload = parse_worker_json_line(line)
-        if payload:
-            yield payload
-
-
 def native_worker_manifest(result: dict[str, Any]) -> NativeWorkerManifest | None:
     manifest = result.get("verified_manifest", {})
     return manifest.get("native_rows")
@@ -187,7 +167,7 @@ def native_output_trace(result: dict[str, Any]) -> NativeOutputTrace | None:
 
 
 def _tail_lines(text: str, limit: int = _STDIO_TAIL_LINES) -> list[str]:
-    # A successful worker result is a single multi-megabyte JSON line.  The
+    # Keep textual process diagnostics bounded. The
     # structured payload is retained separately, so diagnostics only need a
     # bounded textual tail for malformed output and process failures.
     lines = (text or "")[-_STDIO_TAIL_CHARS:].splitlines()

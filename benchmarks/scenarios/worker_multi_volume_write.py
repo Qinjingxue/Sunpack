@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from sunpack_native import encode_worker_frame
 import json
 import os
 from pathlib import Path
@@ -155,11 +156,7 @@ class _JobRun:
         self.finished_ns = 0
         self.done = threading.Event()
 
-    def on_line(self, line: str) -> bool:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return False
+    def on_event(self, event: dict[str, Any]) -> bool:
         if not isinstance(event, dict):
             return False
         self.events.append(event)
@@ -255,18 +252,14 @@ def _job_payload(
     # omitting it falls back to `job:<id>` and the scenario stops testing routing.
     normalized = normalized_output_dir(str(output_dir))
     volume_key = resolve_output_volume_key(normalized) or f"job:{job_id}"
-    return json.dumps(
-        {
+    return encode_worker_frame({
             "job_id": job_id,
             "archive_input": {"entry_path": str(archive), "open_mode": "file", "format_hint": "zip"},
             "output_dir": normalized,
             "output_volume_key": volume_key,
             "password": "",
             "dry_run": False,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+        })
 
 
 def _run_phase(
@@ -314,7 +307,7 @@ def _run_phase(
                     dll_path=dll_path,
                 ),
                 run.job_id,
-                on_line=run.on_line,
+                on_event=run.on_event,
                 on_error=run.on_error,
             )
         _wait_for_jobs(runs, worker=worker, timeout_seconds=timeout_seconds)

@@ -280,4 +280,4 @@ The installer package additionally contains:
 service\sunpack-watch-broker.exe
 ```
 
-`sunpack_sevenzip_worker.exe` reads JSON jobs and extracts files, volumes, and virtual inputs through the embedded 7-Zip backend. `7z.exe` and its adjacent development `7z.dll` are used for fixtures, manual diagnostics, file provenance, and preparing release resources; they are not product extraction runtime dependencies.
+`sunpack_sevenzip_worker.exe` reads binary job frames and extracts files, volumes, and virtual inputs through the embedded 7-Zip backend. `7z.exe` and its adjacent development `7z.dll` are used for fixtures, manual diagnostics, file provenance, and preparing release resources; they are not product extraction runtime dependencies.

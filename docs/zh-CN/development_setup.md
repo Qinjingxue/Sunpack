@@ -280,4 +280,4 @@ tools\sunpack_toast.dll
 service\sunpack-watch-broker.exe
 ```
 
-`sunpack_sevenzip_worker.exe` 读取 JSON job，通过内嵌 7-Zip 后端解压文件、分卷和虚拟输入。`7z.exe` 及其开发环境中的相邻 `7z.dll` 用于 fixture、手工诊断、文件来源和发布资源准备，不属于产品解压运行时依赖。
+`sunpack_sevenzip_worker.exe` 读取二进制任务帧，通过内嵌 7-Zip 后端解压文件、分卷和虚拟输入。`7z.exe` 及其开发环境中的相邻 `7z.dll` 用于 fixture、手工诊断、文件来源和发布资源准备，不属于产品解压运行时依赖。
