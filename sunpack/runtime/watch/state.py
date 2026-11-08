@@ -9,13 +9,12 @@ import weakref
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under
-from sunpack_native import NativeWatchState, NativeWatchOperations, watch_path_key
+from sunpack.core.support.path_keys import absolute_path_key
+from sunpack_native import NativeWatchState, NativeWatchOperations, watch_journal_open, watch_path_key
 from sunpack.core.platform.windows.file_mutex import file_mutex
 
 from sunpack.runtime.watch.journal_commit import (
     JournalTicket,
-    open_state_stream,
     seed_state_stream,
     submit_segment_seal,
     submit_state_transaction,
@@ -171,7 +170,7 @@ class WatchStateStore:
         self._compact_records = max(1, int(compact_records))
         self._compact_bytes = max(1, int(compact_bytes))
         self._hard_compact_bytes = max(self._compact_bytes, int(hard_compact_bytes))
-        self._journal_stream = open_state_stream(self._writer_stream)
+        self._journal_stream = watch_journal_open(self._writer_stream)
         self._closing = False
         self._closed = False
         self._journal_waiters = 0
@@ -1045,13 +1044,7 @@ class WatchStateStore:
         """Retire unused blockers/cursors on configuration changes, keeping recovery."""
         with self._state_lock:
             self.scopes = tuple(scopes)
-            entry_keys, cursor_keys = self._native.unused_scope_keys([scope.native for scope in self.scopes])
-            operations = [self._delete_operation("entries", key) for key in entry_keys]
-            if cursor_keys:
-                cursors = dict(self._native.watch_cursors())
-                for key in cursor_keys:
-                    cursors.pop(key, None)
-                operations.append({"op": "set_watch_cursors", "value": cursors})
+            operations = self._native.scope_retirement_operations([scope.native for scope in self.scopes])
             self._commit_operations_locked(operations, durable=True)
 
     def merge_watch_cursors(self, cursors: dict[str, dict[str, int]], *, durable: bool = True) -> None:
@@ -1179,23 +1172,6 @@ class WatchStateStore:
                 ])
             return changed
 
-    def failed_password_entries_under(self, directory: str, *, include_subtree: bool = True) -> list[WatchStateEntry]:
-        with self._state_lock:
-            root = Path(directory).resolve()
-            result: list[WatchStateEntry] = []
-            for raw in self._native.entry_items(blocker="password"):
-                entry = WatchStateEntry(**raw)
-                try:
-                    scope = Path(entry.password_scope_dir).resolve()
-                    if include_subtree:
-                        scope.relative_to(root)
-                    elif scope != root:
-                        continue
-                except ValueError:
-                    continue
-                result.append(entry)
-            return result
-
     def mark(
         self,
         path: str,
@@ -1251,7 +1227,3 @@ class WatchStateStore:
 def _path_key(path: str) -> str:
     # One key function with NativeWatchState, which keys its record maps.
     return watch_path_key(str(path))
-
-
-def _is_path_under(path: str, root: str) -> bool:
-    return path_key_is_under(absolute_path_key(path), absolute_path_key(root))

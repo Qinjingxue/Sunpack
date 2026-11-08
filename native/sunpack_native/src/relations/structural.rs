@@ -210,7 +210,7 @@ pub(super) fn collect(
         {
             // Refine only structure facts. Stage ownership and filesystem routes
             // stay unchanged; the native residual retains this refined anchor.
-            let probe = inspect_pe_image_reader(&reader, reader.len(), &[]);
+            let probe = inspect_pe_image_reader(&reader);
             let Ok(probe) = probe else {
                 // A transient read error is not evidence against PE identity.
                 continue;

@@ -7,9 +7,9 @@ const passwordIndexes=new WeakMap();
 export default {
   data() { return {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
-    actionError:'',lastCommand:{},errors:{},logPath:'',cliAllowed:false,runtime:{known:false,running:false},
+    actionError:'',errors:{},cliAllowed:false,runtime:{known:false,running:false},
     taskCursors:[],taskPages:[],taskPending:null,taskRevision:0,tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
-    startup:{enabled:false,command:''},directoryQuery:'',directorySelection:'',
+    startupEnabled:false,directoryQuery:'',directorySelection:'',
     taskQuery:'',taskDirectoryDirty:false,taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
@@ -51,7 +51,7 @@ export default {
       return groups;
     },
     matchingBlocks() { return this.configBlocks.filter(g=>(!this.configCategory||g.category===this.configCategory)&&(!this.configQuery.trim()||this.matchesConfig([g.label,...g.fields.map(f=>this.configText(f))].join(' ')))); },
-    showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.startup.enabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
+    showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.startupEnabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
     showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
   },
   methods: {
@@ -78,7 +78,7 @@ export default {
         }); }
         if(scope==='config') {
           query=query.trim();
-          if(this.showStartupSetting) {add(-1,'startup-title',this.texts.startup);add(-1,'startupToggle',this.startup.enabled?this.texts.startupOff:this.texts.startupOn);}
+          if(this.showStartupSetting) {add(-1,'startup-title',this.texts.startup);add(-1,'startupToggle',this.startupEnabled?this.texts.startupOff:this.texts.startupOn);}
           if(this.showThemeSetting) {add(-1,'theme-title',this.texts.theme);add(-1,'themeSelector',[this.texts.system,this.texts.light,this.texts.dark][this.themeChoice]);}
           let rows=this.matchingBlocks;
           rows.forEach((g,i)=>{
@@ -943,7 +943,7 @@ export default {
         <ScrollView id="configListScroll"><div id="configBlocks" class="column">
           <div id="startupSetting" v-show="showStartupSetting" class="card settings-row">
             <div class="setting-copy"><label id="startup-title" class="setting-title">{{ texts.startup }}</label></div>
-            <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startup.enabled?'startupDisable':'startupEnable'})">{{ startup.enabled?texts.startupOff:texts.startupOn }}</button>
+            <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startupEnabled?'startupDisable':'startupEnable'})">{{ startupEnabled?texts.startupOff:texts.startupOn }}</button>
           </div>
           <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label id="theme-title" class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" class="selector-host"/></div>
           <VirtualList id="configItems" class="column" estimated-height="140px"><div v-for="g in matchingBlocks" :key="g.key" :id="'block-'+g.id" :class="'setting-card '+appearance">

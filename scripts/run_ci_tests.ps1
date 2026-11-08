@@ -62,7 +62,7 @@ function Get-CiEnvironmentRefreshReasons {
         return
     }
     try {
-        & $VenvPython -c "import pytest, xdist, psutil, send2trash, watchdog, zstandard; import sunpack_native as n; assert n.native_available(); assert callable(n.inspect_pe_overlay_structure)" *> $null
+        & $VenvPython -c "import pytest, xdist, psutil, send2trash, watchdog, zstandard; import sunpack_native as n; assert callable(n.NativeDirectoryScanOptions) and callable(n.NativeAnalysisConfig)" *> $null
         if ($LASTEXITCODE -ne 0) { "Runtime, test dependencies or native smoke check failed" }
     } catch {
         "Runtime, test dependencies or native smoke check failed"
@@ -104,7 +104,7 @@ try {
     Invoke-TestStep -Label "Native extension smoke test" -Command @(
         $python,
         "-c",
-        "import sunpack_native as n; assert n.native_available(); assert callable(n.inspect_pe_overlay_structure)"
+        "import sunpack_native as n; assert callable(n.NativeDirectoryScanOptions) and callable(n.NativeAnalysisConfig)"
     )
     Invoke-TestStep -Label "Parallel unit, functional, and CLI tests" -Command @(
         $python,

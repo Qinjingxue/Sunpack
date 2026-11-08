@@ -25,14 +25,10 @@ uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
 Smoke test:
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import sunpack_native; print(sunpack_native.native_available())"
+.\.venv\Scripts\python.exe -c "import sunpack_native as n; assert callable(n.NativeDirectoryScanOptions)"
 ```
 
 ## API
-
-`native_available()` returns `True` from the native module and is used by smoke
-tests to confirm the extension was imported.
-
 
 `NativeDirectoryScanOptions.scan(...)` walks a directory tree, applies the configured
 filesystem filters, and returns filtered and raw `NativeDirectorySnapshot` views. Entry data stays
@@ -78,11 +74,6 @@ and snapshot construction. The reproducible benchmark driver is
 `python -m benchmarks scan directory`; its `fresh-process` mode resets
 Python/PyO3 process state but does not flush the operating-system file cache.
 
-`list_regular_files_in_directory(directory)` lists regular files directly under
-one directory and returns path/size/mtime metadata. This is intentionally a thin
-filesystem helper used by relation grouping; Python still owns split-volume
-semantics and grouping decisions.
-
 `scan_embedded_archives(path)` performs one extension-independent sequential
 scan for all supported embedded archive signatures. Every identity candidate
 must pass its format-specific structural checks; the complete hit map is also
@@ -107,7 +98,6 @@ The module also exposes lightweight structure inspectors used by the detection
 pipeline:
 
 - `inspect_compression_stream_structure`
-- `inspect_pe_overlay_structure`
 
 These functions preserve the Python result shapes. During the current test
 phase the application treats this native extension as required; missing native

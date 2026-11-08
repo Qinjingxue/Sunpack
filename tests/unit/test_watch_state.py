@@ -7,6 +7,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from sunpack_native import watch_journal_request_flush
 
 from tests.helpers.binary_wal import header, frame, frames
 import sunpack.runtime.watch.state as watch_state_module
@@ -74,9 +75,6 @@ def test_incremental_update_appends_segment_without_replacing_snapshot(tmp_path,
 
 
 def test_failed_journal_append_faults_store(tmp_path):
-    from sunpack_native import watch_journal_request_flush
-    from sunpack.runtime.watch.journal_commit import journal_stats
-
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state.save()
     # Force native OpenOptions(file) to fail without relying on Python internals.
@@ -102,7 +100,8 @@ def test_failed_journal_append_faults_store(tmp_path):
     ticket = watch_journal_request_flush(state._writer_stream, state.applied_seq)
     with pytest.raises(RuntimeError, match="native Watch journal append failed"):
         state.close()
-    assert not journal_stats(state._writer_stream)["registered"]
+    with pytest.raises(RuntimeError, match="stream is unavailable"):
+        watch_journal_request_flush(state._writer_stream, 0)
 
     # Normal-owner tests cannot cover error retirement: old tickets must keep
     # the error while a new store can write to the same path successfully.
@@ -292,8 +291,6 @@ def test_corrupt_complete_journal_record_is_reported(tmp_path):
 
 
 def test_snapshot_missing_required_field_is_rejected(tmp_path):
-    from sunpack.runtime.watch.journal_commit import journal_stats
-
     state_path = tmp_path / "state.snapshot"
     state_path.write_bytes(header(3))
 
@@ -301,7 +298,8 @@ def test_snapshot_missing_required_field_is_rejected(tmp_path):
         WatchStateStore(str(state_path))
     # Retaining the startup exception/traceback must not retain native ownership.
     assert error.value.__traceback__ is not None
-    assert not journal_stats(absolute_path_key(state_path))["registered"]
+    with pytest.raises(RuntimeError, match="stream is unavailable"):
+        watch_journal_request_flush(absolute_path_key(state_path), 0)
 
 
 def test_journal_operation_with_unexpected_field_is_rejected(tmp_path):
@@ -420,8 +418,6 @@ def test_late_write_callback_does_not_recount_checkpointed_wal(tmp_path, monkeyp
 
 
 def test_close_waits_for_existing_checkpoint_before_releasing_stream(tmp_path, monkeypatch):
-    from sunpack.runtime.watch.journal_commit import journal_stats
-
     state = WatchStateStore(str(tmp_path / "state.snapshot"), compact_records=1)
     entered, release = Event(), Event()
     real_write = state._write_snapshot_view
@@ -440,11 +436,12 @@ def test_close_waits_for_existing_checkpoint_before_releasing_stream(tmp_path, m
         try:
             with pytest.raises(FutureTimeoutError):
                 closing.result(timeout=0.05)
-            assert journal_stats(state._writer_stream)["registered"]
+            watch_journal_request_flush(state._writer_stream, 0).wait()
         finally:
             release.set()
         closing.result(timeout=2)
-    assert not journal_stats(state._writer_stream)["registered"]
+    with pytest.raises(RuntimeError, match="stream is unavailable"):
+        watch_journal_request_flush(state._writer_stream, 0)
     with pytest.raises(RuntimeError, match="closed"):
         state.queue_active(_candidate(tmp_path / "late.7z"))
     recovered = WatchStateStore(str(state.path))

@@ -82,7 +82,9 @@ namespace sunpack::sevenzip
 
         Lease acquire(const std::string &key);
 
+#ifdef SUP7Z_TEST_IO_FAULTS
         std::size_t volume_count() const noexcept;
+#endif
 
         std::vector<std::string> reap_idle();
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 import weakref
@@ -9,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 
 import sunpack.runtime.cli.commands.watch as watch_command
-import sunpack.runtime.watch.runtime as watch_runtime
 import sunpack.runtime.watch.service as service_module
 from sunpack.runtime.watch.scheduler import WatchRunResult
 from sunpack.runtime.watch.service import WatchService
@@ -270,7 +270,7 @@ def test_watch_service_attaches_and_releases_toast_with_watch_lifecycle(tmp_path
     assert host.stopped is enabled
 
 
-def test_watch_runtime_does_not_change_process_cwd(tmp_path, monkeypatch):
+def test_watch_start_once_does_not_change_process_cwd(tmp_path, monkeypatch):
     caller = tmp_path / "caller"
     caller.mkdir()
     observed = {}
@@ -278,19 +278,20 @@ def test_watch_runtime_does_not_change_process_cwd(tmp_path, monkeypatch):
 
     class FakeHost:
         async def run_watch_once(self):
-            observed["run"] = __import__("os").getcwd()
+            observed["run"] = os.getcwd()
             return 7
 
     from sunpack.runtime.cli import runtime_state
 
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
 
-    assert _await(watch_runtime.run_watch_service(tray_enabled=False, once=True)) == 7
+    code, _ = _await(watch_command.handle(SimpleNamespace(watch_action="start", once=True), None))
+    assert code == 7
     assert observed == {"run": str(caller)}
-    assert __import__("os").getcwd() == str(caller)
+    assert os.getcwd() == str(caller)
 
 
-def test_watch_runtime_delegates_start_to_runtime_host(monkeypatch):
+def test_watch_start_passes_no_tray_to_runtime_host(monkeypatch):
     captured = {}
 
     class FakeHost:
@@ -301,7 +302,8 @@ def test_watch_runtime_delegates_start_to_runtime_host(monkeypatch):
 
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
 
-    assert _await(watch_runtime.run_watch_service(tray_enabled=False)) == 0
+    code, _ = _await(watch_command.handle(SimpleNamespace(watch_action="start", no_tray=True), None))
+    assert code == 0
     assert captured == {"tray_enabled": False}
 
 

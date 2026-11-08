@@ -113,8 +113,6 @@ class RequestRuntimeProfiler:
         self._install_instance_method(path_leases, "try_acquire", "pipeline_lease_acquire")
         self._install_instance_method(path_leases, "try_replace", "pipeline_lease_replace")
         self._install_instance_method(path_leases, "release", "pipeline_lease_release")
-        self._install_global_method(DirectoryScanner, "inventory_file_indices", "output_inventory_filter")
-        self._install_global_method(DirectoryScanner, "snapshot_from_entries", "output_snapshot_filter")
         self._install_global_method(
             DirectoryScanner,
             "snapshot_from_output_inventory",
@@ -363,9 +361,7 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
     output_snapshot_children = sum(total(label) for label in (
         "output_inventory_files",
         "output_inventory_path_check",
-        "output_inventory_filter",
         "output_inventory_snapshot_fused",
-        "output_snapshot_filter",
     ))
     planning_children = sum(total(label) for label in (
         "planning_analyze_task",

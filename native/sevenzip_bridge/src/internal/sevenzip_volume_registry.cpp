@@ -200,11 +200,13 @@ namespace sunpack::sevenzip
         return earliest;
     }
 
+#ifdef SUP7Z_TEST_IO_FAULTS
     std::size_t VolumeWriterRegistry::volume_count() const noexcept
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return entries_.size();
     }
+#endif
 
     std::vector<VolumeStatePtr> VolumeWriterRegistry::blocked_volumes(bool require_affected_jobs) const
     {

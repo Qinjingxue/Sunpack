@@ -11,8 +11,8 @@
 
 namespace sunpack::sevenzip
 {
-    // 测试专用：目录创建的空间类错误判定器可注入（默认 is_space_exhaustion_error）。
-    // 生产代码永不设置它；单测用真实错误码（把普通文件挡在目标目录位置上 →
+#ifdef SUP7Z_TEST_IO_FAULTS
+    // 测试用真实错误码（把普通文件挡在目标目录位置上 →
     // ERROR_ALREADY_EXISTS）驱动同一代码路径，只把"是否算空间类"这一步换成可注入判定。
     using DirectoryFailureClassifier = std::function<bool(const std::error_code &)>;
 
@@ -27,9 +27,11 @@ namespace sunpack::sevenzip
     {
         directory_failure_classifier_for_test() = std::move(classifier);
     }
+#endif
 
     inline bool is_directory_space_failure(const std::error_code &error) noexcept
     {
+#ifdef SUP7Z_TEST_IO_FAULTS
         const DirectoryFailureClassifier &injected = directory_failure_classifier_for_test();
         if (injected)
         {
@@ -42,6 +44,7 @@ namespace sunpack::sevenzip
                 return false;
             }
         }
+#endif
         return is_space_exhaustion_error(error);
     }
 

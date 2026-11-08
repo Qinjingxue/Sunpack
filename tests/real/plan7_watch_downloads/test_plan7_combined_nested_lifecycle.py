@@ -58,8 +58,10 @@ def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password
     third = start_watch(tmp_path, label, **options)
     try:
         # Promoted inner inputs use the ordinary watch-root password scope.
-        restored = third.watcher.state.failed_password_entries_under(str(password_scope))
-        assert [Path(item.path) for item in restored] == [retry_input]
+        restored = third.watcher.state.blocked_entries("password")
+        assert [(Path(item.path), Path(item.password_scope_dir)) for item in restored] == [
+            (retry_input, password_scope),
+        ]
         from tests.helpers.passwords import write_password_json
         password_file = third.watcher._password_file_source.path
         write_password_json(password_file, scopes=[(password, [str(password_scope)]) for password in ["wrong-again", *case.passwords]])

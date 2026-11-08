@@ -111,7 +111,7 @@ def test_output_dir_scan_preserves_explicit_filesystem_blacklist(tmp_path):
 
     config = scan_config(extensions=[{'value': 'unitypackage', 'regex': False}])
 
-    assert not OutputScanPolicy(config).should_scan_output_dir(str(tmp_path))
+    assert not OutputScanPolicy(config).prepare_scan([str(tmp_path)]).roots
     assert ScanOrchestrator(config).scan(str(tmp_path)) == []
 
 

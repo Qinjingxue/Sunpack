@@ -183,21 +183,16 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
     if(!alive_) { thread_.join(); throw std::runtime_error("watchNotificationsUnsupported"); }
 }
 DirectoryWatcher::~DirectoryWatcher() { SetEvent(stop_); if (thread_.joinable()) thread_.join(); }
-StartupInfo read_startup() {
-    HKEY key{}; StartupInfo result;
+bool startup_enabled() {
+    HKEY key{};
     auto rc = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &key);
-    if (rc == ERROR_FILE_NOT_FOUND) return result;
+    if (rc == ERROR_FILE_NOT_FOUND) return false;
     if (rc != ERROR_SUCCESS) { SetLastError(rc); win_error("opReadStartupRegistry"); }
     DWORD type{}, bytes{};
     rc = RegQueryValueExW(key, L"SunPackWatchService", nullptr, &type, nullptr, &bytes);
-    if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
-        std::wstring value(bytes / sizeof(wchar_t) + 1, 0);
-        rc = RegQueryValueExW(key, L"SunPackWatchService", nullptr, &type, reinterpret_cast<BYTE*>(value.data()), &bytes);
-        if (rc == ERROR_SUCCESS) { value.resize(wcsnlen(value.data(), value.size())); result = {true, utf8(value)}; }
-    }
     RegCloseKey(key);
     if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) { SetLastError(rc); win_error("opReadStartupValue"); }
-    return result;
+    return rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ);
 }
 fs::path choose_directory(HWND owner, const fs::path& initial) {
     IFileOpenDialog* dialog = nullptr;

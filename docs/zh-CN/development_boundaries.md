@@ -52,7 +52,7 @@ sunpack.runtime.watch
 | ---- | -------- | ---- |
 | CLI | `sunpack.runtime.cli.cli.main` | 命令行入口。 |
 | GUI | `sunpack.runtime.gui.main.main` | 无控制台托盘入口。 |
-| Watch | `sunpack.runtime.watch.runtime.run_watch_service` | 长期运行的 Watch 服务入口。 |
+| Watch | `sunpack.runtime.cli.runtime_host.RuntimeHost.start_watch` | 长期运行的 Watch 服务入口。 |
 | 配置 | `sunpack.core.config.loader.load_config` / `sunpack.core.config.schema` | 配置读取和归一化。 |
 | 应用配置校验 | `sunpack.runtime.config_validation.validate_config_payload` | 校验配置与 pipeline 注册能力是否匹配。 |
 | 契约 | `sunpack.core.contracts.*` | 共享数据结构，包括 `RunState` 与 `RunSummary`。 |

@@ -3,7 +3,6 @@ use crate::wal::{self, Kind};
 use crate::watch_store::{NativeWatchOperations, Operations};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
@@ -185,12 +184,12 @@ struct StreamState {
     sealed_seq: u64,
     segments: BTreeMap<u64, SegmentState>,
     error: Option<String>,
-    write_count: u64,
+    has_written: bool,
+    #[cfg(test)]
     write_calls: u64,
-    flush_rounds: u64,
+    #[cfg(test)]
     flush_calls: u64,
     last_flush_micros: u64,
-    coalesce_micros_total: u64,
 }
 
 #[derive(Default)]
@@ -405,7 +404,7 @@ impl JournalRuntime {
             .get_mut(stream)
             .filter(|stream| !stream.closing)
             .ok_or("Watch journal stream is unavailable")?;
-        if stream_state.write_count == 0 && stream_state.segments.is_empty() {
+        if !stream_state.has_written && stream_state.segments.is_empty() {
             stream_state.written_seq = stream_state.written_seq.max(seq);
             stream_state.durable_seq = stream_state.durable_seq.max(seq);
             stream_state.requested_seq = stream_state.requested_seq.max(stream_state.durable_seq);
@@ -662,8 +661,11 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         segment.last_seq = last_seq;
     }
     stream_state.written_seq = last_seq;
-    stream_state.write_count = stream_state.write_count.saturating_add(batch.len() as u64);
-    stream_state.write_calls = stream_state.write_calls.saturating_add(1);
+    stream_state.has_written = true;
+    #[cfg(test)]
+    {
+        stream_state.write_calls += 1;
+    }
     if let Some(target) = batch
         .iter()
         .filter(|item| item.durable)
@@ -906,7 +908,6 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
                 continue;
             }
 
-            stream.coalesce_micros_total = stream.coalesce_micros_total.saturating_add(window);
             return FlushWork {
                 stream: key,
                 retired: stream.retired.clone(),
@@ -932,6 +933,7 @@ fn flusher_loop(shared: Arc<Shared>) {
             files,
         } = work;
         let flush_started = Instant::now();
+        #[cfg(test)]
         let flush_calls = files.len() as u64;
         let result = files.into_iter().try_for_each(|file| file.sync_all());
         let flush_micros = flush_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -952,8 +954,10 @@ fn flusher_loop(shared: Arc<Shared>) {
             shared.cv.notify_all();
             continue;
         }
-        stream_state.flush_rounds = stream_state.flush_rounds.saturating_add(1);
-        stream_state.flush_calls = stream_state.flush_calls.saturating_add(flush_calls);
+        #[cfg(test)]
+        {
+            stream_state.flush_calls += flush_calls;
+        }
         stream_state.last_flush_micros = flush_micros;
         stream_state.durable_seq = stream_state.durable_seq.max(target);
         close_ready_segments(stream_state);
@@ -1021,43 +1025,6 @@ pub(crate) fn watch_journal_seed(stream: &str, seq: u64) -> PyResult<()> {
 pub(crate) fn watch_journal_flush_all(py: Python<'_>) -> PyResult<()> {
     py.detach(|| runtime().flush_all())
         .map_err(PyRuntimeError::new_err)
-}
-
-#[pyfunction]
-pub(crate) fn watch_journal_stats(py: Python<'_>, stream: String) -> PyResult<Py<PyDict>> {
-    let state = lock_state(&runtime().shared);
-    let snapshot = state.streams.get(&stream);
-    let result = PyDict::new(py);
-    result.set_item("registered", snapshot.is_some())?;
-    result.set_item("owners", snapshot.map_or(0, |s| s.owners))?;
-    if let Some(stream) = snapshot {
-        result.set_item("written_seq", stream.written_seq)?;
-        result.set_item("durable_seq", stream.durable_seq)?;
-        result.set_item("requested_seq", stream.requested_seq)?;
-        result.set_item("sealed_seq", stream.sealed_seq)?;
-        result.set_item("write_count", stream.write_count)?;
-        result.set_item("write_calls", stream.write_calls)?;
-        result.set_item("flush_rounds", stream.flush_rounds)?;
-        result.set_item("flush_calls", stream.flush_calls)?;
-        result.set_item("last_flush_micros", stream.last_flush_micros)?;
-        result.set_item("coalesce_micros_total", stream.coalesce_micros_total)?;
-        result.set_item("segments", stream.segments.len())?;
-        result.set_item("error", stream.error.clone())?;
-    } else {
-        result.set_item("written_seq", 0)?;
-        result.set_item("durable_seq", 0)?;
-        result.set_item("requested_seq", 0)?;
-        result.set_item("sealed_seq", 0)?;
-        result.set_item("write_count", 0)?;
-        result.set_item("write_calls", 0)?;
-        result.set_item("flush_rounds", 0)?;
-        result.set_item("flush_calls", 0)?;
-        result.set_item("last_flush_micros", 0)?;
-        result.set_item("coalesce_micros_total", 0)?;
-        result.set_item("segments", 0)?;
-        result.set_item("error", Option::<String>::None)?;
-    }
-    Ok(result.unbind())
 }
 
 #[cfg(test)]
@@ -1286,7 +1253,6 @@ mod tests {
         let state = lock_state(&shared);
         let stream_state = state.streams.get(&stream).unwrap();
         assert_eq!(stream_state.written_seq, 32);
-        assert_eq!(stream_state.write_count, 32);
         assert_eq!(stream_state.write_calls, 1);
         drop(state);
         let _ = fs::remove_file(path);

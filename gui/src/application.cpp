@@ -457,7 +457,7 @@ void Application::apply_pending() {
             if(!task_snapshot.is_null()) find_->Refresh("task");
             if(patch.contains("rootRows")) find_->Refresh("root");
             if(!password_snapshot.is_null() || !password_delta_patch.is_null()) find_->Refresh("password");
-            if(patch.contains("startup") || patch.contains("themeChoice")) find_->Refresh("config");
+            if(patch.contains("startupEnabled") || patch.contains("themeChoice")) find_->Refresh("config");
         }
     }
 }
@@ -991,6 +991,7 @@ void Application::work() {
         WatchRoots roots; EventLog log; View view;
         Json errors=Json::object();
         auto dir=options_.data_dir;
+        const auto log_dir=log_directory(dir);
         auto dir_key=path_key(dir);
         auto on_data=[this,dir_key](const fs::path& path){
             auto name=path.filename().wstring(); CharLowerBuffW(name.data(),DWORD(name.size()));
@@ -1146,7 +1147,7 @@ void Application::work() {
                         else throw std::runtime_error("cliOperationUnknown");
                         auto result=run_cli(options_.cli,args,stop_);
                         SetEvent(service_refresh_);
-                        Json feedback={{"busy",false},{"lastCommand",{{"action",action},{"code",result.code}}}};
+                        Json feedback={{"busy",false}};
                         if(result.code!=0) {
                             Json output;
                             try { wide(result.output); output=std::move(result.output); }
@@ -1186,7 +1187,6 @@ void Application::work() {
             read(Roots,"sunpack_watch_roots.txt",last_roots,roots_read,[&](const std::string& text){
                 roots=parse_roots(text,dir); tasks_changed=roots_changed=true;
             });
-            auto log_dir=log_directory(dir);
             if(!log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
                 log_watcher.reset();
                 try {
@@ -1295,8 +1295,8 @@ void Application::work() {
             }
             if(config_changed || language_changed || !previous_patch.contains("fields")) patch["fields"]=config_fields(config,last_config,language);
             if(roots_changed || !previous_patch.contains("directories")) patch["directories"]=directory_rows(roots);
-            if(flags&Startup || !previous_patch.contains("startup")) {
-                try { auto state=read_startup(); patch["startup"]={{"enabled",state.enabled},{"command",state.command}}; errors.erase("startup"); }
+            if(flags&Startup || !previous_patch.contains("startupEnabled")) {
+                try { patch["startupEnabled"]=startup_enabled(); errors.erase("startup"); }
                 catch(const std::exception& e){errors["startup"]=e.what();}
             }
             auto displayed_errors=Json::object();
@@ -1304,7 +1304,7 @@ void Application::work() {
             // Reuse observed I/O retries before revealing the initial snapshot.
             // Permanent failures still reveal their error after retries finish.
             initial_load_complete|=std::none_of(retries.begin(),retries.end(),[](const auto& retry){return retry.second.due!=Clock::time_point::max();});
-            patch["errors"]=std::move(displayed_errors); patch["logPath"]=utf8(log.path().wstring()); patch["ready"]=initial_load_complete;
+            patch["errors"]=std::move(displayed_errors); patch["ready"]=initial_load_complete;
             Json changed_patch=Json::object();
             for(auto it=patch.begin();it!=patch.end();++it) if(!previous_patch.contains(it.key()) || it.key()=="tasks" || it.key()=="passwords" || it.key()=="passwordDelta" || previous_patch[it.key()]!=it.value()) {
                 // These projections are generated only after source/filter

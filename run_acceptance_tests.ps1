@@ -406,18 +406,14 @@ function Get-NativeSmokeCode {
     return @"
 import sunpack_native as n
 required = [
-    'native_available',
     'NativeDirectoryScanOptions', 'NativeCandidateTable',
-    'directory_snapshot_from_columns', 'filter_inventory_file_indices',
-    'batch_file_head_facts', 'authorize_nested_candidates',
-    'profile_directory_scan', 'list_regular_files_in_directory',
+    'directory_snapshot_from_columns',
+    'authorize_nested_candidates',
     'scan_embedded_archives',
     'analyze_zip_filename_encoding', 'AnalysisBinaryView',
-    'inspect_pe_overlay_structure',
     'watch_broker_acquire', 'watch_broker_release',
     'watch_broker_is_connected', 'watch_broker_ping_seconds',
 ]
-assert n.native_available()
 missing = [name for name in required if not callable(getattr(n, name, None))]
 assert not missing, missing
 "@

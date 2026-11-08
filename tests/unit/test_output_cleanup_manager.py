@@ -10,7 +10,6 @@ from sunpack.pipeline.postprocess.output_cleanup import (
     OutputCleanupEvent,
     OutputCleanupExecutor,
     OutputCleanupManager,
-    OutputRole,
 )
 
 
@@ -49,31 +48,29 @@ def test_policy_rejected_partial_can_remove_nonempty_canonical_output(tmp_path):
     assert not output.exists()
 
 
-def test_readonly_cleanup_covers_cancelled_tree_partial_file_and_nested_archive(tmp_path):
+def test_readonly_cleanup_covers_cancelled_tree_and_nested_archive(tmp_path):
     # Attribute-preservation tests do not delete their outputs through the
-    # managed cleanup paths. One filesystem scenario covers all three callers.
+    # managed cleanup paths. One filesystem scenario covers both callers.
     from sunpack_native import delete_files_batch
 
     output = tmp_path / "output"
     nested = output / "nested"
     nested.mkdir(parents=True)
     payload = nested / "payload.bin"
-    partial = output / "partial.bin"
     archive = output / "inner.disguised"
-    for path in (payload, partial, archive):
+    for path in (payload, archive):
         path.write_bytes(b"payload")
         os.chmod(path, stat.S_IREAD)
     manager = OutputCleanupManager()
     try:
         assert delete_files_batch([str(archive)])[0]["status"] == "deleted"
-        assert manager.cleanup_partial_file(str(partial), output_root=str(output)).cleaned
         os.chmod(nested, stat.S_IREAD)
         result = manager.cleanup_canonical(
             str(output), event=OutputCleanupEvent.USER_CANCELLED, allow_nonempty=True,
         )
         assert result.cleaned and not output.exists()
     finally:
-        for path in (nested, payload, partial, archive):
+        for path in (nested, payload, archive):
             if path.exists():
                 os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
 
@@ -96,23 +93,6 @@ def test_canonical_cleanup_refuses_unowned_and_root_paths(tmp_path):
     assert unowned.reason == "unowned_output"
     assert root.reason == "filesystem_root_refused"
     assert output.is_dir()
-
-
-def test_partial_file_cleanup_is_limited_to_output_root(tmp_path):
-    output = tmp_path / "output"
-    output.mkdir()
-    inside = output / "partial.bin"
-    outside = tmp_path / "outside.bin"
-    inside.write_bytes(b"inside")
-    outside.write_bytes(b"outside")
-
-    cleaned = OutputCleanupManager().cleanup_partial_file(str(inside), output_root=str(output))
-    refused = OutputCleanupManager().cleanup_partial_file(str(outside), output_root=str(output))
-
-    assert cleaned.cleaned is True
-    assert refused.reason == "unowned_output"
-    assert not inside.exists()
-    assert outside.is_file()
 
 
 def test_executor_failure_is_reported_without_claiming_cleanup(tmp_path):
@@ -166,34 +146,3 @@ def test_cleanup_admits_unrelated_sibling_operation_in_same_request(tmp_path):
         assert sibling.is_file()
     finally:
         scope.close()
-
-
-@pytest.mark.parametrize("role", [OutputRole.CANONICAL, OutputRole.PARTIAL_FILE])
-def test_scoped_cleanup_authorizes_only_strict_workspace_descendants(tmp_path, role):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    inside = workspace / "owned"
-    outside = tmp_path / "outside"
-    if role == OutputRole.CANONICAL:
-        inside.mkdir()
-        outside.mkdir()
-    else:
-        inside.write_text("partial")
-        outside.write_text("unowned")
-    manager = OutputCleanupManager()
-
-    for path in (workspace, outside, workspace / ".." / "outside"):
-        result = manager.cleanup_scoped_path(
-            str(path), event=OutputCleanupEvent.EXTRACT_RETRY,
-            role=role, workspace_root=str(workspace),
-        )
-        assert result.reason == "unowned_output"
-        assert path.exists()
-
-    result = manager.cleanup_scoped_path(
-        str(inside), event=OutputCleanupEvent.EXTRACT_RETRY,
-        role=role, workspace_root=str(workspace),
-    )
-    assert result.cleaned
-    assert not inside.exists()
-    assert workspace.exists() and outside.exists()

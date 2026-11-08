@@ -3,7 +3,7 @@ from sunpack.pipeline.coordinator.async_work import CancellationToken
 from datetime import datetime
 
 from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import (
-    MtimeRangeScanFilter,
+    time_bounds,
     utc_minute_ns,
 )
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
@@ -63,8 +63,8 @@ def test_time_filter_only_accepts_utc_minutes():
     import pytest
     from datetime import timezone
     expected = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
-    configured = MtimeRangeScanFilter.from_config({"start_utc": "2024-01-01T00:00Z"})
-    assert configured.value_range.gte == expected
+    configured = time_bounds({"start_utc": "2024-01-01T00:00Z"})
+    assert configured == (None, expected, None, None, None)
     for value in ("20240101", "2024-01-01T00:00:00Z", "2024-01-01T00:00+08:00", expected):
         with pytest.raises(ValueError):
             utc_minute_ns(value)

@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sunpack_native import watch_journal_request_flush
 
 import sunpack.core.passwords.internal.builtin as builtin_module
 import sunpack.core.passwords.internal.clipboard as clipboard_module
@@ -62,7 +63,6 @@ def _watcher(tmp_path, *, config=None, roots=None, root_entries=None, **override
 
 def test_failed_watch_initialization_releases_wal_without_publishing_outputs(tmp_path, monkeypatch):
     from sunpack.core.support.path_keys import absolute_path_key
-    from sunpack.runtime.watch.journal_commit import journal_stats
 
     def fail_signature(*_args):
         raise OSError("cannot persist password signature")
@@ -76,7 +76,8 @@ def test_failed_watch_initialization_releases_wal_without_publishing_outputs(tmp
 
     # The startup error retains the constructor traceback during these checks.
     assert failure.value.__traceback__ is not None
-    assert not journal_stats(absolute_path_key(tmp_path / "state.snapshot"))["registered"]
+    with pytest.raises(RuntimeError, match="stream is unavailable"):
+        watch_journal_request_flush(absolute_path_key(tmp_path / "state.snapshot"), 0)
     assert reservations.watch_outputs is None
 
 
@@ -1890,8 +1891,6 @@ def test_watch_completion_retires_tracker_during_unchanged_source_probe(tmp_path
 
 @pytest.mark.parametrize("failure", [asyncio.CancelledError, RuntimeError])
 def test_interrupted_harvest_and_close_wait_for_completion_callbacks(tmp_path, failure):
-    from sunpack.runtime.watch.journal_commit import journal_stats
-
     async def scenario():
         watcher = _watcher(tmp_path)
         archive = tmp_path / "retained.zip"
@@ -1955,7 +1954,8 @@ def test_interrupted_harvest_and_close_wait_for_completion_callbacks(tmp_path, f
         assert not watcher._quiet_trackers
         assert watcher._catalog is None
         # An idle owner releases the shared native catalogs and WAL on stop.
-        assert not journal_stats(watcher.state._writer_stream)["registered"]
+        with pytest.raises(RuntimeError, match="stream is unavailable"):
+            watch_journal_request_flush(watcher.state._writer_stream, 0)
 
     asyncio.run(scenario())
 

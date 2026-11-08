@@ -71,9 +71,6 @@ class OutputInventory:
             bool(names_only),
         )
 
-    def parent_directories(self) -> tuple[str, ...]:
-        return tuple(self._native.parent_directories())
-
     def build_directory_snapshots(self, options):
         return self._native.build_directory_snapshots(options)
 

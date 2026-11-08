@@ -52,8 +52,7 @@ public:
     bool alive() const { return alive_; }
     bool direct() const { return direct_; }
 };
-struct StartupInfo { bool enabled = false; std::string command; };
-StartupInfo read_startup();
+bool startup_enabled();
 fs::path choose_directory(HWND owner, const fs::path& initial = {});
 std::wstring quote_arg(const std::wstring& arg);
 struct CliCommand { fs::path executable, cwd; std::vector<std::wstring> prefix; };

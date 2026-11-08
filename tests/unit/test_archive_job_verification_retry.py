@@ -51,8 +51,8 @@ def test_verification_finishes_without_cleanup_or_reextraction(
     monkeypatch.setattr(archive_job, "write_extraction_result", lambda _task, _result: None)
     cleanup_calls = []
     monkeypatch.setattr(
-        archive_job,
-        "cleanup_output_for_retry",
+        archive_job.DEFAULT_OUTPUT_CLEANUP_MANAGER,
+        "cleanup_canonical",
         lambda *_args, **_kwargs: cleanup_calls.append(True),
     )
 

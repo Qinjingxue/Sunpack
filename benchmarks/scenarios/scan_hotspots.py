@@ -230,9 +230,6 @@ def result_count(result: Any) -> int | None:
         return len(result)
     except TypeError:
         pass
-    iter_columns = getattr(result, "iter_columns", None)
-    if callable(iter_columns):
-        return sum(1 for _ in iter_columns())
     entries = getattr(result, "entries", None)
     if entries is not None:
         return len(entries)
@@ -277,9 +274,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     import sunpack.pipeline.discovery.relations.internal.group_builder as group_builder
 
     recorder.wrap(directory_scanner.DirectoryScanner, "scan", "filesystem.DirectoryScanner.scan")
-    recorder.wrap(directory_scanner.DirectoryScanner, "_scan_native", "filesystem.DirectoryScanner._scan_native")
-    recorder.wrap(directory_scanner.DirectoryScanner, "_apply_ordered_filters", "filesystem.apply_ordered_filters")
-    recorder.wrap(directory_scanner, "apply_filter_to_entries", "filesystem.apply_filter_to_entries")
 
     recorder.wrap(relations_scheduler.RelationsScheduler, "build_candidate_groups", "relations.build_candidate_groups")
     recorder.wrap(group_builder.RelationsGroupBuilder, "build_candidate_groups", "relations.builder.build_candidate_groups")
@@ -315,8 +309,11 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
     if mode == "filesystem":
         from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 
-        result = DirectoryScanner(target_path, max_depth=max_depth, config=config).scan()
-        columns = list(result.iter_columns())
+        from sunpack.core.contracts.discovery_scope import DiscoveryScope
+
+        scope = DiscoveryScope(target_path, max_depth=max_depth)
+        result = DirectoryScanner(target_path, scope=scope, config=config).scan().native_snapshot
+        columns = list(zip(*result.materialize_columns()))
         extra["entries"] = len(result)
         extra["files"] = sum(1 for _path, is_dir, _size, _mtime in columns if not is_dir)
         extra["dirs"] = sum(1 for _path, is_dir, _size, _mtime in columns if is_dir)

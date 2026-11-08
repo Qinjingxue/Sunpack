@@ -259,7 +259,7 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             policy = OutputScanPolicy(runner_config())
 
-            self.assertTrue(policy.should_scan_output_dir(str(root)))
+            self.assertTrue(policy.prepare_scan([str(root)]).roots)
 
 
 if __name__ == "__main__":

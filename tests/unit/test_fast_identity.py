@@ -14,8 +14,8 @@ from sunpack_native import (
 
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.internal.store import PasswordSnapshot
+from sunpack.core.platform.windows.file_mutex import file_mutex_name
 from sunpack.runtime.watch.scheduler import _password_source_signature
-from sunpack.runtime.watch.service import watch_roots_mutex_name
 
 
 def test_fast_hash_vectors_and_concurrent_memory_identities():
@@ -77,9 +77,9 @@ def test_password_signature_preserves_boundaries_order_and_unicode():
 
 
 def test_mutex_identity_normalizes_path_case(tmp_path):
-    first = watch_roots_mutex_name(tmp_path / "Roots.json")
-    assert first == watch_roots_mutex_name(tmp_path / "roots.JSON")
-    assert first != watch_roots_mutex_name(tmp_path / "other.json")
+    first = file_mutex_name(tmp_path / "Roots.json")
+    assert first == file_mutex_name(tmp_path / "roots.JSON")
+    assert first != file_mutex_name(tmp_path / "other.json")
 
 
 def test_password_key_tracks_missing_volume_arrival_and_generation(tmp_path):

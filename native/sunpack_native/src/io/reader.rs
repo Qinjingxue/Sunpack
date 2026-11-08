@@ -763,7 +763,7 @@ impl NativeArchiveSession {
     #[getter]
     fn generation_token(&self) -> PyResult<String> {
         self.ensure_open()?;
-        Ok(self.reader.file_identity()?.generation_token())
+        Ok(self.reader.file_identity()?.source_id.to_string())
     }
 
     #[getter]
@@ -1001,51 +1001,24 @@ impl ByteSource for BytesSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileIdentity {
-    pub(crate) path: PathBuf,
+    pub(crate) path: Arc<Path>,
+    // One incarnation covers blocks, structure and prepared-password material.
+    // It also changes when a Watch event invalidates unchanged physical metadata.
+    source_id: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PhysicalFileGeneration {
     len: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
-    // Zero for metadata snapshots; opened readers share one immutable source
-    // incarnation across block, structure and prepared-password cache keys.
-    reader_generation: u64,
     #[cfg(windows)]
-    physical: WindowsFileGeneration,
-}
-
-impl FileIdentity {
-    pub(crate) fn generation_token(&self) -> String {
-        // Metadata snapshots use generation zero. Reader tokens also carry
-        // their source incarnation so upper-layer caches honor invalidation
-        // even when every physical metadata field stayed unchanged.
-        #[cfg(windows)]
-        {
-            let physical = &self.physical;
-            return format!(
-                "{:x}:{:032x}:{:x}:{:x}:{:x}:{:x}",
-                physical.volume,
-                u128::from_le_bytes(physical.file_id),
-                physical.change_time,
-                physical.write_time,
-                self.len,
-                self.reader_generation
-            );
-        }
-        #[cfg(not(windows))]
-        format!(
-            "{:?}",
-            (
-                self.len,
-                self.modified,
-                self.created,
-                self.reader_generation
-            )
-        )
-    }
+    windows: WindowsFileGeneration,
 }
 
 struct FileSource {
     identity: FileIdentity,
-    cache_id: u64,
+    physical: PhysicalFileGeneration,
     cached_shards: AtomicU64,
     file: RwLock<Option<TrackedFile>>,
     closed: AtomicBool,
@@ -1061,7 +1034,7 @@ impl Drop for FileSource {
             let index = shards.trailing_zeros() as usize;
             shards &= shards - 1;
             if let Ok(mut shard) = manager().cache_shards[index].lock() {
-                if shard.remove_source(self.cache_id).0 != 0 {
+                if shard.remove_source(self.identity.source_id).0 != 0 {
                     shard.compact_stale_orders();
                 }
             }
@@ -1147,12 +1120,6 @@ impl FileSource {
         Ok(())
     }
 
-    fn cache_identity(&self) -> FileIdentity {
-        let mut identity = self.identity.clone();
-        identity.reader_generation = self.cache_id;
-        identity
-    }
-
     fn ensure_open(&self) -> io::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             Err(io::Error::other("resource closed"))
@@ -1190,11 +1157,11 @@ impl ByteSource for FileSource {
         self.ensure_open()
     }
     fn file_identity(&self) -> Option<FileIdentity> {
-        Some(self.cache_identity())
+        Some(self.identity.clone())
     }
 
     fn len(&self) -> u64 {
-        self.identity.len
+        self.physical.len
     }
 
     #[cfg(windows)]
@@ -1463,7 +1430,7 @@ struct BlockKey {
 impl BlockKey {
     fn new(source: &FileSource, index: u64) -> Self {
         Self {
-            source_id: source.cache_id,
+            source_id: source.identity.source_id,
             index,
         }
     }
@@ -1521,7 +1488,7 @@ struct CacheShard {
 }
 
 struct CachedSource {
-    path: PathBuf,
+    path: Arc<Path>,
     indices: HashSet<u64>,
 }
 
@@ -1531,8 +1498,8 @@ struct HandleEntry {
 }
 
 struct HandlePool {
-    entries: HashMap<PathBuf, HandleEntry>,
-    order: VecDeque<(PathBuf, u64)>,
+    entries: HashMap<Arc<Path>, HandleEntry>,
+    order: VecDeque<(Arc<Path>, u64)>,
     generation: u64,
     capacity: usize,
 }
@@ -1577,7 +1544,7 @@ impl CacheShard {
     fn insert(
         &mut self,
         key: BlockKey,
-        path: &Path,
+        path: &Arc<Path>,
         data: Arc<[u8]>,
         tier: CacheTier,
     ) -> (Arc<[u8]>, u64) {
@@ -1589,7 +1556,7 @@ impl CacheShard {
         self.by_source
             .entry(key.source_id)
             .or_insert_with(|| CachedSource {
-                path: path.to_path_buf(),
+                path: Arc::clone(path),
                 indices: HashSet::new(),
             })
             .indices
@@ -1753,18 +1720,21 @@ impl ReaderManager {
         // handle: rename/replacement can leave that handle on the old file.
         let file = open_reader_file(path)?;
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let identity = file_identity(canonical, &file)?;
+        let physical = physical_file_generation(&file)?;
         let mut handles = self
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        if let Some(existing) = handles.touch(&identity) {
+        if let Some(existing) = handles.touch(&canonical, &physical) {
             self.metrics.handle_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
         let source = Arc::new(FileSource {
-            identity,
-            cache_id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            identity: FileIdentity {
+                path: Arc::from(canonical),
+                source_id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            },
+            physical,
             cached_shards: AtomicU64::new(0),
             file: RwLock::new(Some(file)),
             closed: AtomicBool::new(false),
@@ -1930,16 +1900,16 @@ impl ReaderManager {
 }
 
 impl HandlePool {
-    fn touch(&mut self, identity: &FileIdentity) -> Option<Arc<FileSource>> {
-        let entry = self.entries.get_mut(&identity.path)?;
-        if entry.source.identity != *identity {
+    fn touch(&mut self, path: &Path, physical: &PhysicalFileGeneration) -> Option<Arc<FileSource>> {
+        let entry = self.entries.get_mut(path)?;
+        if entry.source.physical != *physical {
             return None;
         }
         self.generation = self.generation.wrapping_add(1);
         entry.generation = self.generation;
         let source = Arc::clone(&entry.source);
         self.order
-            .push_back((identity.path.clone(), self.generation));
+            .push_back((Arc::clone(&source.identity.path), self.generation));
         self.compact_order();
         Some(source)
     }
@@ -2121,7 +2091,7 @@ pub(crate) fn invalidate_reader_path(path: &Path) {
     let Some(manager) = MANAGER.get() else { return };
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut handles = manager.handles.lock().unwrap_or_else(|e| e.into_inner());
-    let retired = handles.entries.remove(&path);
+    let retired = handles.entries.remove(path.as_path());
     if retired.is_some() {
         // Do not close a source used by an older request. Its late block loads
         // carry its source id and cannot repopulate the new source's cache.
@@ -2152,16 +2122,14 @@ fn manager() -> &'static ReaderManager {
     })
 }
 
-pub(crate) fn file_identity(path: PathBuf, file: &File) -> io::Result<FileIdentity> {
+fn physical_file_generation(file: &File) -> io::Result<PhysicalFileGeneration> {
     let metadata = file.metadata()?;
-    Ok(FileIdentity {
-        path,
+    Ok(PhysicalFileGeneration {
         len: metadata.len(),
         modified: metadata.modified().ok(),
         created: metadata.created().ok(),
-        reader_generation: 0,
         #[cfg(windows)]
-        physical: windows_file_generation(file)?,
+        windows: windows_file_generation(file)?,
     })
 }
 
@@ -2573,7 +2541,7 @@ mod tests {
         cursor.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, [0x5a; 4]);
         let (_, blocks, retained) = manager()
-            .release_resources_under_roots(&[reader.file_identity().unwrap().path])
+            .release_resources_under_roots(&[reader.file_identity().unwrap().path.to_path_buf()])
             .unwrap();
         assert_eq!((blocks, retained), (0, 0));
         let fault = probe
@@ -2662,7 +2630,7 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
-        let root = reader.file_identity().unwrap().path;
+        let root = reader.file_identity().unwrap().path.to_path_buf();
         manager().release_resources_under_roots(&[root]).unwrap();
         assert!(probe
             .read_cached_at(BLOCK_SIZE as u64 * 2 + 200, 30)
@@ -2724,7 +2692,7 @@ mod tests {
         assert_eq!(reader.stats().unwrap().read_bytes, 4);
         assert_eq!(reader.stats().unwrap().cache_hits, 1);
         let (_, blocks, retained) = manager()
-            .release_resources_under_roots(&[reader.file_identity().unwrap().path])
+            .release_resources_under_roots(&[reader.file_identity().unwrap().path.to_path_buf()])
             .unwrap();
         assert_eq!((blocks, retained), (0, 0));
         assert_eq!(&*first, b"abcd");
@@ -2860,7 +2828,7 @@ mod tests {
         let source = manager().open_file(&path).unwrap();
         let budget = 2 * CACHE_BLOCK_METADATA_BYTES + 1;
         let mut shard = CacheShard::new(budget, budget);
-        let source_path = source.identity.path.as_path();
+        let source_path = &source.identity.path;
         for (start, tier) in [(0, CacheTier::Hot), (3, CacheTier::General)] {
             let first = BlockKey::new(&source, start);
             let second = BlockKey::new(&source, start + 1);
@@ -2923,7 +2891,7 @@ mod tests {
         );
         assert_eq!(&*payload, b"payload");
         manager()
-            .release_resources_under_roots(&[source.identity.path.clone()])
+            .release_resources_under_roots(&[source.identity.path.to_path_buf()])
             .unwrap();
         let _ = std::fs::remove_file(path);
     }
@@ -3122,7 +3090,10 @@ mod tests {
         pool.insert(Arc::clone(&third));
         for _ in 0..2000 {
             assert_eq!(
-                Arc::as_ptr(&pool.touch(&second.identity).unwrap()),
+                Arc::as_ptr(
+                    &pool.touch(&second.identity.path, &second.physical)
+                        .unwrap()
+                ),
                 first_ptr
             );
         }
@@ -3371,7 +3342,6 @@ mod tests {
         // write in the same clock tick, or a late old loader publishing after
         // invalidation. Reuse this tiny lifecycle to cover both boundaries.
         let old_source = manager().open_file(&path).unwrap();
-        let token = old_source.identity.generation_token();
         let metadata = std::fs::metadata(&path).unwrap();
         let old_key = BlockKey::new(&old_source, 0);
         manager().cache_shards[cache_shard_index(&old_key)]
@@ -3384,11 +3354,11 @@ mod tests {
         })
         .unwrap();
         restore_generation_test_times(&writer, &metadata);
-        set_generation_test_change_time(&writer, old_source.identity.physical.change_time);
+        set_generation_test_change_time(&writer, old_source.physical.windows.change_time);
         drop(writer);
         invalidate_reader_path(&path);
         let current = manager().open_file(&path).unwrap();
-        assert_eq!(token, current.identity.generation_token());
+        assert_eq!(old_source.physical, current.physical);
         manager()
             .insert_block(
                 &old_source,
@@ -3398,7 +3368,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(current.read_at(0, 4).unwrap(), b"last");
-        assert_ne!(old_source.cache_identity(), current.cache_identity());
+        assert_ne!(old_source.identity, current.identity);
         assert!(!old_source.closed.load(Ordering::Acquire));
         assert_eq!(third.read_all().unwrap(), b"new!");
         // The superseded source stays reusable only while an older reader

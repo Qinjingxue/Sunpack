@@ -10,7 +10,7 @@ from io import BytesIO
 
 import pytest
 
-from sunpack_native import AnalysisBinaryView, probe_rar_bytes, scan_embedded_archives
+from sunpack_native import AnalysisBinaryView, scan_embedded_archives
 from sunpack.core.analysis.embedded.result import embedded_scan_prepass
 from sunpack.core.analysis.engine import AnalysisEngine
 from sunpack.core.analysis.view import SharedBinaryView
@@ -134,23 +134,32 @@ def test_rar5_extra_area_larger_than_header_does_not_panic(tmp_path):
     assert result["strong_accept"] is False
 
 
-def test_rar5_probe_rejects_overflowing_block_fields():
+def test_rar5_probe_rejects_overflowing_block_fields(tmp_path):
     # Valid header CRCs do not protect against integer truncation. Existing
     # size-vint tests reject long headers before these block fields are read.
     signature = b"Rar!\x1a\x07\x01\x00"
     end = _rar5_block(5)
-    assert probe_rar_bytes(signature + _rar5_block(1) + end, 0)["end_block_found"]
+
+    def probe(index, data):
+        path = _write_bytes(tmp_path / f"rar5-{index}.opaque", data)
+        view = AnalysisBinaryView(str(path))
+        try:
+            return view.probe_rar(0)
+        finally:
+            view.close()
+
+    assert probe("valid", signature + _rar5_block(1) + end)["end_block_found"]
     # The full valid u64 range remains legal for unknown skippable blocks.
-    assert probe_rar_bytes(
-        signature + _rar5_block(1) + _rar5_block((1 << 64) - 1, 4) + end, 0,
+    assert probe(
+        "unknown", signature + _rar5_block(1) + _rar5_block((1 << 64) - 1, 4) + end,
     )["end_block_found"]
-    for block in (
+    for index, block in enumerate((
         _rar5_block((1 << 64) + 1),
         _rar5_block(1, 1 << 64),
         _rar5_block(1, 2, body=_rar5_vint(1 << 64)),
         _rar5_block(1, 1, body=_rar5_vint(1 << 64)),
-    ):
-        observation = probe_rar_bytes(signature + block + end, 0)
+    )):
+        observation = probe(index, signature + block + end)
         assert not observation["end_block_found"]
         assert not observation["strong_accept"]
 
@@ -175,7 +184,11 @@ def test_rar4_large_packed_sizes_preserve_archive_boundaries(tmp_path):
         data = (b"Rar!\x1a\x07\x00" + block(0x73, 0, bytes(6))
                 + block(0x74, flags, fixed + high + b"a") + block(0x7b, 0))
         path = _write_bytes(tmp_path / f"{name}.opaque", data)
-        observation = probe_rar_bytes(data, 0)
+        view = AnalysisBinaryView(str(path))
+        try:
+            observation = view.probe_rar(0)
+        finally:
+            view.close()
         assert observation["end_block_found"] == complete, name
         report = AnalysisEngine().analyze_path(str(path))
         assert any(item.format == "rar" for item in report.selected) == complete, name

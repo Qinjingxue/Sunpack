@@ -100,7 +100,6 @@ class ArchiveTaskProvider:
 
     def resolve_volume_once(self, current_paths: list[str], scope, *, format_hint: str = "", catalog=None, snapshot=None):
         from sunpack.core.contracts.filesystem import DirectorySnapshot
-        from pathlib import Path
         if not current_paths:
             return None
         state = None
@@ -108,7 +107,7 @@ class ArchiveTaskProvider:
             state, options, _ = catalog
             if snapshot is None:
                 filtered, raw = options.catalog_snapshot(state, scope.native, current_paths[0])
-                snapshot = DirectorySnapshot.from_native(Path(scope.root), filtered, raw)
+                snapshot = DirectorySnapshot(filtered, raw)
         else:
             if self._retry_scan_options is None:
                 self._retry_scan_options = DirectoryScanner.compile_scan_options(self.config)
@@ -118,7 +117,7 @@ class ArchiveTaskProvider:
         filtered, raw = options.refresh_relation_bucket(
             scope.native, current_paths[0], snapshot.raw_native_snapshot, state,
         )
-        snapshot = DirectorySnapshot.from_native(Path(scope.root), filtered, raw)
+        snapshot = DirectorySnapshot(filtered, raw)
         groups = self._relations.build_candidate_groups(snapshot)
         required = set(current_paths)
         for group in groups:

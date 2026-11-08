@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from sunpack_native import inspect_pe_image, inspect_pe_overlay_structure, probe_volume_anchors
+from sunpack_native import probe_volume_anchors
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.target_scan import build_native_table_for_targets
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
@@ -26,10 +26,6 @@ def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filenam
     image = make_minimal_pe(pe_offset=pe_offset, pe64=pe64)
     path = tmp_path / filename
     path.write_bytes(image + make_minimal_7z() + b"trailing junk")
-    assert inspect_pe_image(str(path)) is True
-    overlay = inspect_pe_overlay_structure(str(path))
-    assert overlay["is_pe"] is True
-    assert overlay["overlay_offset"] == len(image)
 
     [group] = RelationsScheduler().build_candidate_groups(DirectoryScanner(str(tmp_path), config=_config()).scan())
     assert group.head_metadata["pe_structure"] is True
@@ -58,7 +54,6 @@ def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filenam
 def test_non_pe_exe_carrier_is_scanned(tmp_path, prefix):
     path = tmp_path / "disguised.exe"
     path.write_bytes(prefix + make_minimal_7z() + b"trailing junk")
-    assert inspect_pe_image(str(path)) is False
     [task] = ArchiveTaskProvider(_config()).discover_targets([str(path)]).tasks
     assert task.discovery_source == "embedded"
     assert task.archive_input().primary_extent.start == len(prefix)
@@ -111,7 +106,6 @@ def test_invalid_coff_carriers_are_scanned_instead_of_skipped(tmp_path, pe_offse
     image[pe_offset + 22:pe_offset + 24] = characteristics.to_bytes(2, "little")
     path = tmp_path / "invalid_image.exe"
     path.write_bytes(image + make_minimal_7z() + b"trailing junk")
-    assert inspect_pe_image(str(path)) is False
     [task] = ArchiveTaskProvider(_config()).discover_targets([str(path)]).tasks
     assert task.discovery_source == "embedded"
     assert task.archive_input().primary_extent.start == len(image)

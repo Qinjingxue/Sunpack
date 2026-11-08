@@ -13,17 +13,12 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
         raise ValueError("Missing required config object: verification")
     if not isinstance(value, dict):
         raise ValueError("verification must be an object")
-    # Accept old settings harmlessly; they no longer affect execution.
-    retired = {
-        "max_retries", "cleanup_failed_output", "retry_on_verification_failure",
-        "complete_accept_threshold", "partial_accept_threshold",
-    }
-    unknown = set(value) - set(VERIFICATION_DEFAULTS) - retired
+    unknown = set(value) - set(VERIFICATION_DEFAULTS)
     if unknown:
         raise ValueError(
             f"verification has unknown fields: {', '.join(sorted(unknown))}"
         )
-    config = {**VERIFICATION_DEFAULTS, **{key: item for key, item in value.items() if key not in retired}}
+    config = {**VERIFICATION_DEFAULTS, **value}
     config["enabled"] = require_boolean(config["enabled"], "verification.enabled")
     config["methods"] = _normalize_methods(config.get("methods"))
     return config
@@ -41,26 +36,19 @@ def _normalize_methods(value: Any) -> list[dict[str, Any]]:
         name = str(item.get("name") or "").strip()
         if not name:
             raise ValueError(f"verification.methods[{index}].name must not be empty")
-        defaults = METHOD_DEFAULTS.get(name, {})
-        retired = {
-            "manifest_size_match": {
-                "file_count_abs_tolerance", "file_count_ratio_tolerance",
-                "size_abs_tolerance_bytes", "size_ratio_tolerance",
-            },
-            "archive_test_crc": {"max_reported_items"},
-        }.get(name, ())
-        normalized = {**defaults, **{key: value for key, value in item.items() if key not in retired}}
+        defaults = METHOD_DEFAULTS.get(name)
+        if defaults is not None:
+            unknown = item.keys() - defaults.keys()
+            if unknown:
+                raise ValueError(
+                    f"verification.methods[{index}] has unknown fields: {', '.join(sorted(unknown))}"
+                )
+        normalized = {**(defaults or {}), **item}
         normalized["name"] = name
         normalized["enabled"] = require_boolean(
             item.get("enabled", True),
             f"verification.methods[{index}].enabled",
         )
-        for key, default in defaults.items():
-            if type(default) in (int, float):
-                try:
-                    normalized[key] = max(0, type(default)(normalized[key]))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"verification.methods[{index}].{key} must be a number") from exc
         methods.append(normalized)
     return methods
 

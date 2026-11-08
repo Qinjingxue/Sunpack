@@ -18,20 +18,6 @@ include!("tar.rs");
 include!("report.rs");
 include!("lz4.rs");
 
-#[pyfunction]
-pub(crate) fn probe_rar_bytes(
-    py: Python<'_>,
-    data: &Bound<'_, PyBytes>,
-    start_offset: u64,
-) -> PyResult<Py<PyDict>> {
-    let view = AnalysisBinaryView {
-        path: "<memory>".to_string(),
-        reader: ManagedReader::from_bytes(data.as_bytes().to_vec(), ReaderConfig::default()),
-        closed: false,
-    };
-    view.probe_rar(py, start_offset)
-}
-
 fn reader_error_to_py(error: std::io::Error) -> PyErr {
     crate::io::resource_error::to_py_error(error)
 }

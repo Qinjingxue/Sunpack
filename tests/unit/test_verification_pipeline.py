@@ -276,23 +276,6 @@ def test_verification_evidence_uses_archive_password_fact_when_session_has_none(
     assert verification.completeness == 1.0
 
 
-def test_verification_config_discards_retired_acceptance_thresholds():
-    config = normalize_config({
-        "recursive_extract": "1",
-        "verification": {
-            "enabled": True,
-            "complete_accept_threshold": 0,
-            "partial_accept_threshold": 1,
-            "methods": [{"name": "unit_complete_observation"}],
-        },
-    })
-
-    assert config["verification"]["enabled"] is True
-    assert "complete_accept_threshold" not in config["verification"]
-    assert "partial_accept_threshold" not in config["verification"]
-    assert config["verification"]["methods"][0]["enabled"] is True
-
-
 def _task_and_result(tmp_path):
     archive = tmp_path / "sample.zip"
     with zipfile.ZipFile(archive, "w") as zf:

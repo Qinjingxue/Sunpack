@@ -845,8 +845,7 @@ namespace sunpack::sevenzip
 
         bool output_root_initially_empty() const { return output_root_initially_empty_; }
 
-#ifdef _WIN32
-        // 直接驱动条目目录创建（ensure_directory 本身是 private），生产代码不调用。
+#if defined(_WIN32) && defined(SUP7Z_TEST_IO_FAULTS)
         bool ensure_directory_for_test(const std::wstring &directory, int *out_error_code)
         {
             std::error_code error;

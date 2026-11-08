@@ -1,27 +1,3 @@
-pub(crate) fn inspect_zip_local_header(
-    py: Python<'_>,
-    path: &str,
-    offset: i64,
-) -> PyResult<Py<PyDict>> {
-    let offset = offset.max(0) as u64;
-    let reader = match ManagedReader::open(path) {
-        Ok(reader) => reader,
-        Err(error) => {
-            let result = dict(py)?;
-            let fault = ReadFault::from_io(error, "open", offset, 0, 0, 0)
-                .with_field("zip.local_header.fixed", FieldLocation::Body);
-            set_read_fault(&result, &fault, "os_error")?;
-            return Ok(result.unbind());
-        }
-    };
-    crate::analysis_native::AnalysisBinaryView {
-        path: path.to_string(),
-        reader,
-        closed: false,
-    }
-    .probe_zip_local_header_native(py, offset)
-}
-
 const UNIFIED_PREFILTER_ZIP: u32 = 1 << 0;
 const UNIFIED_PREFILTER_RAR: u32 = 1 << 1;
 const UNIFIED_PREFILTER_SEVEN_ZIP: u32 = 1 << 2;

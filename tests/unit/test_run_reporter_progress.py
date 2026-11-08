@@ -47,14 +47,19 @@ def test_reporter_keeps_display_and_lineage_without_retaining_finished_inputs(tm
     """
     import gc
     import weakref
-    from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+    from sunpack.core.contracts.filesystem import DirectorySnapshot
+    from tests.helpers.directory_snapshot import FileEntry, make_snapshot
     from tests.helpers.archive_tasks import make_archive_task
+
+    class ObservableSnapshot(DirectorySnapshot):
+        pass
 
     output = io.StringIO()
     reporter = RunReporter("en", stdout=output, quiet=quiet)
     for depth, root in ((1, tmp_path), (2, tmp_path / "outer")):
         task = make_archive_task(root / ("outer.zip" if depth == 1 else "inner.zip"))
-        snapshot = DirectorySnapshot.from_entries(root, [FileEntry(root / "member", False, 7)])
+        native = make_snapshot([FileEntry(root / "member", False, 7)]).native_snapshot
+        snapshot = ObservableSnapshot(native, native)
         task.runtime["discovery_snapshot"] = snapshot
         task_ref, snapshot_ref = weakref.ref(task), weakref.ref(snapshot)
         reporter.tasks_discovered(depth, [task])

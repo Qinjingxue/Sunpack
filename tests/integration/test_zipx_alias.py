@@ -4,7 +4,7 @@ from tests.helpers.worker_events import worker_events
 import subprocess
 
 import pytest
-from sunpack_native import AnalysisBinaryView, relations_size_filter_split_family_keys
+from sunpack_native import AnalysisBinaryView
 
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.relations import RelationsScheduler
@@ -20,11 +20,6 @@ def test_zipx_split_alias_preserves_size_anchors_and_extracts_physical_parts(tmp
     first = (case.archive_dir / "payload.z01").rename(case.archive_dir / "payload.zx01")
     terminal = (case.archive_dir / "payload.zip").rename(case.archive_dir / "payload.zipx")
     assert terminal.stat().st_size < first.stat().st_size
-
-    keys = relations_size_filter_split_family_keys(str(terminal))
-    assert keys == relations_size_filter_split_family_keys(str(first))
-    assert len(keys) == 1
-    assert keys[0].startswith("zip:spanned\x1f")
 
     config = make_config({
         "filesystem": {"scan_filters": [

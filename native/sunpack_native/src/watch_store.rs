@@ -731,7 +731,9 @@ impl NativeWatchState {
         {
             let mut data = self.lock();
             for operation in operations.0.iter() {
-                let removed = if let Operation::Delete(Collection::Entries, path) = operation {
+                let removed = if let (Some(_), Operation::Delete(Collection::Entries, path)) =
+                    (&events, operation)
+                {
                     data.entries.get(path).cloned()
                 } else {
                     None
@@ -1129,16 +1131,16 @@ impl NativeWatchState {
     }
 
     /// Configuration retirement only visits resident state, never file-index rows.
-    fn unused_scope_keys(
+    fn scope_retirement_operations(
         &self,
         py: Python<'_>,
         scopes: Vec<Py<crate::scan::scope::NativeDiscoveryScope>>,
-    ) -> (Vec<String>, Vec<String>) {
+    ) -> NativeWatchOperations {
         let scopes: Vec<_> = scopes
             .iter()
             .map(|scope| scope.borrow(py).clone())
             .collect();
-        py.detach(|| {
+        let operations = py.detach(|| {
             let data = self.lock();
             let recovery_paths: Vec<_> = data
                 .pending
@@ -1153,7 +1155,7 @@ impl NativeWatchState {
                         .map(|path| path_key(path))
                 })
                 .collect();
-            let entries = data
+            let mut operations: Vec<_> = data
                 .entries
                 .iter()
                 .filter(|(key, record)| {
@@ -1163,10 +1165,10 @@ impl NativeWatchState {
                             .iter()
                             .any(|root| *key == root || is_path_under(key, root))
                 })
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| Operation::Delete(Collection::Entries, key.clone()))
                 .collect();
             if data.cursors.is_empty() {
-                return (entries, Vec::new());
+                return operations;
             }
 
             // Resolve each root/recovery directory once using the existing
@@ -1187,17 +1189,23 @@ impl NativeWatchState {
                     Some(volume) => {
                         volumes.insert(volume.to_lowercase());
                     }
-                    _ => return (entries, Vec::new()),
+                    _ => return operations,
                 }
             }
-            let cursors = data
-                .cursors
-                .keys()
-                .filter(|key| !volumes.contains(*key))
-                .cloned()
-                .collect();
-            (entries, cursors)
-        })
+            if data.cursors.keys().any(|key| !volumes.contains(key)) {
+                let cursors = data
+                    .cursors
+                    .iter()
+                    .filter(|(key, _)| volumes.contains(*key))
+                    .map(|(key, cursor)| (key.clone(), *cursor))
+                    .collect();
+                operations.push(Operation::SetCursors(cursors));
+            }
+            operations
+        });
+        NativeWatchOperations {
+            operations: Arc::new(Operations(operations)),
+        }
     }
 
     /// Missing-only retirement keeps durable output recovery, even under a removed directory.
@@ -1511,22 +1519,6 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
                 return Err(invalid("metadata password_generation must not be negative"));
             }
             return Ok(Operation::SetMetadata(generation, signature.to_owned()));
-        }
-        "set_watch_cursors" => {
-            require_fields(object, &["op", "value"])?;
-            let value = object
-                .get("value")
-                .and_then(Value::as_object)
-                .ok_or_else(|| PyTypeError::new_err("watch cursor value must be an object"))?;
-            let cursors =
-                serde_json::from_value::<BTreeMap<String, Cursor>>(Value::Object(value.clone()))
-                    .map_err(|error| invalid(format!("invalid watch cursor value: {error}")))?;
-            return Ok(Operation::SetCursors(
-                cursors
-                    .into_iter()
-                    .map(|(key, cursor)| (key.to_lowercase(), cursor))
-                    .collect(),
-            ));
         }
         _ => {}
     }

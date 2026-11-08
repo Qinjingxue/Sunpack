@@ -1,4 +1,3 @@
-use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crc32fast::hash as crc32;
 use pyo3::prelude::*;

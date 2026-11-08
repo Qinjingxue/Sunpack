@@ -914,14 +914,14 @@ fn promote_sfx_archive_anchor(
     let Some(image_end) = facts.pe_image_end else {
         return None;
     };
-    let overlay = inspect_pe_overlay_reader(reader, facts.size, image_end);
-    let archive_like = overlay.archive_like;
-    let format = overlay.format;
-    if archive_like && !matches!(format, "rar" | "7z" | "zip") {
+    if image_end == 0 {
         return None;
     }
-    let image_end = overlay.overlay_offset;
-    if image_end == 0 {
+    let overlay = inspect_pe_overlay_reader(reader, facts.size, image_end);
+    if overlay
+        .as_ref()
+        .is_some_and(|archive| !matches!(archive.format, "rar" | "7z" | "zip"))
+    {
         return None;
     }
 
@@ -931,7 +931,7 @@ fn promote_sfx_archive_anchor(
     // Prove the decompressor stub first with a bounded image-only probe, then
     // validate the archive at the overlay offset below.
     let sfx_profile = executable_sfx_stub_profile(reader, image_end).ok()?;
-    if !archive_like {
+    let Some(overlay) = overlay else {
         let evidence = match sfx_profile {
             "seven_zip_sfx" => "sfx:seven_zip_stub",
             "winrar_sfx" => "sfx:winrar_stub",
@@ -943,7 +943,8 @@ fn promote_sfx_archive_anchor(
         anchor.sfx = true;
         anchor.evidence.push(evidence);
         return Some(anchor);
-    }
+    };
+    let format = overlay.format;
     let sfx_matches_format = match sfx_profile {
         "seven_zip_sfx" => matches!(format, "7z" | "zip"),
         "winrar_sfx" => matches!(format, "rar" | "zip"),
@@ -953,10 +954,7 @@ fn promote_sfx_archive_anchor(
         return None;
     }
 
-    let archive_offset = overlay.archive_offset;
-    if archive_offset == 0 {
-        return None;
-    }
+    let archive_offset = overlay.offset;
 
     let password = path_passwords.and_then(|items| {
         items
@@ -1606,7 +1604,6 @@ fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
 /// scanner may retain a size-rejected row when one of these identities has a
 /// normally accepted anchor; relations still decides whether the resulting
 /// group is a valid archive.
-#[pyfunction]
 pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String> {
     if !may_have_size_deferred_split_identity(path) {
         return Vec::new();
@@ -1646,39 +1643,6 @@ pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String>
     keys.sort_unstable();
     keys.dedup();
     keys
-}
-
-#[pyfunction]
-pub(crate) fn relations_apply_split_size_anchors(
-    paths: Vec<String>,
-    size_accepted: Vec<bool>,
-) -> PyResult<Vec<bool>> {
-    if paths.len() != size_accepted.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "split size anchor paths and decisions must have equal lengths",
-        ));
-    }
-    if size_accepted.iter().all(|accepted| *accepted)
-        || size_accepted.iter().all(|accepted| !*accepted)
-    {
-        return Ok(size_accepted);
-    }
-    let accepted_families: HashSet<String> = paths
-        .iter()
-        .zip(&size_accepted)
-        .filter(|(_, accepted)| **accepted)
-        .flat_map(|(path, _)| relations_size_filter_split_family_keys(path))
-        .collect();
-    Ok(paths
-        .iter()
-        .zip(size_accepted)
-        .map(|(path, accepted)| {
-            accepted
-                || relations_size_filter_split_family_keys(path)
-                    .iter()
-                    .any(|key| accepted_families.contains(key))
-        })
-        .collect())
 }
 
 fn may_have_size_deferred_split_identity(path: &str) -> bool {

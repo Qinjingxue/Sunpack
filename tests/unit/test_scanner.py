@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.core.contracts.filesystem import FileEntry
+from tests.helpers.directory_snapshot import FileEntry, snapshot_rows
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from tests.helpers.config_factory import make_config
@@ -12,7 +12,7 @@ from tests.helpers.config_factory import make_config
 def _entries(snapshot):
     return [
         FileEntry(path=Path(path), is_dir=is_dir, size=size, mtime_ns=mtime_ns)
-        for path, is_dir, size, mtime_ns in snapshot.iter_columns()
+        for path, is_dir, size, mtime_ns in snapshot_rows(snapshot)
     ]
 
 
@@ -28,7 +28,6 @@ def test_directory_scanner_captures_files_and_directories(tmp_path):
     })).scan()
     names = {entry.path.name for entry in _entries(snapshot)}
 
-    assert snapshot.root_path == tmp_path
     assert {"nested", "archive.zip", "notes.txt"} <= names
     entries = _entries(snapshot)
     assert any(entry.is_dir and entry.path.name == "nested" for entry in entries)
@@ -138,25 +137,6 @@ def test_directory_scanner_never_promotes_hard_rejected_split_member(tmp_path):
     assert blocked_tail.name not in names
 
 
-def test_snapshot_from_entries_preserves_anchored_small_split_member(tmp_path):
-    entries = [
-        FileEntry(path=tmp_path / "payload.7z.001", is_dir=False, size=16),
-        FileEntry(path=tmp_path / "payload.7z.002", is_dir=False, size=4),
-        FileEntry(path=tmp_path / "other.7z.002", is_dir=False, size=4),
-    ]
-
-    snapshot = DirectoryScanner.snapshot_from_entries(str(tmp_path), entries, config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "size_range", "enabled": True, "min_bytes": 10},
-            ]
-        }
-    }))
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert names == {"payload.7z.001", "payload.7z.002"}
-
-
 @pytest.mark.parametrize(("times", "start", "end"), [
     ((1_704_067_200, 1_735_689_600, 1_767_225_600), "2025-01-01T00:00Z", "2026-01-01T00:00Z"),
     ((1_735_689_600, 1_767_225_600, 1_798_761_600), "2025-03-20T01:30Z", "2026-04-30T01:40Z"),
@@ -201,21 +181,6 @@ def test_directory_scanner_current_dir_only_scan_mode_skips_subdirectories(tmp_p
     assert "root.zip" in names
     assert "nested" not in names
     assert "nested.zip" not in names
-
-
-def test_directory_scanner_custom_filters_fail_without_native_mapping(tmp_path):
-    (tmp_path / "archive.zip").write_bytes(b"PK\x03\x04payload")
-
-    class KeepAllFilter:
-        name = "keep_all"
-        stage = "path"
-
-        def evaluate(self, candidate):
-            from sunpack.pipeline.discovery.filesystem.filters.base import keep
-            return keep()
-
-    with pytest.raises(RuntimeError, match="Native directory scan requires"):
-        DirectoryScanner(str(tmp_path), filters=[KeepAllFilter()], config=make_config()).scan()
 
 
 def test_directory_scanner_explicit_max_depth_overrides_scan_mode(tmp_path):
@@ -288,57 +253,6 @@ def test_directory_scanner_name_filters_and_switches(tmp_path):
             "filesystem": {"scan_filters_enabled": filters_enabled, "scan_filters": filters},
         })).scan()
         assert {entry.path.name for entry in _entries(snapshot)} == expected, (filters_enabled, filters)
-
-
-def test_directory_scanner_executes_built_in_filters_natively(tmp_path, monkeypatch):
-    target = tmp_path / "archive.zip"
-    target.write_bytes(b"PK\x03\x04payload")
-    observed = []
-
-    from sunpack.pipeline.discovery.filesystem.filters.modules.blacklist import (
-        BlacklistScanFilter,
-    )
-    from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import (
-        MtimeRangeScanFilter,
-    )
-    from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import (
-        SizeRangeScanFilter,
-    )
-    from sunpack.pipeline.discovery.filesystem.filters.modules.whitelist import (
-        WhitelistScanFilter,
-    )
-
-    originals = {
-        "whitelist": WhitelistScanFilter.evaluate,
-        "blacklist": BlacklistScanFilter.evaluate,
-        "size_range": SizeRangeScanFilter.evaluate,
-        "mtime_range": MtimeRangeScanFilter.evaluate,
-    }
-
-    def record(name, original):
-        def wrapped(self, candidate):
-            if candidate.path == target:
-                observed.append(name)
-            return original(self, candidate)
-        return wrapped
-
-    monkeypatch.setattr(WhitelistScanFilter, "evaluate", record("whitelist", originals["whitelist"]))
-    monkeypatch.setattr(BlacklistScanFilter, "evaluate", record("blacklist", originals["blacklist"]))
-    monkeypatch.setattr(SizeRangeScanFilter, "evaluate", record("size_range", originals["size_range"]))
-    monkeypatch.setattr(MtimeRangeScanFilter, "evaluate", record("mtime_range", originals["mtime_range"]))
-
-    DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "mtime_range", "enabled": True},
-                {"name": "whitelist", "enabled": True},
-                {"name": "size_range", "enabled": True},
-                {"name": "blacklist", "enabled": True},
-            ]
-        }
-    })).scan()
-
-    assert observed == []
 
 
 def test_directory_scanner_whitelist_combines_path_and_extension_constraints(tmp_path):

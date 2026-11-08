@@ -16,7 +16,7 @@ from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
 from tests.helpers.native_build import sevenzip_artifact
 import subprocess
-from sunpack_native import enc_fast_verify_passwords, enc_fast_verify_passwords_from_ranges, file_generation_tokens
+from sunpack_native import enc_fast_verify_passwords, enc_fast_verify_passwords_from_ranges
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "native" / "sunpack_enc" / "tests" / "data"
@@ -178,11 +178,9 @@ def test_prepared_context_is_invalidated_when_input_generation_changes(tmp_path)
     shutil.copyfile(DATA / "algorithm_0.mov", path)
 
     def change_content():
-        before = file_generation_tokens([str(path)])[0]
         stat = path.stat()
         _flip_byte(path, 40)
         os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
-        assert file_generation_tokens([str(path)])[0] != before
 
     assert enc_fast_verify_passwords(str(path), ["sunpack-test"])["status"] == "match"
     change_content()

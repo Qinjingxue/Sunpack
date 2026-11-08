@@ -161,9 +161,7 @@ async def close_persistent_runtime() -> None:
                 await broker.close(graceful=True)
         finally:
             if engine is not None:
-                setter = getattr(engine, "set_state_changed_callback", None)
-                if setter is not None:
-                    setter(None)
+                engine.set_state_changed_callback(None)
             _STATE_CHANGED_CALLBACK = None
 
 
@@ -321,9 +319,7 @@ async def pipeline_engine(
                     created = PipelineEngine(copy.deepcopy(config))
                 else:
                     created = PipelineEngine(copy.deepcopy(config), work_broker=_WORK_BROKER)
-                setter = getattr(created, "set_state_changed_callback", None)
-                if setter is not None:
-                    setter(_STATE_CHANGED_CALLBACK)
+                created.set_state_changed_callback(_STATE_CHANGED_CALLBACK)
                 try:
                     engine = await created.__aenter__()
                     from sunpack.runtime.cli.runtime_state import runtime_host
@@ -339,8 +335,7 @@ async def pipeline_engine(
                     try:
                         await created.aclose(graceful=False)
                     finally:
-                        if setter is not None:
-                            setter(None)
+                        created.set_state_changed_callback(None)
                     raise
                 _ENGINE = engine
                 if _WORK_BROKER is engine.work_broker:

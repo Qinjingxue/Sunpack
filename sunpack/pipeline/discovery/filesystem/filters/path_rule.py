@@ -1,7 +1,5 @@
 from sunpack_native import NativePathRule
 
-from sunpack.pipeline.discovery.filesystem.filters.base import ScanCandidate, ScanDecision, keep, prune, reject
-
 
 def validate_path_rule_config(config: dict) -> None:
     unexpected = config.keys() - {"name", "enabled", "paths", "files", "extensions", "full_names"}
@@ -18,25 +16,9 @@ def validate_path_rule_config(config: dict) -> None:
                 raise ValueError(f"{field}[{index}] requires a nonempty value string and a regex boolean")
 
 
-class PathRuleScanFilter:
-    stage = "path"
-
-    def __init__(self, paths=None, files=None, extensions=None, full_names=None):
-        self.native_rule = NativePathRule(paths or [], files or [], extensions or [], full_names or [])
-
-    @classmethod
-    def from_config(cls, config: dict):
-        validate_path_rule_config(config)
-        return cls(paths=config.get("paths"), files=config.get("files"),
-                   extensions=config.get("extensions"), full_names=config.get("full_names"))
-
-    def evaluate(self, candidate: ScanCandidate) -> ScanDecision:
-        if not self.native_rule.rejects(
-            str(candidate.path),
-            str(candidate.root_path if candidate.root_path is not None else candidate.path.parent),
-            candidate.kind == "dir",
-            self.whitelist,
-        ):
-            return keep()
-        reason = "Path excluded by whitelist" if self.whitelist else "Path excluded by blacklist"
-        return prune(reason) if candidate.kind == "dir" else reject(reason)
+def compile_path_rule(config: dict) -> NativePathRule:
+    validate_path_rule_config(config)
+    return NativePathRule(
+        config.get("paths", []), config.get("files", []),
+        config.get("extensions", []), config.get("full_names", []),
+    )

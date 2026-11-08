@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sunpack.core.platform.windows.file_mutex import file_mutex, file_mutex_name
+from sunpack.core.platform.windows.file_mutex import file_mutex
 
 import asyncio
 import os
@@ -29,6 +29,7 @@ from sunpack.core.support.resource_lifecycle import (
 
 SERVICE_STATE = "state.snapshot"
 WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
+_WATCH_ROOTS_MUTEX_PREFIX = "SunPackWatchRoots"
 # Optional columns: ``<input root> | <output root> | <deep_detect> | <initial_scanned>``.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
 
@@ -1052,9 +1053,5 @@ class WatchService:
         ]
 
 
-def watch_roots_mutex_name(path: Path | None = None) -> str:
-    return file_mutex_name(path or watch_roots_path(), prefix="SunPackWatchRoots")
-
-
 def _watch_roots_mutex(path: Path | None = None):
-    return file_mutex(path or watch_roots_path(), prefix="SunPackWatchRoots")
+    return file_mutex(path or watch_roots_path(), prefix=_WATCH_ROOTS_MUTEX_PREFIX)

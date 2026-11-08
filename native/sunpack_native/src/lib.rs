@@ -36,18 +36,12 @@ mod test_support {
     }
 }
 
-#[pyfunction]
-fn native_available() -> bool {
-    true
-}
-
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(
         io::archive_state::archive_input_slices,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(native_available, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::append_failure_report, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::publish_failure_report, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::stream_json, m)?)?;
@@ -68,13 +62,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash128_file, m)?)?;
     m.add_class::<fast_hash::FastHash128>()?;
     #[cfg(windows)]
-    {
-        m.add_class::<io::config_changes::NativeConfigChanges>()?;
-        m.add_function(wrap_pyfunction!(
-            io::file_generation::file_generation_tokens,
-            m
-        )?)?;
-    }
+    m.add_class::<io::config_changes::NativeConfigChanges>()?;
     m.add_class::<watch_store::NativeWatchState>()?;
     m.add_class::<event_log::NativeEventLog>()?;
     m.add_class::<watch_journal::NativeJournalStream>()?;
@@ -98,7 +86,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_seed, m)?)?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_flush_all, m)?)?;
-    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_stats, m)?)?;
     m.add_function(wrap_pyfunction!(io::reader::reader_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(io::reader::clear_reader_resources, m)?)?;
     m.add_function(wrap_pyfunction!(
@@ -127,7 +114,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_class::<analysis_native::AnalysisBinaryView>()?;
     m.add_class::<analysis_native::AnalysisMultiVolumeView>()?;
-    m.add_function(wrap_pyfunction!(analysis_native::probe_rar_bytes, m)?)?;
     m.add_class::<analysis_native::NativeAnalysisConfig>()?;
     m.add_function(wrap_pyfunction!(
         analysis_native::confirm_format_identity,
@@ -174,15 +160,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        scan::directory::filter_inventory_file_indices,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::list_regular_files_in_directory,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(scan::directory::batch_file_head_facts, m)?)?;
-    m.add_function(wrap_pyfunction!(
         scan::nested_authorization::authorize_nested_candidates,
         m
     )?)?;
@@ -194,14 +171,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         relations::relations_parse_numbered_volume,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        relations::relations_size_filter_split_family_keys,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        relations::relations_apply_split_size_anchors,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -252,11 +221,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         analysis_native::inspect_compression_stream_structure,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::pe_overlay::inspect_pe_overlay_structure,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(scan::pe_overlay::inspect_pe_image, m)?)?;
     m.add_function(wrap_pyfunction!(postprocess::scan_watch_candidates, m)?)?;
     m.add_function(wrap_pyfunction!(postprocess::watch_candidate_for_path, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_filesystem_type, m)?)?;

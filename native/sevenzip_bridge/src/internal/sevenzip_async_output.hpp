@@ -126,7 +126,6 @@ namespace sunpack::sevenzip
 
         struct FileSnapshot
         {
-            UInt64 accepted_bytes = 0;
             UInt64 written_bytes = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
@@ -138,7 +137,10 @@ namespace sunpack::sevenzip
             std::vector<unsigned char> magic;
             bool failed = false;
             bool closed = false;
+#ifdef SUP7Z_TEST_IO_FAULTS
+            UInt64 accepted_bytes = 0;
             std::size_t peak_active_data_writes = 0;
+#endif
         };
 
         WriterMeterSnapshot snapshot_global_meters() const noexcept
@@ -233,8 +235,10 @@ namespace sunpack::sevenzip
             Buffer *staging_buffer = nullptr;
             std::size_t inflight_bytes = 0;
             std::size_t outstanding_data = 0;
+#ifdef SUP7Z_TEST_IO_FAULTS
             std::size_t active_data_writes = 0;
             std::size_t peak_active_data_writes = 0;
+#endif
             UInt64 written_bytes = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
@@ -862,6 +866,7 @@ namespace sunpack::sevenzip
             return true;
         }
 
+#ifdef SUP7Z_TEST_IO_FAULTS
         bool has_active_jobs() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -874,6 +879,7 @@ namespace sunpack::sevenzip
             }
             return false;
         }
+#endif
 
         void record_operation_result(const FileStatePtr &file, Int32 operation_result) noexcept
         {
@@ -894,7 +900,6 @@ namespace sunpack::sevenzip
                 return snapshot;
             }
             std::lock_guard<std::mutex> lock(mutex_);
-            snapshot.accepted_bytes = file->accepted_bytes.load(std::memory_order_relaxed);
             snapshot.written_bytes = file->written_bytes;
             snapshot.operation_result = file->operation_result;
             snapshot.hresult = file->hresult;
@@ -906,7 +911,10 @@ namespace sunpack::sevenzip
             snapshot.magic = file->magic;
             snapshot.failed = file->failed;
             snapshot.closed = file->closed;
+#ifdef SUP7Z_TEST_IO_FAULTS
+            snapshot.accepted_bytes = file->accepted_bytes.load(std::memory_order_relaxed);
             snapshot.peak_active_data_writes = file->peak_active_data_writes;
+#endif
             return snapshot;
         }
 
@@ -1438,7 +1446,9 @@ namespace sunpack::sevenzip
                 if (file && file->job->pipeline_timing)
                     file->job->pipeline_timing->end(PipelineStage::Output);
 #endif
+#ifdef SUP7Z_TEST_IO_FAULTS
                 end_data_write(file);
+#endif
                 if (error != ERROR_SUCCESS)
                     result = classify_data_failure(file, error);
                 else if (bytes == 0 || bytes > buffer->size - buffer->transferred)
@@ -1556,11 +1566,13 @@ namespace sunpack::sevenzip
             {
                 creation_flags |= FILE_FLAG_WRITE_THROUGH;
             }
+#ifdef SUP7Z_TEST_IO_FAULTS
             // 整个 FileState 生命周期内 CreateFileW 只应被调用一次。
             if (open_probe_)
             {
                 open_probe_(file->path);
             }
+#endif
 
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
                 WriterProbeSpan probe_open(file->job->probe, WriterProbePhase::Open);
@@ -1581,7 +1593,7 @@ namespace sunpack::sevenzip
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 const DWORD error = open_error;
-                if (failure_classifier_(static_cast<unsigned long>(error)))
+                if (is_output_space_failure(error))
                 {
                     if (!file->space_gate)
                     {
@@ -1649,11 +1661,14 @@ namespace sunpack::sevenzip
             {
                 return false;
             }
+#ifdef SUP7Z_TEST_IO_FAULTS
             ++file->active_data_writes;
             file->peak_active_data_writes = (std::max)(file->peak_active_data_writes, file->active_data_writes);
+#endif
             return true;
         }
 
+#ifdef SUP7Z_TEST_IO_FAULTS
         void end_data_write(const FileStatePtr &file) noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1662,6 +1677,7 @@ namespace sunpack::sevenzip
                 --file->active_data_writes;
             }
         }
+#endif
 
         void add_written_bytes(const FileStatePtr &file, DWORD written, UInt64 offset = 0) noexcept
         {
@@ -1706,19 +1722,23 @@ namespace sunpack::sevenzip
             const auto opened = try_open_file(file);
             if (opened.kind != AttemptResult::Kind::Succeeded) return opened;
             if (!begin_data_write(file)) return {AttemptResult::Kind::Terminal, 0};
+#ifdef SUP7Z_TEST_IO_FAULTS
             unsigned long injected = 0;
-            if (consume_injected_write_fault(&injected))
+            if (write_fault_.consume(injected))
             {
                 end_data_write(file);
                 return classify_data_failure(file, injected);
             }
+#endif
             const UInt64 offset = buffer->output_offset + buffer->transferred;
             buffer->request.overlapped = {};
             buffer->request.overlapped.Offset = static_cast<DWORD>(offset);
             buffer->request.overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32U);
             DWORD size = buffer->size - buffer->transferred;
+#ifdef SUP7Z_TEST_IO_FAULTS
             const auto chunk = max_write_chunk_.load(std::memory_order_relaxed);
             if (chunk && size > chunk) size = chunk;
+#endif
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             if (job->pipeline_timing) job->pipeline_timing->begin(PipelineStage::Output);
 #endif
@@ -1733,23 +1753,43 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
                 if (job->pipeline_timing) job->pipeline_timing->end(PipelineStage::Output);
 #endif
+#ifdef SUP7Z_TEST_IO_FAULTS
                 end_data_write(file);
+#endif
                 return classify_data_failure(file, error);
             }
             submitted = true;
             return {};
         }
 
+        bool is_output_space_failure(DWORD error) const noexcept
+        {
+#ifdef SUP7Z_TEST_IO_FAULTS
+            if (failure_classifier_) return failure_classifier_(error);
+#endif
+            return is_space_exhaustion_error(error);
+        }
+
         // 空间类错误必须走 SpaceFailure 交给骨架重试，绝不能在这里调用 record_failure
         // （那会把 pending 记成 discarded 并把 file/job 标记成永久失败）。
         AttemptResult classify_data_failure(const FileStatePtr &file, DWORD error) noexcept
         {
-            if (failure_classifier_(static_cast<unsigned long>(error)))
+            if (is_output_space_failure(error))
             {
                 return {AttemptResult::Kind::SpaceFailure, static_cast<unsigned long>(error)};
             }
             record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error), 0);
             return {AttemptResult::Kind::PermanentFailure, static_cast<unsigned long>(error)};
+        }
+
+        bool flush_file(HANDLE handle, DWORD &error) noexcept
+        {
+#ifdef SUP7Z_TEST_IO_FAULTS
+            if (flush_fault_.consume(error)) return false;
+#endif
+            if (FlushFileBuffers(handle)) return true;
+            error = GetLastError();
+            return false;
         }
 
         void process_close(const FileStatePtr &file, ProbeLease lease = {}) noexcept
@@ -1783,11 +1823,9 @@ namespace sunpack::sevenzip
             }
             if (result.kind == AttemptResult::Kind::Succeeded && handle != INVALID_HANDLE_VALUE && write_through())
             {
-                unsigned long injected = 0;
-                const bool fault = consume_injected_flush_fault(&injected);
-                if (fault || !FlushFileBuffers(handle))
+                DWORD error = ERROR_SUCCESS;
+                if (!flush_file(handle, error))
                 {
-                    const DWORD error = fault ? injected : GetLastError();
                     result = {is_space_exhaustion_error(error) ? AttemptResult::Kind::SpaceFailure
                                : AttemptResult::Kind::PermanentFailure, error};
                 }
@@ -1986,8 +2024,9 @@ namespace sunpack::sevenzip
         // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};
 
+#ifdef SUP7Z_TEST_IO_FAULTS
     public:
-        // 测试专用，生产代码永不设置：
+        // 测试专用：
         //   A：failure_classifier 可注入，用真实的其他错误码驱动空间失败路径。
         //   B：CreateFileW 调用探针，每个 FileState 的 CreateFileW 调用次数必须恒为 1。
         //   D：WriteFile / FlushFileBuffers 故障注入。
@@ -1996,7 +2035,7 @@ namespace sunpack::sevenzip
 
         void set_failure_classifier_for_test(FailureClassifier classifier) noexcept
         {
-            failure_classifier_ = classifier ? std::move(classifier) : default_failure_classifier();
+            failure_classifier_ = std::move(classifier);
         }
 
         void set_open_probe_for_test(OpenProbe probe) noexcept { open_probe_ = std::move(probe); }
@@ -2005,17 +2044,13 @@ namespace sunpack::sevenzip
         // 放过 skip 次调用后，连续 faults 次以 win32_error 失败，之后恢复。
         void set_write_fault_for_test(unsigned long win32_error, int faults, int skip = 0) noexcept
         {
-            write_fault_error_.store(win32_error, std::memory_order_relaxed);
-            write_fault_remaining_.store(faults, std::memory_order_relaxed);
-            write_fault_skip_.store(skip, std::memory_order_relaxed);
+            write_fault_.set(win32_error, faults, skip);
         }
 
         // FlushFileBuffers 故障注入，同样在真实调用之前生效。
         void set_flush_fault_for_test(unsigned long win32_error, int faults, int skip = 0) noexcept
         {
-            flush_fault_error_.store(win32_error, std::memory_order_relaxed);
-            flush_fault_remaining_.store(faults, std::memory_order_relaxed);
-            flush_fault_skip_.store(skip, std::memory_order_relaxed);
+            flush_fault_.set(win32_error, faults, skip);
         }
 
         // 限制单次 WriteFile 的最大字节数（0 = 不限制），强制制造 partial write，
@@ -2026,77 +2061,50 @@ namespace sunpack::sevenzip
         }
 
     private:
-        static FailureClassifier default_failure_classifier()
-        {
-            return [](unsigned long win32_error) { return is_space_exhaustion_error(win32_error); };
-        }
-
-        FailureClassifier failure_classifier_ = default_failure_classifier();
+        FailureClassifier failure_classifier_;
         OpenProbe open_probe_;
-        std::atomic<unsigned long> write_fault_error_{0};
-        std::atomic<int> write_fault_remaining_{0};
-        std::atomic<int> write_fault_skip_{0};
-        std::atomic<unsigned long> flush_fault_error_{0};
-        std::atomic<int> flush_fault_remaining_{0};
-        std::atomic<int> flush_fault_skip_{0};
         std::atomic<UInt32> max_write_chunk_{0};
 
-        // 返回 true 表示本次系统调用被注入的故障取代。
-        template <typename Remaining, typename Skip>
-        static bool consume_fault(Remaining &remaining, Skip &skip, unsigned long *win32_error) noexcept
+        struct InjectedFault
         {
-            if (remaining.load(std::memory_order_relaxed) <= 0)
+            std::atomic<unsigned long> error{0};
+            std::atomic<int> remaining{0};
+            std::atomic<int> skip{0};
+
+            void set(unsigned long win32_error, int faults, int skip_count) noexcept
             {
-                return false;
+                error.store(win32_error, std::memory_order_relaxed);
+                remaining.store(faults, std::memory_order_relaxed);
+                skip.store(skip_count, std::memory_order_relaxed);
             }
-            int pending_skip = skip.load(std::memory_order_relaxed);
-            while (pending_skip > 0)
+
+            // 返回 true 表示本次系统调用被注入的故障取代。
+            bool consume(unsigned long &win32_error) noexcept
             {
-                if (skip.compare_exchange_weak(pending_skip, pending_skip - 1,
-                                               std::memory_order_relaxed,
-                                               std::memory_order_relaxed))
+                if (remaining.load(std::memory_order_relaxed) <= 0)
                 {
-                    return false; // 本次调用被放过
+                    return false;
                 }
+                int pending_skip = skip.load(std::memory_order_relaxed);
+                while (pending_skip > 0)
+                {
+                    if (skip.compare_exchange_weak(pending_skip, pending_skip - 1,
+                                                   std::memory_order_relaxed))
+                    {
+                        return false;
+                    }
+                }
+                int pending = remaining.load(std::memory_order_relaxed);
+                do
+                {
+                    if (pending <= 0) return false;
+                } while (!remaining.compare_exchange_weak(pending, pending - 1,
+                                                           std::memory_order_relaxed));
+                win32_error = error.load(std::memory_order_relaxed);
+                return true;
             }
-            int pending = remaining.load(std::memory_order_relaxed);
-            do
-            {
-                if (pending <= 0) return false;
-            } while (!remaining.compare_exchange_weak(pending, pending - 1,
-                                                       std::memory_order_relaxed));
-            if (win32_error)
-            {
-                *win32_error = 0;
-            }
-            return true;
-        }
-
-        bool consume_injected_write_fault(unsigned long *win32_error) noexcept
-        {
-            if (!consume_fault(write_fault_remaining_, write_fault_skip_, nullptr))
-            {
-                return false;
-            }
-            if (win32_error)
-            {
-                *win32_error = write_fault_error_.load(std::memory_order_relaxed);
-            }
-            return true;
-        }
-
-        bool consume_injected_flush_fault(unsigned long *win32_error) noexcept
-        {
-            if (!consume_fault(flush_fault_remaining_, flush_fault_skip_, nullptr))
-            {
-                return false;
-            }
-            if (win32_error)
-            {
-                *win32_error = flush_fault_error_.load(std::memory_order_relaxed);
-            }
-            return true;
-        }
+        } write_fault_, flush_fault_;
+#endif
     };
 
 }

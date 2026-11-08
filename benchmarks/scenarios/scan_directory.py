@@ -12,6 +12,7 @@ import gc
 import json
 import statistics
 import subprocess
+from dataclasses import dataclass
 import sys
 from pathlib import Path
 from time import perf_counter_ns
@@ -21,10 +22,17 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sunpack.core.contracts.filesystem import FileEntry
-from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.discovery.filesystem.directory_scanner import native_filter_options
 from benchmarks.harness import render_report, report_from_payload
 from sunpack_native import profile_directory_scan
+
+
+@dataclass
+class FileEntry:
+    path: Path
+    is_dir: bool
+    size: int | None
+    mtime_ns: int | None
 
 
 SCAN_STAGE_KEYS = (
@@ -58,10 +66,7 @@ def _native_options(scenario: str, config_path: Path) -> dict[str, Any]:
             "scan_filters": scan_filters,
         }
     }
-    options = DirectoryScanner(".", config=config)._native_filter_options()
-    if options is None:
-        raise RuntimeError("benchmark requires native-compatible filters")
-    return options
+    return native_filter_options(config)
 
 
 def run_sample(root: Path, scenario: str, config_path: Path) -> dict[str, Any]:

@@ -1,10 +1,8 @@
-use crate::analysis_native::inspect_zip_local_header;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use memchr::memmem;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::borrow::Cow;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
 const OVERLAY_SCAN_WINDOW_BYTES: u64 = 65_536;
@@ -15,16 +13,16 @@ const SECTION_HEADER_SIZE: usize = 40;
 const MAX_PE_SECTIONS: usize = 96;
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 
-const ARCHIVE_MAGICS: [(&[u8], &str, &str); 9] = [
-    (b"7z\xbc\xaf\x27\x1c", "7z", ".7z"),
-    (b"Rar!\x1a\x07\x01\x00", "rar", ".rar"),
-    (b"Rar!\x1a\x07\x00", "rar", ".rar"),
-    (b"PK\x03\x04", "zip", ".zip"),
-    (b"\x1f\x8b\x08", "gzip", ".gz"),
-    (b"BZh", "bzip2", ".bz2"),
-    (b"\xfd7zXZ\x00", "xz", ".xz"),
-    (b"\x28\xb5\x2f\xfd", "zstd", ".zst"),
-    (crate::formats::lz4::MAGIC, "lz4", ".lz4"),
+const ARCHIVE_MAGICS: [(&[u8], &str); 9] = [
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"Rar!\x1a\x07\x01\x00", "rar"),
+    (b"Rar!\x1a\x07\x00", "rar"),
+    (b"PK\x03\x04", "zip"),
+    (b"\x1f\x8b\x08", "gzip"),
+    (b"BZh", "bzip2"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
+    (crate::formats::lz4::MAGIC, "lz4"),
 ];
 
 /// PE structure facts only; SFX classification belongs to Relations.
@@ -37,17 +35,10 @@ pub(crate) enum PeState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PeFacts {
-    pub(crate) image_end: u64,
-    pe_header_offset: u64,
-    section_count: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeProbe {
     NotPe,
     NeedMore,
-    Confirmed(PeFacts),
+    Confirmed(u64),
 }
 
 impl PeProbe {
@@ -61,7 +52,7 @@ impl PeProbe {
 
     pub(crate) fn image_end(self) -> Option<u64> {
         match self {
-            Self::Confirmed(facts) => Some(facts.image_end),
+            Self::Confirmed(image_end) => Some(image_end),
             _ => None,
         }
     }
@@ -143,11 +134,7 @@ fn inspect_pe_headers<'a, E>(
             image_end = image_end.max(end);
         }
     }
-    Ok(PeProbe::Confirmed(PeFacts {
-        image_end,
-        pe_header_offset,
-        section_count: section_count as u64,
-    }))
+    Ok(PeProbe::Confirmed(image_end))
 }
 
 /// Zero I/O: filesystem must only use the bounded prefix it already owns.
@@ -163,21 +150,10 @@ pub(crate) fn probe_pe_prefix(prefix: &[u8], actual_size: u64) -> PeProbe {
     .unwrap()
 }
 
-pub(crate) fn inspect_pe_image_reader(
-    reader: &ManagedReader,
-    actual_size: u64,
-    prefix: &[u8],
-) -> Result<PeProbe, ReadFault> {
+pub(crate) fn inspect_pe_image_reader(reader: &ManagedReader) -> Result<PeProbe, ReadFault> {
     let mut file = reader.cursor();
+    let actual_size = reader.len();
     inspect_pe_headers(actual_size, |offset, len| {
-        if let Ok(start) = usize::try_from(offset) {
-            if let Some(bytes) = start
-                .checked_add(len)
-                .and_then(|end| prefix.get(start..end))
-            {
-                return Ok(Some(Cow::Borrowed(bytes)));
-            }
-        }
         let mut bytes = vec![0; len];
         seek_field(
             &mut file,
@@ -199,73 +175,13 @@ pub(crate) fn inspect_pe_image_reader(
 
 pub(crate) fn inspect_pe_image_native(path: &str) -> std::io::Result<PeProbe> {
     let reader = ManagedReader::open(path)?;
-    inspect_pe_image_reader(&reader, reader.len(), &[])
+    inspect_pe_image_reader(&reader)
         .map_err(|fault| std::io::Error::new(fault.io_kind, fault))
 }
 
-/// Python fallback consumes only PE identity; production facts stay in Rust.
-#[pyfunction]
-pub(crate) fn inspect_pe_image(py: Python<'_>, path: &str) -> PyResult<bool> {
-    Ok(matches!(
-        py.detach(|| inspect_pe_image_native(path))?,
-        PeProbe::Confirmed(_)
-    ))
-}
-
-#[derive(Default)]
-pub(crate) struct PeOverlayStructure {
-    pub(crate) is_pe: bool,
-    pub(crate) has_overlay: bool,
-    pub(crate) archive_like: bool,
-    pub(crate) pe_header_offset: u64,
-    pub(crate) section_count: u64,
-    pub(crate) overlay_offset: u64,
-    pub(crate) overlay_size: u64,
-    pub(crate) archive_offset: u64,
-    pub(crate) offset_delta_from_overlay: u64,
+pub(crate) struct ArchiveOverlay {
     pub(crate) format: &'static str,
-    detected_ext: &'static str,
-    confidence: &'static str,
-    error: &'static str,
-    evidence: Vec<&'static str>,
-    read_fault: Option<ReadFault>,
-}
-
-impl PeOverlayStructure {
-    fn failed(error: &'static str) -> Self {
-        Self {
-            error,
-            confidence: "none",
-            ..Default::default()
-        }
-    }
-}
-
-pub(crate) fn inspect_pe_overlay_native(
-    path: &str,
-    file_size: Option<i64>,
-    magic_bytes: Option<&[u8]>,
-) -> PeOverlayStructure {
-    let Ok(reader) = ManagedReader::open(path) else {
-        return PeOverlayStructure::failed("os_error");
-    };
-    let actual_size = match file_size {
-        Some(value) if value >= 0 => value as u64,
-        _ => reader.len(),
-    };
-    let facts = match inspect_pe_image_reader(&reader, actual_size, magic_bytes.unwrap_or(&[])) {
-        Ok(PeProbe::Confirmed(facts)) => facts,
-        Ok(_) => return PeOverlayStructure::failed("pe_structure_not_confirmed"),
-        Err(fault) => {
-            let mut out = PeOverlayStructure::failed("pe_header_read_failed");
-            out.read_fault = Some(fault);
-            return out;
-        }
-    };
-    let mut result = inspect_pe_overlay_reader(&reader, actual_size, facts.image_end);
-    result.pe_header_offset = facts.pe_header_offset;
-    result.section_count = facts.section_count;
-    result
+    pub(crate) offset: u64,
 }
 
 /// Relations reuses its reader and confirmed boundary without parsing headers again.
@@ -273,160 +189,42 @@ pub(crate) fn inspect_pe_overlay_reader(
     reader: &ManagedReader,
     actual_size: u64,
     pe_end: u64,
-) -> PeOverlayStructure {
-    let mut result = PeOverlayStructure::default();
-    result.is_pe = true;
-    result.overlay_offset = pe_end;
-    result.overlay_size = actual_size.saturating_sub(pe_end);
-    result.evidence.push("pe:valid_headers");
-
+) -> Option<ArchiveOverlay> {
     if pe_end == 0 || pe_end >= actual_size {
-        result.error = "overlay_not_found";
-        return result;
+        return None;
     }
-    result.has_overlay = true;
-    result.evidence.push("pe:overlay_present");
-
     let sample_size = OVERLAY_SCAN_WINDOW_BYTES.min(actual_size - pe_end);
     // Keep reusable PE header blocks; the overlay search sample is one-shot.
     let mut file = reader.probe_reader().cursor();
     let mut sample = vec![0; sample_size as usize];
-    if let Err(fault) = seek_field(
-        &mut file,
-        pe_end,
-        actual_size,
-        "pe.overlay.sample",
-        FieldLocation::Body,
-    )
-    .and_then(|_| {
-        read_exact_field(
-            &mut file,
-            &mut sample,
-            actual_size,
-            "pe.overlay.sample",
-            FieldLocation::Body,
-        )
-    }) {
-        result.error = "overlay_sample_read_failed";
-        result.read_fault = Some(fault);
-        return result;
-    }
-
-    let Some((archive_format, detected_ext, relative_offset)) = find_archive_magic(&sample) else {
-        result.error = "overlay_archive_magic_not_found";
-        return result;
-    };
-    let archive_offset = pe_end + relative_offset as u64;
-    result.archive_like = true;
-    result.error = "";
-    result.archive_offset = archive_offset;
-    result.offset_delta_from_overlay = relative_offset as u64;
-    result.format = archive_format;
-    result.detected_ext = detected_ext;
-    result.confidence = if relative_offset == 0 {
-        "strong"
-    } else {
-        "medium"
-    };
-    result.evidence.push(if relative_offset == 0 {
-        "overlay:archive_magic_at_start"
-    } else {
-        "overlay:archive_magic_near_start"
-    });
-
-    result
+    file.seek(SeekFrom::Start(pe_end)).ok()?;
+    file.read_exact(&mut sample).ok()?;
+    let (format, relative_offset) = find_archive_magic(&sample)?;
+    Some(ArchiveOverlay {
+        format,
+        offset: pe_end + relative_offset as u64,
+    })
 }
 
-#[pyfunction]
-#[pyo3(signature = (path, file_size=None, magic_bytes=None))]
-pub(crate) fn inspect_pe_overlay_structure(
-    py: Python<'_>,
-    path: &str,
-    file_size: Option<i64>,
-    magic_bytes: Option<&[u8]>,
-) -> PyResult<Py<PyDict>> {
-    let facts = py.detach(|| inspect_pe_overlay_native(path, file_size, magic_bytes));
-    let result = empty_result(py, facts.error)?;
-    result.set_item("is_pe", facts.is_pe)?;
-    result.set_item("has_overlay", facts.has_overlay)?;
-    result.set_item("archive_like", facts.archive_like)?;
-    result.set_item("pe_header_offset", facts.pe_header_offset)?;
-    result.set_item("section_count", facts.section_count)?;
-    result.set_item("overlay_offset", facts.overlay_offset)?;
-    result.set_item("overlay_size", facts.overlay_size)?;
-    result.set_item("archive_offset", facts.archive_offset)?;
-    result.set_item("offset_delta_from_overlay", facts.offset_delta_from_overlay)?;
-    result.set_item("format", facts.format)?;
-    result.set_item("detected_ext", facts.detected_ext)?;
-    result.set_item("confidence", facts.confidence)?;
-    let evidence = PyList::new(py, facts.evidence)?;
-    result.set_item("evidence", &evidence)?;
-    if let Some(fault) = facts.read_fault {
-        fault.write_python_with_damage_flags(&result)?;
-    }
-    if facts.archive_like && facts.detected_ext == ".zip" {
-        let header = inspect_zip_local_header(py, path, facts.archive_offset as i64)?;
-        let plausible = header
-            .bind(py)
-            .get_item("plausible")?
-            .and_then(|v| v.extract::<bool>().ok())
-            .unwrap_or(false);
-        result.set_item("zip_local_header", header)?;
-        evidence.append(if plausible {
-            "zip_local_header:plausible"
-        } else {
-            "zip_local_header:implausible"
-        })?;
-        if !plausible {
-            result.set_item("confidence", "medium")?;
-        }
-    }
-    Ok(result.unbind())
-}
-
-fn empty_result<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict>> {
-    let result = PyDict::new(py);
-    result.set_item("is_pe", false)?;
-    result.set_item("has_overlay", false)?;
-    result.set_item("archive_like", false)?;
-    result.set_item("error", error)?;
-    for key in [
-        "pe_header_offset",
-        "section_count",
-        "overlay_offset",
-        "overlay_size",
-        "archive_offset",
-        "offset_delta_from_overlay",
-    ] {
-        result.set_item(key, 0)?;
-    }
-    result.set_item("format", "")?;
-    result.set_item("detected_ext", "")?;
-    result.set_item("confidence", "none")?;
-    result.set_item("evidence", PyList::empty(py))?;
-    result.set_item("zip_local_header", PyDict::new(py))?;
-    Ok(result)
-}
-
-fn find_archive_magic(sample: &[u8]) -> Option<(&'static str, &'static str, usize)> {
-    let mut best: Option<(&'static str, &'static str, usize)> = None;
+fn find_archive_magic(sample: &[u8]) -> Option<(&'static str, usize)> {
+    let mut best: Option<(&'static str, usize)> = None;
     static MATCHERS: OnceLock<[memmem::Finder<'static>; ARCHIVE_MAGICS.len()]> = OnceLock::new();
     let matchers =
-        MATCHERS.get_or_init(|| ARCHIVE_MAGICS.map(|(magic, _, _)| memmem::Finder::new(magic)));
-    for ((_, archive_format, detected_ext), matcher) in ARCHIVE_MAGICS.iter().zip(matchers) {
+        MATCHERS.get_or_init(|| ARCHIVE_MAGICS.map(|(magic, _)| memmem::Finder::new(magic)));
+    for ((_, archive_format), matcher) in ARCHIVE_MAGICS.iter().zip(matchers) {
         let Some(index) = matcher.find(sample) else {
             continue;
         };
-        if best.is_none_or(|(_, _, best_index)| index < best_index) {
-            best = Some((*archive_format, *detected_ext, index));
+        if best.is_none_or(|(_, best_index)| index < best_index) {
+            best = Some((*archive_format, index));
         }
     }
     if let Some(offset) = memchr::memmem::find_iter(sample, b"\x2a\x4d\x18")
         .filter_map(|offset| offset.checked_sub(1))
         .find(|offset| (0x50..=0x5f).contains(&sample[*offset]))
     {
-        if best.is_none_or(|(_, _, best_index)| offset < best_index) {
-            best = Some(("lz4", ".lz4", offset));
+        if best.is_none_or(|(_, best_index)| offset < best_index) {
+            best = Some(("lz4", offset));
         }
     }
     best

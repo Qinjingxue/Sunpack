@@ -30,7 +30,6 @@ from sunpack.core.contracts.retry_targets import (
 )
 from sunpack.core.contracts.results import RunSummary
 from sunpack.core.contracts.run_state import RunState
-from sunpack.core.passwords import dedupe_passwords
 from sunpack.core.support.collections import dedupe_values
 from sunpack.core.support.filesystem_scan_errors import is_filesystem_scan_failure
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions

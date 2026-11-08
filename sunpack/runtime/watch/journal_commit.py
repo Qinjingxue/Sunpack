@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import atexit
-from typing import Any, Callable
+from typing import Callable
 
 from sunpack_native import (
     NativeWatchOperations,
     watch_journal_flush_all as _native_flush_all,
     watch_journal_request_flush as _native_request_flush,
     watch_journal_seed as _native_seed,
-    watch_journal_open as open_state_stream,
-    watch_journal_stats as _native_stats,
     watch_journal_submit_append as _native_submit_append,
     watch_journal_submit_seal as _native_submit_seal,
 )
@@ -107,10 +105,6 @@ def submit_stream_flush(
 
 def seed_state_stream(*, stream: str, seq: int) -> None:
     _native_seed(str(stream), int(seq))
-
-
-def journal_stats(stream: str) -> dict[str, Any]:
-    return dict(_native_stats(str(stream)))
 
 
 def _flush_at_exit() -> None:

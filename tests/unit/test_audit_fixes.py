@@ -1,7 +1,6 @@
 """Physical generations, password cache replacement, and legal dot-dot names."""
 import os
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import sunpack_native
@@ -100,10 +99,10 @@ def test_password_cache_uses_each_physical_generation(tmp_path, replace, source,
     original = get_archive_session(str(changed))
     assert original.read_at(0, 4) == b"old!"
     if replace == "event":
-        token = sunpack_native.file_generation_tokens([str(changed)])[0]
+        token = original.generation_token
         with preserve_file_times(changed):
             changed.write_bytes(b"new!")
-        assert sunpack_native.file_generation_tokens([str(changed)])[0] == token
+        assert get_archive_session(str(changed)).generation_token == token
         catalog.remember_observation(str(changed), stamp.st_size, stamp.st_mtime, "same-file", 11)
     else:
         _change(changed, replace)
@@ -114,19 +113,6 @@ def test_password_cache_uses_each_physical_generation(tmp_path, replace, source,
     result = scheduler.plan_for_extraction(PasswordJob(str(main), part_paths=parts, archive_input=descriptor, candidates=["new-password"]))
     assert result.password == "new-password"
     assert verifier.calls == calls + 1
-
-
-def test_generation_snapshots_are_metadata_only_and_batch_safe(tmp_path):
-    path = tmp_path / "source.dat"
-    _write(path)
-    before = dict(sunpack_native.reader_cache_stats())
-    expected = sunpack_native.file_generation_tokens([str(path), str(tmp_path / "missing")])
-    assert expected[0] and expected[1] is None
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        rows = list(pool.map(lambda _: sunpack_native.file_generation_tokens([str(path)]), range(32)))
-    assert all(row == expected[:1] for row in rows)
-    after = dict(sunpack_native.reader_cache_stats())
-    assert before == after
 
 
 def test_password_cache_revalidates_real_encrypted_replacement(tmp_path):
@@ -167,7 +153,7 @@ def test_dotdot_prefix_is_inside_nested_scan_scope(tmp_path, name, monkeypatch):
     session = DiscoveryScanSession(scope=DiscoveryScope(str(tmp_path), recursive=True))
     session.set_scan_roots([str(tmp_path)])
     assert safe_relative_path(path, tmp_path) == os.path.normpath(name)
-    assert session.is_within_scan_scope(str(path))
+    assert session.scope_for(str(path)).contains(str(path))
     session.snapshot_for_directory = lambda _root: type("Snapshot", (), {"raw_native_snapshot": None})()
     monkeypatch.setattr("sunpack.pipeline.coordinator.recursive_authorization._NATIVE_AUTHORIZE_NESTED_CANDIDATES", lambda *args: [{"allowed": True}])
     result = RecursiveAuthorization({}).authorize_batch([task], [str(tmp_path)], session, depth=2)

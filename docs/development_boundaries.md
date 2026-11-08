@@ -52,7 +52,7 @@ sunpack.runtime.watch
 | ---- | -------- | ---- |
 | CLI | `sunpack.runtime.cli.cli.main` | Command-line entry point. |
 | GUI | `sunpack.runtime.gui.main.main` | Console-less tray entry point. |
-| Watch | `sunpack.runtime.watch.runtime.run_watch_service` | Long-running Watch service entry point. |
+| Watch | `sunpack.runtime.cli.runtime_host.RuntimeHost.start_watch` | Long-running Watch service entry point. |
 | Configuration | `sunpack.core.config.loader.load_config` / `sunpack.core.config.schema` | Configuration loading and normalization. |
 | Application configuration checks | `sunpack.runtime.config_validation.validate_config_payload` | Checks config against registered pipeline capabilities. |
 | Contracts | `sunpack.core.contracts.*` | Shared data structures, including `RunState` and `RunSummary`. |

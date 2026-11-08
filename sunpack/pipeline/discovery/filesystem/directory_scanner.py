@@ -1,243 +1,52 @@
-from pathlib import Path
+from sunpack_native import NativeDirectoryScanOptions
 
-from sunpack.core.support.path_keys import case_key
-from sunpack_native import (
-    NativeDirectoryScanOptions,
-    filter_inventory_file_indices as _NATIVE_FILTER_INVENTORY_FILE_INDICES,
-    relations_apply_split_size_anchors as _NATIVE_APPLY_SPLIT_SIZE_ANCHORS,
-)
-
-from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+from sunpack.core.config.detection_view import scan_filters_config
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
-from sunpack.pipeline.discovery.filesystem.filters import build_filters
-from sunpack.pipeline.discovery.filesystem.filters.base import ScanCandidate, ScanFilter
-from sunpack.pipeline.discovery.filesystem.filters.path_rule import PathRuleScanFilter
+from sunpack.core.contracts.filesystem import DirectorySnapshot
+from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import time_bounds
+from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import size_bounds
+from sunpack.pipeline.discovery.filesystem.filters.path_rule import compile_path_rule
+
+
+def native_filter_options(config: dict | None) -> dict:
+    options = {
+        "blacklist_rules": [],
+        "size_ranges": [],
+        "mtime_ranges": [],
+        "whitelist_rules": [],
+    }
+    for item in scan_filters_config(config) if config else ():
+        if not item["enabled"]:
+            continue
+        name = item["name"]
+        if name in ("blacklist", "whitelist"):
+            options[f"{name}_rules"].append(compile_path_rule(item))
+        elif name == "size_range":
+            options["size_ranges"].append(size_bounds(item))
+        elif name == "mtime_range":
+            options["mtime_ranges"].append(time_bounds(item))
+        else:
+            raise ValueError(f"Unknown filesystem scan filter: {name}")
+    return options
 
 
 class DirectoryScanner:
-    def __init__(self, root_path: str, filters: list[ScanFilter] | None = None, config: dict | None = None, scope: DiscoveryScope | None = None):
-        self.root_path = Path(root_path)
-        self.config = config or {}
-        self._custom_filters = filters is not None
-        self.scope = scope or DiscoveryScope(str(self.root_path))
-        self.filters = list(filters) if filters is not None else build_filters(config)
+    def __init__(
+        self, root_path: str, *, config: dict | None = None,
+        scope: DiscoveryScope | None = None, scan_options: NativeDirectoryScanOptions | None = None,
+    ):
+        self.scope = scope or DiscoveryScope(root_path)
+        self._scan_options = scan_options if scan_options is not None else self.compile_scan_options(config)
 
     def scan(self) -> DirectorySnapshot:
-        return self._scan_native()
+        return DirectorySnapshot(*self._scan_options.scan_scope(self.scope.native))
 
-    @classmethod
-    def snapshot_from_entries(
-        cls,
-        root_path: str,
-        entries: list[FileEntry],
-        *,
-        config: dict | None = None,
-        start_filter: str | None = None,
-        stop_before_filter: str | None = None,
-        raw_entries: list[FileEntry] | None = None,
-    ) -> DirectorySnapshot:
-        """Apply the normal ordered filters to an already collected file table."""
-        scanner = cls(root_path, config=config)
-        return DirectorySnapshot.from_entries(
-            root_path=scanner.root_path,
-            entries=scanner._apply_ordered_filters(
-                list(entries),
-                start_filter=start_filter,
-                stop_before_filter=stop_before_filter,
-            ),
-            raw_entries=raw_entries,
-        )
+    @staticmethod
+    def compile_scan_options(config: dict | None = None) -> NativeDirectoryScanOptions:
+        return NativeDirectoryScanOptions(**native_filter_options(config))
 
-    @classmethod
-    def inventory_file_indices(
-        cls,
-        root_path: str,
-        paths: list[str],
-        sizes: list[int],
-        *,
-        config: dict | None = None,
-    ) -> list[int]:
-        scanner = cls(root_path, config=config)
-        options = scanner._native_filter_options()
-        if options is None:
-            return list(range(len(paths)))
-        return list(_NATIVE_FILTER_INVENTORY_FILE_INDICES(
-            str(scanner.root_path),
-            paths,
-            sizes,
-            options["blacklist_rules"],
-            options["size_ranges"],
-            options["whitelist_rules"],
-        ))
-
-    @classmethod
-    def compile_scan_options(cls, config: dict | None = None):
-        options = cls(".", config=config)._native_filter_options()
-        if options is None:
-            raise RuntimeError("Native directory scan requires built-in filesystem filters only")
-        return NativeDirectoryScanOptions(**options)
-
-    @classmethod
+    @staticmethod
     def snapshot_from_output_inventory(
-        cls,
-        root_path: str,
-        inventory,
-        *,
-        config: dict | None = None,
-        scan_options=None,
-    ) -> DirectorySnapshot | None:
-        if scan_options is None:
-            scan_options = cls.compile_scan_options(config)
-        native_snapshot, raw_native_snapshot = inventory.build_directory_snapshots(scan_options)
-        return DirectorySnapshot.from_native(Path(root_path), native_snapshot, raw_native_snapshot)
-
-    def _scan_native(self) -> DirectorySnapshot | None:
-        options = self._native_filter_options()
-        if options is None:
-            raise RuntimeError("Native directory scan requires built-in filesystem filters only")
-        native_snapshot, raw_native_snapshot = NativeDirectoryScanOptions(**options).scan_scope(self.scope.native)
-        root_path = self.root_path.parent if self.root_path.is_file() else self.root_path
-        return DirectorySnapshot.from_native(root_path, native_snapshot, raw_native_snapshot)
-
-    def _native_filter_options(self) -> dict | None:
-        if self._custom_filters:
-            return None
-
-        blacklist_rules = []
-        size_ranges: list[tuple] = []
-        mtime_ranges: list[tuple] = []
-        whitelist_rules = []
-        for scan_filter in self.filters:
-            name = getattr(scan_filter, "name", "")
-            stage = getattr(scan_filter, "stage", "")
-            if name == "blacklist" and stage == "path":
-                blacklist_rules.append(scan_filter.native_rule)
-                continue
-            if name == "size_range" and stage == "size":
-                value_range = getattr(scan_filter, "value_range", None)
-                if value_range is None:
-                    return None
-                size_ranges.append(_numeric_range_tuple(value_range))
-                continue
-            if name == "whitelist":
-                whitelist_rules.append(scan_filter.native_rule)
-                continue
-            if name == "mtime_range":
-                value_range = getattr(scan_filter, "value_range", None)
-                if value_range is None:
-                    return None
-                mtime_ranges.append(_numeric_range_tuple(value_range))
-                continue
-            return None
-
-        return {
-            "blacklist_rules": blacklist_rules,
-            "size_ranges": size_ranges,
-            "mtime_ranges": mtime_ranges,
-            "whitelist_rules": whitelist_rules,
-        }
-
-    def _apply_ordered_filters(
-        self,
-        entries: list[FileEntry],
-        *,
-        start_filter: str | None = None,
-        stop_before_filter: str | None = None,
-    ) -> list[FileEntry]:
-        if not self.filters:
-            return entries
-
-        current = entries
-        started = start_filter is None
-        for scan_filter in self.filters:
-            name = getattr(scan_filter, "name", "")
-            if not started:
-                if name != start_filter:
-                    continue
-                started = True
-            if stop_before_filter is not None and name == stop_before_filter:
-                break
-            current = (
-                _apply_size_filter_with_split_anchors(current, scan_filter)
-                if name == "size_range"
-                else apply_filter_to_entries(current, scan_filter, root_path=self.root_path)
-            )
-        return current
-
-def _apply_size_filter_with_split_anchors(
-    entries: list[FileEntry],
-    scan_filter: ScanFilter,
-) -> list[FileEntry]:
-    size_accepted: list[bool] = []
-    for entry in entries:
-        candidate = ScanCandidate(
-            path=entry.path,
-            kind="dir" if entry.is_dir else "file",
-            size=entry.size,
-            mtime_ns=entry.mtime_ns,
-            metadata=entry.metadata,
-        )
-        size_accepted.append(not scan_filter.evaluate(candidate).reject_entry)
-    keep = _NATIVE_APPLY_SPLIT_SIZE_ANCHORS(
-        [str(entry.path) for entry in entries],
-        size_accepted,
-    )
-    return [
-        entry
-        for entry, accepted in zip(entries, keep)
-        if accepted
-    ]
-
-
-def apply_filter_to_entries(
-    entries: list[FileEntry], scan_filter: ScanFilter, *, root_path: Path | None = None,
-) -> list[FileEntry]:
-    if isinstance(scan_filter, PathRuleScanFilter):
-        indices = scan_filter.native_rule.accepted_indices(
-            str(root_path) if root_path is not None else None,
-            [str(entry.path) for entry in entries],
-            [entry.is_dir for entry in entries],
-            scan_filter.whitelist,
-        )
-        return [entries[index] for index in indices]
-    kept: list[FileEntry] = []
-    pruned_dir_keys: set[str] = set()
-    for entry in sorted(entries, key=lambda item: (len(item.path.parts), str(item.path).lower())):
-        if _under_any_key(entry.path, pruned_dir_keys):
-            continue
-        decision = scan_filter.evaluate(ScanCandidate(
-            path=entry.path,
-            kind="dir" if entry.is_dir else "file",
-            size=entry.size,
-            mtime_ns=entry.mtime_ns,
-            metadata=entry.metadata,
-            root_path=root_path,
-        ))
-        if decision.prune_dir and entry.is_dir:
-            pruned_dir_keys.add(_path_key(entry.path))
-        if decision.reject_entry:
-            continue
-        kept.append(entry)
-    return kept
-
-
-def _under_any_key(path: Path, parent_keys: set[str]) -> bool:
-    if not parent_keys:
-        return False
-    current = path.parent
-    while current != current.parent:
-        if _path_key(current) in parent_keys:
-            return True
-        current = current.parent
-    return _path_key(current) in parent_keys
-
-
-def _path_key(path: Path) -> str:
-    return case_key(path).replace("\\", "/").rstrip("/")
-
-
-def _numeric_range_tuple(value_range) -> tuple:
-    return tuple(
-        getattr(value_range, field, None)
-        for field in ("gt", "gte", "lt", "lte", "eq")
-    )
+        inventory, *, scan_options: NativeDirectoryScanOptions,
+    ) -> DirectorySnapshot:
+        return DirectorySnapshot(*inventory.build_directory_snapshots(scan_options))

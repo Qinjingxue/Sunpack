@@ -10,7 +10,7 @@ import pytest
 
 from sunpack.core.config.loader import load_config
 from sunpack.core.config.schema import normalize_config
-from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+from tests.helpers.directory_snapshot import FileEntry, make_snapshot
 from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.core.passwords.internal.store import PasswordStore
 from tests.helpers.async_batch import run_extract
@@ -816,7 +816,7 @@ def test_structure_resolution_keeps_each_cross_directory_head_as_an_attempt_plan
         FileEntry(path=path, is_dir=False, size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
         for path in [*first_parts, foreign_first]
     ]
-    snapshot = DirectorySnapshot.from_entries(scan_root, entries)
+    snapshot = make_snapshot(entries)
     groups = scheduler.build_candidate_groups(snapshot)
     assert {path for group in groups for path in group.input_paths} == set(all_paths)
     ambiguous = [group for group in groups

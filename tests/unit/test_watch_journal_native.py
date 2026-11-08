@@ -2,9 +2,9 @@ from types import SimpleNamespace
 import gc
 import weakref
 
-from sunpack_native import watch_journal_flush_all, watch_journal_request_flush
+import pytest
 
-from sunpack.runtime.watch.journal_commit import journal_stats
+from sunpack_native import watch_journal_flush_all, watch_journal_request_flush
 from sunpack.runtime.watch.state import WatchStateStore
 
 
@@ -27,27 +27,10 @@ def test_durable_frontier_covers_prior_nondurable_writes(tmp_path):
     state.queue_active(first, durable=False)
     state.queue_active(second, durable=True)
 
-    stats = journal_stats(state._writer_stream)
-    assert stats["written_seq"] >= state.applied_seq
-    assert stats["durable_seq"] >= state.applied_seq
     assert {item.path for item in WatchStateStore(str(state_path)).pending_work_items()} == {
         first.path,
         second.path,
     }
-
-
-def test_clean_explicit_flush_does_not_repeat_physical_sync(tmp_path):
-    state = WatchStateStore(str(tmp_path / "state.snapshot"))
-    state.queue_active(_candidate(tmp_path / "queued.zip", 1), durable=False)
-    state.flush()
-    first = journal_stats(state._writer_stream)
-
-    state.flush()
-    second = journal_stats(state._writer_stream)
-
-    assert second["durable_seq"] >= state.applied_seq
-    assert second["flush_calls"] == first["flush_calls"]
-    assert second["flush_rounds"] == first["flush_rounds"]
 
 
 def test_last_stream_owner_releases_resources_and_old_tickets_survive_reopen(tmp_path):
@@ -62,14 +45,13 @@ def test_last_stream_owner_releases_resources_and_old_tickets_survive_reopen(tmp
         coordinator = weakref.ref(first._path_coordinator)
         ticket = watch_journal_request_flush(first._writer_stream, first.applied_seq)
         first.close()
-        assert journal_stats(second._writer_stream)["owners"] == 1
         second.queue_active(_candidate(tmp_path / f"other-{index}.zip", index + 10), durable=False)
         stream = second._writer_stream
         second.close()
         second.close()
         assert coordinator() is None
-        assert not journal_stats(stream)["registered"]
-        assert journal_stats(stream)["segments"] == 0
+        with pytest.raises(RuntimeError, match="stream is unavailable"):
+            watch_journal_request_flush(stream, 0)
         # Reopening starts a new stream; old tickets still observe their own
         # completed durable frontier and do not wait on the new incarnation.
         reopened = WatchStateStore(str(path))
@@ -85,4 +67,5 @@ def test_last_stream_owner_releases_resources_and_old_tickets_survive_reopen(tmp
         successor.close()
         watch_journal_flush_all()
         assert owner() is None
-        assert not journal_stats(stream)["registered"]
+        with pytest.raises(RuntimeError, match="stream is unavailable"):
+            watch_journal_request_flush(stream, 0)

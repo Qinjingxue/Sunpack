@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+from tests.helpers.directory_snapshot import FileEntry, make_snapshot
 from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.relation_prober import RelationsPasswordProber
 from sunpack.pipeline.discovery.relations.scheduler import RelationsScheduler
@@ -53,7 +53,7 @@ def _snapshot(root, paths):
         FileEntry(path=os.path.join(root, name), is_dir=False, size=os.path.getsize(os.path.join(root, name)))
         for name in paths
     ]
-    return DirectorySnapshot.from_entries(os.path.abspath(root), entries)
+    return make_snapshot(entries)
 
 
 def test_ambiguous_encrypted_probe_is_terminal_damage_instead_of_a_watch_volume_blocker(tmp_path, monkeypatch):

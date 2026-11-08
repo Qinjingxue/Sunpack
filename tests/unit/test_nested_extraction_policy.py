@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from sunpack.core.config.fields.coordinator import normalize_recursive_authorization
-from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+from tests.helpers.directory_snapshot import FileEntry, make_snapshot
 from sunpack.pipeline.coordinator.recursive_authorization import RecursiveAuthorization
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_scan import direct_file_task
@@ -22,7 +22,7 @@ def _config(**overrides):
 
 
 def _authorize(root: Path, entries: list[FileEntry], archives: list[Path], *, depth=2):
-    snapshot = DirectorySnapshot.from_entries(root, entries, raw_entries=entries)
+    snapshot = make_snapshot(entries)
     session = DiscoveryScanSession(config=_config())
     session.prime_snapshot(str(root), snapshot)
     tasks = [direct_file_task(str(path)) for path in archives]

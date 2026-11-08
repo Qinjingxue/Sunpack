@@ -283,9 +283,8 @@ def test_completed_family_cache_waits_for_watch_callbacks_and_foreground(tmp_pat
 
 
 def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_path):
-    from sunpack_native import reader_cache_stats
+    from sunpack_native import reader_cache_stats, watch_journal_request_flush
     from sunpack.pipeline.coordinator.engine import PipelineEngine
-    from sunpack.runtime.watch.journal_commit import journal_stats
 
     # Existing one-shot clears cannot detect per-file retention across completed
     # batches. Exercise real detection/extraction with disguised retained ZIPs.
@@ -338,7 +337,8 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
                 watcher.notify_path_departed(str(source))
             assert watcher._catalog.memory_stats()["observations"] == 0
             await watcher.aclose()
-            assert not journal_stats(watcher.state._writer_stream)["registered"]
+            with pytest.raises(RuntimeError, match="stream is unavailable"):
+                watch_journal_request_flush(watcher.state._writer_stream, 0)
 
     asyncio.run(scenario())
 

@@ -146,7 +146,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
     catch(...) {
         std::cerr<<"UI wait diagnostic ["<<phase<<"]";
         for(const char* key:{"tab","language","taskQuery","directorySelection","taskStatus","taskPending","taskCursors","requests","dispatch",
-                             "errors","logPath","actionError","busy","lastCommand",
+                             "errors","actionError","busy",
                              "saving","pendingFields","saveErrors","drafts","tagInputs"}) {
             try { std::cerr<<" "<<key<<"="<<state(app.page(),key).dump(); }
             catch(const std::exception& e) { std::cerr<<" "<<key<<"=<unavailable: "<<e.what()<<">"; }
@@ -158,9 +158,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
         } catch(const std::exception& e) { std::cerr<<" tasks=<unavailable: "<<e.what()<<">"; }
         try {
             Json cursors=Json::array(); for(auto& page:state(app.page(),"taskPages")) cursors.push_back(page["cursor"]);
-            EventLog disk; disk.set_path(wide(state(app.page(),"logPath").get<std::string>())); disk.refresh();
-            auto fresh=disk.query({},{});
-            std::cerr<<" windowCursors="<<cursors<<" diskRows="<<fresh["rows"].size()<<" diskFirst="<<(fresh["rows"].empty()?Json():fresh["rows"][0]["name"]);
+            std::cerr<<" windowCursors="<<cursors;
         } catch(...) {}
         std::cerr<<'\n';
         throw;
@@ -2239,12 +2237,12 @@ int wmain(int argc,wchar_t** argv) {
             assert(directory_bounds.left>=navigation_bounds.left && directory_bounds.right<=navigation_bounds.right);
             assert(task_bounds.left>=navigation_bounds.right);
             click(app,"watchStart");
-            pump_diagnostic(app,[&]{return state(app.page(),"lastCommand").value("action",std::string())=="start";},"Watch start command");
-            assert(read_json(dir/"cli-arguments.json")==Json::array({"watch","start"}));
+            pump_diagnostic(app,[&]{return state(app.page(),"busy")==false &&
+                read_json(dir/"cli-arguments.json")==Json::array({"watch","start"});},"Watch start command");
             assert(state(app.page(),"actionError")=="");
             pump_diagnostic(app,[&]{return state(app.page(),"runtime")["known"]==true;},"Runtime status");
             assert(!ui_widget_find_by_id(ui_page_root(app.page()),"refresh"));
-            auto stable_commands=[&](const char* id,const std::string& action,const Json& args) {
+            auto stable_commands=[&](const char* id,const Json& args) {
                 auto tab=state(app.page(),"tab").get<std::string>();
                 auto page=ui_widget_find_by_id(ui_page_root(app.page()),("page-"+tab).c_str());
                 auto rect=ui_widget_get_rect(page);
@@ -2263,7 +2261,7 @@ int wmain(int argc,wchar_t** argv) {
                     throw std::runtime_error("Command changed page visibility");
                 }
                 SetEvent(gate);
-                pump_diagnostic(app,[&]{return state(app.page(),"lastCommand").value("action",std::string())==action && state(app.page(),"busy")==false;},"CLI command completion");
+                pump_diagnostic(app,[&]{return state(app.page(),"busy")==false;},"CLI command completion");
                 assert(read_json(dir/"cli-arguments.json")==args);
                 assert(state(app.page(),"actionError")=="");
                 auto after=ui_widget_get_rect(page);
@@ -2274,11 +2272,11 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"tabPasswords"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="passwords";},"Navigate to passwords");
             settle_motion(app);
             assert(rect(app,"monitorControls").top==monitor_bounds.top);
-            stable_commands("watchStop","stop",Json::array({"watch","stop"}));
+            stable_commands("watchStop",Json::array({"watch","stop"}));
             click(app,"tabConfig"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="config";},"Navigate to settings");
             settle_motion(app);
             assert(rect(app,"monitorControls").top==monitor_bounds.top);
-            stable_commands("watchStart","start",Json::array({"watch","start"}));
+            stable_commands("watchStart",Json::array({"watch","start"}));
             click(app,"tabConfig"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="config";},"Navigate to settings");
             auto content=ui_widget_find_by_id(ui_page_root(app.page()),"page-config");
             assert(content && ui_widget_get_opacity(content)>0); // No blank incoming frame.
@@ -2310,13 +2308,11 @@ int wmain(int argc,wchar_t** argv) {
                 assert(indicator->animationY>0);
             }
             assert(!ui_widget_find_by_id(ui_page_root(app.page()),"watchReload"));
-            auto startup_enabled=state(app.page(),"startup")["enabled"].get<bool>();
-            stable_commands("startupToggle",startup_enabled?"startupDisable":"startupEnable",Json::array({"watch","startup",startup_enabled?"disable":"enable"}));
-            auto alternate=Json{{"enabled",!startup_enabled},{"command",""}}.dump();
-            ui_page_set_json(app.page(),"startup",alternate.c_str());
-            stable_commands("startupToggle",startup_enabled?"startupEnable":"startupDisable",Json::array({"watch","startup",startup_enabled?"enable":"disable"}));
-            auto original_startup=Json{{"enabled",startup_enabled},{"command",""}}.dump();
-            ui_page_set_json(app.page(),"startup",original_startup.c_str());
+            auto startup_enabled=state(app.page(),"startupEnabled").get<bool>();
+            stable_commands("startupToggle",Json::array({"watch","startup",startup_enabled?"disable":"enable"}));
+            ui_page_set_bool(app.page(),"startupEnabled",!startup_enabled);
+            stable_commands("startupToggle",Json::array({"watch","startup",startup_enabled?"enable":"disable"}));
+            ui_page_set_bool(app.page(),"startupEnabled",startup_enabled);
             std::cerr<<"Configuration view mounted\n";
             auto selector_host=ui_widget_find_by_id(ui_page_root(app.page()),"choice-/runtime/process_mode");
             char* selector_tree=ui_debug_dump_widget(selector_host); assert(selector_tree);
@@ -2836,8 +2832,7 @@ int wmain(int argc,wchar_t** argv) {
             publish_events(dir/".sunpack_watch"/"events.json",Json({{"event","done"},{"path",utf8((dir/"other.fake").wstring())}}).dump()+"\n");
             atomic_write(dir/"sunpack_config.json",R"({"watch":{"toast_enabled":true}})");
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["name"]=="other.fake";}); }
-            catch(...) { std::cerr<<"Updated default log: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<" log="<<state(app.page(),"logPath")<<" fields="<<state(app.page(),"fields")<<"\n"; throw; }
-            assert(state(app.page(),"logPath")==utf8((dir/".sunpack_watch"/"events.json").wstring()));
+            catch(...) { std::cerr<<"Updated default log: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<" fields="<<state(app.page(),"fields")<<"\n"; throw; }
             // Exercise an ordinary config containing all advanced settings.
             auto complete=parse_json(kUiDefaultsJson);
             atomic_write(dir/"sunpack_config.json",complete.dump());

@@ -96,7 +96,7 @@ def test_independent_file_requests_keep_full_context_and_observe_disguised_volum
         # Inspect the context actually used for this request. Asking for a new
         # full snapshot here could hide a prematurely narrowed discovery scan.
         snapshot = next(iter(session._snapshots.values()))
-        paths = {Path(path) for path, _size, _mtime in snapshot.iter_file_columns()}
+        paths = {Path(path) for path, _size, _mtime in zip(*snapshot.native_snapshot.file_columns())}
         assert unrelated in paths
         assert candidates
         return candidates[0], paths
@@ -123,7 +123,7 @@ def test_independent_file_requests_keep_full_context_and_observe_disguised_volum
     final_session = DiscoveryScanSession(config=config, scope=DiscoveryScope(str(tmp_path), recursive=True))
     final = build_candidates_for_targets([str(first)], session=final_session)[0]
     assert final.archive_input.part_paths() == [str(first)]
-    anchors = next(iter(final_session._snapshots.values())).iter_relation_anchor_rows()
+    anchors = next(iter(final_session._snapshots.values())).native_snapshot.relation_anchor_rows()
     assert all(Path(path) != unrelated for path, _size, _anchor in anchors)
 
 

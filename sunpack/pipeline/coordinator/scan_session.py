@@ -34,6 +34,7 @@ class DiscoveryScanSession:
             self._scopes[path_key(scope.root)] = scope
         self.relations = relations or RelationsScheduler(self.config)
         self._snapshots: dict[str, DirectorySnapshot] = {}
+        self._scan_options = None
         self._scan_errors: DirectoryErrorReport | None = None
 
     def add_scan_errors(self, errors: Iterable[tuple[str, str, str]]) -> None:
@@ -64,9 +65,6 @@ class DiscoveryScanSession:
         self._snapshots[path_key(directory)] = snapshot
         self._scopes[path_key(directory)] = DiscoveryScope(directory, recursive=True)
 
-    def is_within_scan_scope(self, path: str) -> bool:
-        return not self._scopes or any(scope.contains(path) for scope in self._scopes.values())
-
     def scope_for(self, path: str) -> DiscoveryScope:
         if self.scope is not None:
             return self.scope
@@ -90,13 +88,14 @@ class DiscoveryScanSession:
         if key not in self._snapshots and self.catalog is not None:
             state, options, seed = self.catalog
             filtered, raw = options.catalog_snapshot(state, self.scope.native, seed)
-            from pathlib import Path
-            self._snapshots[key] = DirectorySnapshot.from_native(Path(self.scope.root), filtered, raw)
+            self._snapshots[key] = DirectorySnapshot(filtered, raw)
         if key not in self._snapshots:
+            if self._scan_options is None:
+                self._scan_options = DirectoryScanner.compile_scan_options(self.config)
             self._snapshots[key] = DirectoryScanner(
                 scope.root,
-                config=self.config,
                 scope=scope,
+                scan_options=self._scan_options,
             ).scan()
             self.add_scan_errors(self._snapshots[key].native_snapshot.scan_errors())
         return self._snapshots[key]

@@ -4,7 +4,6 @@ from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 import pytest
 
 from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
-from sunpack.core.contracts.filesystem import DirectorySnapshot
 from sunpack.pipeline.coordinator.output_scan_policy import (
     NestedOutputScanPolicy as OutputScanPolicy,
 )
@@ -18,28 +17,6 @@ from tests.helpers.worker_events import worker_result
 
 def _config():
     return make_config(with_detection_pipeline())
-
-
-def test_output_scan_policy_parent_roots_bypass_file_column_materialization(tmp_path, monkeypatch):
-    first_dir = tmp_path / "one"
-    second_dir = tmp_path / "two"
-    first_dir.mkdir()
-    second_dir.mkdir()
-    (first_dir / "a.bin").write_bytes(b"a")
-    (second_dir / "b.bin").write_bytes(b"b")
-
-    monkeypatch.setattr(
-        DirectorySnapshot,
-        "iter_file_columns",
-        lambda _self: (_ for _ in ()).throw(
-            AssertionError("parent-root projection must stay in native code")
-        ),
-    )
-
-    policy = OutputScanPolicy(_config())
-    roots = policy._candidate_parent_roots(str(tmp_path))
-
-    assert set(roots) == {str(first_dir.resolve()), str(second_dir.resolve())}
 
 
 def test_output_scan_policy_projects_each_confirmed_embedded_segment(tmp_path):
@@ -139,7 +116,7 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch, h
     assert [candidate.entry_path for candidate in candidates] == [str(nested.resolve())]
 
 
-def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, monkeypatch):
+def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path):
     archive = tmp_path / "nested.bin"
     payload = make_minimal_7z()
     archive.write_bytes(payload)
@@ -156,15 +133,6 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
         },
     )
     inventory = collect_output_inventory(str(tmp_path), result)
-    monkeypatch.setattr(
-        "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.inventory_file_indices",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python inventory filtering must be bypassed")),
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.snapshot_from_entries",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python snapshot rebuilding must be bypassed")),
-    )
-
     # Test the snapshot used by real discovery after the source disappears;
     # a separate file-head cache could pass while that snapshot reopened files.
     archive.unlink()

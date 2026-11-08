@@ -543,6 +543,14 @@ void PageState::SetLocale(const std::string& locale) {
 void PageState::OnWidgetMount(const std::string& widgetId,
                                std::function<void(Widget*)> cb) {
     if (widgetId.empty()) return;
+    if (!cb) {
+        auto it = lifecycleHooks_.find(widgetId);
+        if (it != lifecycleHooks_.end()) {
+            if (it->second.onUnmount) it->second.onMount = {};
+            else lifecycleHooks_.erase(it);
+        }
+        return;
+    }
     lifecycleHooks_[widgetId].onMount = cb;
     // Fire immediately if a matching widget is already in the live tree.
     // Typical call order is `ui_page_load_* → ui_page_on_widget_mount →
@@ -550,7 +558,7 @@ void PageState::OnWidgetMount(const std::string& widgetId,
     // initial mount has long since happened — without this catch-up the
     // hook would only ever fire on later v-if / v-for rebuilds. Matches
     // Vue's `watchEffect(immediate)` semantics for "is currently mounted".
-    if (cb && page_.root) {
+    if (page_.root) {
         if (Widget* w = page_.root->FindById(widgetId)) {
             cb(w);
         }
@@ -560,7 +568,15 @@ void PageState::OnWidgetMount(const std::string& widgetId,
 void PageState::OnWidgetUnmount(const std::string& widgetId,
                                   std::function<void(Widget*)> cb) {
     if (widgetId.empty()) return;
-    lifecycleHooks_[widgetId].onUnmount = std::move(cb);
+    if (cb) {
+        lifecycleHooks_[widgetId].onUnmount = std::move(cb);
+        return;
+    }
+    auto it = lifecycleHooks_.find(widgetId);
+    if (it != lifecycleHooks_.end()) {
+        if (it->second.onMount) it->second.onUnmount = {};
+        else lifecycleHooks_.erase(it);
+    }
 }
 
 void PageState::DispatchMountHooks(Widget* root) {

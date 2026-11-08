@@ -1,7 +1,7 @@
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from pathlib import Path
 
-from sunpack.core.contracts.filesystem import FileEntry
+from tests.helpers.directory_snapshot import FileEntry, snapshot_rows
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from tests.helpers.config_factory import make_config
 
@@ -9,7 +9,7 @@ from tests.helpers.config_factory import make_config
 def _entries(snapshot):
     return [
         FileEntry(path=Path(path), is_dir=is_dir, size=size, mtime_ns=mtime_ns)
-        for path, is_dir, size, mtime_ns in snapshot.iter_columns()
+        for path, is_dir, size, mtime_ns in snapshot_rows(snapshot)
     ]
 
 
@@ -125,7 +125,6 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"opaque")
     paths = [str(root / name) for name in sorted(names)]
-    entries = [FileEntry(path=Path(path), is_dir=False, size=6) for path in paths]
     inventory = collect_output_inventory(str(root))
     scope = DiscoveryScope(str(root), recursive=True)
     def literal(value): return {"value": value, "regex": False}
@@ -199,7 +198,7 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
 
     def relative_files(snapshot):
         return {Path(path).relative_to(root).as_posix()
-                for path, is_dir, *_ in snapshot.iter_columns() if not is_dir}
+                for path, is_dir, *_ in snapshot_rows(snapshot) if not is_dir}
 
     def run_case(item):
         index, (filters, expected) = item
@@ -209,11 +208,8 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         assert relative_files(DirectoryScanner(str(root / "keep_12.zip"), config=config).scan()) == (
             expected & {"keep_12.zip"}
         )
-        assert relative_files(DirectoryScanner.snapshot_from_entries(str(root), entries, config=config)) == expected
-        indices = DirectoryScanner.inventory_file_indices(str(root), paths, [6] * len(paths), config=config)
-        assert {Path(paths[i]).relative_to(root).as_posix() for i in indices} == expected
         assert relative_files(DirectoryScanner.snapshot_from_output_inventory(
-            str(root), inventory, scan_options=options,
+            inventory, scan_options=options,
         )) == expected
         state = WatchStateStore(str(tmp_path / f"state-{index}"))
         catalog = NativeWatchCatalog(state._native)
@@ -235,68 +231,9 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         list(pool.map(run_case, enumerate(cases)))
 
 
-def test_regex_cache_pressure_keeps_concurrent_batch_results():
-    """The filesystem matrix never fills a lazy DFA cache. This small in-memory
-    batch catches lost matches during cache clearing/fallback and concurrent
-    reuse of one compiled rule, without directory or archive startup costs.
-    """
-    import random
-    from concurrent.futures import ThreadPoolExecutor
-    from sunpack_native import NativePathRule
-
-    rng = random.Random(20261101)
-    names = ["".join(rng.choice("01") for _ in range(64)) for _ in range(1024)]
-    paths = [f"C:/input/{name}" for name in names]
-    expected = [index for index, name in enumerate(names) if name[-19] == "1"]
-    rule = NativePathRule([], [], [], [{"value": r"\A[01]*1[01]{18}\z", "regex": True}])
-
-    def run(_):
-        assert rule.accepted_indices("C:/input", paths, [False] * len(paths), True) == expected
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(run, range(8)))
-
-
-def test_path_batch_reuse_follows_complete_ancestors_in_arbitrary_order():
-    """The tree matrix does not revisit shuffled ancestors within one scratch.
-
-    This batch catches sibling-prefix, inherited-match and root-reset leakage;
-    removing it leaves cache state transitions uncovered. Scalar comparisons
-    and a concurrent replay add that coverage without filesystem/probe costs.
-    """
-    import random
-    from concurrent.futures import ThreadPoolExecutor
-    from sunpack_native import NativePathRule
-
-    relatives = ["", "a", "ab", "a/keep", "a/keeper", "a/keep/deep",
-                 "a/other", "ab/keep", "中文/keep", "中文/keeper", "別/keep"]
-    rows = [(f"C:/input/{relative}/payload.001", False) for relative in relatives]
-    rows += [(f"C:/input/{relative}", True) for relative in relatives]
-    rows *= 3
-    random.Random(20261102).shuffle(rows)
-    rules = [
-        NativePathRule([{"value": value, "regex": regex}], [], [], [])
-        for value, regex in [("keep", False), ("a/keep", False), ("a/k??p", False),
-                             (r"\Aa/keep\z|\A中文/keep\z", True),
-                             (r"(?:\A|/)keep\z", True), (r"\A\z", True)]
-    ]
-
-    def run(_):
-        for rule in rules:
-            for whitelist in (False, True):
-                for root in ("C:/input", None):
-                    expected = [i for i, (path, is_dir) in enumerate(rows)
-                                if not rule.rejects(path, root or str(Path(path).parent), is_dir, whitelist)]
-                    assert rule.accepted_indices(root, [p for p, _ in rows],
-                                                 [d for _, d in rows], whitelist) == expected
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(run, range(4)))
-
-
 def test_filename_parts_use_the_last_dot_and_handle_absent_or_empty_extensions():
-    """The real tree cannot represent trailing dots on Windows. This native
-    batch adds those boundaries and checks all three selectors without IO.
+    """The real tree cannot represent trailing dots on Windows. The scalar native matcher
+    adds those boundaries and checks all three selectors without IO.
     """
     from sunpack_native import NativePathRule
 
@@ -322,5 +259,5 @@ def test_filename_parts_use_the_last_dot_and_handle_absent_or_empty_extensions()
     ]
     for fields, expected in cases:
         rule = NativePathRule(*(fields.get(field, []) for field in ("paths", "files", "extensions", "full_names")))
-        indices = rule.accepted_indices("C:/input", paths, [False] * len(paths), True)
-        assert {names[index] for index in indices} == expected
+        assert {name for name, path in zip(names, paths)
+                if not rule.rejects(path, "C:/input", False, True)} == expected

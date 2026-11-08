@@ -1,7 +1,6 @@
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable
 
@@ -25,24 +24,6 @@ class NestedOutputScanPolicy:
         self.config = config
         self._scan_options = None
         self._scan_options_lock = Lock()
-
-    def should_scan_output_dir(self, target_dir: str) -> bool:
-        return bool(self._candidate_parent_roots(target_dir))
-
-    def _candidate_parent_roots(
-        self,
-        target_dir: str,
-        inventory: OutputInventory | None = None,
-    ) -> list[str]:
-        # Output discovery is inherently recursive and must not inherit the
-        # user's initial directory-scan depth. Embedded segment extraction adds
-        # a child directory (for example embedded_00_rar), while the next round
-        # may intentionally remain current-directory-only.
-        if inventory is not None and inventory.stats.exists and inventory.stats.is_dir:
-            return list(inventory.parent_directories())
-
-        snapshot = self._scan_output(target_dir)
-        return [os.path.abspath(parent) for parent in snapshot.parent_directories()]
 
     def prepare_scan(
         self,
@@ -128,7 +109,6 @@ class NestedOutputScanPolicy:
         ):
             return None
         return DirectoryScanner.snapshot_from_output_inventory(
-            os.path.abspath(inventory.root),
             inventory,
             scan_options=self._compiled_scan_options(),
         )
@@ -141,5 +121,5 @@ class NestedOutputScanPolicy:
 
     def _scan_output(self, root: str) -> DirectorySnapshot:
         filtered, raw = self._compiled_scan_options().scan_scope(DiscoveryScope(root, recursive=True).native)
-        return DirectorySnapshot.from_native(Path(root), filtered, raw)
+        return DirectorySnapshot(filtered, raw)
 

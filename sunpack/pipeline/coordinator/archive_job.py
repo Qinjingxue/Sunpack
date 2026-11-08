@@ -15,7 +15,7 @@ from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.knowledge import write_extraction_result
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
-from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent, cleanup_output_for_retry
+from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
 
 from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
@@ -356,7 +356,7 @@ class ArchiveJobExecutor:
                     self._report_task_status(task, "resolving_volumes")
                     replacement = missing_volume_retry(task, current_outcome)
                     if isinstance(replacement, ArchiveTask):
-                        cleanup_output_for_retry(
+                        DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
                             result.out_dir,
                             event=OutputCleanupEvent.VERIFICATION_RETRY,
                             planned_output_dir=out_dir,

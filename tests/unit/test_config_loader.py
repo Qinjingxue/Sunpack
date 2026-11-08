@@ -377,13 +377,14 @@ def test_packaged_config_layers_program_data_simple_over_program_advanced(tmp_pa
         loader.clear_config_cache()
 
 
-def test_retired_verification_retry_config_is_accepted_but_discarded():
+@pytest.mark.parametrize("retired", [
+    {"max_retries": 99, "cleanup_failed_output": False, "retry_on_verification_failure": True},
+    {"complete_accept_threshold": 0, "partial_accept_threshold": 1},
+    {"methods": [{"name": "manifest_size_match", "file_count_abs_tolerance": 1}]},
+    {"methods": [{"name": "archive_test_crc", "max_reported_items": 100}]},
+])
+def test_verification_config_rejects_retired_fields(retired):
     from sunpack.core.config.fields.verification import normalize_verification_config
 
-    old = {**_verification_config(), "max_retries": 99,
-           "cleanup_failed_output": False,
-           "retry_on_verification_failure": True}
-    normalized = normalize_verification_config(old)
-    assert "max_retries" not in normalized
-    assert "cleanup_failed_output" not in normalized
-    assert "retry_on_verification_failure" not in normalized
+    with pytest.raises(ValueError, match="unknown fields"):
+        normalize_verification_config({**_verification_config(), **retired})

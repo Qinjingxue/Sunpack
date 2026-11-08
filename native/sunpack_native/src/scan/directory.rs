@@ -4,7 +4,6 @@ use pyo3::types::{PyBytes, PyDict};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -458,34 +457,6 @@ impl NativeOutputInventory {
         self.files.iter().all(|item| item.crc_ok != Some(false))
     }
 
-    fn parent_directories(&self) -> Vec<String> {
-        let root = Path::new(&self.root);
-        let mut seen = HashSet::new();
-        let mut directories = Vec::new();
-        for item in self.files.iter() {
-            let path = item
-                .abs_path
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    let relative = item.output_path.as_ref().unwrap_or(&item.path);
-                    root.join(relative)
-                });
-            if !path.starts_with(root) {
-                continue;
-            }
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let parent = path_to_string(parent);
-            let key = inventory_path_key(&parent);
-            if seen.insert(key) {
-                directories.push(parent);
-            }
-        }
-        directories
-    }
-
     fn build_directory_snapshots(
         &self,
         py: Python<'_>,
@@ -645,24 +616,6 @@ impl NativeDirectorySnapshot {
             mtimes_ns.push(self.table.mtimes_ns[row]);
         }
         (paths, sizes, mtimes_ns)
-    }
-
-    fn parent_directories(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut directories = Vec::new();
-        for &row in self.rows.iter() {
-            if self.table.is_dirs[row] {
-                continue;
-            }
-            let Some(parent) = Path::new(&self.table.paths[row]).parent() else {
-                continue;
-            };
-            let parent = path_to_string(parent);
-            if seen.insert(inventory_path_key(&parent)) {
-                directories.push(parent);
-            }
-        }
-        directories
     }
 
     fn relation_anchor_rows(
@@ -842,17 +795,6 @@ fn measure<const ENABLED: bool, T>(
     let result = operation();
     profile.add_elapsed(bucket, started);
     result
-}
-
-impl DirectoryEntryRecord {
-    fn into_py_dict(self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        dict.set_item("path", self.path)?;
-        dict.set_item("is_dir", self.is_dir)?;
-        dict.set_item("size", self.size)?;
-        dict.set_item("mtime_ns", self.mtime_ns)?;
-        Ok(dict.unbind())
-    }
 }
 
 impl DirectoryScanOptions {
@@ -1235,64 +1177,6 @@ pub(crate) fn profile_directory_scan(
     Ok((snapshot, profile))
 }
 
-#[pyfunction]
-#[pyo3(signature = (root_path, paths, sizes, blacklist_rules, size_ranges, whitelist_rules))]
-pub(crate) fn filter_inventory_file_indices(
-    root_path: &str,
-    paths: Vec<String>,
-    sizes: Vec<u64>,
-    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
-    size_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
-) -> PyResult<Vec<usize>> {
-    let options =
-        DirectoryScanOptions::new(blacklist_rules, size_ranges, Vec::new(), whitelist_rules)?;
-    let root = PathBuf::from(root_path);
-    let mut accepted = vec![false; paths.len()];
-    let mut size_accepted_split_families = HashSet::new();
-    let mut size_deferred = Vec::new();
-    let mut filter_scratch = PathFilterScratch::new(&options);
-    let mut directory_rejections = HashMap::new();
-    for (index, path) in paths.into_iter().enumerate() {
-        let size = sizes.get(index).copied().unwrap_or(0);
-        let path = PathBuf::from(path);
-        if file_rejected_by_path(&path, &root, &options, &mut filter_scratch)
-            || file_under_rejected_directory(
-                &path,
-                &root,
-                &options,
-                &mut filter_scratch,
-                &mut directory_rejections,
-            )
-        {
-            continue;
-        }
-        let family_keys = if options.size_ranges.is_empty() {
-            Vec::new()
-        } else {
-            crate::relations::relations_size_filter_split_family_keys(
-                path.to_string_lossy().as_ref(),
-            )
-        };
-        if numeric_ranges_allow(&options.size_ranges, Some(size)) {
-            accepted[index] = true;
-            size_accepted_split_families.extend(family_keys);
-        } else if !family_keys.is_empty() {
-            size_deferred.push((index, family_keys));
-        }
-    }
-    for (index, family_keys) in size_deferred {
-        accepted[index] = family_keys
-            .iter()
-            .any(|key| size_accepted_split_families.contains(key));
-    }
-    Ok(accepted
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, keep)| keep.then_some(index))
-        .collect())
-}
-
 fn build_inventory_snapshot_views(
     root_path: &str,
     files: &[OutputFileRecord],
@@ -1506,92 +1390,6 @@ fn ancestor_directory_records<'a>(
 }
 
 #[pyfunction]
-pub(crate) fn list_regular_files_in_directory(
-    py: Python<'_>,
-    directory: &str,
-) -> PyResult<Vec<Py<PyDict>>> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut records = Vec::new();
-    for item in entries {
-        let Ok(entry) = item else {
-            continue;
-        };
-        let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        records.push(DirectoryEntryRecord {
-            path: path_to_string(&path),
-            is_dir: false,
-            size: Some(metadata.len()),
-            mtime_ns: metadata_mtime_ns(&metadata),
-            relation_member_eligible: true,
-            relation_anchor: None,
-        });
-    }
-    records
-        .into_iter()
-        .map(|entry| entry.into_py_dict(py))
-        .collect()
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, magic_size=16))]
-pub(crate) fn batch_file_head_facts(
-    py: Python<'_>,
-    paths: Vec<String>,
-    magic_size: usize,
-) -> PyResult<Vec<Py<PyDict>>> {
-    let records = py.detach(|| {
-        if paths.len() < 2 {
-            return paths
-                .into_iter()
-                .map(|path| file_head_record(path, magic_size))
-                .collect::<Vec<_>>();
-        }
-
-        let chunk_count = paths.len().min(4);
-        let chunk_size = paths.len().div_ceil(chunk_count);
-        let mut chunks: Vec<Vec<String>> = Vec::with_capacity(chunk_count);
-        let mut chunk = Vec::with_capacity(chunk_size);
-        for path in paths {
-            chunk.push(path);
-            if chunk.len() == chunk_size {
-                chunks.push(chunk);
-                chunk = Vec::with_capacity(chunk_size);
-            }
-        }
-        if !chunk.is_empty() {
-            chunks.push(chunk);
-        }
-
-        chunks
-            .into_par_iter()
-            .map(|chunk| {
-                chunk
-                    .into_iter()
-                    .map(|path| file_head_record(path, magic_size))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-    });
-    records
-        .into_iter()
-        .map(|record| record.into_py_dict(py))
-        .collect()
-}
-
-#[pyfunction]
 pub(crate) fn scan_output_inventory(py: Python<'_>, output_dir: String) -> NativeOutputInventory {
     py.detach(|| scan_output_inventory_impl(&output_dir))
 }
@@ -1725,59 +1523,6 @@ fn py_dict_bool(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<bool>> {
         return Ok(None);
     }
     value.extract::<bool>().map(Some)
-}
-
-#[derive(Clone)]
-struct FileHeadRecord {
-    path: String,
-    exists: bool,
-    is_file: bool,
-    size: Option<u64>,
-    mtime_ns: Option<u64>,
-    magic: Vec<u8>,
-}
-
-impl FileHeadRecord {
-    fn into_py_dict(self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        dict.set_item("path", self.path)?;
-        dict.set_item("exists", self.exists)?;
-        dict.set_item("is_file", self.is_file)?;
-        dict.set_item("size", self.size)?;
-        dict.set_item("mtime_ns", self.mtime_ns)?;
-        dict.set_item("magic", pyo3::types::PyBytes::new(py, &self.magic))?;
-        Ok(dict.unbind())
-    }
-}
-
-fn file_head_record(path: String, magic_size: usize) -> FileHeadRecord {
-    let path_buf = PathBuf::from(&path);
-    let metadata = fs::metadata(&path_buf).ok();
-    let is_file = metadata
-        .as_ref()
-        .map(|item| item.is_file())
-        .unwrap_or(false);
-    let mut magic = Vec::new();
-    if is_file && magic_size > 0 {
-        if let Ok(mut handle) =
-            crate::io::resource_lifecycle::TrackedFile::open(&path_buf, "directory_probe_file")
-        {
-            let limit = magic_size.min(1024 * 1024);
-            let mut buffer = vec![0u8; limit];
-            if let Ok(count) = handle.read(&mut buffer) {
-                buffer.truncate(count);
-                magic = buffer;
-            }
-        }
-    }
-    FileHeadRecord {
-        path,
-        exists: metadata.is_some(),
-        is_file,
-        size: metadata.as_ref().map(|item| item.len()),
-        mtime_ns: metadata.as_ref().and_then(metadata_mtime_ns),
-        magic,
-    }
 }
 
 #[derive(Default)]
@@ -2368,17 +2113,6 @@ fn path_to_string(path: &Path) -> String {
 
 fn normalize_path_separator(path: String) -> String {
     path.replace('\\', "/")
-}
-
-fn inventory_path_key(path: &str) -> String {
-    #[cfg(windows)]
-    {
-        crate::path_keys::path_key(path)
-    }
-    #[cfg(not(windows))]
-    {
-        path.to_string()
-    }
 }
 
 fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
