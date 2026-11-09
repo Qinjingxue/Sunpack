@@ -1411,6 +1411,7 @@ D2D1_RECT_F TextAreaWidget::ThumbRect() const {
 }
 
 void TextAreaWidget::SetText(const std::wstring& t) {
+    ResetWheelBoundary();
     text_ = t;
     cursorPos_ = (int)t.size();
     selectionStart_ = selectionEnd_ = -1;
@@ -1540,6 +1541,7 @@ void TextAreaWidget::DeleteSelection() {
 }
 
 void TextAreaWidget::EnsureCursorVisible(MeasureContext* measure) {
+    ResetWheelBoundary();
     if (measure) {
         float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
         EnsureLayout(*measure, fontSize);
@@ -1854,10 +1856,16 @@ bool TextAreaWidget::SelectionRange(int* start, int* end) const {
 }
 
 bool TextAreaWidget::OnMouseWheel(const MouseEvent& e) {
-    if (!Contains(e.x, e.y)) return false;
+    if (!Contains(e.x, e.y)) { ResetWheelBoundary(); return false; }
+    if (!NeedsScrollbar()) {
+        ClampScroll();
+        ResetWheelBoundary();
+        return false;
+    }
     const float previous = scrollY_;
     scrollY_ -= e.delta * 0.5f;
     ClampScroll();
+    if (scrollY_ != previous) ResetWheelBoundary();
     return scrollY_ != previous;
 }
 
@@ -2673,6 +2681,8 @@ void RefreshVirtualLists(Widget* w) {
 // ---- ScrollView ----
 
 void ScrollViewWidget::SetContent(WidgetPtr content) {
+    CancelScrollMotion();
+    contentHeight_ = 0;
     children_.clear();
     content_ = content;
     if (content_) AddChild(content_);
@@ -2826,9 +2836,11 @@ void ScrollViewWidget::DrawTree(Renderer& r) {
 }
 
 bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
-    if (!Contains(e.x, e.y)) return false;
-    // 内容完全适配视口时不消耗滚轮事件，让父容器处理
-    if (!NeedsScrollbar()) return false;
+    // Non-scrollable controls never spend the ancestor's wheel budget.
+    if (!Contains(e.x, e.y) || !NeedsScrollbar()) {
+        ResetWheelBoundary();
+        return false;
+    }
     if (draggingThumb_) return true;
     UINT lines = 3;
     SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
@@ -2844,6 +2856,7 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
     const bool reversing = scrollVelocity_ * step < 0;
     if (!reversing && ((step < 0 && scrollY_ <= 0 && scrollPosition_ <= 0) ||
         (step > 0 && scrollY_ >= limit && scrollPosition_ >= limit))) return false;
+    ResetWheelBoundary();
     BOOL animate = TRUE;
     SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0);
     // Like InteractionTracker's additional-velocity requests: integrate the
@@ -2863,6 +2876,7 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
 }
 
 void ScrollViewWidget::CancelScrollMotion() {
+    ResetWheelBoundary();
     scrollVelocity_ = 0;
     scrollPosition_ = scrollY_;
     scrollTick_ = 0;

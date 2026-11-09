@@ -24,12 +24,20 @@ Local changes:
   the existing device recovery path. Windows/GPU validation remains required.
 
 - Let nested ScrollViews and multi-line text areas pass outward wheel input
-  to their existing ancestor route at the top/bottom boundary. ScrollViews
-  retain input until their presented view reaches the physical edge. Preserve
-  full wheel impulses and clamp actual travel, avoiding a slow exponential
-  tail at the edge. Returning to an inner scroller cancels ancestor momentum
-  and pending travel so both levels do not keep moving together. Chaining at
-  the physical edge remains available without a gesture timeout or timer.
+  through their existing ancestor route after consuming 120 raw Win32 wheel
+  units at the physical edge. This one-notch resistance is a SunPack choice,
+  not a common framework threshold: Qt/Flutter reject boundary input directly,
+  while Firefox/ImGui use time-based wheel ownership. High-resolution packets
+  share the same budget; only the crossing packet's surplus reaches the next
+  level, and handoff stays open in that direction. No gesture timeout or timer
+  is added. Reversal, direct positioning, range changes and leaving the input
+  route rearm the budget; changing child hits inside one scroller does not.
+  Non-scrollable controls never consume it. Gate tracking holds weak references
+  only and is cleared on window/input lifecycle changes.
+  ScrollViews retain ownership until their presented view reaches the edge.
+  Preserve full scrolling impulses and clamp actual travel, avoiding a slow
+  exponential tail. Returning to an inner scroller, including resistance at
+  its edge, cancels ancestor momentum and pending travel.
 
 - Add paint-only UTF-16 find ranges shared by ordinary text controls and native
   TAG surfaces. Reuse DirectWrite shaping/layout caches and expand highlights
@@ -218,6 +226,11 @@ Motion references:
 - https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/ScrollPresenter/ScrollPresenter.cpp
 - https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/Repeater/ViewportManager.cpp
 - https://learn.microsoft.com/en-us/windows/apps/develop/composition/interaction-tracker-manipulations
+- https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-mousewheel
+- https://github.com/qt/qtbase/blob/dev/src/widgets/widgets/qabstractslider.cpp
+- https://flutter.googlesource.com/mirrors/flutter.git/+/refs/heads/main/packages/flutter/lib/src/widgets/scrollable.dart
+- https://github.com/mozilla-firefox/firefox/blob/main/gfx/layers/apz/src/InputBlockState.cpp
+- https://github.com/ocornut/imgui/blob/master/imgui.cpp
 
 - Expose read-only ToggleWidget::Animating() to the integration tests. The
   switch's own motion is checked without conflating it with other window

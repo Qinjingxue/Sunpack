@@ -6,6 +6,7 @@
 #include "context_menu.h"
 #include "ui_context.h"  // GetContext().InvalidateAllWindows() from inline setters
 #include "animation.h"
+#include "wheel_boundary.h"
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -428,6 +429,8 @@ public:
     int maxLength = -1;
 
     bool NeedsScrollbar() const;
+    float ConsumeBoundaryWheel(float delta) { return wheelBoundary_.Consume(delta, ContentHeight() - VisibleHeight()); }
+    void ResetWheelBoundary() { wheelBoundary_.Reset(); }
 
     /* 宿主驱动的选区 (build 278) —— 让"外部数据源 ↔ 文本"双向联动可做:
      * 例如 OCR 场景里图上划词后, 宿主把对应文本区间选中并滚到可见。
@@ -445,6 +448,7 @@ private:
     int selectionStart_ = -1;
     int selectionEnd_ = -1;
     float scrollY_ = 0;
+    WheelBoundaryGate wheelBoundary_;
     uint64_t caretBlinkStartTick_ = 0;
     bool dragging_ = false;
     bool draggingThumb_ = false;
@@ -675,6 +679,8 @@ public:
     void DoLayout() override;
 
     bool NeedsScrollbar() const;
+    float ConsumeBoundaryWheel(float delta) { return wheelBoundary_.Consume(delta, ContentHeight() - VisibleHeight()); }
+    void ResetWheelBoundary() { wheelBoundary_.Reset(); }
     bool ScrollAnimating() const { return scrollPending_ || scrollVelocity_ != 0; }
     void UpdateScrollAnimation();
     // Preserve the first visible row when estimated heights become measured.
@@ -683,6 +689,7 @@ public:
 private:
     WidgetPtr content_;
     float scrollY_ = 0;
+    WheelBoundaryGate wheelBoundary_;
     float contentHeight_ = 0;
     // Input changes only the pending view. Both thumb and wheel commit it once
     // per presentation frame; velocity is DIP/ms and survives wheel impulses.

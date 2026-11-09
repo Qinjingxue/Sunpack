@@ -181,6 +181,9 @@ private:
     void CancelMouseCapture();
     void OnMouseDoubleClick(float x, float y);
     void OnMouseWheel(float x, float y, int delta);
+    // Retain gates only on this input route; no timers or strong widget owners.
+    void RetainWheelBoundaries(Widget* hit = nullptr);
+    float ConsumeBoundaryWheel(Widget* widget, float delta);
     void OnDropFiles(HDROP hDrop);
     LRESULT OnNcCalcSize(WPARAM wParam, LPARAM lParam);
     LRESULT OnNcHitTest(int x, int y);
@@ -235,6 +238,7 @@ private:
     Widget*     hoveredWidget_ = nullptr;
     std::vector<std::weak_ptr<Widget>> openComboBoxes_;
     std::vector<std::weak_ptr<Widget>> hoveredScrollViews_;
+    std::vector<std::weak_ptr<Widget>> wheelBoundaryWidgets_;
     Widget*     pressedWidget_ = nullptr;
     ContextMenuPtr activeMenu_;
 

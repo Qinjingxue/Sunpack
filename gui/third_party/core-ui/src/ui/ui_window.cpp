@@ -180,6 +180,7 @@ static void ForEachWidget(Widget* w, const std::function<void(Widget*)>& fn) {
 
 UiWindowImpl::UiWindowImpl() = default;
 UiWindowImpl::~UiWindowImpl() {
+    RetainWheelBoundaries();
     StopAnimationFrames();
     /* toast 叠加窗 owner = hwnd_, DestroyWindow(hwnd_) 会连带销毁它, 但仍要
      * 显式 KillTimer + timeEndPeriod 配对 (DestroyToast 负责), 防泄漏时钟精度. */
@@ -1140,6 +1141,7 @@ static void WireTitleBar(Widget* w, HWND hwnd) {
 }
 
 void UiWindowImpl::SetRoot(WidgetPtr root) {
+    RetainWheelBoundaries();
     root_ = std::move(root);
     // Auto-wire any TitleBarWidget to this window's HWND
     if (root_ && hwnd_) WireTitleBar(root_.get(), hwnd_);
@@ -1514,6 +1516,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HasAnimationFrameWork()) RequestRenderFrame(FrameReason::Animation);
         }
         else {
+            RetainWheelBoundaries();
             startupRevealPending_ = false;
             KillTimer(hwnd_, kWindowOpenAnimTimerId);
             if (!windowClosing_) windowAnimating_ = false;
@@ -1622,6 +1625,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         OnMouseMove((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
     case WM_MOUSELEAVE: {
+        RetainWheelBoundaries();
         bool changed=hoveredWidget_!=nullptr || tooltipVisible_;
         if (hoveredWidget_) {
             for (Widget* w = hoveredWidget_; w; w = w->Parent()) {
@@ -1760,6 +1764,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_KILLFOCUS:
+        RetainWheelBoundaries();
         if (root_) {
             ForEachWidget(root_.get(), [&](Widget* w) {
                 auto* ti = dynamic_cast<TextInputWidget*>(w);
@@ -2828,6 +2833,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
 
     if (root_) {
         auto* hit = root_->HitTest(dx, dy);
+        RetainWheelBoundaries(hit);
         if (hoveredWidget_ != hit) {
             repaintNow = true;
             // Hover propagation: every widget in the new hit's ancestor chain
@@ -2914,6 +2920,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
 }
 
 void UiWindowImpl::OnMouseDown(float x, float y) {
+    RetainWheelBoundaries();
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     float dx = x / dpiScale_, dy = y / dpiScale_;
 
@@ -3209,6 +3216,27 @@ void UiWindowImpl::ScrollWithMeasureContext(ScrollViewWidget* scroll,float y) {
     if(scroll) scroll->SetScrollY(y);
 }
 
+void UiWindowImpl::RetainWheelBoundaries(Widget* hit) {
+    wheelBoundaryWidgets_.erase(std::remove_if(wheelBoundaryWidgets_.begin(), wheelBoundaryWidgets_.end(),
+        [hit](const std::weak_ptr<Widget>& weak) {
+            auto alive = weak.lock();
+            if (!alive) return true;
+            // Moving between children of one scroller must not rearm its gate.
+            for (auto* w = hit; w; w = w->Parent()) if (w == alive.get()) return false;
+            if (auto* scroll = dynamic_cast<ScrollViewWidget*>(alive.get())) scroll->ResetWheelBoundary();
+            else if (auto* text = dynamic_cast<TextAreaWidget*>(alive.get())) text->ResetWheelBoundary();
+            return true;
+        }), wheelBoundaryWidgets_.end());
+}
+
+float UiWindowImpl::ConsumeBoundaryWheel(Widget* widget, float delta) {
+    bool tracked = false;
+    for (auto& weak : wheelBoundaryWidgets_) if (weak.lock().get() == widget) { tracked = true; break; }
+    if (!tracked) wheelBoundaryWidgets_.push_back(widget->weak_from_this());
+    if (auto* scroll = dynamic_cast<ScrollViewWidget*>(widget)) return scroll->ConsumeBoundaryWheel(delta);
+    return static_cast<TextAreaWidget*>(widget)->ConsumeBoundaryWheel(delta);
+}
+
 void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
     // Other wheel controls may measure during input; ScrollView only queues
     // its view change and realizes rows on the presentation frame.
@@ -3241,12 +3269,14 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             }
         }
         if (handledByDropdown) {
+            RetainWheelBoundaries();
             InvalidateNow();
             return;
         }
 
         // HitTest to find deepest widget, then bubble up looking for scroll handler
         Widget* hit = root_->HitTest(dx, dy);
+        RetainWheelBoundaries(hit);
         bool handled = false;
         bool smoothScroll = false;
         bool scrollHandled = false;
@@ -3262,8 +3292,12 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
 
         for (Widget* w = hit; w && !handled; w = w->Parent()) {
             if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
-                if (ta->visible && ta->NeedsScrollbar()) {
+                if (ta->visible) {
                     handled = ta->OnMouseWheel(e);
+                    if (!handled && ta->NeedsScrollbar() && ta->Contains(e.x, e.y)) {
+                        e.delta = ConsumeBoundaryWheel(ta, e.delta);
+                        handled = e.delta == 0;
+                    }
                     if (handled) scrollingWidget = ta;
                 }
             }
@@ -3290,6 +3324,10 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             else if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
                 if (sv->visible) {
                     handled = sv->OnMouseWheel(e);
+                    if (!handled && sv->NeedsScrollbar() && sv->Contains(e.x, e.y)) {
+                        e.delta = ConsumeBoundaryWheel(sv, e.delta);
+                        handled = e.delta == 0;
+                    }
                     if (handled) scrollingWidget = sv;
                     scrollHandled = handled;
                     smoothScroll = handled && sv->ScrollAnimating();
@@ -3303,8 +3341,9 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         // travel through the existing setter, without laying out or rendering.
         if (scrollingWidget) for (Widget* parent = scrollingWidget->Parent(); parent; parent = parent->Parent()) {
             if (auto* scroll = dynamic_cast<ScrollViewWidget*>(parent)) {
+                scroll->ResetWheelBoundary();
                 if (scroll->ScrollAnimating()) scroll->SetScrollY(scroll->ScrollY());
-            }
+            } else if (auto* text = dynamic_cast<TextAreaWidget*>(parent)) text->ResetWheelBoundary();
         }
         if (handled || hookFired || dismissedDropdown) {
             // ScrollView shares the thumb's coalesced presentation path.
