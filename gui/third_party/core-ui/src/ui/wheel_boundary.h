@@ -4,7 +4,7 @@
 
 namespace ui {
 
-// An amount-only resistance budget, in raw Win32 wheel units. One notch is a
+// An amount-only resistance budget, in raw Win32 wheel units. Two notches are a
 // SunPack UX choice, not a framework-standard scroll-chaining threshold. Keep
 // it independent of DPI, SPI_GETWHEELSCROLLLINES and event packet size.
 class WheelBoundaryGate {
@@ -26,7 +26,7 @@ public:
     void Reset() { direction_ = 0; remaining_ = kResistance; }
 
 private:
-    static constexpr float kResistance = 120.0f; // WHEEL_DELTA: one wheel notch
+    static constexpr float kResistance = 240.0f; // 2 * WHEEL_DELTA: two wheel notches
     int direction_ = 0;
     float extent_ = 0;
     float remaining_ = kResistance;

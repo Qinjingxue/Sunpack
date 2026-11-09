@@ -24,8 +24,8 @@ Local changes:
   the existing device recovery path. Windows/GPU validation remains required.
 
 - Let nested ScrollViews and multi-line text areas pass outward wheel input
-  through their existing ancestor route after consuming 120 raw Win32 wheel
-  units at the physical edge. This one-notch resistance is a SunPack choice,
+  through their existing ancestor route after consuming 240 raw Win32 wheel
+  units at the physical edge. This two-notch resistance is a SunPack choice,
   not a common framework threshold: Qt/Flutter reject boundary input directly,
   while Firefox/ImGui use time-based wheel ownership. High-resolution packets
   share the same budget; only the crossing packet's surplus reaches the next

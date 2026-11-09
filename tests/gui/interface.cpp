@@ -79,11 +79,11 @@ void wheel_chain_contracts() {
     outer->AddChild(middle); middle->AddChild(empty); empty->AddChild(inner);
     window.SetRoot(outer);
     auto wheel=[&](int delta,float x=20) { window.SimMouseWheel(x,20,float(delta)); };
-    for(int i=0;i<4;++i) wheel(30);
-    assert(inner->calls==4 && middle->calls==0 && outer->calls==0);
-    wheel(90); // Inner is open; the middle spends its own budget.
-    assert(middle->received==90 && outer->calls==0);
-    wheel(60); // Only 30 remains after the middle finishes its 120 units.
+    for(int i=0;i<8;++i) wheel(30);
+    assert(inner->calls==8 && middle->calls==0 && outer->calls==0);
+    wheel(210); // Inner is open; the middle spends its own budget.
+    assert(middle->received==210 && outer->calls==0);
+    wheel(60); // Only 30 remains after the middle finishes its 240 units.
     assert(outer->calls==1 && outer->received==30);
     wheel(1);
     assert(outer->calls==2 && outer->received==1); // Stay open, no backlog.
@@ -91,8 +91,8 @@ void wheel_chain_contracts() {
     const int middleCalls=middle->calls, outerCalls=outer->calls;
     wheel(-30); wheel(30); // Reverse inward immediately, then return to the edge.
     assert(middle->calls==middleCalls && outer->calls==outerCalls);
-    wheel(120); assert(middle->calls==middleCalls);
-    wheel(120); assert(outer->calls==outerCalls); // Both gates rearmed.
+    wheel(240); assert(middle->calls==middleCalls);
+    wheel(240); assert(outer->calls==outerCalls); // Both gates rearmed.
 
     // No overflow means no resistance, even after a formerly scrolling range.
     inner->SetText(L"short");
@@ -104,7 +104,7 @@ void wheel_chain_contracts() {
     wheel(60); // Partial budget; visiting another route must discard it.
     wheel(30,250);
     const int afterSwitch=outer->calls;
-    wheel(60); wheel(60); assert(outer->calls==afterSwitch);
+    wheel(120); wheel(120); assert(outer->calls==afterSwitch);
     wheel(1); assert(outer->calls==afterSwitch+1 && outer->received==1);
 
     // Child hit changes inside one scroller are not an ownership change.
@@ -113,16 +113,16 @@ void wheel_chain_contracts() {
     inner->AddChild(first); inner->AddChild(second);
     window.SetRoot(outer);
     const int beforeDrift=outer->calls;
-    wheel(60,20);
+    wheel(120,20);
     window.SimMouseMove(70,20);
-    wheel(60,70); assert(outer->calls==beforeDrift);
+    wheel(120,70); assert(outer->calls==beforeDrift);
     wheel(1,70); assert(outer->calls==beforeDrift+1 && outer->received==1);
 
     window.SetRoot(outer);
     wheel(60);
     window.SimMouseMove(250,20); window.SimMouseMove(20,20);
     const int afterLeave=outer->calls;
-    wheel(60); wheel(60); assert(outer->calls==afterLeave);
+    wheel(120); wheel(120); assert(outer->calls==afterLeave);
     wheel(1); assert(outer->calls==afterLeave+1);
 
     // A resized viewport rearms even when content height stays unchanged.
@@ -130,7 +130,7 @@ void wheel_chain_contracts() {
     wheel(60);
     inner->rect.bottom-=10;
     const int beforeResize=outer->calls;
-    wheel(60); wheel(60); assert(outer->calls==beforeResize);
+    wheel(120); wheel(120); assert(outer->calls==beforeResize);
     wheel(1); assert(outer->calls==beforeResize+1);
     inner->rect.bottom+=10;
 
@@ -139,7 +139,7 @@ void wheel_chain_contracts() {
     wheel(60);
     window.SetRoot(outer);
     const int beforeReset=outer->calls;
-    wheel(60); wheel(60); assert(outer->calls==beforeReset);
+    wheel(120); wheel(120); assert(outer->calls==beforeReset);
     wheel(1); assert(outer->calls==beforeReset+1);
     window.SimMouseMove(250,20);
     wheel(1); // Track the inner gate again without making it the hover owner.
@@ -1338,11 +1338,11 @@ void tag_config(Application& app,const fs::path& dir) {
             // Clamp against the live extent; layout can shift it by a float ULP.
             window->ScrollWithMeasureContext(scroll(),delta<0?scroll()->ContentHeight():0.0f);
             const float edge=scroll()->ScrollY();
-            for(int i=0;i<4;++i) {
+            for(int i=0;i<8;++i) {
                 wheel(delta/4);
                 assert(outer->ScrollY()==centered && !outer->ScrollAnimating() && !scroll()->ScrollAnimating());
             }
-            // Four high-resolution packets spend exactly one notch. Further
+            // Eight high-resolution packets spend exactly two notches. Further
             // same-direction input chains without another resistance interval.
             wheel(delta);
             pump(settled,"TAG wheel handoff",false);
@@ -1360,7 +1360,7 @@ void tag_config(Application& app,const fs::path& dir) {
         // line/page setting as ordinary ScrollView motion, never the backlog.
         window->ScrollWithMeasureContext(outer,centered);
         window->ScrollWithMeasureContext(scroll(),scroll()->ContentHeight());
-        wheel(-90); wheel(-60);
+        wheel(-210); wheel(-60);
         pump(settled,"TAG partial wheel handoff",false);
         UINT lines=3; SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&lines,0);
         const float quarterStep=(lines==WHEEL_PAGESCROLL?outer->rect.bottom-outer->rect.top:lines*16.0f)/4;
@@ -1389,6 +1389,8 @@ void tag_config(Application& app,const fs::path& dir) {
             wheel(delta);
             assert(!outer->ScrollAnimating());
             wheel(delta);
+            assert(!outer->ScrollAnimating());
+            wheel(delta);
             assert(outer->ScrollAnimating());
             // Switch back before the parent has presented its pending input.
             wheel(-delta);
@@ -1397,7 +1399,7 @@ void tag_config(Application& app,const fs::path& dir) {
             assert(outer->ScrollY()==centered && (scroll()->ScrollY()-edge)*delta>0);
 
             window->ScrollWithMeasureContext(scroll(),delta<0?scroll()->ContentHeight():0.0f);
-            wheel(delta); wheel(delta);
+            wheel(delta); wheel(delta); wheel(delta);
             pump([&]{return outer->ScrollY()!=centered;},"TAG outer handoff motion",false);
             const float after=outer->ScrollY();
             wheel(-delta);
