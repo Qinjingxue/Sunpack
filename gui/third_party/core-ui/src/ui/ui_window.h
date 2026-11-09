@@ -121,6 +121,7 @@ public:
     void ScrollWithMeasureContext(ScrollViewWidget* scroll,float y);
     WidgetPtr Root() const { return root_; }
     bool skipOpenAnimation_ = false;
+    bool useCompositionSurface_ = false;
     /* Build 105+ (L25): config.start_maximized 状态. ui_window_create 拷,
      * Show / ShowImmediate 消费一次 (走 SW_SHOWMAXIMIZED 路径) 后清零, 不
      * 残留影响后续 ShowWindow(SW_HIDE)+Show() 循环. */

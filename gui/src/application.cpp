@@ -917,6 +917,7 @@ void Application::open() {
     apply_theme(page_,initial_theme);
     stage="stageWindow";
     UiWindowConfig window_config{}; window_config.skip_animation=1;
+    window_config.composition_surface=1;
     window_=ui_page_prepare_window(page_,&window_config);
     if(!window_) throw std::runtime_error(ui_page_last_error(page_));
     stage="stageEvents";

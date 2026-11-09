@@ -57,6 +57,7 @@ public:
         SharedD2DGuard& operator=(const SharedD2DGuard&) = delete;
     };
 
+    Renderer();
     ~Renderer();
 
     // Create and own factories internally (standalone mode)
@@ -65,7 +66,7 @@ public:
     // Use externally-owned factories (DLL shared mode)
     bool Init(ID2D1Factory1* factory, IDWriteFactory* dwFactory, IWICImagingFactory* wicFactory);
 
-    bool CreateRenderTarget(HWND hwnd);
+    bool CreateRenderTarget(HWND hwnd, bool compositionSurface = false);
     // Composition-mode RT for transparent/layered windows (popup menus,
     // tooltips). Builds a SwapChainForComposition with premultiplied alpha
     // and binds it via DirectComposition so per-pixel alpha is honored on
@@ -73,9 +74,9 @@ public:
     // round corners come from D2D's normal FillRoundedRectangle path.
     bool CreateRenderTargetForLayered(HWND hwnd);
     void ReleaseRenderTarget();
-    void Resize(UINT width, UINT height);
+    HRESULT Resize(UINT width, UINT height);
     void BeginDraw();
-    HRESULT EndDraw();
+    HRESULT EndDraw(bool trimCompositionSurface = false);
     HRESULT PresentPrepared(bool skipVSync);
     HRESULT SetSwapChainBackgroundColor(const D2D1_COLOR_F& color);
     void FlushAndTrimGpu();
@@ -332,6 +333,12 @@ public:
     void ApplyTextRenderMode();
 
 private:
+
+    struct CompositionFrame;
+    HRESULT CreateCompositionFrame(const D2D1_BITMAP_PROPERTIES1& bitmapProps, UINT width, UINT height);
+    HRESULT ResizeCompositionBitmap(const D2D1_BITMAP_PROPERTIES1& bitmapProps, UINT width, UINT height);
+    HRESULT PresentCompositionFrame(bool skipVSync, bool trim);
+    std::unique_ptr<CompositionFrame> compositionFrame_;
     /* 视口剔除矩形栈 (build 285). 嵌套 ScrollView 时取交集 —— 内层只可能比
      * 外层更小, 存交集省得判定时反复回溯整个栈。 */
     std::vector<D2D1_RECT_F> cullStack_;

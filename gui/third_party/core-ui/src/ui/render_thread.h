@@ -31,6 +31,7 @@ struct FrameJob {
     int height_px = 0;
     float dpi_scale = 1.0f;
     PresentPolicy policy = PresentPolicy::Deferred;
+    bool live_resize = false;
     int priority = 0;
     bool render_thread_present = false;
     bool defer_present = false;

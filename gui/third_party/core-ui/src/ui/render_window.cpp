@@ -77,7 +77,7 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
     if (!targetReady_ || !renderer_->RT()) {
         const bool created = surfaceKind_ == RenderSurfaceKind::LayeredComposition
             ? renderer_->CreateRenderTargetForLayered(hwnd_)
-            : renderer_->CreateRenderTarget(hwnd_);
+            : renderer_->CreateRenderTarget(hwnd_, surfaceKind_ == RenderSurfaceKind::OpaqueCompositionSurface);
         if (!created) {
             ReleaseResources();
             return RenderFrameResult::DeviceFailure;
@@ -86,7 +86,7 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
         widthPx_ = 0;
         heightPx_ = 0;
     }
-    if (surfaceKind_ == RenderSurfaceKind::HwndSwapChain) {
+    if (surfaceKind_ != RenderSurfaceKind::LayeredComposition) {
         D2D1_COLOR_F clearColor{};
         if (InitialClearColor(job.display_list, clearColor)) {
             // DXGI_SCALING_NONE fills live-resize area outside the back buffer
@@ -98,7 +98,11 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
     const bool presentNow = visible && !job.defer_present;
     const bool sizeChanged = widthPx_ != job.width_px || heightPx_ != job.height_px;
     if (sizeChanged) {
-        renderer_->Resize(static_cast<UINT>(job.width_px), static_cast<UINT>(job.height_px));
+        const HRESULT resized = renderer_->Resize(static_cast<UINT>(job.width_px), static_cast<UINT>(job.height_px));
+        if (FAILED(resized)) {
+            ReleaseResources();
+            return resized == D2DERR_RECREATE_TARGET ? RenderFrameResult::RecreateTarget : RenderFrameResult::DeviceFailure;
+        }
         widthPx_ = job.width_px;
         heightPx_ = job.height_px;
     }
@@ -110,8 +114,8 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
     renderer_->PrepareDisplayList(job.display_list);
     renderer_->BeginDraw();
     renderer_->RenderDisplayList(std::move(job.display_list), !sizeChanged && !job.defer_present && !job.startup_reveal &&
-        visible && surfaceKind_==RenderSurfaceKind::HwndSwapChain && job.policy!=PresentPolicy::Screenshot);
-    HRESULT hr = renderer_->EndDraw();
+        visible && surfaceKind_ != RenderSurfaceKind::LayeredComposition && job.policy != PresentPolicy::Screenshot);
+    HRESULT hr = renderer_->EndDraw(!job.live_resize);
     if (hr == D2DERR_RECREATE_TARGET) {
         ReleaseResources();
         return RenderFrameResult::RecreateTarget;

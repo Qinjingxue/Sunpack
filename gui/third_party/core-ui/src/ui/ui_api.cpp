@@ -112,6 +112,7 @@ UI_API UiWindow ui_window_create(const UiWindowConfig* config) {
 
     auto win = std::make_unique<ui::UiWindowImpl>();
     win->skipOpenAnimation_ = (config->skip_animation != 0);
+    win->useCompositionSurface_ = config->composition_surface && config->system_frame && win->skipOpenAnimation_;
     win->startMaximizedPending_ = (config->start_maximized != 0);
     int initX = (config->x != 0 || config->y != 0) ? config->x : CW_USEDEFAULT;
     int initY = (config->x != 0 || config->y != 0) ? config->y : CW_USEDEFAULT;

@@ -223,7 +223,7 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
      * 该 flag (给子窗自下而上双缓冲 alpha 用) 在此零收益, 却让 DWM 每次合成多走
      * 一层重定向双缓冲, 拖动/缩放时平添开销。WS_EX_LAYERED 仍单独保留给开场动画/
      * 透明路径 (走 SetLayeredWindowAttributes), 不受影响。 */
-    DWORD exStyle = 0;
+    DWORD exStyle = useCompositionSurface_ ? WS_EX_NOREDIRECTIONBITMAP : 0;
     if (toolWindow) exStyle |= WS_EX_TOOLWINDOW;
     /* Build 65+ (L14): owner 窗不上 Alt+Tab / 不单独 taskbar 项. owned 顶级窗
      * 用 WS_EX_APPWINDOW 跟 owner 语义冲突 (强制出现在 taskbar), 撤掉. */
@@ -309,7 +309,8 @@ void UiWindowImpl::RegisterRenderWindow(uint64_t id) {
     renderWindowId_ = RenderWindowId{id, hwndGeneration_};
     renderThreadPresentActive_ = false;
     RenderThread::Instance().Start();
-    RenderThread::Instance().RegisterWindow(renderWindowId_, hwnd_);
+    RenderThread::Instance().RegisterWindow(renderWindowId_, hwnd_, useCompositionSurface_
+        ? RenderSurfaceKind::OpaqueCompositionSurface : RenderSurfaceKind::HwndSwapChain);
 }
 
 void UiWindowImpl::UnregisterRenderWindow() {
@@ -718,6 +719,7 @@ void UiWindowImpl::SubmitFrameJob(const FrameRequest& frame, DisplayList display
     job.height_px = static_cast<int>(clientHeightPx_);
     job.dpi_scale = dpiScale_;
     job.policy = frame.policy;
+    job.live_resize = isMoving_ && isResizing_;
     job.priority = static_cast<int>(frame.policy);
     job.render_thread_present = renderThreadPresentActive_;
     job.defer_present = deferNextFramePresent_ && FrameRequiresPresentBarrier(frame);

@@ -68,7 +68,7 @@ void startup_present_contracts() {
         gui_test::clear_color(*window,theme::kWindowBg());
         root->bgColor=D2D1::ColorF(0x202020);
         gui_test::clear_color(*window,root->bgColor);
-        auto live=D2D1::ColorF(0x2b2b2b);
+        D2D1_COLOR_F live=D2D1::ColorF(0x2b2b2b);
         root->bgColorFn=[&] { return live; };
         gui_test::clear_color(*window,live);
         live=theme::Current().elevatedBg;

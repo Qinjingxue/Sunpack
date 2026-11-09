@@ -137,6 +137,7 @@ typedef struct UiWindowConfig {
      * x/y/width/height 在 start_maximized=1 时仍要填 — 那是用户双击 titlebar
      * 还原后的位置/尺寸, lib 不会丢弃. */
     int start_maximized;
+    int composition_surface; /* Opt in for an opaque system-frame window. */
 } UiWindowConfig;
 
 /* ------------------------------------------------------------------ */

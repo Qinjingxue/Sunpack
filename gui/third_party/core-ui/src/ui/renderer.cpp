@@ -216,6 +216,19 @@ Renderer::SharedD2DGuard::~SharedD2DGuard() {
     g_sharedD2DUseMu.unlock();
 }
 
+struct Renderer::CompositionFrame {
+    ComPtr<IDCompositionDesktopDevice> device;
+    ComPtr<IDCompositionTarget> target;
+    ComPtr<IDCompositionVisual2> visual;
+    ComPtr<IDCompositionRectangleClip> clip;
+    ComPtr<IDCompositionSurface> surface;
+    D2D1_SIZE_U capacity{};
+    D2D1_SIZE_U viewport{};
+    bool fullCopy = true;
+};
+
+Renderer::Renderer() = default;
+
 Renderer::~Renderer() {
     ReleaseRenderTarget();
 }
@@ -390,7 +403,7 @@ void Renderer::ResetSharedDeviceForDeviceLost() {
     s_deviceRefCount = 0;
 }
 
-bool Renderer::CreateRenderTarget(HWND hwnd) {
+bool Renderer::CreateRenderTarget(HWND hwnd, bool compositionSurface) {
     ReleaseRenderTarget();
     hwnd_ = hwnd;
     targetThreadId_ = GetCurrentThreadId();
@@ -410,6 +423,24 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
      * 老系统失败则 ctx5_ 为空，SVG 等能力自动降级。*/
     ctx_.As(&ctx5_);
 
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const UINT dpi = GetDpiForWindow(hwnd);
+    const auto bitmapProps = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        float(dpi), float(dpi));
+    const auto finish = [&]() {
+        ctx_->SetDpi(float(dpi), float(dpi));
+        ctx_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        ApplyTextRenderMode();
+        RebuildFontFallback();
+        return true;
+    };
+    if (compositionSurface && SUCCEEDED(CreateCompositionFrame(bitmapProps, rc.right, rc.bottom))) {
+        return finish();
+    }
+
     /* 3. 创建 SwapChain */
     ComPtr<IDXGIDevice> dxgiDevice;
     hr = s_d3dDevice.As(&dxgiDevice);
@@ -422,9 +453,6 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
     ComPtr<IDXGIFactory2> dxgiFactory;
     hr = adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(dxgiFactory.GetAddressOf()));
     if (FAILED(hr)) return fail();
-
-    RECT rc;
-    GetClientRect(hwnd, &rc);
 
     DXGI_SWAP_CHAIN_DESC1 desc = {};
     desc.Width  = rc.right - rc.left;
@@ -446,32 +474,85 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
     hr = swapChain_->GetBuffer(0, __uuidof(IDXGISurface), reinterpret_cast<void**>(surface.GetAddressOf()));
     if (FAILED(hr)) return fail();
 
-    UINT dpi = GetDpiForWindow(hwnd);
-    D2D1_BITMAP_PROPERTIES1 bitmapProps = {};
-    bitmapProps.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
-    bitmapProps.dpiX = (float)dpi;
-    bitmapProps.dpiY = (float)dpi;
-    bitmapProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
-
     hr = ctx_->CreateBitmapFromDxgiSurface(surface.Get(), bitmapProps, targetBitmap_.GetAddressOf());
     if (FAILED(hr)) return fail();
 
     ctx_->SetTarget(targetBitmap_.Get());
 
-    /* 5. 设置渲染参数 */
-    ctx_->SetDpi((float)dpi, (float)dpi);
-    ctx_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    return finish();
+}
 
-    /* 文字渲染参数：由 theme::TextRenderMode 或 per-window override 决定。
-       ApplyTextRenderMode 会读 TextRenderMode() 并 SetTextAntialiasMode +
-       SetTextRenderingParams。 */
-    ApplyTextRenderMode();
+HRESULT Renderer::CreateCompositionFrame(const D2D1_BITMAP_PROPERTIES1& bitmapProps, UINT width, UINT height) {
+    auto frame = std::make_unique<CompositionFrame>();
+    HRESULT hr = DCompositionCreateDevice2(s_d2dDevice.Get(), IID_PPV_ARGS(&frame->device));
+    if (FAILED(hr)) return hr;
+    if (FAILED(hr = frame->device->CreateTargetForHwnd(hwnd_, TRUE, &frame->target))) return hr;
+    if (FAILED(hr = frame->device->CreateVisual(&frame->visual))) return hr;
+    if (FAILED(hr = frame->device->CreateRectangleClip(&frame->clip))) return hr;
+    if (FAILED(hr = frame->visual->SetClip(frame->clip.Get()))) return hr;
+    if (FAILED(hr = frame->target->SetRoot(frame->visual.Get()))) return hr;
+    if (FAILED(hr = ResizeCompositionBitmap(bitmapProps, width, height))) return hr;
+    compositionFrame_ = std::move(frame);
+    return S_OK;
+}
 
-    /* 如果已经有中英分离设置，重建一次 fallback（theme::SetCjkFonts 可能在
-       窗口创建之前就设了） */
-    RebuildFontFallback();
+HRESULT Renderer::ResizeCompositionBitmap(const D2D1_BITMAP_PROPERTIES1& bitmapProps, UINT width, UINT height) {
+    ComPtr<ID2D1Bitmap1> bitmap;
+    HRESULT hr = ctx_->CreateBitmap(D2D1::SizeU(width, height), nullptr, 0, bitmapProps, &bitmap);
+    if (FAILED(hr)) return hr;
+    targetBitmap_ = std::move(bitmap);
+    ctx_->SetTarget(targetBitmap_.Get());
+    ctx_->SetDpi(bitmapProps.dpiX, bitmapProps.dpiY);
+    return S_OK;
+}
 
-    return true;
+HRESULT Renderer::PresentCompositionFrame(bool skipVsync, bool trim) {
+    auto& frame = *compositionFrame_;
+    const auto size = targetBitmap_->GetPixelSize();
+    const bool replace = !frame.surface || size.width > frame.capacity.width || size.height > frame.capacity.height ||
+        (trim && (size.width != frame.capacity.width || size.height != frame.capacity.height));
+    if (replace) {
+        ComPtr<IDCompositionSurface> surface;
+        HRESULT hr = frame.device->CreateSurface(size.width, size.height,
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_IGNORE, &surface);
+        if (FAILED(hr)) return hr;
+        if (FAILED(hr = frame.visual->SetContent(surface.Get()))) return hr;
+        frame.surface = std::move(surface);
+        frame.capacity = size;
+        frame.fullCopy = true;
+    }
+
+    // The drawing bitmap remains the source for screenshots and retained damage.
+    // Copy only the updated pixels into the compositor's transient update texture.
+    const RECT region = partialPresent_ && !frame.fullCopy
+        ? presentDamage_ : RECT{0, 0, LONG(size.width), LONG(size.height)};
+    POINT offset{};
+    ComPtr<IDXGISurface> update;
+    HRESULT hr = frame.surface->BeginDraw(&region, IID_PPV_ARGS(&update), &offset);
+    if (FAILED(hr)) return hr;
+    {
+        ComPtr<ID2D1Bitmap1> destination;
+        const auto props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        hr = ctx_->CreateBitmapFromDxgiSurface(update.Get(), &props, &destination);
+        if (SUCCEEDED(hr)) {
+            const D2D1_POINT_2U dst{UINT(offset.x), UINT(offset.y)};
+            const D2D1_RECT_U src{UINT(region.left), UINT(region.top), UINT(region.right), UINT(region.bottom)};
+            hr = destination->CopyFromBitmap(&dst, targetBitmap_.Get(), &src);
+        }
+    }
+    update.Reset();
+    const HRESULT ended = frame.surface->EndDraw();
+    if (FAILED(hr)) return hr;
+    if (FAILED(ended)) return ended;
+    if (size.width != frame.viewport.width && FAILED(hr = frame.clip->SetRight(float(size.width)))) return hr;
+    if (size.height != frame.viewport.height && FAILED(hr = frame.clip->SetBottom(float(size.height)))) return hr;
+    TraceEvent("core_renderer", "present_begin", {TraceBool("skip_vsync", skipVsync)});
+    if (FAILED(hr = frame.device->Commit())) return hr;
+    frame.viewport = size;
+    frame.fullCopy = false;
+    return skipVsync ? S_OK : frame.device->WaitForCommitCompletion();
 }
 
 bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
@@ -581,6 +662,7 @@ void Renderer::ReleaseRenderTarget() {
     imageBitmapCache_.clear();
     ClearTextCaches();
     targetBitmap_.Reset();
+    compositionFrame_.reset();
     swapChain_.Reset();
     ctx5_.Reset();
     ctx_.Reset();
@@ -592,9 +674,9 @@ void Renderer::ReleaseRenderTarget() {
     ReleaseSharedDeviceRef();
 }
 
-void Renderer::Resize(UINT width, UINT height) {
+HRESULT Renderer::Resize(UINT width, UINT height) {
     DebugAssertTargetThread("Resize");
-    if (!ctx_ || !swapChain_) return;
+    if (!ctx_ || (!swapChain_ && !compositionFrame_)) return E_UNEXPECTED;
     opacityCommands_.clear();
     previousDisplayList_.Clear();
     previousBounds_ = {};
@@ -604,6 +686,14 @@ void Renderer::Resize(UINT width, UINT height) {
     TraceScope resizeScope("core_renderer", "renderer_resize_duration");
     TraceEvent("core_renderer", "renderer_resize_begin",
                {TraceU64("w_px", width), TraceU64("h_px", height)});
+
+    if (compositionFrame_) {
+        compositionFrame_->fullCopy = true;
+        const float dpi = float(GetDpiForWindow(hwnd_));
+        return ResizeCompositionBitmap(D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi), width, height);
+    }
 
     {
         TraceScope scope("core_renderer", "renderer_resize_detach_duration");
@@ -621,7 +711,7 @@ void Renderer::Resize(UINT width, UINT height) {
     if (FAILED(hr)) {
         TraceEvent("core_renderer", "resize_buffers_failed",
                    {TraceI64("hr", static_cast<int64_t>(hr))});
-        return;
+        return hr;
     }
 
     ComPtr<IDXGISurface> surface;
@@ -633,7 +723,7 @@ void Renderer::Resize(UINT width, UINT height) {
     if (FAILED(hr)) {
         TraceEvent("core_renderer", "resize_get_buffer_failed",
                    {TraceI64("hr", static_cast<int64_t>(hr))});
-        return;
+        return hr;
     }
 
     UINT dpi = GetDpiForWindow(hwnd_);
@@ -651,7 +741,7 @@ void Renderer::Resize(UINT width, UINT height) {
     if (FAILED(hr)) {
         TraceEvent("core_renderer", "resize_create_target_bitmap_failed",
                    {TraceI64("hr", static_cast<int64_t>(hr))});
-        return;
+        return hr;
     }
 
     {
@@ -659,6 +749,7 @@ void Renderer::Resize(UINT width, UINT height) {
         ctx_->SetTarget(targetBitmap_.Get());
         ctx_->SetDpi((float)dpi, (float)dpi);
     }
+    return S_OK;
 }
 
 void Renderer::BeginDraw() {
@@ -670,7 +761,7 @@ void Renderer::BeginDraw() {
     ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
-HRESULT Renderer::EndDraw() {
+HRESULT Renderer::EndDraw(bool trimCompositionSurface) {
     DebugAssertTargetThread("EndDraw");
     TraceScope scope("core_renderer", "renderer_end_draw_duration");
     HRESULT hr = S_OK;
@@ -680,7 +771,10 @@ HRESULT Renderer::EndDraw() {
     }
     /* L177: skipPresent → 只 flush D2D 绘制 (上面 ctx_->EndDraw 已做), 不 flip 到
      * DWM。给"绘制隐藏窗但不上屏"用 (避免 DWM 未合成窗的 Present 在 AMD 死锁)。 */
-    if (SUCCEEDED(hr) && swapChain_ && !skipPresent) {
+    if (SUCCEEDED(hr) && compositionFrame_) {
+        if (skipPresent) compositionFrame_->fullCopy = true;
+        else hr = PresentCompositionFrame(skipVSync, trimCompositionSurface);
+    } else if (SUCCEEDED(hr) && swapChain_ && !skipPresent) {
         DXGI_PRESENT_PARAMETERS params = {};
         if (partialPresent_) { params.DirtyRectsCount = 1; params.pDirtyRects = &presentDamage_; }
         UINT syncInterval = skipVSync ? 0 : 1;
@@ -700,6 +794,7 @@ HRESULT Renderer::EndDraw() {
 
 HRESULT Renderer::PresentPrepared(bool skipVsync) {
     DebugAssertTargetThread("PresentPrepared");
+    if (compositionFrame_) return PresentCompositionFrame(skipVsync, true);
     if (!swapChain_) return S_FALSE;
     DXGI_PRESENT_PARAMETERS params = {};
     if (partialPresent_) { params.DirtyRectsCount = 1; params.pDirtyRects = &presentDamage_; }
@@ -2751,7 +2846,7 @@ void Renderer::RenderDisplayList(DisplayList list, bool incremental) {
     // Two flip-sequential buffers alternate. Repaint last frame's changes as
     // well, so this back buffer is coherent even before Present (readback,
     // overlapping alpha layers and screenshots must see the same image).
-    if(incremental && previousDamage_.right>previousDamage_.left && previousDamage_.bottom>previousDamage_.top) {
+    if(incremental && !compositionFrame_ && previousDamage_.right>previousDamage_.left && previousDamage_.bottom>previousDamage_.top) {
         if(presentDamage_.right<=presentDamage_.left || presentDamage_.bottom<=presentDamage_.top) presentDamage_=previousDamage_;
         else presentDamage_={std::min(presentDamage_.left,previousDamage_.left),std::min(presentDamage_.top,previousDamage_.top),
                              std::max(presentDamage_.right,previousDamage_.right),std::max(presentDamage_.bottom,previousDamage_.bottom)};
