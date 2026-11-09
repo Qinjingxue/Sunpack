@@ -880,7 +880,7 @@ impl NativeWatchState {
             })
     }
     /// Build a bounded WAL delta without exporting a growing pending record.
-    #[pyo3(signature = (owner, task, output, keep=None))]
+    #[pyo3(signature = (owner, task, output, keep=None, *, owned_paths=Vec::new()))]
     fn output_operation(
         &self,
         py: Python<'_>,
@@ -888,7 +888,12 @@ impl NativeWatchState {
         task: String,
         output: String,
         keep: Option<bool>,
+        owned_paths: Vec<String>,
     ) -> PyResult<Option<NativeWatchOperations>> {
+        let register = !owned_paths.is_empty();
+        if register && keep.is_some() {
+            return Err(invalid("output registration requires a start"));
+        }
         let key = path_key(owner);
         let refresh = {
             let data = self.lock();
@@ -915,16 +920,20 @@ impl NativeWatchState {
             }
         };
         let identity = py.detach(|| -> PyResult<Option<String>> {
-            if keep.is_none() {
-                std::fs::create_dir_all(&output)?;
+            let path = Path::new(&output);
+            if register {
+                crate::scan::scope::create_output_root_exclusive(path)?;
+            } else if keep.is_none() {
+                std::fs::create_dir_all(path)?;
             }
-            if refresh && Path::new(&output).is_dir() {
+            if refresh && path.is_dir() {
                 let (volume, identity, _) = crate::filesystem::watch_path_identity(&output)?;
                 Ok(Some(format!("{volume}|{identity}")))
             } else {
                 Ok(None)
             }
         })?;
+        let mut operations = Vec::with_capacity(1 + owned_paths.len());
         let change = if let Some(keep) = keep {
             OutputChange::Finish {
                 task,
@@ -933,14 +942,34 @@ impl NativeWatchState {
                 identity,
             }
         } else {
+            let identity = identity.ok_or_else(|| invalid("output root has no identity"))?;
+            // Flatten finalization can already have published the new identity
+            // at the active path. A repeated start then has no state delta.
+            if !register
+                && self.lock().pending.get(&key).is_some_and(|record| {
+                    record.active_outputs.get(&task) == Some(&output)
+                        && record.output_identities.get(&output) == Some(&identity)
+                })
+            {
+                return Ok(Some(NativeWatchOperations {
+                    operations: Arc::new(Operations::default()),
+                }));
+            }
+            if register {
+                let record = serde_json::json!({ "path": output, "identities": [&identity] });
+                operations.extend(owned_paths.into_iter().map(|path| {
+                    Operation::Runtime(format!("owned|{}", path_key(&path)), Some(record.clone()))
+                }));
+            }
             OutputChange::Start {
                 task,
                 output,
-                identity: identity.ok_or_else(|| invalid("output root has no identity"))?,
+                identity,
             }
         };
+        operations.push(Operation::Output(key, change));
         Ok(Some(NativeWatchOperations {
-            operations: Arc::new(Operations(vec![Operation::Output(key, change)])),
+            operations: Arc::new(Operations(operations)),
         }))
     }
 

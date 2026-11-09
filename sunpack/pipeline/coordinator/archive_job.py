@@ -260,22 +260,17 @@ class ArchiveJobExecutor:
             terminal.planned_out_dir = planned_out_dir
             return task, terminal
 
-        if self.output_reservations is not None and self.output_reservations.watch_outputs is not None:
+        register_output = self.output_reservations is not None and self.output_reservations.watch_outputs is not None
+        register_with_start = register_output and self.origin == "watch" and bool(self.config.get("watch_owner_path"))
+        if register_output and not register_with_start:
             await broker.run("watch_output_root", file_id, self.output_reservations.register_watch_output,
                              planned_out_dir, request_id=self.request_id, cancellation=cancellation)
-        if depth == 1:
-            self._uncommitted_outputs[planned_out_dir] = task
-        if task.runtime.get("retry_output_dir"):
-            task.runtime["retry_created_outputs"] = []
         if self.origin == "watch":
-            task.runtime["watch_active_output"] = (task.main_path, planned_out_dir)
-            await self.extractor.emit_semantic_event_async(
-                broker, task,
-                "task_output_started",
-                request_id=self.request_id,
-                critical=True,
-                output_dir=planned_out_dir,
-            )
+            await broker.run("output_state", file_id, self._start_watch_output, task,
+                             planned_out_dir, depth, register_with_start,
+                             request_id=self.request_id, cancellation=cancellation)
+        else:
+            self._track_output(task, planned_out_dir, depth)
         state = self._extract_verify_state_machine(
             task,
             planned_out_dir,
@@ -311,6 +306,22 @@ class ArchiveJobExecutor:
                 file_id=file_id,
                 cancellation=cancellation,
             )
+
+    def _start_watch_output(self, task, path, depth, register_output):
+        self.extractor.emit_semantic_event(
+            task, "task_output_started", critical=True, output_dir=path,
+            register_output=register_output,
+        )
+        # Track only after exclusive creation succeeds. The broker joins this
+        # operation before cancellation can roll back a successfully started job.
+        task.runtime["watch_active_output"] = (task.main_path, path)
+        self._track_output(task, path, depth)
+
+    def _track_output(self, task, path, depth):
+        if depth == 1:
+            self._uncommitted_outputs[path] = task
+        if task.runtime.get("retry_output_dir"):
+            task.runtime["retry_created_outputs"] = []
 
     def _report_task_started(self, task: ArchiveTask, depth: int) -> None:
         if self.progress_reporter is not None:

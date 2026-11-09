@@ -926,25 +926,34 @@ class WatchStateStore:
             self._commit_operations_locked(operations, durable=True)
             return True
 
-    def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
-        return self._record_output(owner_path, task_path, output_dir, keep=None)
+    def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str, *, owned_paths=()) -> bool:
+        return self._record_output(owner_path, task_path, output_dir, keep=None, owned_paths=owned_paths)
 
     def record_task_output_finished(
         self, owner_path: str, task_path: str, output_dir: str, *, keep_output: bool,
     ) -> bool:
         return self._record_output(owner_path, task_path, output_dir, keep=bool(keep_output))
 
-    def _record_output(self, owner_path, task_path, output_dir, *, keep):
+    def _record_output(self, owner_path, task_path, output_dir, *, keep, owned_paths=()):
         if not task_path or not output_dir:
             return False
         with self._state_lock:
+            if owned_paths:
+                self._ensure_open_locked()
+                self._raise_persistence_fault_locked()
             operations = self._native.output_operation(
                 owner_path, os.path.abspath(task_path), os.path.abspath(output_dir), keep,
+                owned_paths=owned_paths,
             )
             if operations is None:
                 return False
-            self._commit_operations_locked(operations, durable=True)
-            return True
+            if keep is not None or operations:
+                self._commit_operations_locked(operations, durable=True)
+                return True
+        # A concurrent writer can have published the same start in memory
+        # while its WAL ticket is still pending. Join the existing frontier.
+        self.flush()
+        return True
 
     def rebase_pending_work(
         self,

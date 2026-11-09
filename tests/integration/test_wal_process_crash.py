@@ -201,22 +201,42 @@ def _archive(root, kind):
 @pytest.mark.parametrize("boundary", ["started", "finished"])
 def test_real_watch_extraction_recovers_after_process_death(tmp_path, kind, boundary):
     expected = _archive(tmp_path, kind)
+    output_root = tmp_path / "output"
+    # Only outputs within a watched scope need both ownership and start in WAL.
+    if kind == "disguised":
+        manifest = tmp_path / "manifest.json"
+        inputs = json.loads(manifest.read_text(encoding="utf-8"))
+        output_root = Path(inputs["sources"][0]).parent / "output"
+        manifest.write_text(json.dumps({**inputs, "output_in_watch": True}), encoding="utf-8")
     killed = _run_child(tmp_path, "watch", boundary, kill=True)
     assert killed["pending"]
     if boundary == "started":
         assert any(item["active_outputs"] for item in killed["pending"])
+        if kind == "disguised":
+            from sunpack.core.support.path_keys import path_key
+            from sunpack.runtime.watch.state import WatchStateStore
+
+            state = WatchStateStore(str(tmp_path / "state.snapshot"))
+            try:
+                [pending] = state.pending_work_items()
+                output = killed["output"]
+                assert pending.active_outputs == {killed["owner"]: output}
+                owned = state._native.runtime_record("owned|" + path_key(output))
+                assert owned["identities"] == [pending.output_identities[output]]
+            finally:
+                state.close()
     else:
         assert any(item["committed_roots"] for item in killed["pending"])
     recovered = _run_child(tmp_path, "watch", "recover")
     assert recovered["pending"] == 0
     assert recovered["entries"] == []
-    markers = list((tmp_path / "output").rglob("wal-marker.txt"))
+    markers = list(output_root.rglob("wal-marker.txt"))
     assert len(markers) == 1
     assert markers[0].read_text(encoding="utf-8") == expected
-    assert not list((tmp_path / "output").rglob("crash-partial.txt"))
+    assert not list(output_root.rglob("crash-partial.txt"))
     # A second restart must neither duplicate extraction nor restore stale owners.
     assert _run_child(tmp_path, "watch", "recover")["pending"] == 0
-    assert list((tmp_path / "output").rglob("wal-marker.txt")) == markers
+    assert list(output_root.rglob("wal-marker.txt")) == markers
 
 
 @pytest.mark.requires_watch_broker
@@ -227,17 +247,18 @@ def test_multiple_watch_requests_recover_without_duplicate_outputs(tmp_path):
         directory.mkdir()
         expected = _archive(directory, kind)
         sources.extend(json.loads((directory / "manifest.json").read_text(encoding="utf-8"))["sources"])
-    (tmp_path / "manifest.json").write_text(json.dumps({"sources": sources}), encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(json.dumps({"sources": sources, "output_in_watch": True}), encoding="utf-8")
+    outputs = [parent / "output" for parent in dict.fromkeys(Path(path).parent for path in sources)]
     killed = _run_child(tmp_path, "watch", "concurrent", kill=True)
     assert killed["started"] == 5
     recovered = _run_child(tmp_path, "watch", "recover")
     assert recovered["pending"] == 0
     assert recovered["entries"] == []
-    markers = list((tmp_path / "output").rglob("wal-marker.txt"))
+    markers = [marker for output in outputs for marker in output.rglob("wal-marker.txt")]
     assert len(markers) == 5
     assert all(marker.read_text(encoding="utf-8") == expected for marker in markers)
     assert _run_child(tmp_path, "watch", "recover")["pending"] == 0
-    assert list((tmp_path / "output").rglob("wal-marker.txt")) == markers
+    assert [marker for output in outputs for marker in output.rglob("wal-marker.txt")] == markers
 
 
 @pytest.mark.requires_watch_broker

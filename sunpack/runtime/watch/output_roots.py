@@ -55,13 +55,24 @@ class WatchOutputRoots:
         if not self._relevant(paths):
             return
         with self._lock:
-            if self._closed or any(self.protected(item) for item in paths):
+            if not self._needs_registration(paths):
                 return
             # Reservations already exclude this root before mkdir emits events.
             # Only Watch-relevant outputs incur identity IO and a WAL record.
             # Exclusive creation must reject directories created by other processes.
             create_output_root(os.path.abspath(path))
             self._put(path, paths)
+
+    def start_task_output(self, owner, task, path):
+        paths = self._paths(path)
+        if self._relevant(paths):
+            with self._lock:
+                if self._needs_registration(paths):
+                    return self.state.record_task_output_started(owner, task, path, owned_paths=paths)
+        return self.state.record_task_output_started(owner, task, path)
+
+    def _needs_registration(self, paths):
+        return not self._closed and not any(self.protected(path) for path in paths)
 
     def _put(self, path, paths):
         record = {"path": os.path.abspath(path), "identities": [self._identity(path)]}

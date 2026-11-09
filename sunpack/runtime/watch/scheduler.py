@@ -2380,7 +2380,9 @@ class WatchScheduler:
                 raise RuntimeError("watch input promotion state transition rejected")
             return
         if name == "task_output_started":
-            if not self.state.record_task_output_started(
+            start_output = (self._outputs.start_task_output if event.get("register_output")
+                            else self.state.record_task_output_started)
+            if not start_output(
                 owner_path,
                 str(event.get("task_path") or getattr(archive_task, "main_path", "") or ""),
                 str(event.get("output_dir") or ""),

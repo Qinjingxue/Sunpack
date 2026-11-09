@@ -112,12 +112,13 @@ impl NativeDiscoveryScope {
 
 #[pyfunction]
 pub(crate) fn create_output_root(py: Python<'_>, path: String) -> PyResult<()> {
-    py.detach(|| {
-        let path = std::path::Path::new(&path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::create_dir(path)
-    })
-    .map_err(Into::into)
+    py.detach(|| create_output_root_exclusive(std::path::Path::new(&path)))
+        .map_err(Into::into)
+}
+
+pub(crate) fn create_output_root_exclusive(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(path)
 }

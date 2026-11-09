@@ -111,12 +111,17 @@ async def watch_scenario(root, mode):
     config["post_extract"].update(archive_cleanup_mode="keep", flatten_single_directory=False)
     config["watch"].update(clipboard_monitor_enabled=False)
     input_roots = list(dict.fromkeys(str(Path(path).parent) for path in manifest["sources"]))
-    output_roots = {path: str(root / "output" / str(index)) if len(input_roots) > 1
-                    else str(root / "output") for index, path in enumerate(input_roots)}
+    if manifest.get("output_in_watch"):
+        output_roots = {path: str(Path(path) / "output") for path in input_roots}
+    else:
+        output_roots = {path: str(root / "output" / str(index)) if len(input_roots) > 1
+                        else str(root / "output") for index, path in enumerate(input_roots)}
     sunpack_native.watch_broker_acquire()
     try:
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, [WatchRootEntry(path, output_roots[path], True) for path in input_roots],
+            watcher = WatchScheduler(config, [WatchRootEntry(
+                path, output_roots[path], deep_detect=True, recursive=bool(manifest.get("output_in_watch")),
+            ) for path in input_roots],
                 state_path=str(root / "state.snapshot"),
                 pipeline_engine=engine)
             original = watcher._handle_pipeline_progress

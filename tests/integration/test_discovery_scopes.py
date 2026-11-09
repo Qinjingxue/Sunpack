@@ -635,12 +635,14 @@ def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion
         alias.rmdir()
 
 
-def test_reserved_output_rejects_external_directory_before_registration(tmp_path):
+@pytest.mark.parametrize("watch_start", [False, True])
+def test_reserved_output_rejects_external_directory_before_registration(tmp_path, watch_start):
     """Internal collision tests never create an external directory after reservation.
 
     This ordering must reject registration without claiming or changing its contents.
     """
     from sunpack.core.support.output_reservation import OutputReservationRegistry
+    from sunpack.runtime.watch.scanner import WatchCandidate
 
     root = tmp_path / "input"
     root.mkdir()
@@ -654,8 +656,15 @@ def test_reserved_output_rejects_external_directory_before_registration(tmp_path
         output.mkdir()
         sentinel = output / "external.txt"
         sentinel.write_text("external content", encoding="utf-8")
-        with pytest.raises(FileExistsError):
-            registry.register_watch_output(str(output))
+        if watch_start:
+            source = str(root / "archive")
+            state.queue_active(WatchCandidate(path=source, size=10, mtime=1.0), durable=True)
+            with pytest.raises(FileExistsError):
+                outputs.start_task_output(source, source, str(output))
+            assert not state.pending_work_items()[0].active_outputs
+        else:
+            with pytest.raises(FileExistsError):
+                registry.register_watch_output(str(output))
         assert not outputs.protected(str(sentinel))
         assert not state._native.runtime_keys("owned|")
         assert list(output.iterdir()) == [sentinel]
