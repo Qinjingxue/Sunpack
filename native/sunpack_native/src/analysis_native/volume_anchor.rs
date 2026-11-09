@@ -15,6 +15,7 @@ use crate::io::resource_lifecycle::{NativeReadScope, TrackedFile};
 use crate::password::rar::{
     rar4_decrypt_header_flags_with_read, rar5_decrypt_main_header_with_read,
 };
+use crate::scan::compression_stream::validate_bzip2_identity;
 use crate::scan::pe_overlay::{probe_pe_prefix, PeState};
 use std::borrow::Cow;
 
@@ -1535,7 +1536,12 @@ fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor, path: Option<&
     // A continuation volume may start with arbitrary compressed/encrypted
     // bytes. Magic alone must not remove it from its archive's cohort.
     // Keep the canonical identity fact on the anchor for Detection to reuse.
-    if !crate::analysis_native::confirm_format_identity_native(path.unwrap_or(&out.path), format) {
+    let confirmed = if format == "bzip2" {
+        validate_bzip2_identity(prefix, out.size).is_ok()
+    } else {
+        crate::analysis_native::confirm_format_identity_native(path.unwrap_or(&out.path), format)
+    };
+    if !confirmed {
         return;
     }
     out.format = format.to_string();

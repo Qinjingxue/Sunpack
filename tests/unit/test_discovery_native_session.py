@@ -202,6 +202,30 @@ asyncio.run(run())
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_bzip2_detection_claims_valid_head_and_carves_after_forged_head(tmp_path):
+    import bz2
+
+    stream = bz2.compress(b"payload")
+    forged = stream[:10] + bytes(32)  # Valid marker, impossible empty symbol map.
+    leading = tmp_path / "leading.opaque"
+    carrier = tmp_path / "carrier.opaque"
+    # A gapped second stream makes the leading case enter Embedded if Detection
+    # still runs the carrier resolver. A fake first block must leave it there.
+    leading.write_bytes(stream + b"gap" + stream)
+    carrier.write_bytes(forged + stream + b"suffix")
+    table = build_native_table_for_targets([str(tmp_path)], config=make_config())
+    routes = table.resolve()
+    assert [(table.summary(index)[0], status) for index, status in routes.detection_events] == [
+        (str(leading), 1),
+    ]
+    batch = table.prepare_embedded(routes)
+    (_, [(index, status, _, scan)]), = type(batch).scan_pages([(table, batch)], 0, len(batch))
+    assert table.summary(index)[0] == str(carrier) and status == 1
+    assert [(row["offset"], row["end_offset"]) for row in scan["candidates"]] == [
+        (len(forged), len(forged) + len(stream)),
+    ]
+
+
 def test_native_discovery_does_not_project_negative_embedded_candidates(tmp_path):
     for index in range(32):
         (tmp_path / f"fake_{index:03}.zip").write_bytes(b"not an archive")

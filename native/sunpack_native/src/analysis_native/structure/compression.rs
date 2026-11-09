@@ -1,6 +1,7 @@
 use crate::scan::compression_stream::{
-    analyze_gzip_structure, validate_bzip2_structure, validate_gzip_structure,
-    validate_xz_structure_exact, validate_zstd_structure, StructureValidation,
+    analyze_gzip_structure, validate_bzip2_identity, validate_bzip2_structure,
+    validate_gzip_structure, validate_xz_structure_exact, validate_zstd_structure,
+    StructureValidation, BZIP2_IDENTITY_BYTES,
 };
 use std::io::Cursor;
 
@@ -214,7 +215,7 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         Err(_) => return compression_identity_result("", "", false, 0, 0, false, "os_error", &[]),
     };
     let file_size = reader.len();
-    let read_size = file_size.min(32) as usize;
+    let read_size = file_size.min(BZIP2_IDENTITY_BYTES as u64) as usize;
     let mut data = match reader.read_direct_at(0, read_size) {
         Ok(value) => value,
         Err(_) => {
@@ -409,51 +410,34 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
     }
 
     if data.starts_with(b"BZh") {
-        if data.len() < 14 || !matches!(data[3], b'1'..=b'9') {
-            return compression_identity_result(
-                "bzip2",
-                ".bz2",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "bzip2_header_invalid",
-                &["bzip2:magic"],
-            );
-        }
-        const BLOCK_MAGIC: &[u8; 6] = b"\x31\x41\x59\x26\x53\x59";
-        const END_MAGIC: &[u8; 6] = b"\x17\x72\x45\x38\x50\x90";
-        let marker = &data[4..10];
-        if marker != BLOCK_MAGIC && marker != END_MAGIC {
-            return compression_identity_result(
-                "bzip2",
-                ".bz2",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "bzip2_first_marker_invalid",
-                &["bzip2:magic", "bzip2:block_size"],
-            );
-        }
-        let evidence = if marker == BLOCK_MAGIC {
-            vec![
-                "bzip2:magic",
-                "bzip2:block_size",
-                "bzip2:first_block_marker",
-            ]
-        } else {
-            vec!["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"]
-        };
+        let (plausible, error, evidence): (_, _, &[_]) =
+            match validate_bzip2_identity(&data, file_size) {
+                Ok(true) => (
+                    true,
+                    "",
+                    &["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"],
+                ),
+                Ok(false) => (
+                    true,
+                    "",
+                    &[
+                        "bzip2:magic",
+                        "bzip2:block_size",
+                        "bzip2:first_block_marker",
+                        "bzip2:first_block_header",
+                    ],
+                ),
+                Err(error) => (false, error.code(), &["bzip2:magic"]),
+            };
         return compression_identity_result(
             "bzip2",
             ".bz2",
             true,
             file_size,
             base_bytes_read,
-            true,
-            "",
-            &evidence,
+            plausible,
+            error,
+            evidence,
         );
     }
 

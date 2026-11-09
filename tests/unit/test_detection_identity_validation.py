@@ -65,3 +65,10 @@ def test_detection_rejects_magic_only_compression_false_positives(tmp_path):
     wrong_format = tmp_path / "gzip-routed-as-xz.bin"
     wrong_format.write_bytes(gzip.compress(b"payload"))
     assert confirm(str(wrong_format), "xz") is False
+
+    empty = tmp_path / "empty-bzip2.bin"
+    encoded = bz2.compress(b"")
+    empty.write_bytes(encoded)
+    assert confirm(str(empty), "bzip2")
+    empty.write_bytes(encoded[:-1] + b"\x01")
+    assert not confirm(str(empty), "bzip2")

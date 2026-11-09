@@ -1197,7 +1197,10 @@ impl NativeCandidateTable {
                                 format,
                                 "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
                             ) && anchor.is_some_and(|anchor| anchor.standalone);
-                            let scan = if accepted && format != "enc" {
+                            // A leading BZip2 stream owns the whole input for
+                            // Detection. The worker decodes it and checks CRC.
+                            let needs_scan = !matches!(format, "enc" | "bzip2");
+                            let scan = if accepted && needs_scan {
                                 Some(
                                     scan_detected_path(path, format, parallel_files)
                                         .map(Arc::new)
@@ -1207,7 +1210,7 @@ impl NativeCandidateTable {
                                 None
                             };
                             let accepted = accepted
-                                && (format == "enc"
+                                && (!needs_scan
                                     || scan
                                         .as_ref()
                                         .and_then(|scan| scan.as_ref().ok())

@@ -1215,8 +1215,79 @@ pub(crate) fn bzip2_marker_is_end(marker: u64) -> ValidationResult<bool> {
 }
 
 pub(crate) fn bzip2_prefix_valid(prefix: &[u8; 10]) -> bool {
-    bzip2_header_block_limit(prefix[..4].try_into().unwrap()).is_ok()
-        && bzip2_marker_is_end(prefix[4..].iter().fold(0, |n, b| (n << 8) | u64::from(*b))).is_ok()
+    read_bzip2_prefix(prefix).is_ok()
+}
+
+fn read_bzip2_prefix(prefix: &[u8; 10]) -> ValidationResult<(usize, bool)> {
+    let block_limit = bzip2_header_block_limit(prefix[..4].try_into().unwrap())?;
+    let marker = prefix[4..].iter().fold(0, |n, b| (n << 8) | u64::from(*b));
+    Ok((block_limit, bzip2_marker_is_end(marker)?))
+}
+
+// Stream header, marker and CRC (14 bytes), then at most 315 bits through
+// the selector count. Detection already has these bytes in its file head.
+pub(crate) const BZIP2_IDENTITY_BYTES: usize = 54;
+
+/// Validate a bounded leading header. The result indicates an empty first stream.
+pub(crate) fn validate_bzip2_identity(prefix: &[u8], file_size: u64) -> ValidationResult<bool> {
+    let Some(fixed) = prefix.first_chunk::<14>() else {
+        return invalid("bzip2_header_invalid");
+    };
+    let (block_limit, is_end) = read_bzip2_prefix(fixed[..10].try_into().unwrap())?;
+    if is_end {
+        return if fixed[10..14] == [0; 4] {
+            Ok(true)
+        } else {
+            invalid("bzip2_combined_crc_mismatch")
+        };
+    }
+    let mut position = 14 * 8;
+    let (orig_ptr, n_in_use, group_count, selector_count) = read_bzip2_block_header(|count| {
+        let end = position + usize::from(count);
+        if end > prefix.len() * 8 {
+            return invalid("unexpected_end_of_stream");
+        }
+        let mut value = 0;
+        for bit in position..end {
+            value = (value << 1) | u32::from((prefix[bit / 8] >> (7 - bit % 8)) & 1);
+        }
+        position = end;
+        Ok(value)
+    })?;
+    if orig_ptr >= block_limit {
+        return invalid("bzip2_orig_ptr_out_of_range");
+    }
+    // Selectors cost at least one bit each. Each table has a five-bit starting
+    // length and at least one bit per symbol (including RUNB/RUNA and EOB).
+    // A nonempty block also needs data, EOB, and the eventual stream trailer.
+    let minimum_bits = position + selector_count + group_count * (5 + n_in_use + 2) + 2 + 80;
+    if file_size < minimum_bits.div_ceil(8) as u64 {
+        return invalid("unexpected_end_of_stream");
+    }
+    Ok(false)
+}
+
+fn read_bzip2_block_header(
+    mut read: impl FnMut(u8) -> ValidationResult<u32>,
+) -> ValidationResult<(usize, usize, usize, usize)> {
+    let _randomized = read(1)?;
+    let orig_ptr = read(24)? as usize;
+    let in_use16 = read(16)?;
+    let mut n_in_use = 0usize;
+    for group in 0..16 {
+        if in_use16 & (1 << (15 - group)) != 0 {
+            n_in_use += read(16)?.count_ones() as usize;
+        }
+    }
+    if n_in_use == 0 {
+        return invalid("bzip2_empty_symbol_map");
+    }
+    let group_count = read(3)? as usize;
+    let selector_count = read(15)? as usize;
+    if !(2..=6).contains(&group_count) || selector_count == 0 {
+        return invalid("bzip2_huffman_counts_invalid");
+    }
+    Ok((orig_ptr, n_in_use, group_count, selector_count))
 }
 
 pub(crate) fn validate_bzip2_structure_observed(
@@ -1246,22 +1317,10 @@ pub(crate) fn validate_bzip2_structure_observed(
             }
             let block_crc = bits.read(32)?;
             combined_crc = combined_crc.rotate_left(1) ^ block_crc;
-            let _randomized = bits.read(1)?;
-            let orig_ptr = bits.read(24)? as usize;
-            let in_use16 = bits.read(16)?;
-            let mut n_in_use = 0usize;
-            for group in 0..16 {
-                if in_use16 & (1 << (15 - group)) != 0 {
-                    n_in_use += bits.read(16)?.count_ones() as usize;
-                }
-            }
-            if n_in_use == 0 {
-                return invalid("bzip2_empty_symbol_map");
-            }
+            let (orig_ptr, n_in_use, group_count, selector_count) =
+                read_bzip2_block_header(|count| bits.read(count))?;
             let alpha_size = n_in_use + 2;
-            let group_count = bits.read(3)? as usize;
-            let selector_count = bits.read(15)? as usize;
-            if !(2..=6).contains(&group_count) || !(1..=18_002).contains(&selector_count) {
+            if selector_count > 18_002 {
                 return invalid("bzip2_huffman_counts_invalid");
             }
             let mut mtf_groups = [0u8, 1, 2, 3, 4, 5];
