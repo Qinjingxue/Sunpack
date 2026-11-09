@@ -731,7 +731,7 @@ end;
 
 function UpgradeConfigurationFields: Boolean;
 var
-  Parameters: string;
+  Parameters, PreviousVersion: string;
   ResultCode: Integer;
 begin
   { Prepare and validate retained data before replacing the old application.
@@ -742,8 +742,10 @@ begin
     AddQuotes(ExpandConstant('{tmp}\upgrade_config.ps1')) +
     ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json')) +
     ' -TemplateConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-config-template.json')) +
-    ' -AdvancedConfig ' + AddQuotes(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json') +
-    ' -PreviousVersion ' + AddQuotes(InstalledVersion);
+    ' -AdvancedConfig ' + AddQuotes(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json');
+  PreviousVersion := InstalledVersion;
+  if PreviousVersion <> '' then
+    Parameters := Parameters + ' -PreviousVersion ' + AddQuotes(PreviousVersion);
   Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
                  Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if Result then Result := ResultCode = 0;

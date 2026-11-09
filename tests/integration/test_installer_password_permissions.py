@@ -104,6 +104,17 @@ end;
 """, encoding="utf-8-sig")
     result = subprocess.run([compiler, "/Qp", str(harness)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+    fresh = tmp_path / "fresh install"
+    fresh.mkdir()
+    log = fresh / "setup.log"
+    result = subprocess.run([
+        str(harness.with_suffix(".exe")), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/SP-", "/NORESTART",
+        f"/DIR={fresh / 'app'}", f"/Fixture={fresh}", f"/Data={fresh / 'data'}", "/AddPath=0", f"/LOG={log}",
+    ], capture_output=True, text=True)
+    assert result.returncode == 0, log.read_text(encoding="utf-8-sig", errors="replace")
+    assert (fresh / "completed").is_file()
+
     cases = [("v1.2.9", True, False), ("v1.3.0", True, False),
              ("v1.3.5-2-gabcdef0", True, False), ("1.4.0", False, False),
              ("1.10.0", False, False), (None, False, True), ("invalid", False, True),
