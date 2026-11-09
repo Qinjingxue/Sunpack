@@ -72,7 +72,6 @@ private:
     std::unique_ptr<Renderer> renderer_;
     bool rendererReady_ = false;
     bool targetReady_ = false;
-    bool liveResize_ = false;
     bool trimmedWhileMinimized_ = false;
     int widthPx_ = 0;
     int heightPx_ = 0;

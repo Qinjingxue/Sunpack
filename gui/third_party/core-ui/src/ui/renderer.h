@@ -74,7 +74,7 @@ public:
     // round corners come from D2D's normal FillRoundedRectangle path.
     bool CreateRenderTargetForLayered(HWND hwnd);
     void ReleaseRenderTarget();
-    HRESULT Resize(UINT width, UINT height, bool liveResize = false);
+    HRESULT Resize(UINT width, UINT height);
     bool UsesCompositionSurface() const { return bool(compositionFrame_); }
     void BeginDraw();
     HRESULT EndDraw(bool trimCompositionSurface = false);
@@ -265,6 +265,8 @@ public:
     void ReplayDisplayList(const DisplayList& list);
     void PrepareDisplayList(const DisplayList& list);
     void RenderDisplayList(DisplayList list, bool incremental);
+    HRESULT DrawDisplayListFrame(DisplayList list, bool incremental, bool trimCompositionSurface);
+    ComPtr<ID2D1Bitmap1> ScreenshotBitmap();
 
     // SVG icon support
     SvgIcon ParseSvgIcon(const std::string& svgContent);
@@ -336,8 +338,13 @@ public:
 private:
 
     struct CompositionFrame;
-    HRESULT CreateCompositionFrame(const D2D1_BITMAP_PROPERTIES1& bitmapProps, UINT width, UINT height);
-    HRESULT ResizeCompositionBitmap(const D2D1_BITMAP_PROPERTIES1& bitmapProps, UINT width, UINT height);
+    HRESULT CreateCompositionFrame(UINT width, UINT height, float dpi);
+    HRESULT CreateCompositionBitmap(ComPtr<ID2D1Bitmap1>& bitmap);
+    HRESULT EnsureCompositionSurface(bool trim);
+    HRESULT BeginCompositionUpdate(const RECT& region, POINT& offset, ComPtr<ID2D1Bitmap1>& bitmap);
+    HRESULT CommitCompositionFrame(bool skipVsync);
+    void UpdateDisplayListDamage(const DisplayList& list, bool incremental);
+    void ReplayDisplayListFrame(DisplayList list, bool clip);
     HRESULT PresentCompositionFrame(bool skipVSync, bool trim);
     std::unique_ptr<CompositionFrame> compositionFrame_;
     /* 视口剔除矩形栈 (build 285). 嵌套 ScrollView 时取交集 —— 内层只可能比

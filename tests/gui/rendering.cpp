@@ -240,14 +240,25 @@ void rendering_contracts() {
         Surface surface(20,true);
         auto& renderer=surface.renderer;
         if(renderer.UsesCompositionSurface()) {
-            ComPtr<ID2D1Image> original, live;
-            renderer.RT()->GetTarget(&original);
-            assert(SUCCEEDED(renderer.Resize(601,421,true)));
-            renderer.RT()->GetTarget(&live);
-            assert(live.Get()==original.Get());
             assert(SUCCEEDED(renderer.Resize(601,421)));
-            const auto size=renderer.RT()->GetPixelSize();
+            ui::DisplayList base;
+            base.width_px=601; base.height_px=421;
+            base.dpi_scale=float(GetDpiForWindow(surface.hwnd))/96;
+            ui::DisplayListRecorder list(std::move(base));
+            list.Clear(D2D1::ColorF(0x202020));
+            renderer.skipVSync=true;
+            assert(SUCCEEDED(renderer.DrawDisplayListFrame(list.Finish(),false,true)));
+            ComPtr<ID2D1Image> target;
+            renderer.RT()->GetTarget(&target);
+            assert(!target);
+            auto screenshot=renderer.ScreenshotBitmap();
+            assert(screenshot);
+            const auto size=screenshot->GetPixelSize();
             assert(size.width==601 && size.height==421);
+            renderer.RT()->SetTarget(screenshot.Get());
+            const auto captured=pixels(renderer);
+            renderer.RT()->SetTarget(nullptr);
+            assert(captured[0]==0x20 && captured[1]==0x20 && captured[2]==0x20 && captured[3]==0xff);
         }
     }
     // Hidden and prepared buffers must not masquerade as actual presentation.

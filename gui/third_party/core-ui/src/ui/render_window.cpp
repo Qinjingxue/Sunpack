@@ -102,12 +102,9 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
     }
     const bool visible = IsWindowVisible(hwnd_) && !IsIconic(hwnd_);
     const bool presentNow = visible && !job.defer_present;
-    const bool sizeChanged = widthPx_ != job.width_px || heightPx_ != job.height_px;
-    const bool finishResize = liveResize_ && !job.live_resize && renderer_->UsesCompositionSurface();
-    const bool resize = sizeChanged || finishResize;
+    const bool resize = widthPx_ != job.width_px || heightPx_ != job.height_px;
     if (resize) {
-        const HRESULT resized = renderer_->Resize(static_cast<UINT>(job.width_px), static_cast<UINT>(job.height_px),
-                                                  job.live_resize);
+        const HRESULT resized = renderer_->Resize(static_cast<UINT>(job.width_px), static_cast<UINT>(job.height_px));
         if (FAILED(resized)) {
             ReleaseResources();
             return resized == D2DERR_RECREATE_TARGET ? RenderFrameResult::RecreateTarget : RenderFrameResult::DeviceFailure;
@@ -115,18 +112,15 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
         widthPx_ = job.width_px;
         heightPx_ = job.height_px;
     }
-    liveResize_ = job.live_resize;
     trimmedWhileMinimized_ = false;
 
     renderer_->skipPresent = !presentNow;
     renderer_->skipVSync = visible && !job.animate &&
                            job.policy != PresentPolicy::Final &&
                            job.policy != PresentPolicy::Screenshot;
-    renderer_->PrepareDisplayList(job.display_list);
-    renderer_->BeginDraw();
-    renderer_->RenderDisplayList(std::move(job.display_list), !resize && !job.defer_present && !job.startup_reveal &&
-        visible && surfaceKind_ != RenderSurfaceKind::LayeredComposition && job.policy != PresentPolicy::Screenshot);
-    HRESULT hr = renderer_->EndDraw(!job.live_resize);
+    const bool incremental = !resize && !job.defer_present && !job.startup_reveal &&
+        visible && surfaceKind_ != RenderSurfaceKind::LayeredComposition && job.policy != PresentPolicy::Screenshot;
+    const HRESULT hr = renderer_->DrawDisplayListFrame(std::move(job.display_list), incremental, !job.live_resize);
     if (hr == D2DERR_RECREATE_TARGET) {
         ReleaseResources();
         return RenderFrameResult::RecreateTarget;
@@ -196,8 +190,7 @@ int RenderWindow::ScreenshotRegion(D2D1_RECT_F region, const std::wstring& outPa
     HRESULT hr = ctx->CreateBitmap(D2D1::SizeU(pxw, pyh), nullptr, 0, cpuProps, &cpuBmp);
     if (FAILED(hr)) return -3;
 
-    ComPtr<ID2D1Bitmap1> target;
-    ctx->GetTarget(reinterpret_cast<ID2D1Image**>(target.GetAddressOf()));
+    auto target = renderer_->ScreenshotBitmap();
     if (!target) return -4;
 
     D2D1_POINT_2U dst = {0, 0};
@@ -252,7 +245,6 @@ void RenderWindow::ReleaseResources() {
     }
     rendererReady_ = false;
     targetReady_ = false;
-    liveResize_ = false;
     trimmedWhileMinimized_ = false;
     widthPx_ = 0;
     heightPx_ = 0;

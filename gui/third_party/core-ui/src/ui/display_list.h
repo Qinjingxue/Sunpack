@@ -289,6 +289,7 @@ struct DisplayListBounds {
     std::vector<D2D1_RECT_F> commands;
     std::vector<size_t> ends;
     bool incremental = true;
+    bool readsTarget = false;
 };
 // Optional device-resolved local ink bounds, before the command/stack transform.
 // Unknown resources retain their conservative clip footprint.

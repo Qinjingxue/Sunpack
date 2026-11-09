@@ -148,6 +148,7 @@ DisplayListBounds AnalyzeDisplayList(const DisplayList& list, DisplayListInkQuer
                 bounds=IntersectRect(clips.back(),ink);
             } else bounds=clips.back();
         } else if(c.type==DrawCommandType::DrawSvgTextRuns || c.type==DrawCommandType::DrawBackdropBlur) {
+            result.readsTarget |= c.type==DrawCommandType::DrawBackdropBlur;
             result.incremental=false; bounds=window;
         } else {
             auto local=c.rect;
