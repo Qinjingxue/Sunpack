@@ -112,7 +112,7 @@ static EMBEDDED_PACKED_MATCHER: OnceLock<Option<packed::Searcher>> = OnceLock::n
 const DEFAULT_IOCP_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 // Discovery shares one byte budget over all file producers, independent of
 // root count. Account for both read slots and outstanding matching jobs.
-const DISCOVERY_IOCP_BYTE_BUDGET: usize = 2 * 1024 * 1024;
+const DISCOVERY_IOCP_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 const MAX_DISCOVERY_IOCP_CHUNK_SIZE: usize = 512 * 1024;
 const DEFAULT_IOCP_BUFFERS: usize = 2;
 const DEFAULT_IOCP_WORKERS: usize = 4;

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from benchmarks.harness.reporting import report_from_payload, render_report
 from benchmarks.harness.workspace import BenchmarkWorkspace
 from benchmarks.watch_broker import watch_broker_lease
+from benchmarks.watch_wakeup import WatchWakeup
 from benchmarks.scenarios.extraction_large_archive import (
     RequestRuntimeProfiler,
     _timing_totals,
@@ -128,6 +129,7 @@ async def _run_once(
     watcher: WatchScheduler | None = None
     try:
         await engine.__aenter__()
+        wakeup = WatchWakeup()
         watcher = WatchScheduler(
             config,
             [WatchRootEntry(str(root))],
@@ -135,6 +137,7 @@ async def _run_once(
             # result lands in the watch directory itself.
             state_path=str(state_path),
             pipeline_engine=engine,
+            wake_callback=wakeup.notify,
         )
         _wrap_scheduler_timers(watcher, destination, timings)
         await watcher.start()
@@ -144,10 +147,10 @@ async def _run_once(
         timings["copy_seconds"] = _now() - copy_started
         timings["copy_finished"] = _now()
 
-        deadline = _now() + timeout
+        deadline = wakeup.loop.time() + timeout
         completed = False
         terminal_status = ""
-        while _now() < deadline:
+        while wakeup.loop.time() < deadline:
             tick_started = _now()
             await watcher.run_once()
             tick_seconds.append(_now() - tick_started)
@@ -160,8 +163,7 @@ async def _run_once(
                     break
             if terminal_status:
                 break
-            delay = watcher.next_delay_seconds()
-            await asyncio.sleep(0.01 if delay is None else min(max(delay, 0.001), 0.05))
+            await wakeup.wait(watcher.next_delay_seconds(), deadline)
         else:
             raise TimeoutError(
                 f"watch did not complete output before {timeout:g}s; "
@@ -221,7 +223,7 @@ async def _run_once(
         return result
     finally:
         if watcher is not None:
-            await watcher.stop()
+            await watcher.aclose()
         profiler.restore()
         await engine.aclose(graceful=True)
 

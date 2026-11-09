@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from benchmarks.harness.reporting import report_from_payload, render_report
 from benchmarks.harness.workspace import BenchmarkWorkspace
 from benchmarks.watch_broker import watch_broker_lease
+from benchmarks.watch_wakeup import WatchWakeup
 from benchmarks.scenarios.extraction_large_archive import RequestRuntimeProfiler, _timing_totals
 from sunpack.core.config.loader import load_config
 from sunpack.pipeline.coordinator.engine import PipelineEngine
@@ -218,21 +219,21 @@ async def _arrive(
 
 async def _wait_for_completion(
     watcher: WatchScheduler,
+    wakeup: WatchWakeup,
     timings: dict[str, Any],
     *,
     timeout_seconds: float,
     tick_seconds: list[float],
 ) -> None:
-    deadline = _now() + timeout_seconds
-    while _now() < deadline:
+    deadline = wakeup.loop.time() + timeout_seconds
+    while wakeup.loop.time() < deadline:
         tick_seconds.append(await _pump(watcher))
         if any(
             row.get("state_status") in {"done_or_cleared", "done"}
             for row in timings.get("attempts", [])
         ) and watcher.pending_count == 0 and not watcher._inflight_requests:
             return
-        delay = watcher.next_delay_seconds()
-        await asyncio.sleep(0.01 if delay is None else min(max(delay, 0.001), 0.05))
+        await wakeup.wait(watcher.next_delay_seconds(), deadline)
     raise TimeoutError(
         f"watch did not complete output in {timeout_seconds:g}s; "
         f"pending={watcher.pending_count}"
@@ -275,11 +276,13 @@ async def _run_case(
     tick_seconds: list[float] = []
     try:
         await engine.__aenter__()
+        wakeup = WatchWakeup()
         watcher = WatchScheduler(
             config,
             [WatchRootEntry(str(root))],
             state_path=str(state_path),
             pipeline_engine=engine,
+            wake_callback=wakeup.notify,
         )
         _install_instrumentation(watcher, destination, timings, attempts)
         await watcher.start()
@@ -288,7 +291,7 @@ async def _run_case(
             chunk_size=chunk_size, delay_seconds=delay_seconds, timings=timings,
         )
         await _wait_for_completion(
-            watcher, timings, timeout_seconds=timeout_seconds, tick_seconds=tick_seconds,
+            watcher, wakeup, timings, timeout_seconds=timeout_seconds, tick_seconds=tick_seconds,
         )
         timings["case_finished"] = _now()
         pipeline_by_request = [_timing_totals(row) for row in profiler.request_timings]
@@ -337,7 +340,7 @@ async def _run_case(
         }
     finally:
         if watcher is not None:
-            await watcher.stop()
+            await watcher.aclose()
         profiler.restore()
         await engine.aclose(graceful=True)
 

@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from benchmarks.harness import BenchmarkWorkspace, PhaseReporter, render_report, report_from_payload
 from benchmarks.watch_broker import watch_broker_lease
+from benchmarks.watch_wakeup import WatchWakeup
 from benchmarks.scenarios.extraction_format_matrix import (
     DEFAULT_CACHE_ROOT,
     GENERATED_FORMATS,
@@ -435,6 +436,7 @@ async def _run_case(
         engine_started = _now()
         await engine.__aenter__()
         timings["engine_ready"] = _now()
+        wakeup = WatchWakeup()
         watcher = WatchScheduler(
             config,
             [WatchRootEntry(str(root))],
@@ -442,6 +444,7 @@ async def _run_case(
             # land in the watch directory itself, exactly like production watch.
             state_path=str(state_path),
             pipeline_engine=engine,
+            wake_callback=wakeup.notify,
         )
         _install_watch_instrumentation(watcher, fed_keys, timings, attempts)
         await watcher.start()
@@ -455,10 +458,9 @@ async def _run_case(
             await asyncio.sleep(0)
         feed_finished = _now()
 
-        deadline = _now() + timeout_seconds
+        deadline = wakeup.loop.time() + timeout_seconds
         timed_out = False
-        idle_ticks = 0
-        while _now() < deadline:
+        while wakeup.loop.time() < deadline:
             tick_started = _now()
             result = await watcher.run_once()
             tick_seconds.append(_now() - tick_started)
@@ -470,16 +472,9 @@ async def _run_case(
                     "errors": [str(item)[:300] for item in result.errors],
                 })
             idle = watcher.pending_count == 0 and not watcher._inflight_requests
-            idle_ticks = idle_ticks + 1 if idle else 0
-            if idle_ticks >= 2 and any("completion_started" in row for row in attempts):
+            if idle and any("completion_started" in row for row in attempts):
                 break
-            if idle_ticks >= 60 and not attempts:
-                # Nothing was ever dispatched: a watch filter or the quiet policy
-                # dropped every candidate.  Report it instead of burning the full
-                # per-case timeout on a case that can never complete.
-                break
-            delay = watcher.next_delay_seconds()
-            await asyncio.sleep(0.01 if delay is None else min(max(delay, 0.001), 0.05))
+            await wakeup.wait(watcher.next_delay_seconds(), deadline)
         else:
             timed_out = True
 
@@ -546,7 +541,7 @@ async def _run_case(
         }
     finally:
         if watcher is not None:
-            await watcher.stop()
+            await watcher.aclose()
         profiler.restore()
         await engine.aclose(graceful=True)
 
