@@ -224,6 +224,7 @@ struct Renderer::CompositionFrame {
     ComPtr<IDCompositionSurface> surface;
     D2D1_SIZE_U capacity{};
     D2D1_SIZE_U viewport{};
+    D2D1_SIZE_U drawingSize{};
     bool fullCopy = true;
 };
 
@@ -492,6 +493,7 @@ HRESULT Renderer::CreateCompositionFrame(const D2D1_BITMAP_PROPERTIES1& bitmapPr
     if (FAILED(hr = frame->visual->SetClip(frame->clip.Get()))) return hr;
     if (FAILED(hr = frame->target->SetRoot(frame->visual.Get()))) return hr;
     if (FAILED(hr = ResizeCompositionBitmap(bitmapProps, width, height))) return hr;
+    frame->drawingSize = {width, height};
     compositionFrame_ = std::move(frame);
     return S_OK;
 }
@@ -508,7 +510,7 @@ HRESULT Renderer::ResizeCompositionBitmap(const D2D1_BITMAP_PROPERTIES1& bitmapP
 
 HRESULT Renderer::PresentCompositionFrame(bool skipVsync, bool trim) {
     auto& frame = *compositionFrame_;
-    const auto size = targetBitmap_->GetPixelSize();
+    const auto size = frame.drawingSize;
     const bool replace = !frame.surface || size.width > frame.capacity.width || size.height > frame.capacity.height ||
         (trim && (size.width != frame.capacity.width || size.height != frame.capacity.height));
     if (replace) {
@@ -674,7 +676,7 @@ void Renderer::ReleaseRenderTarget() {
     ReleaseSharedDeviceRef();
 }
 
-HRESULT Renderer::Resize(UINT width, UINT height) {
+HRESULT Renderer::Resize(UINT width, UINT height, bool liveResize) {
     DebugAssertTargetThread("Resize");
     if (!ctx_ || (!swapChain_ && !compositionFrame_)) return E_UNEXPECTED;
     opacityCommands_.clear();
@@ -688,11 +690,36 @@ HRESULT Renderer::Resize(UINT width, UINT height) {
                {TraceU64("w_px", width), TraceU64("h_px", height)});
 
     if (compositionFrame_) {
-        compositionFrame_->fullCopy = true;
+        auto& frame = *compositionFrame_;
         const float dpi = float(GetDpiForWindow(hwnd_));
-        return ResizeCompositionBitmap(D2D1::BitmapProperties1(
+        const auto capacity = targetBitmap_->GetPixelSize();
+        float bitmapDpiX, bitmapDpiY;
+        targetBitmap_->GetDpi(&bitmapDpiX, &bitmapDpiY);
+        const bool fits = liveResize ? width <= capacity.width && height <= capacity.height
+                                     : width == capacity.width && height == capacity.height;
+        frame.drawingSize = {width, height};
+        frame.fullCopy = true;
+        if (fits && bitmapDpiX == dpi && bitmapDpiY == dpi) return S_OK;
+
+        const auto props = D2D1::BitmapProperties1(
             D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi), width, height);
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+        if (liveResize) {
+            // Keep drag reallocations infrequent and bound padding on each axis.
+            constexpr UINT step = 256;
+            const UINT limit = ctx_->GetMaximumBitmapSize();
+            const auto grow = [limit](UINT size, UINT current) {
+                if (size <= current) return current;
+                return size + std::min((step - size % step) % step, limit - std::min(size, limit));
+            };
+            const UINT paddedWidth = grow(width, capacity.width);
+            const UINT paddedHeight = grow(height, capacity.height);
+            if (paddedWidth != width || paddedHeight != height) {
+                const HRESULT hr = ResizeCompositionBitmap(props, paddedWidth, paddedHeight);
+                if (hr != E_OUTOFMEMORY) return hr;
+            }
+        }
+        return ResizeCompositionBitmap(props, width, height);
     }
 
     {
@@ -827,17 +854,16 @@ void Renderer::DebugAssertTargetThread(const char* op) const {
 }
 
 void Renderer::FlushAndTrimGpu() {
+    SharedD2DGuard d2dGuard;
     if (!ctx_) return;
     ctx_->Flush();
 
-    ComPtr<ID2D1Device> d2dDevice;
-    ctx_->GetDevice(d2dDevice.GetAddressOf());
-    if (d2dDevice) {
-        ComPtr<IDXGIDevice3> dxgi3;
-        if (SUCCEEDED(d2dDevice.As(&dxgi3)) && dxgi3) {
-            dxgi3->Trim();
-        }
+    ComPtr<IDXGIDevice3> device;
+    {
+        std::lock_guard<std::mutex> lock(g_sharedDeviceMu);
+        s_d3dDevice.As(&device);
     }
+    if (device) device->Trim();
 }
 
 void Renderer::Clear(const D2D1_COLOR_F& color) {
@@ -2503,7 +2529,8 @@ bool Renderer::DrawBackdropBlur(const D2D1_RECT_F& rect, float radius, float blu
     D2D1_RECT_F captureDip = toDeviceRect({rect.left - pad, rect.top - pad,
                                            rect.right + pad, rect.bottom + pad});
 
-    auto targetSize = target->GetPixelSize();
+    const auto targetSize = compositionFrame_ && target.Get() == targetBitmap_.Get()
+        ? compositionFrame_->drawingSize : target->GetPixelSize();
     auto floorClamp = [](float v, float scale, UINT maxv) -> UINT {
         int iv = static_cast<int>(std::floor(v * scale));
         iv = std::max(0, std::min(iv, static_cast<int>(maxv)));

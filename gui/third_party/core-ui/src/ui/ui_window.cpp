@@ -2064,10 +2064,14 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             visualPaintDirty_ = true;
             return 0;
         }
-        if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+        const bool iconic = IsIconic(hwnd_);
+        if (!IsWindowVisible(hwnd_) ||
+            (iconic && (!useCompositionSurface_ || !renderThreadPresentActive_))) {
             return 0;
         }
-        PaintAndValidate();
+        // A minimized composition window needs a render-thread maintenance
+        // job, but it has no visible frame to record.
+        PaintAndValidate(iconic);
         return 0;
     }
     case kMsgRenderDeviceLost: {
@@ -2384,7 +2388,7 @@ void UiWindowImpl::BeginAnimationFrame() {
     }
 }
 
-void UiWindowImpl::PaintAndValidate() {
+void UiWindowImpl::PaintAndValidate(bool trimOnly) {
     if (!hwnd_) return;
     // A scroll frame already submitted to the render thread owns the next
     // presentation. Drain duplicate paint notifications without consuming
@@ -2411,10 +2415,11 @@ void UiWindowImpl::PaintAndValidate() {
     }
     ActivateRenderThreadPresent();
     const bool prepared = deferNextFramePresent_ && FrameRequiresPresentBarrier(frame);
-    DisplayList displayList = OnPaint(frame.generation);
+    DisplayList displayList = trimOnly ? DisplayList{} : OnPaint(frame.generation);
     SubmitFrameJob(frame, std::move(displayList));
     ValidateRect(hwnd_, nullptr);
     completeFrame();
+    if (trimOnly) return;
     const bool completed = WaitForRenderGeneration(frame, false, prepared);
     if (prepared) {
         deferredPresentGeneration_ = frame.generation;

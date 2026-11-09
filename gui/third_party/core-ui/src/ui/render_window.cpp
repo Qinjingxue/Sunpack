@@ -55,6 +55,12 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
         return RenderFrameResult::InvalidWindow;
     }
     if (job.width_px <= 0 || job.height_px <= 0 || job.display_list.Empty()) {
+        // The minimized window queues an empty job on its render thread.
+        if (renderer_ && !trimmedWhileMinimized_ &&
+            surfaceKind_ == RenderSurfaceKind::OpaqueCompositionSurface && IsIconic(hwnd_)) {
+            renderer_->FlushAndTrimGpu();
+            trimmedWhileMinimized_ = true;
+        }
         return RenderFrameResult::Skipped;
     }
 
@@ -97,8 +103,11 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
     const bool visible = IsWindowVisible(hwnd_) && !IsIconic(hwnd_);
     const bool presentNow = visible && !job.defer_present;
     const bool sizeChanged = widthPx_ != job.width_px || heightPx_ != job.height_px;
-    if (sizeChanged) {
-        const HRESULT resized = renderer_->Resize(static_cast<UINT>(job.width_px), static_cast<UINT>(job.height_px));
+    const bool finishResize = liveResize_ && !job.live_resize && renderer_->UsesCompositionSurface();
+    const bool resize = sizeChanged || finishResize;
+    if (resize) {
+        const HRESULT resized = renderer_->Resize(static_cast<UINT>(job.width_px), static_cast<UINT>(job.height_px),
+                                                  job.live_resize);
         if (FAILED(resized)) {
             ReleaseResources();
             return resized == D2DERR_RECREATE_TARGET ? RenderFrameResult::RecreateTarget : RenderFrameResult::DeviceFailure;
@@ -106,6 +115,8 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
         widthPx_ = job.width_px;
         heightPx_ = job.height_px;
     }
+    liveResize_ = job.live_resize;
+    trimmedWhileMinimized_ = false;
 
     renderer_->skipPresent = !presentNow;
     renderer_->skipVSync = visible && !job.animate &&
@@ -113,7 +124,7 @@ RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
                            job.policy != PresentPolicy::Screenshot;
     renderer_->PrepareDisplayList(job.display_list);
     renderer_->BeginDraw();
-    renderer_->RenderDisplayList(std::move(job.display_list), !sizeChanged && !job.defer_present && !job.startup_reveal &&
+    renderer_->RenderDisplayList(std::move(job.display_list), !resize && !job.defer_present && !job.startup_reveal &&
         visible && surfaceKind_ != RenderSurfaceKind::LayeredComposition && job.policy != PresentPolicy::Screenshot);
     HRESULT hr = renderer_->EndDraw(!job.live_resize);
     if (hr == D2DERR_RECREATE_TARGET) {
@@ -157,9 +168,8 @@ int RenderWindow::ScreenshotRegion(D2D1_RECT_F region, const std::wstring& outPa
     Renderer::SharedD2DGuard d2dGuard;
 
     auto* ctx = renderer_->RT();
-    auto pixelSize = ctx->GetPixelSize();
-    int fullW = static_cast<int>(pixelSize.width);
-    int fullH = static_cast<int>(pixelSize.height);
+    const int fullW = widthPx_;
+    const int fullH = heightPx_;
     if (fullW <= 0 || fullH <= 0) return -2;
 
     int px0 = 0;
@@ -242,6 +252,8 @@ void RenderWindow::ReleaseResources() {
     }
     rendererReady_ = false;
     targetReady_ = false;
+    liveResize_ = false;
+    trimmedWhileMinimized_ = false;
     widthPx_ = 0;
     heightPx_ = 0;
     renderer_.reset();

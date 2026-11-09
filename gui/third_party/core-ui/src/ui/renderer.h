@@ -74,7 +74,8 @@ public:
     // round corners come from D2D's normal FillRoundedRectangle path.
     bool CreateRenderTargetForLayered(HWND hwnd);
     void ReleaseRenderTarget();
-    HRESULT Resize(UINT width, UINT height);
+    HRESULT Resize(UINT width, UINT height, bool liveResize = false);
+    bool UsesCompositionSurface() const { return bool(compositionFrame_); }
     void BeginDraw();
     HRESULT EndDraw(bool trimCompositionSurface = false);
     HRESULT PresentPrepared(bool skipVSync);

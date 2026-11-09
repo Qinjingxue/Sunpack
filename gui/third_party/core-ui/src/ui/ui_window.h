@@ -166,7 +166,7 @@ private:
     void StartAnimationFrames();
     void StopAnimationFrames();
     bool HasAnimationFrameWork() const;
-    void PaintAndValidate();
+    void PaintAndValidate(bool trimOnly = false);
     void OnResize(UINT width, UINT height);
     void OnDpiChanged(UINT dpi, const RECT* suggested);
     void RefreshClientSizeCache();

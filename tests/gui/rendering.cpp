@@ -145,10 +145,10 @@ void startup_present_contracts() {
 struct Surface {
     HWND hwnd=nullptr;
     ui::Renderer renderer;
-    explicit Surface(int x) {
+    explicit Surface(int x, bool composition=false) {
         hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"STATIC",L"SunPack rendering check",
             WS_POPUP,x,20,640,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
-        assert(hwnd && renderer.Init() && renderer.CreateRenderTarget(hwnd));
+        assert(hwnd && renderer.Init() && renderer.CreateRenderTarget(hwnd,composition));
         ShowWindow(hwnd,SW_SHOWNOACTIVATE);
     }
     ~Surface() { renderer.ReleaseRenderTarget(); DestroyWindow(hwnd); }
@@ -236,6 +236,20 @@ ui::DisplayList scene(Surface& surface,int step) {
 // replay, including alternating buffers, fractional motion, alpha and lifecycle.
 void rendering_contracts() {
     startup_present_contracts();
+    {
+        Surface surface(20,true);
+        auto& renderer=surface.renderer;
+        if(renderer.UsesCompositionSurface()) {
+            ComPtr<ID2D1Image> original, live;
+            renderer.RT()->GetTarget(&original);
+            assert(SUCCEEDED(renderer.Resize(601,421,true)));
+            renderer.RT()->GetTarget(&live);
+            assert(live.Get()==original.Get());
+            assert(SUCCEEDED(renderer.Resize(601,421)));
+            const auto size=renderer.RT()->GetPixelSize();
+            assert(size.width==601 && size.height==421);
+        }
+    }
     // Hidden and prepared buffers must not masquerade as actual presentation.
     // This also exercises the hidden-HWND Present guard on the real driver.
     auto hidden=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED,L"STATIC",L"Prepared frame check",
