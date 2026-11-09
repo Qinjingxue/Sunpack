@@ -5,6 +5,7 @@
 #ifndef Z7_ST
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -825,6 +826,35 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
 #ifndef Z7_ST
 
 static const unsigned kStreamingBZipMaxLanes = 4;
+
+class CStreamingBZipConcurrency
+{
+  static std::atomic<unsigned> Active;
+  const bool Managed;
+public:
+  explicit CStreamingBZipConcurrency(bool managed): Managed(managed)
+  {
+    if (Managed) Active.fetch_add(1, std::memory_order_relaxed);
+  }
+  ~CStreamingBZipConcurrency()
+  {
+    if (Managed) Active.fetch_sub(1, std::memory_order_relaxed);
+  }
+  CStreamingBZipConcurrency(const CStreamingBZipConcurrency &) = delete;
+  CStreamingBZipConcurrency &operator=(const CStreamingBZipConcurrency &) = delete;
+
+  unsigned Limit(unsigned lanes) const
+  {
+    const unsigned active = Managed ? Active.load(std::memory_order_relaxed) : 0;
+    // Concurrent streams compete for cache space during inverse BWT. Keep
+    // the speculative width small when archive-level parallelism is high.
+    if (active >= 6) return 2;
+    if (active >= 4) return 3;
+    return lanes;
+  }
+};
+
+std::atomic<unsigned> CStreamingBZipConcurrency::Active{0};
 static const size_t kStreamingBZipReadChunk = (size_t)1 << 18;  // 256 KiB.
 static const size_t kStreamingBZipCommitChunk = (size_t)1 << 18;
 static const UInt64 kStreamingBZipBlockMagic = UINT64_CONST(0x314159265359);
@@ -1880,11 +1910,6 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
         kStreamingBZipMaxLanes);
   }
 
-  CStreamingParallelBlockPool pool;
-  if (maxLanes > 1 &&
-      !pool.Start(maxLanes - 1, cpuContext))
-    return E_FAIL;
-
   std::array<std::unique_ptr<CStreamingParallelBlockJob>,
       kStreamingBZipMaxLanes> jobs;
 
@@ -1908,6 +1933,12 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       _inProcessed,
       _inputFinished,
       _inputRes);
+
+  // Workers can refer to both jobs and input until the pool has joined.
+  CStreamingBZipConcurrency concurrency(cpuContext != NULL);
+  CStreamingParallelBlockPool pool;
+  if (maxLanes > 1 && !pool.Start(maxLanes - 1, cpuContext))
+    return E_FAIL;
 
   UInt64 inPrev = 0;
   UInt64 outPrev = 0;
@@ -2132,6 +2163,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     // Gather a small speculative batch. The last candidate gets enough
     // compressed lookahead for the maximum legal Huffman-coded block, so a
     // worker can parse a complete block without seeking or rereading input.
+    const unsigned lanes = concurrency.Limit(maxLanes);
     for (;;)
     {
       unsigned blockCandidates = 0;
@@ -2143,11 +2175,11 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
           continue;
         blockCandidates++;
         lastCandidateBit = marker.BitOffset;
-        if (blockCandidates >= maxLanes)
+        if (blockCandidates >= lanes)
           break;
       }
 
-      if (blockCandidates >= maxLanes)
+      if (blockCandidates >= lanes)
       {
         const UInt64 requiredByte =
             (lastCandidateBit >> 3) +
@@ -2178,7 +2210,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
         continue;
       if (marker.IsEnd)
         break;
-      if (candidateCount == maxLanes)
+      if (candidateCount == lanes)
         break;
       starts[candidateCount++] = marker.BitOffset;
     }

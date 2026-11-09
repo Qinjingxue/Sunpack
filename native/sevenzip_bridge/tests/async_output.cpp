@@ -93,9 +93,13 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     times.attributes = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
     const auto file = writer.make_file(
         job, (directory / L"parallel.bin").wstring(), L"parallel.bin", 0, 0, times);
+    // Start with a partial buffer and then grow it before submission. The
+    // content check below also verifies the staged prefix survives growth.
+    constexpr std::uint32_t prefix = 113;
     std::uint32_t processed = 0;
-    if (writer.write(file, expected.data(), static_cast<std::uint32_t>(expected.size()), &processed) != S_OK ||
-        processed != expected.size()) {
+    if (writer.write(file, expected.data(), prefix, &processed) != S_OK || processed != prefix ||
+        writer.write(file, expected.data() + prefix, static_cast<std::uint32_t>(expected.size() - prefix), &processed) != S_OK ||
+        processed != expected.size() - prefix) {
         return false;
     }
     writer.record_operation_result(file, 0);

@@ -6,6 +6,7 @@
 
 #include "../../../C/Alloc.h"
 #include "internal/decoder_cpu_budget.h"
+#include "internal/decoder_memory.h"
 // #include "../../../C/CpuTicks.h"
 
 #include "../Common/StreamUtils.h"
@@ -114,7 +115,11 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     if (creditManaged || (_tryMt && numThreads >= 1))
     {
       const UInt32 dictSize = LZMA2_DIC_SIZE_FROM_PROP_FULL(_prop);
-      const UInt64 expectedBlockSize64 = Get_ExpectedBlockSize_From_Dict(dictSize);
+      UInt64 expectedBlockSize64 = Get_ExpectedBlockSize_From_Dict(dictSize);
+      // The MT parser already falls back to streaming when a block exceeds
+      // this limit. Smaller independent blocks can still borrow CPU credits.
+      if (creditManaged && expectedBlockSize64 > SUNPACK_MT_DECODE_BLOCK_LIMIT)
+        expectedBlockSize64 = SUNPACK_MT_DECODE_BLOCK_LIMIT;
       const size_t expectedBlockSize = (size_t)expectedBlockSize64;
       const size_t inBlockMax = expectedBlockSize + expectedBlockSize / 16;
       if (expectedBlockSize == expectedBlockSize64 && inBlockMax >= expectedBlockSize)

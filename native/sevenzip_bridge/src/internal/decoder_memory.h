@@ -8,6 +8,10 @@
    LZMA's variable dictionaries use a dedicated 2 MiB entry in LzmaDec.c. */
 #define SUNPACK_LARGE_ALLOCATION ((size_t)4 << 20)
 
+/* Above this decoded block size, prefer the codec's streaming dictionary
+   over staging an entire compressed and decoded block for parallelism. */
+#define SUNPACK_MT_DECODE_BLOCK_LIMIT ((size_t)32 << 20)
+
 #ifdef __cplusplus
 extern "C" {
 #endif

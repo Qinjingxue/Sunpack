@@ -1668,8 +1668,7 @@ namespace sunpack::sevenzip
                     }
                     else
                     {
-                        errors.time = directory.metadata.set_times(handle);
-                        errors.attributes = directory.metadata.set_attributes(handle);
+                        errors = directory.metadata.restore(handle);
                         if (!CloseHandle(handle) && !errors.first_error()) errors.time = GetLastError();
                     }
                 }

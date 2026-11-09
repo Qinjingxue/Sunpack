@@ -31,6 +31,13 @@
 
 namespace sunpack::sevenzip
 {
+    struct ArchiveMetadataErrors
+    {
+        DWORD time = 0;
+        DWORD attributes = 0;
+        DWORD first_error() const noexcept { return time ? time : attributes; }
+    };
+
     struct ArchiveItemMetadata
     {
         enum : unsigned char { Creation = 1, Access = 2, Modification = 4, Attributes = 8 };
@@ -42,6 +49,37 @@ namespace sunpack::sevenzip
 
         bool has_times() const noexcept { return (defined & (Creation | Access | Modification)) != 0; }
 
+        ArchiveMetadataErrors restore(HANDLE handle) const noexcept
+        {
+            const DWORD flags = basic_attributes();
+            if (flags && has_times())
+            {
+                FILE_BASIC_INFO info{};
+                info.FileAttributes = flags;
+                // Keep unusual FILETIME values on the original SetFileTime path.
+                if (copy_time(Creation, creation, info.CreationTime) &&
+                    copy_time(Access, access, info.LastAccessTime) &&
+                    copy_time(Modification, modification, info.LastWriteTime))
+                {
+                    if (SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info))) return {};
+                }
+            }
+            // Some filesystems reject the combined update. Preserve independent
+            // restoration and error reporting for each part in that case.
+            const DWORD time_error = set_times(handle);
+            return {time_error, set_basic_attributes(handle, flags)};
+        }
+
+    private:
+        bool copy_time(unsigned char flag, FILETIME time, LARGE_INTEGER &destination) const noexcept
+        {
+            if (!(defined & flag)) return true;
+            if (time.dwHighDateTime & 0x80000000U) return false;
+            destination.HighPart = static_cast<LONG>(time.dwHighDateTime);
+            destination.LowPart = time.dwLowDateTime;
+            return true;
+        }
+
         DWORD set_times(HANDLE handle) const noexcept
         {
             if (!has_times() || SetFileTime(handle,
@@ -52,9 +90,9 @@ namespace sunpack::sevenzip
             return GetLastError();
         }
 
-        DWORD set_attributes(HANDLE handle) const noexcept
+        DWORD basic_attributes() const noexcept
         {
-            if (!(defined & Attributes)) return ERROR_SUCCESS;
+            if (!(defined & Attributes)) return 0;
             // Only basic writable attributes; never copy type,
             // reparse, compression, encryption or POSIX mode bits into Windows.
             constexpr DWORD mask = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
@@ -63,19 +101,18 @@ namespace sunpack::sevenzip
             const DWORD value = attributes & mask;
             // Zero time fields leave the timestamps unchanged. NORMAL clears
             // writable flags; zero attributes would instead leave them unchanged.
+            return value ? value : FILE_ATTRIBUTE_NORMAL;
+        }
+
+        static DWORD set_basic_attributes(HANDLE handle, DWORD flags) noexcept
+        {
+            if (!flags) return ERROR_SUCCESS;
             FILE_BASIC_INFO info{};
-            info.FileAttributes = value ? value : FILE_ATTRIBUTE_NORMAL;
+            info.FileAttributes = flags;
             if (SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info)))
                 return ERROR_SUCCESS;
             return GetLastError();
         }
-    };
-
-    struct ArchiveMetadataErrors
-    {
-        DWORD time = 0;
-        DWORD attributes = 0;
-        DWORD first_error() const noexcept { return time ? time : attributes; }
     };
 
     class AsyncFileWriter final
@@ -272,7 +309,20 @@ namespace sunpack::sevenzip
         {
             Buffer() { request.buffer = this; }
 
+            void reserve_payload(std::size_t required)
+            {
+                // Keep the logical 1 MiB staging limit. Small files only pay
+                // for a small allocation, which can grow once if needed.
+                constexpr std::size_t small_capacity = 16U << 10;
+                const auto new_capacity = required <= small_capacity ? small_capacity : kBufferSize;
+                std::unique_ptr<unsigned char[]> payload(new unsigned char[new_capacity]);
+                if (size) std::memcpy(payload.get(), data.get(), size);
+                data = std::move(payload);
+                capacity = new_capacity;
+            }
+
             std::unique_ptr<unsigned char[]> data;
+            std::size_t capacity = 0;
             IoRequest request;
             // Completion can be dequeued before WriteFile returns. Serialize
             // that handoff, including synchronous success, before recycling.
@@ -398,7 +448,7 @@ namespace sunpack::sevenzip
         std::size_t idle_memory_bytes() noexcept {
             std::lock_guard<std::mutex> lock(mutex_);
             std::size_t bytes = 0;
-            for (const auto *buffer : free_buffers_) if (buffer->data) bytes += kBufferSize;
+            for (const auto *buffer : free_buffers_) bytes += buffer->capacity;
             return bytes;
         }
 
@@ -406,7 +456,11 @@ namespace sunpack::sevenzip
         // Only free buffers are touched; IOCP keeps ownership of in-flight data.
         void reclaim_idle_memory() noexcept {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (auto *buffer : free_buffers_) buffer->data.reset();
+            for (auto *buffer : free_buffers_)
+            {
+                buffer->data.reset();
+                buffer->capacity = 0;
+            }
         }
 
         HRESULT write(
@@ -481,63 +535,44 @@ namespace sunpack::sevenzip
                     }
 
                     Buffer *buffer = file->staging_buffer;
-                    if (!buffer)
-                    {
-                        if (free_buffers_.empty())
-                        {
-                            continue;
-                        }
+                    if (!buffer && free_buffers_.empty()) continue;
+                    previous_size = buffer ? buffer->size : 0;
+                    const std::size_t job_available = job->max_inflight_bytes -
+                        (std::min)(job->inflight_bytes, job->max_inflight_bytes);
+                    const std::size_t file_available = kDefaultFileInFlightBytes -
+                        (std::min)(file->inflight_bytes, kDefaultFileInFlightBytes);
+                    const std::size_t chunk_size = (std::min)({
+                        static_cast<std::size_t>(size - consumed),
+                        kBufferSize - previous_size,
+                        job_available,
+                        file_available,
+                    });
+                    if (chunk_size == 0) continue;
 
-                        buffer = free_buffers_.back();
-                        free_buffers_.pop_back();
-                        try
+                    if (!buffer) buffer = free_buffers_.back();
+                    try
+                    {
+                        if (buffer->capacity < previous_size + chunk_size)
                         {
-                            if (!buffer->data)
-                            {
-                                buffer->data = std::make_unique<unsigned char[]>(kBufferSize);
-                            }
+                            buffer->reserve_payload(previous_size + chunk_size);
+                        }
+                        if (!file->staging_buffer)
+                        {
+                            free_buffers_.pop_back();
                             buffer->file = file;
                             buffer->size = 0;
                             file->staging_buffer = buffer;
                             newly_acquired_staging = true;
                         }
-                        catch (...)
-                        {
-                            free_buffers_.push_back(buffer);
-                            mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
-                            set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
-                            setup_error = E_OUTOFMEMORY;
-                        }
-                    }
-                    if (setup_error != S_OK)
-                    {
-                    }
-                    else
-                    {
-                        previous_size = buffer->size;
-                        const std::size_t job_available = job->max_inflight_bytes -
-                                                          (std::min)(job->inflight_bytes, job->max_inflight_bytes);
-                        const std::size_t file_available = kDefaultFileInFlightBytes -
-                                                           (std::min)(file->inflight_bytes, kDefaultFileInFlightBytes);
-                        const std::size_t chunk_size = (std::min)({
-                            static_cast<std::size_t>(size - consumed),
-                            kBufferSize - previous_size,
-                            job_available,
-                            file_available,
-                        });
-                        if (chunk_size == 0)
-                        {
-                            if (newly_acquired_staging)
-                            {
-                                file->staging_buffer = nullptr;
-                                buffer->file.reset();
-                                free_buffers_.push_back(buffer);
-                            }
-                            continue;
-                        }
                         chunk = static_cast<UInt32>(chunk_size);
                         job->inflight_bytes += chunk_size;
                         file->inflight_bytes += chunk_size;
+                    }
+                    catch (...)
+                    {
+                        mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                        set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                        setup_error = E_OUTOFMEMORY;
                     }
                 }
 
@@ -1293,14 +1328,19 @@ namespace sunpack::sevenzip
                 if (key == kStopPacket || (!ok && error == ERROR_ABANDONED_WAIT_0)) break;
                 if (key != kWorkPacket) continue;
                 WorkItem item;
+                bool wake_producers = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (work_queue_.empty()) continue;
                     item = std::move(work_queue_.front());
                     work_queue_.pop_front();
                     --queued_jobs_;
+                    wake_producers = queued_jobs_ == queue_limit_ - 1 ||
+                        (queued_jobs_ == 0 && active_files_.empty());
                 }
-                producer_cv_.notify_all();
+                // Dequeue changes only queue capacity. Data completion wakes
+                // producers when it returns buffers or releases byte budgets.
+                if (wake_producers) producer_cv_.notify_all();
                 if (item.kind == WorkItem::Kind::Close)
                 {
                     process_close(item.file);
@@ -1440,7 +1480,7 @@ namespace sunpack::sevenzip
         // Publish the handle under mutex_, but keep filesystem calls outside
         // that per-volume lock. Outstanding data prevents close during opening.
         // Space failures remain retryable through the existing IOCP queue.
-        AttemptResult try_open_file(const FileStatePtr &file) noexcept
+        AttemptResult try_open_file(const FileStatePtr &file, bool has_data = true) noexcept
         {
             if (!file) return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
             {
@@ -1509,7 +1549,7 @@ namespace sunpack::sevenzip
                         static_cast<unsigned long>(error)};
             }
             DWORD registration_error = ERROR_SUCCESS;
-            if (!CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
+            if (has_data && !CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
             {
                 registration_error = GetLastError();
             }
@@ -1684,7 +1724,9 @@ namespace sunpack::sevenzip
                               !file->open_attempted && !(file->replay && file->replay->complete && !file->new_writes);
             }
             AttemptResult result;
-            if (should_open) result = try_open_file(file);
+            // This is a close-only open. The file has no outstanding data
+            // and no future write can require a completion packet.
+            if (should_open) result = try_open_file(file, false);
             HANDLE handle;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1725,10 +1767,7 @@ namespace sunpack::sevenzip
                 // SetOperationResult, so timestamp restoration must not depend on it.
                 if (restore_times)
                 {
-                    metadata_errors.time = file->metadata.set_times(handle);
-                    // Data is drained; restore read-only last, using the same
-                    // handle to avoid a pathname lookup and a second open/close.
-                    metadata_errors.attributes = file->metadata.set_attributes(handle);
+                    metadata_errors = file->metadata.restore(handle);
                 }
                 FILETIME last_write{};
                 if (GetFileTime(handle, nullptr, nullptr, &last_write))

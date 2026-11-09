@@ -4,6 +4,7 @@
 
 #include "../../../C/Alloc.h"
 #include "internal/decoder_cpu_budget.h"
+#include "internal/decoder_memory.h"
 
 #include "../Common/CWrappers.h"
 
@@ -63,7 +64,8 @@ HRESULT CDecoder::Decode(ISequentialInStream *seqInStream, ISequentialOutStream 
 
     if (creditManaged)
     {
-      props.memUseMax = (size_t)0 - 1;
+      // The decoder budgets packed and unpacked storage together.
+      props.memUseMax = 2 * SUNPACK_MT_DECODE_BLOCK_LIMIT;
       isMT = True;
     }
     else if (_tryMt && numThreads > 1)
