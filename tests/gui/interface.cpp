@@ -6,6 +6,7 @@
 #include "tag_collection.hpp"
 #include "ui_defaults_json.h"
 #include "registry_fixture.hpp"
+#include "background.hpp"
 #include <cassert>
 #include <iostream>
 #include <dwmapi.h>
@@ -1027,6 +1028,10 @@ void range_config(Application& app,const fs::path& dir) {
         }
         BYTE alpha=0; DWORD flags=0;
         assert(GetLayeredWindowAttributes(popup->Handle(),nullptr,&alpha,&flags) && alpha==255 && (flags&LWA_ALPHA));
+        const auto background=state(app.page(),"appearance")=="dark"?D2D1::ColorF(0x2b2b2b):theme::Current().elevatedBg;
+        auto* page=surface->FindById("datePopup"); assert(page);
+        gui_test::same_color(page->bgColorFn?page->bgColorFn():page->bgColor,background);
+        gui_test::clear_color(*popup,background);
         auto* picker=ui::GetContext().GetWindow(app.window())->Root()->FindById("range-"+side+"-pick-"+tid);
         assert(picker && picker->focusIndicator==ui::Widget::FocusIndicator::Underline);
         assert(GetWindow(popup->Handle(),GW_OWNER)==ui_window_hwnd(app.window()));

@@ -11,6 +11,13 @@ preserved.
 
 Local changes:
 
+- Use each window root's current opaque page background for the first Clear,
+  reusing RenderWindow's existing DXGI resize-fill synchronization. Resolve
+  dynamic colors on each paint; retain the theme fallback for transparent or
+  semitransparent roots and transparent clearing for non-opaque window modes.
+  SunPack's popup alpha wrapper forwards its original page background without
+  painting another layer. Shared palette and UIX surface colors are unchanged.
+
 - Gate startup reveal on a successful render-thread Present, rather than a
   completed display list or skipped hidden frame. Show at alpha zero before
   submitting, retaining the hidden-HWND AMD Present guard. Normal, maximized,

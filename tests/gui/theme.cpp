@@ -1,6 +1,7 @@
 #include "application.hpp"
 #include "page_value.hpp"
 #include "registry_fixture.hpp"
+#include "background.hpp"
 #include <dwmapi.h>
 #include <process.h>
 #include <ui/ui_context.h>
@@ -80,7 +81,11 @@ void check_theme(Application& app,int choice,bool light) {
     assert(page_value(app.page(),"theme")==(choice==1?"light":choice==2?"dark":"system"));
     assert(page_value(app.page(),"appearance")== (light?"light":"dark"));
     assert(ui_theme_get_mode()==(light?UI_THEME_LIGHT:UI_THEME_DARK));
-    auto* root=ui::GetContext().GetWindow(app.window())->Root().get();
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto* root=window->Root().get();
+    const auto background=light?theme::kWindowBg():D2D1::ColorF(0x202020);
+    gui_test::same_color(root->bgColorFn?root->bgColorFn():root->bgColor,background);
+    if(IsWindowVisible(window->Handle())) gui_test::clear_color(*window,background);
     auto* selector=dynamic_cast<ui::ComboBoxWidget*>(root->FindById("themeSelector"));
     assert(selector && selector->SelectedIndex()==choice);
     BOOL dark=FALSE;

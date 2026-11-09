@@ -52,6 +52,9 @@ void popup(UiWindow handle, bool opening, std::function<void()> complete) {
         auto frame=std::make_shared<PopupSurface>(*window);
         auto contents=window->Root();
         frame->opacity=opening?0.0f:1.0f;
+        // Keep the page as the live clear-color source after adding the alpha
+        // wrapper. PopupSurface does not paint its own background.
+        frame->bgColorFn=[contents] { return contents->bgColorFn?contents->bgColorFn():contents->bgColor; };
         frame->AddChild(contents);
         window->SetWindowAlpha(opening?0:255);
         surface=frame.get();

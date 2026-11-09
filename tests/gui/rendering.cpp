@@ -4,6 +4,7 @@
 #include <ui/render_thread.h>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
+#include "background.hpp"
 #include <cassert>
 #include <cstring>
 #include <iostream>
@@ -59,6 +60,27 @@ void startup_present_contracts() {
     assert(IsWindowVisible(hwnd) && !(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_LAYERED));
     window->ShowImmediate(false); // Already shown must not become transparent.
     assert(!(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_LAYERED));
+
+    // The clear must follow the live page, while translucent/absent page
+    // backgrounds and explicitly transparent windows keep their old behavior.
+    {
+        auto root=window->Root();
+        gui_test::clear_color(*window,theme::kWindowBg());
+        root->bgColor=D2D1::ColorF(0x202020);
+        gui_test::clear_color(*window,root->bgColor);
+        auto live=D2D1::ColorF(0x2b2b2b);
+        root->bgColorFn=[&] { return live; };
+        gui_test::clear_color(*window,live);
+        live=theme::Current().elevatedBg;
+        gui_test::clear_color(*window,live);
+        live.a=0.5f;
+        gui_test::clear_color(*window,theme::kWindowBg());
+        root->bgColorFn=nullptr;
+        window->SetBackgroundMode(1);
+        gui_test::clear_color(*window,{0,0,0,0});
+        window->SetBackgroundMode(0);
+        root->bgColor={0,0,0,0};
+    }
 
     window->Hide();
     window->Show();

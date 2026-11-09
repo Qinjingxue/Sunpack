@@ -2490,7 +2490,16 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
     }
 
     if (bgMode_ == 0) {
-        renderer_.Clear(theme::kWindowBg());
+        // Match the page's current opaque surface, not the shared control
+        // palette. RenderWindow also uses this first Clear for DXGI's fill
+        // outside the back buffer during resize. Resolve on every paint so a
+        // theme/class change cannot leave either background one frame behind.
+        auto background = theme::kWindowBg();
+        if (root_) {
+            const auto pageBackground = root_->bgColorFn ? root_->bgColorFn() : root_->bgColor;
+            if (pageBackground.a >= 1.0f) background = pageBackground;
+        }
+        renderer_.Clear(background);
     } else {
         renderer_.Clear({0, 0, 0, 0});
     }
