@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
 pytestmark = pytest.mark.skipif(
@@ -508,7 +509,9 @@ def _physical_volume_key(path: Path) -> str:
 def _job_request(job_id: str, archive: Path, output_dir: Path, volume_key: str = "") -> dict:
     request = {
         "job_id": job_id,
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(
+            archive_path=str(archive), format_hint="zip",
+        ).to_worker_input(),
         "output_dir": str(output_dir),
     }
     if volume_key:
