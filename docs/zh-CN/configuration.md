@@ -2,7 +2,7 @@
 
 [English](../configuration.md) | **简体中文**
 
-日常设置请修改 `sunpack_config.json`。源码运行时使用项目根目录中的文件；安装版使用 `%ProgramData%\SunPack\sunpack_config.json`。`sunpack_advanced_config.json` 提供其余默认值。日常设置请使用普通配置；从低于 1.4.0 的版本升级重置时，不保留手动复制到普通配置中的高级覆盖字段。
+日常设置请修改 `sunpack_config.json`。源码运行时使用项目根目录中的文件；安装版使用 `%ProgramData%\SunPack\sunpack_config.json`。`sunpack_advanced_config.json` 提供其余默认值。
 
 普通配置的同名值优先于高级配置；`SUNPACK_CONFIG_OVERRIDES` 仍是最后一层显式覆盖。对象按字段合并，`filesystem.scan_filters` 按 `name` 合并，其余数组整体覆盖。Watch 会自动重新加载配置变更。
 
