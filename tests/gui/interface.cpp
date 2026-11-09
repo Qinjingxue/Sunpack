@@ -321,6 +321,13 @@ void settle_motion(Application& app) {
         return settled(root.get());
     }); } catch(...) { std::cerr<<"Unfinished motion: "<<pending<<'\n'; throw; }
 }
+// Widget opacity can finish before the asynchronous first frame is presented.
+// The HWND alpha is applied only when Core UI acknowledges that presentation.
+bool popup_revealed(HWND hwnd) {
+    BYTE alpha=0; DWORD flags=0;
+    return GetLayeredWindowAttributes(hwnd,nullptr,&alpha,&flags) &&
+           alpha==255 && (flags&LWA_ALPHA);
+}
 void motion_after_hidden_start(UiWindow handle) {
     // Use the real popup surface. Its focus setup would invalidate it again
     // after showing and mask a lost first frame, so exercise showing alone.
@@ -330,9 +337,8 @@ void motion_after_hidden_start(UiWindow handle) {
     auto surface=window->Root();
     assert(surface->id=="datePopupSurface");
     ValidateRect(window->Handle(),nullptr);
-    pump([&]{return surface->opacity==1;},"Motion after hidden start",false);
-    BYTE alpha=0; DWORD flags=0;
-    assert(GetLayeredWindowAttributes(window->Handle(),nullptr,&alpha,&flags) && alpha==255 && (flags&LWA_ALPHA));
+    pump([&]{return surface->opacity==1 && popup_revealed(window->Handle());},
+         "Motion after hidden start",false);
 }
 void click(Application& app,const char* id) {
     // Conditional editor views mount during the UI event turn. Drain the
@@ -1019,15 +1025,13 @@ void range_config(Application& app,const fs::path& dir) {
         assert(surface->id=="datePopupSurface");
         try { pump([&]{
             if(date_popup(app)!=popup) throw std::runtime_error("Date popup closed during entrance");
-            return surface->opacity==1;
+            return surface->opacity==1 && popup_revealed(popup->Handle());
         },"Date popup entrance",false); }
         catch(...) {
             std::cerr<<"Date entrance: alive="<<(date_popup(app)==popup)<<" opacity="<<surface->opacity
                      <<" frames="<<animation.frames<<" submitted="<<animation.submitted<<" started="<<animation.started<<" stopped="<<animation.stopped<<'\n';
             throw;
         }
-        BYTE alpha=0; DWORD flags=0;
-        assert(GetLayeredWindowAttributes(popup->Handle(),nullptr,&alpha,&flags) && alpha==255 && (flags&LWA_ALPHA));
         const auto background=state(app.page(),"appearance")=="dark"?D2D1::ColorF(0x2b2b2b):theme::Current().elevatedBg;
         auto* page=surface->FindById("datePopup"); assert(page);
         gui_test::same_color(page->bgColorFn?page->bgColorFn():page->bgColor,background);
