@@ -168,10 +168,15 @@ def test_skippable_only_needs_explicit_format_context(fixtures, tmp_path):
 
 
 def test_confirmed_lz4_planning_does_not_scan_a_gigabyte_skippable_payload(fixtures):
-    task = make_archive_task(fixtures / "large_skip.tar.lz4", format_hint="lz4", discovery_source="detection")
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+    from tests.helpers.config_factory import make_config
+
+    path = fixtures / "large_skip.tar.lz4"
+    task, = ArchiveTaskProvider(make_config()).discover_targets([str(path)]).tasks
+    assert task.discovery_source == "detection"
+    assert task.archive_input().analysis["stream_plan"]["input_bytes"] == path.stat().st_size
     ArchiveInputPlanningStage({}).plan_task(task)
-    assert task.knowledge().get("input_planning.read_bytes") < 5 * 1024 * 1024
-    assert task.archive_input().analysis["stream_plan"]["input_bytes"] > 1024 * 1024 * 1024
+    assert task.knowledge().get("input_planning.read_bytes", 0) < 5 * 1024 * 1024
 
 
 def test_shared_skippable_magic_does_not_claim_a_zstandard_stream_as_lz4(fixtures):

@@ -1619,6 +1619,106 @@ pub(crate) fn validate_xz_header(header: &[u8]) -> ValidationResult<()> {
     Ok(())
 }
 
+fn parse_xz_block_header(block_header: &[u8]) -> ValidationResult<(Option<u64>, Option<u64>)> {
+    let stored_crc = u32::from_le_bytes(block_header[block_header.len() - 4..].try_into().unwrap());
+    if stored_crc != crc32(&block_header[..block_header.len() - 4]) {
+        return invalid("xz_block_header_crc_bad");
+    }
+    let block_flags = block_header[1];
+    if block_flags & 0x3c != 0 {
+        return invalid("xz_block_flags_invalid");
+    }
+    let mut field_cursor = 2usize;
+    let declared_compressed = if block_flags & 0x40 != 0 {
+        Some(read_vli_slice(
+            &block_header[..block_header.len() - 4],
+            &mut field_cursor,
+        )?)
+    } else {
+        None
+    };
+    let declared_uncompressed = if block_flags & 0x80 != 0 {
+        Some(read_vli_slice(
+            &block_header[..block_header.len() - 4],
+            &mut field_cursor,
+        )?)
+    } else {
+        None
+    };
+    for _ in 0..usize::from(block_flags & 0x03) + 1 {
+        let _filter_id =
+            read_vli_slice(&block_header[..block_header.len() - 4], &mut field_cursor)?;
+        let property_size =
+            read_vli_slice(&block_header[..block_header.len() - 4], &mut field_cursor)? as usize;
+        field_cursor = field_cursor
+            .checked_add(property_size)
+            .ok_or(ValidationError::Invalid("xz_filter_properties_overflow"))?;
+        if field_cursor > block_header.len() - 4 {
+            return invalid("xz_filter_properties_truncated");
+        }
+    }
+    if block_header[field_cursor..block_header.len() - 4]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return invalid("xz_block_header_padding_invalid");
+    }
+    Ok((declared_compressed, declared_uncompressed))
+}
+
+pub(crate) fn validate_xz_identity(
+    header: &[u8],
+    file_size: u64,
+    read_header: impl FnOnce(usize) -> io::Result<Vec<u8>>,
+) -> ValidationResult<usize> {
+    let Some(stream_header) = header.get(..12) else {
+        return invalid("xz_header_or_footer_missing");
+    };
+    validate_xz_header(stream_header)?;
+    let check_size = xz_check_size(stream_header[7] & 0x0f)?;
+    let Some(&size_byte) = header.get(12) else {
+        return invalid("xz_block_header_missing");
+    };
+    if size_byte == 0 {
+        // An empty stream has an eight-byte Index and a matching footer.
+        let Some(empty) = header.get(12..32) else {
+            return invalid("xz_empty_stream_truncated");
+        };
+        let footer = parse_xz_footer(&empty[8..], 32)?;
+        if empty[..4] != [0; 4]
+            || empty[4..8] != crc32(&empty[..4]).to_le_bytes()
+            || footer.index_size != 8
+            || stream_header[6..8] != footer.flags
+        {
+            return invalid("xz_empty_stream_invalid");
+        }
+        return Ok(0);
+    }
+    let block_size = (usize::from(size_byte) + 1) * 4;
+    // At least eight Index bytes and the twelve-byte footer follow the block.
+    let overhead = 12 + block_size as u64 + check_size + 20;
+    if file_size <= overhead {
+        return invalid("xz_block_out_of_range");
+    }
+    let mut bytes_read = 0;
+    let extended;
+    let block = if let Some(block) = header.get(12..12 + block_size) {
+        block
+    } else {
+        extended = read_header(block_size)?;
+        if extended.len() != block_size {
+            return invalid("xz_block_header_truncated");
+        }
+        bytes_read = block_size;
+        &extended
+    };
+    let (compressed, _) = parse_xz_block_header(block)?;
+    if compressed.is_some_and(|size| size == 0 || size > file_size - overhead) {
+        return invalid("xz_block_out_of_range");
+    }
+    Ok(bytes_read)
+}
+
 pub(crate) fn validate_xz_structure_exact(
     reader: &ManagedReader,
     offset: u64,
@@ -1671,51 +1771,8 @@ pub(crate) fn validate_xz_structure_exact(
             if block_header.len() != header_size as usize {
                 return invalid("xz_block_header_truncated");
             }
-            let stored_crc =
-                u32::from_le_bytes(block_header[block_header.len() - 4..].try_into().unwrap());
-            if stored_crc != crc32(&block_header[..block_header.len() - 4]) {
-                return invalid("xz_block_header_crc_bad");
-            }
-            let block_flags = block_header[1];
-            if block_flags & 0x3c != 0 {
-                return invalid("xz_block_flags_invalid");
-            }
-            let mut field_cursor = 2usize;
-            let declared_compressed = if block_flags & 0x40 != 0 {
-                Some(read_vli_slice(
-                    &block_header[..block_header.len() - 4],
-                    &mut field_cursor,
-                )?)
-            } else {
-                None
-            };
-            let declared_uncompressed = if block_flags & 0x80 != 0 {
-                Some(read_vli_slice(
-                    &block_header[..block_header.len() - 4],
-                    &mut field_cursor,
-                )?)
-            } else {
-                None
-            };
-            for _ in 0..usize::from(block_flags & 0x03) + 1 {
-                let _filter_id =
-                    read_vli_slice(&block_header[..block_header.len() - 4], &mut field_cursor)?;
-                let property_size =
-                    read_vli_slice(&block_header[..block_header.len() - 4], &mut field_cursor)?
-                        as usize;
-                field_cursor = field_cursor
-                    .checked_add(property_size)
-                    .ok_or(ValidationError::Invalid("xz_filter_properties_overflow"))?;
-                if field_cursor > block_header.len() - 4 {
-                    return invalid("xz_filter_properties_truncated");
-                }
-            }
-            if block_header[field_cursor..block_header.len() - 4]
-                .iter()
-                .any(|byte| *byte != 0)
-            {
-                return invalid("xz_block_header_padding_invalid");
-            }
+            let (declared_compressed, declared_uncompressed) =
+                parse_xz_block_header(&block_header)?;
             let compressed = unpadded
                 .checked_sub(header_size + check_size)
                 .ok_or(ValidationError::Invalid("xz_index_unpadded_size_invalid"))?;

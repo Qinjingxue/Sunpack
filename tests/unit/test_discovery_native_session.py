@@ -202,11 +202,36 @@ asyncio.run(run())
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_bzip2_detection_claims_valid_head_and_carves_after_forged_head(tmp_path):
+@pytest.mark.parametrize("fmt", ["bzip2", "gzip", "xz", "zstd", "tar"])
+def test_stream_detection_claims_valid_head_and_carves_after_forged_head(tmp_path, fmt):
     import bz2
+    import gzip
 
-    stream = bz2.compress(b"payload")
-    forged = stream[:10] + bytes(32)  # Valid marker, impossible empty symbol map.
+    payload = b"payload"
+    if fmt == "bzip2":
+        stream = bz2.compress(payload)
+        forged = stream[:10] + bytes(32)  # Valid marker, empty symbol map.
+    elif fmt == "gzip":
+        stream = gzip.compress(payload)
+        forged = stream[:10] + b"\x03\x00" + b"\xff" * 8  # Empty deflate, bad trailer.
+    elif fmt == "xz":
+        stream = lzma.compress(payload)
+        forged = stream[:12] + b"\x02" + bytes(31)  # Valid stream CRC, bad block CRC.
+    elif fmt == "zstd":
+        import zstandard
+
+        stream = zstandard.ZstdCompressor().compress(payload)
+        forged = b"\x28\xb5\x2f\xfd\x20\x01\x07\x00\x00"  # Reserved first block type.
+    else:
+        output = BytesIO()
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as writer:
+            entry = tarfile.TarInfo("payload.txt")
+            entry.size = len(payload)
+            writer.addfile(entry, BytesIO(payload))
+        stream = output.getvalue()[:2048]  # Header, payload sector, two end sectors.
+        damaged = bytearray(stream[:512])
+        damaged[148] ^= 1
+        forged = bytes(damaged)
     leading = tmp_path / "leading.opaque"
     carrier = tmp_path / "carrier.opaque"
     # A gapped second stream makes the leading case enter Embedded if Detection
@@ -261,12 +286,13 @@ def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, ph
     """
     import ctypes
     from ctypes import wintypes
-    import gzip
     from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
-    path = tmp_path / ("stream.gz" if phase == "detection" else "fake.zip")
-    content = gzip.compress(b"payload") if phase == "detection" else b"not an archive"
+    path = tmp_path / ("stream.lz4" if phase == "detection" else "fake.zip")
+    # A valid empty LZ4 frame needs the Detection frame plan and still opens
+    # the input during resolve, unlike the leading-header dispatch paths.
+    content = bytes.fromhex("04224d1860408200000000") if phase == "detection" else b"not an archive"
     path.write_bytes(content)
     table = build_native_table_for_targets([str(tmp_path)], config=make_config({}))
     if phase == "embedded":

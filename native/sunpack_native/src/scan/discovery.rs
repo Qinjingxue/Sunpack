@@ -9,7 +9,7 @@ use crate::scan::directory::{
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
 };
 use crate::scan::embedded::{
-    scan_detected_path, scan_embedded_path, NativeScanResult, RarInputResolution,
+    scan_detected_lz4, scan_embedded_path, NativeScanResult, RarInputResolution,
 };
 use crate::scan::pe_overlay::{inspect_pe_image_native, PeProbe, PeState};
 use pyo3::exceptions::PyIndexError;
@@ -1197,12 +1197,11 @@ impl NativeCandidateTable {
                                 format,
                                 "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
                             ) && anchor.is_some_and(|anchor| anchor.standalone);
-                            // A leading BZip2 stream owns the whole input for
-                            // Detection. The worker decodes it and checks CRC.
-                            let needs_scan = !matches!(format, "enc" | "bzip2");
-                            let scan = if accepted && needs_scan {
+                            // The confirmed leading structure admits the whole
+                            // file. LZ4 additionally projects its frame plan.
+                            let scan = if accepted && format == "lz4" {
                                 Some(
-                                    scan_detected_path(path, format, parallel_files)
+                                    scan_detected_lz4(path, parallel_files)
                                         .map(Arc::new)
                                         .map_err(Arc::new),
                                 )
@@ -1210,17 +1209,12 @@ impl NativeCandidateTable {
                                 None
                             };
                             let accepted = accepted
-                                && (!needs_scan
+                                && (format != "lz4"
                                     || scan
                                         .as_ref()
                                         .and_then(|scan| scan.as_ref().ok())
-                                        .is_some_and(|scan| scan.is_primary(format)));
-                            Some((
-                                index,
-                                key,
-                                accepted,
-                                scan.filter(|_| !accepted || format == "lz4"),
-                            ))
+                                        .is_some_and(|scan| scan.is_primary_lz4()));
+                            Some((index, key, accepted, scan))
                         })
                     })
                     .collect::<Vec<_>>();

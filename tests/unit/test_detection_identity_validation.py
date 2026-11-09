@@ -36,7 +36,7 @@ def test_detection_stream_identity_is_bounded_independent_of_archive_size(tmp_pa
         assert raw["structure_validation_complete"] is False
         assert raw["integrity_validation_complete"] is False
         assert raw["boundary_exact"] is False
-        assert raw["identity_bytes_read"] <= 64 * 1024 + 8
+        assert raw["identity_bytes_read"] <= 64 * 1024 + 1024 + 8
 
 
 def test_detection_stream_identity_does_not_revalidate_payload_or_trailer(tmp_path):
@@ -66,9 +66,11 @@ def test_detection_rejects_magic_only_compression_false_positives(tmp_path):
     wrong_format.write_bytes(gzip.compress(b"payload"))
     assert confirm(str(wrong_format), "xz") is False
 
-    empty = tmp_path / "empty-bzip2.bin"
-    encoded = bz2.compress(b"")
-    empty.write_bytes(encoded)
-    assert confirm(str(empty), "bzip2")
-    empty.write_bytes(encoded[:-1] + b"\x01")
-    assert not confirm(str(empty), "bzip2")
+    empty = tmp_path / "empty-stream.bin"
+    for fmt, bad_offset in (("bzip2", -1), ("gzip", -8), ("xz", 16)):
+        encoded = bytearray(_FORMATS[fmt](b""))
+        empty.write_bytes(encoded)
+        assert confirm(str(empty), fmt)
+        encoded[bad_offset] ^= 1
+        empty.write_bytes(encoded)
+        assert not confirm(str(empty), fmt)

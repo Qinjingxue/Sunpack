@@ -1,7 +1,7 @@
 use crate::scan::compression_stream::{
     analyze_gzip_structure, validate_bzip2_identity, validate_bzip2_structure,
-    validate_gzip_structure, validate_xz_structure_exact, validate_zstd_structure,
-    StructureValidation, BZIP2_IDENTITY_BYTES,
+    validate_gzip_structure, validate_xz_identity, validate_xz_structure_exact,
+    validate_zstd_structure, StructureValidation, BZIP2_IDENTITY_BYTES,
 };
 use std::io::Cursor;
 
@@ -209,6 +209,35 @@ fn compression_identity_result(
     }
 }
 
+const GZIP_IDENTITY_PAYLOAD_BYTES: usize = 1024;
+
+fn validate_gzip_identity_payload(input: &[u8]) -> Result<(), &'static str> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let mut decoder = Decompress::new(false);
+    let mut output = [0; GZIP_IDENTITY_PAYLOAD_BYTES];
+    let status = decoder
+        .decompress(input, &mut output, FlushDecompress::None)
+        .map_err(|_| "gzip_deflate_prefix_invalid")?;
+    let produced = decoder.total_out() as usize;
+    if status == Status::StreamEnd {
+        let tail = decoder.total_in() as usize;
+        if let Some(trailer) = input[tail..].first_chunk::<8>() {
+            if trailer[..4] != crc32(&output[..produced]).to_le_bytes()
+                || trailer[4..] != (produced as u32).to_le_bytes()
+            {
+                return Err("gzip_trailer_mismatch");
+            }
+            return Ok(());
+        }
+        return Err("gzip_trailer_missing");
+    }
+    if produced == 0 {
+        return Err("gzip_deflate_prefix_unconfirmed");
+    }
+    Ok(())
+}
+
 fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityResult {
     let reader = match ManagedReader::open(path) {
         Ok(value) => value,
@@ -286,125 +315,52 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
                 )
             }
         };
-        let payload_start = parsed.payload_start as usize;
+        let (bytes_read, payload) = {
+            let wanted = (file_size - parsed.payload_start)
+                .min((GZIP_IDENTITY_PAYLOAD_BYTES + 8) as u64) as usize;
+            let available = &data[parsed.payload_start as usize..];
+            if available.len() >= wanted {
+                (
+                    base_bytes_read,
+                    std::borrow::Cow::Borrowed(&available[..wanted]),
+                )
+            } else {
+                match reader.read_direct_at(parsed.payload_start, wanted) {
+                    Ok(bytes) => (
+                        base_bytes_read + bytes.len() as u64,
+                        std::borrow::Cow::Owned(bytes),
+                    ),
+                    Err(_) => {
+                        return compression_identity_result(
+                            "gzip",
+                            ".gz",
+                            true,
+                            file_size,
+                            base_bytes_read,
+                            false,
+                            "os_error",
+                            &["gzip:header"],
+                        )
+                    }
+                }
+            }
+        };
+        let result = validate_gzip_identity_payload(&payload);
         let mut evidence = vec!["gzip:magic", "gzip:header"];
         if parsed.crc16.is_some() {
             evidence.push("gzip:header_crc16");
         }
-        if payload_start as u64 >= file_size {
-            return compression_identity_result(
-                "gzip",
-                ".gz",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "gzip_deflate_missing",
-                &evidence,
-            );
-        }
-        let block_probe = reader
-            .read_direct_at(
-                payload_start as u64,
-                file_size.saturating_sub(payload_start as u64).min(8) as usize,
-            )
-            .unwrap_or_default();
-        if block_probe.is_empty() {
-            return compression_identity_result(
-                "gzip",
-                ".gz",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "gzip_deflate_missing",
-                &evidence,
-            );
-        }
-        let block_type = (block_probe[0] >> 1) & 0x03;
-        if block_type == 3 {
-            return compression_identity_result(
-                "gzip",
-                ".gz",
-                true,
-                file_size,
-                base_bytes_read + block_probe.len() as u64,
-                false,
-                "gzip_deflate_reserved_block_type",
-                &evidence,
-            );
-        }
-        if block_type == 0 {
-            if block_probe.len() < 5 {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read + block_probe.len() as u64,
-                    false,
-                    "gzip_stored_block_header_short",
-                    &evidence,
-                );
-            }
-            let len = u16::from_le_bytes([block_probe[1], block_probe[2]]);
-            let nlen = u16::from_le_bytes([block_probe[3], block_probe[4]]);
-            if len ^ nlen != 0xffff {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read + block_probe.len() as u64,
-                    false,
-                    "gzip_stored_block_length_mismatch",
-                    &evidence,
-                );
-            }
-            evidence.push("gzip:deflate_stored_length");
-        } else if block_type == 2 {
-            if block_probe.len() < 3 {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read + block_probe.len() as u64,
-                    false,
-                    "gzip_dynamic_block_header_short",
-                    &evidence,
-                );
-            }
-            let bits = u32::from_le_bytes([
-                block_probe[0],
-                block_probe[1],
-                block_probe[2],
-                *block_probe.get(3).unwrap_or(&0),
-            ]) >> 3;
-            if bits & 0x1f > 29 {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read + block_probe.len() as u64,
-                    false,
-                    "gzip_dynamic_hlit_invalid",
-                    &evidence,
-                );
-            }
-            evidence.push("gzip:deflate_dynamic_header");
-        } else {
-            evidence.push("gzip:deflate_fixed_header");
+        if result.is_ok() {
+            evidence.push("gzip:deflate_prefix");
         }
         return compression_identity_result(
             "gzip",
             ".gz",
             true,
             file_size,
-            base_bytes_read + block_probe.len() as u64,
-            true,
-            "",
+            bytes_read,
+            result.is_ok(),
+            result.err().unwrap_or(""),
             &evidence,
         );
     }
@@ -442,46 +398,28 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
     }
 
     if data.starts_with(XZ_MAGIC) {
-        if data.len() < 12 || file_size < 24 {
-            return compression_identity_result(
-                "xz",
-                ".xz",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "xz_header_or_footer_missing",
-                &["xz:magic"],
-            );
-        }
-        let flags = [data[6], data[7]];
-        let check_id = flags[1] & 0x0f;
-        let stored = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        if flags[0] != 0
-            || flags[1] & 0xf0 != 0
-            || !matches!(check_id, 0 | 1 | 4 | 10)
-            || stored != crc32(&flags)
-        {
-            return compression_identity_result(
-                "xz",
-                ".xz",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "xz_stream_header_invalid",
-                &["xz:magic"],
-            );
-        }
+        let result = validate_xz_identity(&data, file_size, |size| reader.read_direct_at(12, size));
+        let (plausible, error, extra) = match result {
+            Ok(extra) => (true, "", extra as u64),
+            Err(error) => (false, error.code(), 0),
+        };
         return compression_identity_result(
             "xz",
             ".xz",
             true,
             file_size,
-            base_bytes_read,
-            true,
-            "",
-            &["xz:magic", "xz:stream_flags", "xz:header_crc32"],
+            base_bytes_read + extra,
+            plausible,
+            error,
+            if plausible {
+                &[
+                    "xz:magic",
+                    "xz:header_crc32",
+                    "xz:first_block_or_empty_index",
+                ]
+            } else {
+                &["xz:magic"]
+            },
         );
     }
 

@@ -204,6 +204,7 @@ impl RawHit {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct NativeScanResult {
     file_size: u64,
     scan_read_bytes: u64,
@@ -213,7 +214,6 @@ pub(crate) struct NativeScanResult {
     logical_resolution_complete: bool,
     raw_hit_count: usize,
     budget_exhausted: bool,
-    identity_only: bool,
     zip_eocd_absent: bool,
 }
 
@@ -296,14 +296,13 @@ impl NativeScanResult {
             .any(|c| c.boundary_kind == "exact" && c.extractable && c.volume_anchor.is_none())
     }
 
-    pub(crate) fn is_primary(&self, format: &str) -> bool {
-        self.identity_only
-            || !self
-                .candidates
-                .iter()
-                .any(|item| item.candidate_kind == "logical_archive")
+    pub(crate) fn is_primary_lz4(&self) -> bool {
+        !self
+            .candidates
+            .iter()
+            .any(|item| item.candidate_kind == "logical_archive")
             || (self.candidates.len() == 1
-                && self.candidates[0].format == format
+                && self.candidates[0].format == "lz4"
                 && self.candidates[0].offset == 0
                 && (self.candidates[0].end_offset == Some(self.file_size)
                     || self.candidates[0].boundary_kind != "exact"))
@@ -449,18 +448,25 @@ pub(crate) fn scan_embedded_path(
     scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers)
 }
 
-pub(crate) fn scan_detected_path(
-    path: &str,
-    format: &str,
-    parallel_files: usize,
-) -> io::Result<NativeScanResult> {
+pub(crate) fn scan_detected_lz4(path: &str, parallel_files: usize) -> io::Result<NativeScanResult> {
     let reader = ManagedReader::open(path)?;
-    scan_native(
+    let file_size = reader.len();
+    let index = crate::formats::lz4::walk(&reader.probe_reader(), 0, file_size);
+    if index.complete && index.end == file_size {
+        let mut item = candidate("lz4", 0, Some(file_size), "lz4_frame_structure");
+        item.lz4_index = Some(Box::new(index));
+        return Ok(NativeScanResult {
+            file_size,
+            candidates: vec![item],
+            logical_resolution_complete: true,
+            ..NativeScanResult::default()
+        });
+    }
+    scan_embedded_archives_native_with_iocp(
         reader,
         DEFAULT_IOCP_CHUNK_SIZE / parallel_files.max(1),
         DEFAULT_IOCP_BUFFERS,
         DEFAULT_IOCP_WORKERS,
-        Some(format),
     )
 }
 
@@ -534,16 +540,6 @@ fn scan_embedded_archives_native_with_iocp(
     iocp_chunk_bytes: usize,
     iocp_buffers: usize,
     iocp_workers: usize,
-) -> io::Result<NativeScanResult> {
-    scan_native(reader, iocp_chunk_bytes, iocp_buffers, iocp_workers, None)
-}
-
-fn scan_native(
-    reader: ManagedReader,
-    iocp_chunk_bytes: usize,
-    iocp_buffers: usize,
-    iocp_workers: usize,
-    primary_format: Option<&str>,
 ) -> io::Result<NativeScanResult> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check_io()?;
@@ -644,24 +640,10 @@ fn scan_native(
     let xz_footer_hits = storage.view(1);
     raw_hit_count += output.discarded_results;
 
-    // Identity alone may dispatch a stream only when this same signature pass
-    // proves that no supported peer can be hidden in it. This avoids decoding
-    // large ordinary gzip payloads just to rediscover their only header.
-    let identity_only = primary_format.is_some_and(|format| {
-        format != "lz4"
-            && !raw_hits
-                .iter()
-                .any(|hit| hit.offset() != 0 && !matches!(hit.kind(), "zip64_eocd"))
-    });
-
     // Structural facts survive in the result; transient validation windows
     // share this reader's generation/request state, not the global block cache.
     let probe_reader = reader.probe_reader();
-    let mut candidates = if identity_only {
-        Vec::new()
-    } else {
-        validate_raw_hits(&probe_reader, file_size, raw_hits, xz_footer_hits)?
-    };
+    let mut candidates = validate_raw_hits(&probe_reader, file_size, raw_hits, xz_footer_hits)?;
     candidates.sort_by_key(|candidate| {
         (
             candidate.offset,
@@ -727,7 +709,6 @@ fn scan_native(
         logical_resolution_complete,
         raw_hit_count,
         budget_exhausted: false,
-        identity_only,
         zip_eocd_absent: !saw_zip_eocd.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
