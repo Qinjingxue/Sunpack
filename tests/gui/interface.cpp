@@ -56,6 +56,98 @@ void text_area_wheel_boundaries() {
     area.SetText(L"short");
     assert(!area.OnMouseWheel({20,20,-120}));
 }
+// The live TAG fixture is two levels deep and cannot expose replay of a
+// partially consumed packet across several ancestors. This in-memory route
+// also catches stale/owning gate entries without another rendered UI fixture.
+void wheel_chain_contracts() {
+    struct ObservedArea : ui::TextAreaWidget {
+        int calls=0;
+        float received=0;
+        bool OnMouseWheel(const ui::MouseEvent& event) override {
+            ++calls; received=event.delta;
+            return TextAreaWidget::OnMouseWheel(event);
+        }
+    };
+    ui::UiWindowImpl window;
+    auto outer=std::make_shared<ObservedArea>(); outer->rect={0,0,300,100};
+    auto middle=std::make_shared<ObservedArea>(); middle->rect={0,0,220,90};
+    auto empty=std::make_shared<ui::ScrollViewWidget>(); empty->rect={0,0,200,80};
+    auto inner=std::make_shared<ObservedArea>(); inner->rect=empty->rect;
+    const std::wstring longText(40,L'\n');
+    for(auto* area:{outer.get(),middle.get(),inner.get()}) area->SetText(longText);
+    outer->OnMouseWheel({20,20,-12000}); outer->calls=0;
+    outer->AddChild(middle); middle->AddChild(empty); empty->AddChild(inner);
+    window.SetRoot(outer);
+    auto wheel=[&](int delta,float x=20) { window.SimMouseWheel(x,20,float(delta)); };
+    for(int i=0;i<4;++i) wheel(30);
+    assert(inner->calls==4 && middle->calls==0 && outer->calls==0);
+    wheel(90); // Inner is open; the middle spends its own budget.
+    assert(middle->received==90 && outer->calls==0);
+    wheel(60); // Only 30 remains after the middle finishes its 120 units.
+    assert(outer->calls==1 && outer->received==30);
+    wheel(1);
+    assert(outer->calls==2 && outer->received==1); // Stay open, no backlog.
+
+    const int middleCalls=middle->calls, outerCalls=outer->calls;
+    wheel(-30); wheel(30); // Reverse inward immediately, then return to the edge.
+    assert(middle->calls==middleCalls && outer->calls==outerCalls);
+    wheel(120); assert(middle->calls==middleCalls);
+    wheel(120); assert(outer->calls==outerCalls); // Both gates rearmed.
+
+    // No overflow means no resistance, even after a formerly scrolling range.
+    inner->SetText(L"short");
+    wheel(60); assert(outer->received==60 && outer->calls==outerCalls+1);
+    middle->SetText(L"short");
+    wheel(30); assert(outer->received==30 && outer->calls==outerCalls+2);
+
+    inner->SetText(longText);
+    wheel(60); // Partial budget; visiting another route must discard it.
+    wheel(30,250);
+    const int afterSwitch=outer->calls;
+    wheel(60); wheel(60); assert(outer->calls==afterSwitch);
+    wheel(1); assert(outer->calls==afterSwitch+1 && outer->received==1);
+
+    // Child hit changes inside one scroller are not an ownership change.
+    auto first=std::make_shared<ui::Widget>(); first->rect={0,0,50,80};
+    auto second=std::make_shared<ui::Widget>(); second->rect={50,0,150,80};
+    inner->AddChild(first); inner->AddChild(second);
+    window.SetRoot(outer);
+    const int beforeDrift=outer->calls;
+    wheel(60,20);
+    window.SimMouseMove(70,20);
+    wheel(60,70); assert(outer->calls==beforeDrift);
+    wheel(1,70); assert(outer->calls==beforeDrift+1 && outer->received==1);
+
+    window.SetRoot(outer);
+    wheel(60);
+    window.SimMouseMove(250,20); window.SimMouseMove(20,20);
+    const int afterLeave=outer->calls;
+    wheel(60); wheel(60); assert(outer->calls==afterLeave);
+    wheel(1); assert(outer->calls==afterLeave+1);
+
+    // A resized viewport rearms even when content height stays unchanged.
+    window.SetRoot(outer);
+    wheel(60);
+    inner->rect.bottom-=10;
+    const int beforeResize=outer->calls;
+    wheel(60); wheel(60); assert(outer->calls==beforeResize);
+    wheel(1); assert(outer->calls==beforeResize+1);
+    inner->rect.bottom+=10;
+
+    // Reusing a retained tree must not reuse a prior window interaction.
+    window.SetRoot(outer);
+    wheel(60);
+    window.SetRoot(outer);
+    const int beforeReset=outer->calls;
+    wheel(60); wheel(60); assert(outer->calls==beforeReset);
+    wheel(1); assert(outer->calls==beforeReset+1);
+    window.SimMouseMove(250,20);
+    wheel(1); // Track the inner gate again without making it the hover owner.
+    std::weak_ptr<ui::Widget> released=inner;
+    empty->RemoveChild(inner.get()); inner.reset();
+    assert(released.expired()); // Window tracking must never own a detached row.
+    wheel(30); assert(outer->received==30);
+}
 // Existing UI checks do not inspect the native icons: one default-sized HICON
 // looked correct to those checks even when Windows had to rescale every small
 // icon. Exercise DPI changes in this host, including release of replaced icons.
@@ -1246,6 +1338,12 @@ void tag_config(Application& app,const fs::path& dir) {
             // Clamp against the live extent; layout can shift it by a float ULP.
             window->ScrollWithMeasureContext(scroll(),delta<0?scroll()->ContentHeight():0.0f);
             const float edge=scroll()->ScrollY();
+            for(int i=0;i<4;++i) {
+                wheel(delta/4);
+                assert(outer->ScrollY()==centered && !outer->ScrollAnimating() && !scroll()->ScrollAnimating());
+            }
+            // Four high-resolution packets spend exactly one notch. Further
+            // same-direction input chains without another resistance interval.
             wheel(delta);
             pump(settled,"TAG wheel handoff",false);
             if(!((outer->ScrollY()-centered)*delta<0 && scroll()->ScrollY()==edge))
@@ -1258,6 +1356,16 @@ void tag_config(Application& app,const fs::path& dir) {
             pump(settled,"TAG reverse wheel",false);
             assert(outer->ScrollY()==after && (scroll()->ScrollY()-edge)*delta>0);
         }
+        // A crossing packet forwards only its surplus, using the same system
+        // line/page setting as ordinary ScrollView motion, never the backlog.
+        window->ScrollWithMeasureContext(outer,centered);
+        window->ScrollWithMeasureContext(scroll(),scroll()->ContentHeight());
+        wheel(-90); wheel(-60);
+        pump(settled,"TAG partial wheel handoff",false);
+        UINT lines=3; SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&lines,0);
+        const float quarterStep=(lines==WHEEL_PAGESCROLL?outer->rect.bottom-outer->rect.top:lines*16.0f)/4;
+        const float outerLimit=outer->ContentHeight()-(outer->rect.bottom-outer->rect.top);
+        assert(std::abs(outer->ScrollY()-std::min(centered+quarterStep,outerLimit))<0.2f);
         BOOL animate=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
         if(animate) for(int delta:{-120,120}) {
             // A predicted edge must not start the parent while the inner view
@@ -1279,6 +1387,8 @@ void tag_config(Application& app,const fs::path& dir) {
             // Parent layout may shift the measured extent by a float ULP.
             assert(std::abs(scroll()->ScrollY()-edge)<0.1f);
             wheel(delta);
+            assert(!outer->ScrollAnimating());
+            wheel(delta);
             assert(outer->ScrollAnimating());
             // Switch back before the parent has presented its pending input.
             wheel(-delta);
@@ -1287,7 +1397,7 @@ void tag_config(Application& app,const fs::path& dir) {
             assert(outer->ScrollY()==centered && (scroll()->ScrollY()-edge)*delta>0);
 
             window->ScrollWithMeasureContext(scroll(),delta<0?scroll()->ContentHeight():0.0f);
-            wheel(delta);
+            wheel(delta); wheel(delta);
             pump([&]{return outer->ScrollY()!=centered;},"TAG outer handoff motion",false);
             const float after=outer->ScrollY();
             wheel(-delta);
@@ -2018,6 +2128,7 @@ int wmain(int argc,wchar_t** argv) {
         scalar_reactivity_noop();
         caret_blink_contracts();
         text_area_wheel_boundaries();
+        wheel_chain_contracts();
         rendering_contracts();
         atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
         if(rangesOnly || acceptance) {
