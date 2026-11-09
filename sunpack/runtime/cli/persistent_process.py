@@ -66,6 +66,24 @@ _TERMINAL_COLUMNS_ARG = "--_sunpack-terminal-columns="
 _PIPE_PREFIX = r"\\.\pipe\SunPack-"
 
 
+def configure_stdio_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
+
+
+def should_submit_to_persistent_server(argv: list[str]) -> bool:
+    if not runtime_id_available() or not argv or any(item in {"-h", "--help"} for item in argv):
+        return False
+    from sunpack.runtime.cli.runtime_state import server_runtime_active
+
+    return not server_runtime_active()
+
+
 def handle_early_argv(argv: list[str]) -> int | None:
     if not argv:
         return None
@@ -73,6 +91,9 @@ def handle_early_argv(argv: list[str]) -> int | None:
         return asyncio.run(run_server())
     if argv[0] == SHUTDOWN_ARG:
         return submit_request([], shutdown=True)
+    if should_submit_to_persistent_server(argv):
+        configure_stdio_encoding()
+        return submit_request(argv)
     return None
 
 

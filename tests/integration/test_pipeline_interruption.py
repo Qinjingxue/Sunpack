@@ -141,7 +141,7 @@ def test_cli_prompt_stop_returns_interrupted_over_the_real_protocol(tmp_path, mo
     subprocess.run([str(require_7z()), "a", "-tzip", "-psecret", str(archive), str(payload), "-y"],
                    check=True, capture_output=True)
     config = make_config({"post_extract": {"archive_cleanup_mode": "k"}})
-    monkeypatch.setattr(cli, "runtime_id_available", lambda: False)
+    monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _argv: False)
     monkeypatch.setattr(extract, "load_request_config", lambda *a, **k: config)
     monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
     monkeypatch.setattr(runtime_state, "runtime_host", lambda: None)
@@ -448,7 +448,7 @@ def test_cli_control_returns_130_and_json_after_output_cleanup(tmp_path, monkeyp
     archive = tmp_path / "active.zip"
     archive.write_bytes(make_zip({"data.txt": b"unfinished"}))
     config = make_config({"post_extract": {"archive_cleanup_mode": "d"}})
-    monkeypatch.setattr(cli, "runtime_id_available", lambda: False)
+    monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _argv: False)
     monkeypatch.setattr(extract, "load_request_config", lambda *a, **k: config)
     monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
     release = threading.Event()

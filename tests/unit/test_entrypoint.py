@@ -3,7 +3,7 @@ import sunpack.core.support.resources as resources
 from sunpack.core.support import runtime_identity
 
 
-def test_entrypoint_consumes_private_runtime_identity_before_cli(monkeypatch):
+def test_entrypoint_consumes_private_runtime_identity_before_forwarding(monkeypatch):
     monkeypatch.setattr(entrypoint.sys, "executable", r"C:\\Python310\\python.exe")
     monkeypatch.setattr(
         entrypoint.sys,
@@ -16,14 +16,15 @@ def test_entrypoint_consumes_private_runtime_identity_before_cli(monkeypatch):
         ],
     )
 
-    def fake_main():
+    def submit(argv):
+        assert argv == ["watch", "start"]
         assert entrypoint.sys.argv[1:] == ["watch", "start"]
         assert runtime_identity.runtime_id() == "v2-0123456789abcdef"
         return 19
 
-    import sunpack.runtime.cli.cli as cli
+    from sunpack.runtime.cli import persistent_process
 
-    monkeypatch.setattr(cli, "main", fake_main)
+    monkeypatch.setattr(persistent_process, "submit_request", submit)
 
     assert entrypoint.main() == 19
 

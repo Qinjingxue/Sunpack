@@ -448,6 +448,7 @@ impl Huffman {
         self.lsb().decode(bits)
     }
 
+    #[inline(always)]
     fn decode_msb(&self, bits: &mut MsbBits<'_, '_>) -> ValidationResult<u16> {
         bits.fill_available(self.lookup_bits)?;
         let mut code = 0;
@@ -463,6 +464,16 @@ impl Huffman {
             bits.consume(self.lookup_bits);
             matched_bits = usize::from(self.lookup_bits);
         }
+        self.decode_msb_long(bits, code, matched_bits)
+    }
+
+    #[cold]
+    fn decode_msb_long(
+        &self,
+        bits: &mut MsbBits<'_, '_>,
+        mut code: u32,
+        matched_bits: usize,
+    ) -> ValidationResult<u16> {
         for length in matched_bits + 1..=self.max_len {
             code = (code << 1) | bits.read(1)?;
             let first = self.first_code[length];
@@ -1180,25 +1191,6 @@ pub(crate) fn validate_gzip_structure_observed(
     Ok(walk_gzip_structure(reader, offset, limit, None, visit)?.structure)
 }
 
-fn next_bzip_symbol(
-    bits: &mut MsbBits<'_, '_>,
-    tables: &[Huffman],
-    selectors: &[usize],
-    selector_index: &mut usize,
-    remaining: &mut usize,
-    table_index: &mut usize,
-) -> ValidationResult<u16> {
-    if *remaining == 0 {
-        *table_index = *selectors
-            .get(*selector_index)
-            .ok_or(ValidationError::Invalid("bzip2_selector_underflow"))?;
-        *selector_index += 1;
-        *remaining = 50;
-    }
-    *remaining -= 1;
-    tables[*table_index].decode_msb(bits)
-}
-
 pub(crate) fn validate_bzip2_structure(
     reader: &ManagedReader,
     offset: u64,
@@ -1272,7 +1264,7 @@ pub(crate) fn validate_bzip2_structure_observed(
             if !(2..=6).contains(&group_count) || !(1..=18_002).contains(&selector_count) {
                 return invalid("bzip2_huffman_counts_invalid");
             }
-            let mut mtf_groups: Vec<usize> = (0..group_count).collect();
+            let mut mtf_groups = [0u8, 1, 2, 3, 4, 5];
             let mut selectors = Vec::with_capacity(selector_count);
             for _ in 0..selector_count {
                 let mut index = 0usize;
@@ -1282,8 +1274,9 @@ pub(crate) fn validate_bzip2_structure_observed(
                         return invalid("bzip2_selector_invalid");
                     }
                 }
-                let value = mtf_groups.remove(index);
-                mtf_groups.insert(0, value);
+                let value = mtf_groups[index];
+                mtf_groups.copy_within(..index, 1);
+                mtf_groups[0] = value;
                 selectors.push(value);
             }
             let mut tables = Vec::with_capacity(group_count);
@@ -1307,60 +1300,46 @@ pub(crate) fn validate_bzip2_structure_observed(
             }
 
             let eob = (n_in_use + 1) as u16;
-            let mut selector_index = 0usize;
-            let mut remaining = 0usize;
-            let mut table_index = 0usize;
             let mut nblock = 0usize;
-            let mut symbol = next_bzip_symbol(
-                &mut bits,
-                &tables,
-                &selectors,
-                &mut selector_index,
-                &mut remaining,
-                &mut table_index,
-            )?;
-            while symbol != eob {
-                if symbol <= 1 {
-                    let mut run = 0usize;
-                    let mut weight = 1usize;
-                    loop {
-                        run = run
-                            .checked_add(if symbol == 0 { weight } else { weight * 2 })
-                            .ok_or(ValidationError::Invalid("bzip2_run_overflow"))?;
-                        weight = weight
-                            .checked_mul(2)
-                            .ok_or(ValidationError::Invalid("bzip2_run_overflow"))?;
-                        symbol = next_bzip_symbol(
-                            &mut bits,
-                            &tables,
-                            &selectors,
-                            &mut selector_index,
-                            &mut remaining,
-                            &mut table_index,
-                        )?;
-                        if symbol > 1 {
-                            break;
+            let mut run = 0usize;
+            let mut weight = 1usize;
+            'symbols: {
+                // One selector owns up to 50 symbols. A run may continue
+                // across selectors, so keep its state outside the group.
+                for selector in selectors {
+                    let table = &tables[usize::from(selector)];
+                    for _ in 0..50 {
+                        let symbol = table.decode_msb(&mut bits)?;
+                        if symbol <= 1 {
+                            let next_weight = weight
+                                .checked_mul(2)
+                                .ok_or(ValidationError::Invalid("bzip2_run_overflow"))?;
+                            run = run
+                                .checked_add(if symbol == 0 { weight } else { next_weight })
+                                .ok_or(ValidationError::Invalid("bzip2_run_overflow"))?;
+                            weight = next_weight;
+                            continue;
+                        }
+                        if run != 0 {
+                            nblock = nblock
+                                .checked_add(run)
+                                .ok_or(ValidationError::Invalid("bzip2_block_size_overflow"))?;
+                            if nblock > block_limit {
+                                return invalid("bzip2_block_size_exceeded");
+                            }
+                            run = 0;
+                            weight = 1;
+                        }
+                        if symbol == eob {
+                            break 'symbols;
+                        }
+                        nblock += 1;
+                        if nblock > block_limit {
+                            return invalid("bzip2_block_size_exceeded");
                         }
                     }
-                    nblock = nblock
-                        .checked_add(run)
-                        .ok_or(ValidationError::Invalid("bzip2_block_size_overflow"))?;
-                } else {
-                    // Tables contain exactly n_in_use + 2 slots. With the
-                    // run symbols and EOB excluded, this is a valid MTF index.
-                    nblock += 1;
-                    symbol = next_bzip_symbol(
-                        &mut bits,
-                        &tables,
-                        &selectors,
-                        &mut selector_index,
-                        &mut remaining,
-                        &mut table_index,
-                    )?;
                 }
-                if nblock > block_limit {
-                    return invalid("bzip2_block_size_exceeded");
-                }
+                return invalid("bzip2_selector_underflow");
             }
             if nblock == 0 || orig_ptr >= nblock {
                 return invalid("bzip2_orig_ptr_out_of_range");

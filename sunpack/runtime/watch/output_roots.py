@@ -92,12 +92,13 @@ class WatchOutputRoots:
                     "value": {"path": path, "identities": identities}} for alias in self._paths(path))
             self.state.commit_runtime(changes, durable=True)
 
-    def finish_flatten(self, root):
+    def finish_flatten(self, root) -> bool:
+        """Return whether the final root identity has been durably registered."""
         with self._lock:
             key = "flatten|" + path_key(root)
             record = self.state._native.runtime_record(key)
             if record is None:
-                return
+                return False
             work = record["work"]
             identity = self._identity(root)
             changes = []
@@ -108,17 +109,18 @@ class WatchOutputRoots:
                         changes.append({"op": "relocate_output", "owner": record["owner"],
                             "source": source, "destination": root, "identity": identity})
             elif identity != record["old_identity"] or os.path.exists(work):
-                return
+                return False
             if os.path.exists(work):
                 # Empty-wrapper cleanup failed; retain its intent for restart.
                 self.state.commit_runtime(changes, durable=True)
-                return
+                return False
             for alias in self._paths(root):
                 changes.append({"op": "runtime", "key": "owned|" + path_key(alias),
                     "value": {"path": root, "identities": [identity]}})
             changes.append({"op": "runtime", "key": key})
             changes.extend({"op": "runtime", "key": "owned|" + path_key(alias)} for alias in self._paths(work))
             self.state.commit_runtime(changes, durable=True)
+            return True
 
     def recover_flattens(self):
         from sunpack_native import flatten_single_branch_directories

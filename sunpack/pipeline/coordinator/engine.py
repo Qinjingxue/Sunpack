@@ -86,6 +86,23 @@ def new_work_broker() -> AsyncWorkBroker:
     return AsyncWorkBroker()
 
 
+def _prune_empty_output(path: str) -> bool:
+    """Remove an empty recursive wrapper and report whether the path remains."""
+    try:
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode) and not info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            with os.scandir(path) as entries:
+                if next(entries, None) is not None:
+                    return os.path.exists(path)
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+    return os.path.exists(path)
+
+
 class PipelineEngine:
     """Single-event-loop owner for independently completing requests."""
 
@@ -1585,11 +1602,14 @@ class _RequestRuntime:
                 if ran_recursive_children:
                     # Recursion may consume the output tree; a zero-member
                     # archive's original empty output remains a valid result.
-                    try:
-                        os.rmdir(output_dir)
-                    except OSError:
-                        pass
-                if not os.path.exists(output_dir):
+                    await self._drain_cleanup_tasks_under(output_dir)
+                    output_exists = await broker.run(
+                        "postprocess", task_key, _prune_empty_output, output_dir,
+                        request_id=self.submission.request_id, cancellation=cancellation,
+                    )
+                else:
+                    output_exists = os.path.exists(output_dir)
+                if not output_exists:
                     ownership.forget_output(output_dir)
                     cleared = replace(result, output_dir="")
                     self._replace_target_result(result, cleared)
@@ -1606,7 +1626,8 @@ class _RequestRuntime:
                 # fully asynchronous during extraction/recursion, but finish only
                 # cleanup operations whose source paths would be moved by this
                 # particular flatten.
-                await self._drain_cleanup_tasks_under(output_dir)
+                if not ran_recursive_children:
+                    await self._drain_cleanup_tasks_under(output_dir)
                 flattened = await self._flatten_output(
                     task,
                     output_dir,
@@ -1894,11 +1915,13 @@ class _RequestRuntime:
                 ).flattener.flatten_dirs(output_dir, work_path=work_path,
                     before_move=(lambda root, work, leaf: outputs.prepare_flatten(owner, root, work, leaf))
                         if outputs is not None else None)
-            if outputs is not None and os.path.isdir(output_dir):
-                outputs.finish_flatten(output_dir)
+            registered = outputs is not None and os.path.isdir(output_dir) and outputs.finish_flatten(output_dir)
             root_output = self.job_executor.relocate_output(result)
             if outputs is not None:
-                outputs.replace(output_dir, result.output_dir)
+                if registered and output_dir == result.output_dir:
+                    outputs.reconcile(output_dir, recursive=True)
+                else:
+                    outputs.replace(output_dir, result.output_dir)
             if self.submission.origin == "watch" and not root_output and result.source_dir and result.output_dir == output_dir:
                 self._report_progress(task, {"type": "semantic", "event": "task_output_finished",
                     "task_path": task.main_path, "output_dir": result.output_dir, "keep_output": True})

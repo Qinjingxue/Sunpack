@@ -5,7 +5,7 @@ import io
 def test_password_prompt_handles_windows_lines_and_preserves_spaces(monkeypatch, subtests):
     from sunpack.runtime.cli import cli
 
-    monkeypatch.setattr(cli, "runtime_id_available", lambda: False)
+    monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _argv: False)
     for terminator in ("", "\r", "\r\n"):
         with subtests.test(terminator=repr(terminator)):
             responses = iter(["secret", "crom\r", " secret ", terminator])

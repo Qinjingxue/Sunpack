@@ -15,7 +15,12 @@ from sunpack.core.config.cli_settings import load_cli_language_from_config
 from sunpack.runtime.cli.cli_parsers import localize_parser
 from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.cli_types import CliCommandResult
-from sunpack.core.support.runtime_identity import runtime_id_available
+from sunpack.runtime.cli.persistent_process import (
+    SERVER_ARG,
+    SHUTDOWN_ARG,
+    configure_stdio_encoding,
+    should_submit_to_persistent_server as _should_submit_to_persistent_server,
+)
 from sunpack.core.support.resources import resource_path_resolution_scope
 
 _PARSER_CACHE: dict[tuple[str, str | None], tuple[argparse.ArgumentParser, dict[str, ModuleType]]] = {}
@@ -34,18 +39,6 @@ class _ContextArgumentParser(argparse.ArgumentParser):
         elif file is None or file is sys.stdout:
             file = _PARSER_STDOUT.get() or file
         super()._print_message(message, file)
-
-
-def configure_stdio_encoding():
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
-        try:
-            reconfigure(encoding="utf-8", errors="backslashreplace")
-        except Exception:
-            pass
 
 
 def preprocess_sys_argv(argv: list[str]) -> list[str]:
@@ -162,17 +155,14 @@ async def async_main(
         argv = sys.argv[1:]
     if stdout is None and stderr is None:
         configure_stdio_encoding()
-    if argv and argv[0] in {"--persistent-server", "--persistent-shutdown"}:
+    if argv and argv[0] in {SERVER_ARG, SHUTDOWN_ARG}:
         from sunpack.runtime.cli.persistent_process import run_server, submit_request
 
-        return await run_server() if argv[0] == "--persistent-server" else submit_request([], shutdown=True)
-    if argv and _should_submit_to_persistent_server(argv):
-        from sunpack.runtime.cli.runtime_state import server_runtime_active
+        return await run_server() if argv[0] == SERVER_ARG else submit_request([], shutdown=True)
+    if _should_submit_to_persistent_server(argv):
+        from sunpack.runtime.cli.persistent_process import submit_request
 
-        if not server_runtime_active():
-            from sunpack.runtime.cli.persistent_process import submit_request
-
-            return submit_request(list(argv))
+        return submit_request(list(argv))
 
     with resource_path_resolution_scope(
         enabled=bool(argv) and canonical_command(argv[0]) in {"extract", "scan"},
@@ -264,12 +254,6 @@ async def async_main(
             await broker.run("cli_output", "", reporter.emit_result, result)
             await maybe_pause(args, ctx, exit_code, result)
             return exit_code
-
-
-def _should_submit_to_persistent_server(argv: list[str]) -> bool:
-    if not runtime_id_available() or not argv or any(item in {"-h", "--help"} for item in argv):
-        return False
-    return True
 
 
 if __name__ == "__main__":
