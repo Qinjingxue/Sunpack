@@ -709,9 +709,9 @@ def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
     assert (out_dir / "async.txt").read_text(encoding="utf-8") == "async payload"
 
 
-def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path):
-    worker = tmp_path / "exit_worker.cmd"
-    write_worker_script(worker, [{"type": "worker_ready", "process_mode": "normal", "process_mode_applied": True}, None, 7])
+def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path, monkeypatch):
+    worker = tmp_path / "exit_worker.py"
+    write_worker_script(worker, [{"type": "worker_ready", "process_mode": "normal", "process_mode_applied": True}, None, 7], monkeypatch)
     runner = SevenZipRunner({})
     runner.worker_path = str(worker)
 
@@ -737,7 +737,7 @@ def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path):
 def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path, completion, monkeypatch):
     from sunpack.pipeline.coordinator.engine import PipelineEngine
 
-    worker = tmp_path / "cancel_worker.cmd"
+    worker = tmp_path / "cancel_worker.py"
     ending = [
         {"type": "result", "job_id": "cancel-job", "status": "failed"},
         {"type": "native_event", "event": "job_finished", "job_id": "cancel-job"}, None,
@@ -748,7 +748,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
         {"type": "cancel_ack", "job_id": "cancel-job"},
         {"type": "native_event", "event": "job_cancelling", "job_id": "cancel-job"}, None,
         *ending,
-    ])
+    ], monkeypatch)
 
     async def scenario():
         runner = SevenZipRunner({})
@@ -1372,11 +1372,11 @@ def test_extraction_scheduler_saves_process_failure_diagnostics(tmp_path):
     assert result.diagnostics["repro"]["request"]["archive_input"]["entry_path"] == str(archive)
 
 
-def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit(tmp_path):
-    worker = tmp_path / "malformed_worker.cmd"
+def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit(tmp_path, monkeypatch):
+    worker = tmp_path / "malformed_worker.py"
     # Emit malformed output after accepting a request. Exiting before the
     # handshake races with submission and legitimately reports process_io.
-    write_worker_script(worker, [{"type": "worker_ready", "process_mode": "normal", "process_mode_applied": True}, None, b"broken frame", 2])
+    write_worker_script(worker, [{"type": "worker_ready", "process_mode": "normal", "process_mode_applied": True}, None, b"broken frame", 2], monkeypatch)
     archive = tmp_path / "sample.7z"
     archive.write_bytes(b"not used")
     scheduler = ExtractionScheduler()

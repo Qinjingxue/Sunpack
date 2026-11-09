@@ -228,10 +228,10 @@ def test_malformed_routed_chunk_and_unattributable_frame_are_distinguished():
         parse_worker_transport_event(b"broken stream")
 
 
-def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_events(tmp_path):
+def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_events(tmp_path, monkeypatch):
     # Existing transport tests finish promptly and cannot catch a watchdog
     # cancelling a queued job. The short legacy setting keeps this inexpensive.
-    script = tmp_path / "queued_worker.cmd"
+    script = tmp_path / "queued_worker.py"
     write_worker_script(script, [
         {"type": "worker_ready"}, None,
         {"type": "native_event", "event": "job_started", "job_id": "active"}, None,
@@ -240,7 +240,7 @@ def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_ev
         {"type": "native_event", "event": "job_finished", "job_id": "active"},
         {"type": "result", "job_id": "queued", "status": "ok"},
         {"type": "native_event", "event": "job_finished", "job_id": "queued"}, None,
-    ])
+    ], monkeypatch)
 
     async def run():
         started, queued, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()

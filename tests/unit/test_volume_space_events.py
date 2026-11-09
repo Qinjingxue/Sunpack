@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 
 import pytest
 
 from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.worker_events import launch_python_worker
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _apply_native_environment,
@@ -44,7 +44,7 @@ def _task(archive: Path):
     return make_archive_task(archive, key=str(archive))
 
 
-def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_worker") -> Path:
+def _write_python_worker(tmp_path: Path, events: list[dict], monkeypatch, name: str = "space_worker") -> Path:
     """写一个从请求回显 job_id 的假 worker，供 dispatcher 路由。"""
 
     script = tmp_path / f"{name}.py"
@@ -67,12 +67,7 @@ def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_
         "            emit({**event, 'job_id': request.get('job_id', '')})\n",
         encoding="utf-8",
     )
-    runner = tmp_path / f"{name}.cmd"
-    runner.write_text(
-        f'@echo off\r\n"{sys.executable}" "{script}"\r\n',
-        encoding="utf-8",
-    )
-    return runner
+    return launch_python_worker(monkeypatch, script)
 
 
 def test_space_poll_intervals_environment_mapping():
@@ -121,7 +116,7 @@ def test_new_space_episode_accepts_status_and_discards_previous_episode():
 
 
 @pytest.mark.parametrize("resource", ["space", "memory"])
-def test_stale_resource_event_is_not_forwarded_to_the_ui(tmp_path, resource):
+def test_stale_resource_event_is_not_forwarded_to_the_ui(tmp_path, resource, monkeypatch):
     """端到端：native 按 resumed(ep3) → blocked(ep3) 乱序发送时，
     progress_callback（UI/Toast 的唯一入口）只能看到 resumed。
     """
@@ -143,6 +138,7 @@ def test_stale_resource_event_is_not_forwarded_to_the_ui(tmp_path, resource):
             {"type": "result", "status": "ok"},
             {"type": "native_event", "event": "job_finished"},
         ],
+        monkeypatch,
         name="stale_worker",
     )
 

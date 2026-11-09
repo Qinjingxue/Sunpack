@@ -81,13 +81,38 @@ def read_worker_events(stream):
     decoder.finish()
 
 
-def write_worker_script(path, steps):
-    """A real pipe peer controlled by request frames, without timing sleeps."""
+def launch_python_worker(monkeypatch, path):
+    """Launch this test peer directly so terminate() also closes its pipes."""
+    import asyncio
+    import os
     import sys
+
+    create_subprocess_exec = asyncio.create_subprocess_exec
+
+    async def launch(program, *args, **kwargs):
+        if str(program) == str(path):
+            # A .cmd wrapper leaves Python alive with inherited stdio handles
+            # when the runner terminates the wrapper on Windows.
+            executable = sys.executable
+            if sys.platform == "win32" and os.path.normcase(executable) != os.path.normcase(sys._base_executable):
+                # Mirror multiprocessing.popen_spawn_win32: bypass the venv
+                # redirector too, while retaining its site-packages.
+                executable = sys._base_executable
+                environment = kwargs.get("env")
+                kwargs["env"] = dict(os.environ if environment is None else environment)
+                kwargs["env"]["__PYVENV_LAUNCHER__"] = sys.executable
+            return await create_subprocess_exec(executable, str(path), *args, **kwargs)
+        return await create_subprocess_exec(program, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", launch)
+    return path
+
+
+def write_worker_script(path, steps, monkeypatch):
+    """A real pipe peer controlled by request frames, without timing sleeps."""
     from sunpack_native import encode_worker_frame
     actions = [encode_worker_frame(step) if isinstance(step, dict) else step for step in steps]
-    script = path.with_suffix(".py")
-    script.write_text(
+    path.write_text(
         "import sys, struct\n"
         "def exact(size):\n"
         "    data = bytearray()\n"
@@ -105,8 +130,7 @@ def write_worker_script(path, steps):
         "    else:\n"
         "        sys.stdout.buffer.write(step)\n"
         "        sys.stdout.buffer.flush()\n", encoding="utf-8")
-    path.write_text(f'@"{sys.executable}" "{script}"\n', encoding="utf-8")
-    return path
+    return launch_python_worker(monkeypatch, path)
 
 
 def worker_frames(data):
