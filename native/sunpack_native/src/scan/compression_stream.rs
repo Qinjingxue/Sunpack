@@ -103,6 +103,15 @@ impl<'a> ByteCursor<'a> {
         Ok(value)
     }
 
+    fn take_buffered_word(&mut self) -> Option<u32> {
+        // Only consume bytes already in this cursor window. A short window
+        // still uses the byte path and its existing refill and EOF checks.
+        let start = self.pos.checked_sub(self.buffer_start)? as usize;
+        let word = self.buffer.get(start..)?.first_chunk()?;
+        self.pos += 4;
+        Some(u32::from_be_bytes(*word))
+    }
+
     // Keep refill policy out of the per-byte Huffman/deflate hot path.
     #[inline(never)]
     fn refill(&mut self) -> ValidationResult<()> {
@@ -256,6 +265,7 @@ impl<'a, 'b> LsbBits<'a, 'b> {
 
 struct MsbBits<'a, 'b> {
     cursor: &'a mut ByteCursor<'b>,
+    // Unconsumed bits occupy the high end of the word; consumption is one shift.
     bits: u64,
     count: u8,
 }
@@ -270,19 +280,37 @@ impl<'a, 'b> MsbBits<'a, 'b> {
     }
 
     fn read(&mut self, count: u8) -> ValidationResult<u32> {
+        if count == 0 {
+            return Ok(0);
+        }
         self.fill_available(count)?;
         if self.count < count {
             return invalid("unexpected_end_of_stream");
         }
-        self.count -= count;
-        let value = (self.bits >> self.count) as u32;
-        self.bits &= (1u64 << self.count) - 1;
+        let value = self.peek(count);
+        self.consume(count);
         Ok(value)
     }
 
+    fn peek(&self, count: u8) -> u32 {
+        (self.bits >> (64 - count)) as u32
+    }
+
+    fn consume(&mut self, count: u8) {
+        self.bits <<= count;
+        self.count -= count;
+    }
+
     fn fill_available(&mut self, count: u8) -> ValidationResult<()> {
+        if self.count < count {
+            if let Some(word) = self.cursor.take_buffered_word() {
+                self.bits |= u64::from(word) << (32 - self.count);
+                self.count += 32;
+                return Ok(());
+            }
+        }
         while self.count < count && self.cursor.pos < self.cursor.limit {
-            self.bits = (self.bits << 8) | u64::from(self.cursor.read_byte()?);
+            self.bits |= u64::from(self.cursor.read_byte()?) << (56 - self.count);
             self.count += 8;
         }
         Ok(())
@@ -290,7 +318,7 @@ impl<'a, 'b> MsbBits<'a, 'b> {
 
     fn align_zero(&mut self) -> ValidationResult<()> {
         let padding = self.count % 8;
-        if self.bits >> (self.count - padding) != 0 {
+        if padding != 0 && self.peek(padding) != 0 {
             return invalid("nonzero_stream_padding");
         }
         self.cursor.pos -= u64::from(self.count / 8);
@@ -422,16 +450,20 @@ impl Huffman {
 
     fn decode_msb(&self, bits: &mut MsbBits<'_, '_>) -> ValidationResult<u16> {
         bits.fill_available(self.lookup_bits)?;
+        let mut code = 0;
+        let mut matched_bits = 0;
         if bits.count >= self.lookup_bits {
-            let entry = self.lookup[(bits.bits >> (bits.count - self.lookup_bits)) as usize];
+            code = bits.peek(self.lookup_bits);
+            let entry = self.lookup[code as usize];
             if entry != 0 {
-                bits.count -= (entry >> 16) as u8;
-                bits.bits &= (1u64 << bits.count) - 1;
+                bits.consume((entry >> 16) as u8);
                 return Ok(entry as u16);
             }
+            // An empty lookup slot rules out every shorter canonical code.
+            bits.consume(self.lookup_bits);
+            matched_bits = usize::from(self.lookup_bits);
         }
-        let mut code = 0u32;
-        for length in 1..=self.max_len {
+        for length in matched_bits + 1..=self.max_len {
             code = (code << 1) | bits.read(1)?;
             let first = self.first_code[length];
             let count = u32::from(self.counts[length]);
@@ -1314,9 +1346,8 @@ pub(crate) fn validate_bzip2_structure_observed(
                         .checked_add(run)
                         .ok_or(ValidationError::Invalid("bzip2_block_size_overflow"))?;
                 } else {
-                    if usize::from(symbol - 1) >= n_in_use {
-                        return invalid("bzip2_mtf_symbol_invalid");
-                    }
+                    // Tables contain exactly n_in_use + 2 slots. With the
+                    // run symbols and EOB excluded, this is a valid MTF index.
                     nblock += 1;
                     symbol = next_bzip_symbol(
                         &mut bits,

@@ -1764,6 +1764,10 @@ fn scan_directory_impl<const PROFILE: bool>(
     let mut raw_records = Vec::new();
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred_split_records = Vec::new();
+    let exclusion_scope = options
+        .scope
+        .as_ref()
+        .filter(|scope| scope.has_exclusions());
     let start_depth = options
         .scope
         .as_ref()
@@ -1819,11 +1823,7 @@ fn scan_directory_impl<const PROFILE: bool>(
                 measure::<PROFILE, _>(&mut profile, ProfileBucket::DirectoryEnumeration, || {
                     entry.path()
                 });
-            if options
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.excludes(&path.to_string_lossy()))
-            {
+            if exclusion_scope.is_some_and(|scope| scope.excludes(&path.to_string_lossy())) {
                 continue;
             }
             let outside_relation = options

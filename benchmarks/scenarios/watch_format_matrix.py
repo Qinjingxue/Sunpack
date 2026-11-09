@@ -297,7 +297,7 @@ def _install_watch_instrumentation(
             "candidate": str(candidate.path),
             "candidate_name": Path(candidate.path).name,
             "processing_started": _now(),
-            "input_paths": list(group.input_paths) if group is not None else [str(candidate.path)],
+            "input_paths": [str(candidate.path)],
         }
         attempts.append(attempt)
         return await original_submit(candidate)

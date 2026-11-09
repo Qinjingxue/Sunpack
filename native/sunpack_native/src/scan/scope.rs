@@ -15,6 +15,10 @@ pub(crate) struct NativeDiscoveryScope {
 }
 
 impl NativeDiscoveryScope {
+    pub(crate) fn has_exclusions(&self) -> bool {
+        !self.excluded.is_empty()
+    }
+
     fn contains_key(&self, key: &str) -> bool {
         if key == self.key {
             return !self.excluded.contains(key);
@@ -102,7 +106,7 @@ impl NativeDiscoveryScope {
     }
 
     pub fn excludes(&self, path: &str) -> bool {
-        !self.excluded.is_empty() && self.excludes_key(&path_key(path))
+        self.has_exclusions() && self.excludes_key(&path_key(path))
     }
 }
 

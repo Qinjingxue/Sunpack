@@ -247,6 +247,10 @@ class RequestRuntimeProfiler:
 
         _wrap(scanner, "direct_file_tasks", timings, "pipeline_direct_scan")
         _wrap(scanner, "scan_targets", timings, "pipeline_nested_scan")
+        _wrap(scanner, "discover_targets", timings, "pipeline_discover_targets")
+        discovery = _child(_child(scanner, "provider"), "discovery")
+        _wrap(discovery, "discover_many_native", timings, "discovery_native")
+        _wrap(_child(discovery, "embedded"), "discover_many_native", timings, "discovery_embedded")
 
         _wrap(planning, "plan_task", timings, "input_planning")
         for name, label in (
@@ -311,7 +315,7 @@ class RequestRuntimeProfiler:
         _wrap(_child(password_tester, "password_scheduler"), "plan_for_extraction", timings, "password_bounded_verify")
         sevenzip = _child(extractor, "sevenzip_runner")
         _wrap(sevenzip, "extract_attempt", timings, "sevenzip_worker_legacy", phase_timer=phase)
-        _wrap(sevenzip, "submit_attempt_asyncio", timings, "sevenzip_worker", phase_timer=phase)
+        _wrap(sevenzip, "submit_attempt_asyncio", timings, "sevenzip_worker")
         _wrap(sevenzip, "_emit_progress", timings, "worker_protocol_emit_progress")
         _wrap(job.verifier, "verify", timings, "verify_total", phase_timer=phase)
 
