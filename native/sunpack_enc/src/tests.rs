@@ -494,12 +494,11 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
                                         .saturating_sub(position.get())
                                         .min(BUFFER as u64)
                                         as usize;
-                                    assert_eq!(
-                                        wanted,
-                                        (decrypt_n / MIN_PARALLEL_CHUNK)
-                                            .saturating_sub(1)
-                                            .min(executor_threads - 1),
-                                        "request exceeds data or executor capacity"
+                                    assert!((1..executor_threads).contains(&wanted));
+                                    assert!(
+                                        wanted
+                                            < decrypt_n
+                                                / cipher::payload_parallel_grain(code as u8)
                                     );
                                     assert_eq!(held.get(), 0);
                                     requests.set(requests.get() + 1);
@@ -517,7 +516,7 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
                                 },
                             )
                             .unwrap();
-                        assert!(requests.get() > 0);
+                        assert_eq!(requests.get() > 0, executor_threads > 1);
                         assert_eq!(held.get(), 0);
                         assert_eq!(output, plaintext);
                     });

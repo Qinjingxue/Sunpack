@@ -24,7 +24,6 @@ const PREFIX: u64 = 40;
 const CHECK: u64 = 32;
 const MAC: u64 = 32;
 const BUFFER: usize = 256 * 1024;
-const MIN_PARALLEL_CHUNK: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -410,7 +409,9 @@ impl Decoder {
         let mut mac = Zeroizing::new(blake3::Hasher::new_keyed(&self.keys.auth));
         mac.update(&self.keys.nonce);
         mac.update(&self.header.bytes);
-        let cipher = cipher::Stream::new(self.header.bytes[6], &self.keys.key, &self.keys.nonce);
+        let code = self.header.bytes[6];
+        let cipher = cipher::Stream::new(code, &self.keys.key, &self.keys.nonce);
+        let grain = cipher::payload_parallel_grain(code);
         let capacity = (self.packed - MAC - PREFIX).min(BUFFER as u64) as usize;
         let mut buffer = Zeroizing::new(vec![0u8; capacity]);
         let mut position = PREFIX;
@@ -424,13 +425,17 @@ impl Decoder {
             if decrypt_n != 0 {
                 {
                     let extra = {
-                        let slices = decrypt_n / MIN_PARALLEL_CHUNK;
-                        let wanted = slices.saturating_sub(1);
+                        let wanted = (decrypt_n / grain).saturating_sub(1);
+                        let wanted = if wanted != 0 {
+                            // Bound demand by the executor before borrowing CPU.
+                            wanted.min(rayon::current_num_threads().saturating_sub(1))
+                        } else {
+                            0
+                        };
                         if wanted == 0 {
                             0
                         } else {
-                            // Bound demand by the executor before borrowing CPU.
-                            acquire(wanted.min(rayon::current_num_threads().saturating_sub(1)))
+                            acquire(wanted)
                         }
                     };
                     let _lease = CpuLease {

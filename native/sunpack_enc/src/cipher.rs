@@ -179,6 +179,20 @@ pub(crate) struct Stream {
     stages: Vec<Ctr>,
 }
 
+/// Minimum payload bytes per lane. Leave enough work on each lane to pay
+/// for dispatch and CTR initialization, especially on accelerated ciphers.
+pub(crate) fn payload_parallel_grain(code: u8) -> usize {
+    match code {
+        #[cfg(target_arch = "x86_64")]
+        // At the current 256 KiB window, hardware AES loses time and CPU
+        // even when only one helper is requested.
+        0 if std::arch::is_x86_feature_detected!("aes") => 256 * 1024,
+        8 => 64 * 1024,
+        0 | 1 | 7 => 32 * 1024,
+        _ => 16 * 1024,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,23 +278,22 @@ impl Stream {
         }
     }
     pub fn apply_with_threads(&self, offset: u64, bytes: &mut [u8], threads: usize) {
-        use rayon::prelude::*;
-        if bytes.is_empty() {
-            return;
-        }
-        let chunk_size = bytes.len().div_ceil(threads.max(1));
-        if chunk_size == bytes.len() {
+        if threads <= 1 || bytes.is_empty() {
             self.apply_at(offset, bytes);
             return;
         }
-        // Exactly one CTR operation per granted CPU credit. Rayon cannot fan
-        // this work out beyond these slices, even though the pool is shared.
-        bytes
-            .par_chunks_mut(chunk_size)
-            .with_max_len(1)
-            .enumerate()
-            .for_each(|(index, part)| {
-                self.apply_at(offset + (index * chunk_size) as u64, part);
-            });
+        // Align lane boundaries within an aligned payload window. Only
+        // helpers leave the caller.
+        let chunk_size = bytes.len().div_ceil(threads).next_multiple_of(128);
+        let mut chunks = bytes.chunks_mut(chunk_size);
+        let first = chunks.next().unwrap();
+        rayon::in_place_scope(|scope| {
+            for (index, part) in chunks.enumerate() {
+                scope.spawn(move |_| {
+                    self.apply_at(offset + ((index + 1) * chunk_size) as u64, part);
+                });
+            }
+            self.apply_at(offset, first);
+        });
     }
 }
