@@ -19,6 +19,8 @@ void *sunpack_memory_current_context(void);
 void *sunpack_memory_exchange_context(void *context);
 int sunpack_memory_may_start_thread(void *context);
 void *sunpack_memory_alloc(size_t size);
+/* Refusal must not mark a job for replay when its base workspace can proceed. */
+void *sunpack_memory_try_alloc(size_t size);
 int sunpack_memory_free(void *address);
 size_t sunpack_memory_size(void *address);
 void *sunpack_decoder_allocate(void *opaque, size_t size);

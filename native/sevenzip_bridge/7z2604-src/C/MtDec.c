@@ -555,11 +555,8 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
       if (p->numStartedThreads < p->numStartedThreads_Limit && canCreateNewThread)
       {
         CMtDecThread *candidate = &p->threads[p->numStartedThreads];
-        const BoolInt needsCpuCredit = !Thread_WasCreated(&candidate->thread);
-        unsigned granted = 1;
-        if (needsCpuCredit)
-          granted = sunpack_cpu_acquire_extra_for_context(
-              p->sunpackCpuContext, 1, 1);
+        const unsigned granted = sunpack_cpu_acquire_extra_for_context(
+            p->sunpackCpuContext, 1, 1);
 
         if (granted == 0)
         {
@@ -571,14 +568,14 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
           SRes res2 = MtDecThread_CreateAndStart(candidate);
           if (res2 == SZ_OK)
           {
-            if (needsCpuCredit && p->sunpackCpuContext)
+            if (p->sunpackCpuContext)
               p->sunpackCpuExtraCredits++;
             // if (p->numStartedThreads % 1000 == 0) PRF(printf("\n numStartedThreads=%d\n", p->numStartedThreads));
             p->numStartedThreads++;
           }
           else
           {
-            if (needsCpuCredit && p->sunpackCpuContext)
+            if (p->sunpackCpuContext)
               sunpack_cpu_release_extra_for_context(
                   p->sunpackCpuContext, 1);
             PRF(printf("\nERROR: numStartedThreads=%d\n", p->numStartedThreads));
@@ -1019,14 +1016,6 @@ static void MtDec_Free(CMtDec *p)
   for (i = 0; i < MTDEC_THREADS_MAX; i++)
     MtDecThread_Destruct(&p->threads[i]);
 
-  if (p->sunpackCpuContext && p->sunpackCpuExtraCredits)
-  {
-    sunpack_cpu_release_extra_for_context(
-        p->sunpackCpuContext, p->sunpackCpuExtraCredits);
-    p->sunpackCpuExtraCredits = 0;
-  }
-  p->sunpackCpuContext = NULL;
-
   // Event_Close(&p->finishedEvent);
 
   if (p->crossBlock)
@@ -1049,8 +1038,7 @@ SRes MtDec_Code(CMtDec *p)
 {
   unsigned i;
 
-  if (!p->sunpackCpuContext)
-    p->sunpackCpuContext = sunpack_cpu_current_job_context();
+  p->sunpackCpuContext = sunpack_cpu_current_job_context();
 
   p->inProcessed = 0;
 
@@ -1124,8 +1112,15 @@ SRes MtDec_Code(CMtDec *p)
       MtDec_CloseThreads(p);
     }}}}
 
-    // wres = 17; // for test
-    // wres = Event_Wait(&p->finishedEvent);
+    // The ordered write chain has drained, or the error path joined all
+    // helpers. Parked threads can be reused, including after serial fallback.
+    if (p->sunpackCpuExtraCredits)
+    {
+      sunpack_cpu_release_extra_for_context(
+          p->sunpackCpuContext, p->sunpackCpuExtraCredits);
+      p->sunpackCpuExtraCredits = 0;
+    }
+    p->sunpackCpuContext = NULL;
 
     sres = MY_SRes_HRESULT_FROM_WRes(wres);
 

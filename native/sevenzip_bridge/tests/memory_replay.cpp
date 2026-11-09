@@ -4,6 +4,9 @@
 #include "internal/native_memory.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/sevenzip_callbacks.hpp"
+#include "7zip/Common/StreamObjects.h"
+#include "7zip/Compress/BZip2Decoder.h"
+#include "7zip/Compress/BZip2Encoder.h"
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -326,6 +329,56 @@ void disk_and_memory(const std::filesystem::path &directory, bool memory_first) 
     manager.stop();
 }
 
+void bzip2_optional_workspace() {
+    std::vector<Byte> payload(2 * MiB);
+    UInt32 state = 1;
+    for (auto &byte : payload) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<Byte>(state);
+    }
+    CBufInStream input;
+    input.Init(payload.data(), payload.size());
+    CDynBufSeqOutStream packed;
+    NCompress::NBZip2::CEncoder encoder;
+    require(static_cast<ICompressCoder &>(encoder).Code(&input, &packed, nullptr, nullptr, nullptr) == S_OK,
+            "BZip2 fixture compression failed");
+
+    std::atomic<NativeMemoryJob *> active{nullptr};
+    NativeMemoryManager manager(0, [&] {
+        const auto *job = active.load();
+        return static_cast<std::int64_t>(6 * MiB) -
+               static_cast<std::int64_t>(job ? job->committed : 0);
+    });
+    NativeMemoryJob memory(manager);
+    active = &memory;
+    NativeCpuBudget budget(4);
+    require(budget.try_acquire_base(), "BZip2 base CPU credit unavailable");
+    NativeCpuJobContext cpu(budget);
+    manager.begin(memory);
+    {
+        NativeMemoryScope memory_scope(&memory);
+        NativeCpuContextScope cpu_scope(&cpu);
+        NCompress::NBZip2::CDecoder decoder;
+        decoder.Base.DecodeAllStreams = true;
+        std::vector<Byte> output(payload.size());
+        CBufPtrSeqOutStream sink;
+        sink.Init(output.data(), output.size());
+        input.Init(packed.GetBuffer(), packed.GetSize());
+        require(static_cast<ICompressCoder &>(decoder).Code(&input, &sink, nullptr, nullptr, nullptr) == S_OK &&
+                sink.GetPos() == payload.size() && output == payload,
+                "BZip2 must finish with correct output when only its base workspace fits");
+        require(cpu.snapshot().peak_extra_credits != 0 && !memory.denied && !memory.revoked &&
+                    budget.reserved_credits() == 1,
+                "BZip2 did not return optional credits after a workspace denial");
+    }
+    budget.release(1);
+    manager.end(memory);
+    require(!memory.committed, "BZip2 leaked its workspace after pressure");
+    manager.stop();
+}
+
 int main() {
     auto directory = std::filesystem::temp_directory_path() / (L"sunpack-memory-" + std::to_wstring(GetCurrentProcessId()));
     std::filesystem::create_directories(directory);
@@ -333,6 +386,7 @@ int main() {
     simultaneous_scaled_machine_budgets();
     batched_waiter_admission();
     restart_working_set();
+    bzip2_optional_workspace();
     sparse_replay(directory);
     disk_and_memory(directory, true);
     disk_and_memory(directory, false);

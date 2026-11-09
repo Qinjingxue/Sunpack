@@ -311,10 +311,11 @@ public:
     CDecoder *_decoder;
   public:
     CWaitScout_Releaser(CDecoder *decoder): _decoder(decoder) {}
-    ~CWaitScout_Releaser() { _decoder->WaitScout(); }
+    ~CWaitScout_Releaser() { _decoder->EndScoutRun(); }
   };
 
   HRESULT CreateThread();
+  void EndScoutRun();
 
   #endif
 

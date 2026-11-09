@@ -166,13 +166,13 @@ void NativeMemoryManager::retry(NativeMemoryJob &job) {
     revoke_locked(job);
     SetEvent(change_);
 }
-void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noexcept {
+void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size, bool optional) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         if (job.revoked.load(std::memory_order_acquire)) return nullptr;
         const auto wanted = commitment(size);
         const auto total = wanted > UINT64_MAX - job.committed ? UINT64_MAX : job.committed + wanted;
-        job.peak = (std::max)(job.peak, total);
+        if (!optional) job.peak = (std::max)(job.peak, total);
         const auto credit = (std::min)(wanted, job.admission);
         auto headroom = sample_locked();
         // Do not deny a legal allocation on an old external snapshot. A low
@@ -185,8 +185,10 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noex
             // Reclaim on the monitor: global-new callers may already hold a
             // writer/registry mutex, so inline cache reclaim can deadlock.
             reclaim_requested_ = true;
-            failed_locked(job, total, headroom);
-            job.denied.store(true, std::memory_order_release);
+            if (!optional) {
+                failed_locked(job, total, headroom);
+                job.denied.store(true, std::memory_order_release);
+            }
             SetEvent(change_);
             return nullptr;
         }
@@ -200,9 +202,11 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noex
             // External commit may have shrunk since the ledger's last sample.
             // Its old optimistic value must not become a permanent retry gate.
             headroom = sample_locked(true);
-            job.failed_headroom = headroom + static_cast<std::int64_t>(job.committed + job.admission);
-            failed_locked(job, total, headroom);
-            job.denied.store(true, std::memory_order_release);
+            if (!optional) {
+                job.failed_headroom = headroom + static_cast<std::int64_t>(job.committed + job.admission);
+                failed_locked(job, total, headroom);
+                job.denied.store(true, std::memory_order_release);
+            }
             changed();
             return nullptr;
         }
@@ -213,6 +217,7 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noex
         } catch (...) { VirtualFree(result, 0, MEM_RELEASE); throw; }
         job.admission -= credit;
         job.committed += wanted;
+        if (optional) job.peak = (std::max)(job.peak, total);
         cached_headroom_ -= static_cast<std::int64_t>(wanted);
         if (job.admission && job.committed >= job.required) {
             // The observed dictionary workspace is now funded. Reconcile the
@@ -222,7 +227,7 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noex
             sample_locked(true);
         }
         return result;
-    } catch (...) { retry(job); return nullptr; }
+    } catch (...) { if (!optional) retry(job); return nullptr; }
 }
 void NativeMemoryManager::released(NativeMemoryJob &job, void *address, std::size_t size) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -391,6 +396,10 @@ int sunpack_memory_may_start_thread(void *value) {
 void *sunpack_memory_alloc(size_t size) {
     auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(context);
     return job ? job->owner.allocate(*job, size) : nullptr;
+}
+void *sunpack_memory_try_alloc(size_t size) {
+    auto *job = static_cast<sunpack::sevenzip::NativeMemoryJob *>(sunpack_memory_current_context());
+    return job ? job->owner.allocate(*job, size, true) : nullptr;
 }
 size_t sunpack_memory_size(void *address) {
     if ((reinterpret_cast<std::uintptr_t>(address) & 65535) != 0 || !address ||

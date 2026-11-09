@@ -40,6 +40,7 @@
 
 #include "BZip2Decoder.h"
 #include "internal/decoder_cpu_budget.h"
+#include "internal/decoder_memory.h"
 
 
 namespace NCompress {
@@ -848,8 +849,8 @@ public:
     const unsigned active = Managed ? Active.load(std::memory_order_relaxed) : 0;
     // Concurrent streams compete for cache space during inverse BWT. Keep
     // the speculative width small when archive-level parallelism is high.
-    if (active >= 6) return 2;
-    if (active >= 4) return 3;
+    if (active >= 6) return (std::min)(lanes, 2u);
+    if (active >= 4) return (std::min)(lanes, 3u);
     return lanes;
   }
 };
@@ -1200,7 +1201,8 @@ struct CStreamingParallelBlockJob
           + kBlockSizeMax
         #endif
           + 256;
-      Counters = (UInt32 *)::BigAlloc(size);
+      Counters = (UInt32 *)(size >= SUNPACK_LARGE_ALLOCATION && sunpack_memory_current_context()
+          ? sunpack_memory_try_alloc(size) : ::BigAlloc(size));
       OwnCounters = true;
       if (!Counters)
         return false;
@@ -1411,7 +1413,7 @@ class CStreamingParallelBlockPool
   std::mutex _mutex;
   std::condition_variable _workEvent;
   bool _stop;
-  void *_cpuContext;
+  void *const _cpuContext;
 
   void WorkerLoop()
   {
@@ -1435,9 +1437,9 @@ class CStreamingParallelBlockPool
   }
 
 public:
-  CStreamingParallelBlockPool():
+  explicit CStreamingParallelBlockPool(void *cpuContext):
       _stop(false),
-      _cpuContext(NULL)
+      _cpuContext(cpuContext)
   {}
 
   ~CStreamingParallelBlockPool()
@@ -1445,18 +1447,15 @@ public:
     Stop();
   }
 
-  bool Start(unsigned numThreads, void *cpuContext)
+  bool EnsureWorkers(unsigned numThreads)
   {
-    _cpuContext = cpuContext;
     try
     {
-      _threads.reserve(numThreads);
-      for (unsigned i = 0; i < numThreads; i++)
+      while (_threads.size() < numThreads)
         _threads.emplace_back([this] { WorkerLoop(); });
     }
     catch (...)
     {
-      Stop();
       return false;
     }
     return true;
@@ -1594,13 +1593,6 @@ CDecoder::~CDecoder()
 
     // if (ScoutRes != S_OK) throw ScoutRes;
   }
-  if (_sunpackScoutCpuContext && _sunpackScoutCpuCredit)
-  {
-    sunpack_cpu_release_extra_for_context(
-        _sunpackScoutCpuContext, _sunpackScoutCpuCredit);
-    _sunpackScoutCpuCredit = 0;
-  }
-  _sunpackScoutCpuContext = NULL;
   
   #endif
 
@@ -1805,15 +1797,10 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
           const UInt32 k_Mt_BlockSize_Threshold = (1 << 12);  // (1 << 13)
           if (props.blockSize > k_Mt_BlockSize_Threshold)
           {
-            if (!Thread.IsCreated())
-            {
-              PRIN("=== MT_MODE");
-              const HRESULT createRes = CreateThread();
-              if (createRes != S_OK && createRes != S_FALSE)
-                return createRes;
-            }
-            if (Thread.IsCreated())
-              useMt = true;
+            const HRESULT createRes = CreateThread();
+            if (createRes != S_OK && createRes != S_FALSE)
+              return createRes;
+            useMt = (createRes == S_OK);
           }
         }
         #endif
@@ -1947,9 +1934,10 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
   // Workers can refer to both jobs and input until the pool has joined.
   CStreamingBZipConcurrency concurrency(cpuContext != NULL);
-  CStreamingParallelBlockPool pool;
-  if (maxLanes > 1 && !pool.Start(maxLanes - 1, cpuContext))
-    return E_FAIL;
+  CStreamingParallelBlockPool pool(cpuContext);
+  unsigned helperLanes = maxLanes;
+  unsigned helperRetryBlocks = 1;
+  UInt64 helperRetryAt = 0;
 
   UInt64 inPrev = 0;
   UInt64 outPrev = 0;
@@ -2188,7 +2176,8 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     // Gather a small speculative batch. The last candidate gets enough
     // compressed lookahead for the maximum legal Huffman-coded block, so a
     // worker can parse a complete block without seeking or rereading input.
-    const unsigned lanes = concurrency.Limit(maxLanes);
+    const unsigned lanes = concurrency.Limit(
+        Base.NumBlocks < helperRetryAt ? helperLanes : maxLanes);
     for (;;)
     {
       unsigned blockCandidates = 0;
@@ -2263,20 +2252,28 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       }
     }
 
-    const unsigned activeJobs = 1 + extraWorkers;
-
-    // Helper workspaces are materialized only after the scheduler grants their
-    // credits. Under CPU contention this keeps BZip2 RSS proportional to the
-    // parallelism it can actually use.
-    for (unsigned i = 1; i < activeJobs; i++)
-      if (!jobs[i]->Allocate())
+    // Start helpers only when this batch has both CPU and workspace for them.
+    unsigned activeJobs = 1;
+    for (; activeJobs <= extraWorkers; activeJobs++)
+      if (!jobs[activeJobs]->Allocate() || !pool.EnsureWorkers(activeJobs))
       {
-        if (cpuContext && extraWorkers)
+        if (cpuContext)
           sunpack_cpu_release_extra_for_context(
               cpuContext,
-              extraWorkers);
-        return E_OUTOFMEMORY;
+              extraWorkers + 1 - activeJobs);
+        helperLanes = activeJobs;
+        helperRetryAt = Base.NumBlocks + helperRetryBlocks;
+        // Retry as decoding advances without asking the allocator every block
+        // during sustained pressure. No lane waits for this workspace.
+        helperRetryBlocks = (std::min)(helperRetryBlocks * 2, 32u);
+        break;
       }
+    if (activeJobs > helperLanes)
+    {
+      helperLanes = activeJobs;
+      helperRetryBlocks = 1;
+    }
+    extraWorkers = activeJobs - 1;
 
     // All job pointers refer to input.Data(). No reads or vector growth are
     // allowed until the batch has completed.
@@ -2556,33 +2553,32 @@ static THREAD_FUNC_DECL RunScout2(void *p) { ((CDecoder *)p)->RunScout(); return
 
 HRESULT CDecoder::CreateThread()
 {
-  if (Thread.IsCreated())
-    return S_OK;
-
-  if (!_sunpackScoutCpuContext)
-    _sunpackScoutCpuContext = sunpack_cpu_current_job_context();
-
-  unsigned granted = 1;
-  if (_sunpackScoutCpuContext)
-    granted = sunpack_cpu_acquire_extra_for_context(
-        _sunpackScoutCpuContext, 1, 1);
+  void *context = sunpack_cpu_current_job_context();
+  const unsigned granted = sunpack_cpu_acquire_extra_for_context(context, 1, 1);
   if (granted == 0)
     return S_FALSE;
-
-  WRes wres = DecoderEvent.CreateIfNotCreated_Reset();
-  if (wres == 0) { wres = ScoutEvent.CreateIfNotCreated_Reset();
-  if (wres == 0) { wres = Thread.Create(RunScout2, this); }}
-  if (wres != 0)
+  if (!Thread.IsCreated())
   {
-    if (_sunpackScoutCpuContext)
-      sunpack_cpu_release_extra_for_context(
-          _sunpackScoutCpuContext, granted);
-    return HRESULT_FROM_WIN32(wres);
+    WRes wres = DecoderEvent.CreateIfNotCreated_Reset();
+    if (wres == 0) wres = ScoutEvent.CreateIfNotCreated_Reset();
+    if (wres == 0) wres = Thread.Create(RunScout2, this);
+    if (wres != 0)
+    {
+      sunpack_cpu_release_extra_for_context(context, granted);
+      return HRESULT_FROM_WIN32(wres);
+    }
   }
-
-  if (_sunpackScoutCpuContext)
-    _sunpackScoutCpuCredit = granted;
+  _sunpackScoutCpuContext = context;
+  _sunpackScoutCpuCredit = granted;
   return S_OK;
+}
+
+void CDecoder::EndScoutRun()
+{
+  WaitScout();
+  sunpack_cpu_release_extra_for_context(_sunpackScoutCpuContext, _sunpackScoutCpuCredit);
+  _sunpackScoutCpuContext = NULL;
+  _sunpackScoutCpuCredit = 0;
 }
 
 void CDecoder::RunScout()
