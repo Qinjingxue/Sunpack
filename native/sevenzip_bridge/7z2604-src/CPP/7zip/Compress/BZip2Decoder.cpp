@@ -1134,8 +1134,12 @@ struct CStreamingParallelBlockJob
 {
   UInt32 *Counters;
   bool OwnCounters;
-  std::unique_ptr<Byte[]> Compact;
+  Byte *Compact;
+  #ifndef BZIP2_BYTE_MODE
+  std::unique_ptr<Byte[]> CompactStorage;
+  #endif
   UInt32 CompactSize;
+  bool HasRunLengths;
 
   const Byte *Input;
   size_t InputSize;
@@ -1156,7 +1160,9 @@ struct CStreamingParallelBlockJob
   CStreamingParallelBlockJob():
       Counters(NULL),
       OwnCounters(false),
+      Compact(NULL),
       CompactSize(0),
+      HasRunLengths(false),
       Input(NULL),
       InputSize(0),
       InputBaseByte(0),
@@ -1200,8 +1206,14 @@ struct CStreamingParallelBlockJob
         return false;
     }
 
-    Compact.reset(new (std::nothrow) Byte[kBlockSizeMax]);
-    return Compact.get() != NULL;
+    #ifdef BZIP2_BYTE_MODE
+    // DecodeBlock1 consumes this byte workspace before BuildCompact writes it.
+    Compact = (Byte *)(Counters + 256 + kBlockSizeMax);
+    #else
+    CompactStorage.reset(new (std::nothrow) Byte[kBlockSizeMax]);
+    Compact = CompactStorage.get();
+    #endif
+    return Compact != NULL;
   }
 
   void Reset(
@@ -1221,6 +1233,7 @@ struct CStreamingParallelBlockJob
     ExpectedCrc = expectedCrc;
     CalculatedCrc = 0;
     CompactSize = 0;
+    HasRunLengths = false;
     Props = CBlockProps();
     Result = S_OK;
     NeedMoreInput = false;
@@ -1268,6 +1281,7 @@ struct CStreamingParallelBlockJob
 
       if (runLength == kRleModeRepSize)
       {
+        HasRunLengths = true;
         for (unsigned repeat = 0; repeat < b; repeat++)
           crc.UpdateByte(previous);
         runLength = 0;
@@ -1923,10 +1937,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
   if (!jobs[0]->Allocate(_counters))
     return E_OUTOFMEMORY;
 
-  std::unique_ptr<Byte[]> commitBuffer(
-      new (std::nothrow) Byte[kStreamingBZipCommitChunk]);
-  if (!commitBuffer)
-    return E_OUTOFMEMORY;
+  std::unique_ptr<Byte[]> commitBuffer;
 
   CStreamingBZipInput input(
       Base.InStream,
@@ -1984,26 +1995,40 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     return S_OK;
   };
 
+  auto writeBytes = [&](const Byte *data, size_t size) -> HRESULT
+  {
+    if (size == 0)
+      return S_OK;
+    const HRESULT result = WriteStream(_outStream, data, size);
+    if (result != S_OK)
+    {
+      _writeRes = result;
+      return result;
+    }
+    _outWritten += size;
+    _outPosTotal += size;
+    return S_OK;
+  };
+
   auto writeCompact =
       [&](const CStreamingParallelBlockJob &job) -> HRESULT
   {
-    size_t outPos = 0;
+    if (!job.HasRunLengths)
+      return writeBytes(job.Compact, job.CompactSize);
 
+    if (!commitBuffer)
+    {
+      commitBuffer.reset(new (std::nothrow) Byte[kStreamingBZipCommitChunk]);
+      if (!commitBuffer)
+        return E_OUTOFMEMORY;
+    }
+
+    size_t outPos = 0;
     auto flush = [&]() -> HRESULT
     {
-      if (outPos == 0)
-        return S_OK;
-      const HRESULT result =
-          WriteStream(_outStream, commitBuffer.get(), outPos);
-      if (result != S_OK)
-      {
-        _writeRes = result;
-        return result;
-      }
-      _outWritten += outPos;
-      _outPosTotal += outPos;
+      const HRESULT result = writeBytes(commitBuffer.get(), outPos);
       outPos = 0;
-      return S_OK;
+      return result;
     };
 
     auto emit = [&](Byte value) -> HRESULT
