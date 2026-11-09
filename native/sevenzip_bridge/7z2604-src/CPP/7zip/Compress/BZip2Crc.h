@@ -9,12 +9,14 @@ class CBZip2Crc
 {
   UInt32 _value;
   static UInt32 Table[256];
+  static UInt32 RepeatTables[3][256];
 public:
   static void InitTable();
   CBZip2Crc(UInt32 initVal = 0xFFFFFFFF): _value(initVal) {}
   void Init(UInt32 initVal = 0xFFFFFFFF) { _value = initVal; }
   void UpdateByte(Byte b) { _value = Table[(_value >> 24) ^ b] ^ (_value << 8); }
   void UpdateByte(unsigned b) { _value = Table[(_value >> 24) ^ b] ^ (_value << 8); }
+  void UpdateRepeat(Byte value, unsigned size);
   UInt32 GetDigest() const { return _value ^ 0xFFFFFFFF; }
 };
 

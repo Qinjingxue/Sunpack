@@ -732,14 +732,17 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
   CBZip2Crc crc = _crc;
   const Byte *lim = data + size;
 
-  while (reps > 0)
+  auto writeReps = [&]()
   {
-    reps--;
-    *data++ = (Byte)prevByte;
-    crc.UpdateByte(prevByte);
-    if (data == lim)
-      break;
-  }
+    const size_t available = (size_t)(lim - data);
+    const unsigned count = (size_t)reps < available ? (unsigned)reps : (unsigned)available;
+    memset(data, (Byte)prevByte, count);
+    crc.UpdateRepeat((Byte)prevByte, count);
+    data += count;
+    reps -= (int)count;
+  };
+  if (reps > 0)
+    writeReps();
 
   UInt32 tPos = _tPos;
   UInt32 blockSize = _blockSize;
@@ -779,14 +782,8 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
     }
 
     reps = (int)b;
-    while (reps)
-    {
-      reps--;
-      *data++ = (Byte)prevByte;
-      crc.UpdateByte(prevByte);
-      if (data == lim)
-        break;
-    }
+    if (reps)
+      writeReps();
     if (data == lim)
       break;
     if (blockSize == 0)
@@ -1284,8 +1281,8 @@ struct CStreamingParallelBlockJob
       if (runLength == kRleModeRepSize)
       {
         HasRunLengths = true;
-        for (unsigned repeat = 0; repeat < b; repeat++)
-          crc.UpdateByte(previous);
+        if (b)
+          crc.UpdateRepeat((Byte)previous, b);
         runLength = 0;
         continue;
       }
@@ -2036,8 +2033,16 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
       if (runLength == kRleModeRepSize)
       {
-        for (unsigned repeat = 0; repeat < value; repeat++)
-          RINOK(emit((Byte)previous))
+        unsigned remaining = value;
+        while (remaining)
+        {
+          const size_t count = (std::min)((size_t)remaining, kStreamingBZipCommitChunk - outPos);
+          memset(commitBuffer.get() + outPos, (Byte)previous, count);
+          outPos += count;
+          remaining -= (unsigned)count;
+          if (outPos == kStreamingBZipCommitChunk)
+            RINOK(flush())
+        }
         runLength = 0;
         continue;
       }

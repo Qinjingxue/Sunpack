@@ -1407,24 +1407,19 @@ namespace NCompress
     struct CRar5ParallelDecodedItem
     {
       Byte Type;
-      Byte LiteralSize;
       Byte FilterType;
       Byte FilterChannels;
       UInt16 Length;
-      UInt32 FilterSize;
-      size_t Distance;
-      Byte Literal[16];
+      union { UInt32 FilterSize; UInt32 LiteralSize; };
+      union { size_t Distance; size_t LiteralOffset; };
 
       CRar5ParallelDecodedItem() : Type(RAR5_MT_LITERAL),
-                                   LiteralSize(0),
                                    FilterType(0),
                                    FilterChannels(0),
                                    Length(0),
                                    FilterSize(0),
                                    Distance(0)
-      {
-        memset(Literal, 0, sizeof(Literal));
-      }
+      {}
     };
 
     struct CRar5ParallelTables
@@ -1627,6 +1622,7 @@ namespace NCompress
       CBitDecoder BitState;
       CRar5ParallelTables Tables;
       std::vector<CRar5ParallelDecodedItem> Decoded;
+      std::vector<Byte> Literals;
       UInt64 PackPos;
       bool LastBlock;
       bool TablePresent;
@@ -1654,7 +1650,6 @@ namespace NCompress
 
       void Reset()
       {
-        Data.clear();
         Decoded.clear();
         PackPos = 0;
         LastBlock = false;
@@ -1676,6 +1671,7 @@ namespace NCompress
         {
           Decoded.clear();
           Decoded.reserve(0x4100);
+          Literals.clear();
 
           CBitDecoder bitStream = BitState;
           bool tableWasFilled = InitialTablesValid;
@@ -1708,13 +1704,29 @@ namespace NCompress
             return;
           }
 
+          size_t literalStart = 0;
+          auto finishLiterals = [&]()
+          {
+            if (literalStart == Literals.size())
+              return;
+            Decoded.emplace_back();
+            CRar5ParallelDecodedItem &item = Decoded.back();
+            item.LiteralOffset = literalStart;
+            // A RAR5 block has at most 24 bits of packed size and at least
+            // one input bit per literal, so its literal count fits in UInt32.
+            item.LiteralSize = (UInt32)(Literals.size() - literalStart);
+            literalStart = Literals.size();
+          };
           for (;;)
           {
-            const UInt64 processed = bitStream.GetProcessedSize_Round();
-            if (processed > bitStream._blockEnd ||
-                (processed == bitStream._blockEnd &&
-                 bitStream.GetProcessedBits7() >= bitStream._blockEndBits7))
-              break;
+            if (bitStream._buf >= bitStream._bufCheck_Block)
+            {
+              const UInt64 processed = bitStream.GetProcessedSize_Round();
+              if (processed > bitStream._blockEnd ||
+                  (processed == bitStream._blockEnd &&
+                   bitStream.GetProcessedBits7() >= bitStream._blockEndBits7))
+                break;
+            }
 
             unsigned sym;
             if (!Tables.Main.Decode2(&bitStream, sym))
@@ -1725,24 +1737,11 @@ namespace NCompress
 
             if (sym < 256)
             {
-              if (!Decoded.empty())
-              {
-                CRar5ParallelDecodedItem &prev = Decoded.back();
-                if (prev.Type == RAR5_MT_LITERAL && prev.LiteralSize < sizeof(prev.Literal))
-                {
-                  prev.Literal[prev.LiteralSize++] = (Byte)sym;
-                  continue;
-                }
-              }
-
-              CRar5ParallelDecodedItem item;
-              item.Type = RAR5_MT_LITERAL;
-              item.LiteralSize = 1;
-              item.Literal[0] = (Byte)sym;
-              Decoded.push_back(item);
+              Literals.push_back((Byte)sym);
               continue;
             }
 
+            finishLiterals();
             if (sym == 256)
             {
               CRar5ParallelDecodedItem item;
@@ -1842,7 +1841,7 @@ namespace NCompress
               Decoded.push_back(item);
             }
 
-            if (bitStream.IsBlockOverRead())
+            if (bitStream._buf >= bitStream._bufCheck_Block && bitStream.IsBlockOverRead())
             {
               result = S_FALSE;
               break;
@@ -1851,6 +1850,7 @@ namespace NCompress
 
           if (result == S_OK)
           {
+            finishLiterals();
             if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
               result = S_FALSE;
             else if (bitStream.GetProcessedSize_Round() == bitStream._blockEnd &&
@@ -2817,9 +2817,22 @@ HRESULT CDecoder::DecodeLZParallel()
       switch (item.Type)
       {
       case RAR5_MT_LITERAL:
-        memcpy(_window + winPos, item.Literal, item.LiteralSize);
-        winPos += item.LiteralSize;
+      {
+        const Byte *data = job.Literals.data() + item.LiteralOffset;
+        size_t remaining = item.LiteralSize;
+        for (;;)
+        {
+          const size_t count = (std::min)(remaining, limit - winPos);
+          memcpy(_window + winPos, data, count);
+          winPos += count;
+          remaining -= count;
+          if (remaining == 0)
+            break;
+          data += count;
+          RINOK(normalizeWindow())
+        }
         break;
+      }
 
       case RAR5_MT_MATCH:
       {
@@ -2977,7 +2990,9 @@ HRESULT CDecoder::DecodeLZParallel()
 
       const size_t logicalSize =
           (size_t)rawHeader.HeaderSize + rawHeader.BlockSize;
-      job.Data.resize(logicalSize + kInputBufferPadZone);
+      // The read and padding overwrite this range. Reuse initialized storage.
+      if (job.Data.size() < logicalSize + kInputBufferPadZone)
+        job.Data.resize(logicalSize + kInputBufferPadZone);
       memcpy(job.Data.data(), rawHeader.Bytes, rawHeader.HeaderSize);
       RINOK(ReadStream_FALSE(
           _inStream,
