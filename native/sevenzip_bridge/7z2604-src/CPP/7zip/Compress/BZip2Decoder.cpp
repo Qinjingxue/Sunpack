@@ -584,6 +584,16 @@ SRes CBase::ReadBlock2()
         CMtfVar *mLim = m + lim;
         if (lim != 0)
         {
+          #ifdef MY_CPU_LE
+          if (sym >= 32)
+          {
+            // Little-endian words store the symbols in list order.
+            Byte *list = (Byte *)mtf.Buf;
+            memmove(list + 1, list, sym);
+            list[0] = (Byte)prev;
+            continue;
+          }
+          #endif
           do
           {
             CMtfVar n0 = *m;
