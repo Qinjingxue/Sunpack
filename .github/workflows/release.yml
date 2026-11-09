@@ -126,9 +126,6 @@ jobs:
               echo "Changes since: initial history"
             fi
             echo
-            # Include the destructive-upgrade warning in the actual published notes.
-            cat docs/upgrade-v1.4.md
-            echo
             echo "## Commits"
           } > build-notes.md
 
