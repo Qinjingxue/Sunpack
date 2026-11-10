@@ -82,16 +82,6 @@ def recoverable_partial_inventory(diagnostics: dict[str, Any], out_dir: str) -> 
     return None
 
 
-def iter_progress_files(manifest: NativeProgressManifest | None, page_size: int = 1024):
-    """Yield per-file records while only one bounded page is Python objects."""
-    if manifest is None:
-        return
-    offset = 0
-    while page := manifest.file_page(offset, page_size):
-        yield from page
-        offset += len(page)
-
-
 def _worker_result(diagnostics: dict[str, Any]) -> dict[str, Any]:
     result = diagnostics.get("result")
     return result if isinstance(result, dict) else {}

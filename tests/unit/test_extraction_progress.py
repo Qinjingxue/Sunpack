@@ -1,8 +1,5 @@
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
-from sunpack.pipeline.extraction.progress import (
-    build_extraction_progress_manifest,
-    iter_progress_files,
-)
+from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest
 from tests.helpers.worker_events import worker_result, worker_trace_item
 
 
@@ -52,9 +49,14 @@ def test_progress_manifest_classifies_trace_items_and_skips_directories(tmp_path
     assert manifest.partial_outputs is True
     assert manifest.files_written == 3
     assert manifest.bytes_written == 9
-    assert [item["archive_path"] for item in iter_progress_files(manifest, page_size=1)] == [
+    assert [
+        item["archive_path"]
+        for offset in range(len(manifest))
+        for item in manifest.file_page(offset, 1)
+    ] == [
         "dir/ok.bin", "dir/cut.bin", "dir/none.bin", "pending.bin", "unfinished.bin", "bad-result.bin",
     ]
+    assert manifest.file_page(len(manifest), 1) == []
 
 
 def test_progress_manifest_from_worker_rows_keeps_complete_bytes_written(tmp_path):
@@ -72,7 +74,7 @@ def test_progress_manifest_from_worker_rows_keeps_complete_bytes_written(tmp_pat
         diagnostics={"result": result},
     )
 
-    by_archive_path = {item["archive_path"]: item for item in iter_progress_files(manifest)}
+    by_archive_path = {item["archive_path"]: item for item in manifest.file_page(0, 10)}
     assert by_archive_path["done.bin"]["status"] == "complete"
     assert by_archive_path["done.bin"]["bytes_written"] == 5
     assert by_archive_path["cut.bin"]["status"] == "failed"
@@ -99,7 +101,7 @@ def test_progress_manifest_adds_untraced_output_files(tmp_path):
         )},
     )
 
-    by_archive_path = {item["archive_path"]: item for item in iter_progress_files(manifest)}
+    by_archive_path = {item["archive_path"]: item for item in manifest.file_page(0, 10)}
     assert set(by_archive_path) == {"traced.txt", ".sunpack/extraction_manifest.json"}
     extra = by_archive_path[".sunpack/extraction_manifest.json"]
     assert extra["status"] == "unverified"

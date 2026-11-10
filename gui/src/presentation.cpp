@@ -15,7 +15,7 @@ const Json& setting(const std::string& pointer,const std::string& module) {
     // Named arrays may be reordered or partially copied into the ordinary
     // config. Descriptions follow canonical module names, never array indexes
     // or global leaf-name aliases that could recognize retired fields.
-    for(const std::string prefix:{"/filesystem/scan_filters/","/analysis/modules/","/verification/methods/"}) {
+    for(const std::string prefix:{"/filesystem/scan_filters/","/analysis/modules/"}) {
         if(pointer.rfind(prefix,0)!=0) continue;
         auto suffix=pointer.find('/',prefix.size());
         if(!module.empty()) key=prefix+"@"+module+(suffix==std::string::npos?std::string():pointer.substr(suffix));

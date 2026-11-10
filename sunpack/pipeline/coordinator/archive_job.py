@@ -412,7 +412,11 @@ class ArchiveJobExecutor:
         cleanup = cleanup_failed_output_if_eligible(
             out_dir,
             planned_output_dir=outcome.planned_out_dir,
-            failed=outcome.outcome_kind == OutcomeKind.FAILURE and not task.runtime.get("retry_output_dir"),
+            # Complete empty/directory-only inputs are checkpointed too. Their
+            # output must survive even when a sibling failed without files.
+            failed=outcome.outcome_kind == OutcomeKind.FAILURE and not (
+                task.runtime.get("retry_output_dir") or res.has_complete_inputs
+            ),
             force_owned_output_cleanup=outcome.policy_rejected_partial_output,
             payload_inventory=payload_inventory,
         )

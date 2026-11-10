@@ -27,7 +27,7 @@ class OutputStats:
 class OutputInventory:
     """Python facade over a Rust-owned file table."""
 
-    __slots__ = ("root", "stats", "_native", "worker_inventory_complete", "identity_paths")
+    __slots__ = ("root", "stats", "_native", "worker_inventory_complete")
 
     def __init__(self, native: NativeOutputInventory):
         self._native = native
@@ -39,7 +39,6 @@ class OutputInventory:
             unreadable_count=int(native.unreadable_count),
         )
         self.worker_inventory_complete = bool(native.worker_inventory_complete)
-        self.identity_paths = bool(native.identity_paths)
 
     def file_page(self, *, offset: int = 0, limit: int = 128) -> tuple[dict[str, Any], ...]:
         return tuple(self._native.file_page(

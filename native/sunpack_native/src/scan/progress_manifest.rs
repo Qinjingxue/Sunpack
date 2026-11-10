@@ -41,9 +41,8 @@ struct ProgressFile {
     bytes_written: u64,
     expected_size: Option<u64>,
     crc_ok: Option<bool>,
-    failure_stage: String,
-    failure_kind: String,
-    message: String,
+    // Per-file failure stage/kind are always empty; only the document owns them.
+    message: &'static str,
 }
 
 impl ProgressFile {
@@ -73,12 +72,10 @@ struct Summary {
 }
 
 impl Summary {
-    fn of(files: &[ProgressFile]) -> Self {
-        let mut summary = Self {
-            total: files.len(),
-            ..Self::default()
-        };
+    fn of<'a>(files: impl Iterator<Item = &'a ProgressFile>) -> Self {
+        let mut summary = Self::default();
         for item in files {
+            summary.total += 1;
             match item.status {
                 FileStatus::Complete => summary.complete += 1,
                 FileStatus::Partial => summary.partial += 1,
@@ -103,6 +100,13 @@ struct ManifestDocument {
     bytes_written: u64,
     summary: Summary,
     files: Vec<ProgressFile>,
+    untraced_files: Vec<ProgressFile>,
+}
+
+impl ManifestDocument {
+    fn files(&self) -> impl Iterator<Item = &ProgressFile> {
+        self.files.iter().chain(&self.untraced_files)
+    }
 }
 
 #[pyclass(module = "sunpack_native", frozen)]
@@ -163,18 +167,15 @@ impl NativeProgressManifest {
     }
 
     fn __len__(&self) -> usize {
-        self.document.files.len()
+        self.document.files.len() + self.document.untraced_files.len()
     }
 
     #[pyo3(signature = (offset=0, limit=128))]
     fn file_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<Py<PyDict>>> {
-        let files = &self.document.files;
-        if limit == 0 || offset >= files.len() {
-            return Ok(Vec::new());
-        }
-        let end = offset.saturating_add(limit).min(files.len());
-        files[offset..end]
-            .iter()
+        self.document
+            .files()
+            .skip(offset)
+            .take(limit)
             .map(|item| {
                 let row = PyDict::new(py);
                 row.set_item("path", &item.path)?;
@@ -184,14 +185,13 @@ impl NativeProgressManifest {
                 row.set_item("expected_size", item.expected_size)?;
                 row.set_item("progress", item.progress())?;
                 row.set_item("crc_ok", item.crc_ok)?;
-                row.set_item("failure_stage", &item.failure_stage)?;
-                row.set_item("failure_kind", &item.failure_kind)?;
-                row.set_item("message", &item.message)?;
+                row.set_item("failure_stage", "")?;
+                row.set_item("failure_kind", "")?;
+                row.set_item("message", item.message)?;
                 Ok(row.unbind())
             })
             .collect()
     }
-
 }
 
 /// Summary-only manifest for a worker result whose complete inventory was verified.
@@ -221,6 +221,7 @@ pub(crate) fn complete_progress_manifest(
                 ..Summary::default()
             },
             files: Vec::new(),
+            untraced_files: Vec::new(),
         }),
     }
 }
@@ -268,8 +269,8 @@ pub(crate) fn build_progress_manifest(
         } else if let Some(records) = rows {
             files.extend(records.iter().map(|item| file_from_row(item, &out_dir)));
         }
-        merge_untraced_files(&mut files, &output_files, &out_dir, worker_ok);
-        let summary = Summary::of(&files);
+        let untraced_files = collect_untraced_files(&files, &output_files, &out_dir, worker_ok);
+        let summary = Summary::of(files.iter().chain(&untraced_files));
         let files_written = if files_written > 0 {
             files_written
         } else {
@@ -278,7 +279,11 @@ pub(crate) fn build_progress_manifest(
         let bytes_written = if bytes_written > 0 {
             bytes_written
         } else {
-            files.iter().map(|item| item.bytes_written).sum()
+            files
+                .iter()
+                .chain(&untraced_files)
+                .map(|item| item.bytes_written)
+                .sum()
         };
         ManifestDocument {
             archive,
@@ -292,6 +297,7 @@ pub(crate) fn build_progress_manifest(
             bytes_written,
             summary,
             files,
+            untraced_files,
         }
     });
     NativeProgressManifest {
@@ -326,9 +332,7 @@ fn file_from_trace(item: &OutputTraceItem, out_dir: &str) -> ProgressFile {
         bytes_written: item.bytes_written,
         expected_size: item.has_expected_size.then_some(item.expected_size),
         crc_ok: None,
-        failure_stage: String::new(),
-        failure_kind: String::new(),
-        message: String::new(),
+        message: "",
     }
 }
 
@@ -345,32 +349,33 @@ fn file_from_row(item: &OutputFileRecord, out_dir: &str) -> ProgressFile {
         bytes_written: item.bytes_written,
         expected_size: Some(item.size),
         crc_ok: item.crc_ok,
-        failure_stage: String::new(),
-        failure_kind: String::new(),
-        message: String::new(),
+        message: "",
     }
 }
 
-fn merge_untraced_files(
-    files: &mut Vec<ProgressFile>,
+fn collect_untraced_files(
+    files: &[ProgressFile],
     output_files: &[OutputFileRecord],
     out_dir: &str,
     worker_ok: bool,
-) {
-    let seen: HashSet<String> = files
+) -> Vec<ProgressFile> {
+    // Keep the two row groups separate so membership can borrow the traced paths
+    // without cloning every string or reallocating the traced rows on append.
+    let seen: HashSet<&str> = files
         .iter()
         .filter(|item| !item.path.is_empty())
-        .map(|item| item.path.clone())
+        .map(|item| item.path.as_str())
         .collect();
+    let mut untraced = Vec::new();
     for record in output_files {
         let path = match &record.abs_path {
             Some(path) => windows_path_text(path),
             None => output_path_text(&record.path, out_dir),
         };
-        if seen.contains(&path) {
+        if seen.contains(path.as_str()) {
             continue;
         }
-        files.push(ProgressFile {
+        untraced.push(ProgressFile {
             path,
             archive_path: record.path.clone(),
             status: if worker_ok {
@@ -381,11 +386,10 @@ fn merge_untraced_files(
             bytes_written: record.size,
             expected_size: None,
             crc_ok: None,
-            failure_stage: String::new(),
-            failure_kind: String::new(),
-            message: UNTRACED_MESSAGE.to_string(),
+            message: UNTRACED_MESSAGE,
         });
     }
+    untraced
 }
 
 /// Absolute output path of a traced item, spelled as Windows paths are.

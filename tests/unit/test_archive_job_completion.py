@@ -87,7 +87,7 @@ def test_terminal_policy_is_shared_by_cleanup_report_and_result(tmp_path, monkey
         def cleanup(_out_dir, **kwargs):
             assert len(decisions) == 1
             assert kwargs["force_owned_output_cleanup"] is force_cleanup
-            assert kwargs["failed"] is (expected == OutcomeKind.FAILURE)
+            assert kwargs["failed"] is (expected == OutcomeKind.FAILURE and not retained)
             events.append("cleanup")
             return SimpleNamespace(to_dict=lambda: {})
 

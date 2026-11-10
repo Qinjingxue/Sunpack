@@ -238,3 +238,127 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
             await broker.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["archive", "carrier_failure", "no_recursion"])
+def test_parent_extraction_owners_are_released_before_recursive_waits(tmp_path, case):
+    """Catch parent file-table retention while recursive work is still active.
+
+    Close-time tests cannot observe this peak-memory lifetime. Weak references
+    check both direct and carrier-owned payloads without timings, GC or RSS.
+    """
+    import threading
+    import weakref
+    from types import SimpleNamespace as NS
+
+    from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
+    from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
+    from sunpack.pipeline.coordinator.archive_job import ArchiveJobOutcome
+    from sunpack.pipeline.coordinator.async_work import CancellationToken
+    from sunpack.pipeline.coordinator.content_recovery import ContentRecoveryDecision
+    from tests.helpers.fake_pipeline_engine import _InlineBroker
+
+    class Payload:
+        pass
+
+    async def scenario():
+        output_dir = str(tmp_path)
+        complete = case != "carrier_failure"
+        recursive = case != "no_recursion"
+        kind = OutcomeKind.COMPLETE_SUCCESS if complete else OutcomeKind.FAILURE
+        task = NS(key="parent", main_path="parent.bin", all_parts=[], cleanup_parts=[], runtime={})
+        runtime = object.__new__(_RequestRuntime)
+        runtime.config = {"post_extract": {"flatten_single_directory": False}}
+        runtime.submission = NS(request_id="lifetime")
+        runtime.context = NS(lock=threading.Lock())
+        runtime._active_task_keys = {task.key}
+        runtime._resolve_missing_volume_once = None
+        runtime.input_planning_stage = NS(requires_analysis=lambda task: False)
+        runtime.recursion = NS(allows_children=lambda depth: recursive)
+        runtime.reporter = NS(scope_finished=lambda task: None)
+        runtime._shell_updates = NS(add=lambda paths: None)
+        runtime._schedule_cleanup = lambda *args, **kwargs: None
+        owners = []
+        events = []
+        snapshots = []
+
+        async def no_lease(*args, **kwargs):
+            pass
+
+        runtime._ensure_task_lease = no_lease
+
+        async def execute(task, **kwargs):
+            extracted = ExtractionResult(
+                success=complete, out_dir=output_dir,
+                output_inventory=Payload(), progress_manifest_payload=Payload(),
+            )
+            if not complete:
+                extracted.input_results.append(InputExecutionResult(
+                    input=None,
+                    result=ExtractionResult(
+                        success=True, out_dir=output_dir,
+                        output_inventory=Payload(), progress_manifest_payload=Payload(),
+                    ),
+                ))
+            outcome = ArchiveJobOutcome(extracted, content_decision=ContentRecoveryDecision(kind))
+            for result in [extracted, *(item.result for item in extracted.input_results)]:
+                owners.extend(weakref.ref(value) for value in (
+                    result, result.output_inventory, result.progress_manifest_payload,
+                ))
+            owners.append(weakref.ref(outcome))
+            return task, outcome, TargetRunResult(task.main_path, kind, output_dir=output_dir)
+
+        def assert_released():
+            assert owners and all(ref() is None for ref in owners)
+
+        def prepare_scan(path, extracted):
+            # Discovery consumes the extraction payload before ownership ends.
+            assert path == output_dir and all(ref() is not None for ref in owners)
+            assert extracted.has_complete_inputs == (not complete)
+            snapshot = Payload()
+            snapshots.append(weakref.ref(snapshot))
+            return NS(roots=(path,), session=snapshot)
+
+        async def allow_depth(depth):
+            assert depth == 2
+            assert_released()
+            events.append("prompt")
+            return True
+
+        async def discover(roots, *, scan_session, depth, **kwargs):
+            assert roots == [output_dir] and depth == 2
+            assert snapshots[0]() is scan_session
+            assert_released()
+            events.append("children")
+            # An incomplete child avoids pruning, but not a completed parent's
+            # output commit or source-release bookkeeping after the await.
+            return False
+
+        def commit(*args):
+            assert_released()
+            events.append("commit")
+
+        def release(task, *, outcome_kind):
+            assert_released()
+            assert outcome_kind == kind
+            events.append("release")
+
+        runtime.job_executor = NS(scanning=False, execute_async=execute, commit_output=commit)
+        runtime.source_cleanup = NS(release_task=release)
+        runtime._nested_scan_work = prepare_scan
+        runtime._allow_recursive_depth = allow_depth
+        runtime._discover_and_run = discover
+        ownership = NS(remember_task=lambda task: None, remember_results=lambda results: None)
+
+        result = await runtime._execute_job(
+            task, depth=1, ownership=ownership,
+            broker=_InlineBroker(), cancellation=CancellationToken(),
+        )
+        assert result is (complete and not recursive)
+        assert events == (
+            (["prompt", "children"] if recursive else [])
+            + (["commit"] if complete else []) + ["release"]
+        )
+        assert not runtime._active_task_keys
+
+    asyncio.run(scenario())

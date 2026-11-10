@@ -1534,8 +1534,9 @@ class _RequestRuntime:
             if self.job_executor.scanning:
                 ownership.remember_results([result])
                 return result.outcome_kind == OutcomeKind.SCANNED
+            outcome_kind = outcome.outcome_kind
             watch_version = task.runtime.get("source_generation", watch_version)
-            retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
+            retain_watch_lease = bool(watch_version and outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
             # Watch annotates the leased physical group; CLI retries carry the
             # promoted input paths. Neither depends on the triggering member.
             cli_promoted_paths = self.config.get("promoted_nested_retry_paths", ())
@@ -1557,7 +1558,7 @@ class _RequestRuntime:
             if result.failure is not None and task.runtime.get("discovery_scope") is not None:
                 result.failure.details["discovery_scope"] = task.runtime["discovery_scope"].to_record()
             promoted = False
-            if _should_promote_blocked_input(depth, outcome.outcome_kind, result.failure):
+            if _should_promote_blocked_input(depth, outcome_kind, result.failure):
                 result, promoted = await self._promote_blocked_input(
                     task, result, ownership=ownership, broker=broker, cancellation=cancellation,
                 )
@@ -1569,8 +1570,9 @@ class _RequestRuntime:
             )
 
             # Retryable nested inputs leave recursive ownership, but remain failed.
-            subtree_complete = outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS or promoted
+            subtree_complete = outcome_kind == OutcomeKind.COMPLETE_SUCCESS or promoted
             ran_recursive_children = False
+            scan_work = None
             if output_dir and self.recursion.allows_children(depth):
                 scan_work = await broker.run(
                     "nested_scan",
@@ -1581,17 +1583,21 @@ class _RequestRuntime:
                     request_id=self.submission.request_id,
                     cancellation=cancellation,
                 )
-                if scan_work.roots and await self._allow_recursive_depth(depth + 1):
-                    ran_recursive_children = True
-                    children_complete = await self._discover_and_run(
-                        list(scan_work.roots),
-                        scan_session=scan_work.session,
-                        depth=depth + 1,
-                        ownership=ownership,
-                        broker=broker,
-                        cancellation=cancellation,
-                    )
-                    subtree_complete = subtree_complete and children_complete
+            # Prepared snapshots own the data needed for recursive discovery.
+            # Do not retain parent inventories/manifests while children run or
+            # a recursion prompt waits; the remaining work only needs the kind.
+            del outcome
+            if scan_work is not None and scan_work.roots and await self._allow_recursive_depth(depth + 1):
+                ran_recursive_children = True
+                children_complete = await self._discover_and_run(
+                    list(scan_work.roots),
+                    scan_session=scan_work.session,
+                    depth=depth + 1,
+                    ownership=ownership,
+                    broker=broker,
+                    cancellation=cancellation,
+                )
+                subtree_complete = subtree_complete and children_complete
 
             if output_dir and subtree_complete:
                 if ran_recursive_children:
@@ -1633,14 +1639,14 @@ class _RequestRuntime:
                 subtree_complete = subtree_complete and not flattened.errors
                 ownership.relocate_outputs(flattened)
 
-            if depth == 1 and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+            if depth == 1 and outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
                 await broker.run("output_state", task.key or task.main_path, self.job_executor.commit_output,
                                  task, output_dir, cancellation, request_id=self.submission.request_id)
 
             # Keep source archives until their recursive subtree has settled.
             # An interrupted root can then discard its whole output safely.
             cleanup_request = self.source_cleanup.release_task(
-                task, outcome_kind=outcome.outcome_kind,
+                task, outcome_kind=outcome_kind,
             )
             released_source_ref = True
             self._schedule_cleanup(
@@ -1649,7 +1655,7 @@ class _RequestRuntime:
                 mode_override="delete" if depth > 1 or promoted_retry else None,
             )
 
-            if watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS and output_dir:
+            if watch_version and outcome_kind == OutcomeKind.COMPLETE_SUCCESS and output_dir:
                 self.path_leases.remember_completed_watch(
                     watch_version, output_dir,
                     deep_detect=self.submission.detection_options.force_scan,

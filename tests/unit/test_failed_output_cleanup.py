@@ -84,24 +84,97 @@ def test_cleanup_preserves_failed_output_with_nonzero_payload(tmp_path):
     assert output.is_dir()
 
 
-def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings():
-    child = ExtractionResult(True, "child")
-    failure = FailureInfo(
-        kind=FailureKind.INPUTS_FAILED,
-        stage="inputs",
-        message="one encrypted child failed",
+@pytest.mark.parametrize("requirement", ["complete", "allow_partial"])
+@pytest.mark.parametrize("with_directory", [False, True], ids=["empty", "directory-only"])
+def test_complete_empty_inputs_survive_failed_sibling_cleanup_and_retry(
+    tmp_path, monkeypatch, requirement, with_directory,
+):
+    # File-bearing carrier tests cannot detect deleting valid empty output
+    # while its persisted checkpoint still tells the retry to skip that input.
+    from pathlib import Path
+    from sunpack.core.contracts.archive_input import ArchiveInputPart, InputExtent
+    from sunpack.core.contracts.retry_targets import apply_input_retry
+    from sunpack.core.contracts.tasks import ArchiveTask
+    from sunpack.core.support.path_keys import path_key
+    from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
+    from sunpack.pipeline.coordinator.input_completion import checkpoint_inputs
+    from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
+
+    carrier = str(tmp_path / "carrier.bin")
+    nodes = tuple(LogicalArchiveInput(ArchiveInputDescriptor(
+        carrier, open_mode="file_range", format_hint="zip", logical_name=name,
+        parts=[ArchiveInputPart(InputExtent(carrier, start, start + 10))],
+    ), position=position) for position, (start, name) in enumerate(
+        ((0, "empty.zip"), (10, "encrypted.zip")), 1))
+    output = tmp_path / "output"
+    complete_output = output / "empty.zip"
+    complete_output.mkdir(parents=True)
+    if with_directory:
+        (complete_output / "important-directory").mkdir()
+    generation = ((path_key(carrier), "same-generation"),)
+    task = ArchiveTask.from_archive_input(nodes[0].descriptor, discovery_source="test", logical_inputs=nodes)
+    task.runtime["input_generation"] = generation
+    password = FailureInfo(FailureKind.PASSWORD_REQUIRED, "extract", "password required")
+    extraction = ExtractionResult(
+        False, str(output), partial_outputs=True,
+        failure=FailureInfo(FailureKind.INPUTS_FAILED, "inputs", "sibling failed"),
+        input_results=[
+            InputExecutionResult(nodes[0], ExtractionResult(True, str(complete_output))),
+            InputExecutionResult(nodes[1], ExtractionResult(False, str(output / "encrypted.zip"), failure=password)),
+        ],
     )
-    outer = ExtractionResult(
-        success=False,
+    runner = object.__new__(ArchiveJobExecutor)
+    runner.scanning, runner.context, runner.i18n = False, RunState(), I18nContext("en")
+    runner.content_policy = ContentRecoveryPolicy(requirement)
 
-        out_dir="output",
+    def unexpected_walk(_path):
+        raise AssertionError("completed inputs must be retained without an output walk")
 
-        failure=failure,
-        partial_outputs=True,
-        input_results=[InputExecutionResult(LogicalArchiveInput(ArchiveInputDescriptor("carrier")), child)],
-    )
+    monkeypatch.setattr("sunpack.pipeline.postprocess.output_cleanup._payload_inventory", unexpected_walk)
 
-    assert ContentRecoveryPolicy().decide(outer).rejected_partial_output is False
+    checkpoint_inputs(task, extraction)
+    outcome = ArchiveJobOutcome(extraction, planned_out_dir=str(output))
+    reported = runner.collect_result(task, outcome)
+    assert reported.outcome_kind == OutcomeKind.FAILURE
+    assert not outcome.policy_rejected_partial_output
+    assert not extraction.diagnostics["failed_output_cleanup"]["cleaned"]
+    assert complete_output.is_dir()
+    if with_directory:
+        assert (complete_output / "important-directory").is_dir()
+    refs = CleanupRefTable()
+    refs.register(task)
+    assert not refs.release(task).cleanup_paths
+
+    retry = ArchiveTask.from_archive_input(nodes[0].descriptor, discovery_source="test", logical_inputs=nodes)
+    apply_input_retry(retry, reported.failure, generation, password_changed=True)
+    assert [node.position for node in retry.inputs] == [2]
+    assert retry.runtime["retry_output_dir"] == str(output)
+
+    def worker(child_task, out_dir, **_kwargs):
+        assert child_task.inputs[0].position == 2
+        Path(out_dir).mkdir(parents=True)
+        (Path(out_dir) / "good.txt").write_text("good", encoding="utf-8")
+        if False:
+            yield
+        return ExtractionResult(True, out_dir)
+
+    extractor = object.__new__(SingleArchiveExtractor)
+    extractor.scanning, extractor.i18n = False, runner.i18n
+    extractor._log = lambda *_args: None
+    extractor.sevenzip_runner = SimpleNamespace(emit_semantic_event=lambda *_args, **_kwargs: None)
+    extractor._extract_one_state_machine = worker
+    state = extractor._extract_inputs_state_machine(retry, str(output), retry.inputs)
+    with pytest.raises(StopIteration) as stopped:
+        next(state)
+    retried = stopped.value.value
+    final = runner.collect_result(retry, ArchiveJobOutcome(retried, planned_out_dir=str(output)))
+    assert final.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
+    assert complete_output.is_dir()
+    if with_directory:
+        assert (complete_output / "important-directory").is_dir()
+    refs.register(retry)
+    refs.mark_cleanup_eligible(retry)
+    assert refs.release(retry).cleanup_paths == (carrier,)
 
 
 @pytest.mark.parametrize("with_zero_file", [False, True])
