@@ -213,6 +213,7 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path, language, 
             assert out.getvalue().index("first.bin") < out.getvalue().index("second.bin")
             assert "need password" not in err.getvalue() and "need password" not in out.getvalue()
             assert password_label in out.getvalue()
+            assert ctx.t("cli.scan.parts", parts="first.bin") in out.getvalue()
             assert ctx.t("cli.scan.volumes", state=ctx.t("cli.scan.volumes.missing")) in out.getvalue()
             assert err.getvalue() == "  " + ctx.t("cli.scan.error", error=damaged.message) + "\n"
         if not json_mode:

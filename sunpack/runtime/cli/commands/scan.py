@@ -100,10 +100,8 @@ def _details(item, ctx):
             if layout.get("minimum_slots"):
                 yield ctx.t("cli.scan.volume_count", minimum=layout["minimum_slots"], maximum=len(layout["slots"]))
         yield ctx.t("cli.scan.constraints")
-    elif "all_parts" in item:
-        others = [os.path.basename(path) for path in item["all_parts"] if path != item["main_path"]]
-        if others:
-            yield ctx.t("cli.scan.parts", parts=", ".join(others))
+    elif parts := item.get("all_parts"):
+        yield ctx.t("cli.scan.parts", parts=", ".join(map(os.path.basename, parts)))
     if "volume_completeness" in item:
         yield ctx.t("cli.scan.volumes", state=ctx.t("cli.scan.volumes." + item["volume_completeness"]))
     if "password_used" in item:
