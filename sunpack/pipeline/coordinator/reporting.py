@@ -332,7 +332,7 @@ class RunReporter:
             state = "partial" if kind == OutcomeKind.PARTIAL_SUCCESS else "complete" if success else "error"
             self._finish_row(row, state, detail)
             output = str(getattr(result, "out_dir", "") or "")
-            attach = success or getattr(result, "has_complete_inputs", False)
+            attach = success or getattr(result, "has_retained_outputs", False)
             self._set_output(key, row, output, attach=attach)
             if output and attach and depth == 1:
                 self._top_level_outputs.setdefault(output, output)
@@ -341,15 +341,19 @@ class RunReporter:
                 child_key = (key, item.input.input_id)
                 child = self._task_rows.get(child_key)
                 if child is not None:
-                    self._finish_row(child, "complete" if item.complete else "error",
+                    child_kind = item.outcome_kind
+                    child_state = ("complete" if child_kind == OutcomeKind.COMPLETE_SUCCESS
+                                   else "partial" if child_kind == OutcomeKind.PARTIAL_SUCCESS else "error")
+                    self._finish_row(child, child_state,
                                      item.result.error)
-                    self._set_output(child_key, child, item.result.out_dir, attach=item.complete)
+                    self._set_output(child_key, child, item.result.out_dir,
+                                     attach=child_kind != OutcomeKind.FAILURE)
             if row["container"] and not success:
                 # A group-level failure can stop execution before any segment
                 # has an outcome of its own.
                 for child_key in row["children"]:
                     child = self._task_rows[child_key]
-                    if child["state"] not in {"complete", "error"}:
+                    if child["state"] not in {"complete", "partial", "error"}:
                         self._finish_row(child, "skipped", "")
             self._render_panel_locked(force=True)
 

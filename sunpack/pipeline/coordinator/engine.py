@@ -1565,7 +1565,7 @@ class _RequestRuntime:
             ownership.remember_results([result])
             output_dir = (
                 result.output_dir
-                if result.outcome_kind != OutcomeKind.FAILURE or outcome.result.has_complete_inputs
+                if result.outcome_kind != OutcomeKind.FAILURE or outcome.result.has_retained_outputs
                 else ""
             )
 

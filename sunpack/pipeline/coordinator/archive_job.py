@@ -173,7 +173,7 @@ class ArchiveJobExecutor:
         )
         preserve_output = bool(result.output_dir and (
             task.runtime.get("retry_output_dir")
-            or result.outcome_kind != OutcomeKind.FAILURE or outcome.result.has_complete_inputs
+            or result.outcome_kind != OutcomeKind.FAILURE or outcome.result.has_retained_outputs
         ))
         path = outcome.planned_out_dir
         if path in self._uncommitted_outputs and not os.path.lexists(path):
@@ -412,10 +412,11 @@ class ArchiveJobExecutor:
         cleanup = cleanup_failed_output_if_eligible(
             out_dir,
             planned_output_dir=outcome.planned_out_dir,
-            # Complete empty/directory-only inputs are checkpointed too. Their
-            # output must survive even when a sibling failed without files.
-            failed=outcome.outcome_kind == OutcomeKind.FAILURE and not (
-                task.runtime.get("retry_output_dir") or res.has_complete_inputs
+            # Keep independently accepted inputs, including empty archives.
+            # A continued partial-only root can still be rejected if the user
+            # changed back to requiring complete extraction.
+            failed=outcome.outcome_kind == OutcomeKind.FAILURE and not res.has_retained_outputs and (
+                not task.runtime.get("retry_output_dir") or outcome.policy_rejected_partial_output
             ),
             force_owned_output_cleanup=outcome.policy_rejected_partial_output,
             payload_inventory=payload_inventory,
@@ -423,8 +424,22 @@ class ArchiveJobExecutor:
         diagnostics = res.diagnostics
         res.diagnostics = {**diagnostics, "failed_output_cleanup": cleanup.to_dict()}
 
+        if outcome.policy_rejected_partial_output and (cleanup.cleaned or not os.path.lexists(out_dir)):
+            # A rejected/deleted output must not be revived by a later retry's
+            # compact evidence. Keep blockers, but discard its output receipt.
+            task.recovery = replace(task.recovery, output_dir="", checkpoints=tuple(
+                replace(item, output_dir="", recovered_complete_files=0)
+                for item in task.recovery.checkpoints
+            ))
+            task.runtime.pop("retry_output_dir", None)
+            if res.failure is not None and "input_recovery" in res.failure.details:
+                res.failure = replace(res.failure, details={
+                    **{key: value for key, value in res.failure.details.items() if key != "retry_output_dir"},
+                    "input_recovery": task.recovery.to_dict(),
+                })
+
         if res.failure is not None and (
-            task.runtime.get("retry_output_dir") or res.has_complete_inputs
+            task.runtime.get("retry_output_dir") or res.has_retained_outputs
         ):
             # The path itself is the continuation signal; no output scan or
             # retained success inventories are needed across requests/restarts.
@@ -449,7 +464,7 @@ class ArchiveJobExecutor:
             recovery = {
                 "archive": task.main_path,
                 "out_dir": out_dir,
-                "complete_files": res.progress_manifest_payload.summary["complete"],
+                "complete_files": outcome.content_decision.complete_files,
                 **(
                     {"warning": possible_missing_volume.to_dict()}
                     if possible_missing_volume is not None
@@ -508,6 +523,8 @@ def _possible_missing_volume_failure(
         return None
 
     details: dict[str, Any] = {
+        **({key: failure.details[key] for key in ("input_recovery", "retry_output_dir")
+            if key in failure.details} if failure is not None else {}),
         "missing_volume_confirmed": False,
         "evidence": evidence,
         "partial_recovery": outcome_kind == OutcomeKind.PARTIAL_SUCCESS,

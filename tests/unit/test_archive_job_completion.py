@@ -6,7 +6,7 @@ from sunpack.pipeline.coordinator.content_recovery import (
     CONTENT_REQUIREMENT_ALLOW_PARTIAL,
     ContentRecoveryPolicy,
 )
-from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.i18n import I18nContext
 from sunpack.pipeline.coordinator import archive_job
 from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
@@ -72,7 +72,7 @@ def test_terminal_policy_is_shared_by_cleanup_report_and_result(tmp_path, monkey
         result = ExtractionResult(
             success, str(tmp_path / "output"), partial_outputs=partial,
             failure=FailureInfo(failure_kind, "extract", "failure") if failure_kind else None,
-            retained_complete_count=retained,
+            input_results=[InputExecutionResult(None, ExtractionResult(True, "retained"), retained=True)] if retained else [],
             progress_manifest_payload=SimpleNamespace(worker_status="failed", summary={"complete": complete}),
         )
         outcome = ArchiveJobOutcome(result, planned_out_dir=result.out_dir)
@@ -89,7 +89,7 @@ def test_terminal_policy_is_shared_by_cleanup_report_and_result(tmp_path, monkey
             assert kwargs["force_owned_output_cleanup"] is force_cleanup
             assert kwargs["failed"] is (expected == OutcomeKind.FAILURE and not retained)
             events.append("cleanup")
-            return SimpleNamespace(to_dict=lambda: {})
+            return SimpleNamespace(cleaned=False, to_dict=lambda: {})
 
         def reported(_task, finalized, _depth):
             assert events == ["cleanup"]

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from sunpack.core.contracts.extraction import ExtractionResult
-from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.core.contracts.content_recovery import (
     CONTENT_REQUIREMENT_COMPLETE, CONTENT_REQUIREMENT_ALLOW_PARTIAL, CONTENT_REQUIREMENTS,
@@ -15,6 +14,7 @@ from sunpack.core.contracts.content_recovery import (
 class ContentRecoveryDecision:
     outcome_kind: OutcomeKind = OutcomeKind.FAILURE
     rejected_partial_output: bool = False
+    complete_files: int = 0
 
 
 @dataclass(frozen=True)
@@ -24,17 +24,27 @@ class ContentRecoveryPolicy:
     def decide(self, result: ExtractionResult) -> ContentRecoveryDecision:
         """Use the final execution result, never infer success from output bytes."""
         if result.success:
-            return ContentRecoveryDecision(OutcomeKind.COMPLETE_SUCCESS)
-        failure = result.failure
+            inventory = result.output_inventory
+            return ContentRecoveryDecision(OutcomeKind.COMPLETE_SUCCESS, complete_files=(
+                inventory.stats.file_count if inventory is not None else result.files_written
+            ))
+        if result.input_results:
+            complete_files = 0
+            failed = False
+            partial = False
+            for item in result.input_results:
+                decision = self.decide(item.result)
+                item.content_outcome = decision.outcome_kind
+                complete_files += decision.complete_files
+                failed |= decision.outcome_kind == OutcomeKind.FAILURE
+                partial |= decision.outcome_kind == OutcomeKind.PARTIAL_SUCCESS
+            if not failed and partial:
+                return ContentRecoveryDecision(OutcomeKind.PARTIAL_SUCCESS, complete_files=complete_files)
+        elif self.requirement == CONTENT_REQUIREMENT_ALLOW_PARTIAL:
+            complete_files = result.recoverable_complete_files
+            if complete_files > 0:
+                return ContentRecoveryDecision(OutcomeKind.PARTIAL_SUCCESS, complete_files=complete_files)
         if self.requirement == CONTENT_REQUIREMENT_ALLOW_PARTIAL:
-            manifest = result.progress_manifest_payload
-            if (failure is not None
-                    and failure.kind in {FailureKind.DAMAGED, FailureKind.MISSING_VOLUME}
-                    and not failure.causes
-                    and manifest is not None
-                    and manifest.worker_status == "failed"
-                    and manifest.summary["complete"] > 0):
-                return ContentRecoveryDecision(OutcomeKind.PARTIAL_SUCCESS)
             return ContentRecoveryDecision()
         if result.has_complete_inputs:
             return ContentRecoveryDecision()

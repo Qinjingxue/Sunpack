@@ -173,7 +173,7 @@ def test_retry_tree_keeps_retained_siblings_and_selected_input_updates(tmp_path,
                                       "out_dir": str(tmp_path / "out" / str(node.position))})
     failure = aggregate_input_failures([missing], segment_count=len(nodes), i18n=reporter.i18n)
     reporter.task_finished(task, SimpleNamespace(outcome_kind=OutcomeKind.FAILURE,
-        result=SimpleNamespace(error=failure.message, out_dir=output, failure=failure, has_complete_inputs=True,
+        result=SimpleNamespace(error=failure.message, out_dir=output, failure=failure, has_retained_outputs=True,
             input_results=[InputExecutionResult(node, ExtractionResult(True,
                 str(tmp_path / "out" / str(node.position)))) for node in selected])), 1)
     nested = make_archive_task(tmp_path / "out" / "1" / "nested.zip")

@@ -1,4 +1,5 @@
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
+from sunpack.core.contracts.results import OutcomeKind
 import os
 from dataclasses import dataclass
 from threading import Lock
@@ -76,8 +77,9 @@ class NestedOutputScanPolicy:
         The projection is deliberately based on the in-process child results
         produced by the extractor, rather than on directory names.  A normal
         archive has one logical root (its existing output directory).  An
-        embedded carrier contributes the output directory of each confirmed
-        segment, together with that segment's inventory when available.
+        embedded carrier contributes each policy-accepted segment's output
+        directory and inventory. Unchanged checkpoints were already handled
+        by the previous attempt and do not need to be scanned again.
 
         This only changes the recursive scan boundary.  It does not alter
         extraction, output naming, or the authorization
@@ -85,7 +87,9 @@ class NestedOutputScanPolicy:
         """
         input_results = extraction_result.input_results
         projected: list[tuple[str, OutputInventory | dict[str, Any] | None]] = []
-        for item in extraction_result.complete_input_results():
+        for item in input_results:
+            if item.retained or item.outcome_kind == OutcomeKind.FAILURE:
+                continue
             child_result = item.result
             segment_dir = child_result.out_dir
             if not segment_dir:

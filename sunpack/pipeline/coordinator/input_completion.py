@@ -9,13 +9,17 @@ def checkpoint_inputs(task, result):
         return
     generation = {row[0]: tuple(row) for row in generation}
     checkpoints = {item.input.input_id: item for item in task.recovery.checkpoints}
-    current = ((item.input, item.result) for item in result.input_results) if result.input_results else (
+    current = ((item.input, item.result) for item in result.input_results if not item.retained) if result.input_results else (
         (result.logical_input, result),)
     for node, extracted in current:
         if node is not None:
+            inventory = extracted.output_inventory
             checkpoints[node.input_id] = InputCheckpoint(
                 node, source_generation(node, generation), extracted.out_dir,
-                extracted.success, extracted.failure, extracted.files_written, extracted.bytes_written,
+                extracted.success, extracted.failure,
+                inventory.stats.file_count if inventory is not None else extracted.files_written,
+                inventory.stats.total_size if inventory is not None else extracted.bytes_written,
+                extracted.recoverable_complete_files,
             )
     recovery = InputRecovery(tuple(checkpoints.values()), result.out_dir,
                              task.recovery.input_count or len(task.inputs))

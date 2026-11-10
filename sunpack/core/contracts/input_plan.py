@@ -76,6 +76,7 @@ class InputCheckpoint:
     failure: FailureInfo | None = None
     files_written: int = 0
     bytes_written: int = 0
+    recovered_complete_files: int = 0
 
     @property
     def blockers(self) -> frozenset[str]:
@@ -100,6 +101,7 @@ class InputCheckpoint:
             "blockers": sorted(self.blockers),
             "failure": self.failure.to_dict() if self.failure else None,
             "files_written": self.files_written, "bytes_written": self.bytes_written,
+            "recovered_complete_files": self.recovered_complete_files,
         }
 
     @classmethod
@@ -111,6 +113,7 @@ class InputCheckpoint:
             str(value.get("output_dir") or ""), bool(value.get("complete")),
             FailureInfo.from_dict(value.get("failure")),
             int(value["files_written"]), int(value["bytes_written"]),
+            int(value.get("recovered_complete_files") or 0),
         )
 
 
@@ -208,8 +211,8 @@ class InputRecovery:
                 selected.append(node)
         # Disappeared inputs are not resurrected from an old scan. A changed
         # carrier must run its newly discovered plan in a new output root.
-        retained_complete = any(item.complete for item in carried)
-        root = self.output_dir if retained_complete else ""
+        retained_output = any(item.complete or item.recovered_complete_files > 0 for item in carried)
+        root = self.output_dir if retained_output else ""
         if root:
             # Preserve deterministic output slots for failed attempts too.
             carried_ids = {item.input.input_id for item in carried}

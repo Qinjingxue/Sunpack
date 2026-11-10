@@ -613,7 +613,7 @@ class SingleArchiveExtractor:
         selected_ids = {node.input_id for node in inputs}
         retained = [item for item in task.recovery.checkpoints if item.input.input_id not in selected_ids]
         any_success = any(item.complete for item in retained)
-        any_partial = False
+        any_partial = any(item.recovered_complete_files > 0 for item in retained)
         segment_failures = [item.failure for item in retained if not item.complete and item.failure is not None]
         segment_paths: set[str] = set()
         segment_allocator = None if self.scanning else OutputPathAllocator()
@@ -731,6 +731,19 @@ class SingleArchiveExtractor:
                 "bytes_written": stats["total_bytes"],
             })
 
+        # Retained inputs use the same result model without keeping native file
+        # tables alive across retries. Failed checkpoints remain failed even
+        # when their independently proved complete members can be recovered.
+        input_results.extend(InputExecutionResult(
+            item.input,
+            ExtractionResult(
+                item.complete, item.output_dir, failure=item.failure,
+                files_written=item.files_written, bytes_written=item.bytes_written,
+                recovered_complete_files=item.recovered_complete_files,
+            ),
+            retained=True,
+        ) for item in retained)
+
         if self.scanning:
             failure = (aggregate_input_failures(segment_failures, segment_count=segment_count, i18n=self.i18n)
                        if segment_failures else None)
@@ -744,7 +757,7 @@ class SingleArchiveExtractor:
                 "file_count": sum(item["files_written"] for item in segment_results) + sum(item.files_written for item in retained),
                 "total_bytes": sum(item["bytes_written"] for item in segment_results) + sum(item.bytes_written for item in retained),
             }
-        all_success = bool(segment_results or retained) and not segment_failures and all(item.get("success") for item in segment_results)
+        all_success = bool(input_results) and all(item.complete for item in input_results)
         diagnostics = {
             "result": {
                 "status": "ok" if all_success else ("partial" if any_success or any_partial else "failed"),
@@ -784,7 +797,6 @@ class SingleArchiveExtractor:
                 files_written=totals["file_count"],
                 bytes_written=totals["total_bytes"],
                 input_results=input_results,
-                retained_complete_count=sum(item.complete for item in retained),
             )
         self._log(task, self.i18n.t("extract.log.embedded_failed", archive=archive))
         if aggregate_failure is None:
@@ -809,7 +821,6 @@ class SingleArchiveExtractor:
             partial_outputs=any_partial,
         )
         failed_result.input_results = input_results
-        failed_result.retained_complete_count = sum(item.complete for item in retained)
         failed_result.files_written = totals["file_count"]
         failed_result.bytes_written = totals["total_bytes"]
         return failed_result
