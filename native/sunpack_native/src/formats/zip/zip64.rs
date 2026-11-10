@@ -90,15 +90,6 @@ impl From<std::io::Error> for LocateError {
     }
 }
 
-impl LocateError {
-    pub(crate) fn code(&self) -> &'static str {
-        match self {
-            Self::Read(_) => "zip64_eocd_read_failed",
-            Self::Invalid(code) => code,
-        }
-    }
-}
-
 /// One locator/extent model for byte slices, files and logical volume views.
 /// Try the disk-relative locator first. SFX/carriers can shift that offset;
 /// recover by scanning backwards in bounded windows, accepting only a record

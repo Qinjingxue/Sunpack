@@ -26,7 +26,7 @@ def edge_config(passwords: list[str] | None = None, *, allow_partial: bool = Fal
             "archive_cleanup_mode": "k",
             "flatten_single_directory": False,
         },
-        "verification": {"enabled": True},
+
         "user_passwords": passwords or [],
         "builtin_passwords": [],
     }, processors=[

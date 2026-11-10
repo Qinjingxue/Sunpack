@@ -28,14 +28,7 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32, PROPID id, PROPVARIANT *value)) {
 }
 Z7_COM7F_IMF(CHandler::GetArchiveProperty(PROPID id, PROPVARIANT *value)) {
     NWindows::NCOM::CPropVariant prop;
-    if (decoded) {
-        const UInt64 fields[] = {receipt.input_bytes, receipt.output_bytes, receipt.frames,
-            receipt.skippable_frames, receipt.content_checked_frames, receipt.block_checked_frames,
-            static_cast<UInt64>(receipt.error)};
-        if (id >= sunpack::sevenzip::kLz4ReceiptBase && id < sunpack::sevenzip::kLz4ReceiptBase + 7)
-            prop = fields[id - sunpack::sevenzip::kLz4ReceiptBase];
-        else if (id == kpidNumStreams) prop = static_cast<UInt64>(receipt.frames);
-    }
+    if (decoded && id == kpidNumStreams) prop = static_cast<UInt64>(receipt.frames);
     prop.Detach(value); return S_OK;
 }
 Z7_COM7F_IMF(CHandler::Open(IInStream *input, const UInt64 *, IArchiveOpenCallback *)) {
@@ -109,18 +102,3 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 count, Int32 test, 
 static const Byte k_Signature[] = {4, 0x22, 0x4d, 0x18};
 REGISTER_ARC_I("lz4", "lz4", "*", 0xFA, k_Signature, 0, NArcInfoFlags::kKeepName, nullptr)
 }}
-
-namespace sunpack::sevenzip {
-void read_lz4_receipt(IInArchive *archive, ExtractArchiveResult &result) {
-    UInt64 fields[7]{};
-    for (unsigned int i = 0; i != 7; ++i) {
-        NWindows::NCOM::CPropVariant prop;
-        if (archive->GetArchiveProperty(kLz4ReceiptBase + i, &prop) != S_OK || prop.vt != VT_UI8) return;
-        fields[i] = prop.uhVal.QuadPart;
-    }
-    result.has_stream_receipt = true;
-    result.stream_receipt = {fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
-        static_cast<unsigned int>(fields[6])};
-    result.stream_receipt.format = "lz4";
-}
-}

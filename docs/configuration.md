@@ -42,21 +42,15 @@ CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extracti
 
 Directory discovery is shallow by default. Use `--recursive` with `scan` or `extract`; nested extraction continues to use `--recur`. Upgrades from installed versions below 1.4.0 reset managed runtime data and convert legacy scan-filter fields. Read the [upgrade warning](upgrade-v1.4.md) and back up your data first.
 
-## Partial success and result verification
+## Extraction results and partial success
 
-`extraction.content_requirement` in `sunpack_config.json` is the single partial-success setting. The GUI's “Required extraction result” edits the same field. The default, `"complete"`, accepts only complete results; `"allow_partial"` accepts recoverable partial results identified by verification. CLI, Watch and nested extraction share it. The `-k`, `--allow-partial` and `--ap` overrides have been removed. Partial acceptance does not turn authentication, execution or independent-input failures into success, and never authorizes recycling or deleting that partial result's source archive.
+The worker's final result determines extraction success after decoding, writing and closing outputs. A successful empty archive or directory-only archive is complete. Container warnings alone do not trigger a second source walk, output CRC pass or LZ4 plan/receipt comparison. Success concerns the logical input and members processed by the worker; it does not prove that a damaged container exposed every original member.
 
-The same key in an older advanced configuration remains readable, with the ordinary configuration taking precedence. During an installation upgrade, a missing ordinary setting is filled from the old advanced value, or with `"complete"` if neither exists.
+`extraction.content_requirement` in `sunpack_config.json` controls partial acceptance. `"complete"` is the default. `"allow_partial"` accepts damaged or missing-volume results only when the final worker report identifies at least one completed file, including a zero-byte file. Written bytes, unfinished members and unreported files do not establish completion. Authentication, process and output I/O failures remain failures. Partial acceptance retains the extraction output; it does not repair or independently validate damaged files.
 
-Complete acceptance retains the internal completeness condition of `0.999`, together with a complete assessment and compatible content integrity. There is no external threshold setting.
+Coordinator owns this decision, per-input checkpoints and recovery. Complete siblings survive retries of failed inputs. Only complete success authorizes source cleanup, including the existing shared-carrier ownership checks. CLI, Watch and nested extraction share this behavior.
 
-When complete acceptance does not apply, at least one actual file in the output inventory supports a partial recommendation, including a zero-byte file. No minimum recovered proportion, output-quality score, confidence or estimated recoverable upper bound is required. Empty directories and records of missing files do not count as output files. Password requests and explicit failure recommendations still take precedence.
-
-Verification, coverage, quality scores and damage evidence still run normally. Only the terminal decision applies the ordinary partial-success setting; this does not introduce per-file damage filtering or repair.
-
-`manifest_size_match` compares file counts and total unpacked bytes exactly, without absolute or ratio tolerances. Shortfalls produce failure issues and excesses produce warnings; per-file name, size and CRC checks still run independently.
-
-`archive_test_crc` no longer caps missing-file, CRC-mismatch, size-mismatch or read-error details by item count. Rust encodes complete JSON streams during verification and reuses byte-based spill storage. Python retains immutable handles, while CLI and Watch reports stream the encoded data directly. Temporary storage is reclaimed when its last owning result or knowledge snapshot is released. Writing a complete report still costs disk IO proportional to its contents.
+The verification framework, method settings, completeness thresholds and quality scores have been removed. Installation upgrades discard the old `verification` configuration section. The partial-success setting remains available in the GUI; ordinary configuration takes precedence over an older advanced setting.
 
 ## Scan filters
 
@@ -194,4 +188,3 @@ Persistent passwords come only from `builtin_passwords.json`, including its `cli
   "clipboard_history": []
 }
 ```
-

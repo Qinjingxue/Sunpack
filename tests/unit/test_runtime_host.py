@@ -402,7 +402,9 @@ def test_extract_reports_watch_busy_without_starting_another_task(tmp_path):
                 SimpleNamespace(paths=[str(archive)]),
                 SimpleNamespace(
                     cwd=str(tmp_path),
-                    reporter=None,
+                    reporter=SimpleNamespace(error=lambda _message: None),
+                    work_broker=None,
+                    cancellation=None,
                     t=lambda key, **_kwargs: "该任务已由 watch 处理，请等待" if key == "cli.watch_busy" else key,
                 ),
             )
@@ -430,7 +432,9 @@ def test_extract_reports_foreground_busy_without_watch_wording(tmp_path):
                 SimpleNamespace(paths=[str(archive)]),
                 SimpleNamespace(
                     cwd=str(tmp_path),
-                    reporter=None,
+                    reporter=SimpleNamespace(error=lambda _message: None),
+                    work_broker=None,
+                    cancellation=None,
                     t=lambda key, **_kwargs: {
                         "cli.watch_busy": "watch busy",
                         "cli.archive_busy": "archive busy",

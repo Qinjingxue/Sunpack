@@ -1,11 +1,9 @@
 from typing import Any
 
-from sunpack.pipeline.verification.registry import registered_verification_methods
 
 
 def validate_config_payload(config: dict) -> dict[str, Any]:
-    """Validate registered methods and native scan rules in normalized config."""
-    available = registered_verification_methods()
+    """Validate native scan rules in normalized config."""
     errors = []
     from sunpack_native import NativePathRule
     for index, rule in enumerate(config["filesystem"]["scan_filters"]):
@@ -14,12 +12,8 @@ def validate_config_payload(config: dict) -> dict[str, Any]:
                 NativePathRule(*(rule.get(field, []) for field in ("paths", "files", "extensions", "full_names")))
             except (TypeError, ValueError) as error:
                 errors.append(f"filesystem.scan_filters[{index}]: {error}")
-    for index, method in enumerate(config["verification"]["methods"]):
-        if method["name"] not in available:
-            errors.append(f"Unknown verification method at verification.methods[{index}]: {method['name']}")
     return {
         "ok": not errors,
         "errors": errors,
         "warnings": [],
-        "available_verification_methods": sorted(available),
     }

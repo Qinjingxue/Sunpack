@@ -192,124 +192,6 @@ impl NativeProgressManifest {
             .collect()
     }
 
-    /// Mean per-file progress; 1.0 when no per-file records exist.
-    fn completeness(&self) -> f64 {
-        let files = &self.document.files;
-        if files.is_empty() {
-            return 1.0;
-        }
-        let total: f64 = files.iter().filter_map(ProgressFile::progress).sum();
-        (total / files.len() as f64).clamp(0.0, 1.0)
-    }
-
-    /// File and byte coverage of the recorded outputs.
-    fn coverage<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let files = &self.document.files;
-        let mut matched_files = 0usize;
-        let mut expected_bytes = 0u64;
-        let mut matched_bytes = 0u64;
-        let mut complete_bytes = 0u64;
-        for item in files {
-            if item.status != FileStatus::Failed || item.bytes_written > 0 {
-                matched_files += 1;
-            }
-            let expected = item.expected_size.unwrap_or(0);
-            expected_bytes = expected_bytes.saturating_add(expected);
-            matched_bytes = matched_bytes.saturating_add(if expected > 0 {
-                item.bytes_written.min(expected)
-            } else {
-                item.bytes_written
-            });
-            if item.status == FileStatus::Complete {
-                complete_bytes = complete_bytes.saturating_add(if expected > 0 {
-                    expected
-                } else {
-                    item.bytes_written
-                });
-            }
-        }
-        // Summary-only manifests intentionally have no per-file outcomes.
-        let summary = if files.is_empty() {
-            Summary::default()
-        } else {
-            self.document.summary
-        };
-        let file_coverage = matched_files as f64 / files.len().max(1) as f64;
-        let byte_coverage = if expected_bytes > 0 {
-            matched_bytes as f64 / expected_bytes as f64
-        } else {
-            file_coverage
-        };
-        let dict = PyDict::new(py);
-        dict.set_item("file_coverage", round6(file_coverage))?;
-        dict.set_item("byte_coverage", round6(byte_coverage))?;
-        dict.set_item("expected_files", files.len())?;
-        dict.set_item("matched_files", matched_files)?;
-        dict.set_item("complete_files", summary.complete)?;
-        dict.set_item("partial_files", summary.partial)?;
-        dict.set_item("failed_files", summary.failed)?;
-        dict.set_item("missing_files", 0)?;
-        dict.set_item("unverified_files", summary.unverified)?;
-        dict.set_item("expected_bytes", expected_bytes)?;
-        dict.set_item("matched_bytes", matched_bytes)?;
-        dict.set_item("complete_bytes", complete_bytes)?;
-        Ok(dict)
-    }
-
-    /// Per-entry status and error-class counts over the recorded files.
-    fn entry_outcome_counts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let files = &self.document.files;
-        // Summary-only manifests intentionally have no per-file outcomes.
-        let summary = if files.is_empty() {
-            Summary::default()
-        } else {
-            self.document.summary
-        };
-        let mut crc = 0usize;
-        let mut data = 0usize;
-        let mut unexpected_end = 0usize;
-        let mut unsupported = 0usize;
-        let mut missing_volume = 0usize;
-        for item in files {
-            let text = format!(
-                "{} {} {}",
-                item.failure_kind,
-                item.message,
-                item.status.as_str()
-            )
-            .to_lowercase();
-            if item.crc_ok == Some(false) || text.contains("crc") || text.contains("checksum") {
-                crc += 1;
-            }
-            if text.contains("data_error") || text.contains("corrupted_data") {
-                data += 1;
-            }
-            if text.contains("unexpected_end")
-                || text.contains("unexpected end")
-                || text.contains("truncated")
-            {
-                unexpected_end += 1;
-            }
-            if text.contains("unsupported") {
-                unsupported += 1;
-            }
-            if text.contains("missing_volume") || text.contains("missing volume") {
-                missing_volume += 1;
-            }
-        }
-        let dict = PyDict::new(py);
-        dict.set_item("total", summary.total)?;
-        dict.set_item("complete", summary.complete)?;
-        dict.set_item("partial", summary.partial)?;
-        dict.set_item("failed", summary.failed)?;
-        dict.set_item("unverified", summary.unverified)?;
-        dict.set_item("crc_error", crc)?;
-        dict.set_item("data_error", data)?;
-        dict.set_item("unexpected_end", unexpected_end)?;
-        dict.set_item("unsupported_method", unsupported)?;
-        dict.set_item("missing_volume", missing_volume)?;
-        Ok(dict)
-    }
 }
 
 /// Summary-only manifest for a worker result whose complete inventory was verified.
@@ -418,10 +300,14 @@ pub(crate) fn build_progress_manifest(
 }
 
 fn file_from_trace(item: &OutputTraceItem, out_dir: &str) -> ProgressFile {
-    let status = match (item.failed, item.bytes_written > 0) {
-        (false, _) => FileStatus::Complete,
-        (true, true) => FileStatus::Partial,
-        (true, false) => FileStatus::Failed,
+    let status = if item.done && !item.failed && item.operation_result == 0 {
+        FileStatus::Complete
+    } else if item.bytes_written > 0 {
+        FileStatus::Partial
+    } else if item.failed || (item.done && item.operation_result != 0) {
+        FileStatus::Failed
+    } else {
+        FileStatus::Unverified
     };
     let output = if item.output_path.is_empty() {
         &item.path
@@ -438,7 +324,7 @@ fn file_from_trace(item: &OutputTraceItem, out_dir: &str) -> ProgressFile {
         archive_path: archive_path_text(source, out_dir),
         status,
         bytes_written: item.bytes_written,
-        expected_size: Some(item.expected_size),
+        expected_size: item.has_expected_size.then_some(item.expected_size),
         crc_ok: None,
         failure_stage: String::new(),
         failure_kind: String::new(),
@@ -448,7 +334,7 @@ fn file_from_trace(item: &OutputTraceItem, out_dir: &str) -> ProgressFile {
 
 fn file_from_row(item: &OutputFileRecord, out_dir: &str) -> ProgressFile {
     let status = match item.status {
-        0 | 1 => FileStatus::Complete,
+        1 => FileStatus::Complete,
         2 => FileStatus::Failed,
         _ => FileStatus::Unverified,
     };
@@ -552,10 +438,6 @@ fn windows_path_text(path: &str) -> String {
         output.push('\\');
     }
     output
-}
-
-fn round6(value: f64) -> f64 {
-    (value * 1_000_000.0).round() / 1_000_000.0
 }
 
 #[cfg(test)]

@@ -1,14 +1,9 @@
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
-from sunpack_native import NativeJsonArray
 
 
 def jsonable_value(value: Any) -> Any:
-    if isinstance(value, NativeJsonArray):
-        # Immutable native storage is shared by detached snapshots and streamed
-        # by the JSON writer; never expand its complete row table in Python.
-        return value
     if is_dataclass(value):
         # Build the detached JSON tree once; asdict() first deep-copies a tree
         # that this traversal would immediately rebuild.

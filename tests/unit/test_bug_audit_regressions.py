@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-import sunpack_native
 
 from sunpack.core.support.archive_sessions import (
     clear_archive_sessions,
@@ -61,77 +60,6 @@ def test_bug_regression_session_refreshes_equal_size_restored_timestamp_input(
         assert all(session is current for session in sessions)
     finally:
         clear_archive_sessions()
-
-
-def _inventory(files):
-    return sunpack_native.output_inventory_from_serialized(
-        "C:/unused",
-        files,
-        True,
-        True,
-        len(files),
-        0,
-        len(files),
-        0,
-        True,
-        False,
-        False,
-    )
-
-
-def _output(path, crc, **kwargs):
-    return dict(
-        path=path,
-        size=1,
-        bytes_written=1,
-        status="complete",
-        has_output_crc=True,
-        output_crc32=crc,
-        **kwargs,
-    )
-
-
-def test_bug_regression_unicode_inventory_uses_distinct_outputs():
-    names = ["\u00e9.txt", "e\u0301.txt"]
-    outputs = [_output(names[0], 100), _output(names[1], 200)]
-    expected = [
-        {"path": name, "size": 1, "has_crc": True, "crc32": crc}
-        for name, crc in zip(names, [100, 200])
-    ]
-    result = sunpack_native.match_output_inventory_coverage(
-        expected, _inventory(outputs), True, "none", True
-    )
-    assert result["mismatch_count"] == 0
-    assert result["coverage"]["complete_files"] == 2
-    assert [item["path"] for item in result["observations"]] == names
-    expected[1]["crc32"] = 100
-    result = sunpack_native.match_output_inventory_coverage(
-        expected, _inventory(outputs[:1]), True, "any", True
-    )
-    assert result["coverage"]["complete_files"] == 1
-    assert result["missing_count"] == 1
-
-
-def test_bug_regression_worker_renamed_output_paths_are_reused():
-    expected = [
-        {
-            "path": "name.txt",
-            "output_path": "name(1).txt",
-            "size": 1,
-            "has_crc": True,
-            "crc32": 200,
-        }
-    ]
-    outputs = [
-        _output("name.txt", 100),
-        _output("name.txt", 200, output_path="name(1).txt"),
-    ]
-    result = sunpack_native.match_output_inventory_coverage(
-        expected, _inventory(outputs), True, "none", True
-    )
-    assert result["mismatch_count"] == 0
-    assert result["coverage"]["complete_files"] == 1
-    assert result["observations"][0]["path"] == "name(1).txt"
 
 
 def test_bug_regression_idle_allocator_cleanup_preserves_active_owners(tmp_path):

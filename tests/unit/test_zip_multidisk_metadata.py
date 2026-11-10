@@ -4,8 +4,6 @@ import pytest
 from sunpack_native import AnalysisBinaryView
 
 from sunpack.core.analysis import AnalysisRequest, ArchiveAnalyzer
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
-from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
 
 
 def _zip_details(volumes) -> dict:
@@ -51,17 +49,11 @@ def test_zip_probe_maps_spanned_disk_relative_offsets(tmp_path, zip64):
     assert result["declared_total_disks"] == 2
     assert result["local_header_links_ok"] is True
     assert "zip:multi_disk_offsets" in result["evidence"]
-    descriptor = ArchiveInputDescriptor(
-        entry_path=str(first), open_mode="concat_ranges", format_hint="zip",
-        extents=[InputExtent(str(first)), InputExtent(str(last))],
-    )
-    manifest = archive_input_manifest(descriptor)
-    assert manifest.ok and manifest.expected_names == ["a"]
 
 
 @pytest.mark.parametrize("layout", ["plain", "carrier", "split_carrier"])
 @pytest.mark.parametrize("invalid_field", [None, "locator", "size", "offset", "sum"])
-def test_zip64_bounds_are_shared_by_analysis_and_manifest(tmp_path, layout, invalid_field):
+def test_zip64_bounds_in_analysis(tmp_path, layout, invalid_field):
     # Unique coverage: malformed ZIP64 declarations must not become plausible
     # through carrier scanning or split mapping. Normal archive tests cannot
     # catch that false acceptance; these tiny fixtures cost only bounded reads.
@@ -135,18 +127,6 @@ def test_zip64_bounds_are_shared_by_analysis_and_manifest(tmp_path, layout, inva
         assert any(item.get("plausible") is True for item in details)
     else:
         assert not any(item.get("plausible") is True for item in details)
-    descriptor = ArchiveInputDescriptor(
-        entry_path=str(first) if layout == "split_carrier" else str(path),
-        open_mode="concat_ranges" if layout == "split_carrier" else "file",
-        extents=[InputExtent(str(first)), InputExtent(str(last))] if layout == "split_carrier" else [],
-        format_hint="zip",
-    )
-    manifest = archive_input_manifest(descriptor)
-    assert manifest.ok is (invalid_field is None)
-    if manifest.ok:
-        assert manifest.expected_names == ["a"]
-    else:
-        assert manifest.damaged
 
 
 def test_zip_probe_resolves_zip64_tail_and_central_extra_across_raw_splits(tmp_path):

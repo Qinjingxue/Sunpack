@@ -15,11 +15,10 @@ if TYPE_CHECKING:
 class InputExecutionResult:
     input: LogicalArchiveInput
     result: ExtractionResult
-    verified_complete: bool | None = None
 
     @property
     def complete(self) -> bool:
-        return self.result.success and self.verified_complete is not False
+        return self.result.success
 
 
 @dataclass
@@ -40,7 +39,7 @@ class ExtractionResult:
     files_written: int = 0
     bytes_written: int = 0
     # In-process child results for carriers containing independent archives.
-    # These retain native output inventories for the normal verifier without
+    # These retain native output inventories for recursive discovery without
     # expanding per-file tables into the persisted outer diagnostics.
     logical_input: LogicalArchiveInput | None = None
     input_results: list[InputExecutionResult] = field(default_factory=list)

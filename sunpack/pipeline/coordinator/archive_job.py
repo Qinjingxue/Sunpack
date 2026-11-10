@@ -4,7 +4,7 @@ from typing import Any
 
 from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
-from sunpack.core.contracts.content_recovery import (
+from sunpack.pipeline.coordinator.content_recovery import (
     ContentRecoveryDecision,
     ContentRecoveryPolicy,
 )
@@ -18,7 +18,7 @@ from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
 
 from sunpack.core.passwords.directory_context import PasswordScopeContext
-from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
+from sunpack.pipeline.coordinator.input_completion import checkpoint_inputs
 from sunpack.core.i18n import I18nContext
 
 
@@ -32,8 +32,6 @@ def _advance_job_state(state, sent, *, first: bool):
 @dataclass
 class ArchiveJobOutcome:
     result: ExtractionResult
-    verification: VerificationResult | None = None
-    attempts: int = 1
     planned_out_dir: str = ""
     content_decision: ContentRecoveryDecision = ContentRecoveryDecision()
 
@@ -70,7 +68,6 @@ class ArchiveJobExecutor:
         self.origin = str(origin or "")
         self.output_reservations = output_reservations
         self._uncommitted_outputs: dict[str, ArchiveTask] = {}
-        self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
         self.password_scope_context = self.config.get("password_scope_context") or PasswordScopeContext(self.config.get("password_scope_dir", ""))
 
     def _finish_output(self, task, output_dir: str, *, keep: bool) -> None:
@@ -144,7 +141,7 @@ class ArchiveJobExecutor:
         missing_volume_retry=None,
         ensure_input_lease=None,
     ) -> tuple[ArchiveTask, ArchiveJobOutcome, TargetRunResult]:
-        """Run one logical archive through preflight, extraction and verification."""
+        """Run one logical archive through preflight, extraction and completion."""
 
         try:
             task, outcome = await self._execute_one_async(
@@ -278,7 +275,7 @@ class ArchiveJobExecutor:
                              request_id=self.request_id, cancellation=cancellation)
         else:
             self._track_output(task, planned_out_dir, depth)
-        state = self._extract_verify_state_machine(
+        state = self._extract_state_machine(
             task,
             planned_out_dir,
             missing_volume_retry=missing_volume_retry,
@@ -288,7 +285,7 @@ class ArchiveJobExecutor:
         first = True
         while True:
             done, value = await broker.run(
-                "extract_prepare" if first else "verify_extract",
+                "extract_prepare" if first else "complete_extract",
                 file_id,
                 _advance_job_state,
                 state,
@@ -345,7 +342,7 @@ class ArchiveJobExecutor:
         if self.progress_reporter is not None:
             self.progress_reporter.task_status(task, state, detail)
 
-    def _extract_verify_state_machine(
+    def _extract_state_machine(
         self,
         task: ArchiveTask,
         out_dir: str,
@@ -360,13 +357,11 @@ class ArchiveJobExecutor:
                 "out_dir": out_dir,
             }
             write_extraction_result(task, result)
+            checkpoint_inputs(task, result)
             if not result.success:
                 self._report_task_status(task, "error", str(result.error or ""))
-                verification = self.verifier.verify(task, result)
                 current_outcome = ArchiveJobOutcome(
                     result=result,
-                    verification=verification,
-                    attempts=1,
                 )
                 if (
                     not volume_retry_attempted
@@ -377,21 +372,20 @@ class ArchiveJobExecutor:
                     self._report_task_status(task, "resolving_volumes")
                     replacement = missing_volume_retry(task, current_outcome)
                     if isinstance(replacement, ArchiveTask):
-                        DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
+                        cleanup = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
                             result.out_dir,
-                            event=OutputCleanupEvent.VERIFICATION_RETRY,
+                            event=OutputCleanupEvent.EXTRACT_RETRY,
                             planned_output_dir=out_dir,
                         )
+                        if not (cleanup.cleaned or cleanup.already_absent):
+                            return current_outcome
                         task.adopt_detection_plan(replacement)
                         self._report_task_started(task, replanned=True)
                         self.password_scope_context.annotate([task])
                         continue
                 return current_outcome
 
-            # Verification observes this extraction once. Failed verification
-            # is a result, not a reason to run the same extraction again.
-            verification = self.verifier.verify(task, result)
-            return ArchiveJobOutcome(result=result, verification=verification, attempts=1)
+            return ArchiveJobOutcome(result=result)
 
     def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:
         if isinstance(outcome, ExtractionResult):
@@ -409,7 +403,7 @@ class ArchiveJobExecutor:
             with self.context.lock:
                 self.context.add_target_result(result)
             return result
-        outcome.content_decision = self.content_policy.decide(res, outcome.verification)
+        outcome.content_decision = self.content_policy.decide(res)
         out_dir = res.out_dir
         inventory = OutputInventory.from_value(res.output_inventory, expected_root=out_dir) if out_dir else None
         payload_inventory = (inventory.stats.file_count, inventory.stats.total_size) if inventory is not None else None
@@ -445,20 +439,13 @@ class ArchiveJobExecutor:
             if possible_missing_volume is not None:
                 res.failure = possible_missing_volume
                 res.error = possible_missing_volume.message
-            elif res.success and outcome.verification is not None and not res.error:
-                res.error = self._verification_failure_summary(outcome.verification, outcome.attempts)
 
         recovery = None
-        if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS and outcome.verification is not None:
+        if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
             recovery = {
                 "archive": task.main_path,
                 "out_dir": out_dir,
-                "completeness": outcome.verification.completeness,
-                "assessment_status": outcome.verification.assessment_status,
-                "content_integrity": outcome.verification.content_integrity,
-                "container_integrity": outcome.verification.container_integrity,
-                "verification_strength": outcome.verification.verification_strength,
-                "archive_coverage": _coverage_payload(outcome.verification),
+                "complete_files": res.progress_manifest_payload.summary["complete"],
                 **(
                     {"warning": possible_missing_volume.to_dict()}
                     if possible_missing_volume is not None
@@ -471,7 +458,6 @@ class ArchiveJobExecutor:
             outcome_kind=outcome.outcome_kind,
             task_key=task.key,
             output_dir=out_dir,
-            verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
             error=(
                 possible_missing_volume.message
                 if possible_missing_volume is not None
@@ -486,77 +472,6 @@ class ArchiveJobExecutor:
                 self.context.processed_keys.add(task.key)
             self.context.add_target_result(result)
         return result
-
-    def _verification_failure_summary(self, verification: VerificationResult, attempts: int) -> str:
-        steps = "; ".join(f"{step.method}:{step.status}" for step in verification.steps) or "none"
-        return self.i18n.t(
-            "failure.verification_failed_detail",
-            completeness=verification.completeness,
-            integrity=verification.assessment_status,
-            decision=verification.decision_hint,
-            coverage=verification.archive_coverage.completeness,
-            attempts=attempts,
-            steps=steps,
-        )
-
-
-def _coverage_payload(verification: VerificationResult) -> dict[str, Any]:
-    coverage = verification.archive_coverage
-    return {
-        "completeness": coverage.completeness,
-        "file_coverage": coverage.file_coverage,
-        "byte_coverage": coverage.byte_coverage,
-        "expected_files": coverage.expected_files,
-        "matched_files": coverage.matched_files,
-        "complete_files": coverage.complete_files,
-        "partial_files": coverage.partial_files,
-        "failed_files": coverage.failed_files,
-        "missing_files": coverage.missing_files,
-        "unverified_files": coverage.unverified_files,
-        "expected_bytes": coverage.expected_bytes,
-        "matched_bytes": coverage.matched_bytes,
-        "complete_bytes": coverage.complete_bytes,
-        "confidence": coverage.confidence,
-        "sources": list(coverage.sources),
-    }
-
-
-def _verification_payload(verification: VerificationResult) -> dict[str, Any]:
-    output_quality = _output_quality_payload(verification)
-    return {
-        "completeness": verification.completeness,
-        "recoverable_upper_bound": verification.recoverable_upper_bound,
-        "assessment_status": verification.assessment_status,
-        "content_integrity": verification.content_integrity,
-        "container_integrity": verification.container_integrity,
-        "verification_strength": verification.verification_strength,
-        "total_item_count": verification.total_item_count,
-        "verified_item_count": verification.verified_item_count,
-        "archive_walk_complete": verification.archive_walk_complete,
-        "decision_hint": verification.decision_hint,
-        "output_quality_score": output_quality["score"],
-        "output_file_count": output_quality["file_count"],
-        "output_total_bytes": output_quality["total_bytes"],
-        "output_complete_ratio": output_quality["complete_ratio"],
-        "output_failed_ratio": output_quality["failed_ratio"],
-        "output_empty": output_quality["empty"],
-        "output_confidence": output_quality["confidence"],
-        "output_quality": output_quality,
-        "archive_coverage": _coverage_payload(verification),
-    }
-
-
-def _output_quality_payload(verification: VerificationResult) -> dict[str, Any]:
-    return {
-        "score": verification.output_quality_score,
-        "file_count": verification.output_file_count,
-        "total_bytes": verification.output_total_bytes,
-        "complete_ratio": verification.output_complete_ratio,
-        "failed_ratio": verification.output_failed_ratio,
-        "empty": verification.output_empty,
-        "confidence": verification.output_confidence,
-    }
-
 
 def _should_retry_missing_volume_resolution(
     result: ExtractionResult,

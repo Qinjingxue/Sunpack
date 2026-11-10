@@ -161,7 +161,7 @@ PackageName: SunPack
 PackageUrl: https://github.com/Qinjingxue/Sunpack
 License: MIT
 LicenseUrl: https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE
-ShortDescription: Windows archive detection, extraction, and verification tool
+ShortDescription: Windows archive detection, extraction, and recovery tool
 Description: SunPack identifies and processes archives by binary features, including disguised extensions, nested archives, encrypted archives, split volumes, and embedded archives.
 Tags:
   - archive

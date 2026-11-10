@@ -21,7 +21,6 @@ def write_extraction_result(task: ArchiveTask, result: ExtractionResult, *, phas
             "diagnostics": diagnostics,
             "failure": _failure_payload(result, worker),
             "progress_manifest": _compact_progress_manifest(result.progress_manifest_payload),
-            "entry_outcomes": _entry_outcomes(result, diagnostics, worker),
         }
     with _phase(phase_timer, f"{phase_prefix}_write_payload"):
         write_payload(
@@ -192,59 +191,6 @@ def _compact_progress_manifest(manifest: NativeProgressManifest | None) -> dict[
         "failure_kind": manifest.failure_kind,
         "files": files,
     }
-
-
-def _entry_outcomes(result: ExtractionResult, diagnostics: dict[str, Any], worker: dict[str, Any]) -> dict[str, Any]:
-    manifest = result.progress_manifest_payload if isinstance(result.progress_manifest_payload, NativeProgressManifest) else None
-    failure_stage = str(worker.get("failure_stage") or diagnostics.get("failure_stage") or (manifest.failure_stage if manifest is not None else "") or "")
-    failure_kind = str(worker.get("failure_kind") or diagnostics.get("failure_kind") or (manifest.failure_kind if manifest is not None else "") or "")
-    # Per-file records win; a summary-only manifest falls back to its summary.
-    entries = manifest.entry_outcome_counts() if manifest is not None and len(manifest) else {}
-    summary = manifest.summary if manifest is not None else {}
-    source = entries or summary
-    counts = {
-        "entry_total_count": _int(source.get("total")),
-        "entry_complete_count": _int(source.get("complete")),
-        "entry_partial_count": _int(source.get("partial")),
-        "entry_failed_count": _int(source.get("failed")),
-        "entry_unverified_count": _int(source.get("unverified")),
-        "crc_error_count": _int(entries.get("crc_error")),
-        "data_error_count": _int(entries.get("data_error")),
-        "unexpected_end_count": _int(entries.get("unexpected_end")),
-        "unsupported_method_count": _int(entries.get("unsupported_method")),
-        "missing_volume_count": _int(entries.get("missing_volume")),
-    }
-    global_text = " ".join(str(value or "").lower() for value in (failure_kind, result.error, worker.get("message"), diagnostics.get("message")))
-    if "crc" in global_text or "checksum" in global_text:
-        counts["crc_error_count"] = max(counts["crc_error_count"], 1)
-    if "data_error" in global_text or "corrupted_data" in global_text:
-        counts["data_error_count"] = max(counts["data_error_count"], 1)
-    if "unexpected_end" in global_text or "unexpected end" in global_text or "truncated" in global_text:
-        counts["unexpected_end_count"] = max(counts["unexpected_end_count"], 1)
-    if "unsupported" in global_text or worker.get("unsupported_method"):
-        counts["unsupported_method_count"] = max(counts["unsupported_method_count"], 1)
-    if "missing_volume" in global_text or "missing volume" in global_text or worker.get("missing_volume"):
-        counts["missing_volume_count"] = max(counts["missing_volume_count"], 1)
-    if not result.success and not counts["entry_failed_count"] and not counts["entry_partial_count"]:
-        counts["entry_failed_count"] = max(counts["entry_failed_count"], 1 if failure_kind or result.error else 0)
-        counts["entry_total_count"] = max(counts["entry_total_count"], counts["entry_failed_count"])
-    entry_total = max(1, int(counts["entry_total_count"] or 0))
-    return {
-        **counts,
-        "first_failure_stage": failure_stage,
-        "first_failure_kind": failure_kind,
-        "native_status": str(worker.get("native_status") or diagnostics.get("native_status") or ""),
-        "failed_item_present": bool(worker.get("failed_item")),
-        "partial_outputs": bool(result.partial_outputs),
-        "failed_ratio": float(counts["entry_failed_count"]) / float(entry_total),
-    }
-
-
-def _int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _compact_mapping(value: dict[str, Any], *, max_items: int) -> dict[str, Any]:

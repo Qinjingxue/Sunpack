@@ -738,7 +738,7 @@ class SingleArchiveExtractor:
                                     failure=failure, error=self._localized_failure(failure) if failure else "")
 
         with _phase(phase_timer, f"{phase_prefix}_directory_stats_total"):
-            # Verification and discovery consume each child's native inventory.
+            # Recursive discovery consumes each child's native inventory.
             # The carrier only needs counters; a second per-file table is unused.
             totals = {
                 "file_count": sum(item["files_written"] for item in segment_results) + sum(item.files_written for item in retained),

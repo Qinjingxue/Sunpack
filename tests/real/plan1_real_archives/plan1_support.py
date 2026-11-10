@@ -86,7 +86,6 @@ def probe_offset(hit) -> int:
     return int(extent.start or 0) if extent is not None else 0
 
 
-
 def plan1_config(passwords: list[str] | None = None) -> dict:
     """第 1 条测试统一配置：所有 tar 递归使用 recur=*。
 
@@ -103,7 +102,7 @@ def plan1_config(passwords: list[str] | None = None) -> dict:
                     "archive_cleanup_mode": "k",
                     "flatten_single_directory": False,
                 },
-                "verification": {"enabled": True},
+
                 "user_passwords": passwords or [],
                 "builtin_passwords": [],
             },

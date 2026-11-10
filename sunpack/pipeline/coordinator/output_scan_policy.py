@@ -80,7 +80,7 @@ class NestedOutputScanPolicy:
         segment, together with that segment's inventory when available.
 
         This only changes the recursive scan boundary.  It does not alter
-        extraction, verification, output naming, or the authorization
+        extraction, output naming, or the authorization
         threshold itself.
         """
         input_results = extraction_result.input_results
@@ -122,4 +122,3 @@ class NestedOutputScanPolicy:
     def _scan_output(self, root: str) -> DirectorySnapshot:
         filtered, raw = self._compiled_scan_options().scan_scope(DiscoveryScope(root, recursive=True).native)
         return DirectorySnapshot(filtered, raw)
-

@@ -41,8 +41,8 @@ function Assert-PrivateDirectory([string]$Directory) {
     }
 }
 
-# This script is the entire pre-1.4 boundary. Current installs never repair,
-# migrate or clear data merely because a marker file is absent.
+# This script owns config migration and the pre-1.4 runtime-data reset.
+# A missing marker never triggers a reset.
 $dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
 Assert-PlainPath $dataDirectory
 Assert-PrivateDirectory $dataDirectory
@@ -58,7 +58,28 @@ if ($null -eq $version) {
     }
     exit 0
 }
-if ($version -ge [Version]'1.4.0') { exit 0 }
+if ($version -ge [Version]'1.4.0') {
+    # Retire extraction verification settings at the upgrade boundary only.
+    $retiredSettings = [Collections.Generic.List[object]]::new()
+    foreach ($configPath in @($UserConfig, $AdvancedConfig)) {
+        if (-not $configPath -or -not (Test-Path -LiteralPath $configPath -PathType Leaf)) { continue }
+        $config = Read-Config $configPath
+        if (-not $config.PSObject.Properties['verification']) { continue }
+        $config.PSObject.Properties.Remove('verification')
+        $retiredSettings.Add(@{ Path = $configPath; Text = ($config | ConvertTo-Json -Depth 100) + [Environment]::NewLine })
+    }
+    foreach ($setting in $retiredSettings) {
+        $configPath = $setting.Path
+        $temporary = $configPath + '.upgrade-' + [Guid]::NewGuid().ToString('N')
+        try {
+            [IO.File]::WriteAllText($temporary, $setting.Text, [Text.UTF8Encoding]::new($false))
+            [IO.File]::Replace($temporary, $configPath, [System.Management.Automation.Language.NullString]::Value, $false)
+        } finally {
+            if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        }
+    }
+    exit 0
+}
 
 Assert-PlainTree $dataDirectory
 $template = Read-Config $TemplateConfig

@@ -302,7 +302,7 @@ class EmbeddedDiscovery:
                 item["end_offset"],
                 base_name,
                 password_required=embedded_candidate_requires_password(item["format"], item["validation"]),
-                execution_analysis={"stream_plan": item["stream_plan"]} if item.get("stream_plan") else None,
+                execution_analysis={"structure_complete": True} if item.get("format") == "lz4" else None,
             )
             segments.append(LogicalArchiveInput(
                 descriptor, position=len(segments) + 1,

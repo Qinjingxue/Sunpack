@@ -1,4 +1,4 @@
-//! Shared TAR member semantics for discovery, analysis and source manifests.
+//! Shared TAR member semantics for discovery and analysis.
 use std::collections::HashMap;
 use std::io;
 
@@ -10,21 +10,10 @@ type ReadAt<'a> = dyn FnMut(u64, usize) -> io::Result<Vec<u8>> + 'a;
 pub(crate) struct TarState {
     global: HashMap<String, String>,
     local: HashMap<String, String>,
-    long_name: Option<String>,
-    long_link: Option<String>,
 }
 
 pub(crate) struct TarRecord {
     pub(crate) next: u64,
-    pub(crate) member: Option<TarMember>,
-}
-
-pub(crate) struct TarMember {
-    pub(crate) path: Option<String>,
-    pub(crate) is_directory: bool,
-    pub(crate) is_file: bool,
-    pub(crate) size: u64,
-    pub(crate) hard_link: Option<String>,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -105,14 +94,6 @@ pub(crate) fn padding(size: u64) -> u64 {
     (BLOCK - size % BLOCK) % BLOCK
 }
 
-fn text_bytes(field: &[u8]) -> &[u8] {
-    &field[..field.iter().position(|b| *b == 0).unwrap_or(field.len())]
-}
-
-fn text(field: &[u8]) -> String {
-    String::from_utf8_lossy(text_bytes(field)).into_owned()
-}
-
 fn read_exact(read: &mut ReadAt<'_>, start: u64, size: usize) -> io::Result<Vec<u8>> {
     let data = read(start, size)?;
     if data.len() != size {
@@ -133,11 +114,10 @@ impl TarState {
         header: &[u8],
         offset: u64,
         total: u64,
-        retain_path: bool,
         read: &mut ReadAt<'_>,
     ) -> io::Result<TarRecord> {
         let raw_size = header_size(header).map_err(|_| invalid("invalid TAR member header"))?;
-        self.advance_validated(header, raw_size, offset, total, retain_path, read)
+        self.advance_validated(header, raw_size, offset, total, read)
     }
 
     pub(crate) fn advance_validated(
@@ -146,7 +126,6 @@ impl TarState {
         raw_size: u64,
         offset: u64,
         total: u64,
-        retain_path: bool,
         read: &mut ReadAt<'_>,
     ) -> io::Result<TarRecord> {
         let kind = header[156];
@@ -194,79 +173,21 @@ impl TarState {
             } else {
                 self.local.extend(parsed);
             }
-            return Ok(TarRecord { next, member: None });
+            return Ok(TarRecord { next });
         }
         if matches!(kind, b'L' | b'K') {
-            if raw_size > MAX_METADATA as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "GNU name metadata exceeds metadata budget",
-                ));
-            }
-            let payload = read_exact(read, start, raw_size as usize)?;
-            if kind == b'L' {
-                self.long_name = Some(text(&payload));
-            } else {
-                self.long_link = Some(text(&payload));
-            }
-            return Ok(TarRecord { next, member: None });
+            // Names do not affect discovery boundaries; the worker consumes them.
+            return Ok(TarRecord { next });
         }
-        let extended_path = effective("path").or(self.long_name.as_ref());
-        let name = extended_path
-            .map(|s| s.as_bytes())
-            .unwrap_or_else(|| text_bytes(&header[..100]));
-        // Match 7-Zip's old-normal, normal, symlink and GNU dump-directory rules.
-        let is_directory = matches!(kind, b'5' | b'D')
-            || (matches!(kind, 0 | b'0' | b'2') && name.last() == Some(&b'/'));
-        let is_file = !is_directory && !matches!(kind, b'3' | b'4' | b'6') && !name.is_empty();
-        let path = retain_path.then(|| {
-            if let Some(path) = extended_path {
-                return path.clone();
-            }
-            let name = text(&header[..100]);
-            // GNU headers reuse this region for other metadata.
-            if &header[257..263] == b"ustar\0" {
-                let prefix = text(&header[345..500]);
-                if !prefix.is_empty() {
-                    return format!("{prefix}/{name}");
-                }
-            }
-            name
-        });
-        let size = if kind == b'2' {
-            effective("linkpath")
-                .map(|s| s.len() as u64)
-                .or_else(|| self.long_link.as_ref().map(|s| s.len() as u64))
-                .unwrap_or_else(|| text_bytes(&header[157..257]).len() as u64)
-        } else if kind == b'S' {
+        if kind == b'S' {
             let size = number(&header[483..495])
                 .ok_or_else(|| invalid("invalid old GNU sparse logical size"))?;
             if sparse_end > size {
                 return Err(invalid("old GNU sparse extent exceeds logical size"));
             }
-            size
-        } else {
-            physical_size
-        };
-        let hard_link = (kind == b'1').then(|| {
-            effective("linkpath")
-                .or(self.long_link.as_ref())
-                .cloned()
-                .unwrap_or_else(|| text(&header[157..257]))
-        });
+        }
         self.local.clear();
-        self.long_name = None;
-        self.long_link = None;
-        Ok(TarRecord {
-            next,
-            member: Some(TarMember {
-                path,
-                is_directory,
-                is_file,
-                size,
-                hard_link,
-            }),
-        })
+        Ok(TarRecord { next })
     }
 }
 
@@ -293,7 +214,7 @@ fn pax(read: &mut ReadAt<'_>, start: u64, size: u64) -> io::Result<HashMap<Strin
         let body = &prefix[space + 1..prefix.len().min(length as usize - 1)];
         if let Some(equal) = body.iter().position(|b| *b == b'=') {
             if let Ok(key) = std::str::from_utf8(&body[..equal]) {
-                if !matches!(key, "path" | "linkpath" | "size") {
+                if key != "size" {
                     cursor = end;
                     continue;
                 }
@@ -393,7 +314,7 @@ mod tests {
         // would re-walk the same header and report a valid archive.
         let header = header_with_base256_size(u64::MAX - 511);
         let error = TarState::default()
-            .advance(&header, 0, 3 * BLOCK, false, &mut |_, _| {
+            .advance(&header, 0, 3 * BLOCK, &mut |_, _| {
                 unreachable!("truncated member must be rejected before reading its data")
             })
             .err()

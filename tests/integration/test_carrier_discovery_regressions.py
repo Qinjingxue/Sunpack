@@ -33,7 +33,7 @@ def test_tar_metadata_sizes_and_directory_types_survive_carriers(tmp_path, origi
     # Ordinary TAR fixtures agree on raw/extended sizes and use type '5'. This
     # single end-to-end family catches boundary and manifest disagreements that
     # those tests cannot, including later peers, nesting and both origins.
-    from sunpack_native import AnalysisBinaryView, archive_state_tar_manifest_native
+    from sunpack_native import AnalysisBinaryView
 
     payload = b"payload"
     cases = []
@@ -56,10 +56,6 @@ def test_tar_metadata_sizes_and_directory_types_survive_carriers(tmp_path, origi
     for case, body, names in cases:
         plain = tmp_path / f"{case}.tar"
         plain.write_bytes(body)
-        manifest = archive_state_tar_manifest_native({"entry_path": str(plain)})
-        assert manifest.archive_walk_complete, case
-        assert manifest.file_count == 1, case
-        assert [entry["path"] for entry in manifest.entry_page(0, 10)] == names, case
         view = AnalysisBinaryView(str(plain))
         try:
             assert view.probe_tar(0)["walk_complete"], case
@@ -123,5 +119,3 @@ def test_unproven_carrier_header_cannot_hide_a_real_archive(tmp_path, origin):
         response = asyncio.run(_run(_config(output), carrier, origin))
         assert response.summary.success_count == 1, response.summary.failed_tasks
         assert [path.read_bytes() for path in output.rglob("payload.txt")] == [b"real independent archive"]
-
-

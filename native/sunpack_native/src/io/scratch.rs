@@ -2,8 +2,8 @@
 use crate::io::resource_lifecycle::TrackedFile;
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
-use std::marker::PhantomData;
 use std::ops::Deref;
+use std::marker::PhantomData;
 use std::os::windows::io::AsRawHandle;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -172,136 +172,6 @@ impl Seek for Spool {
     }
 }
 
-pub(crate) struct RowBuilder<T> {
-    memory: Vec<T>,
-    bytes: usize,
-    disk: Option<(Spool, Spool)>,
-    count: usize,
-}
-impl<T> Default for RowBuilder<T> {
-    fn default() -> Self {
-        Self {
-            memory: Vec::new(),
-            bytes: 0,
-            disk: None,
-            count: 0,
-        }
-    }
-}
-impl<T: Serialize + DeserializeOwned + Clone> RowBuilder<T> {
-    pub fn len(&self) -> usize {
-        self.count
-    }
-    pub fn push(&mut self, value: T, bytes: usize) -> io::Result<()> {
-        self.bytes = self.bytes.saturating_add(bytes);
-        if self.disk.is_none() && self.bytes > MEMORY_BYTES {
-            let mut disk = (Spool::default(), Spool::default());
-            // Release the resident row allocation once ownership moves to the
-            // spool; drain would retain its high-water capacity until finish.
-            for item in std::mem::take(&mut self.memory) {
-                append_row(&mut disk, &item)?;
-            }
-            self.disk = Some(disk);
-        }
-        if let Some(disk) = &mut self.disk {
-            append_row(disk, &value)?;
-        } else {
-            self.memory.push(value);
-        }
-        self.count += 1;
-        Ok(())
-    }
-    pub fn update(&mut self, index: usize, change: impl FnOnce(&mut T)) -> io::Result<()> {
-        if let Some((data, offsets)) = &mut self.disk {
-            offsets.seek(SeekFrom::Start(index as u64 * 8))?;
-            let mut offset = [0; 8];
-            offsets.read_exact(&mut offset)?;
-            data.seek(SeekFrom::Start(u64::from_le_bytes(offset)))?;
-            // MessagePack reads individual fields; buffer them before touching
-            // the spill file. The following end seek discards any read-ahead.
-            let mut value = rmp_serde::from_read::<_, T>(BufReader::with_capacity(
-                RECORD_READ_BUFFER_BYTES,
-                &mut *data,
-            ))
-            .map_err(io::Error::other)?;
-            change(&mut value);
-            let end = data.seek(SeekFrom::End(0))?;
-            rmp_serde::encode::write(&mut *data, &value).map_err(io::Error::other)?;
-            offsets.seek(SeekFrom::Start(index as u64 * 8))?;
-            offsets.write_all(&end.to_le_bytes())?;
-        } else {
-            change(&mut self.memory[index]);
-        }
-        Ok(())
-    }
-    pub fn finish(self) -> io::Result<Rows<T>> {
-        match self.disk {
-            Some((data, offsets)) => Ok(Rows::Disk {
-                data: data.finish()?,
-                offsets: offsets.finish()?,
-                count: self.count,
-                marker: PhantomData,
-            }),
-            None => Ok(Rows::Memory(self.memory)),
-        }
-    }
-}
-fn append_row<T: Serialize>(disk: &mut (Spool, Spool), value: &T) -> io::Result<()> {
-    let end = disk.0.seek(SeekFrom::End(0))?;
-    disk.1.seek(SeekFrom::End(0))?;
-    disk.1.write_all(&end.to_le_bytes())?;
-    rmp_serde::encode::write(&mut disk.0, value).map_err(io::Error::other)
-}
-
-pub(crate) enum Rows<T> {
-    Memory(Vec<T>),
-    Disk {
-        data: Blob,
-        offsets: Blob,
-        count: usize,
-        marker: PhantomData<T>,
-    },
-}
-impl<T> From<Vec<T>> for Rows<T> {
-    fn from(value: Vec<T>) -> Self {
-        Self::Memory(value)
-    }
-}
-impl<T> Rows<T> {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Memory(rows) => rows.len(),
-            Self::Disk { count, .. } => *count,
-        }
-    }
-    /// Borrow a spill record for zero-copy deserialization. Resident rows need
-    /// no serialization; callers borrow their typed fields directly instead.
-    pub fn serialized(&self, index: usize) -> io::Result<Option<&[u8]>> {
-        match self {
-            Self::Memory(rows) => {
-                if index >= rows.len() {
-                    return Err(io::Error::other("row index out of range"));
-                }
-                Ok(None)
-            }
-            Self::Disk {
-                data,
-                offsets,
-                count,
-                ..
-            } => {
-                if index >= *count {
-                    return Err(io::Error::other("row index out of range"));
-                }
-                let start =
-                    u64::from_le_bytes(offsets[index * 8..index * 8 + 8].try_into().unwrap())
-                        as usize;
-                Ok(Some(&data[start..]))
-            }
-        }
-    }
-}
-
 /// Fixed-width mutable match slots spill independently of variable-size names.
 pub(crate) enum Slots {
     Memory(Vec<u64>),
@@ -318,12 +188,6 @@ impl Slots {
         let file = scratch_file()?;
         file.set_len(bytes as u64)?;
         Ok(Self::Disk(Mapping::new(&file, true)?))
-    }
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Memory(values) => values.len(),
-            Self::Disk(map) => map.len() / 8,
-        }
     }
     pub fn get(&self, index: usize) -> u64 {
         match self {
@@ -374,34 +238,6 @@ impl<V: Serialize + DeserializeOwned + Clone> SpillMap<V> {
         }
         self.memory = Default::default();
         self.disk = Some(disk);
-        Ok(())
-    }
-    pub fn get(&self, key: &str) -> io::Result<Option<V>> {
-        match &self.disk {
-            Some(disk) => disk.get(key),
-            None => Ok(self.memory.get(key).cloned()),
-        }
-    }
-    pub fn put(&mut self, key: String, value: V) -> io::Result<()> {
-        match &mut self.disk {
-            Some(disk) => {
-                disk.put(&key, &value, false)?;
-            }
-            None => {
-                match self.memory.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        entry.insert(value);
-                    }
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        self.bytes = self
-                            .bytes
-                            .saturating_add(entry.key().len() + std::mem::size_of::<V>() + 64);
-                        entry.insert(value);
-                    }
-                }
-                self.spill()?;
-            }
-        }
         Ok(())
     }
     pub fn insert_new(&mut self, key: String, value: V) -> io::Result<bool> {
@@ -486,9 +322,6 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
             }
             slot = (slot + 1) & (self.capacity - 1);
         }
-    }
-    fn get(&self, key: &str) -> io::Result<Option<V>> {
-        self.find(key, Self::hash(key)).map(|(_, value)| value)
     }
     fn put(&mut self, key: &str, value: &V, only_new: bool) -> io::Result<bool> {
         let hash = Self::hash(key);
@@ -649,114 +482,19 @@ impl Drop for Mapping {
 mod tests {
     use super::*;
 
-    // Small manifest tests never cross spill storage or rehash a disk index.
-    // One lifecycle covers replacement, duplicate insertion, collision equality,
-    // growth, mapped slots and concurrent readers at a few MiB of temporary IO.
     #[test]
-    fn spill_index_keeps_exact_keys_and_updates_across_storage_and_growth() {
-        let mut map = SpillMap::<usize>::default();
-        for value in 0..100_000 {
-            map.put("same".to_owned(), value).unwrap();
-            assert!(!map.insert_new("same".to_owned(), 0).unwrap());
-        }
-        assert_eq!(map.get("same").unwrap(), Some(99_999));
-        assert!(
-            map.disk.is_none(),
-            "replacement must not consume new-key budget"
-        );
+    fn dedup_survives_spill_and_index_growth() {
+        let mut map = SpillMap::<()>::default();
         let suffix = "x".repeat(20_000);
-        for value in 0..400 {
-            assert!(map.insert_new(format!("{value}-{suffix}"), value).unwrap());
+        for index in 0..600 {
+            assert!(map.insert_new(format!("{index}-{suffix}"), ()).unwrap());
         }
-        let disk = map.disk.as_mut().unwrap();
-        assert!(disk.capacity >= 1024);
-        // Exercise mapped slots without a huge corpus just to fill the slot budget.
-        let file = scratch_file().unwrap();
-        let mut file = file;
-        for index in 0..disk.capacity * 2 {
-            file.write_all(&disk.slots.get(index).to_le_bytes())
-                .unwrap();
+        assert!(map.disk.is_some());
+        for index in (0..600).rev() {
+            assert!(!map.insert_new(format!("{index}-{suffix}"), ()).unwrap());
         }
-        disk.slots = Slots::Disk(Mapping::new(&file, true).unwrap());
-        drop(file);
-        let capacity = disk.capacity;
-        assert!(!disk.put("same", &7, false).unwrap());
-        assert!(!disk.put("same", &8, true).unwrap());
-        assert_eq!(disk.capacity, capacity);
-        let hash = DiskMap::<usize>::hash("same");
-        assert!(disk.find("different-full-key", hash).unwrap().1.is_none());
-        for value in 400..600 {
-            assert!(disk
-                .put(&format!("{value}-{suffix}"), &value, true)
-                .unwrap());
-        }
-        assert!(disk.capacity > capacity);
-        std::thread::scope(|scope| {
-            for shard in 0..4 {
-                let map = &map;
-                let suffix = &suffix;
-                scope.spawn(move || {
-                    for value in (shard..600).step_by(4) {
-                        assert_eq!(map.get(&format!("{value}-{suffix}")).unwrap(), Some(value));
-                    }
-                    assert_eq!(map.get("same").unwrap(), Some(7));
-                    assert_eq!(map.get("absent").unwrap(), None);
-                });
-            }
-        });
-        // Short adjacent records exercise read-ahead. Interleave reverse reads
-        // with appends/replacements so buffered bytes cannot hide newer rows.
-        for value in 0..128 {
-            assert!(map.insert_new(format!("short-{value}"), value).unwrap());
-        }
-        for value in 0..128 {
-            assert_eq!(map.get(&format!("short-{value}")).unwrap(), Some(value));
-        }
-        for value in (0..128).rev() {
-            assert_eq!(map.get(&format!("short-{value}")).unwrap(), Some(value));
-            map.put(format!("short-{value}"), value + 1).unwrap();
-            assert_eq!(map.get(&format!("short-{value}")).unwrap(), Some(value + 1));
-            assert!(!map.insert_new(format!("short-{value}"), 0).unwrap());
-        }
-        assert_eq!(map.get("same").unwrap(), Some(7));
-    }
-
-    // Small archive fixtures never update spilled rows. This one lifecycle
-    // checks variable-length replacements, offsets and shared immutable reads
-    // with only a few MiB of IO; another small manifest test cannot replace it.
-    #[test]
-    fn spilled_rows_preserve_replacements_and_concurrent_views() {
-        let mut builder = RowBuilder::<(String, u64)>::default();
-        let mut expected = Vec::new();
-        for index in 0..64 {
-            let row = (format!("{index}:{}", "x".repeat(96 * 1024)), index);
-            builder.push(row.clone(), row.0.len() + 8).unwrap();
-            expected.push(row);
-        }
-        assert!(builder.disk.is_some());
-        assert_eq!(builder.memory.capacity(), 0);
-        for (index, length) in [(0, 0), (63, 200_000), (7, 30), (0, 12_000), (31, 8192)] {
-            expected[index] = ("y".repeat(length), 100 + index as u64);
-            builder
-                .update(index, |row| *row = expected[index].clone())
-                .unwrap();
-        }
-        let rows = builder.finish().unwrap();
-        assert!(matches!(&rows, Rows::Disk { .. }));
-        std::thread::scope(|scope| {
-            for shard in 0..4 {
-                let rows = &rows;
-                let expected = &expected;
-                scope.spawn(move || {
-                    for index in (shard..64).step_by(4).rev() {
-                        let row: (&str, u64) =
-                            rmp_serde::from_slice(rows.serialized(index).unwrap().unwrap())
-                                .unwrap();
-                        assert_eq!(row, (expected[index].0.as_str(), expected[index].1));
-                    }
-                    assert!(rows.serialized(64).is_err());
-                });
-            }
-        });
+        let disk = map.disk.as_ref().unwrap();
+        assert!(disk.find("different-full-key", DiskMap::<()>::hash(&format!("0-{suffix}")))
+            .unwrap().1.is_none());
     }
 }

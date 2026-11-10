@@ -3,10 +3,6 @@ import pytest
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import PASSWORD_NOT_IN_LIST_KEY, FailureInfo, FailureKind
-from sunpack.core.contracts.verification import (
-    CONTENT_INTEGRITY_UNKNOWN,
-    DECISION_REQUEST_PASSWORD,
-)
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
@@ -14,7 +10,6 @@ from sunpack.core.passwords.verifier import PasswordBatchVerification
 from sunpack.core.passwords.verifier.base import (
     normalize_verifier_status,
 )
-from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
 
@@ -110,36 +105,6 @@ def test_embedded_failure_retains_nested_password_cause():
     assert restored.is_password_failure
     assert restored.contains(FailureKind.WRONG_PASSWORD)
     assert restored.message_key == restored.causes[0].message_key == PASSWORD_NOT_IN_LIST_KEY
-
-
-def test_password_failure_bypasses_verification(tmp_path):
-    archive = tmp_path / "encrypted.zip"
-    archive.write_bytes(b"encrypted")
-    failure = FailureInfo(
-        kind=FailureKind.PASSWORD_REQUIRED,
-        stage="password_resolution",
-        message="password required",
-        user_action="request_password",
-    )
-    result = ExtractionResult(
-        success=False,
-
-        out_dir=str(tmp_path / "out"),
-
-        error=failure.message,
-        failure=failure,
-    )
-
-    verification = VerificationScheduler(make_config({
-        "verification": {
-            "enabled": True,
-            "methods": [{"name": "extraction_exit_signal"}],
-        }
-    })).verify(_task(archive), result)
-
-    assert verification.decision_hint == DECISION_REQUEST_PASSWORD
-    assert verification.content_integrity == CONTENT_INTEGRITY_UNKNOWN
-    assert verification.failures[0].code == "fail.password_required"
 
 
 def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retry(tmp_path):

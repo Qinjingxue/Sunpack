@@ -2,17 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack.core.contracts.content_recovery import (
+from sunpack.pipeline.coordinator.content_recovery import (
     CONTENT_REQUIREMENT_ALLOW_PARTIAL,
     ContentRecoveryPolicy,
 )
 from sunpack.core.contracts.extraction import ExtractionResult
-from sunpack.core.contracts.verification import (
-    DECISION_ACCEPT_PARTIAL,
-    DECISION_FAIL,
-    DECISION_RETRY_EXTRACT,
-    VerificationResult,
-)
 from sunpack.core.i18n import I18nContext
 from sunpack.pipeline.coordinator import archive_job
 from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
@@ -21,7 +15,6 @@ from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
 def _executor(*, allow_partial: bool) -> ArchiveJobExecutor:
     executor = object.__new__(ArchiveJobExecutor)
     executor.scanning = False
-    executor.verifier = SimpleNamespace(config={})
     executor.content_policy = ContentRecoveryPolicy(
         CONTENT_REQUIREMENT_ALLOW_PARTIAL if allow_partial else "complete"
     )
@@ -31,7 +24,7 @@ def _executor(*, allow_partial: bool) -> ArchiveJobExecutor:
 
 
 def _finish_first_attempt(executor, task, result):
-    state = executor._extract_verify_state_machine(task, result.out_dir)
+    state = executor._extract_state_machine(task, result.out_dir)
     request = next(state)
     assert request["task"] is task
     assert request["out_dir"] == result.out_dir
@@ -40,90 +33,56 @@ def _finish_first_attempt(executor, task, result):
     return stopped.value.value
 
 
-@pytest.mark.parametrize(("decision", "allow_partial"), [
-    (DECISION_FAIL, False),
-    (DECISION_ACCEPT_PARTIAL, True),
-    (DECISION_RETRY_EXTRACT, False),
-])
-def test_verification_finishes_without_cleanup_or_reextraction(
-    monkeypatch, tmp_path, decision, allow_partial,
-):
-    verification = VerificationResult(decision_hint=decision)
-    monkeypatch.setattr(archive_job, "write_extraction_result", lambda _task, _result: None)
-    cleanup_calls = []
-    monkeypatch.setattr(
-        archive_job.DEFAULT_OUTPUT_CLEANUP_MANAGER,
-        "cleanup_canonical",
-        lambda *_args, **_kwargs: cleanup_calls.append(True),
-    )
-
-    executor = _executor(allow_partial=allow_partial)
-    executor.verifier.verify = lambda _task, _result: verification
-    task = SimpleNamespace(runtime={})
-    result = ExtractionResult(
-        success=True, out_dir=str(tmp_path / "out"), partial_outputs=allow_partial,
-    )
-
-    outcome = _finish_first_attempt(executor, task, result)
-
-    assert outcome.result is result
-    assert outcome.verification is verification
-    assert outcome.attempts == 1
-    assert cleanup_calls == []
-    if decision == DECISION_RETRY_EXTRACT:
-        assert outcome.outcome_kind.value == "failure"
-
-
 @pytest.mark.parametrize("allow_partial", [False, True])
 def test_terminal_policy_is_shared_by_cleanup_report_and_result(tmp_path, monkeypatch, allow_partial):
     """One lifecycle test catches policy bypasses in every terminal consumer.
 
-    Verification-only tests cannot catch raw extraction success being reported
+    Worker-only tests cannot catch extraction success being reported
     before policy, repeated decisions, or cleanup seeing a different decision.
     """
     import asyncio
     from sunpack.core.contracts.failures import FailureInfo, FailureKind
     from sunpack.core.contracts.results import OutcomeKind
     from sunpack.core.contracts.run_state import RunState
-    from sunpack.core.contracts.verification import DECISION_ACCEPT
     from sunpack.pipeline.coordinator.archive_job import ArchiveJobOutcome
     from tests.helpers.archive_tasks import make_archive_task
 
     accepted_partial = OutcomeKind.PARTIAL_SUCCESS if allow_partial else OutcomeKind.FAILURE
     cases = (
-        # raw success, verification, failure, partial output, retained children,
-        # final outcome, force cleanup. No new per-file recovery behavior.
-        (True, DECISION_ACCEPT, None, False, 0, OutcomeKind.COMPLETE_SUCCESS, False),
-        (True, DECISION_ACCEPT_PARTIAL, None, True, 0, accepted_partial, not allow_partial),
-        (False, DECISION_ACCEPT_PARTIAL, FailureKind.DAMAGED, True, 0, accepted_partial, not allow_partial),
-        (False, DECISION_ACCEPT_PARTIAL, FailureKind.MISSING_VOLUME, True, 0, accepted_partial, not allow_partial),
-        (False, DECISION_ACCEPT_PARTIAL, FailureKind.WRONG_PASSWORD, True, 0, OutcomeKind.FAILURE, not allow_partial),
-        (False, DECISION_ACCEPT_PARTIAL, FailureKind.INPUTS_FAILED, True, 1, OutcomeKind.FAILURE, False),
-        (True, DECISION_FAIL, None, False, 0, OutcomeKind.FAILURE, False),
-        (False, DECISION_ACCEPT, FailureKind.PROCESS_ERROR, False, 0, OutcomeKind.FAILURE, False),
-        (False, None, FailureKind.DAMAGED, True, 0, OutcomeKind.FAILURE, not allow_partial),
+        # worker success, failure, completed members, partial bytes, retained inputs,
+        # final outcome, force cleanup
+        (True, None, 0, False, 0, OutcomeKind.COMPLETE_SUCCESS, False),
+        (True, None, 1, False, 0, OutcomeKind.COMPLETE_SUCCESS, False),
+        (False, FailureKind.DAMAGED, 1, True, 0, accepted_partial, not allow_partial),
+        (False, FailureKind.MISSING_VOLUME, 1, True, 0, accepted_partial, not allow_partial),
+        (False, FailureKind.DAMAGED, 0, True, 0, OutcomeKind.FAILURE, not allow_partial),
+        (False, FailureKind.WRONG_PASSWORD, 1, True, 0, OutcomeKind.FAILURE, not allow_partial),
+        (False, FailureKind.PASSWORD_INCONCLUSIVE, 1, True, 0, OutcomeKind.FAILURE, not allow_partial),
+        (False, FailureKind.FILESYSTEM_ERROR, 1, True, 0, OutcomeKind.FAILURE, not allow_partial),
+        (False, FailureKind.INPUTS_FAILED, 1, True, 1, OutcomeKind.FAILURE, False),
+        (False, FailureKind.PROCESS_ERROR, 1, False, 0, OutcomeKind.FAILURE, False),
     )
 
     class Broker:
         async def run(self, _phase, _file_id, function, *args, **_kwargs):
             return function(*args)
 
-    for success, hint, failure_kind, partial, retained, expected, force_cleanup in cases:
+    for success, failure_kind, complete, partial, retained, expected, force_cleanup in cases:
         task = make_archive_task(tmp_path / "source.zip")
         result = ExtractionResult(
             success, str(tmp_path / "output"), partial_outputs=partial,
             failure=FailureInfo(failure_kind, "extract", "failure") if failure_kind else None,
             retained_complete_count=retained,
+            progress_manifest_payload=SimpleNamespace(worker_status="failed", summary={"complete": complete}),
         )
-        verification = VerificationResult(decision_hint=hint) if hint is not None else None
-        outcome = ArchiveJobOutcome(result, verification, planned_out_dir=result.out_dir)
+        outcome = ArchiveJobOutcome(result, planned_out_dir=result.out_dir)
         executor = _executor(allow_partial=allow_partial)
         policy = executor.content_policy
         decisions, events = [], []
 
-        def decide(extracted, verified):
-            decisions.append((extracted, verified))
-            return policy.decide(extracted, verified)
+        def decide(extracted):
+            decisions.append(extracted)
+            return policy.decide(extracted)
 
         def cleanup(_out_dir, **kwargs):
             assert len(decisions) == 1
@@ -136,8 +95,6 @@ def test_terminal_policy_is_shared_by_cleanup_report_and_result(tmp_path, monkey
             assert events == ["cleanup"]
             assert finalized.outcome_kind == expected
             assert finalized.policy_rejected_partial_output is force_cleanup
-            if success and expected == OutcomeKind.FAILURE:
-                assert finalized.result.error.startswith("Verification failed:")
             events.append("reported")
 
         async def extracted(*_args, **_kwargs):
@@ -162,3 +119,26 @@ def test_terminal_policy_is_shared_by_cleanup_report_and_result(tmp_path, monkey
         else:
             assert returned.failure_message == ""
         assert executor.context.target_results == [returned]
+
+
+def test_worker_result_finishes_once_and_retry_requires_clean_output(tmp_path, monkeypatch):
+    from sunpack.core.contracts.failures import FailureInfo, FailureKind
+    from tests.helpers.archive_tasks import make_archive_task
+    from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupResult
+
+    monkeypatch.setattr(archive_job, "write_extraction_result", lambda *_args: None)
+    executor = _executor(allow_partial=False)
+    task = make_archive_task(tmp_path / "source")
+    success = ExtractionResult(True, str(tmp_path / "out"))
+    assert _finish_first_attempt(executor, task, success).result is success
+    failed = ExtractionResult(False, success.out_dir,
+        failure=FailureInfo(FailureKind.MISSING_VOLUME, "extract", "missing"))
+    monkeypatch.setattr(archive_job.DEFAULT_OUTPUT_CLEANUP_MANAGER, "cleanup_canonical",
+                        lambda *_args, **_kwargs: OutputCleanupResult(error="locked"))
+    state = executor._extract_state_machine(task, success.out_dir,
+        missing_volume_retry=lambda *_args: make_archive_task(tmp_path / "replacement"))
+    next(state)
+    with pytest.raises(StopIteration) as stopped:
+        state.send(failed)
+    assert stopped.value.value.result is failed
+    assert task.main_path.endswith("source")

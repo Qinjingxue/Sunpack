@@ -360,7 +360,6 @@ impl NativeWorkerManifest {
             total_size: self.total_size,
             unreadable_count: 0,
             files: Arc::clone(&self.files),
-            worker_crc_available: !self.files.is_empty(),
             worker_inventory_complete: self.complete,
             identity_paths: self.identity_paths,
         }
@@ -378,17 +377,8 @@ pub(crate) struct NativeOutputInventory {
     total_size: u64,
     unreadable_count: usize,
     files: Arc<Vec<OutputFileRecord>>,
-    worker_crc_available: bool,
     worker_inventory_complete: bool,
     identity_paths: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct OutputInventoryVerificationSnapshot {
-    pub(crate) root: String,
-    pub(crate) exists: bool,
-    pub(crate) is_dir: bool,
-    pub(crate) files: Arc<Vec<OutputFileRecord>>,
 }
 
 impl NativeOutputInventory {
@@ -396,14 +386,6 @@ impl NativeOutputInventory {
         &self.files
     }
 
-    pub(crate) fn verification_snapshot(&self) -> OutputInventoryVerificationSnapshot {
-        OutputInventoryVerificationSnapshot {
-            root: self.root.clone(),
-            exists: self.exists,
-            is_dir: self.is_dir,
-            files: Arc::clone(&self.files),
-        }
-    }
 }
 
 #[pymethods]
@@ -437,10 +419,6 @@ impl NativeOutputInventory {
         self.unreadable_count
     }
     #[getter]
-    fn worker_crc_available(&self) -> bool {
-        self.worker_crc_available
-    }
-    #[getter]
     fn worker_inventory_complete(&self) -> bool {
         self.worker_inventory_complete
     }
@@ -451,10 +429,6 @@ impl NativeOutputInventory {
 
     fn __len__(&self) -> usize {
         self.files.len()
-    }
-
-    fn all_crc_ok(&self) -> bool {
-        self.files.iter().all(|item| item.crc_ok != Some(false))
     }
 
     fn build_directory_snapshots(
@@ -1397,7 +1371,7 @@ pub(crate) fn scan_output_inventory(py: Python<'_>, output_dir: String) -> Nativ
 #[pyfunction]
 #[pyo3(signature = (
     root, files, exists, is_dir, file_count, dir_count, total_size,
-    unreadable_count, worker_crc_available,
+    unreadable_count,
     worker_inventory_complete, identity_paths
 ))]
 pub(crate) fn output_inventory_from_serialized(
@@ -1410,7 +1384,6 @@ pub(crate) fn output_inventory_from_serialized(
     dir_count: usize,
     total_size: u64,
     unreadable_count: usize,
-    worker_crc_available: bool,
     worker_inventory_complete: bool,
     identity_paths: bool,
 ) -> PyResult<NativeOutputInventory> {
@@ -1463,7 +1436,6 @@ pub(crate) fn output_inventory_from_serialized(
         total_size,
         unreadable_count,
         files: Arc::new(records),
-        worker_crc_available,
         worker_inventory_complete,
         identity_paths,
     })
@@ -1486,7 +1458,6 @@ pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInvent
         total_size: stats.total_size,
         unreadable_count: stats.unreadable_count,
         files: Arc::new(stats.files),
-        worker_crc_available: false,
         worker_inventory_complete: false,
         identity_paths: false,
     }

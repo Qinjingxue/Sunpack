@@ -489,7 +489,7 @@ class _PathLeaseRegistry:
         paths = tuple(paths)
         absent_keys = frozenset(path_key(os.path.abspath(os.path.normpath(path))) for path in absent_paths)
         prepared = self._snapshot_paths(paths, refresh=bool(absent_keys))
-        # The caller has finished its previous extraction/verification attempt.
+        # The caller has finished its previous extraction attempt.
         # Other jobs in this request keep their pins throughout an upgrade.
         first = True
         while True:
@@ -1364,7 +1364,7 @@ class _RequestRuntime:
                 raise coalesced
 
         # This registration is deliberately only a source-cleanup lifetime
-        # guard. It never gates planning, extraction, verification or recursion.
+        # guard. It never gates planning, extraction or recursion.
         self.source_cleanup.register(tasks)
         await broker.run("report", "", self.reporter.tasks_discovered, depth, tasks,
                          request_id=self.submission.request_id, cancellation=cancellation)
@@ -1663,7 +1663,6 @@ class _RequestRuntime:
                 result = TargetRunResult(
                     input_path=task.main_path, outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
                     task_key=task.key, output_dir=reused.output_dir,
-                    verification={"reused_completed_generation": True},
                 )
                 with self.context.lock:
                     self.context.add_target_result(result)

@@ -4,7 +4,6 @@ import pytest
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind, aggregate_input_failures
 from sunpack.core.i18n import I18nContext
-from sunpack.core.contracts.verification import ASSESSMENT_COMPLETE, CONTENT_INTEGRITY_VERIFIED_COMPLETE, DECISION_ACCEPT
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
@@ -18,10 +17,8 @@ def set_inputs(task, segments):
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
     SingleArchiveExtractor,
 )
-from sunpack.pipeline.verification.scheduler import VerificationScheduler
 from tests.helpers.async_batch import run_extract, stub_worker_attempt
 from tests.helpers.archive_tasks import make_archive_task
-from tests.helpers.config_factory import make_config
 from tests.helpers.worker_events import worker_result
 
 
@@ -173,14 +170,7 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     assert {key for key, _ in resolver.calls} == {node.input_id for node in task.inputs}
     assert [call[1]["parts"][0]["start"] for call in resolver.calls] == [7, 17]
     assert (result.files_written, result.bytes_written) == (2, 4)
-    # Multi-payload verification must consume the retained child tables, even
-    # though the carrier has no merged inventory. The single-SFX test cannot
-    # catch a fallback that counts only the first payload.
-    verification = VerificationScheduler(make_config({
-        "verification": {"enabled": True, "methods": [{"name": "archive_test_crc"}]},
-    })).verify(task, result)
-    assert verification.decision_hint == DECISION_ACCEPT
-    assert verification.archive_coverage.complete_files == 2
+    assert all(item.complete for item in result.input_results)
 
 
 def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
@@ -257,13 +247,6 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
     assert segment_result.logical_input.descriptor.to_dict() == archive_input
     assert segment_result.diagnostics["result"]["verified_manifest"]["validated"] is True
     assert task.archive_input().open_mode == "file"
-
-
-    verification = VerificationScheduler(make_config({"verification": {"enabled": True, "methods": [{"name": "archive_test_crc"}]}})).verify(task, result)
-    assert verification.decision_hint == DECISION_ACCEPT
-    assert verification.assessment_status == ASSESSMENT_COMPLETE
-    assert verification.content_integrity == CONTENT_INTEGRITY_VERIFIED_COMPLETE
-    assert verification.archive_coverage.complete_files == 1
 
 
 @pytest.mark.parametrize("count", [1, 2])

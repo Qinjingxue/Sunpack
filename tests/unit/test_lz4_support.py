@@ -13,11 +13,6 @@ from sunpack.core.analysis.embedded.result import embedded_scan_prepass
 from sunpack_native import scan_embedded_archives
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
-from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
-from sunpack.pipeline.verification.evidence import build_verification_evidence
-from sunpack.pipeline.verification.methods.archive_test_crc import ArchiveTestCrcMethod
-from tests.helpers.async_batch import run_extract
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.native_build import sevenzip_artifact
 from tests.helpers.native_fixture import file_inventory
@@ -62,58 +57,20 @@ def test_frame_options_analysis_is_complete_without_payload_decode(fixtures, blo
     report = AnalysisEngine().analyze_path(str(fixtures / f"frame_{block}_{bits}.lz4"))
     selected = report.best_selected
     assert selected.format == "lz4" and selected.status == "extractable"
-    plan = selected.details["stream_plan"]
-    assert plan["complete"] and plan["frames"] == 1
-    assert plan["content_checked_frames"] == bool(bits & 2)
-    assert plan["block_checked_frames"] == bool(bits & 4)
-    assert plan["expected_size"] == (5 * 1024 * 1024 if bits & 8 else None)
+    candidate = selected.details["candidates"][0]
+    assert candidate["extractable"]
+    assert candidate["end_offset"] == (fixtures / f"frame_{block}_{bits}.lz4").stat().st_size
 
 
-@pytest.mark.parametrize("name,frames,skips,integrity", [
-    ("concat.bin", 2, 3, "verified_complete"), ("concat_partial.bin", 2, 0, "verified_partial"),
-    ("frame_4_0.lz4", 1, 0, "unknown"), ("frame_4_5.lz4", 1, 0, "unknown"),
-    ("empty.lz4", 1, 0, "verified_complete"), ("payload.tar.lz4", 1, 0, "verified_complete"),
-    ("high_compression.lz4", 1, 0, "verified_complete"), ("uncompressed_blocks.lz4", 1, 0, "verified_complete"),
-])
-def test_worker_receipt_matches_plan_and_finalized_inventory(fixtures, tmp_path, name, frames, skips, integrity):
-    path = fixtures / name
-    report = AnalysisEngine().analyze_path(str(path))
-    selected = report.best_selected
-    descriptor = ArchiveInputDescriptor(entry_path=str(path), format_hint=selected.format,
-                                        analysis={"stream_plan": selected.details["stream_plan"]})
-    result = worker(descriptor, tmp_path / "output")
+@pytest.mark.parametrize("name", ["concat.bin", "concat_partial.bin", "frame_4_0.lz4",
+    "frame_4_5.lz4", "empty.lz4", "payload.tar.lz4", "high_compression.lz4", "uncompressed_blocks.lz4"])
+def test_worker_finalizes_lz4_content(fixtures, tmp_path, name):
+    result = worker(ArchiveInputDescriptor(entry_path=str(fixtures / name), format_hint="lz4"), tmp_path / "output")
     assert result["status"] == "ok"
-    receipt = result["stream_receipt"]
-    assert (receipt["frames"], receipt["skippable_frames"]) == (frames, skips)
-    inventory = collect_output_inventory(str(tmp_path / "output"), result)
-    verified = inventory.verify_stream_receipt(descriptor.analysis["stream_plan"], receipt)
-    assert verified["status"] == "passed", verified
-    assert verified["content_integrity"] == integrity
-    # The checksum algorithm is source-plan diagnostics, not verifier dispatch.
-    neutral_plan = {key: value for key, value in descriptor.analysis["stream_plan"].items()
-                    if key != "content_checksum_algorithm"}
-    neutral = inventory.verify_stream_receipt(neutral_plan, receipt)
-    assert neutral["status"] == "passed" and "checksum_algorithm" not in neutral
-    diagnostic = inventory.verify_stream_receipt(dict(neutral_plan, content_checksum_algorithm="other-checksum"), receipt)
-    assert diagnostic["status"] == "passed" and diagnostic["checksum_algorithm"] == "other-checksum"
-    # The old CRC32 evidence must stay empty for LZ4.
+    assert result["verified_manifest"]["validated"]
     rows = result["verified_manifest"]["native_rows"].file_page()
     assert not rows[0]["crc_ok"]
-    forged = dict(receipt, frames=frames + 1)
-    assert inventory.verify_stream_receipt(descriptor.analysis["stream_plan"], forged)["status"] == "failed"
-    diagnostics = {"skippable_frames", "block_checked_frames"}
-    # Diagnostic changes/omissions must not bind planner and decoder state machines.
-    for projected in (
-        {key: value for key, value in receipt.items() if key not in diagnostics},
-        dict(receipt, **{key: receipt[key] + 1 for key in diagnostics}),
-    ):
-        projected_plan = {key: value for key, value in descriptor.analysis["stream_plan"].items() if key not in diagnostics}
-        assert inventory.verify_stream_receipt(projected_plan, projected)["status"] == "passed"
-    for field in ("input_bytes", "output_bytes", "content_checked_frames", "error"):
-        assert inventory.verify_stream_receipt(descriptor.analysis["stream_plan"],
-            dict(receipt, **{field: receipt[field] + 1}))["status"] == "failed", field
-    missing_coverage = {key: value for key, value in receipt.items() if key != "content_checked_frames"}
-    assert inventory.verify_stream_receipt(descriptor.analysis["stream_plan"], missing_coverage)["status"] == "failed"
+    assert sum(p.stat().st_size for p in (tmp_path / "output").rglob("*") if p.is_file()) == result["bytes_written"]
 
 
 def test_skippable_prefix_disguised_identity_and_exact_carrier(fixtures, tmp_path):
@@ -124,10 +81,9 @@ def test_skippable_prefix_disguised_identity_and_exact_carrier(fixtures, tmp_pat
     item = scan["candidates"][0]
     assert item["offset"] == 1031 and item["end_offset"] == path.stat().st_size - 29
     descriptor = ArchiveInputDescriptor(entry_path=str(path), open_mode="file_range", format_hint="lz4",
-        parts=[ArchiveInputPart(InputExtent(str(path), item["offset"], item["end_offset"]))], analysis={"stream_plan": item["stream_plan"]})
+        parts=[ArchiveInputPart(InputExtent(str(path), item["offset"], item["end_offset"]))])
     result = worker(descriptor, tmp_path / "carrier")
     assert result["status"] == "ok"
-    assert result["stream_receipt"]["input_bytes"] == item["end_offset"] - item["offset"]
 
 
 @pytest.mark.parametrize("name,kind", [("bad_content.lz4", "checksum_error"), ("bad_header.lz4", "checksum_error"),
@@ -144,7 +100,7 @@ def test_parallel_jobs_have_independent_lz4_state(fixtures, tmp_path):
     descriptor = ArchiveInputDescriptor(entry_path=str(fixtures / "concat.bin"), format_hint="lz4")
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda i: worker(descriptor, tmp_path / str(i)), range(16)))
-    assert all(r["status"] == "ok" and r["stream_receipt"]["frames"] == 2 for r in results)
+    assert all(r["status"] == "ok" for r in results)
 
 
 def test_gigabyte_skippable_tar_uses_length_jumps(fixtures, tmp_path):
@@ -155,16 +111,14 @@ def test_gigabyte_skippable_tar_uses_length_jumps(fixtures, tmp_path):
     assert report.read_bytes < 5 * 1024 * 1024
     descriptor = ArchiveInputDescriptor(entry_path=str(path), format_hint="lz4")
     result = worker(descriptor, tmp_path / "large_skip")
-    assert result["status"] == "ok" and result["stream_receipt"]["skippable_frames"] == 1
-    assert result["stream_receipt"]["input_bytes"] == path.stat().st_size
+    assert result["status"] == "ok"
 
 
 def test_skippable_only_needs_explicit_format_context(fixtures, tmp_path):
     path = fixtures / "skips_only.lz4"
     assert not inspect_compression_stream_identity(str(path))["identity_strong"]
     result = worker(ArchiveInputDescriptor(entry_path=str(path), format_hint="lz4"), tmp_path / "skips")
-    assert result["status"] == "ok" and result["stream_receipt"]["frames"] == 0
-    assert result["stream_receipt"]["output_bytes"] == 0
+    assert result["status"] == "ok"
 
 
 def test_confirmed_lz4_planning_does_not_scan_a_gigabyte_skippable_payload(fixtures):
@@ -174,7 +128,7 @@ def test_confirmed_lz4_planning_does_not_scan_a_gigabyte_skippable_payload(fixtu
     path = fixtures / "large_skip.tar.lz4"
     task, = ArchiveTaskProvider(make_config()).discover_targets([str(path)]).tasks
     assert task.discovery_source == "detection"
-    assert task.archive_input().analysis["stream_plan"]["input_bytes"] == path.stat().st_size
+    assert task.archive_input().analysis["structure_complete"]
     ArchiveInputPlanningStage({}).plan_task(task)
     assert task.knowledge().get("input_planning.read_bytes", 0) < 5 * 1024 * 1024
 
@@ -205,32 +159,16 @@ def test_dict_id_returns_generic_unsupported_and_keeps_source(fixtures, tmp_path
     task = make_archive_task(path, format_hint="lz4")
     ArchiveInputPlanningStage({}).plan_task(task)
     descriptor = task.archive_input()
-    assert descriptor.analysis["stream_plan"]["complete"]
+    assert descriptor.analysis["structure_complete"]
     result = worker(descriptor, tmp_path / "unsupported")
     assert result["status"] == "failed" and result["native_status"] == "unsupported"
     assert result["failure_kind"] == "unsupported_method"
     assert not result["damaged"] and not result["wrong_password"] and path.exists()
-    assert result["stream_receipt"]["error"] == 5
 
 
 def test_invalid_backreference_is_generic_data_error(fixtures, tmp_path):
     result = worker(ArchiveInputDescriptor(entry_path=str(fixtures / "bad_data.lz4"), format_hint="lz4"), tmp_path / "bad")
     assert result["status"] == "failed" and result["damaged"] and not result["wrong_password"]
-    assert result["stream_receipt"]["error"] == 3
-
-
-def test_stream_verification_dispatch_is_format_neutral(fixtures, tmp_path):
-    task = make_archive_task(fixtures / "frame_7_15.lz4", format_hint="lz4")
-    ArchiveInputPlanningStage({}).plan_task(task)
-    runner = ExtractionScheduler(extraction_config={"quiet": True})
-    result = run_extract(runner, task, str(tmp_path / "output"))
-    assert result.success, result
-    evidence = build_verification_evidence(task, result)
-    from dataclasses import replace
-    neutral = replace(evidence, archive_input=replace(evidence.archive_input, format_hint="other-stream"))
-    step = ArchiveTestCrcMethod().verify(neutral, {})
-    assert step.status == "passed" and step.content_integrity_hint == "verified_complete"
-    assert step.verification_strength == "checksum"
 
 
 def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures, tmp_path):
@@ -264,8 +202,6 @@ def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures,
         assert result["status"] == ("ok" if i % 4 < 2 else "failed")
         if i % 4 == 3:
             assert result["native_status"] == "unsupported" and result["failure_kind"] == "unsupported_method"
-        if i % 4 == 0:
-            assert result["stream_receipt"]["content_checked_frames"] == 1
 
 
 def test_prefix_carrier_is_a_strict_subrange_at_zero(fixtures, tmp_path):
@@ -279,5 +215,5 @@ def test_prefix_carrier_is_a_strict_subrange_at_zero(fixtures, tmp_path):
     assert extent.start == 0 and extent.end == path.stat().st_size - 29
     result = worker(descriptor, tmp_path / "prefix")
     assert result["status"] == "ok"
-    assert result["stream_receipt"]["input_bytes"] == extent.end
+
     assert fingerprints(fixtures / "expected_standard") == fingerprints(tmp_path / "prefix")

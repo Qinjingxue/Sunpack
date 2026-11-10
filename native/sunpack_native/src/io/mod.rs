@@ -8,7 +8,6 @@ pub(crate) mod display_store;
 pub(crate) mod display_wake;
 #[cfg(windows)]
 pub(crate) mod iocp;
-pub(crate) mod json_rows;
 pub(crate) mod read_fault;
 pub(crate) mod reader;
 pub(crate) mod resource_error;

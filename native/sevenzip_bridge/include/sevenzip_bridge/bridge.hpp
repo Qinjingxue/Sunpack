@@ -181,16 +181,7 @@ struct ExtractOutputTrace {
     std::wstring metadata_first_item;
 };
 
-struct StreamDecodeReceipt {
-    unsigned long long input_bytes = 0, output_bytes = 0, frames = 0, skippable_frames = 0;
-    unsigned long long content_checked_frames = 0, block_checked_frames = 0;
-    unsigned int error = 0;
-    std::string format;
-};
-
 struct ExtractArchiveResult {
-    bool has_stream_receipt = false;
-    StreamDecodeReceipt stream_receipt;
 #ifdef SUP7Z_DEBUG
     ExtractPipelineTiming pipeline_timing;
 #endif
@@ -278,4 +269,3 @@ ExtractArchiveResult extract_archive(
 const char* status_name(PasswordTestStatus status);
 
 }  // namespace sunpack::sevenzip
-

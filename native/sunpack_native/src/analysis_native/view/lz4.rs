@@ -21,6 +21,9 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                     facts
                 }
             };
+            if str_of(&facts, "format")? != "lz4" {
+                return Ok(Evidence::not_found(py, format));
+            }
             if u64_of(&facts, "structure.stream_count")? == 0
                 && matches!(
                     str_of(&facts, "error")?.as_str(),
@@ -41,16 +44,12 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         let details = PyDict::new(py);
         details.set_item("source", "embedded_scan")?;
         details.set_item("candidate_kind", "logical_archive")?;
-        let plans = PyDict::new(py);
         let mut segments = Vec::new();
         let mut blocked = false;
         for row in &rows {
-            let Some(plan) = dict_item(row, "stream_plan")? else {
-                continue;
-            };
             let offset = u64_of(row, "offset")?;
             let end = opt_u64_of(row, "end_offset")?;
-            let complete = truthy(&plan, "complete")?;
+            let complete = truthy(row, "extractable")?;
             let mut flags = Vec::new();
             let error = str_of(row, "error")?;
             if !error.is_empty() {
@@ -60,16 +59,11 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 Segment::new(offset, end, flags, vec!["lz4:frame_structure".to_string()]);
             segment.extractable = complete;
             segments.push(segment);
-            plans.set_item(offset.to_string(), &plan)?;
-            if offset == 0 {
-                details.set_item("stream_plan", &plan)?;
-            }
             blocked |= !complete;
         }
         if segments.is_empty() {
             return Ok(Evidence::not_found(py, format));
         }
-        details.set_item("stream_plans", plans)?;
         details.set_item("candidates", pyo3::types::PyList::new(py, &rows)?)?;
         Ok(Evidence::new(
             format,

@@ -32,7 +32,6 @@ sunpack.core
 sunpack.pipeline.coordinator
   -> pipeline.discovery.*
   -> pipeline.extraction
-  -> pipeline.verification
   -> pipeline.postprocess
   -> core.contracts / core.analysis / core.passwords
 
@@ -66,7 +65,6 @@ sunpack.runtime.watch
 | Input planning | `sunpack.pipeline.discovery.detection.input_planning.ArchiveInputPlanningStage` | Converts analysis reports into archive inputs and embedded subtasks. |
 | Passwords | `sunpack.core.passwords` | Candidate passwords, scheduling, fast verifiers, and worker confirmation. |
 | Extraction | `sunpack.pipeline.extraction.scheduler.ExtractionScheduler` | Per-archive output, password resolution, and worker extraction. |
-| Verification | `sunpack.pipeline.verification.scheduler.VerificationScheduler` | Extraction completeness, source integrity, and next-step decisions. |
 | Post-processing | `sunpack.pipeline.postprocess.internal.cleanup.ArchiveCleanup`, `sunpack.pipeline.postprocess.internal.flatten.flatten_dirs` | Cleanup and flattening after success. |
 
 ## Domain boundaries
@@ -77,13 +75,13 @@ sunpack.runtime.watch
 
 ### core.config
 
-`sunpack.core.config` owns external configuration loading, field declarations, and normalization. Application checks that compare config with registered Detection or Verification capabilities live in `sunpack.runtime.config_validation`. Configuration aliases such as `recursive_extract: "*" / "?"`, and `archive_cleanup_mode: "d/r/k"` are part of the user interface. Pipeline code consumes normalized values.
+`sunpack.core.config` owns external configuration loading, field declarations, and normalization. Application checks that compare config with registered Detection capabilities live in `sunpack.runtime.config_validation`. Configuration aliases such as `recursive_extract: "*" / "?"`, and `archive_cleanup_mode: "d/r/k"` are part of the user interface. Pipeline code consumes normalized values.
 
 ### core.contracts
 
-`sunpack.core.contracts` is the shared data contract layer. Discovery produces `ArchiveTask` directly through `StageResult.resolved_tasks`; `DiscoveryCandidate` is a short-lived hint. `ArchiveTask` is the scheduling, lease, and cleanup group for physical sources. Each `LogicalArchiveInput` in `inputs` represents an independently processed archive with a stable ID, canonical `ArchiveInputDescriptor`, analysis facts, and blockers. Parts and concatenated inputs use `InputExtent` for byte ranges. Extraction and verification return `ExtractionResult` and `VerificationResult`, and verification methods return the same `VerificationStep` type stored in the result. `RunState.snapshot()` produces `RunSummary`, whose counts and failures come from `TargetRunResult` entries.
+`sunpack.core.contracts` is the shared data contract layer. Discovery produces `ArchiveTask` directly through `StageResult.resolved_tasks`; `DiscoveryCandidate` is a short-lived hint. `ArchiveTask` is the scheduling, lease, and cleanup group for physical sources. Each `LogicalArchiveInput` in `inputs` represents an independently processed archive with a stable ID, canonical `ArchiveInputDescriptor`, analysis facts, and blockers. Parts and concatenated inputs use `InputExtent` for byte ranges. Extraction returns `ExtractionResult`; coordinator consumes its final success, member completion and failure facts directly. `RunState.snapshot()` produces `RunSummary`, whose counts and failures come from `TargetRunResult` entries.
 
-Files, volume sets, and carrier segments share one logical input lifecycle. Rust establishes the mapping during discovery and refines facts when passwords or members change. Execution, verification, and recursive scanning pass typed inputs and per-input results directly, without reconstructing them from diagnostic dictionaries. `InputRecovery` checkpoints each input's source generation, output location, completion, and failure; missing volumes and passwords may block the same input together. CLI and Watch share the selector that retries changed dependencies or password waiters while retaining completed siblings. Persisted checkpoints contain no passwords, reader handles, or file inventories. Shared carriers are cleaned as user-visible files after the whole group completes.
+Files, volume sets, and carrier segments share one logical input lifecycle. Rust establishes the mapping during discovery and refines facts when passwords or members change. Execution and recursive scanning pass typed inputs and per-input results directly, without reconstructing them from diagnostic dictionaries. `InputRecovery` checkpoints each input's source generation, output location, completion, and failure; missing volumes and passwords may block the same input together. CLI and Watch share the selector that retries changed dependencies or password waiters while retaining completed siblings. Persisted checkpoints contain no passwords, reader handles, or file inventories. Shared carriers are cleaned as user-visible files after the whole group completes.
 
 Uncertain volumes belong to `ArchiveInputDescriptor.volume_attempts`: a shared source-extent pool and prioritized slot domains. Python passes and persists this plan, then commits the source indexes returned on worker success. Logical input IDs remain stable; cleanup references shrink to the selected sources. The plan contains neither an execution cursor nor expanded combinations.
 
@@ -145,17 +143,13 @@ The rule layer must not depend on processor implementation details; shared defau
 
 `sunpack.pipeline.extraction` consumes typed logical inputs resolved by Detection/input planning and password resolution, returning an `InputExecutionResult` per input. Single inputs retain the direct execution fast path; multiple inputs have isolated output directories. The worker accepts only canonical `archive_input`; its reader adapters still specialize for files, named volumes, and range streams. Extraction does not query Relations, scan candidates, schedule pipeline batches, or clean up after success.
 
-### pipeline.verification
-
-`sunpack.pipeline.verification` is the source of truth for extraction result verification. It builds evidence from `ArchiveTask`, `ExtractionResult`, the canonical `ArchiveInputDescriptor`, and `PasswordSession`, runs methods according to the configuration, and returns completeness, file observations, source integrity, a recoverable upper bound, and a decision hint. Whether to retry normally and whether to clean up failed output is decided by the coordinator.
-
 ### pipeline.postprocess
 
 `sunpack.pipeline.postprocess` only handles cleanup and flattening after success. The coordinator passes explicit cleanup and flattening paths to its public actions; `sunpack.pipeline.postprocess.internal` does not depend on the coordinator.
 
 ### pipeline.coordinator
 
-`sunpack.pipeline.coordinator` is the sole owner of pipeline flow dependencies, responsible for filesystem→relations→detection/input planning→extraction→verification→postprocess. It is also responsible for recursive rounds, batch scheduling, resource tokens, normal verification retries, and the summary. It does not implement stage algorithms; domain capabilities are called through public entry points. Archive cleanup is performed through public postprocess actions.
+`sunpack.pipeline.coordinator` is the sole owner of pipeline flow dependencies, responsible for filesystem→relations→detection/input planning→extraction→postprocess. It is also responsible for recursive rounds, batch scheduling, resource tokens, input recovery, and the summary. It does not implement stage algorithms; domain capabilities are called through public entry points. Archive cleanup is performed through public postprocess actions.
 
 Other pipeline stages must not import `sunpack.pipeline.coordinator` in reverse. Detection may call only public Analysis capabilities; Analysis must not depend on pipeline stages. Cross-stage data is passed through shared result contracts in `sunpack.core.contracts`.
 
@@ -202,7 +196,7 @@ from sunpack.pipeline.coordinator.engine import PipelineEngine  # inside runtime
 `sunpack.runtime.watch` does not construct the coordinator engine directly. The application composition layer creates and starts the process-level
 `PipelineEngine`, then injects the instance into the watcher; the watcher only submits stable inputs and consumes request results.
 
-`PipelineEngine` owns the scanner, analyzer, verification components, resource scheduler, and
+`PipelineEngine` owns the scanner, analyzer, resource scheduler, and
 7-Zip worker pool that persist across requests. `PipelineResponse`, the output policy, the post-processing manifest, and statistics belong to a request and must not be written back into the Engine's global accumulated state.
 
 ```python
@@ -227,8 +221,7 @@ Manually confirm:
 - Is the pipeline coordinator still only orchestration?
 - Are relation capabilities exposed through `RelationsScheduler`?
 - Is analysis still a general capability without business scheduling, and does detection call it only through public entry points?
-- Does verification provide completeness and source integrity before a normal retry?
-- Does the normal main pipeline keep the one-way lifecycle extraction → verification → postprocess?
+- Does the normal main pipeline keep the one-way lifecycle extraction → postprocess?
 - Has core.support avoided mixing in business policy or importing pipeline/runtime?
 
 ## Current structure at a glance
@@ -247,7 +240,6 @@ sunpack/
     coordinator/    Pipeline orchestration, batch scheduling, and recursion
     discovery/      filesystem / relations / detection / embedded
     extraction/     Worker extraction and output inventory
-    verification/   Extraction result verification
     postprocess/    Cleanup and flattening after successful extraction
   runtime/
     cli/            CLI commands, arguments, and output adaptation
@@ -268,4 +260,4 @@ native/sevenzip_bridge/ Windows embedded 7-Zip worker
 
 ### Watch / Pipeline boundary
 
-Watch is a runtime input mode responsible for OS events, file readiness, quiet windows, durable state, retries, and notifications. It does not identify archive formats, resolve split families, or call discovery internals. Stable files enter the pipeline through `sunpack.pipeline.coordinator.engine.PipelineEngine.run()`, and Watch consumes only public response facts such as `claimed_paths` and `blocked_paths`. CLI and Watch therefore share the same discovery, planning, extraction, and verification path once a target enters the pipeline.
+Watch is a runtime input mode responsible for OS events, file readiness, quiet windows, durable state, retries, and notifications. It does not identify archive formats, resolve split families, or call discovery internals. Stable files enter the pipeline through `sunpack.pipeline.coordinator.engine.PipelineEngine.run()`, and Watch consumes only public response facts such as `claimed_paths` and `blocked_paths`. CLI and Watch therefore share the same discovery, planning, extraction and completion path once a target enters the pipeline.

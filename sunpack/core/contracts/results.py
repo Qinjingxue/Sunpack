@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import List
 
@@ -59,7 +59,6 @@ class TargetRunResult:
     outcome_kind: OutcomeKind
     task_key: str = ""
     output_dir: str = ""
-    verification: dict = field(default_factory=dict)
     error: str = ""
     failure: FailureInfo | None = None
     failure_message: str = ""

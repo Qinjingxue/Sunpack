@@ -2018,7 +2018,7 @@ fn clean_logical_name(value: &str) -> String {
         name = &name[..basename_start + stem.len()];
     }
     let base = basename(name);
-    let component = crate::verification::paths::output_name_component(base);
+    let component = crate::output_names::output_name_component(base);
     if base.len() == name.len() {
         component
     } else {

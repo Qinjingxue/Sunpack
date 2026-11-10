@@ -1,6 +1,6 @@
 """Direct performance matrix for the native 7z.dll worker.
 
-This scenario deliberately bypasses SunPack's planning, verification, and
+This scenario deliberately bypasses SunPack's planning, finalization, and
 recursive extraction layers.  It measures the persistent native worker itself
 against generated archives from the existing extraction-format corpus builder.
 """

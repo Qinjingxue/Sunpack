@@ -29,7 +29,7 @@ def test_cli_disguised_split_carrier_multilevel_passwords(tmp_path, plan_error, 
         "filesystem": {
                        "scan_filters": [{"name": "size_range", "enabled": False}]},
         "embedded_scan": {"enabled": True},
-        "verification": {"enabled": True},
+
         "post_extract": {"flatten_single_directory": False},
         "extraction": {"content_requirement": "complete"},
     }

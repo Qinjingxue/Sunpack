@@ -41,21 +41,19 @@ def test_progress_manifest_classifies_trace_items_and_skips_directories(tmp_path
             {"path": "dir/ok.bin", "bytes_written": 4, "expected_size": 4},
             {"path": "dir/cut.bin", "bytes_written": 2, "expected_size": 8, "failed": True},
             {"path": "dir/none.bin", "bytes_written": 0, "expected_size": 8, "failed": True},
+            {"path": "pending.bin", "done": False},
+            {"path": "unfinished.bin", "bytes_written": 3, "done": False},
+            {"path": "bad-result.bin", "operation_result": 2},
         ], status="failed", failure_kind="checksum_error")},
     )
 
-    assert manifest.summary == {"complete": 1, "partial": 1, "failed": 1, "skipped": 0, "unverified": 0, "total": 3}
+    assert manifest.summary == {"complete": 1, "partial": 2, "failed": 2, "skipped": 0, "unverified": 1, "total": 6}
     assert manifest.failure_kind == "checksum_error"
     assert manifest.partial_outputs is True
-    assert manifest.files_written == 2
-    assert manifest.bytes_written == 6
-    assert round(manifest.completeness(), 6) == round((1 + 0.25 + 0) / 3, 6)
-    coverage = manifest.coverage()
-    assert coverage["expected_bytes"] == 20
-    assert coverage["matched_bytes"] == 6
-    assert coverage["matched_files"] == 2
+    assert manifest.files_written == 3
+    assert manifest.bytes_written == 9
     assert [item["archive_path"] for item in iter_progress_files(manifest, page_size=1)] == [
-        "dir/ok.bin", "dir/cut.bin", "dir/none.bin",
+        "dir/ok.bin", "dir/cut.bin", "dir/none.bin", "pending.bin", "unfinished.bin", "bad-result.bin",
     ]
 
 
@@ -131,4 +129,3 @@ def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):
     assert manifest.summary["total"] == 2
     assert manifest.files_written == 2
     assert manifest.bytes_written == 6
-    assert manifest.completeness() == 1.0

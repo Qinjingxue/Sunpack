@@ -101,7 +101,7 @@ def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings
         input_results=[InputExecutionResult(LogicalArchiveInput(ArchiveInputDescriptor("carrier")), child)],
     )
 
-    assert ContentRecoveryPolicy().decide(outer, None).rejected_partial_output is False
+    assert ContentRecoveryPolicy().decide(outer).rejected_partial_output is False
 
 
 @pytest.mark.parametrize("with_zero_file", [False, True])

@@ -25,7 +25,7 @@ def test_zipx_split_alias_preserves_size_anchors_and_extracts_physical_parts(tmp
         "filesystem": {"scan_filters": [
             {"name": "size_range", "enabled": True, "min_bytes": first.stat().st_size},
         ]},
-        "verification": {"enabled": False},
+
     })
     tasks = ArchiveTaskProvider(config).scan_targets([str(case.archive_dir)])
     assert len(tasks) == 1

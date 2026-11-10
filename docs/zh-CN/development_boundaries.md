@@ -32,7 +32,6 @@ sunpack.core
 sunpack.pipeline.coordinator
   -> pipeline.discovery.*
   -> pipeline.extraction
-  -> pipeline.verification
   -> pipeline.postprocess
   -> core.contracts / core.analysis / core.passwords
 
@@ -66,7 +65,6 @@ sunpack.runtime.watch
 | 输入规划 | `sunpack.pipeline.discovery.detection.input_planning.ArchiveInputPlanningStage` | 把分析报告转换为归档输入和 embedded 子任务。 |
 | 密码 | `sunpack.core.passwords` | 密码候选、调度、fast verifier 和 worker 确认。 |
 | 解压 | `sunpack.pipeline.extraction.scheduler.ExtractionScheduler` | 单归档输出、密码解析和 worker 解压。 |
-| 校验 | `sunpack.pipeline.verification.scheduler.VerificationScheduler` | 解压完整度、来源完整性和下一步决策。 |
 | 后处理 | `sunpack.pipeline.postprocess.internal.cleanup.ArchiveCleanup`、`sunpack.pipeline.postprocess.internal.flatten.flatten_dirs` | 成功后清理和扁平化。 |
 
 ## 领域边界
@@ -77,13 +75,13 @@ sunpack.runtime.watch
 
 ### core.config
 
-`sunpack.core.config` 负责外部配置读取、字段声明和归一化。将配置与 Detection、Verification 注册能力对照的应用校验放在 `sunpack.runtime.config_validation`。配置别名如 `recursive_extract: "*" / "?"`、`archive_cleanup_mode: "d/r/k"` 是用户接口的一部分。Pipeline 代码消费归一化后的值。
+`sunpack.core.config` 负责外部配置读取、字段声明和归一化。将配置与 Detection 注册能力对照的应用校验放在 `sunpack.runtime.config_validation`。配置别名如 `recursive_extract: "*" / "?"`、`archive_cleanup_mode: "d/r/k"` 是用户接口的一部分。Pipeline 代码消费归一化后的值。
 
 ### core.contracts
 
-`sunpack.core.contracts` 是共享数据契约层。Discovery 通过 `StageResult.resolved_tasks` 直接产出 `ArchiveTask`；`DiscoveryCandidate` 只保存短期线索。`ArchiveTask` 是物理输入的调度、lease 和清理组，`inputs` 中的 `LogicalArchiveInput` 分别代表可独立处理的归档。每个逻辑输入有稳定 ID、canonical `ArchiveInputDescriptor`、分析事实和阻塞原因；部件与拼接输入统一用 `InputExtent` 表示字节区间。解压、验证分别返回 `ExtractionResult`、`VerificationResult`，验证方法返回的 `VerificationStep` 直接保存在结果中。`RunState.snapshot()` 生成 `RunSummary`，计数与失败从 `TargetRunResult` 投影。
+`sunpack.core.contracts` 是共享数据契约层。Discovery 通过 `StageResult.resolved_tasks` 直接产出 `ArchiveTask`；`DiscoveryCandidate` 只保存短期线索。`ArchiveTask` 是物理输入的调度、lease 和清理组，`inputs` 中的 `LogicalArchiveInput` 分别代表可独立处理的归档。每个逻辑输入有稳定 ID、canonical `ArchiveInputDescriptor`、分析事实和阻塞原因；部件与拼接输入统一用 `InputExtent` 表示字节区间。解压返回 `ExtractionResult`；coordinator 依据 worker 的最终执行事实记录检查点并决定终态。`RunState.snapshot()` 生成 `RunSummary`，计数与失败从 `TargetRunResult` 投影。
 
-普通文件、分卷组和载体段共用逻辑输入生命周期。Rust 首次分析确定映射，密码或成员变化时细化事实；执行、校验、递归扫描直接传递类型化输入和逐输入结果，不从诊断字典重建输入。`InputRecovery` 为每个输入保存依赖源的代次、输出位置、完成状态和失败；缺卷与缺密码可同时存在。CLI 和 Watch 使用同一个选择器，只重试依赖变化的输入或密码等待者，保留已完成的兄弟输入。持久化检查点不含密码、读取句柄或文件清单，共享载体在整组完成后按用户可见文件清理。
+普通文件、分卷组和载体段共用逻辑输入生命周期。Rust 首次分析确定映射，密码或成员变化时细化事实；执行、完成记录、递归扫描直接传递类型化输入和逐输入结果，不从诊断字典重建输入。`InputRecovery` 为每个输入保存依赖源的代次、输出位置、完成状态和失败；缺卷与缺密码可同时存在。CLI 和 Watch 使用同一个选择器，只重试依赖变化的输入或密码等待者，保留已完成的兄弟输入。持久化检查点不含密码、读取句柄或文件清单，共享载体在整组完成后按用户可见文件清理。
 
 不确定分卷属于 `ArchiveInputDescriptor.volume_attempts`：共享源区间表加按优先级排列的卷号候选域。Python 只传递、持久化计划，并在 worker 成功后提交返回的源索引；逻辑输入 ID 保持不变，清理引用缩减到实际选中的源。计划不包含尝试游标，也不展开组合。
 
@@ -145,17 +143,13 @@ worker 按计划惰性枚举不重复使用源的组合，复用现有解压、�
 
 `sunpack.pipeline.extraction` 消费 Detection/input planner 解析的类型化逻辑输入和 password resolution，逐输入返回 `InputExecutionResult`。单输入保留直接执行快路径，多输入拥有隔离的输出目录。Worker 只接收 canonical `archive_input`，底层仍可按读取模式选择文件、具名分卷或区间流适配器。它不查询 Relations、不扫描候选、不调度 pipeline 批次，也不做成功后清理。
 
-### pipeline.verification
-
-`sunpack.pipeline.verification` 是解压结果校验的事实来源。它从 `ArchiveTask`、`ExtractionResult`、canonical `ArchiveInputDescriptor` 和 `PasswordSession` 构建证据，按配置执行 method，返回完整度、文件观察、source integrity、recoverable upper bound 和 decision hint。是否普通重试、是否清理失败输出，由 coordinator 决定。
-
 ### pipeline.postprocess
 
 `sunpack.pipeline.postprocess` 只处理成功后的清理和扁平化。Coordinator 向公开动作显式传入清理和扁平化路径；`sunpack.pipeline.postprocess.internal` 不依赖 coordinator。
 
 ### pipeline.coordinator
 
-`sunpack.pipeline.coordinator` 是唯一 pipeline 流程依赖拥有者，负责 filesystem→relations→detection/input planning→extraction→verification→postprocess。它还负责递归轮次、批量调度、资源 token、普通 verification retry 和 summary。它不实现各阶段算法；所有能力均通过公开入口调用。归档清理通过 postprocess 公开动作完成。
+`sunpack.pipeline.coordinator` 是唯一 pipeline 流程依赖拥有者，负责 filesystem→relations→detection/input planning→extraction→postprocess。它还负责递归轮次、批量调度、资源 token、输入恢复 和 summary。它不实现各阶段算法；所有能力均通过公开入口调用。归档清理通过 postprocess 公开动作完成。
 
 其他 pipeline 阶段禁止反向导入 `sunpack.pipeline.coordinator`。Detection 只能调用 Analysis 公共能力；Analysis 不得依赖 pipeline 阶段。跨阶段数据通过 `sunpack.core.contracts` 中的共享结果契约传递。
 
@@ -228,8 +222,7 @@ powershell -ExecutionPolicy Bypass -File scripts\run_ci_tests.ps1
 - pipeline coordinator 是否仍只是编排？
 - relation 能力是否通过 `RelationsScheduler` 暴露？
 - analysis 是否仍是无业务调度的通用能力，detection 是否只通过公共入口调用？
-- verification 是否先于普通重试给出完整度和 source integrity？
-- 正常主流程是否保持 extraction → verification → postprocess 的单向生命周期？
+- 正常主流程是否保持 extraction → postprocess 的单向生命周期？
 - core.support 是否没有混入业务策略或导入 pipeline/runtime？
 
 ## 当前结构速览
@@ -248,7 +241,6 @@ sunpack/
     coordinator/    流水线编排、批量调度和递归
     discovery/      filesystem / relations / detection / embedded
     extraction/     worker 解压和 output inventory
-    verification/   解压结果校验
     postprocess/    成功后的清理和扁平化
   runtime/
     cli/            CLI 命令、参数和输出适配
@@ -269,4 +261,4 @@ native/sevenzip_bridge/ Windows 7z.dll bridge 与 worker
 
 ### Watch / Pipeline 边界
 
-Watch 是 runtime 的一种输入模式，只负责 OS 事件、文件稳定性、quiet window、持久状态、重试与通知。Watch 不识别压缩格式、不解析分卷、不调用 discovery 内部实现；稳定文件通过 `sunpack.pipeline.coordinator.engine.PipelineEngine.run()` 进入完整 pipeline，并仅消费公开响应中的 `claimed_paths` / `blocked_paths` 等事实。CLI 与 Watch 从进入 pipeline 起共享相同的 discovery、planning、extraction 与 verification 路径。
+Watch 是 runtime 的一种输入模式，只负责 OS 事件、文件稳定性、quiet window、持久状态、重试与通知。Watch 不识别压缩格式、不解析分卷、不调用 discovery 内部实现；稳定文件通过 `sunpack.pipeline.coordinator.engine.PipelineEngine.run()` 进入完整 pipeline，并仅消费公开响应中的 `claimed_paths` / `blocked_paths` 等事实。CLI 与 Watch 从进入 pipeline 起共享相同的 discovery、planning、extraction 与完成路径。

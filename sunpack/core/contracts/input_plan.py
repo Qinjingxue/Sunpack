@@ -1,6 +1,6 @@
 """Logical archive plans and bounded, handle-free recovery state.
 
-Discovery owns interpretation of physical sources. Execution, verification and
+Discovery owns interpretation of physical sources. Execution and
 recovery share these objects; serialized diagnostics are never execution input.
 """
 from __future__ import annotations

@@ -136,7 +136,7 @@ Open the manager from the Watch tray or by searching for Sunpackgui in the Start
 ### Robustness and WAL crash recovery
 
 - Automatically pauses extraction tasks when disk space runs out, and resumes them once enough disk space is available again — no manual retry needed.
-- Has a file verification system that allows partially damaged files to yield whatever usable files they can, instead of failing outright. When everything fails, it automatically cleans up the damaged files, leaving no leftovers that need manual cleanup.
+- Uses the worker’s completed-file results to support optional partial recovery. Complete results, partial results and source cleanup follow one coordinator policy.
 - Adopts a database-like WAL design: an unexpected power loss or process crash during extraction leaves no half-finished or corrupted state; the program handles it correctly and completes the task after recovery.
 - The test suite covers a wide range of complex archive formats, concurrency scenarios, and crash recovery cases to continuously verify processing correctness.
 
@@ -202,7 +202,7 @@ CLI / Watch / Explorer (runtime)
         +-- Detection (TAR and compression streams)
         +-- Embedded discovery (unresolved files)
      -> recursive authorization -> password handling -> extraction
-     -> verification -> post-processing
+     -> completion -> post-processing
 ```
 
 Rust provides low-level scanning and archive analysis; the C++ worker extracts with the integrated 7-Zip source code.

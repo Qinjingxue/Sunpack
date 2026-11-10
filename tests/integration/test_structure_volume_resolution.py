@@ -634,7 +634,7 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
         with_detection_pipeline(
             {
                 "recursive_extract": "1",
-                "verification": {"enabled": False, "methods": []},
+
                 "post_extract": {
                     "archive_cleanup_mode": "k",
                     "flatten_single_directory": False,
@@ -692,7 +692,7 @@ def test_pipeline_middle_volume_target_exposes_resolved_physical_family(mixed_re
         with_detection_pipeline(
             {
                 "recursive_extract": "1",
-                "verification": {"enabled": False, "methods": []},
+
                 "post_extract": {
                     "archive_cleanup_mode": "k",
                     "flatten_single_directory": False,
@@ -907,7 +907,7 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
     config = normalize_config(
         with_detection_pipeline(
             {
-                "verification": {"enabled": False, "methods": []},
+
                 "filesystem": {"scan_filters": [
                     {"name": "size_range", "enabled": True, "min_bytes": MIB if zipx else 0},
                 ]},
@@ -1015,7 +1015,7 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
     config = normalize_config(
         with_detection_pipeline(
             {
-                "verification": {"enabled": False, "methods": []},
+
                 "process": {},
             },
             precheck=[

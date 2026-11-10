@@ -225,7 +225,7 @@ def test_pipeline_progress_observer_receives_extract_ready_before_native_progres
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
         "output": {"root": str(tmp_path / "out")},
-        "verification": {"enabled": False, "methods": []},
+
         "post_extract": {
             "archive_cleanup_mode": "k",
             "flatten_single_directory": False,
@@ -265,7 +265,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     config = normalize_config(with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
         "recursive_extract": "1",
-        "verification": {"enabled": False, "methods": []},
+
         "post_extract": {
             "archive_cleanup_mode": "d",
             "flatten_single_directory": True,
@@ -321,7 +321,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
 def test_pipeline_runner_exposes_recent_passwords_without_password_manager():
     engine = PipelineEngine(normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
-        "verification": {"enabled": False, "methods": []},
+
         "post_extract": {
             "archive_cleanup_mode": "k",
             "flatten_single_directory": False,
@@ -349,7 +349,7 @@ def test_independent_jobs_do_not_treat_existing_same_name_directory_as_output(tm
 
     engine = PipelineEngine(normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
-        "verification": {"enabled": False, "methods": []},
+
         "post_extract": {
             "archive_cleanup_mode": "k",
             "flatten_single_directory": False,
@@ -390,7 +390,7 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
 
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "2",
-        "verification": {"enabled": False, "methods": []},
+
         "output": {
             "root": str(output_root),
             "common_root": str(input_root),
@@ -435,7 +435,6 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
     assert response.summary.success_count == 2
 
 
-
 def test_fast_job_recurses_before_slow_sibling_finishes(tmp_path, monkeypatch):
     slow = tmp_path / "slow.zip"
     fast = tmp_path / "fast.zip"
@@ -445,7 +444,7 @@ def test_fast_job_recurses_before_slow_sibling_finishes(tmp_path, monkeypatch):
 
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "2",
-        "verification": {"enabled": False, "methods": []},
+
         "output": {"root": str(output_root)},
         "post_extract": {
             "archive_cleanup_mode": "k",
@@ -558,7 +557,7 @@ def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp
     config = make_config({
         "recursive_extract": "1",
         "output": {"root": str(tmp_path / "out")},
-        "verification": {"enabled": False, "methods": []},
+
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
     })
     output = io.StringIO()

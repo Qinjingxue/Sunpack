@@ -10,13 +10,6 @@ def _write_json(path, payload):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _verification_config():
-    return {
-        "enabled": True,
-        "methods": [{"name": "extraction_exit_signal", "enabled": True}, {"name": "output_presence", "enabled": True}],
-    }
-
-
 def _layered_config_paths(simple, advanced):
     def candidate_paths(filename):
         return [simple if filename == loader.SIMPLE_CONFIG_FILENAME else advanced]
@@ -31,7 +24,6 @@ def _advanced_payload():
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
         "performance": {"worker": {"space_poll_interval_ms": 1000, "space_status_report_interval_ms": 15000}},
-        "verification": _verification_config(),
     }
 
 
@@ -101,11 +93,6 @@ def test_everyday_clipboard_and_report_controls_override_advanced_defaults(tmp_p
         ({"post_extract": {"flatten_single_directory": "false"}}, "post_extract.flatten_single_directory"),
         ({"passwords": {"clipboard_passwords_enabled": "false"}}, "passwords.clipboard_passwords_enabled"),
         ({"watch": {"toast_enabled": "false"}}, "watch.toast_enabled"),
-        ({"verification": {"enabled": "false"}}, "verification.enabled"),
-        (
-            {"verification": {"methods": [{"name": "output_presence", "enabled": "false"}]}},
-            "verification.methods[0].enabled",
-        ),
         (
             {"filesystem": {"scan_filters": [{"name": "size_range", "enabled": "false"}]}},
             "filesystem.scan_filters[0].enabled",
@@ -197,18 +184,6 @@ def test_load_config_uses_explicit_request_cwd(tmp_path, monkeypatch):
         assert loader.resolve_config_sources(first_root) != loader.resolve_config_sources(second_root)
     finally:
         loader.clear_config_cache()
-
-
-def test_load_config_requires_external_verification_config(tmp_path, monkeypatch):
-    simple = tmp_path / "sunpack_config.json"
-    advanced = tmp_path / "sunpack_advanced_config.json"
-    payload = _advanced_payload()
-    payload.pop("verification")
-    _write_json(advanced, payload)
-    _write_json(simple, {})
-    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
-    with pytest.raises(loader.ConfigError, match="verification"):
-        loader.load_config()
 
 
 def test_config_loader_normalizes_external_schema_once(tmp_path, monkeypatch):
@@ -375,16 +350,3 @@ def test_packaged_config_layers_program_data_simple_over_program_advanced(tmp_pa
         assert loader.load_config()["cli"]["language"] == "zh"
     finally:
         loader.clear_config_cache()
-
-
-@pytest.mark.parametrize("retired", [
-    {"max_retries": 99, "cleanup_failed_output": False, "retry_on_verification_failure": True},
-    {"complete_accept_threshold": 0, "partial_accept_threshold": 1},
-    {"methods": [{"name": "manifest_size_match", "file_count_abs_tolerance": 1}]},
-    {"methods": [{"name": "archive_test_crc", "max_reported_items": 100}]},
-])
-def test_verification_config_rejects_retired_fields(retired):
-    from sunpack.core.config.fields.verification import normalize_verification_config
-
-    with pytest.raises(ValueError, match="unknown fields"):
-        normalize_verification_config({**_verification_config(), **retired})

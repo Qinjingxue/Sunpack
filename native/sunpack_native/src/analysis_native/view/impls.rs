@@ -780,7 +780,6 @@ impl AnalysisBinaryView {
                     member_size,
                     cursor,
                     size,
-                    false,
                     &mut |start, length| {
                         self.reader
                             .read_cached_at(start, length)

@@ -21,7 +21,6 @@ class OutputCleanupEvent(str, Enum):
     EXTRACTION_ABORT = "extraction_abort"
     USER_CANCELLED = "user_cancelled"
     EXTRACT_RETRY = "extract_retry"
-    VERIFICATION_RETRY = "verification_retry"
     UNRECOVERABLE_FAILURE = "unrecoverable_failure"
     TERMINAL_FAILURE = "terminal_failure"
     POLICY_REJECTED_PARTIAL = "policy_rejected_partial"

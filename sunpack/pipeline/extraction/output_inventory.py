@@ -8,7 +8,6 @@ from sunpack.core.support.path_keys import case_key
 from sunpack_native import (
     NativeOutputInventory,
     NativeWorkerManifest,
-    match_output_inventory_coverage as _native_match_output_inventory_coverage,
     output_inventory_from_serialized as _native_inventory_from_serialized,
     scan_output_inventory as _native_scan_output_inventory,
 )
@@ -28,7 +27,7 @@ class OutputStats:
 class OutputInventory:
     """Python facade over a Rust-owned file table."""
 
-    __slots__ = ("root", "stats", "_native", "worker_crc_available", "worker_inventory_complete", "identity_paths")
+    __slots__ = ("root", "stats", "_native", "worker_inventory_complete", "identity_paths")
 
     def __init__(self, native: NativeOutputInventory):
         self._native = native
@@ -39,7 +38,6 @@ class OutputInventory:
             total_size=int(native.total_size),
             unreadable_count=int(native.unreadable_count),
         )
-        self.worker_crc_available = bool(native.worker_crc_available)
         self.worker_inventory_complete = bool(native.worker_inventory_complete)
         self.identity_paths = bool(native.identity_paths)
 
@@ -49,37 +47,8 @@ class OutputInventory:
             max(0, int(limit or 0)),
         ))
 
-    def verification_match(
-        self,
-        archive_files,
-        *,
-        verify_crc: bool = False,
-        basename_mode: str = "unique",
-        include_observations: bool = False,
-        detail_offset: int = 0,
-        detail_limit: int = 128,
-        names_only: bool = False,
-    ) -> dict[str, Any]:
-        return _native_match_output_inventory_coverage(
-            archive_files,
-            self._native,
-            bool(verify_crc),
-            str(basename_mode or "unique"),
-            bool(include_observations),
-            max(0, int(detail_offset or 0)),
-            max(0, int(detail_limit or 0)),
-            bool(names_only),
-        )
-
     def build_directory_snapshots(self, options):
         return self._native.build_directory_snapshots(options)
-
-    def verify_stream_receipt(self, plan: dict, receipt: dict) -> dict:
-        from sunpack_native import verify_stream_receipt
-        return verify_stream_receipt(plan, receipt, self._native)
-
-    def all_crc_ok(self) -> bool:
-        return bool(self._native.all_crc_ok())
 
     @classmethod
     def from_value(cls, value: OutputInventory | None, *, expected_root: str = "") -> OutputInventory | None:
@@ -99,7 +68,7 @@ def collect_output_inventory(
     root = os.path.abspath(output_dir) if output_dir else ""
     if not output_dir:
         return OutputInventory.from_native(_native_inventory_from_serialized(
-            root, [], False, False, 0, 0, 0, 0, False, False, False,
+            root, [], False, False, 0, 0, 0, 0, False, False,
         ))
     worker_inventory = _complete_worker_inventory(worker_result)
     if worker_inventory is not None:

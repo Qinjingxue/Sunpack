@@ -126,7 +126,7 @@ class RunReporter:
                         detail = ""
                         if not checkpoint.complete:
                             detail = (self._format_failure(checkpoint.failure) if checkpoint.failure
-                                      else self.i18n.t("failure.verification_failed"))
+                                      else self.i18n.t("failure.extraction_failed"))
                         self._finish_row(child_row, "complete" if checkpoint.complete else "error", detail)
                         self._set_output(child, child_row, checkpoint.output_dir, attach=checkpoint.complete)
                     elif node.failure is not None:
@@ -328,7 +328,7 @@ class RunReporter:
                 # Each cause belongs to a segment with its own error line.
                 detail = ""
             elif not success and not detail:
-                detail = self._format_failure(failure) if failure else self.i18n.t("failure.verification_failed")
+                detail = self._format_failure(failure) if failure else self.i18n.t("failure.extraction_failed")
             state = "partial" if kind == OutcomeKind.PARTIAL_SUCCESS else "complete" if success else "error"
             self._finish_row(row, state, detail)
             output = str(getattr(result, "out_dir", "") or "")
@@ -336,15 +336,13 @@ class RunReporter:
             self._set_output(key, row, output, attach=attach)
             if output and attach and depth == 1:
                 self._top_level_outputs.setdefault(output, output)
-            # Verification can reject a child after its worker completed.
             # Refresh existing segment rows from the authoritative result.
             for item in getattr(result, "input_results", ()):
                 child_key = (key, item.input.input_id)
                 child = self._task_rows.get(child_key)
                 if child is not None:
                     self._finish_row(child, "complete" if item.complete else "error",
-                                     item.result.error or (self.i18n.t("failure.verification_failed")
-                                         if item.verified_complete is False else ""))
+                                     item.result.error)
                     self._set_output(child_key, child, item.result.out_dir, attach=item.complete)
             if row["container"] and not success:
                 # A group-level failure can stop execution before any segment
@@ -487,9 +485,8 @@ class RunReporter:
 
             for item in recovered:
                 archive = os.path.basename(str(item.get("archive") or ""))
-                coverage = item.get("archive_coverage") if isinstance(item.get("archive_coverage"), dict) else {}
-                completeness = _percent(coverage.get("completeness", item.get("completeness", 0.0)))
-                self._print(self.i18n.t("report.partial", archive=archive, completeness=completeness, coverage=_file_coverage(coverage)))
+                self._print(self.i18n.t("report.partial", archive=archive,
+                                        complete_files=item.get("complete_files", 0)))
                 warning = FailureInfo.from_dict(item.get("warning"))
                 if warning is not None:
                     self._print(self.i18n.t("report.partial_warning", warning=warning.message))
@@ -680,19 +677,3 @@ def _truncate_display(text: str, max_width: int) -> str:
 
 def _display_width(text: str) -> int:
     return sum(2 if ord(char) > 0xFF else 1 for char in text)
-
-
-def _percent(value) -> str:
-    try:
-        return f"{float(value or 0.0) * 100:.1f}%"
-    except (TypeError, ValueError):
-        return "0.0%"
-
-
-def _file_coverage(coverage: dict) -> str:
-    expected = int(coverage.get("expected_files", 0) or 0)
-    matched = int(coverage.get("matched_files", 0) or 0)
-    complete = int(coverage.get("complete_files", 0) or 0)
-    if expected <= 0:
-        return ""
-    return f" ({complete}/{matched}/{expected})"

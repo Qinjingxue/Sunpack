@@ -1253,13 +1253,6 @@ int run_request(
         wire::key("hresult") + wire::number(result.hresult);
     const std::string diagnostic_fields = (!ok || dry_run) ?
         wire::key("diagnostics") + diagnostics_wire(result, trace_chunks) : "";
-    const auto &sr = result.stream_receipt;
-    const std::string stream_receipt_field = result.has_stream_receipt ?
-        (wire::key("stream_receipt") + wire::object() + wire::key("format")) + wire::text(sr.format) + wire::key("input_bytes") + wire::number(sr.input_bytes) +
-        wire::key("output_bytes") + wire::number(sr.output_bytes) + wire::key("frames") + wire::number(sr.frames) +
-        wire::key("skippable_frames") + wire::number(sr.skippable_frames) +
-        wire::key("content_checked_frames") + wire::number(sr.content_checked_frames) + wire::key("block_checked_frames") + wire::number(sr.block_checked_frames) +
-        wire::key("error") + wire::number(sr.error) + wire::end() : "";
     const std::string input_trace_field = read_file_timing_enabled() ?
         wire::key("input_trace") + input_trace_wire(result.input_trace) : "";
     const auto &output_trace = result.output_trace;
@@ -1318,7 +1311,7 @@ int run_request(
 #ifdef SUP7Z_DEBUG
         + pipeline_timing_field
 #endif
-        + diagnostic_fields + stream_receipt_field + wire::end());
+        + diagnostic_fields + wire::end());
     return ok ? 0 : 1;
 }
 

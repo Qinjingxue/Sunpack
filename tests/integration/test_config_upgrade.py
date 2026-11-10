@@ -92,7 +92,7 @@ def test_version_gate_and_failed_preflight_leave_all_data_untouched(tmp_path, re
     # install repair, or mutation before JSON/reparse preflight. One matrix
     # covers these distinct entry conditions without separate fine-grained tests.
     for index, (version, broken, success) in enumerate([
-        ("1.4.0", False, True), ("v1.4.0-2-gabcdef0", True, True),
+        ("1.4.0", False, True), ("v1.4.0-2-gabcdef0", True, False),
         ("1.10.0", False, True), ("", False, False), ("invalid", False, False),
         ("1.3.5", True, False),
     ]):
@@ -184,3 +184,24 @@ def test_current_filters_merge_by_name_without_adding_modules(tmp_path, repo_roo
     defaults = {f["name"]: f for f in template["filesystem"]["scan_filters"]}
     expected = [dict(defaults[f["name"]], **f) for f in filters]
     assert json.loads(user.read_text(encoding="utf-8-sig"))["filesystem"]["scan_filters"] == expected
+
+
+def test_current_upgrade_retires_verification_and_preserves_state(tmp_path, repo_root):
+    user, advanced = tmp_path / "sunpack_config.json", tmp_path / "advanced.json"
+    payload = {"extraction": {"content_requirement": "allow_partial"}, "verification": {"enabled": False}}
+    user.write_text(json.dumps(payload), encoding="utf-8")
+    advanced.write_text("{invalid}", encoding="utf-8")
+    before = _snapshot(tmp_path)
+    assert _upgrade(repo_root, user, "1.4.0", advanced).returncode != 0
+    assert _snapshot(tmp_path) == before
+    advanced.write_text(json.dumps({"verification": {"methods": []}, "custom": "retained"}), encoding="utf-8")
+    state = tmp_path / "state.snapshot"
+    state.write_bytes(b"retained runtime state")
+    result = _upgrade(repo_root, user, "1.4.0", advanced)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(user.read_text(encoding="utf-8")) == {"extraction": payload["extraction"]}
+    assert json.loads(advanced.read_text(encoding="utf-8")) == {"custom": "retained"}
+    assert state.read_bytes() == b"retained runtime state"
+    before = _snapshot(tmp_path)
+    assert _upgrade(repo_root, user, "1.4.0", advanced).returncode == 0
+    assert _snapshot(tmp_path) == before

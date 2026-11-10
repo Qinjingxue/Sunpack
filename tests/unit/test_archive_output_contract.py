@@ -13,8 +13,6 @@ from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.pipeline.coordinator.engine import PipelineEngine
-from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
-from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
 from tests.helpers.config_factory import make_config
 
 
@@ -56,19 +54,11 @@ def test_file_directory_collisions_share_worker_and_manifest_names(tmp_path, arc
     assert sorted(path.read_bytes() for path in output.rglob("*") if path.is_file()) == sorted(
         payload for _, payload in members if payload is not None
     )
-    manifest = archive_input_manifest(ArchiveInputDescriptor(str(archive), format_hint=archive_format))
-    assert manifest.ok
-    matched = collect_output_inventory(str(output)).verification_match(
-        manifest.entries, verify_crc=True, basename_mode="none",
-    )
-    assert matched["coverage"]["complete_files"] == 5
-    assert matched["missing_count"] == matched["mismatch_count"] == matched["size_mismatch_count"] == 0
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
 @pytest.mark.parametrize("sparse_version", ["0.1", "1.0"])
-@pytest.mark.parametrize("verify_enabled", [True, False])
-def test_unsupported_tar_payload_encoding_never_authorizes_source_cleanup(tmp_path, origin, sparse_version, verify_enabled):
+def test_unsupported_tar_payload_encoding_never_authorizes_source_cleanup(tmp_path, origin, sparse_version):
     # A successful worker plus valid preceding members used to hide unsupported
     # sparse content. Exercise the shared watch/CLI pipeline with deletion on.
     archive = tmp_path / "input.disguised"
@@ -87,7 +77,7 @@ def test_unsupported_tar_payload_encoding_never_authorizes_source_cleanup(tmp_pa
         stream.addfile(regular, io.BytesIO(b"ok!"))
         stream.addfile(target, io.BytesIO(content))
     config = make_config({"cli": {"quiet": True}, "recursive_extract": 1,
-                          "verification": {"enabled": verify_enabled},
+
                           "post_extract": {"archive_cleanup_mode": "d", "flatten_single_directory": False}})
 
     async def run():
@@ -99,19 +89,3 @@ def test_unsupported_tar_payload_encoding_never_authorizes_source_cleanup(tmp_pa
     assert response.summary.failed_count == 1
     assert all(failure.contains(FailureKind.UNSUPPORTED) for failure in response.summary.failures)
     assert archive.exists()
-
-
-def test_tar_metadata_budget_ignores_unrelated_values_but_bounds_names(tmp_path):
-    # Count caps do not bound a single metadata member. Large unknown values
-    # remain valid, whereas a useful field cannot trigger an unbounded read.
-    archive = tmp_path / "metadata.tar"
-    with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as stream:
-        for name, values in [("first", {"comment": "x" * (2 * 1024 * 1024)}),
-                             ("second", {"path": "y" * (2 * 1024 * 1024)})]:
-            info = tarfile.TarInfo(name)
-            info.pax_headers = values
-            stream.addfile(info)
-    manifest = archive_input_manifest(ArchiveInputDescriptor(str(archive), format_hint="tar"))
-    assert manifest.file_count == 1
-    assert manifest.expected_names == ["first"]
-    assert not manifest.archive_walk_complete

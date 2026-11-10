@@ -5,7 +5,6 @@ def with_detection_pipeline(
     processors: list[dict] | None = None,
 ) -> dict:
     result = dict(config or {})
-    result.setdefault("verification", {})
     scan_filters = [
         dict(rule) for rule in precheck or []
         if isinstance(rule, dict) and rule.get("name") in {"blacklist", "size_range"}

@@ -989,35 +989,14 @@ mod aes_verifier_tests {
 }
 
 fn zipcrypto_header_matches(password: &[u8], encrypted_header: &[u8; 12], expected: u8) -> bool {
-    ZipCryptoDecryptor::new(password, encrypted_header, expected).is_some()
-}
-
-/// Stateful ZipCrypto payload decryptor positioned after the 12-byte header.
-pub(crate) struct ZipCryptoDecryptor {
-    state: ZipCryptoState,
-}
-
-impl ZipCryptoDecryptor {
-    /// Consume the encryption header; `None` when its check byte rejects the password.
-    pub(crate) fn new(password: &[u8], encrypted_header: &[u8; 12], expected: u8) -> Option<Self> {
-        let mut state = ZipCryptoState::new();
-        for byte in password {
-            state.update_keys(*byte);
-        }
-        let mut last = 0u8;
-        for encrypted in encrypted_header {
-            last = encrypted ^ state.decrypt_byte();
-            state.update_keys(last);
-        }
-        (last == expected).then_some(Self { state })
+    let mut state = ZipCryptoState::new();
+    for byte in password { state.update_keys(*byte); }
+    let mut last = 0;
+    for encrypted in encrypted_header {
+        last = encrypted ^ state.decrypt_byte();
+        state.update_keys(last);
     }
-
-    pub(crate) fn decrypt(&mut self, buffer: &mut [u8]) {
-        for byte in buffer {
-            *byte ^= self.state.decrypt_byte();
-            self.state.update_keys(*byte);
-        }
-    }
+    last == expected
 }
 
 struct ZipCryptoState {

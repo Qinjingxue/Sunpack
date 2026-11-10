@@ -14,7 +14,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyFloat, PyInt, PyIterator, PyString};
 
 use crate::io::cancellation::Cancellation;
-use crate::io::json_rows::NativeJsonArray;
 use crate::io::resource_lifecycle::TrackedFile;
 
 const TEXT_CHUNK: usize = 16 * 1024;
@@ -206,14 +205,7 @@ impl<W: Write + Send> Writer<W> {
             self.tick(py)?;
             match frame {
                 Frame::Value(value, depth) => {
-                    if let Ok(array) = value.cast::<NativeJsonArray>() {
-                        self.flush(py)?;
-                        let array = array.get();
-                        let result =
-                            py.detach(|| array.write_json(&mut self.file, &self.cancellation));
-                        self.cancellation.check()?;
-                        result?;
-                    } else if value.is_none() {
+                    if value.is_none() {
                         self.bytes(py, b"null")?;
                     } else if value.is_instance_of::<PyString>() {
                         self.string(py, &value, true)?;

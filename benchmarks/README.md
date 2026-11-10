@@ -249,7 +249,7 @@ batches after checking binary and configuration fingerprints. For diagnosis,
 and collects pipeline timing when the worker is built with `-DSUP7Z_DEBUG=ON`.
 Writer thread counts use each worker binary's internal defaults.
 `--format` and `--no-mixed` restrict diagnostic runs. These direct worker tests
-exclude CLI/watch planning, recursive extraction, and post-extract verification.
+exclude CLI/watch planning, recursive extraction, and post-extract finalization.
 Compressed TAR codecs are measured as one outer stream layer for both engines.
 
 `memory many-tasks` measures memory _growth_ (not peak) of the two long-lived

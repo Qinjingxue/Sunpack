@@ -14,7 +14,7 @@ mod path_keys;
 mod postprocess;
 mod relations;
 mod scan;
-mod verification;
+mod output_names;
 mod wal;
 mod watch_journal;
 mod watch_store;
@@ -45,7 +45,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(failure_report::append_failure_report, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::publish_failure_report, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::stream_json, m)?)?;
-    m.add_class::<io::json_rows::NativeJsonArray>()?;
     m.add_function(wrap_pyfunction!(password::lists::read_password_file, m)?)?;
     m.add_function(wrap_pyfunction!(
         io::resource_lifecycle::read_shared_utf8_text,
@@ -138,7 +137,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scan::discovery::NativeEmbeddedBatch>()?;
     m.add_class::<scan::directory::NativeOutputInventory>()?;
     m.add_class::<scan::directory::NativeWorkerManifest>()?;
-    m.add_class::<verification::archive_manifest::NativeArchiveManifest>()?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_acquire, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_release, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_volume_cursor, m)?)?;
@@ -166,7 +164,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(relations::relations_detect_split_role, m)?)?;
     m.add_function(wrap_pyfunction!(relations::relations_logical_name, m)?)?;
     m.add_function(wrap_pyfunction!(
-        verification::paths::output_name_component,
+        output_names::output_name_component,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -203,14 +201,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         scan::progress_manifest::complete_progress_manifest,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        verification::stream_receipt::verify_stream_receipt,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        verification::inventory::match_output_inventory_coverage,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -281,14 +271,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         password::zip::zip_fast_verify_passwords_from_volumes,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::archive_state::archive_state_zip_manifest_native,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::archive_state::archive_state_tar_manifest_native,
         m
     )?)?;
     Ok(())

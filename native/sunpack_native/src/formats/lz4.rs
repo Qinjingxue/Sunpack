@@ -332,22 +332,9 @@ impl Index {
         result.set_item("structure.stream_count", self.frames)?;
         result.set_item("structure.block_count", self.blocks)?;
         result.set_item("structure.decoded_size", self.decoded_size)?;
-        result.set_item("stream_plan", self.stream_plan(py)?)?;
         Ok(result)
     }
 
-    pub(crate) fn stream_plan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let plan = PyDict::new(py);
-        plan.set_item("content_checksum_algorithm", "xxh32")?;
-        plan.set_item("input_bytes", self.end.saturating_sub(self.start))?;
-        plan.set_item("frames", self.frames)?;
-        plan.set_item("skippable_frames", self.skips)?;
-        plan.set_item("content_checked_frames", self.content_checksums)?;
-        plan.set_item("block_checked_frames", self.block_checksums)?;
-        plan.set_item("expected_size", self.decoded_size)?;
-        plan.set_item("complete", self.complete)?;
-        Ok(plan)
-    }
 }
 
 #[repr(C)]

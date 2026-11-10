@@ -17,7 +17,7 @@ from sunpack.runtime.cli.commands import config, doctor
 def test_cold_snapshot_reads_the_sources_it_registered(tmp_path, monkeypatch):
     preferred = tmp_path / "preferred.json"
     fallback = tmp_path / "fallback.json"
-    fallback.write_text('{"cli":{"language":"en"},"verification":{}}', encoding="utf-8")
+    fallback.write_text('{"cli":{"language":"en"}}', encoding="utf-8")
     monkeypatch.delenv(loader.OVERRIDES_ENV_VAR, raising=False)
     monkeypatch.setattr(loader, "_searched_config_paths", lambda filename, cwd=None:
         [preferred, fallback] if filename == loader.SIMPLE_CONFIG_FILENAME else [])
@@ -26,7 +26,7 @@ def test_cold_snapshot_reads_the_sources_it_registered(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "_CONFIG_DIRTY_SOURCES", set())
     monkeypatch.setattr(builtin, "password_file_source", lambda: SimpleNamespace(snapshot=None))
     monkeypatch.setattr(runtime, "_observe_config_sources", lambda:
-        preferred.write_text('{"cli":{"language":"zh"},"verification":{}}', encoding="utf-8"))
+        preferred.write_text('{"cli":{"language":"zh"}}', encoding="utf-8"))
 
     # A higher-priority file can appear while the cold reader arms its watcher.
     assert runtime.load_request_config()["cli"]["language"] == "en"
@@ -43,7 +43,7 @@ def test_explicit_diagnostics_reject_current_file_without_losing_last_good_confi
     and command boundaries together, without starting a worker or observer.
     """
     path = tmp_path / loader.SIMPLE_CONFIG_FILENAME
-    path.write_text('{"cli":{"language":"en"},"verification":{}}', encoding="utf-8")
+    path.write_text('{"cli":{"language":"en"}}', encoding="utf-8")
     monkeypatch.delenv(loader.OVERRIDES_ENV_VAR, raising=False)
     monkeypatch.setattr(loader, "_searched_config_paths", lambda filename, request_cwd=None: [tmp_path / filename])
     monkeypatch.setattr(runtime, "server_runtime_active", lambda: True)
@@ -79,7 +79,7 @@ def test_explicit_diagnostics_reject_current_file_without_losing_last_good_confi
         assert runtime.load_request_config(ctx.cwd)["cli"]["language"] == "en"
 
         # No event is required for an explicit diagnostic to see the repair.
-        path.write_text('{"cli":{"language":"zh"},"verification":{}}', encoding="utf-8")
+        path.write_text('{"cli":{"language":"zh"}}', encoding="utf-8")
         code, result = run_config("show")
         assert code == 0 and result.items[0]["cli"]["language"] == "zh"
         assert run_config("validate")[0] == 0

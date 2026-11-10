@@ -12,7 +12,6 @@ def make_config(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     config = deepcopy(payload or {})
     config.setdefault("cli", {}).setdefault("language", "en")
-    config.setdefault("verification", {})
     config.setdefault("filesystem", {}).setdefault("scan_filters", [])
     return normalize_config(config)
 

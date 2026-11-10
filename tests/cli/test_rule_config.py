@@ -4,7 +4,6 @@ from sunpack.core.config.schema import ConfigSchemaError, normalize_config
 from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
 )
-from sunpack.runtime.config_validation import validate_config_payload
 from tests.helpers.config_factory import make_config
 
 
@@ -26,22 +25,6 @@ def test_config_validate_checks_embedded_ratio_type():
 def test_normalization_rejects_internal_values_in_external_shorthand_fields(override, field):
     with pytest.raises(ConfigSchemaError, match=field):
         normalize_config({**_payload(), **override})
-
-
-def test_config_validate_checks_verification_methods_are_registered():
-    payload = _payload()
-    payload["verification"] = {
-        "methods": [
-            {"name": "output_presence", "enabled": True},
-            {"name": "missing_verification_method", "enabled": False},
-        ],
-    }
-
-    result = validate_config_payload(normalize_config(payload))
-
-    assert not result["ok"]
-    assert "output_presence" in result["available_verification_methods"]
-    assert any("Unknown verification method" in error for error in result["errors"])
 
 
 def test_rule_preflight_uses_native_syntax_for_direct_and_persistent_input():

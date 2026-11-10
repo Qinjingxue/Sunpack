@@ -603,7 +603,6 @@ namespace sunpack::sevenzip
             if (is_memory_hresult(hr))
                 if (auto *memory = current_native_memory_job(); memory && !memory->revoked.load())
                     memory->owner.retry(*memory);
-            if (format.Data4[5] == kLz4FormatId) read_lz4_receipt(archive, result);
             // Output callbacks have captured all item metadata. Release the
             // decoder and its cached dictionaries before draining disk output
             // or allocating a replay inventory under pressure.
@@ -625,9 +624,7 @@ namespace sunpack::sevenzip
 #else
             raw_extract_callback->finalize_output();
 #endif
-            // A stream receipt carries frame integrity separately from the
-            // generic per-item CRC fields populated by output finalization.
-            if (result.has_stream_receipt)
+            if (format.Data4[5] == kLz4FormatId)
                 for (auto &item : result.output_trace.items) item.crc_verified = false;
 
             last_hr = hr;

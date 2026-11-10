@@ -109,7 +109,8 @@ def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, car
     assert "段 3 (zip)" in first_tree and first_tree.count("密码未在密码表中") == 2
     assert "\n处理完成\n" not in output.out
     assert "使用新输入的密码再解压一轮" not in output.out
-    assert not output.err
+    assert output.err.count("[解压失败]") == 3
+    assert "密码未在密码表中" in output.err
     assert prompts[0] == "[命令行] 是否输入新密码并重试解压？(y/n)："
     root = assert_outputs(tmp_path)
     assert root == conflict.with_name("capture(1)")

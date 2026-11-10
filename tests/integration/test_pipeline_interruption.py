@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.pipeline.verification import VerificationScheduler
+from sunpack.pipeline.coordinator import archive_job
 from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken
 from sunpack.pipeline.coordinator.engine import PipelineEngine, _RequestRuntime
 from tests.helpers.config_factory import make_config
@@ -70,7 +70,7 @@ def test_stop_waiting_split_member_finishes_without_cancelling_its_owner(tmp_pat
     assert admission.reserve("one", origin, [str(first)]) is None
     assert admission.reserve("two", origin, [str(second)]) is None
     config = make_config({"post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False}})
-    verify = VerificationScheduler.verify
+    verify = archive_job.checkpoint_inputs
 
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -83,7 +83,7 @@ def test_stop_waiting_split_member_finishes_without_cancelling_its_owner(tmp_pat
             assert release.wait(10)
             return verify(*args, **kwargs)
 
-        monkeypatch.setattr(VerificationScheduler, "verify", gated_verify)
+        monkeypatch.setattr(archive_job, "checkpoint_inputs", gated_verify)
         async with PipelineEngine(config) as engine:
             registry = engine._path_leases
             register, replace = registry._register_waiter, registry.replace
@@ -217,7 +217,7 @@ def test_interruption_joins_verification_rolls_back_tree_and_keeps_completed_roo
         "post_extract": {"archive_cleanup_mode": "d", "flatten_single_directory": False},
     })
     release = threading.Event()
-    original = VerificationScheduler.verify
+    original = archive_job.checkpoint_inputs
     events = []
     completed_done = threading.Event()
     completed_output = []
@@ -236,15 +236,15 @@ def test_interruption_joins_verification_rolls_back_tree_and_keeps_completed_roo
         verifying = asyncio.Event()
         output = []
 
-        def verify(verifier, task, result, **kwargs):
+        def verify(task, result, **kwargs):
             if Path(task.main_path).name == "inner.blob":
                 assert completed_done.wait(10)
                 output.append(Path(result.out_dir))
                 loop.call_soon_threadsafe(verifying.set)
                 assert release.wait(10), "test did not release verifier"
-            return original(verifier, task, result, **kwargs)
+            return original(task, result, **kwargs)
 
-        monkeypatch.setattr(VerificationScheduler, "verify", verify)
+        monkeypatch.setattr(archive_job, "checkpoint_inputs", verify)
         token = CancellationToken()
         async with PipelineEngine(config) as engine:
             request = asyncio.create_task(engine.run(
@@ -452,18 +452,18 @@ def test_cli_control_returns_130_and_json_after_output_cleanup(tmp_path, monkeyp
     monkeypatch.setattr(extract, "load_request_config", lambda *a, **k: config)
     monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
     release = threading.Event()
-    verify_original = VerificationScheduler.verify
+    verify_original = archive_job.checkpoint_inputs
 
     async def scenario():
         loop = asyncio.get_running_loop()
         entered = asyncio.Event()
         output = []
-        def verify(verifier, task, result, **kwargs):
+        def verify(task, result, **kwargs):
             output.append(Path(result.out_dir))
             loop.call_soon_threadsafe(entered.set)
             assert release.wait(10)
-            return verify_original(verifier, task, result, **kwargs)
-        monkeypatch.setattr(VerificationScheduler, "verify", verify)
+            return verify_original(task, result, **kwargs)
+        monkeypatch.setattr(archive_job, "checkpoint_inputs", verify)
         protocol = persistent_process._PipeRequestProtocol(b"t" * 32,
             on_connected=lambda: None, on_closed=lambda: None,
             on_completed=lambda: None, on_shutdown=lambda: None)
@@ -498,4 +498,3 @@ def test_cli_control_returns_130_and_json_after_output_cleanup(tmp_path, monkeyp
         assert result["summary"]["interrupted"] and result["summary"]["cleanup_complete"]
         await protocol._output_task
     asyncio.run(scenario())
-

@@ -23,7 +23,6 @@ CONFIG_FIELD_PROVIDER_MODULES = (
     "sunpack.core.config.fields.passwords",
     "sunpack.core.config.fields.postprocess",
     "sunpack.core.config.fields.runtime",
-    "sunpack.core.config.fields.verification",
     "sunpack.core.config.fields.watch",
 )
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sunpack"
 version = "1.0.0"
-description = "Archive detection, extraction, and verification pipeline."
+description = "Archive detection, extraction, and recovery pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

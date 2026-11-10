@@ -1108,8 +1108,7 @@ Write-Step "Building Windows release with Nuitka"
     "sunpack.core.passwords.candidates",
         "sunpack.pipeline.extraction.internal",
         "sunpack.pipeline.discovery.relations.internal",
-        "sunpack.pipeline.postprocess.internal",
-        "sunpack.pipeline.verification.methods"
+        "sunpack.pipeline.postprocess.internal"
     )
 
     New-Item -ItemType Directory -Path $nuitkaEntryRoot -Force | Out-Null

@@ -11,8 +11,9 @@ The product runtime uses `sunpack_sevenzip_worker.exe`. The former in-process
 - extraction from files, volume sets, file ranges, concatenated ranges and patch-plan inputs
 - embedded 7-Zip decode backends and SunPack's optimized writer/runtime control
 
-Format, structure, encryption, and verification analysis stay in the Python/Rust
-pipeline. The worker reports structured extraction facts and operation results.
+Format, structure, encryption, and password analysis belong to Rust. The worker
+reports decode and output-finalization facts; the coordinator uses the final
+execution result without rereading source archives or output files.
 
 ## Requirements
 
@@ -78,7 +79,7 @@ Stderr remains diagnostic text.
 The codecs are `src/internal/worker_wire.hpp` and
 `../sunpack_native/src/scan/worker_wire.rs`. Python forwards bytes and receives
 decoded event envelopes; manifest rows and trace items stay in Rust throughout
-assembly and verification.
+assembly, progress reporting, and recursive discovery.
 
 | Tag | Value |
 | --- | --- |

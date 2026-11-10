@@ -317,7 +317,7 @@ impl NativeScanResult {
             return Ok(None);
         };
         let result = PyDict::new(py);
-        result.set_item("stream_plan", index.stream_plan(py)?)?;
+        result.set_item("structure_complete", index.complete)?;
         Ok(Some(result.unbind()))
     }
 
@@ -417,7 +417,6 @@ impl NativeScanResult {
                 row.set_item("eocd_offset", offset)?;
             }
             if let Some(index) = &candidate.lz4_index {
-                row.set_item("stream_plan", index.stream_plan(py)?)?;
                 row.set_item("error", index.error)?;
             }
             rows.append(row)?;
@@ -2237,7 +2236,7 @@ fn walk_tar_candidate(
                 "member_walk_checksums_and_end_blocks",
             ));
         }
-        let record = state.advance(&current, cursor, size, false, &mut |start, size| {
+        let record = state.advance(&current, cursor, size, &mut |start, size| {
             Ok(read_at(file, start, size)?.to_vec())
         });
         let record = match record {

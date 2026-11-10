@@ -905,10 +905,6 @@
     "analysis": {
       "zh": "压缩包分析",
       "en": "Archive analysis"
-    },
-    "verification": {
-      "zh": "结果验证",
-      "en": "Result verification"
     }
   },
   "fields": {
@@ -1315,40 +1311,6 @@
         "en": "Zstandard"
       }
     },
-    "/verification/enabled": {
-      "label": {
-        "zh": "结果验证",
-        "en": "Result verification"
-      }
-    },
-    "/verification/methods/@extraction_exit_signal/enabled": {
-      "label": {
-        "zh": "解压退出信号",
-        "en": "Extraction exit signal"
-      }
-    },
-    "/verification/methods/@output_presence/enabled": {
-      "label": {
-        "zh": "输出检查",
-        "en": "Output check"
-      }
-    },
-    "/verification/methods/@manifest_size_match/enabled": {
-      "label": {
-        "zh": "文件数量与大小",
-        "en": "File count and size"
-      }
-    },
-    "/verification/methods/@archive_test_crc/enabled": {
-      "label": {
-        "zh": "压缩包 CRC 验证",
-        "en": "Archive CRC verification"
-      },
-      "description": {
-        "zh": "使用压缩包校验信息检查完整性",
-        "en": "Check integrity using archive checksums"
-      }
-    },
     "/watch/event_log_retention_days": {
       "label": {
         "zh": "日志保留天数",
@@ -1434,22 +1396,6 @@
     "mtime_range": {
       "zh": "修改时间",
       "en": "Modification time"
-    },
-    "extraction_exit_signal": {
-      "zh": "解压退出信号",
-      "en": "Extraction exit signal"
-    },
-    "output_presence": {
-      "zh": "输出检查",
-      "en": "Output check"
-    },
-    "manifest_size_match": {
-      "zh": "文件数量与大小",
-      "en": "File count and size"
-    },
-    "archive_test_crc": {
-      "zh": "压缩包 CRC 验证",
-      "en": "Archive CRC verification"
     },
     "zip": {
       "zh": "ZIP",

@@ -677,7 +677,6 @@ class WatchEvents:
         return result
 
 
-
 class _NoItemsDict(dict):
     def items(self):
         raise AssertionError("ready scheduling must not scan active mappings")
@@ -1678,7 +1677,7 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
             output.mkdir(parents=True, exist_ok=True)
             (output / "payload.bin").write_bytes(b"payload")
             self.context.generated_outputs = {str(output)}
-            return _watch_summary(self.path, OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
+            return _watch_summary(self.path, OutcomeKind.COMPLETE_SUCCESS)
 
     watcher = _watcher(
         tmp_path,
@@ -1699,7 +1698,6 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
 def _watch_summary(
     path: str,
     kind: OutcomeKind,
-    verification: dict,
     *,
     recovery=None,
 ):
@@ -1709,7 +1707,6 @@ def _watch_summary(
                 path,
                 kind,
                 task_key=path,
-                verification=verification,
                 recovery=recovery,
             ),
         ),
@@ -1733,7 +1730,7 @@ def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
             (self.output_dir / "invalid.bin").write_bytes(b"invalid")
             return RunSummary(target_results=(TargetRunResult(
                 paths[0], OutcomeKind.FAILURE, error="boom",
-                failure=FailureInfo(kind=FailureKind.UNKNOWN, stage="extraction", message="boom"), verification={"decision_hint": "reject"},
+                failure=FailureInfo(kind=FailureKind.UNKNOWN, stage="extraction", message="boom"),
             ),))
 
     watcher = _watcher(
@@ -1770,16 +1767,13 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
             self.output_dir.mkdir(parents=True, exist_ok=True)
             (self.output_dir / "payload.bin").write_bytes(b"payload")
             if kind == OutcomeKind.PARTIAL_SUCCESS:
-                verification = {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}}
                 recovery = {"out_dir": str(self.output_dir)}
             else:
                 self.context.generated_outputs = {str(self.output_dir)}
-                verification = {"decision_hint": "accept"}
                 recovery = None
             return _watch_summary(
                 paths[0],
                 kind,
-                verification,
                 recovery=recovery,
             )
 
@@ -1803,7 +1797,6 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
     assert final.succeeded == 1
     assert (tmp_path / "out" / "sample" / "payload.bin").is_file()
     assert not (tmp_path / ".sunpack_watch_probes").exists()
-
 
 
 def _observation_version(value):
@@ -2378,7 +2371,7 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
         tmp_path,
         pipeline_engine=FakePipelineEngine(lambda _config: SimpleNamespace(
             context=SimpleNamespace(generated_outputs=set()),
-            run_targets=lambda paths: _watch_summary(paths[0], OutcomeKind.PARTIAL_SUCCESS, {}),
+            run_targets=lambda paths: _watch_summary(paths[0], OutcomeKind.PARTIAL_SUCCESS),
             recent_passwords=[],
         )),
     )
@@ -2706,8 +2699,6 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
     assert not watcher.state.pending_work_items()
 
 
-
-
 def test_watch_event_handler_cleans_moved_directory_source_without_arrival_enqueue(tmp_path):
     watch_root = tmp_path / "watched"
     watch_root.mkdir()
@@ -2790,7 +2781,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
             captured["output_dir"] = self.output_dir
             self.output_dir.mkdir(parents=True)
             (self.output_dir / "payload.bin").write_bytes(b"payload")
-            return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
+            return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS)
 
     watcher = _watcher(
         tmp_path,
@@ -3516,8 +3507,6 @@ def test_watch_scheduler_success_hints_do_not_create_new_password_sources(tmp_pa
     assert learned.succeeded == 1
     assert retried.processed == 0
     assert attempts == [("failed.zip", []), ("teacher.zip", [])]
-
-
 
 
 def test_watch_scheduler_writes_display_log_for_failures(tmp_path, monkeypatch):

@@ -49,7 +49,7 @@ class ArchiveInputPlanningStage:
         # Identity confirmation does not carry stream structure.
         # Embedded tasks already own the canonical plan; reuse it directly.
         if descriptor.format_hint == "lz4":
-            return not descriptor.analysis.get("stream_plan")
+            return not descriptor.analysis.get("structure_complete")
         return not _discovery_confirmed(task)
 
     def _analyze_task(self, task: ArchiveTask) -> ArchiveAnalysisReport:
@@ -117,7 +117,8 @@ class ArchiveInputPlanningStage:
         if execution_analysis:
             analysis["execution"] = execution_analysis
         selected_format = str(getattr(selected, "format", "") or "")
-        analysis.update(_stream_execution_analysis(selected, 0))
+        if selected_format == "lz4":
+            analysis["structure_complete"] = True
         analysis.update(_zip_password_analysis(selected, 0))
         updated = replace(
             descriptor,
@@ -154,7 +155,8 @@ class ArchiveInputPlanningStage:
                 "damage_flags": list(segment.damage_flags),
                 "segment_source": "analysis",
             }
-            analysis.update(_stream_execution_analysis(evidence, segment.start_offset))
+            if evidence.format == "lz4":
+                analysis["structure_complete"] = True
             analysis.update(_zip_password_analysis(evidence, segment.start_offset))
             if evidence.details.get("password_required"):
                 analysis["password_required"] = True
@@ -246,13 +248,3 @@ def _zip_password_analysis(evidence: ArchiveFormatEvidence | None, offset: int) 
         if isinstance(eocd, int) and eocd >= offset:
             return {"zip_eocd_offset": eocd - offset}
     return {}
-
-
-def _stream_execution_analysis(evidence: ArchiveFormatEvidence | None, offset: int) -> dict[str, Any]:
-    if evidence is None:
-        return {}
-    details = evidence.details
-    plans = details.get("stream_plans") or {}
-    # A sequence of embedded streams must never inherit the plan at offset zero.
-    plan = plans.get(str(offset)) if plans else (details.get("stream_plan") if offset == 0 else None)
-    return {"stream_plan": plan} if plan else {}
