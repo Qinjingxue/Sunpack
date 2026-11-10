@@ -52,12 +52,14 @@ def test_custom_text_sinks_and_forwarded_destinations_are_not_probed_by_writing(
     ("utf-8", ("├─ first", "│  ├─ nested", "│  │  └─ deep", "│  └─ next", "└─ last")),
     ("cp1252", ("+---first", "|   +---nested", "|   |   \\---deep", "|   \\---next", "\\---last")),
 ])
-def test_deep_sibling_tree_keeps_ancestor_bars_and_releases_rows(encoding, edges):
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["LF", "CRLF"])
+def test_deep_sibling_tree_keeps_ancestor_bars_and_releases_rows(encoding, edges, newline):
     # A single-child example cannot expose lost ancestor bars or a wrong last
     # connector inside a non-last segment. No archive/native I/O is needed.
     output, errors = io.BytesIO(), io.BytesIO()
-    stream = io.TextIOWrapper(output, encoding=encoding)
-    error_stream = io.TextIOWrapper(errors, encoding="cp1252" if encoding == "utf-8" else "utf-8")
+    # Exercise both newline conventions without depending on the host OS.
+    stream = io.TextIOWrapper(output, encoding=encoding, newline=newline)
+    error_stream = io.TextIOWrapper(errors, encoding="cp1252" if encoding == "utf-8" else "utf-8", newline=newline)
     reporter = RunReporter(stdout=stream, stderr=error_stream, verbose=True)
     reporter._scope_roots["root"] = None
     for key, children in (("root", ["first", "last"]), ("first", ["nested", "next"]),
@@ -74,7 +76,8 @@ def test_deep_sibling_tree_keeps_ancestor_bars_and_releases_rows(encoding, edges
     assert names == ["root", *edges]
     stem = "│  │    " if encoding == "utf-8" else "|   |     "
     assert stem + "detail" in text.splitlines()
-    assert "diagnostic" not in text and errors.getvalue().decode(error_stream.encoding) == "diagnostic\n"
+    assert "diagnostic" not in text
+    assert errors.getvalue().decode(error_stream.encoding) == "diagnostic" + newline
     assert not reporter._task_rows and not reporter._scope_roots
 
 
