@@ -1662,3 +1662,175 @@ def test_config_snapshot_claim_preserves_events_during_worker_reads(tmp_path, mo
             release.set()
             await reader
     asyncio.run(scenario())
+
+
+def test_resize_controls_update_live_stream_without_consuming_prompt_text(monkeypatch, tmp_path):
+    # Initial-size and stop tests miss live geometry changes or controls split
+    # across pipe reads while a password is pending. Exercise all on one real
+    # request stream, including a resize received before stdout is constructed.
+    from sunpack.runtime.cli import cli
+
+    async def scenario():
+        connection = _connect_protocol(_PipeTransport())
+        connection._payload = payload = {
+            "argv": ["scan", ".", "--_sunpack-terminal-size=120x30"],
+            "stdout_tty": True, "terminal_resize": True, "cwd": str(tmp_path),
+        }
+
+        def feed(data):
+            connection._buffer.extend(data)
+            connection._parse_input()
+
+        feed(struct.pack("!III", persistent_process._RESIZE_CONTROL, 80, 20))
+
+        async def fake_main(argv, **context):
+            assert argv == ["scan", "."]
+            stdout = context["stdout"]
+            assert stdout.terminal_size == (80, 20)
+            waiter = connection._input_waiter = asyncio.get_running_loop().create_future()
+            frame = struct.pack("!III", persistent_process._RESIZE_CONTROL, 41, 6)
+            for chunk in (frame[:1], frame[1:4], frame[4:9]):
+                feed(chunk)
+                assert not waiter.done()
+                assert stdout.terminal_size == (80, 20)
+            # Reserved bytes inside an already length-framed password remain
+            # password data, not out-of-band controls.
+            password = b"quietQ\xff\xff\xff\xfe\n"
+            feed(frame[9:] + struct.pack("!I", len(password)) + password[:3])
+            assert stdout.terminal_size == (41, 6)
+            assert not waiter.done()
+            feed(password[3:])
+            assert await waiter == password.decode("utf-8", "replace")
+            feed(b"\xff" * 4)
+            assert connection._cancellation.cancelled
+            assert not connection._buffer
+            return 130
+
+        monkeypatch.setattr(cli, "async_main", fake_main)
+        try:
+            assert await persistent_process._execute_streaming_request_async(payload, connection) == 130
+            assert connection._stdout is None
+        finally:
+            await connection._finish_after_output()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("acknowledge, enabled", [(True, True), (False, True), (True, False)])
+def test_client_resize_negotiation_and_prompt_resume(monkeypatch, acknowledge, enabled):
+    # An old resident source runtime shares python.exe's build ID. It must not
+    # receive a new control unless it acknowledges capability. Prompt resume
+    # also catches a resize whose console event was consumed by line input.
+    from contextlib import contextmanager
+    from sunpack.core.platform.windows import console_cancel
+
+    output = io.StringIO()
+    output.terminal_size = os.terminal_size((120, 30))
+    monkeypatch.setattr(persistent_process.sys, "stdout", output)
+    controls = []
+
+    class Controls:
+        def __init__(self, cancel, *, enabled, on_resize):
+            self.on_resize = on_resize
+            controls.append(self)
+
+        def __enter__(self):
+            self.resized()  # Before the server acknowledges: no control sent.
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def resized(self):
+            if self.on_resize is not None:
+                self.on_resize()
+
+        @contextmanager
+        def prompt(self):
+            yield
+            output.terminal_size = os.terminal_size((41, 6))
+            self.resized()
+            self.resized()  # Duplicate console events do not resend geometry.
+
+    monkeypatch.setattr(console_cancel, "ConsoleCancellation", Controls)
+    wire = ((struct.pack("!BI", 4, 0) if acknowledge else b"")
+            + struct.pack("!BI", 3, 0) + struct.pack("!BIi", 0, 4, 0))
+
+    class Connection:
+        data = io.BytesIO(wire)
+        sent = bytearray()
+
+        def recv(self, size):
+            return self.data.read(min(size, 2))
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+    connection = Connection()
+    assert persistent_process._recv_stream(
+        connection, io.StringIO("quietQpassword\n"), enable_resize=enabled,
+    )["exit_code"] == 0
+    password = b"quietQpassword\n"
+    expected = struct.pack("!I", len(password)) + password
+    if acknowledge and enabled:
+        expected = (struct.pack("!III", persistent_process._RESIZE_CONTROL, 120, 30)
+                    + struct.pack("!III", persistent_process._RESIZE_CONTROL, 41, 6) + expected)
+    assert connection.sent == expected
+    assert output.getvalue() == ""
+
+
+@pytest.mark.parametrize("stdout_tty, stdin_tty", [(True, True), (False, True), (True, False)])
+def test_resize_capability_round_trips_only_for_interactive_clients(monkeypatch, tmp_path, stdout_tty, stdin_tty):
+    # Control-only tests bypass the request header and would miss an omitted
+    # capability flag or an acknowledgement leaked to redirected/old clients.
+    from sunpack.runtime.cli import cli
+
+    build_id = b"0" * 16
+    token = b"t" * 32
+
+    class Connection:
+        sent = bytearray()
+        response = io.BytesIO(persistent_process._STREAM_MAGIC + build_id)
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            return self.response.read(size)
+
+        def close(self):
+            pass
+
+    client = Connection()
+    expected = stdout_tty and stdin_tty
+    monkeypatch.setattr(persistent_process, "_read_state", lambda: ("test", token))
+    monkeypatch.setattr(persistent_process, "_open_pipe", lambda _name: client)
+    monkeypatch.setattr(persistent_process, "_runtime_binary_build_id", lambda: build_id)
+
+    def receive(_connection, *, enable_cancel, enable_resize):
+        assert enable_cancel and enable_resize == expected
+        return {"exit_code": 0}
+
+    monkeypatch.setattr(persistent_process, "_recv_stream", receive)
+    assert persistent_process._try_send({
+        "argv": ["s", "."], "cwd": str(tmp_path),
+        "stdout_tty": stdout_tty, "stdin_tty": stdin_tty,
+    }) == {"exit_code": 0}
+
+    async def fake_main(_argv, **_context):
+        return 0
+
+    monkeypatch.setattr(cli, "async_main", fake_main)
+
+    async def scenario():
+        writer = _PipeTransport()
+        server = _connect_protocol(writer)
+        server._buffer.extend(client.sent)
+        payload = server._parse_request()
+        assert payload["terminal_resize"] == expected
+        await server._run_request(payload)
+        handshake = persistent_process._STREAM_MAGIC + build_id
+        acknowledgement = struct.pack("!BI", 4, 0) if expected else b""
+        assert writer.wire == handshake + acknowledgement + struct.pack("!BIi", 0, 4, 0)
+
+    asyncio.run(scenario())

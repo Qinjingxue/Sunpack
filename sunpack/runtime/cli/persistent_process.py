@@ -64,6 +64,8 @@ def _runtime_binary_stamp() -> str:
 _RUNTIME_BINARY_STAMP = _runtime_binary_stamp()
 _MAX_FIELD_BYTES = 16 * 1024 * 1024
 _TERMINAL_SIZE_ARG = "--_sunpack-terminal-size="
+_CANCEL_CONTROL = 0xFFFFFFFF
+_RESIZE_CONTROL = 0xFFFFFFFE
 _PIPE_PREFIX = r"\\.\pipe\SunPack-"
 
 
@@ -373,7 +375,8 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
             return None
         flags = ((1 if payload.get("shutdown") else 0)
                  | (2 if payload.get("stdout_tty") else 0)
-                 | (4 if payload.get("stdin_tty") else 0))
+                 | (4 if payload.get("stdin_tty") else 0)
+                 | (8 if payload.get("stdout_tty") and payload.get("stdin_tty") else 0))
         build_id = _runtime_binary_build_id()
         request_started = True
         connection.sendall(_REQUEST_MAGIC + build_id + token + struct.pack("!III", flags, len(cwd), len(argv_values)))
@@ -384,7 +387,11 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
             connection.sendall(item)
         if _recv_exact(connection, 4) != _STREAM_MAGIC or _recv_exact(connection, len(build_id)) != build_id:
             return _delivery_uncertain_response(payload, "invalid response handshake")
-        return _recv_stream(connection, enable_cancel=bool(argv_values and canonical_command(argv_values[0]) in {"extract", "scan"}))
+        return _recv_stream(
+            connection,
+            enable_cancel=bool(argv_values and canonical_command(argv_values[0]) in {"extract", "scan"}),
+            enable_resize=bool(flags & 8),
+        )
     except (EOFError, OSError, ValueError) as exc:
         if request_started:
             return _delivery_uncertain_response(payload, exc)
@@ -492,6 +499,8 @@ class _PipeRequestProtocol(asyncio.Protocol):
         self._argv_remaining = 0
         self._next_arg_size: int | None = None
         self._input_size: int | None = None
+        self._terminal_size: os.terminal_size | None = None
+        self._stdout: _AsyncConnectionTextStream | None = None
         self._cancellation = CancellationToken()
         self._input_waiter: asyncio.Future[str] | None = None
         self._request_task: asyncio.Task[None] | None = None
@@ -538,6 +547,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
         # owns the parsed payload; retain no transport or partial input here.
         self._buffer.clear()
         self._payload = None
+        self._stdout = None
         self._output_queue.close()
         waiter, self._input_waiter = self._input_waiter, None
         self._input_size = None
@@ -582,6 +592,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
                 "shutdown": bool(flags & 1),
                 "stdout_tty": bool(flags & 2),
                 "stdin_tty": bool(flags & 4),
+                "terminal_resize": bool(flags & 8) and bool(flags & 2),
             }
             self._argv_remaining = int(argc)
             self._next_arg_size = int(cwd_size)
@@ -619,9 +630,26 @@ class _PipeRequestProtocol(asyncio.Protocol):
         return payload
 
     def _parse_input(self) -> None:
-        # Reserved length is an out-of-band stop control, valid even while a
-        # password prompt owns stdin. It never becomes prompt text.
-        while self._input_size is None and len(self._buffer) >= 4 and self._buffer[:4] == b"\xff" * 4:
+        # Reserved lengths carry controls between complete password frames.
+        # Leave partial controls buffered; never reinterpret their dimensions
+        # as prompt input, even when a prompt is pending.
+        while self._input_size is None and len(self._buffer) >= 4:
+            kind = struct.unpack("!I", self._buffer[:4])[0]
+            if kind == _RESIZE_CONTROL:
+                if not (self._payload or {}).get("terminal_resize"):
+                    raise ValueError("persistent terminal resize was not negotiated")
+                if len(self._buffer) < 12:
+                    return
+                _, columns, lines = struct.unpack("!III", self._buffer[:12])
+                if not (0 < columns <= 32767 and 0 < lines <= 32767):
+                    raise ValueError("invalid persistent terminal size")
+                del self._buffer[:12]
+                self._terminal_size = os.terminal_size((columns, lines))
+                if self._stdout is not None:
+                    self._stdout.terminal_size = self._terminal_size
+                continue
+            if kind != _CANCEL_CONTROL:
+                break
             del self._buffer[:4]
             first = not self._cancellation.cancelled
             self._cancellation.cancel()
@@ -675,6 +703,11 @@ class _PipeRequestProtocol(asyncio.Protocol):
                     queue_ms=max(0.0, (started_at - self._connected_at) * 1000.0),
                 )
             await self.send_frame(_STREAM_MAGIC + _runtime_binary_build_id())
+            if payload.get("terminal_resize"):
+                # Old clients never request this frame. New clients do not send
+                # resize controls until this acknowledgement, so an older
+                # resident source runtime continues to work without a restart.
+                await self.send_frame(struct.pack("!BI", 4, 0))
             if payload.get("shutdown"):
                 await self.send_frame(struct.pack("!BIi", 0, 4, 0))
                 await self.flush_output()
@@ -994,18 +1027,46 @@ def _recv_exact(connection, size: int) -> bytes:
     return bytes(chunks)
 
 
-def _recv_stream(connection, input_stream=None, *, enable_cancel=True) -> dict[str, Any]:
+def _recv_stream(connection, input_stream=None, *, enable_cancel=True, enable_resize=False) -> dict[str, Any]:
     from sunpack.core.platform.windows.console_cancel import ConsoleCancellation
 
     lock = threading.Lock()
+    resize_supported = False
+    last_size = None
+
     def send(data):
         with lock:
             connection.sendall(data)
-    with ConsoleCancellation(lambda: send(b"\xff" * 4), enabled=enable_cancel) as controls:
-        return _recv_stream_frames(connection, input_stream, controls=controls, send=send)
+
+    def resized():
+        nonlocal last_size
+        if not resize_supported:
+            return
+        from sunpack.pipeline.coordinator.reporting import _terminal_size
+
+        with lock:
+            size = _terminal_size(sys.stdout)
+            if size != last_size and 0 < size.columns <= 32767 and 0 < size.lines <= 32767:
+                connection.sendall(struct.pack("!III", _RESIZE_CONTROL, *size))
+                last_size = size
+
+    def enable_terminal_resize():
+        nonlocal resize_supported
+        if enable_resize:
+            resize_supported = True
+            controls.resized()
+
+    with ConsoleCancellation(
+        lambda: send(struct.pack("!I", _CANCEL_CONTROL)), enabled=enable_cancel,
+        on_resize=resized if enable_resize else None,
+    ) as controls:
+        return _recv_stream_frames(
+            connection, input_stream, controls=controls, send=send,
+            enable_terminal_resize=enable_terminal_resize,
+        )
 
 
-def _recv_stream_frames(connection, input_stream=None, *, controls, send) -> dict[str, Any]:
+def _recv_stream_frames(connection, input_stream=None, *, controls, send, enable_terminal_resize=lambda: None) -> dict[str, Any]:
     input_stream = sys.stdin if input_stream is None else input_stream
     while True:
         kind, size = struct.unpack("!BI", _recv_exact(connection, 5))
@@ -1016,7 +1077,11 @@ def _recv_stream_frames(connection, input_stream=None, *, controls, send) -> dic
             if size != 4:
                 raise ValueError("invalid persistent final frame")
             return {"exit_code": struct.unpack("!i", payload)[0], "stdout": "", "stderr": ""}
-        if kind == 3:
+        if kind == 4:
+            if size:
+                raise ValueError("invalid persistent resize acknowledgement")
+            enable_terminal_resize()
+        elif kind == 3:
             with controls.prompt():
                 try:
                     line = input_stream.readline() if input_stream is not None else ""
@@ -1125,8 +1190,9 @@ async def _execute_streaming_request_async(
         connection.output_queue,
         1,
         is_tty=bool(payload.get("stdout_tty")),
-        terminal_size=terminal_size,
+        terminal_size=connection._terminal_size or terminal_size,
     )
+    connection._stdout = stdout
     stderr = _AsyncConnectionTextStream(loop, connection.output_queue, 2, is_tty=False)
     try:
         return int(
@@ -1146,6 +1212,7 @@ async def _execute_streaming_request_async(
         await stderr.awrite(I18nContext(load_cli_language_from_config(request_cwd)).t("cli.persistent_request_failed", error=exc) + "\n")
         return 1
     finally:
+        connection._stdout = None
         await connection.flush_output()
 
 

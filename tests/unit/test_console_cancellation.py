@@ -71,3 +71,79 @@ def test_console_startup_failures_release_resources(monkeypatch, failure_stage):
     assert controls._stop is None
     assert controls._main_thread is None
     controls.__exit__()
+
+
+@pytest.mark.parametrize("already_enabled, fail_start", [(False, False), (True, False), (False, True)])
+def test_resize_reuses_console_listener_and_restores_only_its_mode_bit(monkeypatch, already_enabled, fail_start):
+    # Transport mocks do not exercise console mode ownership or resize input
+    # dispatch. Check listener reuse and failure cleanup without OS waits.
+    mode = 7 | (8 if already_enabled else 0)
+    kernel = Mock()
+    kernel.GetStdHandle.return_value = 100
+    kernel.CreateEventW.return_value = 101
+    kernel.OpenThread.return_value = 102
+    kernel.SetConsoleCtrlHandler.return_value = True
+
+    def get_mode(_handle, pointer):
+        pointer._obj.value = mode
+        return True
+
+    def set_mode(_handle, value):
+        nonlocal mode
+        mode = value
+        return True
+
+    kernel.GetConsoleMode.side_effect = get_mode
+    kernel.SetConsoleMode.side_effect = set_mode
+    monkeypatch.setattr(console_cancel.ctypes, "WinDLL", lambda *_args, **_kwargs: kernel)
+    threads = []
+
+    class Thread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+            self.started = False
+            threads.append(self)
+
+        def start(self):
+            if fail_start:
+                raise RuntimeError("listener start failed")
+            self.started = True
+
+        def join(self):
+            assert self.started
+            self.started = False
+
+    monkeypatch.setattr(console_cancel, "threading", SimpleNamespace(Thread=Thread, Event=console_cancel.threading.Event))
+    changes, cancels = [], []
+    controls = console_cancel.ConsoleCancellation(lambda: cancels.append(True), on_resize=lambda: changes.append(mode))
+    if fail_start:
+        with pytest.raises(RuntimeError, match="listener start failed"):
+            controls.__enter__()
+    else:
+        with controls:
+            assert len(threads) == 1 and mode & 8
+            assert len(changes) == 1
+            kernel.WaitForMultipleObjects.side_effect = [1, 1, 0]
+            events = iter((4, 1))
+
+            def read_event(_input, record, _count, count):
+                record._obj.kind = next(events)
+                record._obj.event.key.down = True
+                record._obj.event.key.char = "Q"
+                count._obj.value = 1
+                return True
+
+            kernel.ReadConsoleInputW.side_effect = read_event
+            controls._listen()
+            assert len(changes) == 2 and cancels == [True]
+            assert len(threads) == 1
+            with controls.prompt():
+                assert not threads[0].started
+            assert len(changes) == 3
+            mode |= 0x20  # An unrelated mode change is not ours to undo.
+    assert bool(mode & 8) == already_enabled
+    if not fail_start:
+        assert mode & 0x20
+    assert all(not thread.started for thread in threads)
+    assert controls._stop is None
+    assert controls._main_thread is None

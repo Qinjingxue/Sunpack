@@ -24,6 +24,129 @@ def _success(out_dir):
     )
 
 
+def _screen(text):
+    """Decode the panel's VT subset independently of its frame cache."""
+    lines, row, column = {}, 0, 0
+    for token in re.findall(r"\033\[\d*[ABJK]|\r|\n|[^\033\r\n]+", text):
+        if token.startswith("\033["):
+            count = int(token[2:-1] or "1")
+            if token[-1] == "A":
+                row = max(0, row - count)
+            elif token[-1] == "B":
+                row += count
+            elif token[-1] == "J":
+                lines = {i: value for i, value in lines.items() if i < row}
+            else:
+                assert token == "\033[2K"
+                lines[row] = ""
+        elif token == "\r":
+            column = 0
+        elif token == "\n":
+            row, column = row + 1, 0
+        else:
+            old = lines.get(row, "")
+            lines[row] = old[:column] + token + old[column + len(token):]
+            column += len(token)
+    return [lines.get(i, "") for i in range(row + 1)], column
+
+
+def test_incremental_panel_preserves_cursor_rows_and_completed_history(tmp_path):
+    # Raw-text checks cannot detect stale suffixes or cursor drift after an
+    # unchanged tail. Decode repeated lifecycle/progress updates and scope flush.
+    from tests.helpers.archive_tasks import make_archive_task
+
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    stream.supports_terminal_updates = True
+    stream.terminal_size = os.terminal_size((100, 10))
+    reporter = RunReporter("en", stdout=stream)
+    tasks = [make_archive_task(tmp_path / f"item_{i}.zip") for i in range(2)]
+    reporter.tasks_discovered(1, tasks)
+
+    def check(history=()):
+        expected = list(history) + list(reporter._scope_lines(reporter._scope_roots, columns=100)) + [""]
+        assert _screen(stream.getvalue()) == (expected, 0)
+
+    check()
+    before = len(stream.getvalue())
+    reporter.task_started(tasks[0])
+    patch = stream.getvalue()[before:]
+    assert patch.count("\033[2K") == 1 and "item_1.zip" not in patch
+    check()
+    before = stream.getvalue()
+    reporter.task_status(tasks[0], "preparing")
+    assert stream.getvalue() == before
+    for event in ({"event": "space_blocked"}, {"event": "space_resumed"},
+                  {"type": "progress", "completed_bytes": 50, "total_bytes": 100}):
+        reporter._last_render_at = 0
+        reporter.task_progress(tasks[0], event)
+        check()
+    reporter.task_finished(tasks[0], _success(tmp_path / "out"), 1)
+    check()
+    history = list(reporter._scope_lines((reporter._row_key(tasks[0]),)))
+    reporter.scope_finished(tasks[0])
+    check(history)
+    reporter.pause_panel()
+    assert _screen(stream.getvalue()) == (history + [""], 0)
+    reporter.task_status(tasks[1], "extracting")
+    reporter.resume_panel()
+    check(history)
+    reporter._print("a log message")
+    check([*history, "a log message"])
+
+
+@pytest.mark.parametrize("action", ["refresh", "pause", "log", "finish", "write_error", "flush_error"])
+def test_panel_reanchors_after_resize_or_uncertain_output(tmp_path, action):
+    # A resized or partly accepted frame has no trustworthy cursor origin.
+    # Clearing by its former logical height can erase completed output above it.
+    from tests.helpers.archive_tasks import make_archive_task
+
+    class Output(io.StringIO):
+        terminal_size = os.terminal_size((100, 10))
+        supports_terminal_updates = True
+        failure = ""
+
+        def isatty(self):
+            return True
+
+        def write(self, text):
+            if self.failure == "write_error":
+                self.failure = ""
+                super().write(text[:6])
+                raise BlockingIOError("partially accepted frame")
+            return super().write(text)
+
+        def flush(self):
+            if self.failure == "flush_error":
+                self.failure = ""
+                raise BlockingIOError("uncertain flush")
+
+    stream = Output()
+    reporter = RunReporter("en", stdout=stream)
+    tasks = [make_archive_task(tmp_path / f"item_{i}.zip") for i in range(2)]
+    reporter.tasks_discovered(1, tasks)
+    if action.endswith("error"):
+        stream.failure = action
+        with pytest.raises(BlockingIOError):
+            reporter.task_started(tasks[0])
+    else:
+        stream.terminal_size = os.terminal_size((30, 4))
+    before = len(stream.getvalue())
+    if action == "pause":
+        reporter.pause_panel()
+        reporter.resume_panel()
+    elif action == "log":
+        reporter._print("preserve this log")
+    elif action == "finish":
+        reporter.scope_finished(tasks[0])
+    else:
+        reporter.task_status(tasks[0], "extracting")
+    patch = stream.getvalue()[before:]
+    anchor = "\x18\r\n" if action.endswith("error") else "\r\n"
+    assert patch.startswith(anchor) and not re.search(r"\033\[\d+A", patch)
+    assert reporter._rendered_lines < stream.terminal_size.lines
+
+
 def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tmp_path, monkeypatch):
     # One tree checks routing, stable grouping, no task retention, and viewport
     # bounds; former flat-row tests could not detect cross-segment updates.

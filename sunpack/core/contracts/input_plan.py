@@ -77,6 +77,8 @@ class InputCheckpoint:
     files_written: int = 0
     bytes_written: int = 0
     recovered_complete_files: int = 0
+    # A policy-discarded receipt is a reason to rerun, never live evidence.
+    discarded_recoverable_output: bool = False
 
     @property
     def blockers(self) -> frozenset[str]:
@@ -102,6 +104,7 @@ class InputCheckpoint:
             "failure": self.failure.to_dict() if self.failure else None,
             "files_written": self.files_written, "bytes_written": self.bytes_written,
             "recovered_complete_files": self.recovered_complete_files,
+            "discarded_recoverable_output": self.discarded_recoverable_output,
         }
 
     @classmethod
@@ -114,6 +117,7 @@ class InputCheckpoint:
             FailureInfo.from_dict(value.get("failure")),
             int(value["files_written"]), int(value["bytes_written"]),
             int(value.get("recovered_complete_files") or 0),
+            bool(value.get("discarded_recoverable_output")),
         )
 
 
@@ -161,7 +165,8 @@ class InputRecovery:
                                    for item in self.checkpoints),
                              relocate(self.output_dir), self.input_count)
 
-    def select(self, inputs: tuple[LogicalArchiveInput, ...], generation: tuple, *, password_changed: bool) -> tuple[tuple[LogicalArchiveInput, ...], InputRecovery]:
+    def select(self, inputs: tuple[LogicalArchiveInput, ...], generation: tuple, *, password_changed: bool,
+               recover_partial: bool = False) -> tuple[tuple[LogicalArchiveInput, ...], InputRecovery]:
         """Refine a discovered plan and wake only inputs whose dependencies changed."""
         by_id = {item.input.input_id: item for item in self.checkpoints}
         remaining = set(by_id)
@@ -205,7 +210,9 @@ class InputRecovery:
                 unchanged = current == previous.generation and same_mapping
             else:
                 unchanged = current == previous.generation and node.descriptor.same_retry_input(previous.input.descriptor)
-            if unchanged and (previous.complete or not (password_changed and "password" in previous.blockers)):
+            wake_failed = (password_changed and "password" in previous.blockers
+                           or recover_partial and previous.discarded_recoverable_output)
+            if unchanged and (previous.complete or not wake_failed):
                 carried.append(replace(previous, input=node))
             else:
                 selected.append(node)

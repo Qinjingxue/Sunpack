@@ -25,6 +25,7 @@ constexpr char kStreamMagic[] = "SPS2";
 constexpr char kRuntimeIdentityArgumentPrefix[] = "--_sunpack-runtime-id=";
 constexpr char kTerminalSizeArgumentPrefix[] = "--_sunpack-terminal-size=";
 constexpr std::size_t kMaxFieldBytes = 16u * 1024u * 1024u;
+constexpr std::uint32_t kResizeControl = 0xfffffffeu;
 
 std::wstring current_executable_path() {
     std::vector<wchar_t> buffer(32768);
@@ -381,10 +382,18 @@ std::string read_input_line() {
 // it may already be executing, and resending it could run the command twice.
 enum class RequestOutcome { NotDelivered, Completed, DeliveryUncertain };
 
+bool supports_cancellation(const std::vector<std::wstring>& arguments) {
+    return !arguments.empty() &&
+        (arguments[0] == L"extract" || arguments[0] == L"e" || arguments[0] == L"scan" || arguments[0] == L"s");
+}
+
 class ConsoleCancellation {
     inline static std::mutex active_mutex_;
     inline static ConsoleCancellation* active_ = nullptr;
-    HANDLE pipe_, input_ = INVALID_HANDLE_VALUE, stop_ = nullptr, main_thread_ = nullptr;
+    HANDLE pipe_, input_ = INVALID_HANDLE_VALUE, output_ = INVALID_HANDLE_VALUE, stop_ = nullptr, main_thread_ = nullptr;
+    bool enabled_, window_input_added_ = false;
+    SHORT last_columns_ = 0, last_rows_ = 0;
+    std::atomic<bool> resize_supported_{false};
     std::thread listener_;
     std::mutex write_mutex_;
     std::atomic<bool> sent_{false}, prompt_{false};
@@ -403,7 +412,9 @@ class ConsoleCancellation {
             INPUT_RECORD record{};
             DWORD count = 0;
             if (!ReadConsoleInputW(input_, &record, 1, &count)) return;
-            if (count && record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown) {
+            if (count && record.EventType == WINDOW_BUFFER_SIZE_EVENT) {
+                resized();
+            } else if (enabled_ && count && record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown) {
                 const wchar_t key = record.Event.KeyEvent.uChar.UnicodeChar;
                 if (key == L'q' || key == L'Q') cancel();
             }
@@ -413,6 +424,7 @@ class ConsoleCancellation {
         if (stop_) {
             ResetEvent(stop_);
             listener_ = std::thread([this] { listen(); });
+            resized();
         }
     }
     void join() {
@@ -422,15 +434,21 @@ class ConsoleCancellation {
         }
     }
 public:
-    ConsoleCancellation(HANDLE pipe, bool enabled) : pipe_(pipe) {
-        if (!enabled) return;
+    ConsoleCancellation(HANDLE pipe, bool enabled, bool terminal_resize) : pipe_(pipe), enabled_(enabled) {
+        if (!enabled && !terminal_resize) return;
         input_ = GetStdHandle(STD_INPUT_HANDLE);
         DWORD mode = 0;
         if (!GetConsoleMode(input_, &mode)) return;
         stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!stop_) return;
-        main_thread_ = OpenThread(THREAD_TERMINATE, FALSE, GetCurrentThreadId());
-        {
+        if (terminal_resize) {
+            output_ = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (!(mode & ENABLE_WINDOW_INPUT) && SetConsoleMode(input_, mode | ENABLE_WINDOW_INPUT)) {
+                window_input_added_ = true;
+            }
+        }
+        if (enabled_) {
+            main_thread_ = OpenThread(THREAD_TERMINATE, FALSE, GetCurrentThreadId());
             std::lock_guard lock(active_mutex_);
             active_ = this;
             SetConsoleCtrlHandler(control, TRUE);
@@ -440,6 +458,28 @@ public:
         } catch (...) {
             close();
             throw;
+        }
+    }
+    void enable_resize() {
+        resize_supported_ = true;
+        resized();
+    }
+    void resized() {
+        if (!resize_supported_) return;
+        std::lock_guard lock(write_mutex_);
+        CONSOLE_SCREEN_BUFFER_INFO screen{};
+        if (!GetConsoleScreenBufferInfo(output_, &screen)) return;
+        const SHORT columns = screen.srWindow.Right - screen.srWindow.Left + 1;
+        const SHORT rows = screen.srWindow.Bottom - screen.srWindow.Top + 1;
+        if (columns <= 0 || rows <= 0) return;
+        if (columns == last_columns_ && rows == last_rows_) return;
+        std::string frame;
+        append_u32(frame, kResizeControl);
+        append_u32(frame, static_cast<std::uint32_t>(columns));
+        append_u32(frame, static_cast<std::uint32_t>(rows));
+        if (write_all(pipe_, frame.data(), frame.size())) {
+            last_columns_ = columns;
+            last_rows_ = rows;
         }
     }
     void cancel() {
@@ -462,6 +502,11 @@ public:
                 active_ = nullptr;
                 SetConsoleCtrlHandler(control, FALSE);
             }
+        }
+        if (window_input_added_) {
+            DWORD mode = 0;
+            if (GetConsoleMode(input_, &mode)) SetConsoleMode(input_, mode & ~ENABLE_WINDOW_INPUT);
+            window_input_added_ = false;
         }
         if (stop_) { CloseHandle(stop_); stop_ = nullptr; }
         if (main_thread_) { CloseHandle(main_thread_); main_thread_ = nullptr; }
@@ -500,7 +545,9 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     }
     DWORD input_mode = 0;
     const bool stdin_tty = GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode) != 0;
-    append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u));
+    const bool terminal_resize = stdout_tty && stdin_tty;
+    append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u) |
+                     (terminal_resize ? 8u : 0u));
     append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
     append_u32(wire, static_cast<std::uint32_t>(arguments.size() + !terminal_size.empty()));
     if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, cwd.data(), cwd.size())) {
@@ -525,7 +572,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         memcmp(build_id.data(), runtime_build_id.data(), build_id.size()) != 0) {
         return RequestOutcome::DeliveryUncertain;
     }
-    ConsoleCancellation controls(pipe, !arguments.empty() && (arguments[0] == L"extract" || arguments[0] == L"e"));
+    ConsoleCancellation controls(pipe, supports_cancellation(arguments), terminal_resize);
     while (true) {
         std::array<char, 5> header{};
         if (!read_all(pipe, header.data(), header.size())) break;
@@ -541,6 +588,10 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         }
         if (kind == 1) write_stream(STD_OUTPUT_HANDLE, payload);
         else if (kind == 2) write_stream(STD_ERROR_HANDLE, payload);
+        else if (kind == 4) {
+            if (size != 0 || !terminal_resize) break;
+            controls.enable_resize();
+        }
         else if (kind == 3) {
             controls.pause();
             const std::string input = read_input_line();

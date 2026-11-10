@@ -42,12 +42,14 @@ def password_retry_failures(summary: RunSummary) -> dict[str, FailureInfo]:
             if result.failure.details.get("input_recovery")}
 
 
-def apply_input_retry(task, failure: FailureInfo | None, generation: tuple, *, password_changed: bool = True) -> None:
+def apply_input_retry(task, failure: FailureInfo | None, generation: tuple, *, password_changed: bool = True,
+                      recover_partial: bool = False) -> None:
     recovery = InputRecovery.from_failure(failure)
     if not recovery.checkpoints or not generation:
         return
     previous = task.inputs
-    selected, recovery = recovery.select(previous, generation, password_changed=password_changed)
+    selected, recovery = recovery.select(previous, generation, password_changed=password_changed,
+                                         recover_partial=recover_partial)
     task.set_inputs(selected)
     task.recovery = recovery
     task.release_unused_sources(path for node in previous if node.descriptor.volume_attempts

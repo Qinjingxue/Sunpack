@@ -47,6 +47,8 @@ class RunReporter:
         # large batch whose earlier scopes have already finished.
         self._scope_roots = OrderedDict()
         self._rendered_lines = 0
+        self._rendered_panel: list[str] = []
+        self._rendered_size = None
         self._panel_pauses = 0
         self._finished_scopes = set()
         self._task_rows: dict[object, dict[str, Any]] = {}
@@ -545,9 +547,40 @@ class RunReporter:
         return parent
 
     def _clear_panel_locked(self):
-        if self._rendered_lines:
-            self.stdout.write(f"\033[{self._rendered_lines}A\r\033[J")
-            self._rendered_lines = 0
+        output = self._panel_clear_output()
+        if output:
+            self._write_panel_output(output)
+        self._rendered_lines = 0
+        self._rendered_panel = []
+        self._rendered_size = None
+
+    def _panel_clear_output(self, size=None):
+        if not self._rendered_lines:
+            return ""
+        if self._rendered_size is None:
+            # Cancel any escape sequence cut in half by a partial write.
+            return "\x18\r\n"
+        if size is None:
+            size = _terminal_size(self.stdout)
+        if self._rendered_size != tuple(size):
+            # Resize can reflow the old panel. Its logical row count no longer
+            # locates its origin; keep that snapshot instead of erasing history.
+            return "\r\n"
+        return f"\033[{self._rendered_lines}A\r\033[J"
+
+    def _write_panel_output(self, output, *, flush=False):
+        try:
+            if output:
+                self.stdout.write(output)
+            if flush:
+                self.stdout.flush()
+        except Exception:
+            # A transport may accept only part of a large write. Its cursor is
+            # now unknown; start fresh next time instead of reusing stale rows.
+            self._rendered_lines = max(1, self._rendered_lines)
+            self._rendered_panel = []
+            self._rendered_size = None
+            raise
 
     def _render_panel_locked(self, *, force: bool) -> None:
         if not self._interactive or self._panel_pauses:
@@ -560,19 +593,35 @@ class RunReporter:
         # tree or retaining event histories. No idle refresh thread is needed.
         columns, rows = _terminal_size(self.stdout)
         height = rows - 1  # Keep the cursor's line inside the viewport.
-        self._clear_panel_locked()
-        if height <= 0 or columns <= 1:
-            return
         lines = []
-        for line in self._scope_lines(self._scope_roots, columns=columns):
-            if len(lines) == height - 1:
-                lines.append(_truncate_display("…", columns - 1))
-                break
-            lines.append(_truncate_display(line, columns - 1))
-        if lines:
-            self.stdout.write("\n".join(lines) + "\n")
+        if height > 0 and columns > 1:
+            for line in self._scope_lines(self._scope_roots, columns=columns):
+                if len(lines) == height - 1:
+                    lines.append(_truncate_display("…", columns - 1))
+                    break
+                lines.append(_truncate_display(line, columns - 1))
+        previous = self._rendered_panel
+        if self._rendered_size == (columns, rows) and len(previous) == len(lines):
+            if previous == lines:
+                return
+            first = next(i for i, line in enumerate(lines) if line != previous[i])
+            last = len(lines)
+            while lines[last - 1] == previous[last - 1]:
+                last -= 1
+            # The cursor stays below the panel. Update only the changed range,
+            # erasing each old row so shorter labels cannot leave stale text.
+            output = f"\033[{len(lines) - first}A"
+            output += "".join("\r\033[2K" + line + "\n" for line in lines[first:last])
+            if last < len(lines):
+                output += f"\033[{len(lines) - last}B\r"
+        else:
+            output = self._panel_clear_output((columns, rows))
+            if lines:
+                output += "\n".join(lines) + "\n"
+        self._write_panel_output(output, flush=True)
         self._rendered_lines = len(lines)
-        self.stdout.flush()
+        self._rendered_panel = lines
+        self._rendered_size = (columns, rows)
 
     def _format_task_row(self, row: dict[str, Any], *, max_width: int | None = None) -> str:
         state = row["state"]
@@ -665,6 +714,10 @@ def _truncate_display(text: str, max_width: int) -> str:
     ellipsis_width = _display_width(ellipsis)
     if max_width < ellipsis_width:
         return ""
+    # Each character occupies at most two cells in this renderer. Most status
+    # lines fit without constructing and joining a second character buffer.
+    if len(text) * 2 <= max_width or (len(text) <= max_width and text.isascii()):
+        return text
     width = 0
     chars = []
     for char in text:
@@ -680,4 +733,6 @@ def _truncate_display(text: str, max_width: int) -> str:
 
 
 def _display_width(text: str) -> int:
+    if text.isascii():
+        return len(text)
     return sum(2 if ord(char) > 0xFF else 1 for char in text)
