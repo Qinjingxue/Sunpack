@@ -46,10 +46,9 @@ def command_result(args, ctx, paths, summary):
             ctx.reporter.info(path)
             multiple = len(entries) > 1
             for index, item in enumerate(entries, 1):
-                prefix = ("   " if index == len(entries) else "│  ") if multiple else "  "
+                prefix = ("   " if index == len(entries) else "|  ") if multiple else "  "
                 if multiple:
-                    branch = "└─ " if index == len(entries) else "├─ "
-                    ctx.reporter.info(branch + ctx.t("cli.scan.segment", index=index) + _range(item))
+                    ctx.reporter.info("+- " + ctx.t("cli.scan.segment", index=index) + _range(item))
                 elif "offset" in item:
                     ctx.reporter.info(prefix + ctx.t("cli.scan.range", start=item["offset"], end=item.get("end_offset") if item.get("end_offset") is not None else "?"))
                 # Omit errors already explained by visible fact fields. Quiet

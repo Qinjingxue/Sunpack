@@ -436,9 +436,9 @@ class RunReporter:
                 pending.pop()
                 continue
             row = self._task_rows[key]
-            branch = "" if root else "└─ " if last else "├─ "
+            branch = "" if root else "+- "
             yield prefix + branch + str(row["name"]).replace("\n", " ").replace("\r", " ")
-            child_prefix = prefix + ("" if root else "   " if last else "│  ")
+            child_prefix = prefix + ("" if root else "   " if last else "|  ")
             if not row["container"] or row["state"] == "error":
                 status_prefix = child_prefix + "  "
                 available = None if columns is None else columns - 1 - _display_width(status_prefix)

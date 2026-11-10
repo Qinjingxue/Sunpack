@@ -309,6 +309,42 @@ mod tests {
     }
 
     #[test]
+    fn gnu_names_skip_payload_reads_but_keep_checked_boundaries() {
+        // No body allocation is needed even above the former metadata quota.
+        // Checking only ordinary members would miss an early metadata return.
+        for kind in [b'L', b'K'] {
+            let size = MAX_METADATA as u64 + 1;
+            let mut header = header_with_base256_size(size);
+            header[156] = kind;
+            let total = BLOCK + size + padding(size);
+            let mut state = TarState::default();
+            let mut read = |_, _| unreachable!("GNU names must not read their payload");
+            assert_eq!(
+                state
+                    .advance_validated(&header, size, 0, total, &mut read)
+                    .unwrap()
+                    .next,
+                total
+            );
+            for (size, offset, total) in [
+                (size, 0, total - 1),
+                (size, u64::MAX - BLOCK + 1, u64::MAX),
+                (u64::MAX - BLOCK + 1, 0, u64::MAX),
+                (u64::MAX - BLOCK, 0, u64::MAX),
+            ] {
+                assert_eq!(
+                    state
+                        .advance_validated(&header, size, offset, total, &mut read)
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::UnexpectedEof
+                );
+            }
+        }
+    }
+
+    #[test]
     fn huge_base256_member_size_is_out_of_range_instead_of_wrapping() {
         // offset(0) + 512 + (2^64 - 512) wraps to 0 without saturation, which
         // would re-walk the same header and report a valid archive.

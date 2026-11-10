@@ -132,9 +132,9 @@ def test_native_semantics_validate_exact_pax_record_lengths(tmp_path):
     assert raw["walk_complete"] is False
 
 
-def test_tar_metadata_budget_preserves_incomplete_analysis_instead_of_damage(tmp_path):
-    # Malformed-PAX tests cannot distinguish a valid oversized metadata value
-    # from corrupt structure. This also checks the shared carrier scan fallback.
+def test_tar_longname_above_metadata_budget_keeps_complete_boundary(tmp_path):
+    # GNU names are consumed by the worker, not retained for boundary discovery.
+    # The old metadata budget must not stop either analysis or carrier scanning.
     info = tarfile.TarInfo("././@LongLink")
     info.type = tarfile.GNUTYPE_LONGNAME
     info.size = 1024 * 1024 + 1
@@ -145,9 +145,8 @@ def test_tar_metadata_budget_preserves_incomplete_analysis_instead_of_damage(tmp
     view = AnalysisBinaryView(str(path))
     try:
         raw = view.probe_tar(0)
-        assert raw["plausible"] and raw["error"] == "analysis_resource_limit"
-        assert raw["structure_status"] == "incomplete"
-        assert not raw["walk_complete"] and raw["segment_end"] is None
+        assert raw["plausible"] and raw["error"] == ""
+        assert raw["walk_complete"] and raw["segment_end"] == len(data)
         assert not raw["damage_flags"]
     finally:
         view.close()
@@ -156,4 +155,17 @@ def test_tar_metadata_budget_preserves_incomplete_analysis_instead_of_damage(tmp
     assert evidence.status == "extractable" and not evidence.details["damage_flags"]
     result = sunpack_native.scan_embedded_archives(str(path))
     candidate = next(row for row in result["candidates"] if row["format"] == "tar")
-    assert candidate["offset"] == 0 and candidate["end_offset"] is None
+    assert candidate["offset"] == 0 and candidate["end_offset"] == len(data)
+
+
+def test_tar_retained_pax_size_still_obeys_metadata_budget(tmp_path):
+    # Unlike GNU names, PAX size affects the walk and must be retained. This
+    # distinguishes a resource limit from corrupt metadata after name skipping.
+    info = tarfile.TarInfo("payload.bin")
+    info.pax_headers = {"size": "1" * (1024 * 1024 + 1)}
+    data = info.tobuf(format=tarfile.PAX_FORMAT) + bytes(1024)
+    raw = _probe_tar(tmp_path, data)
+    assert raw["plausible"] and raw["error"] == "analysis_resource_limit"
+    assert raw["structure_status"] == "incomplete"
+    assert not raw["walk_complete"] and raw["segment_end"] is None
+    assert not raw["damage_flags"]

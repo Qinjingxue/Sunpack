@@ -260,13 +260,16 @@ def test_scan_keeps_unicode_carrier_segments_together(tmp_path):
     summary = RunSummary(target_results=(
         TargetRunResult(carrier, OutcomeKind.SCANNED, scan_items=items),
     ))
-    out, err = io.StringIO(), io.StringIO()
+    output, err = io.BytesIO(), io.StringIO()
+    out = io.TextIOWrapper(output, encoding="cp1252")
     ctx = CliContext(language="en", reporter=CliReporter(stdout=out, stderr=err))
     scan.command_result(SimpleNamespace(json=False, verbose=False, deep_detect=False), ctx, [carrier], summary)
-    text = out.getvalue()
+    out.flush()
+    text = output.getvalue().decode("cp1252")
     assert text.count(carrier) == text.count(other) == 1
-    assert "Segment 1: [10, 20)" in text and "Segment 2: [30, 40)" in text
-    assert "Volumes: incomplete" in text
+    assert "+- Segment 1: [10, 20)" in text.splitlines()
+    assert "+- Segment 2: [30, 40)" in text.splitlines()
+    assert "|  Volumes: incomplete" in text.splitlines()
     assert err.getvalue() == f"{carrier}: [30, 40): Error: damaged segment\n"
 
 

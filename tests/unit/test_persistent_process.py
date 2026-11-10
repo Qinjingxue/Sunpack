@@ -972,6 +972,7 @@ def test_protocol_incrementally_parses_a_fragmented_request(monkeypatch):
         "shutdown": False,
         "stdout_tty": True,
         "stdin_tty": True,
+        "terminal_resize": False,
     }
     assert wire == (
         persistent_process._STREAM_MAGIC

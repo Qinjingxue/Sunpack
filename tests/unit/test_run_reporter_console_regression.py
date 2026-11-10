@@ -206,9 +206,9 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.resume_panel()
         text = stream.getvalue()
         assert text.index("段 1") < text.index("段 2") < text.index("nested.zip")
-        assert "   └─ nested.zip" in text.splitlines()
+        assert "   +- nested.zip" in text.splitlines()
         assert text.count("[完成] [####################] 100%") == 3
-        assert "│" in text and "└─" in text
+        assert "|" in text and "+-" in text
         assert reporter._row_key(outer) not in reporter._task_rows
         if not interactive:
             assert "other.zip" not in text and "\033[" not in text
@@ -281,7 +281,8 @@ def test_retry_tree_keeps_retained_siblings_and_selected_input_updates(tmp_path,
     selected, task.recovery = recovery.select(nodes, generation, password_changed=True)
     assert tuple(node.position for node in selected) == ((3, 4) if complete_positions == (1,) else (4,))
 
-    stream = io.StringIO()
+    output = io.BytesIO()
+    stream = io.TextIOWrapper(output, encoding="cp1252")
     reporter = RunReporter("en", stdout=stream)
     reporter.tasks_discovered(1, [task])
     reporter.task_started(task)
@@ -303,7 +304,7 @@ def test_retry_tree_keeps_retained_siblings_and_selected_input_updates(tmp_path,
     reporter.tasks_discovered(2, [nested])
     reporter.task_finished(nested, _success(tmp_path / "out" / "1" / "nested"), 2)
     reporter.scope_finished(task)
-    text = stream.getvalue()
+    text = output.getvalue().decode("cp1252")
     assert [text.index(f"Segment {i}") for i in range(1, 5)] == sorted(text.index(f"Segment {i}") for i in range(1, 5))
     assert text.count("[Complete]") == 4  # Three complete segments plus nested output.
     assert "retained segment needs volume" in text and "old password failure" not in text
