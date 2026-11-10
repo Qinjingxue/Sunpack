@@ -29,7 +29,7 @@ from sunpack.core.contracts.retry_targets import (
 )
 from sunpack.core.contracts.results import RunSummary
 from sunpack.core.contracts.run_state import RunState
-from sunpack.core.support.collections import dedupe_values
+from sunpack.core.passwords import dedupe_passwords
 from sunpack.core.support.filesystem_scan_errors import is_filesystem_scan_failure
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 import asyncio
@@ -54,6 +54,7 @@ def register(subparsers, ctx):
 
 
 async def handle(args, ctx, *, operation="extract"):
+    is_scan = operation == "scan"
     reporter = ctx.reporter
     target_paths = resolve_target_paths(args.paths, base_dir=ctx.cwd)
 
@@ -82,12 +83,7 @@ async def handle(args, ctx, *, operation="extract"):
     config = load_request_config(ctx.cwd)
     config_overrides = apply_runtime_config_overrides(config, args, base_dir=ctx.cwd)
     try:
-        passwords = await collect_cli_passwords_async(
-            args,
-            ctx,
-            prompt_text=ctx.t("cli.password_prompt"),
-            input_prompt=ctx.t("cli.password_input_prompt"),
-        )
+        passwords = await collect_cli_passwords_async(args, ctx)
         clipboard_passwords = collect_clipboard_passwords(config)
     except Exception as exc:
         message = ctx.t("cli.operation_failed", error=exc)
@@ -99,27 +95,29 @@ async def handle(args, ctx, *, operation="extract"):
     config.setdefault("output", {})["common_root"] = common_root
 
     def report_targets():
-        if operation == "scan":
-            return
         if len(target_paths) == 1:
             reporter.info(ctx.t("cli.extract.single_target", path=target_paths[0]))
         else:
             reporter.info(ctx.t("cli.extract.target_paths", count=len(target_paths)))
-            for path in target_paths:
-                reporter.detail(ctx.t("cli.detail_item_path", path=path))
-        reporter.detail(ctx.t("cli.extract.common_root", root=common_root))
+            if reporter.verbose:
+                for path in target_paths:
+                    reporter.detail(ctx.t("cli.detail_item_path", path=path))
+        if reporter.verbose:
+            reporter.detail(ctx.t("cli.extract.common_root", root=common_root))
 
-    async with command_work_broker(ctx) as broker:
-        await broker.run("cli_output", "", report_targets)
+    if not is_scan and not (reporter.quiet or reporter.json_mode):
+        async with command_work_broker(ctx) as broker:
+            await broker.run("cli_output", "", report_targets)
 
-    attempts = []
-    retry_count = 0
-    current_targets = list(target_paths)
-    latest_target_results: dict[str, object] = {}
-    all_processed_keys: list[str] = []
-    scan_report = RunState()
-    all_recovered_outputs: list[dict] = []
-    cleanup_results_by_path = {}
+    current_targets = target_paths
+    if not is_scan:
+        attempts = []
+        retry_count = 0
+        latest_target_results = {}
+        all_processed_keys: set[str] = set()
+        scan_report = RunState()
+        all_recovered_outputs: list[dict] = []
+        cleanup_results_by_path = {}
     initial_password_summary = build_password_summary(
         passwords,
         use_builtin_passwords=not args.no_builtin_passwords,
@@ -128,29 +126,19 @@ async def handle(args, ctx, *, operation="extract"):
     run_config = _extract_run_config(
         config,
         initial_password_summary,
-        quiet=bool(getattr(reporter, "quiet", False) or getattr(reporter, "json_mode", False)),
+        quiet=is_scan or reporter.quiet or reporter.json_mode,
         verbose=bool(getattr(reporter, "verbose", False)),
         json_mode=bool(args.json),
     )
     deep_detect = bool(getattr(args, "deep_detect", False))
     run_config["extraction"]["operation"] = operation
-    if operation == "scan":
-        run_config["cli"]["quiet"] = True
+    if is_scan:
         run_config["extraction"]["quiet"] = True
     engine_context = pipeline_engine(config)
     if not args.json and getattr(ctx.stdout, "isatty", lambda: False)():
         reporter.info(ctx.t("interrupt.hint"))
     async with engine_context as engine:
         while True:
-            password_summary = build_password_summary(
-                passwords,
-                use_builtin_passwords=not args.no_builtin_passwords,
-                clipboard_passwords=clipboard_passwords,
-                password_snapshot=initial_password_summary.password_snapshot,
-            )
-            run_config["user_passwords"] = password_summary.user_passwords
-            run_config["clipboard_passwords"] = password_summary.clipboard_passwords
-            run_config["password_snapshot"] = password_summary.password_snapshot
             response = await engine.run(
                 current_targets,
                 direct=bool(getattr(args, "direct_file", False)),
@@ -167,17 +155,18 @@ async def handle(args, ctx, *, operation="extract"):
                 return interrupted_result(ctx, operation, {"paths": target_paths}, response.interruption_cleanup_errors)
             # Scan reports the facts from this whole pass, including unknown
             # passwords. Only extraction offers interactive retry rounds.
-            if operation == "scan":
+            if is_scan:
                 break
-            failures = list(summary.failures)
+            failures = summary.failures
             scan_report.record_failures(summary.scan_failures, ctx.language)
-            processed_keys = list(summary.processed_keys)
+            processed_keys = summary.processed_keys
             merge_latest_results(latest_target_results, summary)
-            all_processed_keys.extend(processed_keys)
-            for item in list(getattr(summary, "recovered_outputs", []) or []):
+            all_processed_keys.update(processed_keys)
+            recovered_outputs = summary.recovered_outputs
+            for item in recovered_outputs:
                 if item not in all_recovered_outputs:
                     all_recovered_outputs.append(item)
-            for item in list(getattr(summary, "cleanup_results", []) or []):
+            for item in summary.cleanup_results:
                 cleanup_results_by_path[case_key(os.path.abspath(item.path))] = item
             retry_targets = [path for path in password_retry_paths(summary) if os.path.exists(path)]
             attempts.append({
@@ -185,9 +174,9 @@ async def handle(args, ctx, *, operation="extract"):
                 "failed_count": summary.failed_count,
                 "scan_error_count": summary.scan_error_count,
                 "input_error_count": summary.input_error_count,
-                "processed_count": len(set(processed_keys)),
-                "partial_success_count": getattr(summary, "partial_success_count", 0),
-                "recovered_outputs": list(getattr(summary, "recovered_outputs", []) or []),
+                "processed_count": len(processed_keys),
+                "partial_success_count": summary.partial_success_count,
+                "recovered_outputs": recovered_outputs,
                 "wrong_password_failure": has_password_failure(failures),
                 "failures": [failure.to_dict() for failure in failures if not is_filesystem_scan_failure(failure)],
             })
@@ -196,17 +185,14 @@ async def handle(args, ctx, *, operation="extract"):
             if not await _confirm_password_retry(ctx):
                 break
             try:
-                new_passwords = await prompt_for_passwords_async(
-                    ctx,
-                    prompt_text=ctx.t("cli.password_prompt"),
-                    input_prompt=ctx.t("cli.password_input_prompt"),
-                )
+                new_passwords = await prompt_for_passwords_async(ctx)
             except (EOFError, KeyboardInterrupt):
                 break
             if not new_passwords:
                 reporter.info(ctx.t("cli.extract.retry_no_passwords"))
                 break
-            passwords = _dedupe([*passwords, *new_passwords])
+            passwords = dedupe_passwords([*passwords, *new_passwords])
+            run_config["user_passwords"] = passwords
             # Only promoted nested retries should be deleted under keep mode.
             # This immutable, request-local set is replaced on each retry round.
             run_config["promoted_nested_retry_paths"] = frozenset(
@@ -217,9 +203,10 @@ async def handle(args, ctx, *, operation="extract"):
             current_targets = retry_targets
             run_config["password_retry_failures"] = password_retry_failures(summary)
             retry_count += 1
-        recent_passwords = engine.recent_passwords
+        if not is_scan:
+            recent_passwords = engine.recent_passwords
 
-    if operation == "scan":
+    if is_scan:
         from sunpack.runtime.cli.commands.scan import command_result
         async with command_work_broker(ctx) as broker:
             return await broker.run("cli_output", "", command_result, args, ctx, target_paths, summary)
@@ -254,7 +241,7 @@ async def handle(args, ctx, *, operation="extract"):
             "scan_error_count": final_summary.scan_error_count,
             "scan_failures": [failure.to_dict() for failure in final_summary.scan_failures if is_filesystem_scan_failure(failure)],
             "input_error_count": final_summary.input_error_count,
-            "processed_count": len(set(all_processed_keys)),
+            "processed_count": len(all_processed_keys),
             "partial_success_count": final_summary.partial_success_count,
             "recovered_outputs": all_recovered_outputs,
             "use_builtin_passwords": not args.no_builtin_passwords,
@@ -324,6 +311,3 @@ async def _confirm_password_retry(ctx) -> bool:
         if answer in {"n", "no", ""}:
             return False
         print(ctx.t("cli.answer_yes_no"), file=ctx.stdout, flush=True)
-
-
-_dedupe = dedupe_values

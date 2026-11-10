@@ -8,15 +8,16 @@ from sunpack.runtime.cli import cli, runtime_state
 from sunpack.runtime.cli.cli_types import CliCommandResult
 
 
-@pytest.mark.parametrize("argv, expected", [(["e", "sample.zip"], ["high"]), (["s", "."], ["high"]), (["w", "status"], [])])
+@pytest.mark.parametrize("argv, expected", [(["e", "sample.zip"], 1), (["s", "."], 1), (["w", "status"], 0)])
 def test_workload_priority_is_applied_before_dispatch(monkeypatch, tmp_path, argv, expected):
-    modes = []
+    calls = 0
 
-    async def set_override(mode):
-        modes.append(mode)
+    async def set_override():
+        nonlocal calls
+        calls += 1
 
     async def dispatch(args, ctx):
-        assert modes == expected
+        assert calls == expected
         return 0, CliCommandResult(args.command, {}, {})
 
     monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _argv: False)

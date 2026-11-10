@@ -521,7 +521,7 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
         await host.start_watch(tray_enabled=False)
         assert host.process_mode == "background"
 
-        await host.set_cli_process_mode_override("high")
+        await host.set_cli_process_mode_override()
         assert host.process_mode == "high"
 
         assert (await host.reload_watch())["reloaded"] is True
@@ -541,9 +541,9 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
             ("activity", False),
         ]
 
-        assert await host.expire_cli_process_mode_override() is True
+        await host.expire_cli_process_mode_override()
         assert host.process_mode == "normal"
-        assert await host.expire_cli_process_mode_override() is False
+        await host.expire_cli_process_mode_override()
 
         await host.stop_watch()
         assert host.process_mode == "normal"
@@ -588,7 +588,7 @@ def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground
             host._watch_service = SimpleNamespace(scheduler=None)
             host._watch_task = SimpleNamespace(done=lambda: watch_state == "stopped")
         await host._set_configured_process_mode({"runtime": {"process_mode": "normal"}})
-        await host.set_cli_process_mode_override("high")
+        await host.set_cli_process_mode_override()
         assert host.process_mode == "high"
 
         await host.foreground_started()
@@ -597,7 +597,6 @@ def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground
         assert host.process_mode == "high"
         await host.foreground_finished()
 
-        assert host._cli_process_mode_override is None
         assert host.process_mode == "normal"
 
     asyncio.run(scenario())
@@ -645,8 +644,8 @@ def test_process_mode_policy_retries_unapplied_changes_and_syncs_replacement_eng
 
     async def scenario():
         host = RuntimeHost()
-        await host.set_cli_process_mode_override("high")
-        await host.set_cli_process_mode_override("high")
+        await host.set_cli_process_mode_override()
+        await host.set_cli_process_mode_override()
         assert worker_calls == host_calls == ["high", "high"]
         await host.sync_process_mode_to_engine(Engine())
         assert worker_calls[-1] == host_calls[-1] == "high"

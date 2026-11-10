@@ -393,7 +393,7 @@ def test_idle_maintenance_expires_cli_mode_and_clears_caches(tmp_path):
             watcher.state.mark(str(recovering), 1, 1.0, status="failed_password")
             watcher.state.queue_active(WatchCandidate(str(recovering), 1, 1.0), durable=True)
             await host._set_configured_process_mode({"runtime": {"process_mode": "background"}})
-            await host.set_cli_process_mode_override("high")
+            await host.set_cli_process_mode_override()
             assert host.process_mode == "high"
 
             watcher._arm_idle_cache_cleanup()
@@ -401,7 +401,6 @@ def test_idle_maintenance_expires_cli_mode_and_clears_caches(tmp_path):
             await watcher._maybe_clear_idle_caches()
 
             assert host.process_mode == "background"
-            assert host._cli_process_mode_override is None
             assert engine.clear_calls == 1
             assert watcher.state.latest_entry_for_path(str(recovering)) is not None
             watcher.state.complete_work([str(recovering)])

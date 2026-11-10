@@ -75,7 +75,7 @@ def command_result(args, ctx, paths, summary):
                  "scan_error_count": summary.scan_error_count, "input_error_count": summary.input_error_count},
         items=items, errors=summary.failed_tasks,
     )
-    return (EXIT_TASK_FAILED if summary.failed_tasks else 0), result
+    return (EXIT_TASK_FAILED if result.errors else 0), result
 
 
 def _range(item):

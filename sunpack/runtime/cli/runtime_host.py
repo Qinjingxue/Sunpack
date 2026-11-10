@@ -45,7 +45,7 @@ class RuntimeHost:
         self._last_watch_error = ""
         self._foreground_requests = 0
         self._configured_process_mode = "normal"
-        self._cli_process_mode_override: str | None = None
+        self._cli_priority_override = False
         self._state_changed = state_changed
         self.archive_registry = ActiveArchiveRegistry()
         self._event_log = None
@@ -321,27 +321,22 @@ class RuntimeHost:
 
     @property
     def process_mode(self) -> str:
-        return self._cli_process_mode_override or self._configured_process_mode
+        return "high" if self._cli_priority_override else self._configured_process_mode
 
-    async def set_cli_process_mode_override(self, mode: str) -> None:
-        normalized = str(mode or "high").strip().lower()
-        if normalized not in {"background", "normal", "high"}:
-            raise ValueError(f"unsupported process mode: {mode}")
-        self._cli_process_mode_override = normalized
+    async def set_cli_process_mode_override(self) -> None:
+        self._cli_priority_override = True
         await self._apply_effective_process_mode()
 
-    async def expire_cli_process_mode_override(self) -> bool:
-        if self._cli_process_mode_override is None:
-            return False
-        previous = self._cli_process_mode_override
-        self._cli_process_mode_override = None
+    async def expire_cli_process_mode_override(self) -> None:
+        if not self._cli_priority_override:
+            return
+        self._cli_priority_override = False
         await self._apply_effective_process_mode()
         self.log_event(
             "cli_process_mode_override_expired",
-            previous_mode=previous,
+            previous_mode="high",
             restored_mode=self._configured_process_mode,
         )
-        return True
 
     async def sync_process_mode_to_engine(self, engine) -> None:
         await self._apply_effective_process_mode(engine=engine)

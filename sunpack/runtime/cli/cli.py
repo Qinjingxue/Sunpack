@@ -196,7 +196,7 @@ async def async_main(
 
             host = runtime_host()
             if host is not None:
-                await host.set_cli_process_mode_override("high")
+                await host.set_cli_process_mode_override()
         reporter = CliReporter(
             json_mode=args.json,
             quiet=args.quiet,

@@ -56,15 +56,10 @@ def collect_clipboard_passwords(config: dict | None) -> list[str]:
     return read_clipboard_passwords()
 
 
-async def prompt_for_passwords_async(
-    ctx,
-    prompt_text: str | None = None,
-    input_prompt: str | None = None,
-) -> list[str]:
-    prompt_text = prompt_text or ctx.t("cli.password_prompt")
-    input_prompt = input_prompt or ctx.t("cli.password_input_prompt")
+async def prompt_for_passwords_async(ctx) -> list[str]:
+    input_prompt = ctx.t("cli.password_input_prompt")
     passwords = []
-    print(prompt_text, file=ctx.stdout, flush=True)
+    print(ctx.t("cli.password_prompt"), file=ctx.stdout, flush=True)
     while True:
         # Windows console input can leave a bare CR. Preserve password spaces.
         line = (await ctx.readline(input_prompt)).rstrip("\r\n")
@@ -74,14 +69,7 @@ async def prompt_for_passwords_async(
     return dedupe_passwords(passwords)
 
 
-async def collect_cli_passwords_async(
-    args,
-    ctx,
-    prompt_text: str | None = None,
-    input_prompt: str | None = None,
-) -> list[str]:
-    prompt_text = prompt_text or ctx.t("cli.password_prompt")
-    input_prompt = input_prompt or ctx.t("cli.password_input_prompt")
+async def collect_cli_passwords_async(args, ctx) -> list[str]:
     passwords = list(getattr(args, "password", []) or [])
     if getattr(args, "password_file", None):
         password_file = str(args.password_file)
@@ -96,13 +84,7 @@ async def collect_cli_passwords_async(
     else:
         passwords = dedupe_passwords(passwords)
     if getattr(args, "prompt_passwords", False):
-        passwords.extend(
-            await prompt_for_passwords_async(
-                ctx,
-                prompt_text=prompt_text,
-                input_prompt=input_prompt,
-            )
-        )
+        passwords.extend(await prompt_for_passwords_async(ctx))
         return dedupe_passwords(passwords)
     return passwords
 
@@ -114,13 +96,11 @@ def build_password_summary(
     clipboard_passwords: list[str] | None = None,
     password_snapshot=None,
 ) -> CliPasswordSummary:
-    recent = dedupe_passwords(recent_passwords or [])
-    clipboard = dedupe_passwords(clipboard_passwords or [])
     snapshot = (password_snapshot if password_snapshot is not None else password_file_source().snapshot) if use_builtin_passwords else EMPTY_PASSWORD_SNAPSHOT
     store = PasswordStore.from_sources(
         cli_passwords=user_passwords,
-        clipboard_passwords=clipboard,
-        recent_passwords=recent,
+        clipboard_passwords=clipboard_passwords,
+        recent_passwords=recent_passwords,
         password_snapshot=snapshot,
     )
     return CliPasswordSummary(
