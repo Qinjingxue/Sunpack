@@ -141,7 +141,7 @@ def test_command_help_exposes_public_options(subtests, capsys):
         ("watch", "startup"): (("enable", "disable", "status"), ()),
         ("passwords",): (
             ("--json", "--password"),
-            ("--clipboard-pw", "--quiet", "--verbose", "--pause"),
+            ("--clipboard-pw", "--verbose", "--pause"),
         ),
         ("config",): (
             ("show", "validate"),

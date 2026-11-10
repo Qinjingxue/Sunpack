@@ -49,7 +49,7 @@ def test_existing_cli_json_includes_postprocess_failure(tmp_path, monkeypatch, m
     args = SimpleNamespace(
         paths=[str(source)], password=[], password_file=None, prompt_passwords=False,
         no_builtin_passwords=True, recursive_extract=None, recursive=False, archive_cleanup_mode=None,
-        flatten_single_directory=None, json=True, quiet=False, verbose=False,
+        flatten_single_directory=None, json=True, verbose=False,
     )
     output = io.StringIO()
     reporter = CliReporter(json_mode=True, stdout=output)
@@ -107,7 +107,6 @@ def test_extract_preserves_scan_failure_when_target_succeeds(tmp_path, monkeypat
         archive_cleanup_mode=None,
         flatten_single_directory=None,
         json=False,
-        quiet=False,
         verbose=False,
     )
     ctx = CliContext(language="en", reporter=CliReporter())
@@ -140,7 +139,7 @@ def test_extract_counts_do_not_classify_or_dedupe_by_display_text(tmp_path, monk
     monkeypatch.setattr(extract, "pipeline_engine", lambda config: FakePipelineEngine(Runner))
     monkeypatch.setattr(extract, "collect_clipboard_passwords", lambda config: [])
     args = SimpleNamespace(recursive=False, paths=[str(tmp_path / "archive")], password=[], password_file=None, prompt_passwords=False,
-                           no_builtin_passwords=True, json=True, quiet=False, verbose=False)
+                           no_builtin_passwords=True, json=True, verbose=False)
     code, result = asyncio.run(extract.handle(args, CliContext(language="en", reporter=CliReporter(json_mode=True))))
     assert code != 0
     assert result.summary["failed_count"] == 1 and result.summary["scan_error_count"] == 1
@@ -181,8 +180,8 @@ def test_scan_diagnostic_budget_is_shared_across_password_retry_rounds(tmp_path,
     monkeypatch.setattr(extract, "_confirm_password_retry", confirm)
     monkeypatch.setattr(extract, "prompt_for_passwords_async", password)
     args = SimpleNamespace(recursive=False, paths=[str(target)], password=[], password_file=None, prompt_passwords=False,
-                           no_builtin_passwords=True, json=False, quiet=False, verbose=False)
-    code, result = asyncio.run(extract.handle(args, CliContext(language="en", reporter=CliReporter(quiet=True))))
+                           no_builtin_passwords=True, json=False, verbose=False)
+    code, result = asyncio.run(extract.handle(args, CliContext(language="en", reporter=CliReporter())))
     assert code != 0 and result.summary["success_count"] == 1
     assert result.summary["scan_error_count"] == 150
     assert len(result.summary["scan_failures"]) == len(result.errors) == 101
@@ -233,10 +232,10 @@ def test_password_retry_provenance_is_scoped_to_promoted_inputs(tmp_path, monkey
     args = SimpleNamespace(
         recursive=False, paths=[str(promoted), str(ordinary)], password=[],
         password_file=None, prompt_passwords=False, no_builtin_passwords=True,
-        json=False, quiet=False, verbose=False,
+        json=False, verbose=False,
     )
     code, result = asyncio.run(extract.handle(
-        args, CliContext(language="en", reporter=CliReporter(quiet=True)),
+        args, CliContext(language="en", reporter=CliReporter()),
     ))
     from sunpack.core.support.path_keys import case_key
 
@@ -288,7 +287,6 @@ def test_extract_prompts_for_password_retry_after_wrong_password(tmp_path, monke
         archive_cleanup_mode=None,
         flatten_single_directory=None,
         json=False,
-        quiet=False,
         verbose=False,
     )
     ctx = CliContext(language="en", reporter=CliReporter())

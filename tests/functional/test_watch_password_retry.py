@@ -85,7 +85,6 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
         write_password_json(builtin_path, scopes=[(wrong_password, [str(watch_root)])])
 
     config = load_config()
-    config["cli"] = {**(config.get("cli") or {}), "quiet": True}
     config["post_extract"] = {**config.get("post_extract", {}), "archive_cleanup_mode": "keep"}
     config["watch"] = {
         **config.get("watch", {}),
@@ -219,7 +218,6 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     write_password_json(builtin_path, scopes=[(candidate, [str(watch_root)]) for candidate in supplied_passwords])
     config = load_config()
-    config["cli"] = {**(config.get("cli") or {}), "quiet": True}
     config["post_extract"] = {**config.get("post_extract", {}), "archive_cleanup_mode": "keep"}
     config["watch"] = {
         **config.get("watch", {}),

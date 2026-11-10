@@ -175,7 +175,7 @@ def test_scan_confirms_enc_password_with_damaged_recovery_framing(tmp_path, monk
 @pytest.mark.parametrize("language, password_label", [("en", "Password: not in password list"), ("zh", "密码：未在密码表中")])
 def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path, language, password_label):
     # Real happy-path archives miss distinct blocked segments, different source
-    # files within one task, and verbose/JSON/quiet projection combinations.
+    # files within one task, and verbose/JSON projection combinations.
     from types import SimpleNamespace
     from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
     from sunpack.core.contracts.input_plan import LogicalArchiveInput
@@ -220,20 +220,16 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path, language, 
     task_with_gap = ArchiveTask.from_archive_input(declared_missing, discovery_source="relations")
     [gap] = scan_items(task_with_gap, ExtractionResult(True, ""), I18nContext("en"))
     assert gap["volume_completeness"] == "missing"
-    for json_mode, verbose, quiet in ((True, False, False), (True, True, False), (False, False, True), (False, True, False)):
+    for json_mode, verbose in ((True, False), (True, True), (False, False), (False, True)):
         out, err = io.StringIO(), io.StringIO()
-        ctx = CliContext(language=language, reporter=CliReporter(json_mode=json_mode, quiet=quiet,
+        ctx = CliContext(language=language, reporter=CliReporter(json_mode=json_mode,
                          verbose=verbose, stdout=out, stderr=err))
         summary = RunSummary(target_results=(TargetRunResult(task.main_path, OutcomeKind.FAILURE,
                           failure=missing, error=missing.message, scan_items=tuple(dict(i) for i in items)),))
-        _, projected = scan.command_result(SimpleNamespace(json=json_mode, verbose=verbose, quiet=quiet,
+        _, projected = scan.command_result(SimpleNamespace(json=json_mode, verbose=verbose,
                                      deep_detect=False), ctx, [task.main_path], summary)
         assert all(("discovery_source" in item) == verbose for item in projected.items)
-        if quiet:
-            assert not out.getvalue() and "need password" in err.getvalue()
-            assert items[0]["error"] in err.getvalue()
-            assert items[2]["main_path"] in err.getvalue()
-        elif not json_mode:
+        if not json_mode:
             assert out.getvalue().index("first.bin") < out.getvalue().index("second.bin")
             assert "need password" not in err.getvalue() and "need password" not in out.getvalue()
             assert password_label in out.getvalue()

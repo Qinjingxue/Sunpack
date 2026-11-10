@@ -217,7 +217,7 @@ def _check_unusable_rar5_password_proofs(tmp_path):
     config = get_config("archive_scan_deep_embedded", {
         "user_passwords": ["wrong", "secret"], "builtin_passwords": [],
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
-        "recursive_extract": "1", "cli": {"language": "en", "quiet": True},
+        "recursive_extract": "1", "cli": {"language": "en"},
     })
     for carrier in (False, True):
         directory = tmp_path / f"recovery-{carrier}"

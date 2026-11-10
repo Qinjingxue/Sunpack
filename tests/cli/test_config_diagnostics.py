@@ -58,7 +58,7 @@ def test_explicit_diagnostics_reject_current_file_without_losing_last_good_confi
     )
 
     def run_config(action):
-        return asyncio.run(config.handle(SimpleNamespace(config_action=action, json=True, quiet=True), ctx))
+        return asyncio.run(config.handle(SimpleNamespace(config_action=action, json=True), ctx))
 
     loader.clear_config_cache()
     try:

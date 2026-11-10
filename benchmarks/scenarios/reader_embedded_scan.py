@@ -98,7 +98,6 @@ def benchmark_cli(path: Path, timeout_seconds: float) -> dict:
                 "sunpack",
                 "scan",
                 "--json",
-                "--quiet",
                 "--no-pause",
                 str(path),
             ],

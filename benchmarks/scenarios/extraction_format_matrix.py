@@ -608,7 +608,7 @@ def benchmark(
                     else:
                         command = [
                             str(PYTHON), "-m", "sunpack", "extract", "--recur", "*",
-                            "--cleanup", "k", "--no-flatten", "--no-builtin-pw",  "--quiet",
+                            "--cleanup", "k", "--no-flatten", "--no-builtin-pw",
                             "--no-pause", "-o", str(output), str(archive),
                         ]
                         extract_started = time.perf_counter()

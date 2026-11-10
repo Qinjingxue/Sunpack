@@ -80,7 +80,6 @@ def test_successful_cleanup_does_not_abort_older_volume_discovery(tmp_path, monk
     output = tmp_path / "output"
     config = make_config({
         "user_passwords": ["race-password"],
-        "cli": {"quiet": True},
         "recursive_extract": "1",
         "post_extract": {"archive_cleanup_mode": "d"},
         "output": {"root": str(output), "common_root": str(case.archive_dir), "fixed_root": True},
@@ -135,7 +134,7 @@ def test_departed_middle_volume_remains_missing_and_recovers_when_restored(tmp_p
     middle = parts[1]
     output = tmp_path / "output"
     config = make_config({
-        "user_passwords": ["partial-password"], "cli": {"quiet": True},
+        "user_passwords": ["partial-password"],
         "recursive_extract": "1", "post_extract": {"archive_cleanup_mode": "d"},
         "output": {"root": str(output), "common_root": str(root), "fixed_root": True},
     })

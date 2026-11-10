@@ -94,7 +94,7 @@ def main() -> int:
                     paths.append(str(archive_path))
                 code = await async_main([
                     "extract", *paths, "--direct-file", "--out-dir", str(output_dir),
-                    "--cleanup", "k", "--no-flatten", "--no-pause", "--quiet",
+                    "--cleanup", "k", "--no-flatten", "--no-pause",
                 ])
                 if code:
                     raise RuntimeError(f"batch {batch} failed: {code}")

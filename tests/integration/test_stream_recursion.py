@@ -32,7 +32,7 @@ def test_stream_then_tar_uses_the_same_recursive_pipeline(tmp_path, origin, fmt)
     source = make_input(tmp_path, fmt)
     output = tmp_path / "out"
     config = normalize_config(with_detection_pipeline({
-        "recursive_extract": "2", "cli": {"quiet": True},
+        "recursive_extract": "2",
         "output": {"root": str(output)},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
     }))

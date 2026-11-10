@@ -52,7 +52,6 @@ def test_concurrent_header_encrypted_rar_retry_cleans_single_and_disguised_volum
     config = load_config()
     config['user_passwords'] = []
     config['builtin_passwords'] = ['wrong']
-    config['cli']['quiet'] = True
     config['post_extract']['archive_cleanup_mode'] = 'delete'
     config['watch']['clipboard_monitor_enabled'] = False
 

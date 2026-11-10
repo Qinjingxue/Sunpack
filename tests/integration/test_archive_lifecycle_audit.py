@@ -26,7 +26,6 @@ from tests.helpers.tool_config import require_7z, get_optional_rar
 
 def _config(**extra):
     return make_config({
-        "cli": {"quiet": True},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
         "recursive_extract": 1,
         **extra,

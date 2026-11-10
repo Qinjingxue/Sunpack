@@ -23,7 +23,6 @@ class RunReporter:
     def __init__(
         self,
         language: str = "en",
-        quiet: bool = False,
         verbose: bool = False,
         *,
         emit_errors: bool = True,
@@ -33,7 +32,6 @@ class RunReporter:
         request_id: str = "",
     ):
         self.i18n = I18nContext(language)
-        self.quiet = bool(quiet)
         self.verbose = bool(verbose)
         self.emit_errors = bool(emit_errors)
         self.stdout = stdout if stdout is not None else sys.stdout
@@ -44,7 +42,7 @@ class RunReporter:
         self._max_depth = 0
         self._output_rows = PathMap()
         self._top_level_outputs = PathMap()
-        self._interactive = not self.quiet and _terminal_supports_updates(self.stdout)
+        self._interactive = _terminal_supports_updates(self.stdout)
         # Iteration must visit active roots, not deleted dict slots from a
         # large batch whose earlier scopes have already finished.
         self._scope_roots = OrderedDict()
@@ -66,8 +64,6 @@ class RunReporter:
                 self._nested_tasks += len(tasks)
             if tasks:
                 self._max_depth = max(self._max_depth, depth)
-            if self.quiet:
-                return
             for task in tasks:
                 # A physical job can adopt a new entry path and new input IDs.
                 # Keep its tree identity for the entire request-local scope.
@@ -97,8 +93,6 @@ class RunReporter:
         return scope
 
     def task_started(self, task: Any) -> None:
-        if self.quiet:
-            return
         with self._lock:
             key = task.runtime.get("report_scope")
             row = self._task_rows.get(key)
@@ -140,8 +134,6 @@ class RunReporter:
             self._render_panel_locked(force=True)
 
     def task_replanned(self, task: Any) -> None:
-        if self.quiet:
-            return
         with self._lock:
             key = task.runtime.get("report_scope")
             if key not in self._task_rows:
@@ -152,8 +144,6 @@ class RunReporter:
             self.task_started(task)
 
     def task_status(self, task: Any, state: str, detail: str = "") -> None:
-        if self.quiet:
-            return
         with self._lock:
             row = self._task_rows.get(task.runtime.get("report_scope"))
             if row is None:
@@ -167,8 +157,6 @@ class RunReporter:
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
         name = str(event.get("event") or "")
         if name == "task_detail" and not self.verbose:
-            return
-        if self.quiet and not (self.emit_errors and name in _SPACE_EVENTS):
             return
         if name in {"input_started", "input_finished", "task_detail"}:
             # Pipeline semantic events arrive in admitted broker jobs. Their
@@ -235,9 +223,6 @@ class RunReporter:
 
     def _task_progress_locked(self, task: Any, event: dict[str, Any]) -> None:
         name = str(event.get("event") or "")
-        if self.quiet:
-            self._warn_disk_wait_locked(task, name, event)
-            return
         task_id = self._row_key(task)
         row = self._task_rows.get(task_id)
         if row is None or row["state"] in {"complete", "partial", "error", "skipped"}:
@@ -317,8 +302,6 @@ class RunReporter:
 
     def task_finished(self, task: Any, outcome: Any, depth: int) -> None:
         with self._lock:
-            if self.quiet:
-                return
             key = task.runtime.get("report_scope")
             row = self._task_rows.get(key)
             if row is None:
@@ -385,8 +368,6 @@ class RunReporter:
 
     def scope_finished(self, task):
         """Flush one complete recursive tree, then release all display state."""
-        if self.quiet:
-            return
         with self._lock:
             root = task.runtime.get("report_scope")
             if root not in self._scope_roots:
@@ -479,25 +460,24 @@ class RunReporter:
         complete_count = summary.success_count
         elapsed = max(0.0, time.time() - start_time)
 
-        if not self.quiet:
-            self._print("\n" + "-" * 54)
-            self._print(self.i18n.t("report.time", duration=self.i18n.format_duration(elapsed)))
-            self._print(self.i18n.t("report.counts", complete=complete_count, partial=partial_count,
-                                    failed=summary.failed_count, scan_errors=summary.scan_error_count,
-                                    input_errors=summary.input_error_count))
-            if self._max_depth > 1:
-                self._print(self.i18n.t("report.recursion", levels=self._max_depth, count=self._nested_tasks))
-            output_location = self._output_location()
-            if output_location:
-                self._print(self.i18n.t("report.output", output=output_location))
+        self._print("\n" + "-" * 54)
+        self._print(self.i18n.t("report.time", duration=self.i18n.format_duration(elapsed)))
+        self._print(self.i18n.t("report.counts", complete=complete_count, partial=partial_count,
+                                failed=summary.failed_count, scan_errors=summary.scan_error_count,
+                                input_errors=summary.input_error_count))
+        if self._max_depth > 1:
+            self._print(self.i18n.t("report.recursion", levels=self._max_depth, count=self._nested_tasks))
+        output_location = self._output_location()
+        if output_location:
+            self._print(self.i18n.t("report.output", output=output_location))
 
-            for item in recovered:
-                archive = os.path.basename(str(item.get("archive") or ""))
-                self._print(self.i18n.t("report.partial", archive=archive,
-                                        complete_files=item.get("complete_files", 0)))
-                warning = FailureInfo.from_dict(item.get("warning"))
-                if warning is not None:
-                    self._print(self.i18n.t("report.partial_warning", warning=warning.message))
+        for item in recovered:
+            archive = os.path.basename(str(item.get("archive") or ""))
+            self._print(self.i18n.t("report.partial", archive=archive,
+                                    complete_files=item.get("complete_files", 0)))
+            warning = FailureInfo.from_dict(item.get("warning"))
+            if warning is not None:
+                self._print(self.i18n.t("report.partial_warning", warning=warning.message))
 
         if self.emit_errors:
             for failure in summary.scan_failures:
@@ -511,7 +491,7 @@ class RunReporter:
                 self._print(self.i18n.t(key, task=message), error=True)
             if summary.scan_error_count:
                 self._print(self.i18n.t("report.scan_incomplete"), error=True)
-        if recovered and not self.quiet and not summary.failed_tasks:
+        if recovered and not summary.failed_tasks:
             self._print(self.i18n.t("report.partial_complete"))
 
         cleanup_failures = [
@@ -524,8 +504,7 @@ class RunReporter:
             for item in cleanup_failures:
                 self._print(f"  {item.path}: {item.message}", error=True)
 
-        if not self.quiet:
-            self._print("-" * 54)
+        self._print("-" * 54)
 
     def _format_failure(self, failure: FailureInfo) -> str:
         reason = self.i18n.t(failure.message_key, **failure.message_params) if failure.message_key else failure.message

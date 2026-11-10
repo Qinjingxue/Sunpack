@@ -198,7 +198,6 @@ async def async_main(
             _PARSER_STDERR.reset(stderr_token)
 
         args.json = bool(getattr(args, "json", False) or "-j" in argv or "--json" in argv)
-        args.quiet = bool(getattr(args, "quiet", False) or "-q" in argv or "--quiet" in argv)
         args.verbose = bool(getattr(args, "verbose", False) or "-v" in argv or "--verbose" in argv)
         args.pause_on_exit = bool(getattr(args, "pause_on_exit", False) or "--pause" in argv)
         if args.command in {"extract", "scan"}:
@@ -209,7 +208,6 @@ async def async_main(
                 await host.set_cli_process_mode_override()
         reporter = CliReporter(
             json_mode=args.json,
-            quiet=args.quiet,
             verbose=args.verbose,
             stdout=ctx.stdout,
             stderr=ctx.stderr,

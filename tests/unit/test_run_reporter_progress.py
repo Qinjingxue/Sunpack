@@ -48,10 +48,10 @@ def test_partial_recovery_prints_possible_missing_volume_warning(tmp_path, capsy
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
-@pytest.mark.parametrize("quiet, emit_errors", [(False, True), (True, True), (True, False)])
-def test_final_summary_distinguishes_scan_and_archive_errors(tmp_path, language, quiet, emit_errors):
+@pytest.mark.parametrize("emit_errors", [True, False])
+def test_final_summary_distinguishes_scan_and_archive_errors(tmp_path, language, emit_errors):
     # Separately covers mixed error presentation and overflow counts. Native
-    # scan tests alone cannot expose quiet swallowing archive failure messages.
+    # scan tests alone cannot expose archive failure presentation errors.
     output, errors = io.StringIO(), io.StringIO()
     path = tmp_path / "broken.7z"
     failure = FailureInfo(
@@ -76,7 +76,7 @@ def test_final_summary_distinguishes_scan_and_archive_errors(tmp_path, language,
                         failure=FailureInfo(FailureKind.FILESYSTEM_ERROR, "postprocess", "promotion failed")),
     )
 
-    RunReporter(language, quiet=quiet, emit_errors=emit_errors, stdout=output, stderr=errors).log_final_summary(
+    RunReporter(language, emit_errors=emit_errors, stdout=output, stderr=errors).log_final_summary(
         0,
         RunSummary(target_results=target_results, scan_failures=(failure, *scan_failures)),
     )
@@ -94,11 +94,8 @@ def test_final_summary_distinguishes_scan_and_archive_errors(tmp_path, language,
         assert labels[2] in errors.getvalue()
     else:
         assert errors.getvalue() == ""
-    if quiet:
-        assert output.getvalue() == ""
-    else:
-        assert labels[4] in output.getvalue()
-        assert all(label not in output.getvalue() for label in labels[:3])
+    assert labels[4] in output.getvalue()
+    assert all(label not in output.getvalue() for label in labels[:3])
 
 
 def test_forwarded_terminal_capability_does_not_require_server_console():
@@ -107,16 +104,6 @@ def test_forwarded_terminal_capability_does_not_require_server_console():
     stream.supports_terminal_updates = True
 
     assert reporting._terminal_supports_updates(stream)
-
-
-def test_quiet_still_explains_blocked_disk_once(tmp_path):
-    out, err = io.StringIO(), io.StringIO()
-    reporter = RunReporter(quiet=True, stdout=out, stderr=err)
-    task = _task(tmp_path / "sample.7z")
-    for name in ("space_blocked", "space_status", "space_status"):
-        reporter.task_progress(task, {"event": name, "episode_id": 1})
-    assert not out.getvalue()
-    assert err.getvalue().count("Free space to resume automatically") == 1
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

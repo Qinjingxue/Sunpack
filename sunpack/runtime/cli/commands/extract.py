@@ -105,7 +105,7 @@ async def handle(args, ctx, *, operation="extract"):
         if reporter.verbose:
             reporter.detail(ctx.t("cli.extract.common_root", root=common_root))
 
-    if not is_scan and not (reporter.quiet or reporter.json_mode):
+    if not is_scan and not reporter.json_mode:
         async with command_work_broker(ctx) as broker:
             await broker.run("cli_output", "", report_targets)
 
@@ -126,14 +126,11 @@ async def handle(args, ctx, *, operation="extract"):
     run_config = _extract_run_config(
         config,
         initial_password_store,
-        quiet=is_scan or reporter.quiet or reporter.json_mode,
         verbose=bool(getattr(reporter, "verbose", False)),
         json_mode=bool(args.json),
     )
     deep_detect = bool(getattr(args, "deep_detect", False))
     run_config["extraction"]["operation"] = operation
-    if is_scan:
-        run_config["extraction"]["quiet"] = True
     engine_context = pipeline_engine(config)
     if not args.json and getattr(ctx.stdout, "isatty", lambda: False)():
         reporter.info(ctx.t("interrupt.hint"))
@@ -229,7 +226,6 @@ async def handle(args, ctx, *, operation="extract"):
             "paths": target_paths,
             "common_root": common_root,
             "json": args.json,
-            "quiet": args.quiet,
             "verbose": args.verbose,
             "config_overrides": config_overrides,
             "direct_file": bool(getattr(args, "direct_file", False)),
@@ -271,20 +267,17 @@ def _extract_run_config(
     config: dict,
     password_store,
     *,
-    quiet: bool = False,
     verbose: bool = False,
     json_mode: bool = False,
 ) -> dict:
     run_config = dict(config)
     run_config["cli"] = {
         **(config.get("cli", {}) if isinstance(config.get("cli"), dict) else {}),
-        "quiet": quiet,
         "verbose": verbose,
         "json": json_mode,
     }
     run_config["extraction"] = {
         **(config.get("extraction", {}) if isinstance(config.get("extraction"), dict) else {}),
-        "quiet": not verbose,
     }
     run_config["user_passwords"] = password_store.user_passwords
     run_config["clipboard_passwords"] = password_store.clipboard_passwords
@@ -297,7 +290,7 @@ def has_password_failure(failures: list[FailureInfo]) -> bool:
 
 
 def _should_retry_password_failure(args, retry_targets: list[str]) -> bool:
-    return bool(retry_targets) and not getattr(args, "json", False) and not getattr(args, "quiet", False)
+    return bool(retry_targets) and not getattr(args, "json", False)
 
 
 async def _confirm_password_retry(ctx) -> bool:

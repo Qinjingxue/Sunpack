@@ -256,7 +256,7 @@ async def _run_case(
     destination = root / source.name
     state_path = workspace.work / label / "state.snapshot"
     config = load_config()
-    config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}
+    config["cli"] = {**(config.get("cli") or {}), "verbose": False}
     config["watch"] = {
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,

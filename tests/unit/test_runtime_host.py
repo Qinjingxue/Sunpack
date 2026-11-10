@@ -20,7 +20,7 @@ def test_cold_cli_broker_transfers_to_the_engine_and_closes_once(monkeypatch):
     from sunpack.pipeline.coordinator.engine import PipelineEngine
 
     async def scenario():
-        config = make_config({"cli": {"quiet": True}})
+        config = make_config()
         monkeypatch.setattr(runtime, "_ENGINE", None)
         monkeypatch.setattr(runtime, "_WORK_BROKER", None)
         monkeypatch.setattr(runtime, "_ENGINE_LOCK", asyncio.Lock())

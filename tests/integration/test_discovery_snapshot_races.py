@@ -28,7 +28,7 @@ from tests.real.plan1_real_archives.plan1_support import assert_expected_files_e
 
 def _config(root, output):
     return make_config({
-        "cli": {"quiet": True}, "recursive_extract": "1",
+        "recursive_extract": "1",
         "post_extract": {"archive_cleanup_mode": "d"},
         "output": {"root": str(output), "common_root": str(root), "fixed_root": True},
     })

@@ -5,7 +5,7 @@ from sunpack.core.support.resource_lifecycle import named_task_temporary_file
 
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED
-from sunpack.runtime.cli.cli_parsers import build_config_output_parser
+from sunpack.runtime.cli.cli_parsers import build_json_parser
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.runtime.cli.persistent_runtime import load_request_config_payload
 from sunpack.runtime.config_validation import validate_config_payload
@@ -46,7 +46,7 @@ _INSTALL_CHECK_LABELS = {
 
 
 def register(subparsers, ctx):
-    common_parser = build_config_output_parser(ctx)
+    common_parser = build_json_parser(ctx)
     parser = subparsers.add_parser(
         COMMAND,
         aliases=COMMAND_ALIASES[COMMAND],

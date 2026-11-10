@@ -3,7 +3,7 @@ import json
 
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_USAGE
-from sunpack.runtime.cli.cli_parsers import build_config_output_parser
+from sunpack.runtime.cli.cli_parsers import build_json_parser
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.runtime.config_validation import validate_config_payload
 from sunpack.runtime.cli.persistent_runtime import load_request_config_payload
@@ -14,7 +14,7 @@ ORDER = 50
 
 
 def register(subparsers, ctx):
-    common_parser = build_config_output_parser(ctx)
+    common_parser = build_json_parser(ctx)
     config_parser = subparsers.add_parser(
         COMMAND,
         aliases=COMMAND_ALIASES[COMMAND],
@@ -45,7 +45,7 @@ async def handle(args, ctx):
         config_path, payload = load_request_config_payload(ctx.cwd, refresh=True, normalized=args.config_action == "validate")
         item = payload
         if args.config_action == "show":
-            if not args.json and not args.quiet:
+            if not args.json:
                 print(to_json_text(payload), file=ctx.stdout, flush=True)
         elif args.config_action == "validate":
             item = validate_config_payload(payload)

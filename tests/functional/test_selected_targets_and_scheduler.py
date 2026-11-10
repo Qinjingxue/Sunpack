@@ -50,7 +50,7 @@ def test_direct_file_task_preserves_explicit_zero_based_split_volumes(tmp_path):
     # canonical worker stream with this zero-based family too.
     from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 
-    extractor = ExtractionScheduler(extraction_config={"quiet": True})
+    extractor = ExtractionScheduler()
     result = run_extract(extractor, task, str(tmp_path / "out"))
     assert result.success, result.error
     assert next((tmp_path / "out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text

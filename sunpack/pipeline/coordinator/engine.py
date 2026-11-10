@@ -263,7 +263,7 @@ class PipelineEngine:
                         ),
                     )
                 self._remember_recent_passwords(response.recent_passwords)
-                if response.summary.postprocess_completed and not response.interrupted:
+                if runtime.reporter is not None and response.summary.postprocess_completed and not response.interrupted:
                     await self._broker.run(
                         "report",
                         submission.request_id,
@@ -1079,20 +1079,19 @@ class _RequestRuntime:
         cli_config = self.config["cli"]
         self.i18n = I18nContext(cli_config.get("language"))
         self.language = self.i18n.language
-        self.quiet = bool(cli_config.get("quiet", False))
         self.verbose = bool(cli_config.get("verbose", False))
         self.context = RunState()
-        self.reporter = RunReporter(
-            language=self.language,
-            quiet=self.quiet,
-            verbose=self.verbose,
-            emit_errors=submission.origin == "foreground" and not cli_config.get("json", False)
-                and self.config.get("extraction", {}).get("operation") != "scan",
-            stdout=submission.stdout,
-            stderr=submission.stderr,
-            work_broker=services.broker,
-            request_id=submission.request_id,
-        )
+        self.reporter = None
+        if not cli_config.get("json", False) and self.config.get("extraction", {}).get("operation") != "scan":
+            self.reporter = RunReporter(
+                language=self.language,
+                verbose=self.verbose,
+                emit_errors=submission.origin == "foreground",
+                stdout=submission.stdout,
+                stderr=submission.stderr,
+                work_broker=services.broker,
+                request_id=submission.request_id,
+            )
         self._shell_updates = _ShellUpdateBatch()
         self.source_cleanup = _SourceCleanup(
             self.context,
@@ -1145,7 +1144,8 @@ class _RequestRuntime:
         self._consumer_budget: int | None = None
 
     def _report_progress(self, task: Any, event: dict[str, Any]) -> None:
-        self.reporter.task_progress(task, event)
+        if self.reporter is not None:
+            self.reporter.task_progress(task, event)
         callback = self.submission.progress_callback
         if callback is not None:
             try:
@@ -1270,7 +1270,8 @@ class _RequestRuntime:
                 self._shell_updates.flush()
             finally:
                 self.extractor.set_progress_callback(None)
-                await self.reporter.drain_progress()
+                if self.reporter is not None:
+                    await self.reporter.drain_progress()
 
     async def _discover_and_run(
         self,
@@ -1366,8 +1367,9 @@ class _RequestRuntime:
         # This registration is deliberately only a source-cleanup lifetime
         # guard. It never gates planning, extraction or recursion.
         self.source_cleanup.register(tasks)
-        await broker.run("report", "", self.reporter.tasks_discovered, depth, tasks,
-                         request_id=self.submission.request_id, cancellation=cancellation)
+        if self.reporter is not None:
+            await broker.run("report", "", self.reporter.tasks_discovered, depth, tasks,
+                             request_id=self.submission.request_id, cancellation=cancellation)
 
         if self.submission.origin == "watch" and tasks:
             claimed_sources = tuple(dict.fromkeys(
@@ -1700,8 +1702,9 @@ class _RequestRuntime:
                 )
             with self.context.lock:
                 self._active_task_keys.discard(task_key)
-            await broker.run("report", task_key, self.reporter.scope_finished, task,
-                             request_id=self.submission.request_id)
+            if self.reporter is not None:
+                await broker.run("report", task_key, self.reporter.scope_finished, task,
+                                 request_id=self.submission.request_id)
 
     def _nested_scan_work(self, output_dir: str, extraction_result):
         logical_roots = []
@@ -1732,16 +1735,18 @@ class _RequestRuntime:
         if gate is None:
             async def prompt():
                 broker = self.services.broker
-                await broker.run("report", "", self.reporter.pause_panel,
-                                 request_id=self.submission.request_id)
+                if self.reporter is not None:
+                    await broker.run("report", "", self.reporter.pause_panel,
+                                     request_id=self.submission.request_id)
                 try:
                     return await self.recursion.prompt_continue(
                         depth - 1, readline=self.submission.input_reader,
                         stdout=self.submission.stdout,
                     )
                 finally:
-                    await broker.run("report", "", self.reporter.resume_panel,
-                                     request_id=self.submission.request_id)
+                    if self.reporter is not None:
+                        await broker.run("report", "", self.reporter.resume_panel,
+                                         request_id=self.submission.request_id)
             gate = asyncio.create_task(prompt())
             self._prompt_gates[depth] = gate
         return bool(await gate)
@@ -1948,7 +1953,7 @@ class _RequestRuntime:
                 self.context.add_cleanup_result(ArchiveCleanupResult(
                     result.output_dir, "flatten", "failed", message="; ".join(result.errors),
                 ))
-        if result.source_dir:
+        if result.source_dir and self.reporter is not None:
             await broker.run("report", "", self.reporter.relocate_outputs, result,
                              request_id=self.submission.request_id, cancellation=cancellation)
         return result

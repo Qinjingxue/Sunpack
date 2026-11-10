@@ -33,7 +33,6 @@ def _watch_memory_config() -> dict:
     }
     config["cli"] = {
         **(config.get("cli") or {}),
-        "quiet": True,
         "verbose": False,
     }
     config["post_extract"] = {

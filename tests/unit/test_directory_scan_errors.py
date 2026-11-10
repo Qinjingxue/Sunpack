@@ -142,7 +142,7 @@ def test_explicit_missing_target_keeps_valid_input_and_reports_metadata_failure(
 
 
 @pytest.mark.parametrize("direct", [False, True])
-@pytest.mark.parametrize("mode", ["text", "quiet", "json"])
+@pytest.mark.parametrize("mode", ["text", "json"])
 def test_extract_cli_keeps_valid_archive_when_an_explicit_target_is_missing(tmp_path, direct, mode):
     # Extraction has its own CLI admission and request path; scan-only checks
     # cannot catch an early return there or loss of errors in its final result.
@@ -181,10 +181,7 @@ def test_extract_cli_keeps_valid_archive_when_an_explicit_target_is_missing(tmp_
             assert ("[输入错误]" if label == "[扫描错误]" else "[Input error]") in completed.stderr
             assert str(invalid) in completed.stderr
         assert label not in completed.stdout
-        if mode == "quiet":
-            assert completed.stdout == ""
-        else:
-            assert any(counts in completed.stdout for counts in ("解压失败：0  扫描错误：1", "Extraction failed: 0  Scan errors: 1"))
+        assert any(counts in completed.stdout for counts in ("解压失败：0  扫描错误：1", "Extraction failed: 0  Scan errors: 1"))
     assert (tmp_path / "good" / "payload.txt").read_text() == "payload"
 
 

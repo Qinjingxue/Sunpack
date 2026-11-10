@@ -46,16 +46,15 @@ These options apply to `extract` and `scan`:
 | --- | --- |
 | `-R/--recursive` | Discover input subdirectories; independent of nested extraction with `--recur`. |
 | `-j`, `--json` | Output results as JSON; suitable for scripting. |
-| `-q`, `--quiet` | Reduce terminal output. |
 | `-v`, `--verbose` | Output more detection and diagnostic detail. |
 | `--pause` | Wait for a key press before exiting. |
 | `--no-pause` | Do not pause after the command finishes. |
 
 `extract` and `scan` use high process priority. When the shared runtime reaches the Watch idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`), it returns to the configured `runtime.process_mode`.
 
-`passwords` supports only `--json` plus the password input options; `config` supports `--json` and `--quiet`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
+`passwords` supports only `--json` plus the password input options; `config` supports `--json`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
 
-For `extract` and `scan`, normal text goes to stdout and errors go to stderr. `[Scan error]` identifies filesystem scan failures; `[Extraction failed]` identifies archive processing failures. `[Scan incomplete]` means some paths could not be read and the discovered results may be incomplete. Readable inputs are still processed. `--quiet` hides progress while retaining errors and post-processing warnings; `--json` emits the JSON result without these text messages.
+For `extract` and `scan`, normal text goes to stdout and errors go to stderr. `[Scan error]` identifies filesystem scan failures; `[Extraction failed]` identifies archive processing failures. `[Scan incomplete]` means some paths could not be read and the discovered results may be incomplete. Readable inputs are still processed. `--json` emits the JSON result without these text messages.
 
 JSON `summary.scan_error_count` counts filesystem scan errors, including errors whose individual details were omitted. Filesystem scan diagnostics retain at most 100 records per report, plus one total omission summary; the existing 20-detail limit per directory also applies. Above the report budget, only the omitted count is accumulated, without retaining each path or error identity. Archive task results remain available independently of this diagnostic budget.
 
@@ -239,7 +238,6 @@ Options:
 | Option | Description |
 | --- | --- |
 | `-j`, `--json` | Output the result as JSON. |
-| `-q`, `--quiet` | Reduce plain-text output. |
 
 Examples:
 
@@ -254,8 +252,8 @@ python sunpack.py config validate --json
 Usage:
 
 ```powershell
-python sunpack.py doctor [--json] [--quiet]
-python sunpack.py d [-j] [-q]
+python sunpack.py doctor [--json]
+python sunpack.py d [-j]
 ```
 
 `doctor` performs a read-only check of the configuration, the native extension, `7z.dll`, the SevenZip worker, Windows notification capability, and the configured monitored roots. A monitored root that does not exist is reported as a warning; the command never starts continuous monitoring or a real extraction, and never modifies the registry. The exit code is `1` when any check fails, and `0` when there are only warnings or skipped items.

@@ -25,7 +25,7 @@ def worker_jobs(monkeypatch):
 
 
 def config_for(tmp_path, passwords=("wrong", "sunpack-test")):
-    return make_config({"recursive_extract": "6", "cli": {"quiet": True},
+    return make_config({"recursive_extract": "6",
                         "user_passwords": list(passwords),
                         "output": {"root": str(tmp_path / "out")},
                         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False}})

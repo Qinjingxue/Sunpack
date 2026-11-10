@@ -103,7 +103,6 @@ async def watch_scenario(root, mode):
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     builtin.builtin_password_path = lambda: root / "builtin_passwords.json"
     config = load_config()
-    config["cli"]["quiet"] = True
     config["user_passwords"] = ["wrong-candidate"]
     if not manifest.get("unknown_password"):
         config["user_passwords"].append("wal-test-secret")

@@ -190,11 +190,10 @@ def test_output_target_ownership_survives_junction_flatten_and_forget(tmp_path):
     assert ownership._target_for_path(str(physical / "result" / "child" / "new.zip")) is one
 
 
-@pytest.mark.parametrize("quiet", [False, True])
-def test_existing_final_report_shows_postprocess_warning_and_actual_output(quiet):
+def test_existing_final_report_shows_postprocess_warning_and_actual_output():
     stream = io.StringIO()
     errors = io.StringIO()
-    reporter = RunReporter("zh", stdout=stream, stderr=errors, quiet=quiet)
+    reporter = RunReporter("zh", stdout=stream, stderr=errors)
     reporter._top_level_outputs["C:/output"] = "C:/output"
     reporter.relocate_outputs(DirectoryFlattenResult("C:/output", "C:/output.work", "C:/output"))
     reporter.log_final_summary(0, RunSummary(target_results=(TargetRunResult("archive", OutcomeKind.COMPLETE_SUCCESS),), cleanup_results=(
@@ -202,7 +201,4 @@ def test_existing_final_report_shows_postprocess_warning_and_actual_output(quiet
     )))
     assert "[后处理警告] 解压完成，1 项后处理操作失败" in errors.getvalue()
     assert "C:/output.work: publish failed" in errors.getvalue()
-    if quiet:
-        assert stream.getvalue() == ""
-    else:
-        assert "输出位置：C:/output.work" in stream.getvalue().replace("\\", "/")
+    assert "输出位置：C:/output.work" in stream.getvalue().replace("\\", "/")

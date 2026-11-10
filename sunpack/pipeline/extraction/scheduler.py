@@ -110,7 +110,6 @@ class ExtractionScheduler:
             password_resolver=self.password_resolver,
             sevenzip_runner=self.sevenzip_runner,
             best_effort=True,
-            quiet=bool(self.extraction_config.get("quiet", False)),
             language=str(self.extraction_config.get("language") or "en"),
             operation=self.extraction_config.get("operation", "extract"),
         )

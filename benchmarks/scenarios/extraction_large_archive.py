@@ -467,7 +467,7 @@ def main() -> int:
     passwords = [f"sunpack-wrong-{index:04d}" for index in range(max(0, args.generated_wrong_passwords))]
     passwords.extend(args.password)
     config = archive_pressure_config(passwords=passwords)
-    config.setdefault("cli", {}).update({"quiet": True, "verbose": False})
+    config.setdefault("cli", {}).update({"verbose": False})
     config["recursive_extract"] = {"mode": "fixed", "max_rounds": max(1, args.recursive_rounds)}
     output_base = Path(args.output).resolve()
     config["output"] = {"root": str(output_base)}

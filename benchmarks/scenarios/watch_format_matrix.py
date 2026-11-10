@@ -406,7 +406,7 @@ async def _run_case(
     state_path = workspace.work / label / "state.snapshot"
 
     config = load_config()
-    config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}
+    config["cli"] = {**(config.get("cli") or {}), "verbose": False}
     config["post_extract"] = {
         **(config.get("post_extract") or {}),
         # Post-extract flattening is the dominant per-file tail of one watch

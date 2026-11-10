@@ -300,7 +300,6 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
     missing.unlink()
     output = tmp_path / "out"
     config = plan1_config(passwords=["wrong-one", "wrong-two"])
-    config["cli"]["quiet"] = True
     config["watch"].update(clipboard_monitor_enabled=False)
 
     async def exercise():

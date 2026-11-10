@@ -50,7 +50,6 @@ def carrier_case(tmp_path):
         "output": {"root": str(tmp_path / "out")},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
         "watch": {"clipboard_monitor_enabled": False},
-        "cli": {"quiet": True},
     })
     return SimpleNamespace(carrier=carrier, watch=watch, config=config, passwords=passwords, archives=archives)
 
@@ -96,7 +95,7 @@ def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, car
         paths=[str(case.carrier)], password=[case.passwords[0]], password_file=None,
         prompt_passwords=False, no_builtin_passwords=True, recursive_extract=None,
         archive_cleanup_mode=None, flatten_single_directory=None, json=False,
-        quiet=False, verbose=False, recursive=False,
+        verbose=False, recursive=False,
     )
     code, result = asyncio.run(extract.handle(args, CliContext(
         language="zh", reporter=CliReporter(), cwd=str(tmp_path), input_reader=read_answer,

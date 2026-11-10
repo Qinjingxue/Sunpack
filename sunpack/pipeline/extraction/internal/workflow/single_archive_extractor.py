@@ -73,7 +73,6 @@ class SingleArchiveExtractor:
         password_resolver,
         sevenzip_runner: SevenZipRunner | None = None,
         best_effort: bool = True,
-        quiet: bool = False,
         language: str = "en",
         operation: str = "extract",
     ):
@@ -81,7 +80,6 @@ class SingleArchiveExtractor:
         self.password_resolver = password_resolver
         self.sevenzip_runner = sevenzip_runner
         self.best_effort = bool(best_effort)
-        self.quiet = bool(quiet)
         self.i18n = I18nContext(language)
         self.scanning = operation == "scan"
 
@@ -817,8 +815,7 @@ class SingleArchiveExtractor:
         result["item_count"] = max(int(result.get("item_count", 0) or 0), int(stats.get("file_count", 0) or 0))
 
     def _log(self, task, message: str) -> None:
-        if not self.quiet:
-            self.sevenzip_runner.emit_semantic_event(task, "task_detail", detail=message)
+        self.sevenzip_runner.emit_semantic_event(task, "task_detail", detail=message)
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

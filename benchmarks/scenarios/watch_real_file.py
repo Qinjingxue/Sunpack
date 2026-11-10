@@ -111,7 +111,7 @@ async def _run_once(
     state_path = workspace.work / (f"{case_key}.state.snapshot" if case_key else "state.snapshot")
 
     config = load_config()
-    config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}
+    config["cli"] = {**(config.get("cli") or {}), "verbose": False}
     config["watch"] = {
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,

@@ -1342,12 +1342,10 @@ def test_persistent_runtime_reuses_engine_for_request_only_config(monkeypatch):
     monkeypatch.setattr(persistent_runtime, "PipelineEngine", FakeEngine)
     first = {
         "output": {"root": "one", "common_root": "a"},
-        "cli": {"quiet": True},
         "performance": {"persistent_server_idle_seconds": 3},
     }
     second = {
         "output": {"root": "two", "common_root": "b"},
-        "cli": {"quiet": False},
         "performance": {"persistent_server_idle_seconds": 9},
     }
     async def scenario():

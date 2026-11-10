@@ -33,7 +33,6 @@ def _watch_broker_lease():
 
 def _watch_config() -> dict:
     config = load_config()
-    config["cli"] = {**(config.get("cli") or {}), "quiet": True}
     config["post_extract"] = {
         **(config.get("post_extract") or {}),
         "archive_cleanup_mode": "keep",

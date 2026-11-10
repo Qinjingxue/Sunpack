@@ -192,7 +192,7 @@ def test_hard_links_survive_pipeline_verification(tmp_path, origin, layout):
             disguised = tmp_path / "archive.blob"
             archive.rename(disguised)
             archive = disguised
-    config = make_config({"cli": {"quiet": True}, "recursive_extract": 3,
+    config = make_config({"recursive_extract": 3,
                           "user_passwords": ["audit-secret"],
                           "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False}})
 

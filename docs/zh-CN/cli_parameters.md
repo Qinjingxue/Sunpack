@@ -46,16 +46,15 @@ sunpack w st
 | --- | --- |
 | `-R/--recursive` | 递归发现输入子目录；与嵌套解压的 `--recur` 独立。 |
 | `-j`, `--json` | 以 JSON 格式输出结果，适合脚本调用。 |
-| `-q`, `--quiet` | 减少终端输出。 |
 | `-v`, `--verbose` | 输出更多检测和诊断细节。 |
 | `--pause` | 命令结束后等待按键退出。 |
 | `--no-pause` | 命令结束后不暂停。 |
 
 `extract` 和 `scan` 使用高进程优先级。共享运行时达到 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`）后，恢复配置中的 `runtime.process_mode`。
 
-`passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json` 和 `--quiet`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
+`passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
 
-`extract` 和 `scan` 的普通文本写入 stdout，错误写入 stderr。`[扫描错误]` 表示文件系统扫描失败，`[解压失败]` 表示归档处理失败；`[扫描不完整]` 表示部分路径无法读取，发现结果可能不完整，其余可读取的输入仍会继续处理。`--quiet` 隐藏进度，但保留错误和后处理警告；`--json` 输出 JSON 结果，不输出这些文本消息。
+`extract` 和 `scan` 的普通文本写入 stdout，错误写入 stderr。`[扫描错误]` 表示文件系统扫描失败，`[解压失败]` 表示归档处理失败；`[扫描不完整]` 表示部分路径无法读取，发现结果可能不完整，其余可读取的输入仍会继续处理。`--json` 输出 JSON 结果，不输出这些文本消息。
 
 JSON 的 `summary.scan_error_count` 统计文件系统扫描错误，包括省略了单独详情的错误。每份报告最多保留 100 条文件系统扫描诊断记录，另加 1 条总省略摘要；单个目录仍适用原有的 20 条详情上限。超出报告预算后只累计省略数量，不再保留每条错误的路径或身份。归档任务结果独立于这项诊断预算保留。
 
@@ -239,7 +238,6 @@ python sunpack.py config [options] <show|validate>
 | 参数 | 说明 |
 | --- | --- |
 | `-j`, `--json` | 以 JSON 输出结果。 |
-| `-q`, `--quiet` | 减少普通文本输出。 |
 
 示例：
 
@@ -254,8 +252,8 @@ python sunpack.py config validate --json
 用法：
 
 ```powershell
-python sunpack.py doctor [--json] [--quiet]
-python sunpack.py d [-j] [-q]
+python sunpack.py doctor [--json]
+python sunpack.py d [-j]
 ```
 
 `doctor` 只读检查配置、原生扩展、`7z.dll`、SevenZip worker、Windows 通知能力以及已配置的监控根。不存在的监控根报告为警告；命令不会启动持续监控或真实解压，也不会修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码为 `0`。

@@ -176,7 +176,7 @@ def _run_python_phase(
                 started = time.perf_counter()
                 code = await async_main([
                     "extract", *paths, "--direct-file", "--out-dir", str(out_dir),
-                    "--cleanup", "k", "--no-flatten", "--no-pause", "--quiet",
+                    "--cleanup", "k", "--no-flatten", "--no-pause",
                 ])
                 elapsed = time.perf_counter() - started
                 if code:

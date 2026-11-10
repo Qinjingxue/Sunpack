@@ -62,7 +62,6 @@ def nested_failures(tmp_path):
         "embedded_scan": {"recursive_candidate_ratio": 1e-9},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": True},
         "watch": {"clipboard_monitor_enabled": False},
-        "cli": {"quiet": True},
     })
     return SimpleNamespace(
         outer=outer, carrier=carrier, password=password, config=config,
@@ -181,10 +180,10 @@ def test_cli_scan_failure_prompts_only_for_password_and_reports_missing_volume(
         paths=[str(case.outer)], password=[case.password] if provide_password else ["wrong-candidate"],
         password_file=None, prompt_passwords=False, no_builtin_passwords=True,
         recursive_extract=None, archive_cleanup_mode=None, flatten_single_directory=None,
-        json=False, quiet=False, verbose=False, recursive=False,
+        json=False, verbose=False, recursive=False,
     )
     code, result = asyncio.run(extract.handle(args, CliContext(
-        language="en", reporter=CliReporter(quiet=True), cwd=str(tmp_path), input_reader=read_input,
+        language="en", reporter=CliReporter(), cwd=str(tmp_path), input_reader=read_input,
     )))
     assert code != 0 and len(result.errors) == 1
     assert result.summary["failed_count"] == 1

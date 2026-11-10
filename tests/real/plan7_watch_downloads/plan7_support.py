@@ -223,7 +223,6 @@ class _TimedPipelineEngine:
 def plan7_watch_config(passwords: list[str] | None = None) -> dict:
     """plan1 全检测配置 + watch 运行参数（保留持久 worker 以观察内存）。"""
     config = plan1_config(passwords=passwords or [PASSWORD])
-    config["cli"] = {**(config.get("cli") or {}), "quiet": True}
     config["post_extract"] = {
         **(config.get("post_extract") or {}),
         "archive_cleanup_mode": "keep",

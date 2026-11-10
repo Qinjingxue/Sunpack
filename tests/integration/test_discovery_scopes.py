@@ -582,7 +582,7 @@ def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion
         inner.writestr("payload.txt", b"payload")
     with zipfile.ZipFile(archive, "w") as outer:
         outer.writestr("inner.blob", content.getvalue())
-    config = make_config({"cli": {"quiet": True}, "recursive_extract": 1,
+    config = make_config({"recursive_extract": 1,
         "output": {"root": str(alias / "results")},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
         "watch": {"clipboard_monitor_enabled": False}})

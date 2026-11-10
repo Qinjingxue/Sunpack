@@ -50,7 +50,6 @@ def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encry
                 "password_candidates_all_rejected": True, "password_attempts": len(candidate_passwords),
             }),
         ),
-        quiet=True,
     )
     extractor._resolve_password = lambda *args: resolution
     result = run_extract(extractor, task, str(tmp_path / "out"))

@@ -19,7 +19,7 @@ from tests.unit.test_lz4_support import ROOT, fixtures, fingerprints  # shared n
 
 def config_for(tmp_path, fixtures):
     return normalize_config(with_detection_pipeline({
-        "recursive_extract": "4", "cli": {"quiet": True},
+        "recursive_extract": "4",
         "output": {"root": str(tmp_path / "out")},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
     }))

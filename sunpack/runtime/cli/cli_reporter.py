@@ -16,24 +16,22 @@ class CliReporter:
     def __init__(
         self,
         json_mode: bool = False,
-        quiet: bool = False,
         verbose: bool = False,
         *,
         stdout=None,
         stderr=None,
     ):
         self.json_mode = json_mode
-        self.quiet = quiet
         self.verbose = verbose
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
 
     def info(self, message: str):
-        if not self.json_mode and not self.quiet:
+        if not self.json_mode:
             print(message, file=self.stdout, flush=True)
 
     def detail(self, message: str):
-        if not self.json_mode and self.verbose and not self.quiet:
+        if not self.json_mode and self.verbose:
             print(message, file=self.stdout, flush=True)
 
     def error(self, message: str):

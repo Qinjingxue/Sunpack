@@ -56,7 +56,6 @@ def localize_parser(parser: argparse.ArgumentParser, ctx: CliContext) -> None:
 def build_common_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-j", "--json", action="store_true", help=ctx.t("cli.json"))
-    parser.add_argument("-q", "--quiet", action="store_true", help=ctx.t("cli.quiet"))
     parser.add_argument("-v", "--verbose", action="store_true", help=ctx.t("cli.verbose"))
     pause_group = parser.add_mutually_exclusive_group()
     pause_group.add_argument("--no-pause", action="store_true", help=ctx.t("cli.no_pause"))
@@ -67,12 +66,6 @@ def build_common_parser(ctx: CliContext) -> argparse.ArgumentParser:
 def build_json_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-j", "--json", action="store_true", help=ctx.t("cli.json"))
-    return parser
-
-
-def build_config_output_parser(ctx: CliContext) -> argparse.ArgumentParser:
-    parser = build_json_parser(ctx)
-    parser.add_argument("-q", "--quiet", action="store_true", help=ctx.t("cli.quiet"))
     return parser
 
 

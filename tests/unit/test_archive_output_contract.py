@@ -76,7 +76,7 @@ def test_unsupported_tar_payload_encoding_never_authorizes_source_cleanup(tmp_pa
         regular.size = 3
         stream.addfile(regular, io.BytesIO(b"ok!"))
         stream.addfile(target, io.BytesIO(content))
-    config = make_config({"cli": {"quiet": True}, "recursive_extract": 1,
+    config = make_config({"recursive_extract": 1,
 
                           "post_extract": {"archive_cleanup_mode": "d", "flatten_single_directory": False}})
 
