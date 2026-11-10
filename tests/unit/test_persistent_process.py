@@ -472,7 +472,7 @@ def test_progress_never_waits_for_a_reporter_parked_on_output():
         held = asyncio.Event()
         release = threading.Event()
         reporter = RunReporter(stdout=io.StringIO())
-        task = SimpleNamespace(main_path="archive.bin", logical_name="archive.bin")
+        task = SimpleNamespace(key="archive.bin", main_path="archive.bin", logical_name="archive.bin")
         reporter.tasks_discovered(1, [task])
         loop = asyncio.get_running_loop()
 

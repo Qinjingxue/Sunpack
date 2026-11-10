@@ -141,6 +141,7 @@ def test_collect_result_records_cleanup_and_preserves_zero_byte_files(tmp_path, 
         monkeypatch.setattr("sunpack.pipeline.postprocess.output_cleanup._payload_inventory", unexpected_walk)
     outcome = ArchiveJobOutcome(result=extraction, planned_out_dir=str(output))
     runner = object.__new__(ArchiveJobExecutor)
+    runner.scanning = False
     runner.context = RunState()
     runner.i18n = I18nContext("en")
     runner.config = {}
@@ -174,6 +175,7 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
     extraction = ExtractionResult(False, str(output), error="damaged", partial_outputs=True)
     outcome = ArchiveJobOutcome(extraction, planned_out_dir=str(output))
     runner = object.__new__(ArchiveJobExecutor)
+    runner.scanning = False
     runner.context, runner.i18n, runner.config = RunState(), I18nContext("en"), {}
     runner.content_policy = ContentRecoveryPolicy.from_config({})
     runner.origin, runner.request_id = origin, "cleanup-request"

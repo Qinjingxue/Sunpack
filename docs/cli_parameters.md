@@ -20,8 +20,7 @@ Top-level commands:
 | --- | --- |
 | `extract`, `x` | Scan, identify, extract, verify, post-process, and clean up. |
 | `watch`, `w` | Monitor directories and process files automatically once they are stable. |
-| `scan`, `s` | Only scan and list extractable tasks; does not modify files. |
-| `inspect`, `i` | Print detection and structural analysis details; does not modify files. |
+| `scan`, `s` | Read-only archive discovery and password confirmation. |
 | `passwords`, `pw` | Show a summary of the password sources available to the current command. |
 | `config`, `cfg` | Show or validate the merged effective configuration. |
 | `doctor`, `d` | Read-only check of configuration and runtime environment. |
@@ -33,7 +32,7 @@ Short command examples:
 
 ```powershell
 sunpack x D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -k --no-pause
-sunpack i D:\Downloads --analysis -d -j
+sunpack s D:\Downloads -v -d -j
 sunpack w add D:\Downloads -o E:\Output -s -i -d
 sunpack w ls
 sunpack w st
@@ -41,7 +40,7 @@ sunpack w st
 
 ## Common output options
 
-These options apply to `extract`, `scan`, and `inspect`:
+These options apply to `extract` and `scan`:
 
 | Option | Description |
 | --- | --- |
@@ -53,11 +52,11 @@ These options apply to `extract`, `scan`, and `inspect`:
 | `--no-pause` | Do not pause after the command finishes. |
 | `-m MODE`, `--process-mode MODE` | Temporarily override the shared RuntimeHost/native-worker process mode for this workload. Defaults to `high`. |
 
-For `extract`, `scan`, and `inspect`, the process-mode override remains effective after the command finishes and expires when the shared runtime reaches the existing Watch idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`); it then returns to `runtime.process_mode`.
+For `extract` and `scan`, the process-mode override remains effective after the command finishes and expires when the shared runtime reaches the existing Watch idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`); it then returns to `runtime.process_mode`.
 
 `passwords` supports only `--json` plus the password input options; `config` supports `--json` and `--quiet`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
 
-For `extract`, `scan`, and `inspect`, normal text goes to stdout and errors go to stderr. `[Scan error]` identifies filesystem scan failures; `[Extraction failed]` identifies archive processing failures. `[Scan incomplete]` means some paths could not be read and the discovered results may be incomplete. Readable inputs are still processed. `--quiet` hides progress while retaining errors and post-processing warnings; `--json` emits the JSON result without these text messages.
+For `extract` and `scan`, normal text goes to stdout and errors go to stderr. `[Scan error]` identifies filesystem scan failures; `[Extraction failed]` identifies archive processing failures. `[Scan incomplete]` means some paths could not be read and the discovered results may be incomplete. Readable inputs are still processed. `--quiet` hides progress while retaining errors and post-processing warnings; `--json` emits the JSON result without these text messages.
 
 JSON `summary.scan_error_count` counts filesystem scan errors, including errors whose individual details were omitted. Filesystem scan diagnostics retain at most 100 records per report, plus one total omission summary; the existing 20-detail limit per directory also applies. Above the report budget, only the omitted count is accumulated, without retaining each path or error identity. Archive task results remain available independently of this diagnostic budget.
 
@@ -116,6 +115,8 @@ Exit codes:
 - `3`: runtime exception.
 - `4`: no task failed, but at least one task only partially succeeded.
 
+Extraction displays a tree of logical task scopes. Each carrier segment and nested archive owns its status, progress, and errors. Redirected output prints each complete tree when its root finishes; the final summary is unchanged.
+
 ## scan
 
 Usage:
@@ -124,9 +125,13 @@ Usage:
 python sunpack.py scan [options] <paths...>
 ```
 
-`scan` outputs the identified extraction tasks, volume relationships, detected extensions, verdicts, and matched rules. It does not extract or clean up files.
+`scan` shares extract's discovery, input planning, and password confirmation. Results are grouped by physical file and logical segment, showing only obtained format, range, volume, password, and error facts. Ordinary archives omit ranges; carriers show `[start, end)`, with `?` for an unknown end and a tree for multiple segments. Known encryption without a confirmed password is shown as unknown; confirmed passwords are printed directly.
 
-`--deep-detect` performs a full embedded scan on candidates not resolved by normal detection and disables all filesystem scan filters for this request, including nested output scans. `--recursive` determines the directory scope. Each CLI request uses its own arguments, even when it shares a runtime with deep monitoring of the same input directory.
+Ambiguous volumes retain compact slot candidates and layouts, without expanding combinations, and remain pending actual extraction. A bounded password test does not establish archive integrity or validate an entire volume set. Scan does not extract, create output directories, inspect contents that require extraction, verify outputs, flatten directories, or clean source files.
+
+The password input options are shared with extract. `-v` adds existing discovery sources and damage facts without extra analysis; `--json` independently selects the output format.
+
+`--deep-detect` performs a full embedded scan on candidates not resolved by normal detection and disables all filesystem scan filters for this request, for scan. `--recursive` determines the directory scope. Each CLI request uses its own arguments, even when it shares a runtime with deep monitoring of the same input directory.
 
 Examples:
 
@@ -134,35 +139,6 @@ Examples:
 python sunpack.py scan D:\Downloads
 python sunpack.py scan D:\Downloads --deep-detect --json
 python sunpack.py scan D:\Downloads -v
-```
-
-## inspect
-
-Usage:
-
-```powershell
-python sunpack.py inspect [options] <paths...>
-```
-
-`inspect` is a read-only detection diagnostic command. It lists the verdicts, processing stages, stop reasons, and factual errors of candidate files.
-
-Options:
-
-| Option | Description |
-| --- | --- |
-| `--archives-only`, `--archives` | Show only items finally judged extractable. |
-| `--analyze`, `--analysis` | Attach format, fragment, damage markers, and candidate summaries to extractable or pending candidates. |
-| `-d`, `--deep-detect` | Enable a full embedded scan for unresolved candidates and disable all filesystem scan filters for this request. |
-
-`-v` additionally prints the effective configuration, matched rules, scoring details, and factual errors; JSON output keeps the corresponding structured fields.
-
-Examples:
-
-```powershell
-python sunpack.py inspect D:\Downloads
-python sunpack.py inspect D:\Downloads --archives-only --analyze
-python sunpack.py inspect D:\Downloads --deep-detect --json
-python sunpack.py inspect D:\Downloads -v
 ```
 
 ## watch

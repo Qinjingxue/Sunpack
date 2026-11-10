@@ -11,7 +11,7 @@ _COMMAND_CACHE_LOCK = threading.Lock()
 _COMMAND_MODULE_CACHE: tuple[ModuleType, ...] | None = None
 _COMMAND_MODULE_NAMES = {
     "extract": "sunpack.runtime.cli.commands.extract", "watch": "sunpack.runtime.cli.commands.watch",
-    "scan": "sunpack.runtime.cli.commands.scan", "inspect": "sunpack.runtime.cli.commands.inspect_command",
+    "scan": "sunpack.runtime.cli.commands.scan",
     "passwords": "sunpack.runtime.cli.commands.passwords", "config": "sunpack.runtime.cli.commands.config",
 }
 

@@ -60,7 +60,6 @@ def test_cli_parser_registers_discovered_commands():
         "extract": ["extract", "."],
         "watch": ["watch", "list"],
         "scan": ["scan", "."],
-        "inspect": ["inspect", "."],
         "passwords": ["passwords"],
         "config": ["config", "show"],
         "doctor": ["doctor"],
@@ -93,7 +92,6 @@ def test_command_help_exposes_public_options(subtests, capsys):
     """Cover all command help contracts without launching persistent clients."""
     cases = {
         "scan": ((), ("--min-size",)),
-        "inspect": (("--archives-only", "--analyze"), ()),
         "extract": (
             ("--recur", "--cleanup", "--out-dir",
              "--direct-file", "--process-mode"),

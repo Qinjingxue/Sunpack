@@ -77,6 +77,7 @@ class SingleArchiveExtractor:
         quiet: bool = False,
         language: str = "en",
         output_stream=None,
+        operation: str = "extract",
     ):
         self.password_store = password_store
         self.password_resolver = password_resolver
@@ -85,6 +86,7 @@ class SingleArchiveExtractor:
         self.quiet = bool(quiet)
         self.i18n = I18nContext(language)
         self.output_stream = output_stream if output_stream is not None else sys.stdout
+        self.scanning = operation == "scan"
 
     async def extract_asyncio(
         self,
@@ -172,10 +174,11 @@ class SingleArchiveExtractor:
             or len(run_parts) > 1
         )
 
-        self._log(self.i18n.t("extract.log.start", archive=archive))
+        self._log(task, self.i18n.t("extract.log.start", archive=archive))
 
         try:
-            os.makedirs(out_dir, exist_ok=True)
+            if not self.scanning:
+                os.makedirs(out_dir, exist_ok=True)
         except Exception as exc:
             failure = self._failure_info(FailureKind.FILESYSTEM_ERROR, "preflight", "extract.dir_create_failed", error=str(exc))
             return self._failed(
@@ -194,7 +197,7 @@ class SingleArchiveExtractor:
         resolution_failure = self._password_resolution_failure(resolution)
         if resolution_failure is not None:
             self._cleanup_output(out_dir, OutputCleanupEvent.EXTRACTION_ABORT)
-            self._log(self.i18n.t("extract.log.failed", archive=archive, error=self._localized_failure(resolution_failure)))
+            self._log(task, self.i18n.t("extract.log.failed", archive=archive, error=self._localized_failure(resolution_failure)))
             return self._failed(
                 out_dir,
                 self._localized_failure(resolution_failure),
@@ -203,6 +206,7 @@ class SingleArchiveExtractor:
                     "failure_stage": resolution_failure.stage,
                     "failure_kind": resolution_failure.kind.value,
                     "message": resolution.error_text,
+                    "result": {"encrypted": resolution.encrypted} if resolution.encrypted is not None else {},
                 },
             )
         correct_pwd = resolution.password
@@ -211,7 +215,7 @@ class SingleArchiveExtractor:
             err = test_err
         else:
             with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
-                selected_codepage = _zip_filename_codepage(task, descriptor)
+                selected_codepage = None if self.scanning else _zip_filename_codepage(task, descriptor)
             self.sevenzip_runner.emit_semantic_event(
                 task,
                 "extract_ready",
@@ -226,11 +230,16 @@ class SingleArchiveExtractor:
                     "password": correct_pwd,
                     "password_candidates": list(resolution.candidate_passwords),
                     "password_verified": bool(correct_pwd) and not resolution.requires_extraction_confirmation,
+                    "encrypted": resolution.encrypted,
+                    "operation": "scan" if self.scanning else "extract",
                     "selected_codepage": selected_codepage,
                     "task": task,
                     "phase_timer": phase_timer,
                     "phase_prefix": f"{phase_prefix}_sevenzip",
                 }
+
+            if self.scanning:
+                return self._scan_result(resolution, run_result, archive, is_split)
 
             if run_result.returncode == 0:
                 if descriptor.volume_attempts is not None:
@@ -262,7 +271,7 @@ class SingleArchiveExtractor:
                         "total_bytes": output_inventory.stats.total_size,
                     }
                     self._fill_success_output_counts(diagnostics, output_stats)
-                self._log(self.i18n.t("extract.log.success", archive=archive))
+                self._log(task, self.i18n.t("extract.log.success", archive=archive))
                 manifest_payload = None
                 if worker_result:
                     with _phase(phase_timer, f"{phase_prefix}_build_success_manifest"):
@@ -304,7 +313,7 @@ class SingleArchiveExtractor:
                 self.password_resolver.reject_extraction_candidates(resolution)
 
         error_msg = self._localized_failure(failure)
-        self._log(self.i18n.t("extract.log.failed", archive=archive, error=error_msg))
+        self._log(task, self.i18n.t("extract.log.failed", archive=archive, error=error_msg))
         with _phase(phase_timer, f"{phase_prefix}_diagnostics_failure"):
             diagnostics = self._diagnostics_from(run_result)
             if resolution.requires_extraction_confirmation:
@@ -381,13 +390,39 @@ class SingleArchiveExtractor:
             scope_path=scope_path,
         )
 
-    @staticmethod
-    def _cleanup_output(out_dir: str, event: OutputCleanupEvent) -> None:
+    def _cleanup_output(self, out_dir: str, event: OutputCleanupEvent) -> None:
+        if self.scanning:
+            return
         DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
             out_dir,
             event=event,
             planned_output_dir=out_dir,
         )
+
+    def _scan_result(self, resolution, run_result, archive, is_split):
+        payload = worker_result_payload(run_result)
+        confirmed = (resolution.password is not None and not resolution.requires_extraction_confirmation)
+        confirmed = confirmed or payload.get("password_verified") is True
+        password = self._worker_selected_password(resolution, run_result) if confirmed else None
+        if payload.get("password_verified") is True:
+            self.password_resolver.confirm_extraction(resolution, password=password)
+        elif payload.get("password_candidates_all_rejected"):
+            self.password_resolver.reject_extraction_candidates(resolution)
+        failure = None
+        if run_result.returncode != 0:
+            failure = classify_extract_failure(run_result, f"{run_result.stdout}\n{run_result.stderr}".lower(),
+                                               archive=archive, is_split_archive=is_split,
+                                               password_evidence=resolution.candidate_evidence)
+        # Keep only receipts, never transport histories or request candidate arrays.
+        facts = {key: payload[key] for key in (
+            "encrypted", "archive_type", "missing_volume", "missing_volume_evidence",
+            "missing_volume_name", "password_verified", "failure_kind", "message",
+        ) if key in payload}
+        if resolution.encrypted is not None:
+            facts.setdefault("encrypted", resolution.encrypted)
+        return ExtractionResult(success=failure is None, out_dir="", password_used=password,
+                                failure=failure, error=self._localized_failure(failure) if failure else "",
+                                diagnostics={"result": facts})
 
     @staticmethod
     def _password_archive_key(task: ArchiveTask) -> str:
@@ -560,10 +595,11 @@ class SingleArchiveExtractor:
         phase_prefix: str = "extract_inputs",
     ) -> ExtractionResult:
         archive = task.main_path
-        self._log(self.i18n.t("extract.log.embedded_start", archive=archive, count=len(inputs)))
+        self._log(task, self.i18n.t("extract.log.embedded_start", archive=archive, count=len(inputs)))
         try:
             with _phase(phase_timer, f"{phase_prefix}_mkdir_initial"):
-                os.makedirs(out_dir, exist_ok=True)
+                if not self.scanning:
+                    os.makedirs(out_dir, exist_ok=True)
         except Exception as exc:
             failure = self._failure_info(FailureKind.FILESYSTEM_ERROR, "preflight", "extract.dir_create_failed", error=str(exc))
             return self._failed(
@@ -583,21 +619,21 @@ class SingleArchiveExtractor:
         any_partial = False
         segment_failures = [item.failure for item in retained if not item.complete and item.failure is not None]
         segment_paths: set[str] = set()
-        segment_allocator = OutputPathAllocator()
+        segment_allocator = None if self.scanning else OutputPathAllocator()
         segment_count = task.recovery.input_count or len(inputs)
         previous = {item.input.input_id: item for item in task.recovery.checkpoints}
 
         for node in inputs:
             position = node.position
             descriptor = node.descriptor
-            segment = node.projection()
+            segment = None if self.scanning else node.projection()
             segment_id = node.input_id
             # A single embedded payload is the logical archive represented by
             # this task (the common SFX case).  Extract it at the task output
             # root so manifest paths continue to match.  Multiple independent
             # payloads still need isolated subdirectories to avoid collisions.
             checkpoint = previous.get(node.input_id)
-            segment_dir = checkpoint.output_dir if checkpoint and checkpoint.output_dir else (
+            segment_dir = "" if self.scanning else checkpoint.output_dir if checkpoint and checkpoint.output_dir else (
                 out_dir
                 if segment_count == 1
                 else segment_allocator.next_available(
@@ -605,7 +641,8 @@ class SingleArchiveExtractor:
                     segment_paths,
                 )
             )
-            segment_paths.add(resolved_path_key(segment_dir))
+            if not self.scanning:
+                segment_paths.add(resolved_path_key(segment_dir))
             if checkpoint and checkpoint.output_dir:
                 # This attempt owns one logical output. Replacing a changed or
                 # failed input must never merge old files into its new result.
@@ -627,6 +664,7 @@ class SingleArchiveExtractor:
                 # logical segment.
                 write_source_password_probe_input(child_task, descriptor)
             discovery_failure = node.failure
+            self.sevenzip_runner.emit_semantic_event(child_task, "input_started")
             if discovery_failure is not None:
                 result = self._failed(segment_dir, self._localized_failure(discovery_failure),
                                       failure=discovery_failure)
@@ -635,10 +673,21 @@ class SingleArchiveExtractor:
                     child_task, segment_dir,
                     phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_segment_extract",
                 )
-            if result.success and node.descriptor.volume_attempts is not None:
+            if not self.scanning and result.success and node.descriptor.volume_attempts is not None:
                 task.select_volumes(node, child_task.archive_input())
                 node = child_task.inputs[0]
             result.logical_input = node
+            if not self.scanning:
+                self.sevenzip_runner.emit_semantic_event(
+                    child_task, "input_finished", success=result.success,
+                    error=result.error, out_dir=result.out_dir,
+                )
+
+            if self.scanning:
+                input_results.append(InputExecutionResult(node, result))
+                if result.failure is not None:
+                    segment_failures.append(result.failure)
+                continue
 
             if result.password_used is not None and password_used is None:
                 password_used = result.password_used
@@ -685,6 +734,11 @@ class SingleArchiveExtractor:
                 "bytes_written": stats["total_bytes"],
             })
 
+        if self.scanning:
+            failure = self._aggregate_input_failure(segment_failures, segment_count=segment_count) if segment_failures else None
+            return ExtractionResult(success=failure is None, out_dir="", input_results=input_results,
+                                    failure=failure, error=self._localized_failure(failure) if failure else "")
+
         with _phase(phase_timer, f"{phase_prefix}_directory_stats_total"):
             # Verification and discovery consume each child's native inventory.
             # The carrier only needs counters; a second per-file table is unused.
@@ -711,7 +765,7 @@ class SingleArchiveExtractor:
                 segment_count=segment_count,
             )
         if any_success:
-            self._log(self.i18n.t(
+            self._log(task, self.i18n.t(
                 "extract.log.embedded_success" if all_success else "extract.log.embedded_failed",
                 archive=archive,
             ))
@@ -733,7 +787,7 @@ class SingleArchiveExtractor:
                 input_results=input_results,
                 retained_complete_count=sum(item.complete for item in retained),
             )
-        self._log(self.i18n.t("extract.log.embedded_failed", archive=archive))
+        self._log(task, self.i18n.t("extract.log.embedded_failed", archive=archive))
         if aggregate_failure is None:
             aggregate_failure = FailureInfo(
                 kind=FailureKind.INPUTS_FAILED,
@@ -814,9 +868,9 @@ class SingleArchiveExtractor:
         result["bytes_written"] = int(stats.get("total_bytes", 0) or 0)
         result["item_count"] = max(int(result.get("item_count", 0) or 0), int(stats.get("file_count", 0) or 0))
 
-    def _log(self, message: str) -> None:
+    def _log(self, task, message: str) -> None:
         if not self.quiet:
-            print(message, file=self.output_stream, flush=True)
+            self.sevenzip_runner.emit_semantic_event(task, "task_detail", detail=message)
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

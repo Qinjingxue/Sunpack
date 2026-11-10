@@ -12,7 +12,8 @@ import pytest
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.pipeline.coordinator.engine import PipelineEngine
-from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+from sunpack.core.contracts.run_state import RunState
 from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.commands import extract
@@ -157,9 +158,8 @@ def test_cli_scan_failure_prompts_only_for_password_and_reports_missing_volume(
     # Existing CLI mocks never exercise scan failures becoming retry targets.
     # The password-present case also proves missing volumes finish without input.
     case = nested_failures
-    report = ScanOrchestrator(case.config).scan_report([str(case.carrier)])
-    assert report.tasks == [] and report.findings
-    assert all(f.reason == "embedded_password_required" for f in report.findings)
+    tasks = ArchiveTaskScanner(case.config, RunState()).scan_targets([str(case.carrier)])
+    assert tasks and all(node.failure.kind == FailureKind.PASSWORD_REQUIRED for task in tasks for node in task.inputs)
     responses, prompts = [], []
 
     class RecordingEngine(PipelineEngine):

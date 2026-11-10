@@ -59,7 +59,7 @@ def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) 
         epilog=(
             f"{ctx.t('cli.examples')}\n"
             '  sunpack x C:\\Archives -r "*" -c r\n'
-            "  sunpack i .\\fixtures --analysis -j\n"
+            "  sunpack s .\\fixtures -v -j\n"
             "  sunpack pw -a\n"
             "  sunpack w add C:\\Downloads -s -i"
         ),

@@ -170,22 +170,14 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path):
         raw_hit_count=1,
         budget_exhausted=False,
     )
+    scan["candidates"] += ({**scan["candidates"][0], "offset": 64},)
     result = _project_scan(_candidate(path), scan)
 
     assert len(result.tasks) == 1
     assert result.tasks[0].discovery_failure.kind.value == "damaged"
     assert result.blocked_paths
-    assert any(
-        trace.reason == "embedded_truncated" and trace.status == "blocked"
-        for trace in result.traces
-    )
-    assert len(result.findings) == 1
-    finding = result.findings[0]
-    assert finding.format == "7z"
-    assert finding.offset == 16
-    assert finding.status == "blocked"
-    assert finding.reason == "embedded_truncated"
-    assert finding.extractable is False
+    assert [node.descriptor.primary_extent.start for node in result.tasks[0].inputs] == [16, 64]
+    assert all(node.failure.details["reason"] == "embedded_truncated" for node in result.tasks[0].inputs)
 
 
 def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path):
@@ -273,11 +265,7 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
     )
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.resolve_embedded_rar_boundaries",
-        lambda _path, _offsets, _passwords: {
-            "status": status,
-            "failed_offset": 40,
-            "resolved": [],
-        },
+        lambda _path, _offsets, _passwords: [{"status": status, "offset": 40}],
     )
 
     result = _project_scan(_candidate(path), scan)

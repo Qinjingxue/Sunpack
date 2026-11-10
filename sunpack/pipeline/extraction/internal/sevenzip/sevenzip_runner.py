@@ -712,13 +712,15 @@ class SevenZipRunner:
         phase_timer: Any | None = None,
         phase_prefix: str = "sevenzip_build_job",
         password_verified: bool = False,
+        operation: str = "extract",
+        encrypted: bool | None = None,
     ) -> dict:
         job_id = f"{str(getattr(task, 'key', '') or archive_path)}:{time.monotonic_ns()}"
         # The routing key and the request must use the same absolute path.  A failed
         # volume resolution falls back to a synthetic per-job key so the job gets an
         # isolated write facility rather than silently sharing another volume's.
-        out_dir = normalized_output_dir(out_dir)
-        volume_key = resolve_output_volume_key(out_dir) or f"job:{job_id}"
+        out_dir = normalized_output_dir(out_dir) if operation == "extract" else ""
+        volume_key = (resolve_output_volume_key(out_dir) or f"job:{job_id}") if out_dir else ""
         job = {
             "job_id": job_id,
             "request_id": str(self.request_id or ""),
@@ -727,7 +729,10 @@ class SevenZipRunner:
             "output_volume_key": volume_key,
             "password": password or "",
             "password_verified": password_verified,
+            "operation": operation,
         }
+        if encrypted is not None:
+            job["encrypted"] = encrypted
         candidates = tuple(dict.fromkeys(str(item) for item in (password_candidates or ()) if item is not None))
         if candidates:
             job["password_candidates"] = list(candidates)

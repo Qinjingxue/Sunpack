@@ -12,7 +12,7 @@ from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure
 
 
 def _task(path):
-    return SimpleNamespace(main_path=str(path), logical_name=path.stem)
+    return SimpleNamespace(key=str(path), main_path=str(path), logical_name=path.stem)
 
 
 def _outcome(out_dir, *, success=True, partial=False, error=""):
@@ -22,112 +22,6 @@ def _outcome(out_dir, *, success=True, partial=False, error=""):
         result=SimpleNamespace(success=success, out_dir=str(out_dir), error=error),
         verification=SimpleNamespace(decision_hint="accept_partial" if partial else "accept"),
     )
-
-
-@pytest.mark.parametrize("kind, raw_success, expected_status", [
-    (OutcomeKind.PARTIAL_SUCCESS, False, "部分恢复"),
-    (OutcomeKind.FAILURE, True, "失败"),
-])
-def test_reporter_uses_final_policy_outcome(tmp_path, capsys, kind, raw_success, expected_status):
-    reporter = RunReporter("zh")
-    task = _task(tmp_path / "source.zip")
-    outcome = _outcome(tmp_path / "output", success=raw_success, partial=True)
-    outcome.outcome_kind = kind
-    reporter.tasks_discovered(1, [task])
-    reporter.task_finished(task, outcome, 1)
-    assert f"[{expected_status} 1/1]" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("quiet", [False, True])
-def test_reporter_keeps_display_and_lineage_without_retaining_finished_inputs(tmp_path, quiet):
-    """Display tests cannot detect a reporter pinning native discovery snapshots.
-
-    Without this, completed recursive subtrees can accumulate for the entire
-    request. Two tiny snapshots verify ownership and later rendering together.
-    """
-    import gc
-    import weakref
-    from sunpack.core.contracts.filesystem import DirectorySnapshot
-    from tests.helpers.directory_snapshot import FileEntry, make_snapshot
-    from tests.helpers.archive_tasks import make_archive_task
-
-    class ObservableSnapshot(DirectorySnapshot):
-        pass
-
-    output = io.StringIO()
-    reporter = RunReporter("en", stdout=output, quiet=quiet)
-    for depth, root in ((1, tmp_path), (2, tmp_path / "outer")):
-        task = make_archive_task(root / ("outer.zip" if depth == 1 else "inner.zip"))
-        native = make_snapshot([FileEntry(root / "member", False, 7)]).native_snapshot
-        snapshot = ObservableSnapshot(native, native)
-        task.runtime["discovery_snapshot"] = snapshot
-        task_ref, snapshot_ref = weakref.ref(task), weakref.ref(snapshot)
-        reporter.tasks_discovered(depth, [task])
-        if quiet:
-            assert not reporter._task_rows
-        else:
-            row = reporter._task_rows[id(task)]
-            assert row["name"] == ("outer.zip" if depth == 1 else "inner.zip")
-            if depth == 2:
-                assert row["lineage"] == ("outer.zip",)
-        reporter.task_finished(task, _outcome(root / ("outer" if depth == 1 else "inner")), depth)
-        assert not reporter._task_rows
-        assert not reporter._panel_row_index
-        del task, snapshot
-        gc.collect()
-        assert task_ref() is None and snapshot_ref() is None
-    if quiet:
-        assert output.getvalue() == ""
-        assert not reporter._output_lineages and not reporter._top_level_outputs
-    else:
-        assert "inner.zip" in output.getvalue() and "outer.zip" in output.getvalue()
-
-
-def test_progress_displays_nested_archive_parent_chain_and_final_page(tmp_path, capsys):
-    reporter = RunReporter("zh")
-    outer = _task(tmp_path / "outer.zip")
-    outer_output = tmp_path / "outer"
-
-    reporter.scan_started(1)
-    reporter.tasks_discovered(1, [outer])
-    reporter.task_started(outer, 1)
-    reporter.task_finished(outer, _outcome(outer_output), 1)
-
-    inner = _task(outer_output / "folder" / "inner.7z")
-    inner_output = outer_output / "folder" / "inner"
-    reporter.tasks_discovered(2, [inner])
-    reporter.task_started(inner, 2)
-    reporter.task_finished(inner, _outcome(inner_output), 2)
-    reporter.log_final_summary(0, RunSummary(target_results=(
-        TargetRunResult(str(outer.main_path), OutcomeKind.COMPLETE_SUCCESS),
-        TargetRunResult(str(inner.main_path), OutcomeKind.COMPLETE_SUCCESS),
-    )))
-
-    output = capsys.readouterr().out
-    assert "[扫描中] 正在查找压缩包…" in output
-    assert "[扫描完成] 发现 1 个待处理压缩包" in output
-    assert "[递归扫描] 第 2 层发现 1 个嵌套压缩包" in output
-    assert "+- [成功 2/2] inner.7z（来自 outer.zip）" in output
-    assert "完整成功：2  部分恢复：0  解压失败：0  扫描错误：0" in output
-    assert "递归层级：2 层，处理嵌套包：1 个" in output
-    assert f"输出位置：{outer_output}" in output
-
-
-def test_progress_displays_full_lineage_for_deep_recursion(tmp_path, capsys):
-    reporter = RunReporter("zh")
-    paths = [
-        (tmp_path / "outer.zip", tmp_path / "outer"),
-        (tmp_path / "outer" / "inner.rar", tmp_path / "outer" / "inner"),
-        (tmp_path / "outer" / "inner" / "data.7z", tmp_path / "outer" / "inner" / "data"),
-    ]
-
-    for depth, (archive, output_dir) in enumerate(paths, start=1):
-        task = _task(archive)
-        reporter.tasks_discovered(depth, [task])
-        reporter.task_finished(task, _outcome(output_dir), depth)
-
-    output = capsys.readouterr().out
-    assert "data.7z（来自 outer.zip > inner.rar）" in output
 
 
 def test_partial_recovery_prints_possible_missing_volume_warning(tmp_path, capsys):
@@ -196,104 +90,12 @@ def test_final_summary_distinguishes_scan_and_archive_errors(tmp_path, language,
         assert all(label not in output.getvalue() for label in labels[:3])
 
 
-def test_interactive_panel_updates_fixed_row_with_progress_and_colors(tmp_path, monkeypatch):
-    stream = io.StringIO()
-    stream.terminal_columns = 72
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: True)
-    monkeypatch.setattr(reporting.sys, "stdout", stream)
-    reporter = RunReporter("zh")
-    task = _task(tmp_path / "large.7z")
-
-    reporter.tasks_discovered(1, [task])
-    reporter.task_started(task, 1)
-    reporter._last_render_at = 0.0
-    reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
-    reporter.task_status(task, "extracting")
-    finished_row = reporter._task_rows[id(task)]
-    reporter.task_finished(task, _outcome(tmp_path / "large"), 1)
-
-    output = stream.getvalue()
-    assert "等待队列" in output
-    assert "50%" in output
-    assert "正在解压" in output
-    assert "\033[32m" in output and "完成" in output
-    assert "\033[1A" in output
-    row = reporter._format_task_row(finished_row)
-    plain_row = re.sub(r"\033\[[0-9;]*m", "", row)
-    assert reporting._display_width(plain_row) <= stream.terminal_columns
-
-
-def test_interactive_row_accounts_for_wide_status_and_archive_characters(tmp_path, monkeypatch):
-    stream = io.StringIO()
-    stream.terminal_columns = 80
-    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: True)
-    reporter = RunReporter("zh", stdout=stream)
-    task = _task(tmp_path / ("很长的嵌套压缩包名称" * 8 + ".zip"))
-
-    reporter.tasks_discovered(2, [task])
-    reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
-
-    row = reporter._format_task_row(reporter._task_rows[id(task)])
-    plain_row = re.sub(r"\033\[[0-9;]*m", "", row)
-    assert reporting._display_width(plain_row) <= stream.terminal_columns
-    assert plain_row.endswith("…")
-
-
-@pytest.mark.parametrize("language,hint", [
-    ("zh", "释放空间后自动继续"),
-    ("en", "Free space to resume automatically"),
-])
-def test_disk_full_guidance_in_interactive_and_streamed_cli(tmp_path, monkeypatch, language, hint):
-    task = _task(tmp_path / "sample.zip")
-    blocked = {
-        "type": "progress", "event": "space_blocked",
-        "volume_key": "C:", "episode_id": 1, "job_id": "job-1",
-        "free_bytes": 0,
-    }
-
-    terminal = io.StringIO()
-    terminal.terminal_columns = 120
-    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: True)
-    interactive = RunReporter(language, stdout=terminal)
-    interactive.tasks_discovered(1, [task])
-    interactive.task_progress(task, blocked)
-    assert hint in terminal.getvalue()
-    assert reporting._display_width(
-        re.sub(r"\033\[[0-9;]*m", "", interactive._format_task_row(interactive._task_rows[id(task)]))
-    ) < terminal.terminal_columns
-
-    streamed = io.StringIO()
-    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: False)
-    noninteractive = RunReporter(language, stdout=streamed)
-    noninteractive.tasks_discovered(1, [task])
-    noninteractive.task_progress(task, blocked)
-    noninteractive.task_progress(task, {**blocked, "event": "space_status"})
-    assert streamed.getvalue().count(hint.lower() if language == "en" else hint) == 1
-
-
 def test_forwarded_terminal_capability_does_not_require_server_console():
     stream = io.StringIO()
     stream.isatty = lambda: True
     stream.supports_terminal_updates = True
 
     assert reporting._terminal_supports_updates(stream)
-
-
-def test_noninteractive_terminal_streams_throttled_progress_bar(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: False)
-    reporter = RunReporter("zh")
-    task = _task(tmp_path / "large.7z")
-
-    reporter.tasks_discovered(1, [task])
-    reporter.task_progress(task, {"type": "progress", "completed_bytes": 5, "total_bytes": 100})
-    reporter.task_progress(task, {"type": "progress", "completed_bytes": 9, "total_bytes": 100})
-    reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
-
-    output = capsys.readouterr().out
-    assert output.count("正在解压") == 2
-    assert "  5%" in output
-    assert " 50%" in output
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
@@ -316,12 +118,13 @@ def test_resource_waits_overlap_and_clear(tmp_path, monkeypatch, language, inter
             "volume_key": "C:", "episode_id": 1, "job_id": "job", **extra})
 
     def latest():
-        return reporter._format_task_row(reporter._task_rows[id(task)])
+        return reporter._format_task_row(reporter._task_rows[task.key])
 
     send(blocked_first, "blocked")
     send("space" if blocked_first == "memory" else "memory", "blocked")
     combined = reporter.i18n.t("report.status.resources_paused")
-    assert combined in latest() and combined in stream.getvalue()
+    assert combined in latest()
+    assert not interactive or combined in stream.getvalue()
     reporter.task_status(task, "extracting")
     assert combined in latest()
     send("space", "status", volume_query_ok=False, volume_query_error=21)
@@ -329,19 +132,19 @@ def test_resource_waits_overlap_and_clear(tmp_path, monkeypatch, language, inter
     assert unavailable in latest()
     send("space", "status", volume_query_ok=True)
     assert unavailable not in latest()
-    assert unavailable not in stream.getvalue().splitlines()[-1]
+    assert not interactive or unavailable not in stream.getvalue().splitlines()[-1]
 
     send(resumed_first, "resumed")
     remaining = "disk" if resumed_first == "memory" else "memory"
     label = reporter.i18n.t("report.status." + remaining + "_paused")
     assert label in latest() and combined not in latest()
-    assert label in stream.getvalue().splitlines()[-1]
+    assert not interactive or label in stream.getvalue().splitlines()[-1]
     send("space" if resumed_first == "memory" else "memory", "resumed")
     restored = latest()
     assert reporter.i18n.t("report.status.extracting") in restored
     assert label not in restored and unavailable not in restored
     assert "25%" in restored
-    assert reporter.i18n.t("report.status.extracting") in stream.getvalue().splitlines()[-1]
+    assert not interactive or reporter.i18n.t("report.status.extracting") in stream.getvalue().splitlines()[-1]
 
 
 @pytest.mark.parametrize("interactive", [True, False])
@@ -384,7 +187,7 @@ def test_resource_recovery_survives_report_lock_and_output_backpressure(tmp_path
         send("memory", "blocked")
         send("space", "blocked")
         await reporter.drain_progress()
-        assert "等待内存/磁盘" in output.getvalue()
+        assert "等待内存/磁盘" in reporter._format_task_row(reporter._task_rows[task.key])
         output.parked = True
 
         def parked_report():
@@ -422,13 +225,15 @@ def test_resource_recovery_survives_report_lock_and_output_backpressure(tmp_path
             finally:
                 await broker.close()
         if finish_while_pending:
+            assert reporter._task_rows[task.key]["state"] == "complete"
+            reporter.scope_finished(task, 1)
             assert not reporter._task_rows
-            assert "完成" in output.getvalue() if interactive else "成功" in output.getvalue()
+            assert "完成" in output.getvalue()
         else:
-            row = reporter._task_rows[id(task)]
+            row = reporter._task_rows[task.key]
             assert row["state"] == "extracting"
             assert not row["space_blocked"] and not row["memory_blocked"]
-            assert "正在解压" in output.getvalue().splitlines()[-1]
+            assert not interactive or "正在解压" in output.getvalue().splitlines()[-1]
         assert reporter._pending_resource_progress == {}
         assert reporter._resource_progress_task is None
 

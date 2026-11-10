@@ -75,8 +75,7 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 | ----------- | ----- | -------------------------------------------- |
 | `extract`   | `x`   | 解压文件                                     |
 | `watch`     | `w`   | 监控目录，发现压缩文件后自动解压             |
-| `scan`      | `s`   | 扫描发现目录下压缩包，可用于识别归档         |
-| `inspect`   | `i`   | 输出详细检测数据，调试命令，支持json诊断输出 |
+| `scan`      | `s`   | 只读扫描压缩包并确认密码         |
 | `passwords` | `pw`  | 查看本次会参与尝试的密码列表。               |
 | `config`    | `cfg` | 查看或校验当前有效配置                       |
 | `doctor`    | `d`   | 非破坏性检查安装状态和运行环境               |

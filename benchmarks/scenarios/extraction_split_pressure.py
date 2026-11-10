@@ -15,7 +15,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from sunpack.pipeline.coordinator.engine import PipelineEngine
-from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+from sunpack.core.contracts.run_state import RunState
 from tests.helpers.performance_config import archive_pressure_config
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory, normalize_archive_format
@@ -567,7 +568,7 @@ def run_case(pressure_case: PressureCase) -> dict:
 
     scan_config = archive_pressure_config(passwords=pressure_case.passwords)
     started = time.perf_counter()
-    scan_results = ScanOrchestrator(scan_config).scan(str(pressure_case.case.archive_dir))
+    scan_results = ArchiveTaskScanner(scan_config, RunState()).scan_root(str(pressure_case.case.archive_dir))
     scan_seconds = time.perf_counter() - started
 
     pipeline_result = _run_engine([str(pressure_case.case.archive_dir)], scan_config)
@@ -649,7 +650,7 @@ def run_batch_cases(pressure_cases: list[PressureCase]) -> list[dict]:
 
     scan_config = archive_pressure_config(passwords=PASSWORD_TRY_LIST)
     started = time.perf_counter()
-    scan_results = ScanOrchestrator(scan_config).scan(str(batch_dir))
+    scan_results = ArchiveTaskScanner(scan_config, RunState()).scan_root(str(batch_dir))
     scan_seconds = time.perf_counter() - started
 
     pipeline_result = _run_engine([str(batch_dir)], scan_config)

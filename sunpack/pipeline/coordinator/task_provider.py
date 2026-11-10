@@ -48,7 +48,6 @@ class ArchiveTaskProvider:
                 tables, session, is_recursive_scan=True,
             ):
                 result.tasks.extend(partial.tasks)
-                result.findings.extend(partial.findings)
                 result.claimed_paths.update(partial.claimed_paths)
                 result.blocked_paths.update(partial.blocked_paths)
                 result.traces.extend(partial.traces)

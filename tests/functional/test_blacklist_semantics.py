@@ -4,7 +4,8 @@ from pathlib import Path
 from sunpack.pipeline.coordinator.output_scan_policy import (
     NestedOutputScanPolicy as OutputScanPolicy,
 )
-from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from tests.helpers.config_factory import make_config
@@ -69,7 +70,7 @@ def test_filename_blacklist_filters_single_rename_candidate_before_planning(tmp_
     archive = tmp_path / "asset.foo"
     archive.write_bytes(make_zip({"payload.txt": "payload"}))
 
-    results = ScanOrchestrator(scan_config(full_names=[{'value': '\\A(?:asset\\.[^/]*)\\z', 'regex': True}])).scan(str(tmp_path))
+    results = ArchiveTaskScanner(scan_config(full_names=[{'value': '\\A(?:asset\\.[^/]*)\\z', 'regex': True}]), RunState()).scan_root(str(tmp_path))
 
     assert results == []
 
@@ -80,7 +81,7 @@ def test_filename_blacklist_filters_series_rename_candidate_before_planning(tmp_
     first.write_bytes(b"Rar!" + b"x" * 128)
     second.write_bytes(b"x" * 128)
 
-    results = ScanOrchestrator(scan_config(full_names=[{'value': '\\A(?:bundle\\.part[^/][^/]\\.rar\\.jpg)\\z', 'regex': True}])).scan(str(tmp_path))
+    results = ArchiveTaskScanner(scan_config(full_names=[{'value': '\\A(?:bundle\\.part[^/][^/]\\.rar\\.jpg)\\z', 'regex': True}]), RunState()).scan_root(str(tmp_path))
 
     assert results == []
 
@@ -98,7 +99,7 @@ def test_docx_semantic_container_is_not_promoted_to_extract_task(tmp_path):
     archive = tmp_path / "sample.docx"
     archive.write_bytes(b"PK\x03\x04" + b"x" * 128)
 
-    results = ScanOrchestrator(scan_config(extensions=[{'value': 'docx', 'regex': False}])).scan(str(tmp_path))
+    results = ArchiveTaskScanner(scan_config(extensions=[{'value': 'docx', 'regex': False}]), RunState()).scan_root(str(tmp_path))
     decisions = decisions_for(tmp_path, scan_config(extensions=[{'value': 'docx', 'regex': False}]))
 
     assert results == []
@@ -112,6 +113,6 @@ def test_output_dir_scan_preserves_explicit_filesystem_blacklist(tmp_path):
     config = scan_config(extensions=[{'value': 'unitypackage', 'regex': False}])
 
     assert not OutputScanPolicy(config).prepare_scan([str(tmp_path)]).roots
-    assert ScanOrchestrator(config).scan(str(tmp_path)) == []
+    assert ArchiveTaskScanner(config, RunState()).scan_root(str(tmp_path)) == []
 
 

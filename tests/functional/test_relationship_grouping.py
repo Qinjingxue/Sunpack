@@ -5,7 +5,8 @@ import zlib
 import pytest
 
 from sunpack.core.config.schema import normalize_config
-from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.detection_config import with_detection_pipeline
 
@@ -40,7 +41,7 @@ def _write_files(root: Path, names: list[str]):
 
 
 def _scan_parts(root: Path) -> dict[str, list[str]]:
-    results = ScanOrchestrator(SCAN_CONFIG).scan(str(root))
+    results = ArchiveTaskScanner(SCAN_CONFIG, RunState()).scan_root(str(root))
     actual = {}
     for result in results:
         key = Path(result.main_path).name

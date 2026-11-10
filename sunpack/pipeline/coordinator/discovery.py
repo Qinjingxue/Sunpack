@@ -56,7 +56,6 @@ class ArchiveDiscoveryPipeline:
                         cleanup_paths=candidate.cleanup_paths,
                         discovery_evidence=dict(candidate.relation_anchor),
                     ),
-                    reason="Relations confirmed native archive identity",
                 )
 
         for index, status in routes.detection_events:
@@ -71,7 +70,6 @@ class ArchiveDiscoveryPipeline:
                         cleanup_paths=candidate.cleanup_paths,
                         discovery_evidence={"format": candidate.format_hint},
                     ),
-                    reason=f"Confirmed {candidate.format_hint} structure",
                 )
 
         return result
@@ -96,10 +94,9 @@ class ArchiveDiscoveryPipeline:
             result.claimed_paths.difference_update(replaced)
             result.blocked_paths.difference_update(replaced)
             result.traces = [trace for trace in result.traces if not (
-                trace.status in {"resolved", "blocked"} and path_key(trace.entry_path) in replaced
+                path_key(trace.entry_path) in replaced
             )]
         result.tasks.extend(embedded_result.tasks)
-        result.findings.extend(embedded_result.findings)
         result.claimed_paths.update(embedded_result.claimed_paths)
         result.blocked_paths.update(embedded_result.blocked_paths)
         result.traces.extend(embedded_result.traces)

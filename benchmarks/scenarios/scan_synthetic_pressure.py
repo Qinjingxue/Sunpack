@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+from sunpack.core.contracts.run_state import RunState
 from tests.helpers.performance_fixtures import build_pressure_corpus, pressure_scan_config
 
 
@@ -85,7 +86,7 @@ def run_once(profile_path: Path | None, trace_memory: bool) -> dict:
         with timed_calls(layer_specs()) as layers:
             started = time.perf_counter()
             profile.enable()
-            results = ScanOrchestrator(pressure_scan_config()).scan(str(root))
+            results = ArchiveTaskScanner(pressure_scan_config(), RunState()).scan_root(str(root))
             profile.disable()
             elapsed = time.perf_counter() - started
         current = peak = 0

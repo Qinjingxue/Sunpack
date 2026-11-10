@@ -32,103 +32,26 @@ class CliBasicTests(unittest.TestCase):
         self.assertIn("extract", result.stdout)
         self.assertIn("watch", result.stdout)
         self.assertIn("scan", result.stdout)
-        self.assertIn("inspect", result.stdout)
+        self.assertNotIn("inspect (", result.stdout)
         self.assertIn("passwords", result.stdout)
         self.assertIn("config", result.stdout)
         self.assertNotIn("models", result.stdout)
 
     def test_scan_json_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
-            fixture = build_cli_pipeline_fixture(Path(tmp))
+            fixture = Path(tmp) / "plain.zip"
+            with zipfile.ZipFile(fixture, "w") as archive:
+                archive.writestr("payload", b"plain archive")
+            before = fixture.read_bytes()
             result = run_cli("scan", "--json", str(fixture), "--no-pause")
-
+            self.assertEqual(list(Path(tmp).iterdir()), [fixture])
+            self.assertEqual(fixture.read_bytes(), before)
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["command"], "scan")
-        self.assertIn("task_count", payload["summary"])
-        self.assertGreaterEqual(payload["summary"]["task_count"], 1)
-        self.assertIn("finding_count", payload["summary"])
-        self.assertGreaterEqual(payload["summary"]["finding_count"], payload["summary"]["task_count"])
-        self.assertIn("items", payload)
-        self.assertEqual(payload["summary"]["finding_count"], len(payload["items"]))
-        self.assertIn("tasks", payload)
-
-    def test_inspect_json_shape(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            fixture = build_cli_pipeline_fixture(Path(tmp))
-            result = run_cli("inspect", "--json", str(fixture), "--no-pause")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["command"], "inspect")
-        self.assertIn("total_items", payload["summary"])
-        self.assertGreaterEqual(payload["summary"]["total_items"], 1)
-        self.assertNotIn("residual_items", payload["summary"])
-        self.assertTrue(all(item["status"] in {"resolved", "blocked"} for item in payload["items"]))
-        self.assertIn("items", payload)
-        first_item = payload["items"][0]
-        self.assertIn("path", first_item)
-        self.assertIn("status", first_item)
-        self.assertIn("should_extract", first_item)
-        self.assertIn("format", first_item)
-        self.assertIn("discovery_source", first_item)
-        self.assertIn("reason", first_item)
-        self.assertIn("archive_input", first_item)
-        self.assertNotIn("decision_stage", first_item)
-        self.assertNotIn("deciding_rule", first_item)
-
-    def test_inspect_analyze_json_shape_is_compact(self):
-        # Shape-only checks miss errors for valid empty archives and carved
-        # inputs. Reuse this CLI invocation to cover both at negligible cost;
-        # the distant payload also checks reuse of discovery's full scan.
-        with tempfile.TemporaryDirectory() as tmp:
-            fixture = build_cli_pipeline_fixture(Path(tmp))
-            buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, "w") as archive:
-                archive.writestr("payload.txt", b"carrier payload")
-            prefix = b"x" * (2 * 1024 * 1024)
-            (fixture / "carrier.opaque").write_bytes(prefix + buffer.getvalue() + prefix)
-            fields = bytes(20)
-            (fixture / "empty.7z").write_bytes(
-                b"7z\xbc\xaf\x27\x1c\x00\x04" + crc32(fields).to_bytes(4, "little") + fields
-            )
-            result = run_cli("inspect", "--json", "--analyze", str(fixture), "--no-pause")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertTrue(payload["summary"]["analyze"])
-        analyzed = [item for item in payload["items"] if item.get("analysis")]
-        self.assertGreaterEqual(len(analyzed), 1)
-        analysis = analyzed[0]["analysis"]
-        self.assertIn("status", analysis)
-        self.assertIn("selected_format", analysis)
-        self.assertNotIn("selected_confidence", analysis)
-        self.assertIn("primary_segment", analysis)
-        self.assertIn("candidates", analysis)
-        self.assertLessEqual(len(analysis["candidates"]), 3)
-        self.assertNotIn("prepass", analysis)
-        self.assertNotIn("fuzzy", analysis)
-        by_name = {Path(item["path"]).name: item for item in payload["items"]}
-        for name in ("carrier.opaque", "empty.7z"):
-            self.assertEqual(by_name[name]["analysis"]["status"], "extractable", by_name[name])
-        carrier = by_name["carrier.opaque"]["analysis"]
-        self.assertEqual(carrier["primary_segment"]["start"], len(prefix))
-        self.assertLess(carrier["read_bytes"], 1024 * 1024)
-
-    def test_inspect_archives_only_filters_output_items(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            fixture = build_cli_pipeline_fixture(Path(tmp))
-            result = run_cli("inspect", "--json", "--archives-only", str(fixture), "--no-pause")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertTrue(payload["inputs"]["archives_only"])
-        self.assertTrue(payload["summary"]["archives_only"])
-        self.assertGreaterEqual(payload["summary"]["total_items"], payload["summary"]["displayed_items"])
-        self.assertGreaterEqual(payload["summary"]["displayed_items"], 1)
-        self.assertTrue(all(item["should_extract"] for item in payload["items"]))
-        self.assertTrue(all(item["status"] == "resolved" for item in payload["items"]))
-        self.assertTrue(all(item["archive_input"] for item in payload["items"]))
+        self.assertEqual(payload["summary"]["archive_count"], 1)
+        self.assertEqual(payload["items"][0]["format"], "zip")
+        self.assertNotIn("password_used", payload["items"][0])
 
     def test_passwords_json_shape(self):
         result = run_cli("passwords", "--json", "-p", "secret", "--no-builtin-pw")

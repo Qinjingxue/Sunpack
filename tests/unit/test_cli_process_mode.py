@@ -6,7 +6,6 @@ def test_workload_process_mode_defaults_to_high():
     cases = (
         ("extract", ["extract", "sample.zip"]),
         ("scan", ["scan", "."]),
-        ("inspect", ["inspect", "."]),
     )
     for command, argv in cases:
         args = build_cli_parser(CliContext(language="en"), command=command).parse_args(argv)

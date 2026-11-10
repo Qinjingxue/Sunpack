@@ -461,7 +461,8 @@ def _worker_detection(
 ) -> int:
     """Run detection in-process; imports and CLI startup are outside samples."""
     from sunpack.core.config.loader import load_config
-    from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+    from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+    from sunpack.core.contracts.run_state import RunState
 
     config = load_config()
     rows: dict[str, dict[str, Any]] = {}
@@ -473,10 +474,10 @@ def _worker_detection(
             reporter.note(f"detection-worker: scanning {index}/{total} {name} ({archive.stat().st_size} bytes)")
         try:
             for _ in range(warmups):
-                ScanOrchestrator(config).scan_targets([str(archive)])
+                ArchiveTaskScanner(config, RunState()).scan_targets([str(archive)])
             for _ in range(runs):
                 started = time.perf_counter()
-                results = ScanOrchestrator(config).scan_targets([str(archive)])
+                results = ArchiveTaskScanner(config, RunState()).scan_targets([str(archive)])
                 samples.append(time.perf_counter() - started)
                 result_count = len(results)
         except Exception as exc:  # Keep a single unsupported/broken format from aborting the matrix.

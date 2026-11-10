@@ -115,4 +115,5 @@ class ExtractionScheduler:
             quiet=bool(self.extraction_config.get("quiet", False)),
             language=str(self.extraction_config.get("language") or "en"),
             output_stream=self.output_stream,
+            operation=self.extraction_config.get("operation", "extract"),
         )

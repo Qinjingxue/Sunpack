@@ -358,6 +358,8 @@ struct WorkerRequest {
     std::wstring codepage;
     bool dry_run = false;
     bool password_verified = false;
+    bool scan_only = false;
+    int encrypted = -1;
     std::vector<std::wstring> password_candidates;
     WorkerArchiveInput archive_input;
 };
@@ -385,6 +387,9 @@ WorkerRequest parse_worker_request(const std::string& request_frame) {
     request.codepage = utf8_to_wide(fields.string_field("codepage", ""));
     request.dry_run = fields.bool_field("dry_run", false);
     request.password_verified = fields.bool_field("password_verified", false);
+    request.scan_only = fields.string_field("operation", "extract") == "scan";
+    request.encrypted = fields.bool_field("encrypted", false) ? 1 :
+        (fields.bool_field("encrypted", true) ? -1 : 0);
 
     const auto candidates = fields.array_field("password_candidates");
     request.password_candidates.reserve(candidates.size());
@@ -715,6 +720,79 @@ int interrupted_result(const std::string& job_id) {
     return -101;
 }
 
+int scan_request(const WorkerRequest& request) {
+    using namespace sunpack::sevenzip;
+    const auto& input = request.archive_input;
+    const bool ambiguous = !input.volume_attempts.layouts.empty();
+    PasswordTestResult probe;
+    bool tested = false;
+    bool verified = request.password_verified;
+    bool ok = true;
+    std::string fields;
+    if (input.missing_volume_number) {
+        ok = false;
+        fields += wire::key("missing_volume") + wire::boolean(true) +
+            wire::key("missing_volume_evidence") + wire::text("structured_volume_gap") +
+            wire::key("failure_kind") + wire::text("missing_volume");
+    } else if (!verified && request.encrypted != 0) {
+        // A scan never chooses or walks speculative compositions. Only a fixed
+        // first source can provide independent password evidence in this case.
+        const auto* ranges = &input.ranges;
+        const auto* names = &input.canonical_names;
+        std::vector<ExtractInputRange> head;
+        std::vector<std::wstring> head_names;
+        bool independent_head = !ambiguous;
+        if (ambiguous && !input.volume_attempts.head_size_from_total && input.volume_attempts.tail_totals.empty()) {
+            const auto& plan = input.volume_attempts;
+            const auto& domain = plan.domains[plan.layouts.front().front().domain];
+            independent_head = domain.size() == 1 && std::all_of(plan.layouts.begin(), plan.layouts.end(),
+                [&](const auto& layout) { return plan.domains[layout.front().domain] == domain; });
+            if (independent_head) {
+                head.push_back(plan.sources[domain.front()]);
+                head_names.push_back(plan.layouts.front().front().name);
+                ranges = &head;
+                names = &head_names;
+            }
+        }
+        if (independent_head) {
+            const auto& candidates = request.password_candidates;
+            probe = test_password_batch(input.archive_path, input.part_paths, *ranges, input.format_hint,
+                candidates.empty() ? &request.password : candidates.data(),
+                candidates.empty() ? 1 : candidates.size(), *names, true);
+            tested = true;
+            if (auto* memory = current_native_memory_job()) {
+                if (memory->denied.load(std::memory_order_acquire) && !memory->revoked.load(std::memory_order_acquire))
+                    memory->owner.retry(*memory);
+                if (memory->revoked.load(std::memory_order_acquire)) return kMemoryRetry;
+            }
+            if (native_job_cancelled()) return interrupted_result(request.job_id);
+            verified = probe.status == PasswordTestStatus::Ok && probe.encrypted;
+            // Failure against a head alone says nothing about the password or
+            // the availability of candidates for later volumes.
+            ok = probe.status == PasswordTestStatus::Ok || ambiguous;
+            if (!ok) {
+                fields += wire::key("native_status") + wire::text(status_to_string(probe.status)) +
+                    wire::key("message") + wire::text(probe.message) +
+                    wire::key("password_candidates_all_rejected") + wire::boolean(probe.status == PasswordTestStatus::WrongPassword);
+                if (probe.missing_volume)
+                    fields += wire::key("missing_volume_suspected") + wire::boolean(true);
+                if (probe.status == PasswordTestStatus::Error && probe.encrypted)
+                    fields += wire::key("failure_kind") + wire::text("password_or_volume_inconclusive");
+            }
+            if (probe.status == PasswordTestStatus::Ok)
+                fields += wire::key("matched_index") + wire::number(probe.matched_index);
+        }
+    }
+    if (request.encrypted >= 0 || verified || (tested && (probe.encrypted || probe.status == PasswordTestStatus::Ok)))
+        fields += wire::key("encrypted") + wire::boolean(request.encrypted == 1 || verified || probe.encrypted);
+    print_frame(wire::object() + wire::key("type") + wire::text("result") +
+        wire::key("job_id") + wire::text(request.job_id) + wire::key("status") + wire::text(ok ? "ok" : "failed") +
+        wire::key("operation") + wire::text("scan") + wire::key("password_verified") + wire::boolean(verified) +
+        wire::key("archive_type") + wire::text(wide_to_utf8(probe.archive_type.empty() ? input.format_hint : probe.archive_type)) +
+        fields + wire::end());
+    return ok ? 0 : 1;
+}
+
 // Called only for a candidate transaction whose output was initially empty.
 // Extraction has already drained and closed every writer before this point.
 std::error_code discard_candidate_output(const std::wstring& output_dir) {
@@ -830,7 +908,7 @@ int run_request(
     const std::wstring& codepage = request.codepage;
     const bool dry_run = request.dry_run;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
-    if (archive_path.empty() || (!dry_run && output_dir.empty())) {
+    if (archive_path.empty() || (!dry_run && !request.scan_only && output_dir.empty())) {
         print_frame(
             (wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
             (wire::key("status") + wire::text("error") + wire::key("category") + wire::text("invalid_request") + wire::key("message") + wire::text("archive_path is required; output_dir is required unless dry_run is true") + wire::end()));
@@ -895,6 +973,7 @@ int run_request(
             wire::text(request.archive_input.validation_error) + wire::end());
         return 2;
     }
+    if (request.scan_only) return scan_request(request);
     auto* volume_replay = current_extraction_replay;
     WorkerArchiveInput selected_input;
     if (volume_trials) {
@@ -1577,7 +1656,7 @@ private:
             wire::key("request_id") + wire::text(request_id) +
             wire::key("origin") + wire::text(request.origin != "watch" ? "foreground" : "watch") +
             wire::key("output_volume_key") + wire::text(request.output_volume_key) +
-            wire::key("requires_writer") + wire::boolean(!request.dry_run);
+            wire::key("requires_writer") + wire::boolean(!request.dry_run && !request.scan_only);
         return metadata;
     }
 
@@ -1910,7 +1989,7 @@ private:
                         code = 1;
                         print_frame((wire::object() + wire::key("type") + wire::text("result") + wire::key("job_id")) + wire::text(job_id) +
                             (wire::key("status") + wire::text("failed") + wire::key("native_status") + wire::text("error") + wire::key("failure_kind") + wire::text("input_changed") + wire::key("failure_stage") + wire::text("native_replay") + wire::key("message") + wire::text("archive input changed while waiting for memory; rescan required") + wire::end()));
-                    } else if (!job.request.dry_run) {
+                    } else if (!job.request.dry_run && !job.request.scan_only) {
                         const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_->acquire(key);
                         if (lease.created_facility()) print_writer_facility_event("writer_facility_created", key);

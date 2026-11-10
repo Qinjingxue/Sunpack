@@ -40,7 +40,7 @@ For example, add these fields to the main configuration to keep original archive
 
 CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
 
-Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. Upgrades from installed versions below 1.4.0 reset managed runtime data and convert legacy scan-filter fields. Read the [upgrade warning](upgrade-v1.4.md) and back up your data first.
+Directory discovery is shallow by default. Use `--recursive` with `scan` or `extract`; nested extraction continues to use `--recur`. Upgrades from installed versions below 1.4.0 reset managed runtime data and convert legacy scan-filter fields. Read the [upgrade warning](upgrade-v1.4.md) and back up your data first.
 
 ## Partial success and result verification
 

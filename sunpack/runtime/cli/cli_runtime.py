@@ -5,7 +5,6 @@ from typing import Any
 from sunpack.runtime.cli.cli_types import CliCommandResult, CliPasswordSummary
 from sunpack.core.config.loader import apply_config_overrides
 from sunpack.core.config.schema import normalize_config_value
-from sunpack.core.config.detection_view import scan_filter_config, scan_filters_enabled
 from sunpack.core.passwords import dedupe_passwords, PasswordStore, read_password_file
 from sunpack.core.passwords.internal.clipboard import read_clipboard_passwords
 from sunpack.core.passwords.internal.builtin import password_file_source
@@ -24,26 +23,6 @@ def interrupted_result(ctx, command: str, inputs: dict, cleanup_errors=()):
         errors=list(cleanup_errors),
     )
 
-
-def build_effective_config(config: dict) -> dict[str, Any]:
-    size_rule = scan_filter_config(config, "size_range")
-    size_range_min_bytes = size_rule.get("min_bytes") if isinstance(size_rule, dict) else None
-    return {
-        "size_range_min_bytes": size_range_min_bytes,
-        "worker": {
-            "controller": "native_worker",
-            "sizing": "selected_by_worker",
-        },
-        "embedded_scan": dict(config.get("embedded_scan") or {}),
-        "filesystem": {
-            "scan_filters_enabled": scan_filters_enabled(config),
-            "scan_filters": [
-                {"name": item.get("name"), "enabled": item.get("enabled", False)}
-                for item in config.get("filesystem", {}).get("scan_filters", [])
-                if isinstance(item, dict)
-            ]
-        },
-    }
 
 def resolve_target_paths(paths: list[str], *, base_dir: str | None = None) -> list[str]:
     target_paths = []
@@ -180,48 +159,6 @@ def apply_runtime_config_overrides(config: dict, args, *, base_dir: str | None =
     apply_config_overrides(config, payload)
     return overrides
 
-
-def scan_result_to_item(res) -> dict[str, Any]:
-    return {
-        "main_path": res.main_path,
-        "all_parts": list(res.all_parts or []),
-        "format": str(res.format or ""),
-        "discovery_source": str(res.discovery_source or ""),
-        "discovery_reason": str(res.discovery_reason or ""),
-        "archive_input": dict(res.archive_input or {}),
-        "split_role": "first" if len(res.all_parts or []) > 1 else "",
-    }
-
-
-def scan_finding_to_item(finding) -> dict[str, Any]:
-    part_paths = list(finding.part_paths or ())
-    if not part_paths and finding.entry_path:
-        part_paths = [finding.entry_path]
-    return {
-        "main_path": finding.entry_path,
-        "logical_name": str(finding.logical_name or ""),
-        "all_parts": part_paths,
-        "format": str(finding.format or ""),
-        "discovery_source": str(finding.source or ""),
-        "discovery_reason": str(finding.reason or ""),
-        "status": str(finding.status or ""),
-        "offset": finding.offset,
-        "end_offset": finding.end_offset,
-        "boundary_kind": str(finding.boundary_kind or ""),
-        "extractable": bool(finding.extractable),
-    }
-
-
-def inspect_result_to_item(res) -> dict[str, Any]:
-    return {
-        "path": res.path,
-        "status": res.status,
-        "should_extract": res.should_extract,
-        "format": str(res.format or ""),
-        "discovery_source": str(res.source or ""),
-        "reason": str(res.reason or ""),
-        "archive_input": dict(res.archive_input or {}) if res.archive_input else None,
-    }
 
 def password_summary_item(summary: CliPasswordSummary) -> dict[str, Any]:
     return {**{f.name: getattr(summary, f.name) for f in fields(summary) if f.name != "password_snapshot"}, "combined_passwords": summary.combined_passwords}

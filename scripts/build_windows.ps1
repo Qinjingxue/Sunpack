@@ -522,7 +522,7 @@ assert os.path.getsize(target) > 0
         Push-Location $RepoRoot
         try {
             Invoke-Native -FilePath $PythonPath -Arguments @(
-                "sunpack.py", "inspect", "--analyze", "--no-pause", "-q", $fixture
+                "sunpack.py", "scan", "--no-pause", "-q", $fixture
             )
         } finally {
             try {
@@ -1229,7 +1229,7 @@ if ($processArch -eq $buildArch) {
         try {
             Invoke-Native -FilePath $distExePath -Arguments @("--help")
             Invoke-Native -FilePath $distExePath -Arguments @("passwords", "--json")
-            Invoke-Native -FilePath $distExePath -Arguments @("inspect", (Join-Path $repoRoot "tests"), "--json")
+            Invoke-Native -FilePath $distExePath -Arguments @("scan", (Join-Path $repoRoot "tests"), "--json")
             Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "--json")
         } finally {
             # Every launcher request may start the packaged persistent runtime.

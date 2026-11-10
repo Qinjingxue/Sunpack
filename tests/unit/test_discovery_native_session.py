@@ -268,7 +268,7 @@ def test_native_discovery_does_not_project_negative_embedded_candidates(tmp_path
 
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
     result = ArchiveTaskProvider(make_config({})).discover_targets([str(tmp_path)])
-    assert not result.tasks and not result.traces and not result.findings
+    assert not result.tasks and not result.traces
     assert not result.claimed_paths and not result.blocked_paths
 
 
@@ -321,6 +321,14 @@ def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, ph
         result = provider.discovery.embedded.discover_many_native([(table, batch)], session)[0]
         if source_state == "departed":
             assert not result.tasks and not result.traces
+        elif phase == "detection":
+            # Keep already-known archive facts on the failed logical input;
+            # a parallel trace would report the same I/O failure twice.
+            task, = result.tasks
+            assert not result.traces and result.blocked_paths
+            assert task.main_path == str(path) and task.archive_input().format_hint == "lz4"
+            assert task.discovery_failure.details["reason"] == "embedded_scan_io_error"
+            assert task.discovery_failure.message
         else:
             trace, = result.traces
             assert trace.reason == "embedded_scan_io_error" and trace.error

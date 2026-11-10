@@ -3,7 +3,6 @@ import pytest
 from sunpack.core.config.schema import ConfigSchemaError, normalize_config
 from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
-    build_effective_config,
 )
 from sunpack.runtime.config_validation import validate_config_payload
 from tests.helpers.config_factory import make_config
@@ -100,19 +99,3 @@ def test_omitted_output_dir_keeps_default_beside_archive_behavior(tmp_path):
 
     assert "output_dir" not in overrides
     assert "output" not in config or "root" not in config["output"]
-
-
-def test_effective_config_includes_native_worker_without_detection_switch():
-    config = _payload()
-    config["filesystem"] = {
-        "scan_filters": [
-            {"name": "size_range", "enabled": True, "min_bytes": 1048576}
-        ]
-    }
-    effective = build_effective_config(make_config(config))
-
-    assert effective["size_range_min_bytes"] == 1048576
-    assert "directory_scan_mode" not in effective["filesystem"]
-    assert effective["worker"]["controller"] == "native_worker"
-    assert effective["worker"]["sizing"] == "selected_by_worker"
-    assert "detection" not in effective

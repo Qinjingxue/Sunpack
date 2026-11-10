@@ -76,7 +76,6 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 | `extract`   | `x`        | Extract files.                                                       |
 | `watch`     | `w`        | Monitor directories and extract archives automatically once found.   |
 | `scan`      | `s`        | Scan a directory for archives; useful for identifying archives.      |
-| `inspect`   | `i`        | Print detailed detection data; a debugging command with JSON output. |
 | `passwords` | `pw`       | Show the password list that will be attempted in this run.           |
 | `config`    | `cfg`      | Show or validate the effective configuration.                        |
 | `doctor`    | `d`        | Non-destructive check of installation and runtime health.            |

@@ -341,9 +341,10 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
         return discovery_result.tasks, extra
 
     if mode == "full":
-        from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+        from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+        from sunpack.core.contracts.run_state import RunState
 
-        orchestrator = ScanOrchestrator(config)
+        orchestrator = ArchiveTaskScanner(config, RunState())
         result = orchestrator.scan_targets([target_path])
         extra["tasks"] = len(result)
         return result, extra

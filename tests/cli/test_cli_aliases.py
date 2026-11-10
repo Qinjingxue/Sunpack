@@ -16,7 +16,6 @@ def parser():
 @pytest.mark.parametrize("short, full", [
     (["x", "."], ["extract", "."]),
     (["s", "."], ["scan", "."]),
-    (["i", "."], ["inspect", "."]),
     (["pw"], ["passwords"]),
     (["cfg", "show"], ["config", "show"]),
     (["cfg", "validate"], ["config", "validate"]),
@@ -53,7 +52,7 @@ def test_extract_aliases_preserve_handler_inputs(parser, short, full):
     assert vars(parser.parse_args(["x", ".", *short])) == vars(parser.parse_args(["extract", ".", *full]))
 
 
-@pytest.mark.parametrize("command", ["x", "s", "i"])
+@pytest.mark.parametrize("command", ["x", "s"])
 @pytest.mark.parametrize("short, full", [("b", "background"), ("n", "normal"), ("h", "high")])
 def test_priority_values_are_normalized_before_dispatch(parser, command, short, full):
     assert vars(parser.parse_args([command, ".", "-m", short, "-d"])) == vars(
@@ -61,10 +60,7 @@ def test_priority_values_are_normalized_before_dispatch(parser, command, short, 
     )
 
 
-def test_inspect_and_password_short_options(parser):
-    assert vars(parser.parse_args(["i", ".", "--archives", "--analysis"])) == vars(
-        parser.parse_args(["inspect", ".", "--archives-only", "--analyze"])
-    )
+def test_password_short_options(parser):
     assert vars(parser.parse_args(["pw", "-P", "pw.txt", "-a", "--no-bpw"])) == vars(
         parser.parse_args(["passwords", "--pw-file", "pw.txt", "--ask-pw", "--no-builtin-pw"])
     )

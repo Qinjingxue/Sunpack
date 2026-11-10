@@ -20,8 +20,7 @@ sunpack.exe <command> [options] [paths...]
 | --- | --- |
 | `extract`, `x` | 扫描、识别、解压、校验、后处理和清理。 |
 | `watch`, `w` | 监控目录，文件稳定后自动处理。 |
-| `scan`, `s` | 只扫描并列出可解压任务，不修改文件。 |
-| `inspect`, `i` | 输出检测和结构分析细节，不修改文件。 |
+| `scan`, `s` | 只读扫描归档并确认密码。 |
 | `passwords`, `pw` | 查看当前命令可用的密码来源汇总。 |
 | `config`, `cfg` | 查看或校验合并后的有效配置。 |
 | `doctor`, `d` | 只读检查配置和运行环境。 |
@@ -33,7 +32,7 @@ sunpack.exe <command> [options] [paths...]
 
 ```powershell
 sunpack x D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -k --no-pause
-sunpack i D:\Downloads --analysis -d -j
+sunpack s D:\Downloads -v -d -j
 sunpack w add D:\Downloads -o E:\Output -s -i -d
 sunpack w ls
 sunpack w st
@@ -41,7 +40,7 @@ sunpack w st
 
 ## 通用输出参数
 
-这些参数用于 `extract`、`scan`、`inspect`：
+这些参数用于 `extract`、`scan`：
 
 | 参数 | 说明 |
 | --- | --- |
@@ -53,11 +52,11 @@ sunpack w st
 | `--no-pause` | 命令结束后不暂停。 |
 | `-m MODE`, `--process-mode MODE` | 临时覆盖本次工作负载使用的共享 RuntimeHost/native-worker 进程模式；默认 `high`。 |
 
-对于 `extract`、`scan`、`inspect`，process-mode override 在命令结束后继续有效，直到共享 Runtime 到达现有 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`），随后恢复 `runtime.process_mode`。
+对于 `extract`、`scan`，process-mode override 在命令结束后继续有效，直到共享 Runtime 到达现有 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`），随后恢复 `runtime.process_mode`。
 
 `passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json` 和 `--quiet`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
 
-`extract`、`scan` 和 `inspect` 的普通文本写入 stdout，错误写入 stderr。`[扫描错误]` 表示文件系统扫描失败，`[解压失败]` 表示归档处理失败；`[扫描不完整]` 表示部分路径无法读取，发现结果可能不完整，其余可读取的输入仍会继续处理。`--quiet` 隐藏进度，但保留错误和后处理警告；`--json` 输出 JSON 结果，不输出这些文本消息。
+`extract` 和 `scan` 的普通文本写入 stdout，错误写入 stderr。`[扫描错误]` 表示文件系统扫描失败，`[解压失败]` 表示归档处理失败；`[扫描不完整]` 表示部分路径无法读取，发现结果可能不完整，其余可读取的输入仍会继续处理。`--quiet` 隐藏进度，但保留错误和后处理警告；`--json` 输出 JSON 结果，不输出这些文本消息。
 
 JSON 的 `summary.scan_error_count` 统计文件系统扫描错误，包括省略了单独详情的错误。每份报告最多保留 100 条文件系统扫描诊断记录，另加 1 条总省略摘要；单个目录仍适用原有的 20 条详情上限。超出报告预算后只累计省略数量，不再保留每条错误的路径或身份。归档任务结果独立于这项诊断预算保留。
 
@@ -116,6 +115,8 @@ python sunpack.py extract D:\Archives -o E:\Unpacked
 - `3`：运行时异常。
 - `4`：没有失败任务，但至少一个任务只有部分成功。
 
+解压过程按逻辑任务展示树形作用域，载体内多段和递归归档各自拥有状态、进度和错误；重定向输出在根任务结束后按完整树输出，最终汇总保持不变。
+
 ## scan
 
 用法：
@@ -124,9 +125,13 @@ python sunpack.py extract D:\Archives -o E:\Unpacked
 python sunpack.py scan [options] <paths...>
 ```
 
-`scan` 输出识别到的解压任务、分卷关系、检测扩展名、判定和命中规则，不会解压或清理文件。
+`scan` 复用 extract 的发现、输入规划和密码确认流程，按物理文件和逻辑段列出本次取得的格式、范围、分卷、密码及错误。普通压缩包省略范围；载体标注 `[起点, 终点)`，未知终点用 `?`，多段以树形展示。未取得的信息省略；已知加密但未找到密码时显示“密码未知”，确认的密码直接显示。
 
-`--deep-detect` 会对普通检测未解决的候选执行完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块，包括嵌套输出扫描。目录范围由 `--recursive` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
+分卷歧义使用现有卷位候选和布局的紧凑表示，不展开组合，状态为“等待实际解压验证”。有限密码测试不代表整包完整或整套分卷已验证。scan 不解压、不创建输出目录、不递归进入尚未解压的内容，也不验证输出、扁平化或清理源文件。
+
+支持与 extract 相同的密码输入参数。`-v` 仅增加已有发现来源和损坏信息，不额外分析；`--json` 独立控制输出格式。
+
+`--deep-detect` 会对普通检测未解决的候选执行完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块，目录范围由 `--recursive` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
 
 示例：
 
@@ -134,35 +139,6 @@ python sunpack.py scan [options] <paths...>
 python sunpack.py scan D:\Downloads
 python sunpack.py scan D:\Downloads --deep-detect --json
 python sunpack.py scan D:\Downloads -v
-```
-
-## inspect
-
-用法：
-
-```powershell
-python sunpack.py inspect [options] <paths...>
-```
-
-`inspect` 是只读检测诊断命令，会列出候选文件的判定结果、处理阶段、停止原因和事实错误。
-
-参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `--archives-only`, `--archives` | 只显示最终判定为可解压的项目。 |
-| `--analyze`, `--analysis` | 为可解压或待确认候选附加格式、片段、损坏标记和候选摘要。 |
-| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块。 |
-
-`-v` 会额外打印有效配置、命中规则、评分细节和事实错误；JSON 输出保留对应结构化字段。
-
-示例：
-
-```powershell
-python sunpack.py inspect D:\Downloads
-python sunpack.py inspect D:\Downloads --archives-only --analyze
-python sunpack.py inspect D:\Downloads --deep-detect --json
-python sunpack.py inspect D:\Downloads -v
 ```
 
 ## watch

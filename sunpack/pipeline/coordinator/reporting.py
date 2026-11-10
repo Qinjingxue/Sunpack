@@ -54,9 +54,12 @@ class RunReporter:
         self._output_lineages = PathMap()
         self._top_level_outputs = PathMap()
         self._interactive = not self.quiet and _terminal_supports_updates(self.stdout)
-        self._use_color = self._interactive and os.environ.get("NO_COLOR") is None
-        self._panel_row_index: dict[int, int] = {}
-        self._task_rows: dict[int, dict[str, Any]] = {}
+        self._scope_roots = {}
+        self._input_rows = {}
+        self._rendered_lines = 0
+        self._panel_pauses = 0
+        self._finished_scopes = set()
+        self._task_rows: dict[str, dict[str, Any]] = {}
         self._last_render_at = 0.0
         self._work_broker = work_broker
         self._request_id = request_id
@@ -64,15 +67,9 @@ class RunReporter:
         self._resource_progress_task: asyncio.Task | None = None
 
     def scan_started(self, depth: int) -> None:
-        if self.quiet:
-            return
-        depth = max(1, int(depth or 1))
-        with self._lock:
-            key = "report.scan_started" if depth == 1 else "report.recursive_scan_checking"
-            self._print(self.i18n.t(key, depth=depth))
+        pass
 
     def tasks_discovered(self, depth: int, tasks: list[Any], direct: bool = False) -> None:
-        depth = max(1, int(depth or 1))
         with self._lock:
             self._total_tasks += len(tasks)
             if depth > 1:
@@ -82,55 +79,77 @@ class RunReporter:
             if self.quiet:
                 return
             for task in tasks:
-                parent_lineage = self._lineage_for_path(str(getattr(task, "main_path", "") or ""))
-                self._task_rows[id(task)] = {
-                    "name": _task_name(task),
-                    "depth": depth,
-                    "lineage": parent_lineage,
-                    "state": "waiting",
-                    "progress": 0.0,
-                    "progress_known": False,
-                    "completed_bytes": 0,
-                    "total_bytes": 0,
-                    "detail": "",
-                }
-            if direct and depth == 1:
-                message = self.i18n.t("report.ready_archives", count=len(tasks))
-            elif depth == 1:
-                message = self.i18n.t("report.scan_found", count=len(tasks))
-            else:
-                message = self.i18n.t("report.recursive_found", depth=depth, count=len(tasks))
-            self._print(message)
-            if self._interactive:
-                self._panel_row_index = {id(task): i for i, task in enumerate(tasks)}
-                for task_id in self._panel_row_index:
-                    self._print(self._format_task_row(self._task_rows[task_id]))
+                key = str(task.key or task.main_path)
+                lineage = self._lineage_for_path(task.main_path)
+                parent = lineage[-1] if lineage else None
+                self._task_rows[key] = self._new_row(_task_name(task), depth, parent)
+                if parent in self._task_rows:
+                    self._task_rows[parent]["children"].append(key)
+                else:
+                    self._scope_roots[key] = None
+            self._render_panel_locked(force=True)
+
+    @staticmethod
+    def _new_row(name, depth, parent=None):
+        return dict(name=name, depth=depth, parent=parent, children=[], state="waiting",
+                    progress=0.0, progress_known=False, completed_bytes=0, total_bytes=0,
+                    detail="", output="", container=False, input_ids=[])
+
+    def _row_key(self, task):
+        key = str(task.key or task.main_path)
+        inputs = getattr(task, "inputs", ())
+        if len(inputs) == 1 and inputs[0].input_id in self._input_rows:
+            return self._input_rows[inputs[0].input_id]
+        return key if key in self._task_rows else None
 
     def task_started(self, task: Any, depth: int) -> None:
         if self.quiet:
             return
         with self._lock:
-            if self._interactive:
-                self._update_task_locked(task, state="preparing", force=True)
+            key = str(task.key or task.main_path)
+            row = self._task_rows.get(key)
+            if row is None:
                 return
-            depth = max(1, int(depth or 1))
-            name = _task_name(task)
-            prefix = self._tree_prefix(depth)
-            progress = f"{self._completed_tasks}/{self._total_tasks}"
-            self._print(self.i18n.t("report.processing", prefix=prefix, progress=progress, name=name))
+            inputs = getattr(task, "inputs", ())
+            row["container"] = len(inputs) > 1
+            for node in inputs:
+                if len(inputs) == 1:
+                    self._input_rows[node.input_id] = key
+                    row["input_ids"].append(node.input_id)
+                    continue
+                child = node.input_id
+                if child not in self._task_rows:
+                    extent = node.descriptor.primary_extent
+                    name = self.i18n.t("cli.scan.segment", index=node.position)
+                    name += f" ({node.descriptor.format_hint})"
+                    if extent:
+                        name += f" [{extent.start}, {extent.end if extent.end is not None else '?'})"
+                    self._task_rows[child] = self._new_row(name, depth + 1, key)
+                    if node.failure is not None:
+                        self._task_rows[child]["state"] = "error"
+                        self._task_rows[child]["detail"] = self._format_failure(node.failure)
+                    row["children"].append(child)
+                self._input_rows[child] = child
+                self._task_rows[child]["input_ids"].append(child)
+            row["state"] = "preparing"
+            self._render_panel_locked(force=True)
 
     def task_status(self, task: Any, state: str, detail: str = "") -> None:
         if self.quiet:
             return
         with self._lock:
-            if self._interactive:
-                self._update_task_locked(task, state=state, detail=detail, force=True)
-                return
+            self._update_task_locked(task, state=state, detail=detail, force=True)
 
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
             return
         name = str(event.get("event") or "")
+        if name in {"input_started", "input_finished", "task_detail"}:
+            # Pipeline semantic events arrive in admitted broker jobs. Their
+            # scope/output relationship must survive concurrent console updates.
+            with self._lock:
+                self._task_progress_locked(task, event)
+            return
         if name in _SPACE_EVENTS or name in {"memory_blocked", "memory_resumed"}:
             if self._work_broker is None:
                 self._resource_progress(task, event)
@@ -191,18 +210,30 @@ class RunReporter:
     def _task_progress_locked(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
             return
-        task_id = id(task)
+        task_id = self._row_key(task)
         row = self._task_rows.get(task_id)
-        if row is None:
+        if row is None or row["state"] in {"complete", "partial", "error"}:
             return
         name = str(event.get("event") or "")
+        if name in {"input_started", "input_finished", "task_detail"}:
+            if name == "input_started":
+                row["state"] = "preparing"
+            elif name == "input_finished":
+                row["state"] = "complete" if event.get("success") else "error"
+                row["detail"] = str(event.get("error") or "")
+                row["output"] = str(event.get("out_dir") or "")
+                if row["output"] and event.get("success"):
+                    self._output_lineages[row["output"]] = (task_id,)
+            elif self.verbose:
+                row["detail"] = str(event.get("detail") or "")
+            self._render_panel_locked(force=True)
+            return
         if name in {"memory_blocked", "memory_resumed"}:
             row["memory_blocked"] = name == "memory_blocked"
             self._restore_progress_locked(row)
             if self._interactive:
                 self._render_panel_locked(force=True, task_id=task_id)
-            else:
-                self._print(self._format_task_row(row))
+
             return
         if name in _SPACE_EVENTS:
             self._space_progress_locked(task, row, name, event)
@@ -229,16 +260,6 @@ class RunReporter:
             new_percent = int(progress * 100) if known else None
             if new_percent != old_percent or old_state != "extracting":
                 self._render_panel_locked(force=False, task_id=task_id)
-        else:
-            # Stream one indeterminate line, then throttle known progress to 10% steps.
-            last_percent = row.get("streamed_percent", -10)
-            displayed_percent = (int(progress * 100) // 10) * 10 if known else -1
-            if (known and (last_percent < 0 or displayed_percent >= last_percent + 10)) or (
-                not known and last_percent != -1
-            ):
-                row["streamed_percent"] = displayed_percent
-                self._print(self._format_task_row(row))
-
     # Transport filters stale episodes; only retain the visible state here.
     def _space_progress_locked(
         self, task: Any, row: dict[str, Any], event: str, payload: dict[str, Any],
@@ -249,24 +270,14 @@ class RunReporter:
             self._restore_progress_locked(row)
             if self._interactive:
                 self._render_panel_locked(force=True, task_id=id(task))
-            else:
-                self._print(self._format_task_row(row))
+
             return
 
         row["space_blocked"] = True
         self._restore_progress_locked(row)
-        previous_detail = row["detail"]
         row["detail"] = self._space_status_detail(payload) if event == "space_status" else ""
         if self._interactive:
             self._render_panel_locked(force=True, task_id=id(task))
-        elif event == "space_blocked" and not row.get("memory_blocked"):
-            self._print(self.i18n.t(
-                "report.disk_paused", name=_task_name(task),
-                free=_format_bytes(int(payload.get("free_bytes") or 0)),
-            ))
-        elif event == "space_blocked" or previous_detail != row["detail"]:
-            self._print(self._format_task_row(row))
-
     def _space_status_detail(self, payload: dict[str, Any]) -> str:
         # 卷查询失败（拔盘 / UNC 断开 / 权限变化）必须与"空间不足"可区分。
         if not bool(payload.get("volume_query_ok", True)):
@@ -284,55 +295,105 @@ class RunReporter:
             self._completed_tasks += 1
             if self.quiet:
                 return
-            row = self._task_rows.get(id(task))
-            depth = max(1, int(depth or 1))
-            name = _task_name(task)
-            parent_lineage = row["lineage"] if row is not None else ()
+            key = self._row_key(task)
+            row = self._task_rows.get(key)
+            if row is None:
+                return
             result = getattr(outcome, "result", outcome)
-            out_dir = str(getattr(result, "out_dir", "") or "")
             kind = outcome.outcome_kind
             success = kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}
-            partial = kind == OutcomeKind.PARTIAL_SUCCESS
-            if success and out_dir:
-                lineage = (*parent_lineage, name)
-                self._output_lineages[out_dir] = lineage
+            row["state"] = "partial" if kind == OutcomeKind.PARTIAL_SUCCESS else "complete" if success else "error"
+            row["detail"] = str(getattr(result, "error", "") or "")
+            row["output"] = str(getattr(result, "out_dir", "") or "")
+            if success:
+                row["progress"] = 1.0
+                row["progress_known"] = True
+            if row["output"] and (success or getattr(result, "has_complete_inputs", False)):
+                self._output_lineages[row["output"]] = (key,)
                 if depth == 1:
-                    self._top_level_outputs.setdefault(out_dir, out_dir)
+                    self._top_level_outputs.setdefault(row["output"], row["output"])
+            # Verification can reject a child after its worker completed.
+            # Refresh existing segment rows from the authoritative result.
+            for item in getattr(result, "input_results", ()):
+                child = self._task_rows.get(self._input_rows.get(item.input.input_id))
+                if child is not None and child is not row:
+                    child["state"] = "complete" if item.complete else "error"
+                    child["detail"] = item.result.error or (self.i18n.t("failure.verification_failed")
+                        if item.verified_complete is False else "")
+            self._render_panel_locked(force=True)
 
-            if self._interactive:
-                state = "partial" if partial else "complete" if success else "error"
-                error = str(getattr(result, "error", "") or "") if not success else ""
-                self._update_task_locked(
-                    task,
-                    state=state,
-                    progress=1.0 if success else None,
-                    detail=error,
-                    force=True,
-                )
-            else:
-                prefix = self._tree_prefix(depth)
-                progress = f"{self._completed_tasks}/{self._total_tasks}"
-                if partial:
-                    status = self.i18n.t("report.status.partial")
-                elif success:
-                    status = self.i18n.t("report.status.success")
-                else:
-                    status = self.i18n.t("report.status.failed")
-                parent = " > ".join(parent_lineage)
-                relation = self.i18n.t("report.relation.from", parent=parent) if parent else ""
-                detail = ""
-                if self.verbose and success and out_dir:
-                    detail = self.i18n.t("report.detail.output", output=out_dir)
-                elif self.verbose and not success:
-                    error = str(getattr(result, "error", "") or "")
-                    detail = self.i18n.t("report.detail.error", error=error) if error else ""
-                self._print(f"{prefix}[{status} {progress}] {name}{relation}{detail}")
-            # The terminal already owns the rendered row. Keep ancestry only
-            # by output path for recursive discovery, never by completed task.
-            self._task_rows.pop(id(task), None)
-            if not self._task_rows:
-                self._task_rows.clear()
-                self._panel_row_index.clear()
+    def scope_finished(self, task, depth):
+        """Flush one complete recursive tree, then release all display state."""
+        if self.quiet or depth != 1:
+            return
+        with self._lock:
+            root = str(task.key or task.main_path)
+            if root not in self._task_rows:
+                return
+            if self._panel_pauses:
+                self._finished_scopes.add(root)
+                return
+            self._flush_scope_locked(root)
+
+    def _flush_scope_locked(self, root):
+        self._clear_panel_locked()
+        for line in self._scope_lines((root,)):
+            print(line, file=self.stdout)
+        pending = [root]
+        while pending:
+            key = pending.pop()
+            row = self._task_rows.pop(key)
+            pending.extend(row["children"])
+            for input_id in row["input_ids"]:
+                self._input_rows.pop(input_id, None)
+            if row["output"]:
+                self._output_lineages.pop(row["output"], None)
+        self._scope_roots.pop(root, None)
+        self._render_panel_locked(force=True)
+        self.stdout.flush()
+
+
+    def pause_panel(self):
+        with self._lock:
+            self._panel_pauses += 1
+            self._clear_panel_locked()
+            self.stdout.flush()
+
+    def resume_panel(self):
+        with self._lock:
+            self._panel_pauses -= 1
+            if self._panel_pauses == 0:
+                for root in self._finished_scopes:
+                    self._flush_scope_locked(root)
+                self._finished_scopes.clear()
+                self._render_panel_locked(force=True)
+
+    def _scope_lines(self, roots):
+        pending = [iter((key, "", True, True) for key in roots)]
+        while pending:
+            try:
+                key, prefix, last, root = next(pending[-1])
+            except StopIteration:
+                pending.pop()
+                continue
+            row = self._task_rows[key]
+            branch = "" if root else "└─ " if last else "├─ "
+            yield prefix + branch + str(row["name"]).replace("\n", " ").replace("\r", " ")
+            child_prefix = prefix + ("" if root else "   " if last else "│  ")
+            if not row["container"]:
+                yield child_prefix + "  " + self._format_task_row(row)
+                if row["detail"] and (self.verbose or row["state"] == "error"):
+                    yield child_prefix + "  " + row["detail"].replace("\n", " ").replace("\r", " ")
+                if self.verbose and row["output"]:
+                    yield child_prefix + "  " + self.i18n.t("report.detail.output", output=row["output"])
+            children = row["children"]
+            pending.append(self._child_entries(children, child_prefix))
+
+
+    @staticmethod
+    def _child_entries(children, prefix):
+        for i, child in enumerate(children):
+            yield child, prefix, i == len(children) - 1, False
 
     def relocate_outputs(self, result: DirectoryFlattenResult) -> None:
         with self._lock:
@@ -340,6 +401,9 @@ class RunReporter:
                 relocated = result.relocate(original)
                 self._top_level_outputs[relocated] = relocated
             self._output_lineages.relocate(result)
+            for row in self._task_rows.values():
+                if row["output"]:
+                    row["output"] = result.relocate(row["output"])
 
     def log_final_summary(
         self,
@@ -409,7 +473,10 @@ class RunReporter:
         return f"{path}: {reason}" if path and failure.stage == "embedded_boundary" else reason
 
     def _print(self, value: str, *, error: bool = False) -> None:
-        print(value, file=self.stderr if error else self.stdout, flush=True)
+        with self._lock:
+            self._clear_panel_locked()
+            print(value, file=self.stderr if error else self.stdout, flush=True)
+            self._render_panel_locked(force=True)
 
     def _lineage_for_path(self, path: str) -> tuple[str, ...]:
         lineage = ()
@@ -427,10 +494,9 @@ class RunReporter:
         detail: str | None = None,
         force: bool = False,
     ) -> None:
-        row = self._task_rows.get(id(task))
+        row = self._task_rows.get(self._row_key(task))
         if row is None:
             return
-        row["name"] = _task_name(task)
         if state is not None:
             row["state"] = state
             if state in {"waiting", "preparing", "extracting"} and (row.get("space_blocked") or row.get("memory_blocked")):
@@ -442,97 +508,46 @@ class RunReporter:
             row["detail"] = detail
         self._render_panel_locked(force=force, task_id=id(task))
 
-    def _render_panel_locked(self, *, force: bool, task_id: int) -> None:
-        if not self._interactive:
-            return
-        row_index = self._panel_row_index.get(task_id)
-        if row_index is None:
+    def _clear_panel_locked(self):
+        if self._rendered_lines:
+            self.stdout.write(f"\033[{self._rendered_lines}A\r\033[J")
+            self._rendered_lines = 0
+
+    def _render_panel_locked(self, *, force: bool, task_id=None) -> None:
+        if not self._interactive or self._panel_pauses:
             return
         now = time.monotonic()
         if not force and now - self._last_render_at < 0.08:
             return
         self._last_render_at = now
-        # Cursor rests immediately below the panel; replace only the changed row.
-        lines_up = len(self._panel_row_index) - row_index
-        row = self._task_rows.get(task_id)
-        text = self._format_task_row(row) if row is not None else ""
-        self.stdout.write(f"\033[{lines_up}A\r\033[2K{text}\033[{lines_up}B\r")
+        # Bound terminal rendering by its viewport, without truncating the final
+        # tree or retaining event histories. No idle refresh thread is needed.
+        size = shutil.get_terminal_size(fallback=(120, 30))
+        columns = getattr(self.stdout, "terminal_columns", size.columns)
+        height = max(3, size.lines - 2)
+        self._clear_panel_locked()
+        lines = []
+        for line in self._scope_lines(self._scope_roots):
+            if len(lines) == height - 1:
+                lines.append("…")
+                break
+            lines.append(_truncate_display(line, max(1, columns - 1)))
+        if lines:
+            self.stdout.write("\n".join(lines) + "\n")
+        self._rendered_lines = len(lines)
         self.stdout.flush()
 
     def _format_task_row(self, row: dict[str, Any]) -> str:
-        depth = int(row.get("depth", 1) or 1)
-        name = str(row.get("name") or "archive")
-        state = str(row.get("state") or "waiting")
-        progress = float(row.get("progress", 0.0) or 0.0)
-        known = bool(row.get("progress_known"))
-        percent = max(0, min(100, int(progress * 100)))
-        filled = max(0, min(20, int(progress * 20))) if known else 0
-        bar = "#" * filled + "-" * (20 - filled)
-        percent_text = f"{percent:3d}%" if known else " --%"
-        labels = {
-            "waiting": "report.status.waiting",
-            "preparing": "report.status.preparing",
-            "extracting": "report.status.extracting",
-            "disk_paused": "report.status.disk_paused",
-            "memory_paused": "report.status.memory_paused",
-            "error": "report.status.error",
-            "partial": "report.status.partial",
-            "complete": "report.status.complete",
-        }
-        label = self.i18n.t(labels.get(state, labels["waiting"]))
-        both_paused = state in {"disk_paused", "memory_paused"} and row.get("space_blocked") and row.get("memory_blocked")
-        if both_paused:
-            label = self.i18n.t("report.status.resources_paused")
-        colors = {
-            "waiting": "\033[90m",
-            "preparing": "\033[36m",
-            "extracting": "\033[36m",
-            "disk_paused": "\033[33m",
-            "memory_paused": "\033[33m",
-            "error": "\033[31m",
-            "partial": "\033[33m",
-            "complete": "\033[32m",
-        }
-        label = f"{label:^8}"
-        plain_label = label
-        if self._use_color:
-            label = f"{colors.get(state, '')}{label}\033[0m"
-        prefix = self._tree_prefix(depth)
-        lineage = tuple(row.get("lineage") or ())
-        parent = " > ".join(lineage)
-        relation = self.i18n.t("report.relation.from", parent=parent) if parent else ""
-        detail = str(row.get("detail") or "")
-        if detail and (self.verbose or state == "error"):
-            detail = self.i18n.t("report.detail.error", error=detail)
-        else:
-            detail = ""
-        fixed = f"{prefix}[{plain_label}] [{bar}] {percent_text}  "
-        fixed_width = _display_width(fixed)
-        terminal_columns = getattr(self.stdout, "terminal_columns", None)
-        if not isinstance(terminal_columns, int) or terminal_columns <= 0:
-            terminal_columns = shutil.get_terminal_size(fallback=(120, 30)).columns
-        if terminal_columns <= fixed_width:
-            # A narrow/resized console must not wrap a panel row and corrupt
-            # relative cursor positioning. Omit the bar in this edge case.
-            return _truncate_display(
-                f"{prefix}[{plain_label}] {percent_text} {name}",
-                max(1, terminal_columns - 1),
-            )
-        available = max(0, terminal_columns - fixed_width - 1)
-        if state in {"disk_paused", "memory_paused"}:
-            # Put the recovery hint before the filename so a long name cannot hide it.
-            hint = self.i18n.t("report.status.memory_resume_hint") if state == "memory_paused" else (str(row.get("detail") or "") or self.i18n.t("report.status.disk_resume_hint"))
-            if both_paused:
-                hint = str(row.get("detail") or "") or self.i18n.t("report.status.resources_resume_hint")
-            suffix_text = f"{hint}  {name}{relation}"
-        else:
-            suffix_text = f"{name}{relation}{detail}"
-        suffix = _truncate_display(suffix_text, available)
-        return f"{prefix}[{label}] [{bar}] {percent_text}  {suffix}"
-
-    @staticmethod
-    def _tree_prefix(depth: int) -> str:
-        return "" if depth <= 1 else "  " * (depth - 1) + "+- "
+        state = row["state"]
+        if state in {"disk_paused", "memory_paused"} and row.get("space_blocked") and row.get("memory_blocked"):
+            state = "resources_paused"
+        label = self.i18n.t("report.status." + state)
+        percent = f"{row['progress']:.0%}" if row["progress_known"] else "--%"
+        detail = ""
+        if state in {"disk_paused", "memory_paused", "resources_paused"}:
+            hint = {"disk_paused": "disk", "memory_paused": "memory", "resources_paused": "resources"}[state]
+            detail = " " + (row["detail"] or self.i18n.t(f"report.status.{hint}_resume_hint"))
+        return f"[{label}] {percent}{detail}"
 
     def _output_location(self) -> str:
         outputs = [os.path.abspath(os.path.normpath(path)) for path in self._top_level_outputs.values() if path]

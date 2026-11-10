@@ -11,11 +11,12 @@ from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _is_st
 from sunpack.runtime.watch.toast import WatchToastCoordinator
 
 
-def test_memory_wait_reaches_both_presenters_without_owning_task_state(tmp_path):
+def test_memory_wait_reaches_both_presenters_without_owning_task_state(tmp_path, monkeypatch):
+    monkeypatch.setattr("sunpack.pipeline.coordinator.reporting._terminal_supports_updates", lambda _stream: True)
     snapshots = []
     host = SimpleNamespace(publish=snapshots.append, clear=lambda: None)
     watch = WatchToastCoordinator(host, {"cli": {"language": "zh"}, "watch": {}}, str(tmp_path / "state"))
-    task = SimpleNamespace(main_path=str(tmp_path / "a.zip"))
+    task = SimpleNamespace(key=str(tmp_path / "a.zip"), main_path=str(tmp_path / "a.zip"))
     output = StringIO()
     cli = RunReporter(language="zh", stdout=output)
     cli.tasks_discovered(1, [task])
@@ -40,10 +41,10 @@ def test_memory_wait_reaches_both_presenters_without_owning_task_state(tmp_path)
     assert "内存" in snapshots[-1].progress_status
     assert "等待可用内存" in output.getvalue().splitlines()[-1]
     assert "磁盘" not in output.getvalue().splitlines()[-1]
-    assert cli._task_rows[id(task)]["state"] == "memory_paused"
+    assert cli._task_rows[task.key]["state"] == "memory_paused"
     deliver("memory_resumed")
     restored = output.getvalue().splitlines()[-1]
     assert "正在解压" in restored and "内存" not in restored and "磁盘" not in restored
     assert "内存" not in snapshots[-1].progress_status
-    assert cli._task_rows[id(task)]["state"] == "extracting"
+    assert cli._task_rows[task.key]["state"] == "extracting"
     watch.stop()

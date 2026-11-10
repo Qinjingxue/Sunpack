@@ -20,6 +20,7 @@ from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
 
 def _executor(*, allow_partial: bool) -> ArchiveJobExecutor:
     executor = object.__new__(ArchiveJobExecutor)
+    executor.scanning = False
     executor.verifier = SimpleNamespace(config={})
     executor.content_policy = ContentRecoveryPolicy(
         CONTENT_REQUIREMENT_ALLOW_PARTIAL if allow_partial else "complete"

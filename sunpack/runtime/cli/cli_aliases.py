@@ -1,7 +1,6 @@
 COMMAND_ALIASES = {
     "extract": ("x",),
     "scan": ("s",),
-    "inspect": ("i",),
     "passwords": ("pw",),
     "watch": ("w",),
     "config": ("cfg",),

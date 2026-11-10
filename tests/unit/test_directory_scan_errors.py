@@ -1,4 +1,5 @@
 import io
+import asyncio
 import json
 import os
 import subprocess
@@ -24,7 +25,9 @@ from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_reporter import CliReporter
-from sunpack.runtime.cli.commands import inspect_command, scan
+from sunpack.runtime.cli.commands import extract, scan
+from sunpack.runtime.cli.cli import build_cli_parser
+from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.state import WatchStateStore
@@ -55,7 +58,8 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
     config = normalize_config({"verification": {}, "cli": {"language": language}, "filesystem": {
         "scan_filters": [{"name": "size_range", "enabled": False}],
     }})
-    monkeypatch.setattr(scan, "load_request_config", lambda _cwd: config)
+    monkeypatch.setattr(extract, "load_request_config", lambda _cwd: config)
+    monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
     stderr = io.StringIO()
     context = CliContext(language=language, cwd=str(tmp_path), reporter=CliReporter(
         json_mode=json_mode, stdout=io.StringIO(), stderr=stderr,
@@ -88,8 +92,9 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
         tasks = ArchiveTaskScanner(config, state).scan_targets([str(root)], scan_session=DiscoveryScanSession(config=config,scope=DiscoveryScope(str(root),recursive=True)))
         assert len(tasks) == 1 and tasks[0].main_path == str(root / "good.blob")
         assert state.scan_failures[0].kind == FailureKind.FILESYSTEM_ERROR
-        code, result = scan.handle(SimpleNamespace(recursive=True, paths=[str(root)], deep_detect=False, json=json_mode), context)
-        assert code != 0 and result.summary["task_count"] == 1
+        args = build_cli_parser(context, command="scan").parse_args(["scan", str(root), "--recursive", *(["--json"] if json_mode else [])])
+        code, result = asyncio.run(scan.handle(args, context))
+        assert code != 0 and result.summary["archive_count"] == 1
         assert result.summary["scan_error_count"] == 1
         assert len(result.errors) == 1 and str(blocked) in result.errors[0]
         expected = "无法读取目录：" if language == "zh" else "Cannot read directory: "
@@ -111,8 +116,7 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
     scheduler.state.close()
 
 
-@pytest.mark.parametrize("command, count_key", [(scan, "task_count"), (inspect_command, "resolved_items")])
-def test_explicit_missing_target_keeps_valid_input_and_reports_metadata_failure(tmp_path, monkeypatch, command, count_key):
+def test_explicit_missing_target_keeps_valid_input_and_reports_metadata_failure(tmp_path, monkeypatch):
     # Unlike subtree failures, root metadata failures used to disappear before
     # native discovery, or prevent the CLI from processing any valid input.
     good = tmp_path / "good.blob"
@@ -120,13 +124,14 @@ def test_explicit_missing_target_keeps_valid_input_and_reports_metadata_failure(
     with zipfile.ZipFile(good, "w") as output:
         output.writestr("payload.txt", "payload")
     config = normalize_config({"verification": {}, "cli": {"language": "zh"}})
-    monkeypatch.setattr(command, "load_request_config", lambda _cwd: config)
+    monkeypatch.setattr(extract, "load_request_config", lambda _cwd: config)
+    monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
     context = CliContext(language="zh", cwd=str(tmp_path), reporter=CliReporter(
         json_mode=True, stdout=io.StringIO(), stderr=io.StringIO(),
     ))
-    code, result = command.handle(SimpleNamespace(recursive=True, paths=[str(missing), str(good)], deep_detect=False, json=True,
-                                                analyze=False, archives_only=False), context)
-    assert code != 0 and result.summary[count_key] == 1
+    args = build_cli_parser(context, command="scan").parse_args(["scan", str(missing), str(good), "--json", "--recursive"])
+    code, result = asyncio.run(scan.handle(args, context))
+    assert code != 0 and result.summary["archive_count"] == 1
     assert len(result.errors) == 1 and str(missing) in result.errors[0]
     assert result.errors[0].startswith("无法读取文件或目录信息：")
     state = RunState()

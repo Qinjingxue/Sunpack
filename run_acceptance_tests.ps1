@@ -778,7 +778,6 @@ try {
     Invoke-TestStep -Label "CLI help smoke test" -Command @($python, "sunpack.py", "--help") -QuietOutput
     Invoke-TestStep -Label "CLI passwords smoke test" -Command @($python, "sunpack.py", "passwords", "--json") -QuietOutput
     Invoke-TestStep -Label "CLI scan smoke test" -Command @($python, "sunpack.py", "scan", (Join-Path $repoRoot "tests"), "--json") -QuietOutput
-    Invoke-TestStep -Label "CLI inspect smoke test" -Command @($python, "sunpack.py", "inspect", (Join-Path $repoRoot "tests"), "--json") -QuietOutput
     Invoke-TestStep -Label "CLI config smoke test" -Command @($python, "sunpack.py", "config", "--json", "show") -QuietOutput
 } finally {
     Write-Host ""

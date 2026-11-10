@@ -55,7 +55,7 @@ def register(subparsers, ctx):
     parser.add_argument("paths", nargs="+", help=ctx.t("cli.extract.paths"))
 
 
-async def handle(args, ctx):
+async def handle(args, ctx, *, operation="extract"):
     reporter = ctx.reporter
     target_paths = resolve_target_paths(args.paths, base_dir=ctx.cwd)
 
@@ -67,14 +67,14 @@ async def handle(args, ctx):
         conflict = host.archive_registry.reserve(lease_owner, "foreground", target_paths)
         if conflict is not None and conflict.origin == "watch":
             return EXIT_TASK_FAILED, CliCommandResult(
-                command=COMMAND,
+                command=operation,
                 inputs={"paths": target_paths},
                 summary={"status": "watch_busy", "conflicts": list(conflict.paths)},
                 errors=[ctx.t("cli.watch_busy")],
             )
         if conflict is not None:
             return EXIT_TASK_FAILED, CliCommandResult(
-                command=COMMAND,
+                command=operation,
                 inputs={"paths": target_paths},
                 summary={"status": "busy", "conflicts": list(conflict.paths)},
                 errors=[ctx.t("cli.archive_busy")],
@@ -94,12 +94,14 @@ async def handle(args, ctx):
         )
         clipboard_passwords = collect_clipboard_passwords(config)
     except Exception as exc:
-        return EXIT_USAGE, CliCommandResult(command=COMMAND, inputs={"paths": list(args.paths)}, summary={}, errors=[ctx.t("cli.operation_failed", error=exc)])
+        return EXIT_USAGE, CliCommandResult(command=operation, inputs={"paths": list(args.paths)}, summary={}, errors=[ctx.t("cli.operation_failed", error=exc)])
 
     common_root = resolve_common_root(target_paths)
     config.setdefault("output", {})["common_root"] = common_root
 
     def report_targets():
+        if operation == "scan":
+            return
         if len(target_paths) == 1:
             reporter.info(ctx.t("cli.extract.single_target", path=target_paths[0]))
         else:
@@ -134,6 +136,10 @@ async def handle(args, ctx):
         json_mode=bool(args.json),
     )
     deep_detect = bool(getattr(args, "deep_detect", False))
+    run_config["extraction"]["operation"] = operation
+    if operation == "scan":
+        run_config["cli"]["quiet"] = True
+        run_config["extraction"]["quiet"] = True
     engine_context = pipeline_engine(config)
     if not args.json and getattr(ctx.stdout, "isatty", lambda: False)():
         reporter.info(ctx.t("interrupt.hint"))
@@ -161,7 +167,7 @@ async def handle(args, ctx):
             )
             summary = response.summary
             if response.interrupted:
-                return interrupted_result(ctx, COMMAND, {"paths": target_paths}, response.interruption_cleanup_errors)
+                return interrupted_result(ctx, operation, {"paths": target_paths}, response.interruption_cleanup_errors)
             failures = list(summary.failures)
             scan_report.record_failures(summary.scan_failures, ctx.language)
             processed_keys = list(summary.processed_keys)
@@ -224,9 +230,13 @@ async def handle(args, ctx):
     final_summary = RunSummary(
         target_results=tuple(latest_target_results.values()), scan_failures=tuple(scan_report.scan_failures),
     )
+    if operation == "scan":
+        from sunpack.runtime.cli.commands.scan import command_result
+        async with command_work_broker(ctx) as broker:
+            return await broker.run("cli_output", "", command_result, args, ctx, target_paths, final_summary)
     failed_tasks = final_summary.failed_tasks
     result = CliCommandResult(
-        command=COMMAND,
+        command=operation,
         inputs={
             "paths": target_paths,
             "common_root": common_root,

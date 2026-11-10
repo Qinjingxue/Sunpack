@@ -963,12 +963,15 @@ class _SourceCleanup:
                 try:
                     if mode == "keep":
                         cli = self._config.get("cli", {})
-                        cleanup = ArchiveCleanup("keep", cli.get("language", "en"), quiet=bool(cli.get("quiet", False)))
+                        cleanup = ArchiveCleanup("keep", cli.get("language", "en"), quiet=True)
                         results.extend(cleanup.cleanup_success_archives(
                             [[path] for path in existing],
                         ))
                     else:
-                        actions = PostProcessActions(self._config, stdout=None, cleanup_mode_override=mode)
+                        actions = PostProcessActions(
+                            {**self._config, "cli": {**self._config.get("cli", {}), "quiet": True}},
+                            cleanup_mode_override=mode,
+                        )
                         with promotion_barrier(
                             existing,
                             cache_releasers=(release_archive_sessions_under_roots,),
@@ -1092,7 +1095,8 @@ class _RequestRuntime:
             language=self.language,
             quiet=self.quiet,
             verbose=self.verbose,
-            emit_errors=submission.origin == "foreground" and not cli_config.get("json", False),
+            emit_errors=submission.origin == "foreground" and not cli_config.get("json", False)
+                and self.config.get("extraction", {}).get("operation") != "scan",
             stdout=submission.stdout,
             stderr=submission.stderr,
             work_broker=services.broker,
@@ -1539,6 +1543,9 @@ class _RequestRuntime:
                     current, depth=depth, cancellation=cancellation,
                 ),
             )
+            if self.job_executor.scanning:
+                ownership.remember_results([result])
+                return result.outcome_kind == OutcomeKind.SCANNED
             watch_version = task.runtime.get("source_generation", watch_version)
             retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
             # Watch annotates the leased physical group; CLI retries carry the
@@ -1700,6 +1707,8 @@ class _RequestRuntime:
                 )
             with self.context.lock:
                 self._active_task_keys.discard(task_key)
+            await broker.run("report", task_key, self.reporter.scope_finished, task, depth,
+                             request_id=self.submission.request_id)
 
     def _nested_scan_work(self, output_dir: str, extraction_result):
         logical_roots = []
@@ -1728,13 +1737,19 @@ class _RequestRuntime:
             return True
         gate = self._prompt_gates.get(depth)
         if gate is None:
-            gate = asyncio.create_task(
-                self.recursion.prompt_continue(
-                    depth - 1,
-                    readline=self.submission.input_reader,
-                    stdout=self.submission.stdout,
-                )
-            )
+            async def prompt():
+                broker = self.services.broker
+                await broker.run("report", "", self.reporter.pause_panel,
+                                 request_id=self.submission.request_id)
+                try:
+                    return await self.recursion.prompt_continue(
+                        depth - 1, readline=self.submission.input_reader,
+                        stdout=self.submission.stdout,
+                    )
+                finally:
+                    await broker.run("report", "", self.reporter.resume_panel,
+                                     request_id=self.submission.request_id)
+            gate = asyncio.create_task(prompt())
             self._prompt_gates[depth] = gate
         return bool(await gate)
 
@@ -1912,7 +1927,7 @@ class _RequestRuntime:
                 result = PostProcessActions(
                     self.config,
                     stdout=self.submission.stdout,
-                ).flattener.flatten_dirs(output_dir, work_path=work_path,
+                ).flattener.flatten_dirs(output_dir, announce=False, work_path=work_path,
                     before_move=(lambda root, work, leaf: outputs.prepare_flatten(owner, root, work, leaf))
                         if outputs is not None else None)
             registered = outputs is not None and os.path.isdir(output_dir) and outputs.finish_flatten(output_dir)

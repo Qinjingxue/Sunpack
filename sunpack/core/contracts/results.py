@@ -9,6 +9,7 @@ from sunpack.core.support.filesystem_scan_errors import is_filesystem_scan_failu
 
 
 class OutcomeKind(str, Enum):
+    SCANNED = "scanned"
     COMPLETE_SUCCESS = "complete_success"
     PARTIAL_SUCCESS = "partial_success"
     FAILURE = "failure"
@@ -63,6 +64,8 @@ class TargetRunResult:
     failure: FailureInfo | None = None
     failure_message: str = ""
     recovery: dict | None = None
+    # Sparse CLI facts only; never retain native readers, inventories or tasks.
+    scan_items: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)

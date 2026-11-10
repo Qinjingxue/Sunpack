@@ -22,10 +22,3 @@ def scan_filters_config(config: dict[str, Any]) -> list[dict[str, Any]]:
 
 def scan_filters_enabled(config: dict[str, Any]) -> bool:
     return filesystem_config(config)["scan_filters_enabled"]
-
-
-def scan_filter_config(config: dict[str, Any], name: str) -> dict[str, Any]:
-    for item in scan_filters_config(config):
-        if item["name"] == name:
-            return item
-    return {}

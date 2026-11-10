@@ -9,7 +9,7 @@ from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 def test_discovery_records_each_batch_and_releases_its_session(monkeypatch):
     context = RunState()
     scanner = ArchiveTaskScanner({}, context)
-    error = DiscoveryTrace("carrier.bin", "embedded", "blocked",
+    error = DiscoveryTrace("carrier.bin", "embedded",
                            reason="embedded_scan_io_error", error="Unable to read input")
     failure = FailureInfo(FailureKind.FILESYSTEM_ERROR, "embedded_boundary", error.error,
                           details={"path": error.entry_path, "reason": error.reason})

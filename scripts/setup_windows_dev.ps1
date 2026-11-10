@@ -812,7 +812,7 @@ assert os.path.getsize(target) > 0
         Push-Location $RepoRoot
         try {
             Invoke-Native -FilePath $PythonPath -Arguments @(
-                "sunpack.py", "inspect", "--analyze", "--no-pause", "-q", $fixture
+                "sunpack.py", "scan", "--no-pause", "-q", $fixture
             )
         } finally {
             try {

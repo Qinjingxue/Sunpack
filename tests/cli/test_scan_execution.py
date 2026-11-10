@@ -1,0 +1,174 @@
+"""One real shared-chain run covers scan's read-only and sparse-fact contract.
+
+Discovery-only tests cannot catch accidental extraction/cleanup or candidate
+passwords being published as confirmed. Tiny archives cover both cheaply.
+"""
+import asyncio
+import io
+import zipfile
+from pathlib import Path
+
+from sunpack.runtime.cli.cli import build_cli_parser
+from sunpack.runtime.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli_reporter import CliReporter
+from sunpack.runtime.cli.commands import extract, scan
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from tests.helpers.config_factory import make_config
+from tests.helpers.real_archives import create_encrypted_zip_archive, create_encrypted_7z_archive
+
+
+def test_scan_shared_execution_preserves_sources_and_per_segment_passwords(tmp_path, monkeypatch):
+    secret = create_encrypted_zip_archive(tmp_path, "secret", password="found-password")
+    hidden = create_encrypted_7z_archive(tmp_path, "hidden", password="unlisted-password")
+    source = tmp_path / "inputs"
+    source.mkdir()
+    plain = io.BytesIO()
+    with zipfile.ZipFile(plain, "w") as archive:
+        archive.writestr("nested.zip", b"not an archive")
+    prefix = b"carrier prefix" * 19
+    middle = b"gap" * 17
+    payload = secret.entry_path.read_bytes()
+    (source / "mixed.jpg").write_bytes(prefix + plain.getvalue() + middle + payload + b"tail" * 23)
+    (source / "ordinary.disguised").write_bytes(plain.getvalue())
+    (source / "unknown-password.blob").write_bytes(hidden.entry_path.read_bytes())
+    before = {path: path.read_bytes() for path in source.iterdir()}
+    output = tmp_path / "must-not-exist"
+    config = make_config({"output": {"root": str(output)}, "post_extract": {"archive_cleanup_mode": "d"}})
+    monkeypatch.setattr(extract, "load_request_config", lambda _cwd: config)
+    monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
+    ctx = CliContext(language="en", cwd=str(tmp_path), stdout=io.StringIO(), stderr=io.StringIO())
+    ctx.reporter = CliReporter(json_mode=True, stdout=ctx.stdout, stderr=ctx.stderr)
+    args = build_cli_parser(ctx, command="scan").parse_args([
+        "scan", str(source), "--json", "--deep-detect", "--no-builtin-pw", "-p", "found-password",
+    ])
+    code, result = asyncio.run(scan.handle(args, ctx))
+    assert code != 0  # Known encryption, but no matching password for hidden.
+    assert not output.exists()
+    assert {path: path.read_bytes() for path in source.iterdir()} == before
+    items = result.items
+    mixed = [item for item in items if Path(item["main_path"]).name == "mixed.jpg"]
+    assert len(mixed) == 2, items
+    assert mixed[0]["offset"] == len(prefix)
+    assert "password_used" not in mixed[0]
+    assert mixed[1]["password_used"] == "found-password", mixed[1]
+    ordinary = next(item for item in items if Path(item["main_path"]).name == "ordinary.disguised")
+    assert "offset" not in ordinary and "password_used" not in ordinary
+    unknown = next(item for item in items if Path(item["main_path"]).name == "unknown-password.blob")
+    assert unknown["password_used"] is None and "all_parts" not in unknown
+    assert all("status" not in item and "discovery_source" not in item for item in items)
+
+
+def test_scan_retains_volume_domains_and_never_confirms_empty_zipcrypto(tmp_path):
+    # Ordinary scan fixtures cannot catch speculative composition selection or
+    # weak empty-entry proof being cached as a confirmed password.
+    import subprocess
+    from sunpack_native import encode_worker_frame
+    from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+    from sunpack.core.passwords.internal.store import PasswordStore
+    from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+    from tests.helpers.async_batch import run_extract
+    from tests.helpers.native_build import sevenzip_artifact
+    from tests.helpers.tool_config import require_7z
+    from tests.helpers.worker_events import worker_events
+    from tests.integration.test_volume_attempts import _ambiguous_case
+
+    case, paths, config, task = _ambiguous_case(tmp_path, "7z", "found-password", True)
+    before = tuple(node.descriptor for node in task.inputs)
+    contents = {path: path.read_bytes() for path in paths}
+    output = tmp_path / "scan-output"
+    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config),
+                                    extraction_config={"operation": "scan"})
+    result = run_extract(extractor, task, str(output))
+    assert tuple(node.descriptor for node in task.inputs) == before
+    assert not output.exists() and {path: path.read_bytes() for path in paths} == contents
+    from sunpack.pipeline.coordinator.scan_projection import scan_items
+    from sunpack.core.i18n import I18nContext
+    receipts = list(scan_items(task, result, I18nContext("en")))
+    assert receipts and all(item["volume_completeness"] == "pending" for item in receipts)
+    assert all("volume_attempts" in item for item in receipts)
+    # Text and JSON use the same compact plan rather than enumerating products.
+    ctx = CliContext(language="en")
+    assert ctx.t("cli.scan.volumes.pending") in " ".join(scan._details(receipts[0], ctx))
+
+    empty = tmp_path / "empty.txt"
+    empty.write_bytes(b"")
+    archive = tmp_path / "empty.zip"
+    subprocess.run([str(require_7z()), "a", "-tzip", "-mem=ZipCrypto", "-psecret",
+                    str(archive), str(empty)], check=True, capture_output=True)
+    request = {"job_id": "empty-scan", "operation": "scan", "password_candidates": ["secret"],
+               "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
+               "output_dir": str(output)}
+    run = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
+                         input=encode_worker_frame(request), capture_output=True)
+    final = next(event for event in worker_events(run.stdout) if event.get("type") == "result")
+    assert not final["password_verified"], final
+    assert final["encrypted"] and final["status"] == "failed", final
+    assert not output.exists()
+
+
+def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
+    # Real happy-path archives miss distinct blocked segments, different source
+    # files within one task, and verbose/JSON/quiet projection combinations.
+    from types import SimpleNamespace
+    from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
+    from sunpack.core.contracts.input_plan import LogicalArchiveInput
+    from sunpack.core.contracts.tasks import ArchiveTask
+    from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
+    from sunpack.core.contracts.failures import FailureInfo, FailureKind
+    from sunpack.core.contracts.results import RunSummary, TargetRunResult, OutcomeKind
+    from sunpack.core.i18n import I18nContext
+    from sunpack.pipeline.coordinator.scan_projection import scan_items
+
+    missing = FailureInfo(FailureKind.MISSING_VOLUME, "embedded", "missing segment volume",
+                          details={"missing_volume_confirmed": True})
+    password = FailureInfo(FailureKind.PASSWORD_REQUIRED, "embedded", "need password")
+    nodes = tuple(LogicalArchiveInput(ArchiveInputDescriptor(
+        str(tmp_path / name), format_hint="rar", open_mode="file_range",
+        parts=[ArchiveInputPart(InputExtent(str(tmp_path / name), start, end))],
+    ), position=i, failure=failure) for i, (name, start, end, failure) in enumerate((
+        ("first.bin", 0, 64, missing), ("second.bin", 128, None, password)), 1))
+    task = ArchiveTask.from_archive_input(nodes[0].descriptor, discovery_source="embedded", logical_inputs=nodes)
+    result = ExtractionResult(False, "", failure=missing, input_results=[
+        InputExecutionResult(node, ExtractionResult(False, "", failure=node.failure)) for node in nodes])
+    items = tuple(scan_items(task, result, I18nContext("en")))
+    assert items[0]["main_path"].endswith("first.bin") and items[0]["offset"] == 0
+    assert items[0]["volume_completeness"] == "missing" and "password_used" not in items[0]
+    assert items[1]["main_path"].endswith("second.bin") and items[1]["end_offset"] is None
+    assert items[1]["password_used"] is None and "all_parts" not in items[1]
+    assert items[0]["error"] != items[1]["error"]
+    for json_mode, verbose, quiet in ((True, False, False), (True, True, False), (False, False, True), (False, True, False)):
+        out, err = io.StringIO(), io.StringIO()
+        ctx = CliContext(language="en", reporter=CliReporter(json_mode=json_mode, quiet=quiet,
+                         verbose=verbose, stdout=out, stderr=err))
+        summary = RunSummary(target_results=(TargetRunResult(task.main_path, OutcomeKind.FAILURE,
+                          failure=missing, error=missing.message, scan_items=tuple(dict(i) for i in items)),))
+        _, projected = scan.command_result(SimpleNamespace(json=json_mode, verbose=verbose, quiet=quiet,
+                                     deep_detect=False), ctx, [task.main_path], summary)
+        assert all(("discovery_source" in item) == verbose for item in projected.items)
+        if quiet:
+            assert not out.getvalue() and "need password" in err.getvalue()
+        elif not json_mode:
+            assert out.getvalue().index("first.bin") < out.getvalue().index("second.bin")
+
+
+def test_rar_boundary_batch_preserves_later_success_and_truncated_password(tmp_path):
+    # A first failed header previously terminated the batch and assigned its
+    # error to every later segment. Real encrypted headers also check that a
+    # confirmed password survives a later missing terminator.
+    from sunpack_native import resolve_embedded_rar_boundaries
+    from tests.unit.test_rar_7z_fast_verifier import _rar5_encryption_header_fixture
+    from tests.unit.test_rar_hp_header_decryption import SINGLE_HP_HEX
+    complete = bytes.fromhex(SINGLE_HP_HEX)
+    first = _rar5_encryption_header_fixture()
+    prefix, gap = b"prefix" * 7, b"gap" * 11
+    offsets = [len(prefix), len(prefix) + len(first) + len(gap)]
+    offsets.append(offsets[-1] + len(complete) + len(gap))
+    path = tmp_path / "mixed.rar.carrier"
+    path.write_bytes(prefix + first + gap + complete + gap + complete[:-20])
+    rows = resolve_embedded_rar_boundaries(str(path), offsets, ["secret"])
+    assert [row["offset"] for row in rows] == offsets
+    assert [row["status"] for row in rows] == ["wrong_password", "ok", "truncated"]
+    assert "password" not in rows[0]
+    assert rows[1]["password"] == rows[2]["password"] == "secret"
+    assert rows[1]["end_offset"] == offsets[1] + len(complete)
+    assert "end_offset" not in rows[2]

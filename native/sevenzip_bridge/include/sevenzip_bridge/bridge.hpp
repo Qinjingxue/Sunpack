@@ -255,7 +255,8 @@ PasswordTestResult test_password_batch(
     const std::wstring& format_hint,
     const std::wstring* candidates,
     std::size_t candidate_count,
-    const std::vector<std::wstring>& canonical_names
+    const std::vector<std::wstring>& canonical_names,
+    bool scan_only = false
 );
 
 ExtractArchiveResult extract_archive(

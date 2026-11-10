@@ -198,7 +198,8 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> &canonical_names,
         const std::wstring &format_hint,
-        PasswordProbeCache &cache
+        PasswordProbeCache &cache,
+        bool scan_only
 
     )
     {
@@ -365,6 +366,19 @@ namespace sunpack::sevenzip
             last_encryption_evidence = last_encryption_evidence || selection.encrypted;
             result.encrypted = result.encrypted || last_encryption_evidence;
             result.password_required = result.password_required || last_encryption_evidence;
+            if (scan_only && !selection.encrypted && !last_encryption_evidence && selection.item_count_known)
+            {
+                archive->Close();
+                result.status = PasswordTestStatus::Ok;
+                return result;
+            }
+            if (scan_only && !selection.index && selection.item_count != 0 && selection.encrypted)
+            {
+                archive->Close();
+                result.status = PasswordTestStatus::Error;
+                result.message = "no nonempty encrypted item can confirm the password";
+                return result;
+            }
             const bool tested = probe_opened_archive(archive, selection, password,
                 last_encryption_evidence, hr, last_op_res);
             result.operation_result = last_op_res;
@@ -488,7 +502,8 @@ namespace sunpack::sevenzip
         const std::wstring &format_hint,
         const std::wstring *candidates,
         std::size_t candidate_count,
-        const std::vector<std::wstring> &canonical_names)
+        const std::vector<std::wstring> &canonical_names,
+        bool scan_only)
     {
 #ifdef _WIN32
         PasswordProbeCache cache;
@@ -504,7 +519,7 @@ namespace sunpack::sevenzip
                 return last;
             }
             auto current = test_one_password(archive_path, candidate_count == 0 ? empty : candidates[index],
-                part_paths, formats, input_ranges, canonical_names, format_hint, cache);
+                part_paths, formats, input_ranges, canonical_names, format_hint, cache, scan_only);
             current.attempts = static_cast<int>(index + 1);
             if (native_job_cancelled()) {
                 current.status = PasswordTestStatus::Error;

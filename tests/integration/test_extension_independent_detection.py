@@ -79,7 +79,7 @@ def test_header_encrypted_rar4_primary_uses_relations_identity(tmp_path):
     )
     blocked = ArchiveTaskProvider(detection_pipeline_config()).discover_targets([str(carrier)])
     assert len(blocked.tasks) == 1 and blocked.tasks[0].discovery_failure.is_password_failure
-    assert any(finding.format == "rar" for finding in blocked.findings)
+    assert any(node.descriptor.format_hint == "rar" for task in blocked.tasks for node in task.inputs)
 
 
 def test_signature_bytes_without_valid_structure_are_not_accepted(tmp_path):

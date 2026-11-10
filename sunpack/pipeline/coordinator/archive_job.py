@@ -61,6 +61,7 @@ class ArchiveJobExecutor:
         self.context = context
         self.extractor = extractor
         self.config = config
+        self.scanning = config.get("extraction", {}).get("operation") == "scan"
         self.content_policy = ContentRecoveryPolicy.from_config(self.config)
         cli_config = self.config["cli"]
         self.i18n = I18nContext(cli_config["language"])
@@ -218,7 +219,7 @@ class ArchiveJobExecutor:
                 return "", ArchiveJobOutcome(ExtractionResult(
                     success=False, out_dir="", error=failure.message, failure=failure,
                 ))
-            out_dir = output_dir_resolver(task)
+            out_dir = "" if self.scanning else output_dir_resolver(task)
             result = self.extractor.inspect(task, out_dir)
             if result is not None:
                 return out_dir, ArchiveJobOutcome(result)
@@ -259,6 +260,12 @@ class ArchiveJobExecutor:
         if terminal is not None:
             terminal.planned_out_dir = planned_out_dir
             return task, terminal
+
+        if self.scanning:
+            result = await self.extractor.extract_asyncio(
+                broker, task, "", request_id=self.request_id, file_id=file_id, cancellation=cancellation,
+            )
+            return task, ArchiveJobOutcome(result)
 
         register_output = self.output_reservations is not None and self.output_reservations.watch_outputs is not None
         register_with_start = register_output and self.origin == "watch" and bool(self.config.get("watch_owner_path"))
@@ -386,6 +393,18 @@ class ArchiveJobExecutor:
         if isinstance(outcome, ExtractionResult):
             outcome = ArchiveJobOutcome(outcome)
         res = outcome.result
+        if self.scanning:
+            from sunpack.pipeline.coordinator.scan_projection import scan_items
+
+            result = TargetRunResult(
+                input_path=task.main_path, task_key=task.key,
+                outcome_kind=OutcomeKind.SCANNED if res.success else OutcomeKind.FAILURE,
+                failure=res.failure, error=res.error,
+                scan_items=tuple(scan_items(task, res, self.i18n)),
+            )
+            with self.context.lock:
+                self.context.add_target_result(result)
+            return result
         outcome.content_decision = self.content_policy.decide(res, outcome.verification)
         out_dir = res.out_dir
         inventory = OutputInventory.from_value(res.output_inventory, expected_root=out_dir) if out_dir else None

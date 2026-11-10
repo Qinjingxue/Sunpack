@@ -57,47 +57,21 @@ class DiscoveryCandidate:
 class DiscoveryTrace:
     entry_path: str
     source: str
-    status: str
     format: str = ""
     reason: str = ""
     error: str = ""
 
 
-@dataclass(frozen=True, slots=True)
-class DiscoveryFinding:
-    """A confirmed archive identity independent from execution planning."""
-
-    entry_path: str
-    source: str
-    format: str
-    status: str
-    reason: str = ""
-    logical_name: str = ""
-    part_paths: tuple[str, ...] = ()
-    offset: int | None = None
-    end_offset: int | None = None
-    boundary_kind: str = ""
-    extractable: bool = False
-
-
 @dataclass
 class StageResult:
     tasks: list[ArchiveTask] = field(default_factory=list)
-    findings: list[DiscoveryFinding] = field(default_factory=list)
     claimed_paths: set[str] = field(default_factory=set)
     blocked_paths: set[str] = field(default_factory=set)
     traces: list[DiscoveryTrace] = field(default_factory=list)
 
-    def add_resolved(self, task: ArchiveTask, *, reason: str = "") -> None:
+    def add_resolved(self, task: ArchiveTask) -> None:
         self.tasks.append(task)
         self.claimed_paths.update(path_key(path) for path in task.cleanup_parts if path)
-        self.traces.append(DiscoveryTrace(
-            entry_path=task.main_path,
-            source=task.discovery_source,
-            status="resolved",
-            format=task.archive_input().format_hint,
-            reason=reason,
-        ))
 
     def add_blocked(self, candidate: DiscoveryCandidate, *, source: str, reason: str, error: str = "") -> None:
         self.blocked_paths.update(candidate.path_keys)
@@ -109,14 +83,8 @@ class StageResult:
                 discovery_evidence=candidate.relation_anchor, discovery_reason=reason,
                 discovery_failure=failure,
             ))
-        self.traces.append(DiscoveryTrace(
-            entry_path=candidate.entry_path,
-            source=source,
-            status="blocked",
-            format=candidate.format_hint,
-            reason=reason,
-            error=error,
-        ))
+        if error and failure is None:
+            self.traces.append(DiscoveryTrace(candidate.entry_path, source, candidate.format_hint, reason, error))
 
     def validate(self) -> None:
         if self.claimed_paths & self.blocked_paths:
@@ -140,6 +108,7 @@ _DISCOVERY_FAILURES = {
     "embedded_wrong_password": (FailureKind.WRONG_PASSWORD, "failure.wrong_password", "request_password"),
     "needs_password": (FailureKind.PASSWORD_REQUIRED, "failure.password_required", "request_password"),
     "wrong_password": (FailureKind.WRONG_PASSWORD, "failure.wrong_password", "request_password"),
+    "embedded_scan_io_error": (FailureKind.FILESYSTEM_ERROR, "", ""),
     "embedded_truncated": (FailureKind.DAMAGED, "failure.damaged", ""),
     "missing_volume": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),
     "ambiguous_volume_mapping": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),

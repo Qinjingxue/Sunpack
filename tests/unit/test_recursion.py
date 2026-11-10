@@ -38,10 +38,24 @@ def test_prompt_recursion_uses_request_local_async_input():
 
     runtime = object.__new__(_RequestRuntime)
     runtime.recursion = RecursionController("prompt")
-    runtime.submission = SimpleNamespace(input_reader=readline, stdout=output)
+    runtime.submission = SimpleNamespace(input_reader=readline, stdout=output, request_id="prompt-test")
     runtime._prompt_gates = {}
 
-    assert asyncio.run(runtime._allow_recursive_depth(2)) is True
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+    from sunpack.pipeline.coordinator.reporting import RunReporter
+    runtime.reporter = RunReporter(stdout=output)
+
+    async def run():
+        broker = AsyncWorkBroker()
+        try:
+            runtime.services = SimpleNamespace(broker=broker)
+            assert await runtime._allow_recursive_depth(2) is True
+            assert await runtime._allow_recursive_depth(2) is True
+            assert runtime.reporter._panel_pauses == 0
+        finally:
+            await broker.close()
+
+    asyncio.run(run())
     assert len(prompts) == 1
     assert "1" in prompts[0]
 

@@ -1,117 +1,112 @@
+import os
+from itertools import groupby
+
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
-from sunpack.runtime.cli.cli_parsers import build_common_parser, build_detection_parser, build_process_mode_parser
-from sunpack.runtime.cli.cli_runtime import (
-    resolve_common_root,
-    resolve_target_paths,
-    scan_finding_to_item,
-    scan_result_to_item,
+from sunpack.runtime.cli.cli_parsers import (
+    build_common_parser, build_detection_parser, build_password_parser, build_process_mode_parser,
 )
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED
-from sunpack.runtime.cli.persistent_runtime import load_request_config
-from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
-from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
 COMMAND = "scan"
 ORDER = 20
 
-_REASON_KEYS = {
-    "embedded_password_required": "failure.password_required",
-    "embedded_wrong_password": "failure.wrong_password",
-    "embedded_truncated": "failure.damaged",
-    "embedded_carrier_blocked": "cli.scan.carrier_blocked",
-}
-
-_SOURCE_KEYS = {
-    "embedded": "cli.scan.source.embedded",
-    "relations": "cli.scan.source.relations",
-    "detection": "cli.scan.source.detection",
-}
-
-_STATUS_KEYS = {
-    "resolved": "cli.scan.status.resolved",
-    "blocked": "cli.scan.status.blocked",
-}
-
 
 def register(subparsers, ctx):
     parser = subparsers.add_parser(
-        COMMAND,
-        aliases=COMMAND_ALIASES[COMMAND],
-        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_process_mode_parser(ctx)],
-        help=ctx.t("cli.scan.help"),
-        usage="sunpack scan [options] <paths...>",
+        COMMAND, aliases=COMMAND_ALIASES[COMMAND],
+        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_process_mode_parser(ctx)],
+        help=ctx.t("cli.scan.help"), usage="sunpack scan [options] <paths...>",
     )
     parser.set_defaults(command=COMMAND)
     parser.add_argument("paths", nargs="+", help=ctx.t("cli.scan.paths"))
 
 
-def handle(args, ctx):
-    reporter = ctx.reporter
-    target_paths = resolve_target_paths(args.paths, base_dir=ctx.cwd)
+async def handle(args, ctx):
+    from sunpack.runtime.cli.commands.extract import handle as execute
+    return await execute(args, ctx, operation="scan")
 
-    config = load_request_config(ctx.cwd)
-    orchestrator = ScanOrchestrator(config, EmbeddedOptions(force_scan=bool(args.deep_detect)))
-    report = orchestrator.scan_report(target_paths, recursive=args.recursive)
 
-    task_items = [scan_result_to_item(res) for res in report.tasks]
-    task_items.sort(key=lambda item: item["main_path"].lower())
-
-    finding_items = [scan_finding_to_item(finding) for finding in report.findings]
-    finding_items.sort(key=lambda item: (
-        item["main_path"].lower(),
-        item["offset"] if item["offset"] is not None else -1,
-        item["format"],
-    ))
-
-    summary = {
-        "task_count": len(task_items),
-        "split_task_count": sum(1 for item in task_items if len(item["all_parts"]) > 1),
-        "finding_count": len(finding_items),
-        "blocked_finding_count": sum(1 for item in finding_items if item["status"] == "blocked"),
-        "scan_error_count": report.scan_error_count,
-    }
+def command_result(args, ctx, paths, summary):
+    items = [item for result in summary.target_results for item in result.scan_items]
+    items.sort(key=lambda item: (item["main_path"].casefold(), item.get("offset", -1), item.get("format", "")))
+    if not args.verbose:
+        for item in items:
+            item.pop("discovery_source", None)
+            item.pop("damage_flags", None)
     if not args.json:
-        reporter.info(ctx.t(
-            "cli.scan.identified",
-            count=summary["finding_count"],
-            resolved=sum(1 for item in finding_items if item["status"] == "resolved"),
-            blocked=summary["blocked_finding_count"],
-        ))
-        for item in finding_items:
-            source_key = _SOURCE_KEYS.get(item["discovery_source"])
-            status_key = _STATUS_KEYS.get(item["status"])
-            reporter.info(ctx.t("cli.item_path", path=item["main_path"]))
-            reporter.info(ctx.t(
-                "cli.scan.details",
-                source=ctx.t(source_key) if source_key else item["discovery_source"] or "-",
-                format=item["format"] or "-",
-                status=ctx.t(status_key) if status_key else item["status"] or "-",
-                parts=len(item["all_parts"]),
-            ))
-            if item["offset"] is not None:
-                reporter.info(ctx.t(
-                    "cli.scan.range",
-                    start=item["offset"],
-                    end=item["end_offset"] if item["end_offset"] is not None else "?",
-                ))
-            if item["discovery_reason"] and (
-                reporter.verbose or item["status"] != "resolved"
-            ):
-                reason_key = _REASON_KEYS.get(item["discovery_reason"])
-                reason = ctx.t(reason_key) if reason_key else item["discovery_reason"]
-                reporter.info(ctx.t("cli.scan.reason", reason=reason))
-
-        for error in report.errors:
-            reporter.error(ctx.t("report.scan_error", task=error))
-        if report.errors:
-            reporter.error(ctx.t("report.scan_incomplete"))
-
-    return (EXIT_TASK_FAILED if report.errors else 0), CliCommandResult(
-        command=COMMAND,
-        inputs={"paths": target_paths, "common_root": resolve_common_root(target_paths), "config_overrides": {}, "deep_detect": bool(args.deep_detect)},
-        summary=summary,
-        items=finding_items,
-        tasks=task_items,
-        errors=report.errors,
+        for path, entries in groupby(items, key=lambda item: item["main_path"]):
+            entries = list(entries)
+            ctx.reporter.info(path)
+            for index, item in enumerate(entries, 1):
+                multiple = len(entries) > 1
+                prefix = ("   " if index == len(entries) else "│  ") if multiple else "  "
+                if multiple:
+                    branch = "└─ " if index == len(entries) else "├─ "
+                    ctx.reporter.info(branch + ctx.t("cli.scan.segment", index=index) + _range(item))
+                elif "offset" in item:
+                    ctx.reporter.info(prefix + ctx.t("cli.scan.range", start=item["offset"], end=item.get("end_offset") if item.get("end_offset") is not None else "?"))
+                if args.quiet and item.get("error"):
+                    ctx.reporter.error(f"{path}{_range(item)}: {item['error']}")
+                for text in _details(item, ctx):
+                    ctx.reporter.info(prefix + text)
+        for failure in summary.scan_failures:
+            ctx.reporter.error(ctx.t("report.scan_error", task=failure.display_message))
+        if summary.scan_error_count:
+            ctx.reporter.error(ctx.t("report.scan_incomplete"))
+        for result in summary.target_results:
+            if not result.scan_items and result.error:
+                ctx.reporter.error(f"{result.input_path}: {result.error}")
+    result = CliCommandResult(
+        command=COMMAND, inputs={"paths": paths, "deep_detect": bool(args.deep_detect)},
+        summary={"archive_count": len(items), "failed_count": summary.failed_count,
+                 "scan_error_count": summary.scan_error_count, "input_error_count": summary.input_error_count},
+        items=items, errors=summary.failed_tasks,
     )
+    return (EXIT_TASK_FAILED if summary.failed_tasks else 0), result
+
+
+def _range(item):
+    if "offset" not in item:
+        return ""
+    end = item.get("end_offset")
+    return f": [{item['offset']}, {end if end is not None else '?'})"
+
+
+def _details(item, ctx):
+    if item.get("format"):
+        yield ctx.t("cli.scan.format", format=item["format"])
+    plan = item.get("volume_attempts")
+    if plan:
+        domains = []
+        for domain in plan["domains"]:
+            names = [_source_name(plan["sources"][i]) for i in domain["choices"]]
+            domains.append(names[0] if len(names) == 1 else "(" + ", ".join(names) + ")")
+        for layout in plan["layouts"]:
+            yield ctx.t("cli.scan.parts", parts=", ".join(domains[slot["domain"]] for slot in layout["slots"]))
+            if layout.get("minimum_slots"):
+                yield ctx.t("cli.scan.volume_count", minimum=layout["minimum_slots"], maximum=len(layout["slots"]))
+        yield ctx.t("cli.scan.constraints")
+    elif "all_parts" in item:
+        others = [os.path.basename(path) for path in item["all_parts"] if path != item["main_path"]]
+        if others:
+            yield ctx.t("cli.scan.parts", parts=", ".join(others))
+    if "volume_completeness" in item:
+        yield ctx.t("cli.scan.volumes", state=ctx.t("cli.scan.volumes." + item["volume_completeness"]))
+    if "password_used" in item:
+        password = item["password_used"]
+        yield ctx.t("cli.scan.password", password=ctx.t("cli.scan.password_unknown") if password is None else repr(password) if password == "" else password)
+    if item.get("error"):
+        yield ctx.t("cli.scan.error", error=item["error"])
+    if item.get("discovery_source"):
+        yield ctx.t("cli.scan.source", source=item["discovery_source"])
+    if item.get("damage_flags"):
+        yield ctx.t("cli.scan.damage", flags=", ".join(item["damage_flags"]))
+
+
+def _source_name(source):
+    name = os.path.basename(source["path"])
+    if source.get("start") or source.get("end") is not None:
+        end = source.get("end")
+        name += f"[{source.get('start', 0)}, {end if end is not None else '?'})"
+    return name

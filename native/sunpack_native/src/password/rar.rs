@@ -1275,32 +1275,22 @@ pub(crate) fn resolve_embedded_rar_boundaries(
     archive_path: String,
     offsets: Vec<u64>,
     passwords: Vec<String>,
-) -> PyResult<Py<PyDict>> {
-    let outcome = py.detach(
-        move || -> io::Result<(String, Vec<(u64, u64, String)>, Option<u64>)> {
-            let reader = ManagedReader::open(&archive_path)?;
-            let mut resolved = Vec::with_capacity(offsets.len());
-            if offsets.is_empty() {
-                return Ok(("ok".to_string(), resolved, None));
-            }
-            if passwords.is_empty() {
-                return Ok((
-                    "password_required".to_string(),
-                    resolved,
-                    offsets.first().copied(),
-                ));
-            }
-
-            for offset in offsets {
-                let mut matched_incomplete = false;
-                let mut exact = None;
+) -> PyResult<Py<PyList>> {
+    // One reader and one pass over each logical input. A failed segment must
+    // not discard earlier facts or classify the unvisited remainder.
+    let outcomes = py.detach(move || -> io::Result<_> {
+        let reader = ManagedReader::open(&archive_path)?;
+        let mut outcomes = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            let outcome = (|| -> io::Result<_> {
+                if passwords.is_empty() {
+                    return Ok(("password_required", None, None));
+                }
                 for password in &passwords {
                     let Some(proof) = probe_header_encrypted_terminal(
                         &reader,
                         offset,
                         password,
-                        // Every encrypted header consumes at least an IV/salt
-                        // and a cipher block; bound by input, never a quota.
                         usize::try_from(reader.len().saturating_sub(offset) / 8)
                             .unwrap_or(usize::MAX),
                     )?
@@ -1311,41 +1301,39 @@ pub(crate) fn resolve_embedded_rar_boundaries(
                         continue;
                     }
                     if proof.end_block_found {
-                        if let Some(end_offset) = proof.end_offset.filter(|end| *end > offset) {
-                            exact = Some((end_offset, password.clone()));
-                            break;
+                        if let Some(end) = proof.end_offset.filter(|end| *end > offset) {
+                            return Ok(("ok", Some(end), Some(password.clone())));
                         }
                     }
-                    matched_incomplete = true;
-                    break;
+                    return Ok(("truncated", None, Some(password.clone())));
                 }
-                if let Some((end_offset, password)) = exact {
-                    resolved.push((offset, end_offset, password));
-                    continue;
-                }
-                if matched_incomplete {
-                    return Ok(("truncated".to_string(), resolved, Some(offset)));
-                }
-                return Ok(("wrong_password".to_string(), resolved, Some(offset)));
+                Ok(("wrong_password", None, None))
+            })();
+            match outcome {
+                Ok((status, end, password)) => outcomes.push((offset, status, end, password, None)),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                Err(error) => outcomes.push((offset, "error", None, None, Some(error.to_string()))),
             }
-            Ok(("ok".to_string(), resolved, None))
-        },
-    )?;
-
-    let (status, resolved, failed_offset) = outcome;
-    let result = PyDict::new(py);
-    result.set_item("status", status)?;
-    result.set_item("failed_offset", failed_offset)?;
+        }
+        Ok(outcomes)
+    })?;
     let rows = PyList::empty(py);
-    for (offset, end_offset, password) in resolved {
+    for (offset, status, end, password, error) in outcomes {
         let row = PyDict::new(py);
         row.set_item("offset", offset)?;
-        row.set_item("end_offset", end_offset)?;
-        row.set_item("password", password)?;
+        row.set_item("status", status)?;
+        if let Some(end) = end {
+            row.set_item("end_offset", end)?;
+        }
+        if let Some(password) = password {
+            row.set_item("password", password)?;
+        }
+        if let Some(error) = error {
+            row.set_item("error", error)?;
+        }
         rows.append(row)?;
     }
-    result.set_item("resolved", rows)?;
-    Ok(result.unbind())
+    Ok(rows.unbind())
 }
 
 fn probe_rar5_encrypted_terminal(

@@ -41,7 +41,7 @@ python sunpack.py config show
 
 CLI 的 `--recur`、`--cleanup` 和 `--out-dir` 等参数可为单次命令指定解压行为，详见 [CLI 参数说明](cli_parameters.md)。
 
-目录发现默认只扫描当前层；`scan`、`inspect`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。从低于 1.4.0 的已安装版本升级会重置托管运行数据，并转换旧扫描过滤字段。请先阅读[升级警告](../upgrade-v1.4.md)并备份数据。
+目录发现默认只扫描当前层；`scan`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。从低于 1.4.0 的已安装版本升级会重置托管运行数据，并转换旧扫描过滤字段。请先阅读[升级警告](../upgrade-v1.4.md)并备份数据。
 
 ## 部分成功与结果校验
 
