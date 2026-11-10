@@ -88,6 +88,35 @@ def test_flatten_exception_is_a_postprocess_warning(tmp_path, monkeypatch):
     assert runtime.context.cleanup_results[0].mode == "flatten"
 
 
+def test_reporter_flatten_only_visits_affected_output_rows(tmp_path, monkeypatch):
+    from tests.helpers.archive_tasks import make_archive_task
+
+    stream = io.StringIO()
+    reporter = RunReporter(stdout=stream, verbose=True)
+    root = tmp_path / "output"
+    leaf = root / "wrapper"
+    other = tmp_path / "unrelated"
+    tasks = [make_archive_task(tmp_path / f"{name}.zip") for name in ("outer", "peer")]
+    reporter.tasks_discovered(1, tasks)
+    for task, path in zip(tasks, (leaf, other)):
+        reporter.task_finished(task, SimpleNamespace(outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
+                               result=SimpleNamespace(out_dir=str(path))), 1)
+    relocate = DirectoryFlattenResult.relocate
+    visited = []
+
+    def record(result, path):
+        visited.append(path)
+        return relocate(result, path)
+
+    monkeypatch.setattr(DirectoryFlattenResult, "relocate", record)
+    reporter.relocate_outputs(DirectoryFlattenResult(str(root), str(root), str(leaf), moved=1))
+    assert visited and set(visited) == {str(leaf)}
+    for task in tasks:
+        reporter.scope_finished(task)
+    assert " -> " + str(root) in stream.getvalue().splitlines()[2]
+    assert not reporter._output_rows
+
+
 def test_flatten_projection_handles_removed_wrappers_and_other_drives():
     result = DirectoryFlattenResult("C:/output", "C:/output", "C:/output/outer/inner", moved=1)
     assert result.relocate("C:/output/outer") == "C:/output"

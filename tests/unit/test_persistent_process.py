@@ -284,7 +284,7 @@ def test_submit_request_strips_server_side_pause(tmp_path, monkeypatch):
     monkeypatch.setattr(persistent_process.sys, "stdout", io.StringIO())
     monkeypatch.setattr(persistent_process.sys.stdin, "isatty", lambda: False)
     monkeypatch.setattr(persistent_process, "_client_supports_terminal_updates", lambda _stream: True)
-    monkeypatch.setattr(persistent_process, "_client_terminal_columns", lambda _stream: 93)
+    persistent_process.sys.stdout.terminal_size = os.terminal_size((93, 7))
 
     assert persistent_process.submit_request(["extract", "sample.zip", "--pause"]) == 0
     assert "--pause" not in captured["argv"]
@@ -292,7 +292,7 @@ def test_submit_request_strips_server_side_pause(tmp_path, monkeypatch):
     assert captured["cwd"] == request_cwd
     assert captured["client_cwd"] == request_cwd
     assert captured["stdout_tty"] is True
-    assert captured["stdout_columns"] == 93
+    assert captured["terminal_size"] == (93, 7)
     assert os.getcwd() == request_cwd
     assert persistent_process.sys.stdout.getvalue() == "done\n"
 
@@ -382,11 +382,11 @@ def test_connection_stream_preserves_client_tty_capability():
     async def scenario():
         queue = persistent_process._ConnectionOutputQueue()
         stream = persistent_process._AsyncConnectionTextStream(
-            asyncio.get_running_loop(), queue, 1, is_tty=True, terminal_columns=93
+            asyncio.get_running_loop(), queue, 1, is_tty=True, terminal_size=os.terminal_size((93, 7))
         )
         assert stream.isatty()
         assert stream.supports_terminal_updates
-        assert stream.terminal_columns == 93
+        assert stream.terminal_size == (93, 7)
         assert stream.write("progress") == 8
         await asyncio.sleep(0)
         frame = await queue.get()
@@ -472,7 +472,7 @@ def test_progress_never_waits_for_a_reporter_parked_on_output():
         held = asyncio.Event()
         release = threading.Event()
         reporter = RunReporter(stdout=io.StringIO())
-        task = SimpleNamespace(key="archive.bin", main_path="archive.bin", logical_name="archive.bin")
+        task = SimpleNamespace(key="archive.bin", main_path="archive.bin", logical_name="archive.bin", runtime={})
         reporter.tasks_discovered(1, [task])
         loop = asyncio.get_running_loop()
 
@@ -492,12 +492,12 @@ def test_progress_never_waits_for_a_reporter_parked_on_output():
     asyncio.run(scenario())
 
 
-def test_streaming_request_strips_terminal_columns_metadata(monkeypatch):
+def test_streaming_request_strips_terminal_size_metadata(monkeypatch):
     from sunpack.runtime.cli import cli
 
     async def fake_main(argv, **context):
         assert argv == ["extract", "sample.zip"]
-        assert context["stdout"].terminal_columns == 79
+        assert context["stdout"].terminal_size == (79, 6)
         return 0
 
     monkeypatch.setattr(cli, "async_main", fake_main)
@@ -505,7 +505,7 @@ def test_streaming_request_strips_terminal_columns_metadata(monkeypatch):
     async def scenario():
         return await _execute_request(
             {
-                "argv": ["extract", "sample.zip", "--_sunpack-terminal-columns=79"],
+                "argv": ["extract", "sample.zip", "--_sunpack-terminal-size=79x6"],
                 "stdout_tty": True,
             },
             _PipeTransport(),

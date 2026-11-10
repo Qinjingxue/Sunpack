@@ -27,26 +27,20 @@ def scan_items(task, result, i18n):
         elif (facts.get("encrypted") is True or descriptor.analysis.get("password_required") is True
               or failure and failure.kind in {FailureKind.PASSWORD_REQUIRED, FailureKind.WRONG_PASSWORD}):
             item["password_used"] = None
+        completeness = "missing" if failure and failure.is_confirmed_missing_volume else node.volume_completeness
         plan = descriptor.volume_attempts
         if plan is not None:
             # Domains are shared, not copied per slot or expanded into products.
             item["volume_attempts"] = plan.to_dict()
-            item["volume_completeness"] = "pending"
+            item["volume_completeness"] = "missing" if completeness == "missing" else "pending"
         else:
             parts = descriptor.part_paths()
-            if len(parts) > 1 or descriptor.volume_style or descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}:
+            if (completeness == "missing" or len(parts) > 1 or descriptor.volume_style
+                    or descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}):
                 item["all_parts"] = parts
-                completeness = descriptor.analysis.get("volume_completeness")
-                if completeness == "complete":
+                if completeness in {"complete", "missing"}:
                     item["volume_completeness"] = completeness
         if failure is not None:
-            details = failure.details
-            if (details.get("missing_volume_confirmed") is True
-                    or details.get("reason") == "missing_volume"
-                    or facts.get("missing_volume_evidence") in {"structured_volume_gap", "open_volume_file_missing"}):
-                if "all_parts" not in item:
-                    item["all_parts"] = descriptor.part_paths()
-                item["volume_completeness"] = "missing"
             item["error"] = (i18n.t(failure.message_key, **failure.message_params)
                              if failure.message_key else failure.message)
         if task.discovery_source:

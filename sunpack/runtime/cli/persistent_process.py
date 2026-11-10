@@ -62,7 +62,7 @@ def _runtime_binary_stamp() -> str:
 
 _RUNTIME_BINARY_STAMP = _runtime_binary_stamp()
 _MAX_FIELD_BYTES = 16 * 1024 * 1024
-_TERMINAL_COLUMNS_ARG = "--_sunpack-terminal-columns="
+_TERMINAL_SIZE_ARG = "--_sunpack-terminal-size="
 _PIPE_PREFIX = r"\\.\pipe\SunPack-"
 
 
@@ -131,12 +131,14 @@ def submit_request(argv: list[str], *, shutdown: bool = False) -> int:
         if "--no-pause" not in request_argv:
             request_argv.append("--no-pause")
     supports_terminal_updates = _client_supports_terminal_updates(sys.stdout)
+    from sunpack.pipeline.coordinator.reporting import _terminal_size
+
     payload = {
         "argv": request_argv,
         "cwd": request_cwd,
         "shutdown": bool(shutdown),
         "stdout_tty": supports_terminal_updates,
-        "stdout_columns": _client_terminal_columns(sys.stdout) if supports_terminal_updates else 0,
+        "terminal_size": _terminal_size(sys.stdout) if supports_terminal_updates else None,
         "stdin_tty": bool(sys.stdin is not None and sys.stdin.isatty()),
     }
     response = _send_or_start(payload)
@@ -160,14 +162,6 @@ def _client_supports_terminal_updates(stream) -> bool:
     from sunpack.pipeline.coordinator.reporting import _terminal_supports_updates
 
     return _terminal_supports_updates(stream)
-
-
-def _client_terminal_columns(stream) -> int:
-    try:
-        columns = int(os.get_terminal_size(stream.fileno()).columns)
-    except (AttributeError, OSError, TypeError, ValueError):
-        return 80
-    return max(20, min(1000, columns))
 
 
 def _send_or_start(payload: dict[str, Any]) -> dict[str, Any]:
@@ -372,12 +366,8 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
     try:
         cwd = str(payload.get("cwd") or "").encode("utf-8", "surrogatepass")
         argv_values = [str(item) for item in payload.get("argv") or []]
-        try:
-            stdout_columns = int(payload.get("stdout_columns") or 0)
-        except (TypeError, ValueError):
-            stdout_columns = 0
-        if stdout_columns > 0:
-            argv_values.append(f"{_TERMINAL_COLUMNS_ARG}{max(20, min(1000, stdout_columns))}")
+        if size := payload.get("terminal_size"):
+            argv_values.append(f"{_TERMINAL_SIZE_ARG}{size.columns}x{size.lines}")
         if len(cwd) > _MAX_FIELD_BYTES or any(len(item.encode("utf-8", "surrogatepass")) > _MAX_FIELD_BYTES for item in argv_values):
             return None
         flags = ((1 if payload.get("shutdown") else 0)
@@ -1051,7 +1041,7 @@ class _AsyncConnectionTextStream:
         kind: int,
         *,
         is_tty: bool = False,
-        terminal_columns: int | None = None,
+        terminal_size: os.terminal_size | None = None,
     ):
         self.loop = loop
         self._loop_thread_id = threading.get_ident()
@@ -1059,7 +1049,7 @@ class _AsyncConnectionTextStream:
         self.kind = kind
         self._is_tty = is_tty
         self.supports_terminal_updates = is_tty
-        self.terminal_columns = terminal_columns
+        self.terminal_size = terminal_size or os.terminal_size((80, 25))
 
     def write(self, text: str) -> int:
         value = str(text)
@@ -1106,14 +1096,16 @@ async def _execute_streaming_request_async(
     loop = asyncio.get_running_loop()
 
     argv = []
-    terminal_columns = None
+    terminal_size = None
     for item in payload.get("argv") or []:
         value = str(item)
-        if value.startswith(_TERMINAL_COLUMNS_ARG):
+        if value.startswith(_TERMINAL_SIZE_ARG):
             try:
-                terminal_columns = max(20, min(1000, int(value[len(_TERMINAL_COLUMNS_ARG):])))
+                columns, lines = map(int, value[len(_TERMINAL_SIZE_ARG):].split("x"))
+                if 0 < columns <= 32767 and 0 < lines <= 32767:
+                    terminal_size = os.terminal_size((columns, lines))
             except ValueError:
-                terminal_columns = None
+                pass
             continue
         argv.append(value)
 
@@ -1132,7 +1124,7 @@ async def _execute_streaming_request_async(
         connection.output_queue,
         1,
         is_tty=bool(payload.get("stdout_tty")),
-        terminal_columns=terminal_columns,
+        terminal_size=terminal_size,
     )
     stderr = _AsyncConnectionTextStream(loop, connection.output_queue, 2, is_tty=False)
     try:

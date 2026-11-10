@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from sunpack.core.i18n import I18nContext
 
 class FailureKind(str, Enum):
     INVALID_INPUT = "invalid_input"
@@ -49,6 +50,14 @@ class FailureInfo:
                 or self.kind == FailureKind.PASSWORD_INCONCLUSIVE and self.user_action == "request_password"
                 or any(cause.is_password_failure for cause in self.causes))
 
+    @property
+    def is_confirmed_missing_volume(self) -> bool:
+        confirmed = self.details.get("missing_volume_confirmed")
+        return (confirmed is True
+                or (confirmed is None and self.kind == FailureKind.MISSING_VOLUME
+                    and self.details.get("reason") not in {"ambiguous_volume_mapping", "structural_conflict"})
+                or any(cause.is_confirmed_missing_volume for cause in self.causes))
+
     def contains(self, *kinds: FailureKind) -> bool:
         expected = set(kinds)
         return self.kind in expected or any(cause.contains(*kinds) for cause in self.causes)
@@ -88,3 +97,36 @@ class FailureInfo:
             causes=causes,
             details=dict(payload.get("details") or {}),
         )
+
+
+def aggregate_input_failures(
+    failures: list[FailureInfo], *, segment_count: int, i18n: I18nContext,
+) -> FailureInfo:
+    details = {"segment_count": segment_count, "failed_segment_count": len(failures)}
+    if len(failures) == 1 and segment_count == 1:
+        child = failures[0]
+        return FailureInfo(
+            kind=FailureKind.INPUTS_FAILED,
+            stage="inputs",
+            message=i18n.t(child.message_key, **child.message_params) if child.message_key else child.message,
+            message_key=child.message_key,
+            message_params=dict(child.message_params),
+            user_action=child.user_action,
+            causes=(child,),
+            details=details,
+        )
+    if all(failure.kind == FailureKind.WRONG_PASSWORD for failure in failures):
+        key = "failure.embedded_wrong_password"
+    elif all(failure.kind == FailureKind.PASSWORD_REQUIRED for failure in failures):
+        key = "failure.password_required"
+    else:
+        key = "failure.embedded_extract_failed"
+    return FailureInfo(
+        kind=FailureKind.INPUTS_FAILED,
+        stage="inputs",
+        message=i18n.t(key),
+        message_key=key,
+        user_action="request_password" if any(failure.is_password_failure for failure in failures) else "",
+        causes=tuple(failures),
+        details=details,
+    )

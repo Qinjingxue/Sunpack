@@ -1,4 +1,5 @@
 import io
+import os
 import re
 from types import SimpleNamespace
 
@@ -12,7 +13,7 @@ from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure
 
 
 def _task(path):
-    return SimpleNamespace(key=str(path), main_path=str(path), logical_name=path.stem)
+    return SimpleNamespace(key=str(path), main_path=str(path), logical_name=path.stem, runtime={})
 
 
 def _outcome(out_dir, *, success=True, partial=False, error=""):
@@ -98,6 +99,16 @@ def test_forwarded_terminal_capability_does_not_require_server_console():
     assert reporting._terminal_supports_updates(stream)
 
 
+def test_quiet_still_explains_blocked_disk_once(tmp_path):
+    out, err = io.StringIO(), io.StringIO()
+    reporter = RunReporter(quiet=True, stdout=out, stderr=err)
+    task = _task(tmp_path / "sample.7z")
+    for name in ("space_blocked", "space_status", "space_status"):
+        reporter.task_progress(task, {"event": name, "episode_id": 1})
+    assert not out.getvalue()
+    assert err.getvalue().count("Free space to resume automatically") == 1
+
+
 @pytest.mark.parametrize("language", ["zh", "en"])
 @pytest.mark.parametrize("interactive", [True, False])
 @pytest.mark.parametrize("blocked_first", ["memory", "space"])
@@ -106,9 +117,10 @@ def test_resource_waits_overlap_and_clear(tmp_path, monkeypatch, language, inter
     # Single-resource tests miss ordering-dependent labels, premature recovery,
     # and diagnostics left behind after recovery. Exercise both output modes.
     stream = io.StringIO()
-    stream.terminal_columns = 200
+    stream.terminal_size = os.terminal_size((200, 25))
+    errors = io.StringIO()
     monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: interactive)
-    reporter = RunReporter(language, stdout=stream, verbose=True)
+    reporter = RunReporter(language, stdout=stream, stderr=errors, verbose=True)
     task = _task(tmp_path / "sample.7z")
     reporter.tasks_discovered(1, [task])
     reporter.task_progress(task, {"type": "progress", "completed_bytes": 25, "total_bytes": 100})
@@ -118,10 +130,13 @@ def test_resource_waits_overlap_and_clear(tmp_path, monkeypatch, language, inter
             "volume_key": "C:", "episode_id": 1, "job_id": "job", **extra})
 
     def latest():
-        return reporter._format_task_row(reporter._task_rows[task.key])
+        return reporter._format_task_row(reporter._task_rows[reporter._row_key(task)])
 
     send(blocked_first, "blocked")
     send("space" if blocked_first == "memory" else "memory", "blocked")
+    if not interactive:
+        hint = reporter.i18n.t("report.status.disk_resume_hint")
+        assert hint in errors.getvalue() and not stream.getvalue()
     combined = reporter.i18n.t("report.status.resources_paused")
     assert combined in latest()
     assert not interactive or combined in stream.getvalue()
@@ -145,6 +160,10 @@ def test_resource_waits_overlap_and_clear(tmp_path, monkeypatch, language, inter
     assert label not in restored and unavailable not in restored
     assert "25%" in restored
     assert not interactive or reporter.i18n.t("report.status.extracting") in stream.getvalue().splitlines()[-1]
+    if not interactive:
+        assert errors.getvalue().count(hint) == 1
+        reporter.task_progress(task, {"event": "space_blocked", "episode_id": 2})
+        assert errors.getvalue().count(hint) == 2
 
 
 @pytest.mark.parametrize("interactive", [True, False])
@@ -164,7 +183,7 @@ def test_resource_recovery_survives_report_lock_and_output_backpressure(tmp_path
         release = threading.Event()
 
         class Output(io.StringIO):
-            terminal_columns = 200
+            terminal_size = os.terminal_size((200, 25))
             parked = False
 
             def write(self, text):
@@ -187,7 +206,7 @@ def test_resource_recovery_survives_report_lock_and_output_backpressure(tmp_path
         send("memory", "blocked")
         send("space", "blocked")
         await reporter.drain_progress()
-        assert "等待内存/磁盘" in reporter._format_task_row(reporter._task_rows[task.key])
+        assert "等待内存/磁盘" in reporter._format_task_row(reporter._task_rows[reporter._row_key(task)])
         output.parked = True
 
         def parked_report():
@@ -225,12 +244,12 @@ def test_resource_recovery_survives_report_lock_and_output_backpressure(tmp_path
             finally:
                 await broker.close()
         if finish_while_pending:
-            assert reporter._task_rows[task.key]["state"] == "complete"
-            reporter.scope_finished(task, 1)
+            assert reporter._task_rows[reporter._row_key(task)]["state"] == "complete"
+            reporter.scope_finished(task)
             assert not reporter._task_rows
             assert "完成" in output.getvalue()
         else:
-            row = reporter._task_rows[task.key]
+            row = reporter._task_rows[reporter._row_key(task)]
             assert row["state"] == "extracting"
             assert not row["space_blocked"] and not row["memory_blocked"]
             assert not interactive or "正在解压" in output.getvalue().splitlines()[-1]

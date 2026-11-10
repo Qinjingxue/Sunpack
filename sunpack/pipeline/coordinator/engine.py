@@ -1695,7 +1695,7 @@ class _RequestRuntime:
                 )
             with self.context.lock:
                 self._active_task_keys.discard(task_key)
-            await broker.run("report", task_key, self.reporter.scope_finished, task, depth,
+            await broker.run("report", task_key, self.reporter.scope_finished, task,
                              request_id=self.submission.request_id)
 
     def _nested_scan_work(self, output_dir: str, extraction_result):

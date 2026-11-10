@@ -210,8 +210,7 @@ class ArchiveJobExecutor:
         file_id = task.key or task.main_path
 
         def preflight():
-            if not retried_missing_volume:
-                self._report_task_started(task)
+            self._report_task_started(task, replanned=retried_missing_volume)
             if task.discovery_failure is not None:
                 failure = task.discovery_failure
                 if failure.message_key:
@@ -241,6 +240,7 @@ class ArchiveJobExecutor:
                 and callable(missing_volume_retry)
                 and not retried_missing_volume
                 and terminal.result.failure is not None
+                and len(task.inputs) == 1
                 and terminal.result.failure.contains(FailureKind.MISSING_VOLUME)
             ):
                 break
@@ -330,9 +330,12 @@ class ArchiveJobExecutor:
         if task.runtime.get("retry_output_dir"):
             task.runtime["retry_created_outputs"] = []
 
-    def _report_task_started(self, task: ArchiveTask) -> None:
+    def _report_task_started(self, task: ArchiveTask, *, replanned: bool = False) -> None:
         if self.progress_reporter is not None:
-            self.progress_reporter.task_started(task)
+            if replanned:
+                self.progress_reporter.task_replanned(task)
+            else:
+                self.progress_reporter.task_started(task)
 
     def _report_task_finished(self, task: ArchiveTask, outcome: ArchiveJobOutcome, depth: int) -> None:
         if self.progress_reporter is not None:
@@ -380,6 +383,7 @@ class ArchiveJobExecutor:
                             planned_output_dir=out_dir,
                         )
                         task.adopt_detection_plan(replacement)
+                        self._report_task_started(task, replanned=True)
                         self.password_scope_context.annotate([task])
                         continue
                 return current_outcome

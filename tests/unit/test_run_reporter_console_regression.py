@@ -37,7 +37,7 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
     for interactive in (False, True):
         monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: interactive)
         stream = io.StringIO()
-        stream.terminal_columns = 68
+        stream.terminal_size = os.terminal_size((68, 5))
         reporter = RunReporter("zh", stdout=stream)
         nodes = tuple(LogicalArchiveInput(ArchiveInputDescriptor(
             str(tmp_path / "carrier.bin"), open_mode="file_range", format_hint="zip",
@@ -50,8 +50,10 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.task_started(other)
         for node in nodes:
             child = ArchiveTask.from_archive_input(node.descriptor, discovery_source="embedded", logical_inputs=(node,))
+            child.key = node.input_id
+            child.runtime = dict(outer.runtime)
             reporter.task_progress(child, {"type": "progress", "completed_bytes": node.position, "total_bytes": 10})
-            assert reporter._task_rows[node.input_id]["progress"] == node.position / 10
+            assert reporter._task_rows[reporter._row_key(child)]["progress"] == node.position / 10
             reporter.task_progress(child, {"type": "semantic", "event": "input_finished", "success": True,
                                            "out_dir": str(tmp_path / "out" / str(node.position))})
         reporter.task_finished(outer, _success(tmp_path / "out"), 1)
@@ -64,31 +66,31 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         gc.collect()
         assert ref() is None
         if interactive:
-            assert reporter._rendered_lines <= 28
+            assert reporter._rendered_lines < stream.terminal_size.lines
             for line in stream.getvalue().splitlines():
                 plain = re.sub(r"\033\[[0-9;]*[A-Za-z]", "", line).replace("\r", "")
-                assert reporting._display_width(plain) < stream.terminal_columns
+                assert reporting._display_width(plain) < stream.terminal_size.columns
         else:
             assert stream.getvalue() == ""
         stream.seek(0); stream.truncate(0)
         reporter.pause_panel()
         paused = stream.getvalue()
-        reporter.scope_finished(outer, 1)
-        assert stream.getvalue() == paused and outer.key in reporter._task_rows
+        reporter.scope_finished(outer)
+        assert stream.getvalue() == paused and reporter._row_key(outer) in reporter._task_rows
         reporter.resume_panel()
         text = stream.getvalue()
         assert text.index("段 1") < text.index("段 2") < text.index("nested.zip")
         assert "   └─ nested.zip" in text.splitlines()
+        assert text.count("[完成] 100%") == 3
         assert "│" in text and "└─" in text
-        assert nodes[0].input_id not in reporter._input_rows
-        assert outer.key not in reporter._task_rows
+        assert reporter._row_key(outer) not in reporter._task_rows
         if not interactive:
             assert "other.zip" not in text and "\033[" not in text
         reporter.task_finished(other, _success(tmp_path / "other"), 1)
         reporter.task_progress(other, {"event": "memory_blocked"})
-        assert reporter._task_rows[other.key]["state"] == "complete"
-        reporter.scope_finished(other, 1)
-        assert not reporter._task_rows and not reporter._input_rows and not reporter._output_rows
+        assert reporter._task_rows[reporter._row_key(other)]["state"] == "complete"
+        reporter.scope_finished(other)
+        assert not reporter._task_rows and not reporter._output_rows
 
         from dataclasses import replace
         from sunpack.core.contracts.failures import FailureInfo, FailureKind
@@ -103,9 +105,19 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.task_finished(blocked, SimpleNamespace(outcome_kind=OutcomeKind.FAILURE,
                                result=SimpleNamespace(error="blocked", out_dir="")), 1)
         stream.seek(0); stream.truncate(0)
-        reporter.scope_finished(blocked, 1)
+        reporter.scope_finished(blocked)
         assert "segment 1 damaged" in stream.getvalue() and "segment 2 damaged" in stream.getvalue()
         assert not reporter._task_rows
+
+        reporter.tasks_discovered(1, [outer])
+        reporter.task_started(outer)
+        reporter.task_finished(outer, SimpleNamespace(outcome_kind=OutcomeKind.FAILURE,
+                               result=SimpleNamespace(error="access denied", out_dir="")), 1)
+        stream.seek(0); stream.truncate(0)
+        reporter.scope_finished(outer)
+        assert "access denied" in stream.getvalue()
+        assert stream.getvalue().count("[跳过]") == 2
+        assert "等待队列" not in stream.getvalue()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows console handles")

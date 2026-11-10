@@ -76,7 +76,7 @@ namespace sunpack::sevenzip
             bool encrypted = false;
         };
 
-        BoundedPasswordProbeSelection bounded_password_probe_selection(IInArchive *archive)
+        BoundedPasswordProbeSelection bounded_password_probe_selection(IInArchive *archive, bool authenticates_empty_item)
         {
             BoundedPasswordProbeSelection selection;
             if (!archive)
@@ -111,8 +111,9 @@ namespace sunpack::sevenzip
                 const UInt64 size = prop_u64(value);
                 clear_prop(value);
                 // An empty ZipCrypto item proves only the weak header byte.
-                // Missing size metadata must not be mistaken for an empty file.
-                if (size_known && size == 0) continue;
+                // ENC test mode reports the password proof from Open even when
+                // damaged recovery framing prevents reporting a payload size.
+                if (size_known && size == 0 && !authenticates_empty_item) continue;
                 remember(regular, {index, size});
                 if (is_encrypted)
                 {
@@ -352,7 +353,7 @@ namespace sunpack::sevenzip
             any_opened = true;
             result.archive_type = canonical_archive_type_for_guid(format);
             result.is_archive = true;
-            auto selection = bounded_password_probe_selection(archive);
+            auto selection = bounded_password_probe_selection(archive, result.archive_type == L"enc");
             if (selection.item_count_known && rar4_rejected_empty_encrypted_headers(
                     archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
             {

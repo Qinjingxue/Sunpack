@@ -45,7 +45,7 @@ class LogicalArchiveInput:
     def volume_completeness(self) -> str:
         """Only publish analysis/execution facts; unknown is not completeness."""
         execution = self.descriptor.analysis.get("execution") or {}
-        if execution.get("missing_volume_evidence") or (self.failure and self.failure.contains(FailureKind.MISSING_VOLUME)):
+        if execution.get("missing_volume_evidence") or (self.failure and self.failure.is_confirmed_missing_volume):
             return "missing"
         return str(self.descriptor.analysis.get("volume_completeness") or "unknown")
 

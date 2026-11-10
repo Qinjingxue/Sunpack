@@ -156,6 +156,7 @@ def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retr
 
     reporter = SimpleNamespace(
         task_started=lambda task: events.append((task.key, "started", None)),
+        task_replanned=lambda task: events.append((task.key, "replanned", None)),
         task_finished=lambda task, outcome, depth: events.append((task.key, "finished", depth)),
     )
 
@@ -189,9 +190,10 @@ def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retr
 
     asyncio.run(scenario())
     for index, task in enumerate(tasks):
-        assert [event[1:] for event in events if event[0] == task.key] == [
-            ("started", None), ("finished", index + 1),
-        ]
+        expected = [("started", None)]
+        if task is tasks[2]:
+            expected.append(("replanned", None))
+        assert [event[1:] for event in events if event[0] == task.key] == [*expected, ("finished", index + 1)]
     assert retries == [tasks[2].key]
     assert set(inspected) == {tasks[2].key, tasks[3].key}
 

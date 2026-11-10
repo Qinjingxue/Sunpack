@@ -23,6 +23,7 @@ namespace {
 constexpr char kRequestMagic[] = "SPK2";
 constexpr char kStreamMagic[] = "SPS2";
 constexpr char kRuntimeIdentityArgumentPrefix[] = "--_sunpack-runtime-id=";
+constexpr char kTerminalSizeArgumentPrefix[] = "--_sunpack-terminal-size=";
 constexpr std::size_t kMaxFieldBytes = 16u * 1024u * 1024u;
 
 std::wstring current_executable_path() {
@@ -485,27 +486,36 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     std::string wire(kRequestMagic, 4);
     wire.append(runtime_build_id);
     wire.append(reinterpret_cast<const char*>(token.data()), token.size());
+    const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD console_mode = 0;
-    const bool stdout_tty = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &console_mode) != 0;
+    const bool stdout_tty = GetConsoleMode(output, &console_mode) &&
+        ((console_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) ||
+         SetConsoleMode(output, console_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING));
+    std::string terminal_size;
+    CONSOLE_SCREEN_BUFFER_INFO screen{};
+    if (stdout_tty && GetConsoleScreenBufferInfo(output, &screen)) {
+        terminal_size = kTerminalSizeArgumentPrefix +
+            std::to_string(screen.srWindow.Right - screen.srWindow.Left + 1) + "x" +
+            std::to_string(screen.srWindow.Bottom - screen.srWindow.Top + 1);
+    }
     DWORD input_mode = 0;
     const bool stdin_tty = GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode) != 0;
     append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u));
     append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
-    append_u32(wire, static_cast<std::uint32_t>(arguments.size()));
+    append_u32(wire, static_cast<std::uint32_t>(arguments.size() + !terminal_size.empty()));
     if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, cwd.data(), cwd.size())) {
         return RequestOutcome::NotDelivered;
     }
-    for (const auto& argument : arguments) {
-        const std::string encoded = utf8(argument);
-        if (encoded.size() > kMaxFieldBytes) {
-            return RequestOutcome::NotDelivered;
-        }
+    auto send_argument = [&](const std::string& encoded) {
+        if (encoded.size() > kMaxFieldBytes) return false;
         wire.clear();
         append_u32(wire, static_cast<std::uint32_t>(encoded.size()));
-        if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, encoded.data(), encoded.size())) {
-            return RequestOutcome::NotDelivered;
-        }
+        return write_all(pipe, wire.data(), wire.size()) && write_all(pipe, encoded.data(), encoded.size());
+    };
+    for (const auto& argument : arguments) {
+        if (!send_argument(utf8(argument))) return RequestOutcome::NotDelivered;
     }
+    if (!terminal_size.empty() && !send_argument(terminal_size)) return RequestOutcome::NotDelivered;
     std::array<char, 4> magic{};
     if (!read_all(pipe, magic.data(), magic.size()) || memcmp(magic.data(), kStreamMagic, 4) != 0) {
         return RequestOutcome::DeliveryUncertain;

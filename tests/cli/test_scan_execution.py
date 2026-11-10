@@ -106,6 +106,35 @@ def test_scan_retains_volume_domains_and_never_confirms_empty_zipcrypto(tmp_path
     assert not output.exists()
 
 
+def test_scan_confirms_enc_password_with_damaged_recovery_framing(tmp_path, monkeypatch):
+    from sunpack.pipeline.extraction.internal.sevenzip import sevenzip_runner
+    from tests.helpers.native_build import sevenzip_artifact
+    from tests.unit.test_enc_support import DATA
+
+    source = tmp_path / "damaged.blob"
+    content = bytearray((DATA / "recovery.enc").read_bytes())
+    content[-120] ^= 1  # Same recovery trailer mutation as the Rust decoder test.
+    source.write_bytes(content)
+    output = tmp_path / "must-not-exist"
+    monkeypatch.setattr(sevenzip_runner, "get_sevenzip_bridge_worker_path",
+                        lambda: str(sevenzip_artifact("sunpack_sevenzip_worker.exe")))
+    monkeypatch.setattr(extract, "load_request_config",
+                        lambda _cwd: make_config({"output": {"root": str(output)}}))
+    monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
+
+    for password, expected in (("sunpack-test", "sunpack-test"), ("wrong", None)):
+        ctx = CliContext(language="en", cwd=str(tmp_path), stdout=io.StringIO(), stderr=io.StringIO())
+        ctx.reporter = CliReporter(json_mode=True, stdout=ctx.stdout, stderr=ctx.stderr)
+        args = build_cli_parser(ctx, command="scan").parse_args(
+            ["scan", str(source), "--json", "--no-builtin-pw", "-p", password],
+        )
+        code, result = asyncio.run(scan.handle(args, ctx))
+        assert (code == 0) == (expected is not None)
+        [item] = result.items
+        assert item["format"] == "enc" and item["password_used"] == expected
+    assert not output.exists() and source.read_bytes() == content
+
+
 def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
     # Real happy-path archives miss distinct blocked segments, different source
     # files within one task, and verbose/JSON/quiet projection combinations.
@@ -119,23 +148,37 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
     from sunpack.core.i18n import I18nContext
     from sunpack.pipeline.coordinator.scan_projection import scan_items
 
-    missing = FailureInfo(FailureKind.MISSING_VOLUME, "embedded", "missing segment volume",
-                          details={"missing_volume_confirmed": True})
+    # Rust's password resolver can produce MISSING_VOLUME without a second
+    # "confirmed" flag. It overrides the discovery-time structural conclusion.
+    from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
+    from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
+
+    missing = SingleArchiveExtractor(None, None)._password_resolution_failure(
+        PasswordResolution(None, PasswordResolutionStatus.MISSING_VOLUME),
+    )
     password = FailureInfo(FailureKind.PASSWORD_REQUIRED, "embedded", "need password")
     nodes = tuple(LogicalArchiveInput(ArchiveInputDescriptor(
         str(tmp_path / name), format_hint="rar", open_mode="file_range",
         parts=[ArchiveInputPart(InputExtent(str(tmp_path / name), start, end))],
-    ), position=i, failure=failure) for i, (name, start, end, failure) in enumerate((
-        ("first.bin", 0, 64, missing), ("second.bin", 128, None, password)), 1))
+        analysis={"volume_completeness": "complete"} if end is not None else {},
+    ), position=i) for i, (name, start, end) in enumerate((
+        ("first.bin", 0, 64), ("second.bin", 128, None)), 1))
     task = ArchiveTask.from_archive_input(nodes[0].descriptor, discovery_source="embedded", logical_inputs=nodes)
     result = ExtractionResult(False, "", failure=missing, input_results=[
-        InputExecutionResult(node, ExtractionResult(False, "", failure=node.failure)) for node in nodes])
+        InputExecutionResult(node, ExtractionResult(False, "", failure=failure))
+        for node, failure in zip(nodes, (missing, password))])
     items = tuple(scan_items(task, result, I18nContext("en")))
     assert items[0]["main_path"].endswith("first.bin") and items[0]["offset"] == 0
     assert items[0]["volume_completeness"] == "missing" and "password_used" not in items[0]
     assert items[1]["main_path"].endswith("second.bin") and items[1]["end_offset"] is None
     assert items[1]["password_used"] is None and "all_parts" not in items[1]
     assert items[0]["error"] != items[1]["error"]
+    declared_missing = ArchiveInputDescriptor(
+        entry_path=str(tmp_path / "partial.bin"), analysis={"volume_completeness": "missing"},
+    )
+    task_with_gap = ArchiveTask.from_archive_input(declared_missing, discovery_source="relations")
+    [gap] = scan_items(task_with_gap, ExtractionResult(True, ""), I18nContext("en"))
+    assert gap["volume_completeness"] == "missing"
     for json_mode, verbose, quiet in ((True, False, False), (True, True, False), (False, False, True), (False, True, False)):
         out, err = io.StringIO(), io.StringIO()
         ctx = CliContext(language="en", reporter=CliReporter(json_mode=json_mode, quiet=quiet,
@@ -149,6 +192,26 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
             assert not out.getvalue() and "need password" in err.getvalue()
         elif not json_mode:
             assert out.getvalue().index("first.bin") < out.getvalue().index("second.bin")
+            assert "need password" in err.getvalue() and "need password" not in out.getvalue()
+
+
+def test_scan_keeps_unicode_carrier_segments_together(tmp_path):
+    from types import SimpleNamespace
+    from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+
+    carrier = str(tmp_path / "Straße.bin")
+    other = str(tmp_path / "STRASSE.bin")  # Same Python casefold, different Windows path key.
+    items = tuple(dict(main_path=path, offset=offset, end_offset=offset + 10)
+                  for path, offset in ((carrier, 10), (other, 20), (carrier, 30)))
+    summary = RunSummary(target_results=(
+        TargetRunResult(carrier, OutcomeKind.SCANNED, scan_items=items),
+    ))
+    out = io.StringIO()
+    ctx = CliContext(language="en", reporter=CliReporter(stdout=out))
+    scan.command_result(SimpleNamespace(json=False, verbose=False, deep_detect=False), ctx, [carrier], summary)
+    text = out.getvalue()
+    assert text.count(carrier) == text.count(other) == 1
+    assert "Segment 1: [10, 20)" in text and "Segment 2: [30, 40)" in text
 
 
 def test_rar_boundary_batch_preserves_later_success_and_truncated_password(tmp_path):

@@ -147,7 +147,11 @@ def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_p
     assert task.archive_input().primary_extent.end == 40
 
 
-def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path):
+def test_all_blocked_carrier_retains_damage_and_password_retry(tmp_path):
+    from sunpack.core.contracts.failures import FailureKind
+    from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+    from sunpack.core.contracts.retry_targets import password_retry_paths
+
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"x" * 128)
     scan = dict(
@@ -170,14 +174,22 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path):
         raw_hit_count=1,
         budget_exhausted=False,
     )
-    scan["candidates"] += ({**scan["candidates"][0], "offset": 64},)
+    scan["candidates"] += ({**scan["candidates"][0], "format": "rar", "offset": 64,
+                            "validation": "rar5_encryption_header_crc",
+                            "discovery_failure_reason": "embedded_password_required"},)
     result = _project_scan(_candidate(path), scan)
 
     assert len(result.tasks) == 1
-    assert result.tasks[0].discovery_failure.kind.value == "damaged"
+    task = result.tasks[0]
+    failure = task.discovery_failure
+    assert failure.contains(FailureKind.DAMAGED, FailureKind.PASSWORD_REQUIRED)
+    assert failure.is_password_failure
+    assert password_retry_paths(RunSummary(target_results=(
+        TargetRunResult(task.main_path, OutcomeKind.FAILURE, failure=failure),
+    ))) == [str(path)]
     assert result.blocked_paths
     assert [node.descriptor.primary_extent.start for node in result.tasks[0].inputs] == [16, 64]
-    assert all(node.failure.details["reason"] == "embedded_truncated" for node in result.tasks[0].inputs)
+    assert [node.failure.kind for node in task.inputs] == [FailureKind.DAMAGED, FailureKind.PASSWORD_REQUIRED]
 
 
 def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path):

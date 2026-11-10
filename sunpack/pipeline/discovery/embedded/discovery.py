@@ -23,6 +23,8 @@ from sunpack.core.contracts.discovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
+from sunpack.core.contracts.failures import aggregate_input_failures
+from sunpack.core.i18n import I18nContext
 from sunpack.core.analysis.embedded.result import (
     embedded_candidate_requires_password,
     embedded_scan_prepass,
@@ -321,8 +323,12 @@ class EmbeddedDiscovery:
             },
             logical_inputs=tuple(segments),
         )
-        if all(node.failure is not None for node in segments):
-            task.discovery_failure = segments[0].failure
+        if pending_failures:
+            failures = [node.failure for node in segments if node.failure is not None]
+            if len(failures) == len(segments):
+                task.discovery_failure = failures[0] if len(failures) == 1 else aggregate_input_failures(
+                    failures, segment_count=len(segments), i18n=I18nContext(self.config.get("cli", {}).get("language")),
+                )
         return task
 
     def _password_candidates(self, path: str) -> list[str]:

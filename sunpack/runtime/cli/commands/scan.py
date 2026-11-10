@@ -1,6 +1,7 @@
 import os
 from itertools import groupby
 
+from sunpack.core.support.path_keys import path_key
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_parsers import (
     build_common_parser, build_detection_parser, build_password_parser, build_process_mode_parser,
@@ -28,26 +29,29 @@ async def handle(args, ctx):
 
 
 def command_result(args, ctx, paths, summary):
-    items = [item for result in summary.target_results for item in result.scan_items]
-    items.sort(key=lambda item: (item["main_path"].casefold(), item.get("offset", -1), item.get("format", "")))
+    rows = [(path_key(item["main_path"]), item)
+            for result in summary.target_results for item in result.scan_items]
+    rows.sort(key=lambda row: (row[0], row[1].get("offset", -1), row[1].get("format", "")))
+    items = [item for _, item in rows]
     if not args.verbose:
         for item in items:
             item.pop("discovery_source", None)
             item.pop("damage_flags", None)
     if not args.json:
-        for path, entries in groupby(items, key=lambda item: item["main_path"]):
-            entries = list(entries)
+        for _, group in groupby(rows, key=lambda row: row[0]):
+            entries = [item for _, item in group]
+            path = entries[0]["main_path"]
             ctx.reporter.info(path)
+            multiple = len(entries) > 1
             for index, item in enumerate(entries, 1):
-                multiple = len(entries) > 1
                 prefix = ("   " if index == len(entries) else "│  ") if multiple else "  "
                 if multiple:
                     branch = "└─ " if index == len(entries) else "├─ "
                     ctx.reporter.info(branch + ctx.t("cli.scan.segment", index=index) + _range(item))
                 elif "offset" in item:
                     ctx.reporter.info(prefix + ctx.t("cli.scan.range", start=item["offset"], end=item.get("end_offset") if item.get("end_offset") is not None else "?"))
-                if args.quiet and item.get("error"):
-                    ctx.reporter.error(f"{path}{_range(item)}: {item['error']}")
+                if item.get("error"):
+                    ctx.reporter.error(f"{path}{_range(item)}: {ctx.t('cli.scan.error', error=item['error'])}")
                 for text in _details(item, ctx):
                     ctx.reporter.info(prefix + text)
         for failure in summary.scan_failures:
@@ -96,8 +100,6 @@ def _details(item, ctx):
     if "password_used" in item:
         password = item["password_used"]
         yield ctx.t("cli.scan.password", password=ctx.t("cli.scan.password_unknown") if password is None else repr(password) if password == "" else password)
-    if item.get("error"):
-        yield ctx.t("cli.scan.error", error=item["error"])
     if item.get("discovery_source"):
         yield ctx.t("cli.scan.source", source=item["discovery_source"])
     if item.get("damage_flags"):

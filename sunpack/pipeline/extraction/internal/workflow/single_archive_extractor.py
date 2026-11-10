@@ -10,7 +10,7 @@ from sunpack.core.support.output_paths import OutputPathAllocator
 from sunpack.core.support.path_keys import resolved_path_key
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.failures import FailureInfo, FailureKind, aggregate_input_failures
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
@@ -732,7 +732,8 @@ class SingleArchiveExtractor:
             })
 
         if self.scanning:
-            failure = self._aggregate_input_failure(segment_failures, segment_count=segment_count) if segment_failures else None
+            failure = (aggregate_input_failures(segment_failures, segment_count=segment_count, i18n=self.i18n)
+                       if segment_failures else None)
             return ExtractionResult(success=failure is None, out_dir="", input_results=input_results,
                                     failure=failure, error=self._localized_failure(failure) if failure else "")
 
@@ -757,9 +758,10 @@ class SingleArchiveExtractor:
         }
         aggregate_failure = None
         if segment_failures:
-            aggregate_failure = self._aggregate_input_failure(
+            aggregate_failure = aggregate_input_failures(
                 segment_failures,
                 segment_count=segment_count,
+                i18n=self.i18n,
             )
         if any_success:
             self._log(task, self.i18n.t(
@@ -812,40 +814,6 @@ class SingleArchiveExtractor:
         failed_result.bytes_written = totals["total_bytes"]
         return failed_result
 
-    def _aggregate_input_failure(
-        self,
-        segment_failures: list[FailureInfo],
-        *,
-        segment_count: int,
-    ) -> FailureInfo:
-        details = {
-            "segment_count": int(segment_count),
-            "failed_segment_count": len(segment_failures),
-        }
-        if len(segment_failures) == 1 and segment_count == 1:
-            child = segment_failures[0]
-            return FailureInfo(
-                kind=FailureKind.INPUTS_FAILED,
-                stage="inputs",
-                message=self._localized_failure(child),
-                message_key=child.message_key,
-                message_params=dict(child.message_params),
-                user_action=child.user_action,
-                causes=(child,),
-                details=details,
-            )
-
-        password_failure = any(failure.is_password_failure for failure in segment_failures)
-        message_key = "failure.embedded_wrong_password" if password_failure else "failure.embedded_extract_failed"
-        return FailureInfo(
-            kind=FailureKind.INPUTS_FAILED,
-            stage="inputs",
-            message=self.i18n.t(message_key),
-            message_key=message_key,
-            user_action="request_password" if password_failure else "",
-            causes=tuple(segment_failures),
-            details=details,
-        )
 
     @staticmethod
     def _safe_segment_dir_name(logical_name: str, position: int) -> str:

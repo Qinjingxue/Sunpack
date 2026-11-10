@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.failures import FailureInfo, FailureKind, aggregate_input_failures
+from sunpack.core.i18n import I18nContext
 from sunpack.core.contracts.verification import ASSESSMENT_COMPLETE, CONTENT_INTEGRITY_VERIFIED_COMPLETE, DECISION_ACCEPT
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
@@ -267,12 +268,6 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
 
 @pytest.mark.parametrize("count", [1, 2])
 def test_multiple_embedded_failures_keep_aggregate_diagnosis(count):
-    extractor = SingleArchiveExtractor(
-        password_store=_FakePasswordStore(),
-        password_resolver=_FakePasswordResolver(),
-        sevenzip_runner=_FakeSevenZipRunner(),
-        best_effort=True,
-    )
     failures = [
         FailureInfo(
             kind=FailureKind.DAMAGED,
@@ -289,7 +284,7 @@ def test_multiple_embedded_failures_keep_aggregate_diagnosis(count):
     ]
 
     failures = failures[:count]
-    aggregate = extractor._aggregate_input_failure(failures, segment_count=count)
+    aggregate = aggregate_input_failures(failures, segment_count=count, i18n=I18nContext("en"))
 
     assert aggregate.kind is FailureKind.INPUTS_FAILED
     assert aggregate.message_key == ("failure.damaged" if count == 1 else "failure.embedded_extract_failed")

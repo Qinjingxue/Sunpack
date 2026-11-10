@@ -1,6 +1,7 @@
 from pathlib import Path
 import asyncio
 import io
+import os
 
 import pytest
 
@@ -563,7 +564,7 @@ def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp
     output = io.StringIO()
     output.isatty = lambda: True
     output.supports_terminal_updates = True
-    output.terminal_columns = 100
+    output.terminal_size = os.terminal_size((100, 25))
     events = []
     reporters = []
     rendered = []
