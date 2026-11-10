@@ -14,7 +14,7 @@ def parser():
 
 
 @pytest.mark.parametrize("short, full", [
-    (["x", "."], ["extract", "."]),
+    (["e", "."], ["extract", "."]),
     (["s", "."], ["scan", "."]),
     (["pw"], ["passwords"]),
     (["cfg", "show"], ["config", "show"]),
@@ -26,8 +26,8 @@ def parser():
     (["w", "st"], ["watch", "status"]),
     (["w", "start", "--once", "--no-tray"],
      ["watch", "start", "--once", "--no-tray"]),
-    (["w", "add", ".", "-o", "out", "-s"],
-     ["watch", "add", ".", "--out-dir", "out", "--start"]),
+    (["w", "add", ".", "-o", "out", "-s", "-R"],
+     ["watch", "add", ".", "--out-dir", "out", "--start", "--recursive"]),
     (["w", "startup", "status"], ["watch", "startup", "status"]),
 ])
 def test_command_aliases_preserve_handler_inputs(parser, short, full):
@@ -40,6 +40,7 @@ def test_command_aliases_preserve_handler_inputs(parser, short, full):
     (["-r", "?"], ["--recur", "?"]),
     (["-c", "r"], ["--cleanup", "r"]),
     (["-d"], ["--deep-detect"]),
+    (["-R"], ["--recursive"]),
     (["-p", "first", "-p", "second"], ["--password", "first", "--password", "second"]),
     (["-P", "pw.txt"], ["--pw-file", "pw.txt"]),
     (["-a"], ["--ask-pw"]),
@@ -49,14 +50,12 @@ def test_command_aliases_preserve_handler_inputs(parser, short, full):
     (["--direct"], ["--direct-file"]),
 ])
 def test_extract_aliases_preserve_handler_inputs(parser, short, full):
-    assert vars(parser.parse_args(["x", ".", *short])) == vars(parser.parse_args(["extract", ".", *full]))
+    assert vars(parser.parse_args(["e", ".", *short])) == vars(parser.parse_args(["extract", ".", *full]))
 
 
-@pytest.mark.parametrize("command", ["x", "s"])
-@pytest.mark.parametrize("short, full", [("b", "background"), ("n", "normal"), ("h", "high")])
-def test_priority_values_are_normalized_before_dispatch(parser, command, short, full):
-    assert vars(parser.parse_args([command, ".", "-m", short, "-d"])) == vars(
-        parser.parse_args([command, ".", "--process-mode", full, "--deep-detect"])
+def test_scan_recursive_option_alias(parser):
+    assert vars(parser.parse_args(["s", ".", "-R"])) == vars(
+        parser.parse_args(["scan", ".", "--recursive"])
     )
 
 
@@ -67,20 +66,22 @@ def test_password_short_options(parser):
 
 
 @pytest.mark.parametrize("argv", [
-    ["x", ".", "-k"],
-    ["x", ".", "--allow-partial"],
-    ["x", ".", "--ap"],
-    ["x", ".", "--deep"],
+    ["e", ".", "-k"],
+    ["e", ".", "--allow-partial"],
+    ["e", ".", "--ap"],
+    ["e", ".", "--deep"],
     ["i", ".", "--arch"],
     ["pw", "--no-bp"],
     ["w", "start", "--initial"],
     ["w", "add", ".", "--sta"],
     ["cfg", "show", "--qui"],
-    ["x", ".", "-f", "-F"],
-    ["x", ".", "-m", "invalid"],
-    ["x", ".", "-r", "0"],
-    ["x", ".", "-c", "invalid"],
+    ["e", ".", "-f", "-F"],
+    ["e", ".", "-m", "h"],
+    ["s", ".", "--process-mode", "normal"],
+    ["e", ".", "-r", "0"],
+    ["e", ".", "-c", "invalid"],
     ["ex", "."],
+    ["x", "."],
 ])
 def test_invalid_and_unregistered_abbreviations_are_rejected(parser, argv):
     with pytest.raises(SystemExit) as exc:
@@ -88,7 +89,7 @@ def test_invalid_and_unregistered_abbreviations_are_rejected(parser, argv):
     assert exc.value.code == 2
 
 
-@pytest.mark.parametrize("command, canonical", [("x", "extract"), ("s", "scan")])
+@pytest.mark.parametrize("command, canonical", [("e", "extract"), ("s", "scan")])
 def test_aliases_work_with_command_specific_discovery(command, canonical):
     ctx = CliContext(language="en")
     parser = cli.build_cli_parser(ctx, command=command)
@@ -97,7 +98,7 @@ def test_aliases_work_with_command_specific_discovery(command, canonical):
 
 
 @pytest.mark.parametrize("argv, command, action", [
-    (["x", ".", "-j", "-m", "b", "-r", "*"], "extract", None),
+    (["e", ".", "-j", "-r", "*"], "extract", None),
     (["s", ".", "-j", "-d"], "scan", None),
     (["w", "ls", "-j"], "watch", "list"),
     (["w", "st", "-j"], "watch", "status"),

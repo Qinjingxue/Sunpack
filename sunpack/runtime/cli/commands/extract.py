@@ -6,7 +6,6 @@ from sunpack.runtime.cli.cli_parsers import (
     build_detection_parser,
     build_extract_config_override_parser,
     build_password_parser,
-    build_process_mode_parser,
 )
 from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
@@ -46,7 +45,7 @@ def register(subparsers, ctx):
     parser = subparsers.add_parser(
         COMMAND,
         aliases=COMMAND_ALIASES[COMMAND],
-        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_extract_config_override_parser(ctx), build_process_mode_parser(ctx)],
+        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_extract_config_override_parser(ctx)],
         help=ctx.t("cli.extract.help"),
         usage="sunpack extract [options] <paths...>",
     )

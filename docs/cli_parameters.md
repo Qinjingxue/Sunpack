@@ -18,7 +18,7 @@ Top-level commands:
 
 | Command | Purpose |
 | --- | --- |
-| `extract`, `x` | Scan, identify, extract, verify, post-process, and clean up. |
+| `extract`, `e` | Scan, identify, extract, verify, post-process, and clean up. |
 | `watch`, `w` | Monitor directories and process files automatically once they are stable. |
 | `scan`, `s` | Read-only archive discovery and password confirmation. |
 | `passwords`, `pw` | Show a summary of the password sources available to the current command. |
@@ -26,14 +26,14 @@ Top-level commands:
 | `doctor`, `d` | Read-only check of configuration and runtime environment. |
 | `version`, `ver` | Print the installed SunPack version. |
 
-Full names and the listed aliases are both supported syntax. Arbitrary long-option prefixes are rejected. JSON `command` fields always use the full command name. `-m` accepts `background`/`b`, `normal`/`n`, and `high`/`h`. `-p` supplies a password; `-P` supplies a password file. `-f` enables flattening; `-F` disables it. Separate options from their values, for example `-r 3` and `-c r`.
+Full names and the listed aliases are both supported syntax. Arbitrary long-option prefixes are rejected. JSON `command` fields always use the full command name. `-p` supplies a password; `-P` supplies a password file. `-f` enables flattening; `-F` disables it. Separate options from their values, for example `-r 3` and `-c r`.
 
 Short command examples:
 
 ```powershell
-sunpack x D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -k --no-pause
+sunpack e D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt --no-pause
 sunpack s D:\Downloads -v -d -j
-sunpack w add D:\Downloads -o E:\Output -s -i -d
+sunpack w add D:\Downloads -o E:\Output -s -R -d
 sunpack w ls
 sunpack w st
 ```
@@ -44,15 +44,14 @@ These options apply to `extract` and `scan`:
 
 | Option | Description |
 | --- | --- |
-| `--recursive` | Discover input subdirectories; independent of nested extraction with `--recur`. |
+| `-R/--recursive` | Discover input subdirectories; independent of nested extraction with `--recur`. |
 | `-j`, `--json` | Output results as JSON; suitable for scripting. |
 | `-q`, `--quiet` | Reduce terminal output. |
 | `-v`, `--verbose` | Output more detection and diagnostic detail. |
 | `--pause` | Wait for a key press before exiting. |
 | `--no-pause` | Do not pause after the command finishes. |
-| `-m MODE`, `--process-mode MODE` | Temporarily override the shared RuntimeHost/native-worker process mode for this workload. Defaults to `high`. |
 
-For `extract` and `scan`, the process-mode override remains effective after the command finishes and expires when the shared runtime reaches the existing Watch idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`); it then returns to `runtime.process_mode`.
+`extract` and `scan` use high process priority. When the shared runtime reaches the Watch idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`), it returns to the configured `runtime.process_mode`.
 
 `passwords` supports only `--json` plus the password input options; `config` supports `--json` and `--quiet`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
 
@@ -172,13 +171,14 @@ Subcommands and options:
 | `start` | `--no-tray` | Disable the tray entry point while running continuously. |
 | `add PATH...` | `-o/--out-dir DIR` | Add a monitored root; only one path may be added at a time. |
 | `add PATH...` | `-s`, `--start` | Start continuous monitoring after adding. |
+| `add PATH...` | `-R/--recursive` | Enable recursive discovery for the monitored root. |
 | `add PATH...` | `-d`, `--deep-detect` | Persist `deep_detect=true` for each input root; update already registered roots too. |
 | `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory. |
 | `list`, `ls` | — | List the persisted input directories. |
 | `reload` | — | Re-read the configuration and monitored roots. |
 | `rebuild-log` | — | Clear display logs and rebuild from the watch snapshot/WAL. Completed history is discarded. Reports success or failure (exit code 1); automatic recovery still ignores failures and retries on later log operations. |
 | `stop` | — | Stop continuous monitoring. |
-| `status`, `st` | — | Show run status, pending counts, errors, and root directories. |
+| `status`, `st` | — | Show whether the watch service is running. JSON also includes pending counts, the last error, and root directories. |
 | `startup enable\|disable\|status` | — | Manage the current user's logon startup entry. |
 
 `start` keeps running until a stop request arrives; `start --once` completes one current scheduling pass and then exits. Writing, moving, or modifying a file triggers an active cycle. New candidates have no initial delay; subsequent content changes adapt the quiet window to observed write intervals, without a fixed minimum or maximum wait. Ready files are submitted for processing. The arrival of a new volume or a change in password sources reactivates the affected tasks.

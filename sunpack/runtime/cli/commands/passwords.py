@@ -43,14 +43,15 @@ async def handle(args, ctx):
     except Exception as exc:
         return EXIT_USAGE, CliCommandResult(command=COMMAND, inputs={}, summary={}, errors=[ctx.t("cli.operation_failed", error=exc)])
 
+    item = password_summary_item(password_summary)
     if not args.json:
         reporter = ctx.reporter
         reporter.info(ctx.t("cli.passwords.summary"))
         reporter.info(ctx.t("cli.passwords.user_input", value=password_summary.user_passwords or []))
         reporter.info(ctx.t("cli.passwords.recent", value=password_summary.recent_passwords or []))
         reporter.info(ctx.t("cli.passwords.clipboard", value=password_summary.clipboard_passwords or []))
-        reporter.info(ctx.t("cli.passwords.builtin", value=password_summary.builtin_passwords or []))
-        reporter.info(ctx.t("cli.passwords.final_order", value=password_summary.combined_passwords or []))
+        reporter.info(ctx.t("cli.passwords.builtin", value=list(password_summary.builtin_passwords)))
+        reporter.info(ctx.t("cli.passwords.final_order", value=item["combined_passwords"]))
 
     return 0, CliCommandResult(
         command=COMMAND,
@@ -63,7 +64,7 @@ async def handle(args, ctx):
             "recent_password_count": len(password_summary.recent_passwords),
             "clipboard_password_count": len(password_summary.clipboard_passwords),
             "builtin_password_count": len(password_summary.builtin_passwords),
-            "combined_password_count": len(password_summary.combined_passwords),
+            "combined_password_count": len(item["combined_passwords"]),
         },
-        items=[password_summary_item(password_summary)],
+        items=[item],
     )

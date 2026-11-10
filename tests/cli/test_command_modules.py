@@ -91,13 +91,16 @@ def test_cached_scan_parser_keeps_its_command_scope(monkeypatch):
 def test_command_help_exposes_public_options(subtests, capsys):
     """Cover all command help contracts without launching persistent clients."""
     cases = {
-        "scan": ((), ("--min-size",)),
+        "scan": (
+            ("-h/--help", "-R/--recursive", "-p/--password PASSWORD"),
+            ("--min-size", "--process-mode", "-p PASSWORD"),
+        ),
         "extract": (
             ("--recur", "--cleanup", "--out-dir",
-             "--direct-file", "--process-mode"),
-            ("--color", "--worker-profile", "--min-size", "--write-manifest", "--manifest"),
+             "--direct-file/--direct"),
+            ("--color", "--worker-profile", "--min-size", "--write-manifest", "--manifest", "--process-mode"),
         ),
-        "watch": (("add", "start", "list", "startup", "rebuild-log"), ("--process-mode",)),
+        "watch": (("add", "start", "remove (rm)", "list", "startup", "rebuild-log"), ("--process-mode",)),
         "passwords": (
             ("--json", "--password"),
             ("--clipboard-pw", "--quiet", "--verbose", "--pause"),

@@ -73,7 +73,7 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 | 命令        | 简写  | 说明                                         |
 | ----------- | ----- | -------------------------------------------- |
-| `extract`   | `x`   | 解压文件                                     |
+| `extract`   | `e`   | 解压文件                                     |
 | `watch`     | `w`   | 监控目录，发现压缩文件后自动解压             |
 | `scan`      | `s`   | 只读扫描压缩包并确认密码         |
 | `passwords` | `pw`  | 查看本次会参与尝试的密码列表。               |

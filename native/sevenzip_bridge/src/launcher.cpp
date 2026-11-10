@@ -525,7 +525,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         memcmp(build_id.data(), runtime_build_id.data(), build_id.size()) != 0) {
         return RequestOutcome::DeliveryUncertain;
     }
-    ConsoleCancellation controls(pipe, !arguments.empty() && (arguments[0] == L"extract" || arguments[0] == L"x"));
+    ConsoleCancellation controls(pipe, !arguments.empty() && (arguments[0] == L"extract" || arguments[0] == L"e"));
     while (true) {
         std::array<char, 5> header{};
         if (!read_all(pipe, header.data(), header.size())) break;

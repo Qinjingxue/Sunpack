@@ -2,7 +2,7 @@ import argparse
 from functools import partial
 
 from sunpack.runtime.cli.cli_context import CliContext
-from sunpack.runtime.cli.cli_values import parse_archive_cleanup_value, parse_process_mode_value, parse_recursive_extract_value
+from sunpack.runtime.cli.cli_values import parse_archive_cleanup_value, parse_recursive_extract_value
 from sunpack.core.i18n import I18nContext
 
 
@@ -24,6 +24,15 @@ class CliHelpFormatter(argparse.RawDescriptionHelpFormatter):
                 "options": i18n.t("cli.options"),
             }.get(heading, heading)
         return super().start_section(heading)
+
+    def _format_action_invocation(self, action):
+        if len(action.option_strings) < 2:
+            return super()._format_action_invocation(action)
+        options = "/".join(action.option_strings)
+        if action.nargs == 0:
+            return options
+        metavar = self._get_default_metavar_for_optional(action)
+        return f"{options} {self._format_args(action, metavar)}"
 
 
 def localize_parser(parser: argparse.ArgumentParser, ctx: CliContext) -> None:
@@ -74,21 +83,8 @@ def build_password_parser(ctx: CliContext) -> argparse.ArgumentParser:
 
 def build_detection_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--recursive", action="store_true", help=ctx.t("cli.recursive_scan"))
+    parser.add_argument("-R", "--recursive", action="store_true", help=ctx.t("cli.recursive_scan"))
     parser.add_argument("-d", "--deep-detect", dest="deep_detect", action="store_true", help=ctx.t("cli.deep_detect"))
-    return parser
-
-
-def build_process_mode_parser(ctx: CliContext) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "-m", "--process-mode",
-        dest="process_mode",
-        type=parse_process_mode_value,
-        choices=("background", "normal", "high"),
-        default="high",
-        help=ctx.t("cli.process_mode"),
-    )
     return parser
 
 

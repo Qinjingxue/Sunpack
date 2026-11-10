@@ -22,6 +22,7 @@ from sunpack.core.support.runtime_identity import (
     runtime_id_argument,
     runtime_id_available,
 )
+from sunpack.runtime.cli.cli_aliases import canonical_command
 
 
 SERVER_ARG = "--persistent-server"
@@ -383,7 +384,7 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
             connection.sendall(item)
         if _recv_exact(connection, 4) != _STREAM_MAGIC or _recv_exact(connection, len(build_id)) != build_id:
             return _delivery_uncertain_response(payload, "invalid response handshake")
-        return _recv_stream(connection, enable_cancel=bool(argv_values and argv_values[0] in {"extract", "x", "scan", "s"}))
+        return _recv_stream(connection, enable_cancel=bool(argv_values and canonical_command(argv_values[0]) in {"extract", "scan"}))
     except (EOFError, OSError, ValueError) as exc:
         if request_started:
             return _delivery_uncertain_response(payload, exc)

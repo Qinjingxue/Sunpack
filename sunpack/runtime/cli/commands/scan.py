@@ -6,7 +6,7 @@ from sunpack.core.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
 from sunpack.core.support.path_keys import path_key
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_parsers import (
-    build_common_parser, build_detection_parser, build_password_parser, build_process_mode_parser,
+    build_common_parser, build_detection_parser, build_password_parser,
 )
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED
@@ -18,7 +18,7 @@ ORDER = 20
 def register(subparsers, ctx):
     parser = subparsers.add_parser(
         COMMAND, aliases=COMMAND_ALIASES[COMMAND],
-        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_process_mode_parser(ctx)],
+        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx)],
         help=ctx.t("cli.scan.help"), usage="sunpack scan [options] <paths...>",
     )
     parser.set_defaults(command=COMMAND)

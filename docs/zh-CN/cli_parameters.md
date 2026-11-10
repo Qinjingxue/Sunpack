@@ -18,7 +18,7 @@ sunpack.exe <command> [options] [paths...]
 
 | 命令 | 作用 |
 | --- | --- |
-| `extract`, `x` | 扫描、识别、解压、校验、后处理和清理。 |
+| `extract`, `e` | 扫描、识别、解压、校验、后处理和清理。 |
 | `watch`, `w` | 监控目录，文件稳定后自动处理。 |
 | `scan`, `s` | 只读扫描归档并确认密码。 |
 | `passwords`, `pw` | 查看当前命令可用的密码来源汇总。 |
@@ -26,14 +26,14 @@ sunpack.exe <command> [options] [paths...]
 | `doctor`, `d` | 只读检查配置和运行环境。 |
 | `version`, `ver` | 输出当前安装的 SunPack 版本号。 |
 
-完整名称和简写都是正式语法；只接受明确列出的简写，不接受任意截断长参数。简写输出的 JSON `command` 仍使用完整命令名。`-m` 接受 `background`/`b`、`normal`/`n`、`high`/`h`。`-p` 是密码，`-P` 是密码文件；`-f` 启用扁平化，`-F` 关闭扁平化。带值参数推荐分开写，例如 `-r 3`、`-c r`。
+完整名称和简写都是正式语法；只接受明确列出的简写，不接受任意截断长参数。简写输出的 JSON `command` 仍使用完整命令名。`-p` 是密码，`-P` 是密码文件；`-f` 启用扁平化，`-F` 关闭扁平化。带值参数推荐分开写，例如 `-r 3`、`-c r`。
 
 常用简写示例：
 
 ```powershell
-sunpack x D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -k --no-pause
+sunpack e D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt --no-pause
 sunpack s D:\Downloads -v -d -j
-sunpack w add D:\Downloads -o E:\Output -s -i -d
+sunpack w add D:\Downloads -o E:\Output -s -R -d
 sunpack w ls
 sunpack w st
 ```
@@ -44,15 +44,14 @@ sunpack w st
 
 | 参数 | 说明 |
 | --- | --- |
-| `--recursive` | 递归发现输入子目录；与嵌套解压的 `--recur` 独立。 |
+| `-R/--recursive` | 递归发现输入子目录；与嵌套解压的 `--recur` 独立。 |
 | `-j`, `--json` | 以 JSON 格式输出结果，适合脚本调用。 |
 | `-q`, `--quiet` | 减少终端输出。 |
 | `-v`, `--verbose` | 输出更多检测和诊断细节。 |
 | `--pause` | 命令结束后等待按键退出。 |
 | `--no-pause` | 命令结束后不暂停。 |
-| `-m MODE`, `--process-mode MODE` | 临时覆盖本次工作负载使用的共享 RuntimeHost/native-worker 进程模式；默认 `high`。 |
 
-对于 `extract`、`scan`，process-mode override 在命令结束后继续有效，直到共享 Runtime 到达现有 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`），随后恢复 `runtime.process_mode`。
+`extract` 和 `scan` 使用高进程优先级。共享运行时达到 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`）后，恢复配置中的 `runtime.process_mode`。
 
 `passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json` 和 `--quiet`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
 
@@ -172,13 +171,14 @@ G:\Incoming | | true
 | `start` | `--no-tray` | 持续运行时关闭托盘入口。 |
 | `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
 | `add PATH...` | `-s`, `--start` | 添加后启动持续监控。 |
+| `add PATH...` | `-R/--recursive` | 为该监控根启用递归发现。 |
 | `add PATH...` | `-d`, `--deep-detect` | 将各输入目录的 `deep_detect` 写为 `true`；已登记目录也会更新。 |
 | `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根。 |
 | `list`, `ls` | — | 列出持久化的输入目录。 |
 | `reload` | — | 重新读取配置和监控根。 |
 | `rebuild-log` | — | 清空显示日志，从监控快照/WAL重建。已完成的历史记录会丢弃。显示重建成败，失败退出码为 1；自动恢复仍忽略失败，后续日志操作再尝试。 |
 | `stop` | — | 停止持续监控。 |
-| `status`, `st` | — | 显示运行状态、待处理数量、错误和根目录。 |
+| `status`, `st` | — | 显示监控服务是否运行。JSON 还包含待处理数量、最后一次错误和根目录。 |
 | `startup enable\|disable\|status` | — | 管理当前用户登录启动项。 |
 
 `start` 会持续运行直到收到停止请求；`start --once` 完成一次当前调度后退出。文件写入、移动或修改会触发活跃周期。新候选没有首次处理延迟；后续内容变化按观测到的写入间隔自适应调整静默窗口，不设固定最短或最长等待时间。文件准备好后提交处理。新分卷到达或密码来源变化会重新激活受影响任务。

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import io
 import subprocess
@@ -7,8 +8,14 @@ import unittest
 import zipfile
 from binascii import crc32
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from tests.helpers.generated_fixtures import build_cli_pipeline_fixture
+from sunpack.runtime.cli import cli, cli_runtime, runtime_state
+from sunpack.runtime.cli.commands import watch
+from sunpack.runtime.watch import startup
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -135,6 +142,45 @@ class CliBasicTests(unittest.TestCase):
                 Path(payload["inputs"]["config_overrides"]["output_dir"]).resolve(),
                 (request_dir / "relative-out").resolve(),
             )
+
+@pytest.mark.parametrize("active", [False, True])
+def test_watch_status_commands_render_state_and_keep_json(monkeypatch, tmp_path, active):
+    monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _: False)
+    monkeypatch.setattr(cli, "load_cli_language_from_config", lambda _: "zh")
+    monkeypatch.setattr(runtime_state, "_HOST", SimpleNamespace(watch_status=lambda: {"running": active}))
+    monkeypatch.setattr(watch, "list_watch_roots", lambda: ("roots.txt", []))
+    monkeypatch.setattr(watch, "service_state_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(startup, "startup_status", lambda: (active, "watch start" if active else ""))
+
+    cases = (
+        (["w", "status"], "running", "监控服务正在运行" if active else "监控服务已停止"),
+        (["w", "startup", "status"], "enabled", "开机自启动已启用" if active else "开机自启动未启用"),
+    )
+    for argv, key, message in cases:
+        output = io.StringIO()
+        assert asyncio.run(cli.async_main(argv, cwd=str(tmp_path), stdout=output)) == 0
+        assert output.getvalue().splitlines() == [message]
+        output = io.StringIO()
+        assert asyncio.run(cli.async_main([*argv, "-j"], cwd=str(tmp_path), stdout=output)) == 0
+        assert json.loads(output.getvalue())["summary"][key] is active
+
+
+def test_passwords_text_displays_builtins_as_a_list(monkeypatch, tmp_path):
+    from sunpack.core.passwords.internal.builtin import read_builtin_password_file
+    from sunpack.runtime.cli.commands import passwords
+
+    path = tmp_path / "passwords.json"
+    path.write_text('{"passwords":[{"value":"sample-key"}]}', encoding="utf-8")
+    snapshot = read_builtin_password_file(path)
+    monkeypatch.setattr(cli_runtime, "password_file_source", lambda: SimpleNamespace(snapshot=snapshot))
+    monkeypatch.setattr(passwords, "collect_clipboard_passwords", lambda _: [])
+    monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _: False)
+    monkeypatch.setattr(cli, "load_cli_language_from_config", lambda _: "zh")
+    output = io.StringIO()
+
+    assert asyncio.run(cli.async_main(["pw"], cwd=str(tmp_path), stdout=output)) == 0
+    assert "  内置密码：['sample-key']" in output.getvalue().splitlines()
+
 
 if __name__ == "__main__":
     unittest.main()

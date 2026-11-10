@@ -40,7 +40,7 @@ def register(subparsers, ctx):
     add_parser.add_argument("paths", nargs="+", help=ctx.t("cli.watch.paths"))
     add_parser.add_argument("-o", "--out-dir", dest="output_dir", help=ctx.t("cli.watch.output_dir"))
     add_parser.add_argument("-s", "--start", dest="start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
-    add_parser.add_argument("--recursive", action="store_true", default=None, help=ctx.t("cli.recursive_scan"))
+    add_parser.add_argument("-R", "--recursive", action="store_true", default=None, help=ctx.t("cli.recursive_scan"))
     add_parser.add_argument("-d", "--deep-detect", dest="deep_detect", action="store_true", default=None, help=ctx.t("cli.watch.deep_detect"))
 
     remove_parser = actions.add_parser("remove", aliases=["rm"], parents=[common], help=ctx.t("cli.watch.remove"))
@@ -88,7 +88,7 @@ async def handle(args, ctx):
         if action == "status":
             return _handle_status(ctx)
         if action == "startup":
-            return _handle_startup(args)
+            return _handle_startup(args, ctx)
     except Exception as exc:
         return EXIT_TASK_FAILED, CliCommandResult(command=COMMAND, inputs={}, summary={}, errors=[ctx.t("cli.operation_failed", error=exc)])
     return EXIT_USAGE, CliCommandResult(command=COMMAND, inputs={}, summary={}, errors=[ctx.t("cli.watch.unknown_action", action=action)])
@@ -225,6 +225,8 @@ def _handle_status(ctx):
 
     _, roots = list_watch_roots()
     host_status = require_runtime_host().watch_status()
+    if ctx.reporter is not None:
+        ctx.reporter.info(ctx.t("cli.watch.running" if host_status["running"] else "cli.watch.stopped"))
     return 0, CliCommandResult(
         command=COMMAND,
         inputs={"action": "status"},
@@ -233,7 +235,7 @@ def _handle_status(ctx):
     )
 
 
-def _handle_startup(args):
+def _handle_startup(args, ctx):
     from sunpack.runtime.watch.startup import disable_startup, enable_startup, startup_status
 
     if args.startup_action == "enable":
@@ -243,4 +245,6 @@ def _handle_startup(args):
         changed = disable_startup()
         return 0, CliCommandResult(command=COMMAND, inputs={"action": "startup", "startup_action": "disable"}, summary={"enabled": False, "changed": changed})
     enabled, command = startup_status()
+    if ctx.reporter is not None:
+        ctx.reporter.info(ctx.t("cli.watch.startup_enabled" if enabled else "cli.watch.startup_disabled"))
     return 0, CliCommandResult(command=COMMAND, inputs={"action": "startup", "startup_action": "status"}, summary={"enabled": enabled, "command": command})

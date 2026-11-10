@@ -1,18 +1,26 @@
-from sunpack.runtime.cli.cli import build_cli_parser
-from sunpack.runtime.cli.cli_context import CliContext
+import asyncio
+import io
+from types import SimpleNamespace
+
+import pytest
+
+from sunpack.runtime.cli import cli, runtime_state
+from sunpack.runtime.cli.cli_types import CliCommandResult
 
 
-def test_workload_process_mode_defaults_to_high():
-    cases = (
-        ("extract", ["extract", "sample.zip"]),
-        ("scan", ["scan", "."]),
-    )
-    for command, argv in cases:
-        args = build_cli_parser(CliContext(language="en"), command=command).parse_args(argv)
-        assert args.process_mode == "high"
+@pytest.mark.parametrize("argv, expected", [(["e", "sample.zip"], ["high"]), (["s", "."], ["high"]), (["w", "status"], [])])
+def test_workload_priority_is_applied_before_dispatch(monkeypatch, tmp_path, argv, expected):
+    modes = []
 
+    async def set_override(mode):
+        modes.append(mode)
 
-def test_workload_process_mode_accepts_explicit_override():
-    parser = build_cli_parser(CliContext(language="en"), command="extract")
-    args = parser.parse_args(["extract", "--process-mode", "normal", "sample.zip"])
-    assert args.process_mode == "normal"
+    async def dispatch(args, ctx):
+        assert modes == expected
+        return 0, CliCommandResult(args.command, {}, {})
+
+    monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _argv: False)
+    monkeypatch.setattr(cli, "dispatch_command", dispatch)
+    monkeypatch.setattr(runtime_state, "_HOST", SimpleNamespace(set_cli_process_mode_override=set_override))
+
+    assert asyncio.run(cli.async_main(argv, cwd=str(tmp_path), stdout=io.StringIO(), stderr=io.StringIO())) == 0

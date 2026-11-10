@@ -58,10 +58,10 @@ def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) 
         usage=ctx.t("cli.usage"),
         epilog=(
             f"{ctx.t('cli.examples')}\n"
-            '  sunpack x C:\\Archives -r "*" -c r\n'
+            '  sunpack e C:\\Archives -r "*" -c r\n'
             "  sunpack s .\\fixtures -v -j\n"
             "  sunpack pw -a\n"
-            "  sunpack w add C:\\Downloads -s -i"
+            "  sunpack w add C:\\Downloads -s -R"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, parser_class=_ContextArgumentParser)
@@ -201,13 +201,12 @@ async def async_main(
         args.quiet = bool(getattr(args, "quiet", False) or "-q" in argv or "--quiet" in argv)
         args.verbose = bool(getattr(args, "verbose", False) or "-v" in argv or "--verbose" in argv)
         args.pause_on_exit = bool(getattr(args, "pause_on_exit", False) or "--pause" in argv)
-        process_mode = getattr(args, "process_mode", None)
-        if process_mode is not None:
+        if args.command in {"extract", "scan"}:
             from sunpack.runtime.cli.runtime_state import runtime_host
 
             host = runtime_host()
             if host is not None:
-                await host.set_cli_process_mode_override(process_mode)
+                await host.set_cli_process_mode_override("high")
         reporter = CliReporter(
             json_mode=args.json,
             quiet=args.quiet,
