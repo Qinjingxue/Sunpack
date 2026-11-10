@@ -82,7 +82,7 @@ def test_installation_checks_accept_machine_toast_com_registration(tmp_path, mon
 
     values = {
         (doctor.SERVICE_REGISTRY_KEY, "ImagePath"): f'"{broker}"',
-        (doctor.TOAST_LOCAL_SERVER_KEY, ""): f'"{runtime}" --toast-activated',
+        (doctor.TOAST_LOCAL_SERVER_KEY, ""): f'"{launcher}" --toast-activated',
         (doctor.SUNPACK_REGISTRY_KEY, doctor.PATH_MARKER_NAME): 1,
         (doctor.ENVIRONMENT_REGISTRY_KEY, "Path"): f"C:\\Windows;{launcher.parent}",
     }

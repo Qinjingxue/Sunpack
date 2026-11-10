@@ -20,10 +20,12 @@ def parser():
     (["cfg", "show"], ["config", "show"]),
     (["cfg", "validate"], ["config", "validate"]),
     (["ver"], ["version"]),
+    (["d"], ["doctor"]),
     (["d", "-j", "-q"], ["doctor", "--json", "--quiet"]),
     (["w", "rm", "D:\\Downloads"], ["watch", "remove", "D:\\Downloads"]),
     (["w", "ls"], ["watch", "list"]),
     (["w", "st"], ["watch", "status"]),
+    (["w", "start"], ["watch", "start"]),
     (["w", "start", "--once", "--no-tray"],
      ["watch", "start", "--once", "--no-tray"]),
     (["w", "add", ".", "-o", "out", "-s", "-R"],
@@ -82,6 +84,8 @@ def test_password_short_options(parser):
     ["e", ".", "-c", "invalid"],
     ["ex", "."],
     ["x", "."],
+    ["s", "--json"],
+    ["w", "startup", "unknown"],
 ])
 def test_invalid_and_unregistered_abbreviations_are_rejected(parser, argv):
     with pytest.raises(SystemExit) as exc:
@@ -95,6 +99,24 @@ def test_aliases_work_with_command_specific_discovery(command, canonical):
     parser = cli.build_cli_parser(ctx, command=command)
     assert parser.parse_args([command, "."]).command == canonical
     assert set(ctx.commands) == {canonical}
+
+
+@pytest.mark.parametrize("argv", [
+    [], ["extract"], ["e"], ["scan"], ["s"], ["watch"], ["w"],
+    ["config"], ["cfg"], ["w", "add"], ["watch", "rm"], ["w", "startup"],
+])
+def test_missing_required_arguments_defaults_to_help(monkeypatch, tmp_path, argv):
+    monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _argv: False)
+
+    def run(args):
+        output, error = io.StringIO(), io.StringIO()
+        assert asyncio.run(cli.async_main(args, cwd=str(tmp_path), stdout=output, stderr=error)) == 0
+        assert not error.getvalue()
+        return output.getvalue()
+
+    expected = run([*argv, "-h"])
+    assert "-h/--help" in expected
+    assert run(argv) == expected
 
 
 @pytest.mark.parametrize("argv, command, action", [

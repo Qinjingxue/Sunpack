@@ -172,8 +172,8 @@ def _toast_registration_check() -> dict:
         command = _read_hklm_value(TOAST_LOCAL_SERVER_KEY)
         if command is None:
             return _check("toast_registration", "fail", "machine COM registration is missing")
-        executable = current_process_executable()
-        if not _text_contains_path(command, executable) or "--toast-activated" not in str(command):
+        launcher = _install_dir() / "bin" / "sunpack.exe"
+        if not _text_contains_path(command, launcher) or "--toast-activated" not in str(command):
             return _check("toast_registration", "fail", f"activation command is stale: {command}")
         return _check("toast_registration", "ok", str(command))
     except Exception as exc:

@@ -33,6 +33,20 @@ class _ContextArgumentParser(argparse.ArgumentParser):
         kwargs.setdefault("allow_abbrev", False)
         super().__init__(*args, **kwargs)
 
+    def parse_known_args(self, args=None, namespace=None):
+        if args is None:
+            args = sys.argv[1:]
+        # Argparse calls this on each selected subparser with its own arguments.
+        if not args and (
+            any(action.required for action in self._actions)
+            or any(group.required for group in self._mutually_exclusive_groups)
+        ):
+            for action in self._actions:
+                if isinstance(action, argparse._HelpAction):
+                    args = action.option_strings[:1]
+                    break
+        return super().parse_known_args(args, namespace)
+
     def _print_message(self, message, file=None):
         if file is sys.stderr:
             file = _PARSER_STDERR.get() or file
@@ -176,13 +190,9 @@ async def async_main(
         stdout_token = _PARSER_STDOUT.set(ctx.stdout)
         stderr_token = _PARSER_STDERR.set(ctx.stderr)
         try:
-            if not argv:
-                parser.print_help()
-                return EXIT_OK
-            try:
-                args = parser.parse_args(argv)
-            except SystemExit as exc:
-                return int(exc.code)
+            args = parser.parse_args(argv)
+        except SystemExit as exc:
+            return int(exc.code)
         finally:
             _PARSER_STDOUT.reset(stdout_token)
             _PARSER_STDERR.reset(stderr_token)
