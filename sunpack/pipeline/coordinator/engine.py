@@ -29,7 +29,6 @@ from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.content_recovery import CONTENT_REQUIREMENT_ALLOW_PARTIAL
 from sunpack.core.contracts.retry_targets import apply_input_retry, remap_retry_failure
 from sunpack.pipeline.postprocess.internal.blocked_input import (
     BlockedInputPromotionError, NativeBlockedInputPromotion, promote_blocked_input,
@@ -1500,9 +1499,7 @@ class _RequestRuntime:
             retry_failure = self.config.get("password_retry_failures", {}).get(path_key(task.main_path))
             if retry_failure is not None:
                 apply_input_retry(task, retry_failure, task.runtime.get("input_generation", ()),
-                                  password_changed=self.config.get("retry_password_changed", True),
-                                  recover_partial=(self.job_executor.content_policy.requirement
-                                                   == CONTENT_REQUIREMENT_ALLOW_PARTIAL))
+                                  password_changed=self.config.get("retry_password_changed", True))
 
             ownership.remember_task(task)
             # Admission already confirmed the physical generation under the

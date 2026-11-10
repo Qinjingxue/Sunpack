@@ -426,11 +426,9 @@ class ArchiveJobExecutor:
 
         if outcome.policy_rejected_partial_output and (cleanup.cleaned or not os.path.lexists(out_dir)):
             # A rejected/deleted output must not be revived by a later retry's
-            # compact evidence. Keep only a rerun hint for a later policy change.
+            # compact evidence. Keep blockers, but discard its output receipt.
             task.recovery = replace(task.recovery, output_dir="", checkpoints=tuple(
-                replace(item, output_dir="", recovered_complete_files=0,
-                        discarded_recoverable_output=(item.discarded_recoverable_output
-                                                      or item.recovered_complete_files > 0))
+                replace(item, output_dir="", recovered_complete_files=0)
                 for item in task.recovery.checkpoints
             ))
             task.runtime.pop("retry_output_dir", None)
