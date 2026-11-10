@@ -4,6 +4,7 @@ from itertools import groupby
 
 from sunpack.core.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
 from sunpack.core.support.path_keys import path_key
+from sunpack.core.support.console_tree import tree_style
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_parsers import (
     build_common_parser, build_detection_parser, build_password_parser,
@@ -40,15 +41,17 @@ def command_result(args, ctx, paths, summary):
             item.pop("discovery_source", None)
             item.pop("damage_flags", None)
     if not args.json:
+        tree = tree_style(ctx.reporter.stdout)
         for _, group in groupby(rows, key=lambda row: row[0]):
             entries = [item for _, item in group]
             path = entries[0]["main_path"]
             ctx.reporter.info(path)
             multiple = len(entries) > 1
             for index, item in enumerate(entries, 1):
-                prefix = ("   " if index == len(entries) else "|  ") if multiple else "  "
+                last = index == len(entries)
+                prefix = tree.continuation(last) + "  " if multiple else "  "
                 if multiple:
-                    ctx.reporter.info("+- " + ctx.t("cli.scan.segment", index=index) + _range(item))
+                    ctx.reporter.info(tree.edge(last) + ctx.t("cli.scan.segment", index=index) + _range(item))
                 elif "offset" in item:
                     ctx.reporter.info(prefix + ctx.t("cli.scan.range", start=item["offset"], end=item.get("end_offset") if item.get("end_offset") is not None else "?"))
                 # Omit errors already explained by visible fact fields. Quiet

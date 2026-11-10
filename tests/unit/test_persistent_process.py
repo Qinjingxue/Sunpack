@@ -292,12 +292,14 @@ def test_submit_request_strips_server_side_pause(tmp_path, monkeypatch):
     assert captured["cwd"] == request_cwd
     assert captured["client_cwd"] == request_cwd
     assert captured["stdout_tty"] is True
+    assert captured["stdout_unicode_tree"] is True
     assert captured["terminal_size"] == (93, 7)
     assert os.getcwd() == request_cwd
     assert persistent_process.sys.stdout.getvalue() == "done\n"
 
 
-def test_submit_request_does_not_claim_unverified_terminal_updates(tmp_path, monkeypatch):
+@pytest.mark.parametrize("encoding", ["utf-8", "cp1252"])
+def test_submit_request_does_not_claim_unverified_terminal_updates(tmp_path, monkeypatch, encoding):
     captured = {}
 
     def fake_send(payload):
@@ -306,10 +308,12 @@ def test_submit_request_does_not_claim_unverified_terminal_updates(tmp_path, mon
 
     monkeypatch.setattr(persistent_process, "_send_or_start", fake_send)
     monkeypatch.setattr(persistent_process, "_client_supports_terminal_updates", lambda _stream: False)
+    monkeypatch.setattr(persistent_process.sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding=encoding))
     monkeypatch.setattr(persistent_process.sys.stdin, "isatty", lambda: False)
 
     assert persistent_process.submit_request(["extract", str(tmp_path / "sample.zip")]) == 0
     assert captured["stdout_tty"] is False
+    assert captured["stdout_unicode_tree"] == (encoding == "utf-8")
 
 
 def test_extract_is_submitted_to_persistent_server_by_default(monkeypatch):
@@ -971,6 +975,7 @@ def test_protocol_incrementally_parses_a_fragmented_request(monkeypatch):
         "cwd": "C:\\work",
         "shutdown": False,
         "stdout_tty": True,
+        "stdout_unicode_tree": False,
         "stdin_tty": True,
         "terminal_resize": False,
     }
@@ -1780,8 +1785,9 @@ def test_client_resize_negotiation_and_prompt_resume(monkeypatch, acknowledge, e
     assert output.getvalue() == ""
 
 
+@pytest.mark.parametrize("unicode_tree", [False, True])
 @pytest.mark.parametrize("stdout_tty, stdin_tty", [(True, True), (False, True), (True, False)])
-def test_resize_capability_round_trips_only_for_interactive_clients(monkeypatch, tmp_path, stdout_tty, stdin_tty):
+def test_resize_capability_round_trips_only_for_interactive_clients(monkeypatch, tmp_path, stdout_tty, stdin_tty, unicode_tree):
     # Control-only tests bypass the request header and would miss an omitted
     # capability flag or an acknowledgement leaked to redirected/old clients.
     from sunpack.runtime.cli import cli
@@ -1815,10 +1821,13 @@ def test_resize_capability_round_trips_only_for_interactive_clients(monkeypatch,
     monkeypatch.setattr(persistent_process, "_recv_stream", receive)
     assert persistent_process._try_send({
         "argv": ["s", "."], "cwd": str(tmp_path),
-        "stdout_tty": stdout_tty, "stdin_tty": stdin_tty,
+        "stdout_tty": stdout_tty, "stdin_tty": stdin_tty, "stdout_unicode_tree": unicode_tree,
     }) == {"exit_code": 0}
 
-    async def fake_main(_argv, **_context):
+    async def fake_main(_argv, **context):
+        from sunpack.core.support.console_tree import ASCII_TREE, UNICODE_TREE, tree_style
+
+        assert tree_style(context["stdout"]) is (UNICODE_TREE if unicode_tree else ASCII_TREE)
         return 0
 
     monkeypatch.setattr(cli, "async_main", fake_main)
@@ -1829,6 +1838,7 @@ def test_resize_capability_round_trips_only_for_interactive_clients(monkeypatch,
         server._buffer.extend(client.sent)
         payload = server._parse_request()
         assert payload["terminal_resize"] == expected
+        assert payload["stdout_unicode_tree"] == unicode_tree
         await server._run_request(payload)
         handshake = persistent_process._STREAM_MAGIC + build_id
         acknowledgement = struct.pack("!BI", 4, 0) if expected else b""

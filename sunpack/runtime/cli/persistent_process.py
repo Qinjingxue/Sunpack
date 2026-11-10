@@ -135,12 +135,14 @@ def submit_request(argv: list[str], *, shutdown: bool = False) -> int:
             request_argv.append("--no-pause")
     supports_terminal_updates = _client_supports_terminal_updates(sys.stdout)
     from sunpack.pipeline.coordinator.reporting import _terminal_size
+    from sunpack.core.support.console_tree import supports_unicode_tree
 
     payload = {
         "argv": request_argv,
         "cwd": request_cwd,
         "shutdown": bool(shutdown),
         "stdout_tty": supports_terminal_updates,
+        "stdout_unicode_tree": supports_unicode_tree(sys.stdout),
         "terminal_size": _terminal_size(sys.stdout) if supports_terminal_updates else None,
         "stdin_tty": bool(sys.stdin is not None and sys.stdin.isatty()),
     }
@@ -376,7 +378,8 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
         flags = ((1 if payload.get("shutdown") else 0)
                  | (2 if payload.get("stdout_tty") else 0)
                  | (4 if payload.get("stdin_tty") else 0)
-                 | (8 if payload.get("stdout_tty") and payload.get("stdin_tty") else 0))
+                 | (8 if payload.get("stdout_tty") and payload.get("stdin_tty") else 0)
+                 | (16 if payload.get("stdout_unicode_tree") else 0))
         build_id = _runtime_binary_build_id()
         request_started = True
         connection.sendall(_REQUEST_MAGIC + build_id + token + struct.pack("!III", flags, len(cwd), len(argv_values)))
@@ -591,6 +594,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
                 "argv": [],
                 "shutdown": bool(flags & 1),
                 "stdout_tty": bool(flags & 2),
+                "stdout_unicode_tree": bool(flags & 16),
                 "stdin_tty": bool(flags & 4),
                 "terminal_resize": bool(flags & 8) and bool(flags & 2),
             }
@@ -1107,6 +1111,7 @@ class _AsyncConnectionTextStream:
         kind: int,
         *,
         is_tty: bool = False,
+        unicode_tree: bool = True,
         terminal_size: os.terminal_size | None = None,
     ):
         self.loop = loop
@@ -1115,6 +1120,7 @@ class _AsyncConnectionTextStream:
         self.kind = kind
         self._is_tty = is_tty
         self.supports_terminal_updates = is_tty
+        self.supports_unicode_tree = unicode_tree
         self.terminal_size = terminal_size or os.terminal_size((80, 25))
 
     def write(self, text: str) -> int:
@@ -1190,6 +1196,7 @@ async def _execute_streaming_request_async(
         connection.output_queue,
         1,
         is_tty=bool(payload.get("stdout_tty")),
+        unicode_tree=bool(payload.get("stdout_unicode_tree")),
         terminal_size=connection._terminal_size or terminal_size,
     )
     connection._stdout = stdout

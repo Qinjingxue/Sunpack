@@ -547,7 +547,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     const bool stdin_tty = GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode) != 0;
     const bool terminal_resize = stdout_tty && stdin_tty;
     append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u) |
-                     (terminal_resize ? 8u : 0u));
+                     (terminal_resize ? 8u : 0u) | 16u);  // WriteConsoleW or redirected UTF-8, independent of VT.
     append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
     append_u32(wire, static_cast<std::uint32_t>(arguments.size() + !terminal_size.empty()));
     if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, cwd.data(), cwd.size())) {

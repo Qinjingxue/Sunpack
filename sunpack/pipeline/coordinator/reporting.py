@@ -7,6 +7,7 @@ from collections import OrderedDict
 from typing import Any
 
 from sunpack.core.support.path_map import PathMap
+from sunpack.core.support.console_tree import tree_style
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import DirectoryFlattenResult, RunSummary, OutcomeKind
 from sunpack.core.i18n import I18nContext
@@ -37,6 +38,7 @@ class RunReporter:
         self.emit_errors = bool(emit_errors)
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
+        self._tree = tree_style(self.stdout)
         self._lock = threading.RLock()
         self._nested_tasks = 0
         self._max_depth = 0
@@ -436,9 +438,9 @@ class RunReporter:
                 pending.pop()
                 continue
             row = self._task_rows[key]
-            branch = "" if root else "+- "
+            branch = "" if root else self._tree.edge(last)
             yield prefix + branch + str(row["name"]).replace("\n", " ").replace("\r", " ")
-            child_prefix = prefix + ("" if root else "   " if last else "|  ")
+            child_prefix = prefix + ("" if root else self._tree.continuation(last))
             if not row["container"] or row["state"] == "error":
                 status_prefix = child_prefix + "  "
                 available = None if columns is None else columns - 1 - _display_width(status_prefix)
@@ -597,9 +599,9 @@ class RunReporter:
         if height > 0 and columns > 1:
             for line in self._scope_lines(self._scope_roots, columns=columns):
                 if len(lines) == height - 1:
-                    lines.append(_truncate_display("…", columns - 1))
+                    lines.append(_truncate_display(self._tree.ellipsis, columns - 1, ellipsis=self._tree.ellipsis))
                     break
-                lines.append(_truncate_display(line, columns - 1))
+                lines.append(_truncate_display(line, columns - 1, ellipsis=self._tree.ellipsis))
         previous = self._rendered_panel
         if self._rendered_size == (columns, rows) and len(previous) == len(lines):
             if previous == lines:
@@ -709,11 +711,11 @@ def _terminal_supports_updates(stream: Any) -> bool:
         return False
 
 
-def _truncate_display(text: str, max_width: int) -> str:
-    ellipsis = "…"
-    ellipsis_width = _display_width(ellipsis)
-    if max_width < ellipsis_width:
+def _truncate_display(text: str, max_width: int, *, ellipsis: str = "…") -> str:
+    if max_width <= 0:
         return ""
+    ellipsis = ellipsis[:max_width]
+    ellipsis_width = _display_width(ellipsis)
     # Each character occupies at most two cells in this renderer. Most status
     # lines fit without constructing and joining a second character buffer.
     if len(text) * 2 <= max_width or (len(text) <= max_width and text.isascii()):
@@ -721,11 +723,11 @@ def _truncate_display(text: str, max_width: int) -> str:
     width = 0
     chars = []
     for char in text:
-        char_width = 2 if ord(char) > 0xFF else 1
+        char_width = _character_width(char)
         if width + char_width > max_width:
             while chars and width + ellipsis_width > max_width:
                 removed = chars.pop()
-                width -= 2 if ord(removed) > 0xFF else 1
+                width -= _character_width(removed)
             return "".join(chars) + ellipsis
         chars.append(char)
         width += char_width
@@ -735,4 +737,10 @@ def _truncate_display(text: str, max_width: int) -> str:
 def _display_width(text: str) -> int:
     if text.isascii():
         return len(text)
-    return sum(2 if ord(char) > 0xFF else 1 for char in text)
+    return sum(_character_width(char) for char in text)
+
+
+def _character_width(char: str) -> int:
+    # Conventional terminal tree strokes and the truncation marker use one
+    # cell. Preserve the existing conservative width for other text.
+    return 1 if ord(char) <= 0xFF or char in "├─└│…" else 2

@@ -95,6 +95,35 @@ def test_incremental_panel_preserves_cursor_rows_and_completed_history(tmp_path)
     check([*history, "a log message"])
 
 
+@pytest.mark.parametrize("encoding, first, last", [("utf-8", "├─ ", "└─ "), ("cp1252", "+---", "\\---")])
+def test_live_tree_repaints_previous_last_sibling_without_stale_connectors(encoding, first, last):
+    # Progress-only panels do not change topology. Discovering another nested
+    # archive must repaint the former last edge and all its continuation bars.
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding=encoding)
+    stream.isatty = lambda: True
+    stream.supports_terminal_updates = True
+    stream.terminal_size = os.terminal_size((100, 10))
+    reporter = RunReporter(stdout=stream)
+    reporter._scope_roots["root"] = None
+    root = reporter._task_rows["root"] = reporter._new_row("root")
+    reporter._task_rows["first"] = reporter._new_row("first")
+    root["children"] = ["first"]
+    reporter._render_panel_locked(force=True)
+    assert last + "first" in reporter._rendered_panel
+    root["children"].append("last")
+    reporter._task_rows["last"] = reporter._new_row("last")
+    reporter._render_panel_locked(force=True)
+    # A same-height semantic update now exercises the partial diff path.
+    reporter._task_rows["first"]["state"] = "extracting"
+    reporter._render_panel_locked(force=True)
+    text = raw.getvalue().decode(encoding)
+    assert "\033[2K" in text
+    assert _screen(text) == (reporter._rendered_panel + [""], 0)
+    assert first + "first" in reporter._rendered_panel
+    assert last + "last" in reporter._rendered_panel
+
+
 @pytest.mark.parametrize("action", ["refresh", "pause", "log", "finish", "write_error", "flush_error"])
 def test_panel_reanchors_after_resize_or_uncertain_output(tmp_path, action):
     # A resized or partly accepted frame has no trustworthy cursor origin.
@@ -206,9 +235,9 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.resume_panel()
         text = stream.getvalue()
         assert text.index("段 1") < text.index("段 2") < text.index("nested.zip")
-        assert "   +- nested.zip" in text.splitlines()
+        assert "   └─ nested.zip" in text.splitlines()
         assert text.count("[完成] [####################] 100%") == 3
-        assert "|" in text and "+-" in text
+        assert "│" in text and "├─" in text and "└─" in text
         assert reporter._row_key(outer) not in reporter._task_rows
         if not interactive:
             assert "other.zip" not in text and "\033[" not in text

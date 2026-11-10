@@ -247,7 +247,11 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path, language, 
             assert projected.items[1]["error"] == "need password"
 
 
-def test_scan_keeps_unicode_carrier_segments_together(tmp_path):
+@pytest.mark.parametrize("encoding, first, last, continuation", [
+    ("utf-8", "├─ ", "└─ ", "│    "),
+    ("cp1252", "+---", "\\---", "|     "),
+])
+def test_scan_keeps_unicode_carrier_segments_together(tmp_path, encoding, first, last, continuation):
     from types import SimpleNamespace
     from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 
@@ -261,15 +265,15 @@ def test_scan_keeps_unicode_carrier_segments_together(tmp_path):
         TargetRunResult(carrier, OutcomeKind.SCANNED, scan_items=items),
     ))
     output, err = io.BytesIO(), io.StringIO()
-    out = io.TextIOWrapper(output, encoding="cp1252")
+    out = io.TextIOWrapper(output, encoding=encoding)
     ctx = CliContext(language="en", reporter=CliReporter(stdout=out, stderr=err))
     scan.command_result(SimpleNamespace(json=False, verbose=False, deep_detect=False), ctx, [carrier], summary)
     out.flush()
-    text = output.getvalue().decode("cp1252")
+    text = output.getvalue().decode(encoding)
     assert text.count(carrier) == text.count(other) == 1
-    assert "+- Segment 1: [10, 20)" in text.splitlines()
-    assert "+- Segment 2: [30, 40)" in text.splitlines()
-    assert "|  Volumes: incomplete" in text.splitlines()
+    assert first + "Segment 1: [10, 20)" in text.splitlines()
+    assert last + "Segment 2: [30, 40)" in text.splitlines()
+    assert continuation + "Volumes: incomplete" in text.splitlines()
     assert err.getvalue() == f"{carrier}: [30, 40): Error: damaged segment\n"
 
 
