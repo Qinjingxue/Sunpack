@@ -9,7 +9,7 @@ from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary, TargetRunResult
 from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_reporter import CliReporter
-from sunpack.runtime.cli.cli_runtime import build_password_summary
+from sunpack.runtime.cli.cli_runtime import build_password_store
 from sunpack.runtime.cli.commands import extract
 from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure
 from sunpack.core.contracts.run_state import RunState
@@ -67,12 +67,12 @@ def test_existing_cli_json_includes_postprocess_failure(tmp_path, monkeypatch, m
 
 
 def test_extract_config_combines_clipboard_passwords_for_engine():
-    password_summary = build_password_summary(
+    password_store = build_password_store(
         ["cli-secret", "shared-secret"],
         use_builtin_passwords=False,
         clipboard_passwords=["clipboard-secret", "shared-secret"],
     )
-    config = extract._extract_run_config({}, password_summary)
+    config = extract._extract_run_config({}, password_store)
 
     assert config["user_passwords"] == ["cli-secret", "shared-secret"]
     assert config["clipboard_passwords"] == ["clipboard-secret", "shared-secret"]

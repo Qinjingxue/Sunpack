@@ -1,18 +1,14 @@
 //! Short-lived spill storage. Memory limits select storage, never truncate data.
 use crate::io::resource_lifecycle::TrackedFile;
-use serde::{de::DeserializeOwned, Serialize};
+use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
-use std::marker::PhantomData;
 use std::os::windows::io::AsRawHandle;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const MEMORY_BYTES: usize = 4 * 1024 * 1024;
 // Small records are often accessed in hash order. Avoid the standard reader's
-// 8 KiB read amplification while still combining their MessagePack fields.
+// 8 KiB read amplification while still combining record lengths and names.
 const RECORD_READ_BUFFER_BYTES: usize = 256;
 
 #[derive(Debug)]
@@ -205,14 +201,13 @@ impl Slots {
     }
 }
 
-/// Exact key lookup. A private open-addressed disk index reuses the same
-/// fixed-width slots, record spool, and MessagePack encoding as manifests.
-pub(crate) struct SpillMap<V> {
-    memory: std::collections::HashMap<String, V>,
+/// Exact name deduplication, spilling through the shared slots and spool.
+pub(crate) struct SpillSet {
+    memory: HashSet<String>,
     bytes: usize,
-    disk: Option<DiskMap<V>>,
+    disk: Option<DiskSet>,
 }
-impl<V> Default for SpillMap<V> {
+impl Default for SpillSet {
     fn default() -> Self {
         Self {
             memory: Default::default(),
@@ -221,51 +216,45 @@ impl<V> Default for SpillMap<V> {
         }
     }
 }
-impl<V: Serialize + DeserializeOwned + Clone> SpillMap<V> {
+impl SpillSet {
     fn spill(&mut self) -> io::Result<()> {
         if self.disk.is_some() || self.bytes <= MEMORY_BYTES {
             return Ok(());
         }
-        let mut disk = DiskMap::new(
+        let mut disk = DiskSet::new(
             self.memory
                 .len()
                 .saturating_mul(2)
                 .max(16)
                 .next_power_of_two(),
         )?;
-        for (key, value) in &self.memory {
-            disk.put(key, value, false)?;
+        for key in &self.memory {
+            disk.insert(key)?;
         }
         self.memory = Default::default();
         self.disk = Some(disk);
         Ok(())
     }
-    pub fn insert_new(&mut self, key: String, value: V) -> io::Result<bool> {
+    pub fn insert(&mut self, key: &str) -> io::Result<bool> {
         if self.disk.is_none() {
-            let inserted = match self.memory.entry(key) {
-                std::collections::hash_map::Entry::Occupied(_) => false,
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    self.bytes = self
-                        .bytes
-                        .saturating_add(entry.key().len() + std::mem::size_of::<V>() + 64);
-                    entry.insert(value);
-                    true
-                }
-            };
+            if self.memory.contains(key) {
+                return Ok(false);
+            }
+            self.bytes = self.bytes.saturating_add(key.len() + 64);
+            self.memory.insert(key.to_owned());
             self.spill()?;
-            return Ok(inserted);
+            return Ok(true);
         }
-        self.disk.as_mut().unwrap().put(&key, &value, true)
+        self.disk.as_mut().unwrap().insert(key)
     }
 }
-struct DiskMap<V> {
+struct DiskSet {
     slots: Slots,
     capacity: usize,
     count: usize,
-    data: Mutex<BufReader<Spool>>,
-    marker: PhantomData<V>,
+    data: BufReader<Spool>,
 }
-impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
+impl DiskSet {
     fn new(capacity: usize) -> io::Result<Self> {
         Ok(Self {
             slots: Slots::new(
@@ -275,21 +264,17 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
             )?,
             capacity,
             count: 0,
-            data: Mutex::new(BufReader::with_capacity(
+            data: BufReader::with_capacity(
                 RECORD_READ_BUFFER_BYTES,
                 Spool::default(),
-            )),
-            marker: PhantomData,
+            ),
         })
     }
     fn hash(key: &str) -> u64 {
         crate::fast_hash::xxh64(key.as_bytes(), 0)
     }
-    fn row(&self, offset: u64) -> io::Result<(String, V)> {
-        let mut data = self
-            .data
-            .lock()
-            .map_err(|_| io::Error::other("scratch index poisoned"))?;
+    fn matches(&mut self, offset: u64, key: &str) -> io::Result<bool> {
+        let data = &mut self.data;
         // Spool tracks the underlying position, including read-ahead. Adjacent
         // records can reuse the buffer without a file seek or another read.
         let end = data.get_ref().position;
@@ -301,35 +286,43 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
         }
         let mut length = [0; 4];
         data.read_exact(&mut length)?;
-        let mut bytes = vec![0; u32::from_le_bytes(length) as usize];
-        data.read_exact(&mut bytes)?;
-        rmp_serde::from_slice(&bytes).map_err(io::Error::other)
+        if u32::from_le_bytes(length) as usize != key.len() {
+            return Ok(false);
+        }
+        let mut bytes = [0; RECORD_READ_BUFFER_BYTES];
+        for expected in key.as_bytes().chunks(bytes.len()) {
+            let actual = &mut bytes[..expected.len()];
+            data.read_exact(actual)?;
+            if actual != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
-    fn find(&self, key: &str, hash: u64) -> io::Result<(usize, Option<V>)> {
+    fn find(&mut self, key: &str, hash: u64) -> io::Result<(usize, bool)> {
         let mut slot = hash as usize & (self.capacity - 1);
         loop {
             let offset = self.slots.get(slot * 2);
             if offset == 0 {
-                return Ok((slot, None));
+                return Ok((slot, false));
             }
             // Probe and rehash fixed-width metadata without reading the spool.
             // The full key still decides equality, including hash collisions.
             if self.slots.get(slot * 2 + 1) == hash {
-                let (stored, value) = self.row(offset - 1)?;
-                if stored == key {
-                    return Ok((slot, Some(value)));
+                if self.matches(offset - 1, key)? {
+                    return Ok((slot, true));
                 }
             }
             slot = (slot + 1) & (self.capacity - 1);
         }
     }
-    fn put(&mut self, key: &str, value: &V, only_new: bool) -> io::Result<bool> {
+    fn insert(&mut self, key: &str) -> io::Result<bool> {
         let hash = Self::hash(key);
         let (mut slot, previous) = self.find(key, hash)?;
-        if only_new && previous.is_some() {
+        if previous {
             return Ok(false);
         }
-        if previous.is_none() && self.count >= self.capacity / 2 {
+        if self.count >= self.capacity / 2 {
             let capacity = self
                 .capacity
                 .checked_mul(2)
@@ -359,23 +352,17 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
                 slot = (slot + 1) & (capacity - 1);
             }
         }
-        let data = self
-            .data
-            .get_mut()
-            .map_err(|_| io::Error::other("scratch index poisoned"))?;
+        let data = &mut self.data;
         // Discard buffered reads before appending through the inner writer.
         let offset = data.seek(SeekFrom::End(0))?;
         let data = data.get_mut();
-        let bytes = rmp_serde::to_vec(&(key, value)).map_err(io::Error::other)?;
-        let len = u32::try_from(bytes.len()).map_err(io::Error::other)?;
+        let len = u32::try_from(key.len()).map_err(io::Error::other)?;
         data.write_all(&len.to_le_bytes())?;
-        data.write_all(&bytes)?;
+        data.write_all(key.as_bytes())?;
         self.slots.set(slot * 2, offset + 1);
         self.slots.set(slot * 2 + 1, hash);
-        if previous.is_none() {
-            self.count += 1;
-        }
-        Ok(previous.is_none())
+        self.count += 1;
+        Ok(true)
     }
 }
 
@@ -484,17 +471,24 @@ mod tests {
 
     #[test]
     fn dedup_survives_spill_and_index_growth() {
-        let mut map = SpillMap::<()>::default();
+        let mut map = SpillSet::default();
         let suffix = "x".repeat(20_000);
         for index in 0..600 {
-            assert!(map.insert_new(format!("{index}-{suffix}"), ()).unwrap());
+            assert!(map.insert(&format!("{index}-{suffix}")).unwrap());
         }
         assert!(map.disk.is_some());
         for index in (0..600).rev() {
-            assert!(!map.insert_new(format!("{index}-{suffix}"), ()).unwrap());
+            assert!(!map.insert(&format!("{index}-{suffix}")).unwrap());
         }
-        let disk = map.disk.as_ref().unwrap();
-        assert!(disk.find("different-full-key", DiskMap::<()>::hash(&format!("0-{suffix}")))
-            .unwrap().1.is_none());
+        let disk = map.disk.as_mut().unwrap();
+        assert!(!disk.find("different-full-key", DiskSet::hash(&format!("0-{suffix}")))
+            .unwrap().1);
+        let mut collision = format!("0-{suffix}");
+        collision.pop();
+        collision.push('y');
+        assert!(!disk.find(&collision, DiskSet::hash(&format!("0-{suffix}")))
+            .unwrap().1);
+        assert!(map.insert("").unwrap());
+        assert!(!map.insert("").unwrap());
     }
 }

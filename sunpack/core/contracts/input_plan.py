@@ -113,7 +113,7 @@ class InputCheckpoint:
             str(value.get("output_dir") or ""), bool(value.get("complete")),
             FailureInfo.from_dict(value.get("failure")),
             int(value["files_written"]), int(value["bytes_written"]),
-            int(value.get("recovered_complete_files") or 0),
+            int(value["recovered_complete_files"]),
         )
 
 

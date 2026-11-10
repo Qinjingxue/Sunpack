@@ -14,7 +14,34 @@ def write_extraction_result(task: ArchiveTask, result: ExtractionResult, *, phas
     with _phase(phase_timer, f"{phase_prefix}_ensure_knowledge"):
         knowledge = ensure_knowledge(task)
     with _phase(phase_timer, f"{phase_prefix}_build_payload"):
-        diagnostics = _compact_diagnostics(dict(result.diagnostics or {}))
+        diagnostics = _compact_diagnostics(result.diagnostics)
+        if result.input_results:
+            # Execution keeps one typed result per input. Expand only the
+            # bounded diagnostic preview, after the whole carrier has settled.
+            inputs = []
+            count = 0
+            for item in result.input_results:
+                if item.retained:
+                    continue
+                count += 1
+                if count > 20:
+                    continue
+                child = item.result
+                inputs.append(_compact_mapping({
+                    **item.input.projection(),
+                    "out_dir": child.out_dir, "success": child.success,
+                    "partial_outputs": child.partial_outputs or child.files_written > 0,
+                    "error": child.error,
+                    "failure": child.failure.to_dict() if child.failure is not None else None,
+                    "password_used": child.password_used,
+                    "selected_codepage": child.selected_codepage,
+                    "diagnostics": child.diagnostics,
+                    "files_written": child.files_written,
+                    "bytes_written": child.bytes_written,
+                }, max_items=20))
+            if count > 20:
+                inputs.append({"truncated_count": count - 20})
+            diagnostics["inputs"] = inputs
         worker = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
         payload = {
             "result": _result_payload(task, result),
@@ -103,14 +130,6 @@ def _compact_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
     result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
     if result:
         output["result"] = _compact_worker_result(result)
-    for key in ("output_trace", "segments", "inputs"):
-        value = diagnostics.get(key)
-        if isinstance(value, dict):
-            output[key] = _compact_mapping(value, max_items=30)
-        elif isinstance(value, list):
-            output[key] = [_compact_mapping(item, max_items=20) if isinstance(item, dict) else item for item in value[:20]]
-            if len(value) > 20:
-                output[key].append({"truncated_count": len(value) - 20})
     return output
 
 

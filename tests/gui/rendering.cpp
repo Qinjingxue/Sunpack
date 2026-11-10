@@ -239,11 +239,14 @@ void rendering_contracts() {
     {
         Surface surface(20,true);
         auto& renderer=surface.renderer;
-        if(renderer.UsesCompositionSurface()) {
+        ComPtr<ID2D1Image> initialTarget;
+        renderer.RT()->GetTarget(&initialTarget);
+        if(!initialTarget) {
             assert(SUCCEEDED(renderer.Resize(601,421)));
             ui::DisplayList base;
             base.width_px=601; base.height_px=421;
-            base.dpi_scale=float(GetDpiForWindow(surface.hwnd))/96;
+            const float dpiScale=float(GetDpiForWindow(surface.hwnd))/96;
+            base.dpi_scale=dpiScale;
             ui::DisplayListRecorder list(std::move(base));
             list.Clear(D2D1::ColorF(0x202020));
             renderer.skipVSync=true;
@@ -259,6 +262,29 @@ void rendering_contracts() {
             const auto captured=pixels(renderer);
             renderer.RT()->SetTarget(nullptr);
             assert(captured[0]==0x20 && captured[1]==0x20 && captured[2]==0x20 && captured[3]==0xff);
+
+            // A deferred frame owns a bitmap only until its explicit present;
+            // the existing screenshot path must still work after releasing it.
+            ui::DisplayList prepared;
+            prepared.width_px=601; prepared.height_px=421;
+            prepared.dpi_scale=dpiScale;
+            ui::DisplayListRecorder deferred(std::move(prepared));
+            deferred.Clear(D2D1::ColorF(0x303030));
+            renderer.skipPresent=true;
+            assert(SUCCEEDED(renderer.DrawDisplayListFrame(deferred.Finish(),false,true)));
+            renderer.RT()->GetTarget(&target);
+            assert(target);
+            target.Reset();
+            assert(SUCCEEDED(renderer.PresentPrepared(true)));
+            renderer.RT()->GetTarget(&target);
+            assert(!target);
+            screenshot=renderer.ScreenshotBitmap();
+            assert(screenshot);
+            renderer.RT()->SetTarget(screenshot.Get());
+            const auto deferredPixels=pixels(renderer);
+            renderer.RT()->SetTarget(nullptr);
+            assert(deferredPixels[0]==0x30 && deferredPixels[1]==0x30 &&
+                deferredPixels[2]==0x30 && deferredPixels[3]==0xff);
         }
     }
     // Hidden and prepared buffers must not masquerade as actual presentation.

@@ -181,10 +181,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "DIRECTORY_ERROR_REPORT_LIMIT",
         io::directory_errors::DIRECTORY_ERROR_REPORT_LIMIT,
     )?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::output_inventory_from_serialized,
-        m
-    )?)?;
     m.add_class::<scan::worker_event::NativeOutputTrace>()?;
     m.add_class::<scan::worker_wire::NativeWorkerFrameDecoder>()?;
     m.add_class::<scan::worker_event::NativeWorkerResultAccumulator>()?;

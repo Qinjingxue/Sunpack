@@ -135,11 +135,15 @@ def test_unknown_input_without_passwords_uses_unconfirmed_empty_candidate(tmp_pa
 
 
 def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path):
+    # Exceed the diagnostic preview so losing inputs outside that preview
+    # still fails through execution totals, password binding and knowledge.
     carrier = tmp_path / "carrier.bin"
-    carrier.write_bytes(b"prefix-first-gap-second-tail")
+    carrier.write_bytes(b"x" * 300)
     task = _task(carrier)
     segments = []
-    for index, (start, end) in enumerate(((7, 12), (17, 23)), start=1):
+    starts = range(7, 247, 10)
+    for index, start in enumerate(starts, start=1):
+        end = start + 5
         segments.append({
             "input_id": f"embedded_{index:02d}",
             "format": "zip",
@@ -166,11 +170,18 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
 
     assert result.success is True
     assert task.archive_input().open_mode == "file"
-    assert len({key for key, _ in resolver.calls}) == 2
+    assert len({key for key, _ in resolver.calls}) == len(starts)
     assert {key for key, _ in resolver.calls} == {node.input_id for node in task.inputs}
-    assert [call[1]["parts"][0]["start"] for call in resolver.calls] == [7, 17]
-    assert (result.files_written, result.bytes_written) == (2, 4)
+    assert [call[1]["parts"][0]["start"] for call in resolver.calls] == list(starts)
+    assert (result.files_written, result.bytes_written) == (len(starts), len(starts) * 2)
     assert all(item.complete for item in result.input_results)
+    from sunpack.pipeline.extraction.knowledge import write_extraction_result
+
+    write_extraction_result(task, result)
+    diagnostics = task.knowledge().get("extraction.diagnostics")
+    assert diagnostics["result"]["files_written"] == len(starts)
+    assert len(diagnostics["inputs"]) == 21
+    assert diagnostics["inputs"][-1] == {"truncated_count": len(starts) - 20}
 
 
 def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):

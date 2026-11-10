@@ -75,7 +75,6 @@ public:
     bool CreateRenderTargetForLayered(HWND hwnd);
     void ReleaseRenderTarget();
     HRESULT Resize(UINT width, UINT height);
-    bool UsesCompositionSurface() const { return bool(compositionFrame_); }
     void BeginDraw();
     HRESULT EndDraw(bool trimCompositionSurface = false);
     HRESULT PresentPrepared(bool skipVSync);

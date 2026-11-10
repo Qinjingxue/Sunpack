@@ -74,8 +74,6 @@ int main() {
             ConsoleCancellation controls(client, supports_cancellation({L"scan"}), true);
             DWORD active_mode = 0;
             require(GetConsoleMode(input, &active_mode) && (active_mode & ENABLE_WINDOW_INPUT), "resize input enabled");
-            expect_empty(server); // No new wire controls before negotiation.
-            controls.enable_resize();
             expect_resize(server, screen.srWindow.Right - screen.srWindow.Left + 1,
                           screen.srWindow.Bottom - screen.srWindow.Top + 1);
             controls.pause();

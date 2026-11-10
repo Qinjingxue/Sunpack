@@ -88,14 +88,14 @@ def test_embedded_failure_retains_nested_password_cause():
         kind=FailureKind.WRONG_PASSWORD,
         stage="password_resolution",
         message="password rejected",
-        message_key="failure.password_wrong_or_unknown",
+        message_key=PASSWORD_NOT_IN_LIST_KEY,
         user_action="request_password",
     )
     embedded = FailureInfo(
         kind=FailureKind.INPUTS_FAILED,
         stage="inputs",
         message="segment failed",
-        message_key="failure.embedded_wrong_password",
+        message_key=PASSWORD_NOT_IN_LIST_KEY,
         causes=(password,),
     )
 

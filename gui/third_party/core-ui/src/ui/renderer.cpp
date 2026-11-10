@@ -558,7 +558,15 @@ HRESULT Renderer::PresentCompositionFrame(bool skipVsync, bool trim) {
     const HRESULT ended = frame.surface->EndDraw();
     if (FAILED(hr)) return hr;
     if (FAILED(ended)) return ended;
-    return CommitCompositionFrame(skipVsync);
+    hr = CommitCompositionFrame(skipVsync);
+    if (SUCCEEDED(hr) && !previousBounds_.readsTarget && !previousDisplayList_.commands.empty() &&
+        previousDisplayList_.commands.front().type == DrawCommandType::Clear) {
+        // A prepared frame only needs its bitmap until the compositor owns the
+        // pixels. Screenshots can replay the retained list on demand.
+        ctx_->SetTarget(nullptr);
+        targetBitmap_.Reset();
+    }
+    return hr;
 }
 
 HRESULT Renderer::CommitCompositionFrame(bool skipVsync) {

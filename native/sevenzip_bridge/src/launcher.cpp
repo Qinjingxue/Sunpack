@@ -393,7 +393,6 @@ class ConsoleCancellation {
     HANDLE pipe_, input_ = INVALID_HANDLE_VALUE, output_ = INVALID_HANDLE_VALUE, stop_ = nullptr, main_thread_ = nullptr;
     bool enabled_, window_input_added_ = false;
     SHORT last_columns_ = 0, last_rows_ = 0;
-    std::atomic<bool> resize_supported_{false};
     std::thread listener_;
     std::mutex write_mutex_;
     std::atomic<bool> sent_{false}, prompt_{false};
@@ -460,12 +459,8 @@ public:
             throw;
         }
     }
-    void enable_resize() {
-        resize_supported_ = true;
-        resized();
-    }
     void resized() {
-        if (!resize_supported_) return;
+        if (output_ == INVALID_HANDLE_VALUE) return;
         std::lock_guard lock(write_mutex_);
         CONSOLE_SCREEN_BUFFER_INFO screen{};
         if (!GetConsoleScreenBufferInfo(output_, &screen)) return;
@@ -588,10 +583,6 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         }
         if (kind == 1) write_stream(STD_OUTPUT_HANDLE, payload);
         else if (kind == 2) write_stream(STD_ERROR_HANDLE, payload);
-        else if (kind == 4) {
-            if (size != 0 || !terminal_resize) break;
-            controls.enable_resize();
-        }
         else if (kind == 3) {
             controls.pause();
             const std::string input = read_input_line();

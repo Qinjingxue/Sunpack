@@ -1,6 +1,6 @@
 use crate::io::archive_state::{build_segments, Segment};
 use crate::io::reader::ManagedReader;
-use crate::io::scratch::SpillMap;
+use crate::io::scratch::SpillSet;
 use encoding_rs::{BIG5, GBK, SHIFT_JIS};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -322,7 +322,7 @@ struct EncodingAccumulator {
     score: i64,
     decoded_count: usize,
     count: usize,
-    components: SpillMap<()>,
+    components: SpillSet,
     units: HashSet<(u8, u8)>,
 }
 impl EncodingAccumulator {
@@ -332,7 +332,7 @@ impl EncodingAccumulator {
             score: 0,
             decoded_count: 0,
             count: 0,
-            components: SpillMap::default(),
+            components: SpillSet::default(),
             units: HashSet::new(),
         }
     }
@@ -354,7 +354,7 @@ impl EncodingAccumulator {
     fn observe_components(&mut self, decoded: &str) -> io::Result<()> {
         for part in decoded.split(['/', '\\']).filter(|part| !part.is_empty()) {
             let score = score_decoded_name(part, self.kind);
-            if score != 0 && self.components.insert_new(part.to_owned(), ())? {
+            if score != 0 && self.components.insert(part)? {
                 self.score = self.score.saturating_add(score);
             }
         }

@@ -707,11 +707,6 @@ class _PipeRequestProtocol(asyncio.Protocol):
                     queue_ms=max(0.0, (started_at - self._connected_at) * 1000.0),
                 )
             await self.send_frame(_STREAM_MAGIC + _runtime_binary_build_id())
-            if payload.get("terminal_resize"):
-                # Old clients never request this frame. New clients do not send
-                # resize controls until this acknowledgement, so an older
-                # resident source runtime continues to work without a restart.
-                await self.send_frame(struct.pack("!BI", 4, 0))
             if payload.get("shutdown"):
                 await self.send_frame(struct.pack("!BIi", 0, 4, 0))
                 await self.flush_output()
@@ -1035,7 +1030,6 @@ def _recv_stream(connection, input_stream=None, *, enable_cancel=True, enable_re
     from sunpack.core.platform.windows.console_cancel import ConsoleCancellation
 
     lock = threading.Lock()
-    resize_supported = False
     last_size = None
 
     def send(data):
@@ -1044,8 +1038,6 @@ def _recv_stream(connection, input_stream=None, *, enable_cancel=True, enable_re
 
     def resized():
         nonlocal last_size
-        if not resize_supported:
-            return
         from sunpack.pipeline.coordinator.reporting import _terminal_size
 
         with lock:
@@ -1054,23 +1046,16 @@ def _recv_stream(connection, input_stream=None, *, enable_cancel=True, enable_re
                 connection.sendall(struct.pack("!III", _RESIZE_CONTROL, *size))
                 last_size = size
 
-    def enable_terminal_resize():
-        nonlocal resize_supported
-        if enable_resize:
-            resize_supported = True
-            controls.resized()
-
     with ConsoleCancellation(
         lambda: send(struct.pack("!I", _CANCEL_CONTROL)), enabled=enable_cancel,
         on_resize=resized if enable_resize else None,
     ) as controls:
         return _recv_stream_frames(
             connection, input_stream, controls=controls, send=send,
-            enable_terminal_resize=enable_terminal_resize,
         )
 
 
-def _recv_stream_frames(connection, input_stream=None, *, controls, send, enable_terminal_resize=lambda: None) -> dict[str, Any]:
+def _recv_stream_frames(connection, input_stream=None, *, controls, send) -> dict[str, Any]:
     input_stream = sys.stdin if input_stream is None else input_stream
     while True:
         kind, size = struct.unpack("!BI", _recv_exact(connection, 5))
@@ -1081,11 +1066,7 @@ def _recv_stream_frames(connection, input_stream=None, *, controls, send, enable
             if size != 4:
                 raise ValueError("invalid persistent final frame")
             return {"exit_code": struct.unpack("!i", payload)[0], "stdout": "", "stderr": ""}
-        if kind == 4:
-            if size:
-                raise ValueError("invalid persistent resize acknowledgement")
-            enable_terminal_resize()
-        elif kind == 3:
+        if kind == 3:
             with controls.prompt():
                 try:
                     line = input_stream.readline() if input_stream is not None else ""

@@ -8,7 +8,6 @@ from sunpack.core.support.path_keys import case_key
 from sunpack_native import (
     NativeOutputInventory,
     NativeWorkerManifest,
-    output_inventory_from_serialized as _native_inventory_from_serialized,
     scan_output_inventory as _native_scan_output_inventory,
 )
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import native_worker_manifest
@@ -40,12 +39,6 @@ class OutputInventory:
         )
         self.worker_inventory_complete = bool(native.worker_inventory_complete)
 
-    def file_page(self, *, offset: int = 0, limit: int = 128) -> tuple[dict[str, Any], ...]:
-        return tuple(self._native.file_page(
-            max(0, int(offset or 0)),
-            max(0, int(limit or 0)),
-        ))
-
     def build_directory_snapshots(self, options):
         return self._native.build_directory_snapshots(options)
 
@@ -66,9 +59,7 @@ def collect_output_inventory(
 ) -> OutputInventory:
     root = os.path.abspath(output_dir) if output_dir else ""
     if not output_dir:
-        return OutputInventory.from_native(_native_inventory_from_serialized(
-            root, [], False, False, 0, 0, 0, 0, False, False,
-        ))
+        return OutputInventory.from_native(NativeOutputInventory.empty())
     worker_inventory = _complete_worker_inventory(worker_result)
     if worker_inventory is not None:
         return OutputInventory.from_native(worker_inventory.to_output_inventory(root))

@@ -390,6 +390,22 @@ impl NativeOutputInventory {
 
 #[pymethods]
 impl NativeOutputInventory {
+    #[staticmethod]
+    fn empty() -> Self {
+        Self {
+            root: String::new(),
+            exists: false,
+            is_dir: false,
+            file_count: 0,
+            dir_count: 0,
+            total_size: 0,
+            unreadable_count: 0,
+            files: Arc::new(Vec::new()),
+            worker_inventory_complete: false,
+            identity_paths: false,
+        }
+    }
+
     #[getter]
     fn root(&self) -> &str {
         &self.root
@@ -456,11 +472,6 @@ impl NativeOutputInventory {
             )
         });
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
-    }
-
-    #[pyo3(signature = (offset=0, limit=128))]
-    fn file_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<Py<PyDict>>> {
-        output_file_page(py, &self.files, offset, limit)
     }
 }
 
@@ -1368,79 +1379,6 @@ pub(crate) fn scan_output_inventory(py: Python<'_>, output_dir: String) -> Nativ
     py.detach(|| scan_output_inventory_impl(&output_dir))
 }
 
-#[pyfunction]
-#[pyo3(signature = (
-    root, files, exists, is_dir, file_count, dir_count, total_size,
-    unreadable_count,
-    worker_inventory_complete, identity_paths
-))]
-pub(crate) fn output_inventory_from_serialized(
-    py: Python<'_>,
-    root: String,
-    files: Vec<Py<PyDict>>,
-    exists: bool,
-    is_dir: bool,
-    file_count: usize,
-    dir_count: usize,
-    total_size: u64,
-    unreadable_count: usize,
-    worker_inventory_complete: bool,
-    identity_paths: bool,
-) -> PyResult<NativeOutputInventory> {
-    let mut records = Vec::with_capacity(files.len());
-    for item in files {
-        let dict = item.bind(py);
-        let path = py_dict_string(dict, "path")?.unwrap_or_default();
-        let output_path = py_dict_string(dict, "output_path")?.filter(|value| value != &path);
-        let size = py_dict_u64(dict, "size")?.unwrap_or(0);
-        let status = match py_dict_string(dict, "status")?.as_deref() {
-            Some("complete") => 1,
-            Some("failed") => 2,
-            _ => 0,
-        };
-        let has_crc = py_dict_bool(dict, "has_crc")?.unwrap_or(false);
-        let has_output_crc = py_dict_bool(dict, "has_output_crc")?.unwrap_or(false);
-        records.push(OutputFileRecord {
-            index: py_dict_u64(dict, "index")?.unwrap_or(records.len() as u64) as u32,
-            path,
-            abs_path: None,
-            output_path,
-            size,
-            bytes_written: py_dict_u64(dict, "bytes_written")?.unwrap_or(size),
-            crc32: if has_crc {
-                py_dict_u64(dict, "crc32")?.map(|value| value as u32)
-            } else {
-                None
-            },
-            output_crc32: if has_output_crc {
-                py_dict_u64(dict, "output_crc32")?.map(|value| value as u32)
-            } else {
-                None
-            },
-            crc_ok: py_dict_bool(dict, "crc_ok")?,
-            status,
-            mtime_ns: py_dict_u64(dict, "mtime_ns")?,
-            magic: dict
-                .get_item("magic")?
-                .map(|value| value.extract::<Vec<u8>>())
-                .transpose()?
-                .unwrap_or_default(),
-        });
-    }
-    Ok(NativeOutputInventory {
-        root,
-        exists,
-        is_dir,
-        file_count,
-        dir_count,
-        total_size,
-        unreadable_count,
-        files: Arc::new(records),
-        worker_inventory_complete,
-        identity_paths,
-    })
-}
-
 pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {
     let root = PathBuf::from(output_dir);
     let exists = root.exists();
@@ -1461,39 +1399,6 @@ pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInvent
         worker_inventory_complete: false,
         identity_paths: false,
     }
-}
-
-fn py_dict_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
-    let Some(value) = dict.get_item(key)? else {
-        return Ok(None);
-    };
-    if value.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(value.str()?.to_string_lossy().into_owned()))
-}
-
-fn py_dict_u64(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
-    let Some(value) = dict.get_item(key)? else {
-        return Ok(None);
-    };
-    if value.is_none() {
-        return Ok(None);
-    }
-    Ok(value
-        .extract::<u64>()
-        .ok()
-        .or_else(|| value.extract::<i64>().ok().map(|item| item.max(0) as u64)))
-}
-
-fn py_dict_bool(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<bool>> {
-    let Some(value) = dict.get_item(key)? else {
-        return Ok(None);
-    };
-    if value.is_none() {
-        return Ok(None);
-    }
-    value.extract::<bool>().map(Some)
 }
 
 #[derive(Default)]

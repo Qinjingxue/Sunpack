@@ -58,7 +58,7 @@ class ExtractionResult:
 
     @property
     def has_complete_inputs(self) -> bool:
-        return any(self.complete_input_results())
+        return any(item.complete for item in self.input_results)
 
     @property
     def has_retained_outputs(self) -> bool:
@@ -74,7 +74,3 @@ class ExtractionResult:
         if manifest is not None:
             return manifest.summary["complete"] if manifest.worker_status == "failed" else 0
         return self.recovered_complete_files
-
-    def complete_input_results(self):
-        """Independent payloads safe to retain and recursively discover."""
-        return (item for item in self.input_results if item.complete)

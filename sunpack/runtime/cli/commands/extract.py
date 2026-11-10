@@ -9,7 +9,7 @@ from sunpack.runtime.cli.cli_parsers import (
 )
 from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
-    build_password_summary,
+    build_password_store,
     collect_clipboard_passwords,
     collect_cli_passwords_async,
     interrupted_result,
@@ -118,14 +118,14 @@ async def handle(args, ctx, *, operation="extract"):
         scan_report = RunState()
         all_recovered_outputs: list[dict] = []
         cleanup_results_by_path = {}
-    initial_password_summary = build_password_summary(
+    initial_password_store = build_password_store(
         passwords,
         use_builtin_passwords=not args.no_builtin_passwords,
         clipboard_passwords=clipboard_passwords,
     )
     run_config = _extract_run_config(
         config,
-        initial_password_summary,
+        initial_password_store,
         quiet=is_scan or reporter.quiet or reporter.json_mode,
         verbose=bool(getattr(reporter, "verbose", False)),
         json_mode=bool(args.json),
@@ -211,12 +211,12 @@ async def handle(args, ctx, *, operation="extract"):
         async with command_work_broker(ctx) as broker:
             return await broker.run("cli_output", "", command_result, args, ctx, target_paths, summary)
 
-    password_summary = build_password_summary(
+    password_store = build_password_store(
         passwords,
         use_builtin_passwords=not args.no_builtin_passwords,
         recent_passwords=recent_passwords,
         clipboard_passwords=clipboard_passwords,
-        password_snapshot=initial_password_summary.password_snapshot,
+        password_snapshot=initial_password_store.snapshot,
     )
 
     final_summary = RunSummary(
@@ -258,7 +258,7 @@ async def handle(args, ctx, *, operation="extract"):
             ],
         },
         errors=failed_tasks,
-        items=[password_summary_item(password_summary)],
+        items=[password_summary_item(password_store, use_builtin_passwords=not args.no_builtin_passwords)],
         tasks=attempts,
     )
     if failed_tasks:
@@ -269,7 +269,7 @@ async def handle(args, ctx, *, operation="extract"):
 
 def _extract_run_config(
     config: dict,
-    password_summary,
+    password_store,
     *,
     quiet: bool = False,
     verbose: bool = False,
@@ -286,9 +286,9 @@ def _extract_run_config(
         **(config.get("extraction", {}) if isinstance(config.get("extraction"), dict) else {}),
         "quiet": not verbose,
     }
-    run_config["user_passwords"] = password_summary.user_passwords
-    run_config["clipboard_passwords"] = password_summary.clipboard_passwords
-    run_config["password_snapshot"] = password_summary.password_snapshot
+    run_config["user_passwords"] = password_store.user_passwords
+    run_config["clipboard_passwords"] = password_store.clipboard_passwords
+    run_config["password_snapshot"] = password_store.snapshot
     return run_config
 
 

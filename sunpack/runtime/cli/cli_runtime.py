@@ -1,8 +1,7 @@
 import os
-from dataclasses import fields
 from typing import Any
 
-from sunpack.runtime.cli.cli_types import CliCommandResult, CliPasswordSummary
+from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.core.config.loader import apply_config_overrides
 from sunpack.core.config.schema import normalize_config_value
 from sunpack.core.passwords import dedupe_passwords, PasswordStore, read_password_file
@@ -89,26 +88,18 @@ async def collect_cli_passwords_async(args, ctx) -> list[str]:
     return passwords
 
 
-def build_password_summary(
+def build_password_store(
     user_passwords: list[str],
     use_builtin_passwords: bool,
     recent_passwords: list[str] | None = None,
     clipboard_passwords: list[str] | None = None,
     password_snapshot=None,
-) -> CliPasswordSummary:
+) -> PasswordStore:
     snapshot = (password_snapshot if password_snapshot is not None else password_file_source().snapshot) if use_builtin_passwords else EMPTY_PASSWORD_SNAPSHOT
-    store = PasswordStore.from_sources(
+    return PasswordStore.from_sources(
         cli_passwords=user_passwords,
         clipboard_passwords=clipboard_passwords,
         recent_passwords=recent_passwords,
-        password_snapshot=snapshot,
-    )
-    return CliPasswordSummary(
-        user_passwords=store.user_passwords,
-        clipboard_passwords=store.clipboard_passwords,
-        recent_passwords=store.recent_passwords,
-        builtin_passwords=store.builtin_passwords,
-        use_builtin_passwords=use_builtin_passwords,
         password_snapshot=snapshot,
     )
 
@@ -140,5 +131,12 @@ def apply_runtime_config_overrides(config: dict, args, *, base_dir: str | None =
     return overrides
 
 
-def password_summary_item(summary: CliPasswordSummary) -> dict[str, Any]:
-    return {**{f.name: getattr(summary, f.name) for f in fields(summary) if f.name != "password_snapshot"}, "combined_passwords": summary.combined_passwords}
+def password_summary_item(store: PasswordStore, *, use_builtin_passwords: bool) -> dict[str, Any]:
+    return {
+        "user_passwords": store.user_passwords,
+        "clipboard_passwords": store.clipboard_passwords,
+        "recent_passwords": store.recent_passwords,
+        "builtin_passwords": store.builtin_passwords,
+        "use_builtin_passwords": use_builtin_passwords,
+        "combined_passwords": store.candidates(),
+    }

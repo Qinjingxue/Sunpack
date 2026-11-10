@@ -108,9 +108,6 @@ def test_partial_input_checkpoint_keeps_evidence_but_never_becomes_complete(tmp_
     decision = ContentRecoveryPolicy("allow_partial").decide(resumed)
     assert decision.outcome_kind == OutcomeKind.PARTIAL_SUCCESS and decision.complete_files == 5
     assert ContentRecoveryPolicy("complete").decide(resumed).outcome_kind == OutcomeKind.FAILURE
-    old = checkpoint.to_dict()
-    del old["recovered_complete_files"]
-    assert InputCheckpoint.from_dict(old).recovered_complete_files == 0
 
 
 def test_carrier_partial_output_survives_password_retry_and_uses_child_scan_roots(tmp_path):

@@ -1722,11 +1722,10 @@ def test_resize_controls_update_live_stream_without_consuming_prompt_text(monkey
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("acknowledge, enabled", [(True, True), (False, True), (True, False)])
-def test_client_resize_negotiation_and_prompt_resume(monkeypatch, acknowledge, enabled):
-    # An old resident source runtime shares python.exe's build ID. It must not
-    # receive a new control unless it acknowledges capability. Prompt resume
-    # also catches a resize whose console event was consumed by line input.
+@pytest.mark.parametrize("enabled", [True, False])
+def test_client_resize_and_prompt_resume(monkeypatch, enabled):
+    # Prompt resume catches a resize whose console event was consumed by line
+    # input, while duplicate events must not resend the same geometry.
     from contextlib import contextmanager
     from sunpack.core.platform.windows import console_cancel
 
@@ -1741,7 +1740,7 @@ def test_client_resize_negotiation_and_prompt_resume(monkeypatch, acknowledge, e
             controls.append(self)
 
         def __enter__(self):
-            self.resized()  # Before the server acknowledges: no control sent.
+            self.resized()
             return self
 
         def __exit__(self, *_):
@@ -1759,8 +1758,7 @@ def test_client_resize_negotiation_and_prompt_resume(monkeypatch, acknowledge, e
             self.resized()  # Duplicate console events do not resend geometry.
 
     monkeypatch.setattr(console_cancel, "ConsoleCancellation", Controls)
-    wire = ((struct.pack("!BI", 4, 0) if acknowledge else b"")
-            + struct.pack("!BI", 3, 0) + struct.pack("!BIi", 0, 4, 0))
+    wire = struct.pack("!BI", 3, 0) + struct.pack("!BIi", 0, 4, 0)
 
     class Connection:
         data = io.BytesIO(wire)
@@ -1778,7 +1776,7 @@ def test_client_resize_negotiation_and_prompt_resume(monkeypatch, acknowledge, e
     )["exit_code"] == 0
     password = b"quietQpassword\n"
     expected = struct.pack("!I", len(password)) + password
-    if acknowledge and enabled:
+    if enabled:
         expected = (struct.pack("!III", persistent_process._RESIZE_CONTROL, 120, 30)
                     + struct.pack("!III", persistent_process._RESIZE_CONTROL, 41, 6) + expected)
     assert connection.sent == expected
@@ -1789,7 +1787,7 @@ def test_client_resize_negotiation_and_prompt_resume(monkeypatch, acknowledge, e
 @pytest.mark.parametrize("stdout_tty, stdin_tty", [(True, True), (False, True), (True, False)])
 def test_resize_capability_round_trips_only_for_interactive_clients(monkeypatch, tmp_path, stdout_tty, stdin_tty, unicode_tree):
     # Control-only tests bypass the request header and would miss an omitted
-    # capability flag or an acknowledgement leaked to redirected/old clients.
+    # capability flag or an incorrect terminal capability for redirected output.
     from sunpack.runtime.cli import cli
 
     build_id = b"0" * 16
@@ -1841,7 +1839,6 @@ def test_resize_capability_round_trips_only_for_interactive_clients(monkeypatch,
         assert payload["stdout_unicode_tree"] == unicode_tree
         await server._run_request(payload)
         handshake = persistent_process._STREAM_MAGIC + build_id
-        acknowledgement = struct.pack("!BI", 4, 0) if expected else b""
-        assert writer.wire == handshake + acknowledgement + struct.pack("!BIi", 0, 4, 0)
+        assert writer.wire == handshake + struct.pack("!BIi", 0, 4, 0)
 
     asyncio.run(scenario())
