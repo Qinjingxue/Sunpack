@@ -60,8 +60,7 @@ def command_result(args, ctx, paths, summary):
                     or (item.get("error_kind") == FailureKind.MISSING_VOLUME
                         and item.get("volume_completeness") == "missing")
                 )):
-                    error_prefix = f"{path}{_range(item)}: " if ctx.reporter.quiet else prefix
-                    ctx.reporter.error(error_prefix + ctx.t("cli.scan.error", error=item["error"]))
+                    ctx.reporter.error(f"{path}{_range(item)}: " + ctx.t("cli.scan.error", error=item["error"]))
                 for text in _details(item, ctx):
                     ctx.reporter.info(prefix + text)
         for failure in summary.scan_failures:

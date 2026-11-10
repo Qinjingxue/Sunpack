@@ -48,6 +48,9 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.tasks_discovered(1, [outer, other])
         reporter.task_started(outer)
         reporter.task_started(other)
+        before_detail = stream.getvalue()
+        reporter.task_progress(outer, {"event": "task_detail", "detail": "invisible in normal mode"})
+        assert stream.getvalue() == before_detail
         for node in nodes:
             child = ArchiveTask.from_archive_input(node.descriptor, discovery_source="embedded", logical_inputs=(node,))
             child.key = node.input_id
@@ -122,6 +125,67 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         assert "access denied" in stream.getvalue()
         assert stream.getvalue().count("[跳过]") == 2
         assert "等待队列" not in stream.getvalue()
+
+
+@pytest.mark.parametrize("complete_positions", [(1,), (1, 3)])
+def test_retry_tree_keeps_retained_siblings_and_selected_input_updates(tmp_path, complete_positions):
+    # The normal tree test has no recovery checkpoints. This covers a retry
+    # selecting one or several inputs without hiding failed/complete siblings,
+    # resurrecting selected inputs' stale errors, or losing output ownership.
+    from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
+    from sunpack.core.contracts.input_plan import InputCheckpoint, InputRecovery, LogicalArchiveInput
+    from sunpack.core.contracts.tasks import ArchiveTask
+    from sunpack.core.contracts.failures import FailureInfo, FailureKind, aggregate_input_failures
+    from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
+    from sunpack.core.support.path_keys import path_key
+    from tests.helpers.archive_tasks import make_archive_task
+
+    carrier = str(tmp_path / "carrier.bin")
+    nodes = tuple(LogicalArchiveInput(ArchiveInputDescriptor(
+        carrier, open_mode="file_range", format_hint="zip",
+        parts=[ArchiveInputPart(InputExtent(carrier, i * 100, i * 100 + 40))],
+    ), position=i) for i in range(1, 5))
+    missing = FailureInfo(FailureKind.MISSING_VOLUME, "extraction", "retained segment needs volume")
+    password = FailureInfo(FailureKind.WRONG_PASSWORD, "extraction", "old password failure")
+    generation = ((path_key(carrier), 1, 1000),)
+    output = str(tmp_path / "out")
+    task = ArchiveTask.from_archive_input(nodes[0].descriptor, discovery_source="embedded", logical_inputs=nodes)
+    recovery = InputRecovery(tuple(InputCheckpoint(
+        node, generation, str(tmp_path / "out" / str(node.position)),
+        complete=node.position in complete_positions,
+        failure=None if node.position in complete_positions else missing if node.position == 2 else password,
+    ) for node in nodes), output, len(nodes))
+    selected, task.recovery = recovery.select(nodes, generation, password_changed=True)
+    assert tuple(node.position for node in selected) == ((3, 4) if complete_positions == (1,) else (4,))
+
+    stream = io.StringIO()
+    reporter = RunReporter("en", stdout=stream)
+    reporter.tasks_discovered(1, [task])
+    reporter.task_started(task)
+    task.set_inputs(selected)
+    reporter.task_replanned(task)
+    for node in selected:
+        child = ArchiveTask.from_archive_input(node.descriptor, discovery_source="embedded", logical_inputs=(node,))
+        child.key = node.input_id
+        child.runtime = dict(task.runtime)
+        reporter.task_progress(child, {"event": "input_started"})
+        reporter.task_progress(child, {"event": "input_finished", "success": True,
+                                      "out_dir": str(tmp_path / "out" / str(node.position))})
+    failure = aggregate_input_failures([missing], segment_count=len(nodes), i18n=reporter.i18n)
+    reporter.task_finished(task, SimpleNamespace(outcome_kind=OutcomeKind.FAILURE,
+        result=SimpleNamespace(error=failure.message, out_dir=output, failure=failure, has_complete_inputs=True,
+            input_results=[InputExecutionResult(node, ExtractionResult(True,
+                str(tmp_path / "out" / str(node.position)))) for node in selected])), 1)
+    nested = make_archive_task(tmp_path / "out" / "1" / "nested.zip")
+    reporter.tasks_discovered(2, [nested])
+    reporter.task_finished(nested, _success(tmp_path / "out" / "1" / "nested"), 2)
+    reporter.scope_finished(task)
+    text = stream.getvalue()
+    assert [text.index(f"Segment {i}") for i in range(1, 5)] == sorted(text.index(f"Segment {i}") for i in range(1, 5))
+    assert text.count("[Complete]") == 4  # Three complete segments plus nested output.
+    assert "retained segment needs volume" in text and "old password failure" not in text
+    assert text.index("nested.zip") < text.index("Segment 2")
+    assert not reporter._task_rows and not reporter._scope_roots and not reporter._output_rows
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows console handles")

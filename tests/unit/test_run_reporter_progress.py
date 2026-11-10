@@ -86,8 +86,8 @@ def test_final_summary_distinguishes_scan_and_archive_errors(tmp_path, language,
     )
     if emit_errors:
         assert f"{path}: {labels[3]}" in errors.getvalue()
-        assert errors.getvalue().count(labels[0]) == 2 + quiet
-        assert ("shown.7z [shown in tree]" in errors.getvalue()) == quiet
+        assert errors.getvalue().count(labels[0]) == 3
+        assert "shown.7z [shown in tree]" in errors.getvalue()
         assert "bad-input [invalid target]" in errors.getvalue()
         assert "nested.7z [promotion failed]" in errors.getvalue()
         assert errors.getvalue().count(labels[1]) == 2

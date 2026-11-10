@@ -58,25 +58,23 @@ async def handle(args, ctx, *, operation="extract"):
     reporter = ctx.reporter
     target_paths = resolve_target_paths(args.paths, base_dir=ctx.cwd)
 
+    from sunpack.runtime.cli.cli import command_work_broker
     from sunpack.runtime.cli.runtime_state import runtime_host
 
     host = runtime_host()
     lease_owner = uuid.uuid4().hex
     if host is not None:
         conflict = host.archive_registry.reserve(lease_owner, "foreground", target_paths)
-        if conflict is not None and conflict.origin == "watch":
-            return EXIT_TASK_FAILED, CliCommandResult(
-                command=operation,
-                inputs={"paths": target_paths},
-                summary={"status": "watch_busy", "conflicts": list(conflict.paths)},
-                errors=[ctx.t("cli.watch_busy")],
-            )
         if conflict is not None:
+            watch_busy = conflict.origin == "watch"
+            message = ctx.t("cli.watch_busy" if watch_busy else "cli.archive_busy")
+            async with command_work_broker(ctx) as broker:
+                await broker.run("cli_output", "", reporter.error, message)
             return EXIT_TASK_FAILED, CliCommandResult(
                 command=operation,
                 inputs={"paths": target_paths},
-                summary={"status": "busy", "conflicts": list(conflict.paths)},
-                errors=[ctx.t("cli.archive_busy")],
+                summary={"status": "watch_busy" if watch_busy else "busy", "conflicts": list(conflict.paths)},
+                errors=[message],
             )
         current_task = asyncio.current_task()
         if current_task is not None:
@@ -93,7 +91,10 @@ async def handle(args, ctx, *, operation="extract"):
         )
         clipboard_passwords = collect_clipboard_passwords(config)
     except Exception as exc:
-        return EXIT_USAGE, CliCommandResult(command=operation, inputs={"paths": list(args.paths)}, summary={}, errors=[ctx.t("cli.operation_failed", error=exc)])
+        message = ctx.t("cli.operation_failed", error=exc)
+        async with command_work_broker(ctx) as broker:
+            await broker.run("cli_output", "", reporter.error, message)
+        return EXIT_USAGE, CliCommandResult(command=operation, inputs={"paths": list(args.paths)}, summary={}, errors=[message])
 
     common_root = resolve_common_root(target_paths)
     config.setdefault("output", {})["common_root"] = common_root
@@ -108,8 +109,6 @@ async def handle(args, ctx, *, operation="extract"):
             for path in target_paths:
                 reporter.detail(ctx.t("cli.detail_item_path", path=path))
         reporter.detail(ctx.t("cli.extract.common_root", root=common_root))
-
-    from sunpack.runtime.cli.cli import command_work_broker
 
     async with command_work_broker(ctx) as broker:
         await broker.run("cli_output", "", report_targets)

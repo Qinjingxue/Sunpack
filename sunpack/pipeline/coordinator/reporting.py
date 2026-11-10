@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from sunpack.core.support.path_map import PathMap
@@ -42,7 +43,9 @@ class RunReporter:
         self._output_rows = PathMap()
         self._top_level_outputs = PathMap()
         self._interactive = not self.quiet and _terminal_supports_updates(self.stdout)
-        self._scope_roots = {}
+        # Iteration must visit active roots, not deleted dict slots from a
+        # large batch whose earlier scopes have already finished.
+        self._scope_roots = OrderedDict()
         self._rendered_lines = 0
         self._panel_pauses = 0
         self._finished_scopes = set()
@@ -98,6 +101,16 @@ class RunReporter:
             if row is None:
                 return
             inputs = getattr(task, "inputs", ())
+            retained = {}
+            if inputs and task.recovery.checkpoints:
+                selected_ids = {node.input_id for node in inputs}
+                retained = {item.input.input_id: item for item in task.recovery.checkpoints
+                            if item.input.input_id not in selected_ids}
+                if retained:
+                    # A retry executes only changed inputs. Keep unchanged
+                    # siblings visible without retaining their task/results.
+                    inputs = sorted((*inputs, *(item.input for item in retained.values())),
+                                    key=lambda node: node.position)
             if len(inputs) > 1:
                 row["container"] = True
                 for node in inputs:
@@ -108,7 +121,15 @@ class RunReporter:
                     if extent:
                         name += f" [{extent.start}, {extent.end if extent.end is not None else '?'})"
                     child_row = self._task_rows[child] = self._new_row(name)
-                    if node.failure is not None:
+                    checkpoint = retained.get(node.input_id)
+                    if checkpoint is not None:
+                        detail = ""
+                        if not checkpoint.complete:
+                            detail = (self._format_failure(checkpoint.failure) if checkpoint.failure
+                                      else self.i18n.t("failure.verification_failed"))
+                        self._finish_row(child_row, "complete" if checkpoint.complete else "error", detail)
+                        self._set_output(child, child_row, checkpoint.output_dir, attach=checkpoint.complete)
+                    elif node.failure is not None:
                         self._finish_row(child_row, "error", self._format_failure(node.failure))
                     row["children"].append(child)
             row["state"] = "preparing"
@@ -141,6 +162,8 @@ class RunReporter:
 
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
         name = str(event.get("event") or "")
+        if name == "task_detail" and not self.verbose:
+            return
         if self.quiet and not (self.emit_errors and name in _SPACE_EVENTS):
             return
         if name in {"input_started", "input_finished", "task_detail"}:
@@ -477,12 +500,6 @@ class RunReporter:
                 self._print(self.i18n.t(key, task=self._format_failure(failure)), error=True)
             for result in summary.target_results:
                 if result.outcome_kind != OutcomeKind.FAILURE:
-                    continue
-                # Task failures already appear in the tree unless progress is
-                # hidden or a later post-processing step failed.
-                if not self.quiet and result.task_key and (
-                    result.failure is None or result.failure.stage != "postprocess"
-                ):
                     continue
                 key = "report.input_error" if result.failure is not None and result.failure.kind == FailureKind.INVALID_INPUT else "report.failed"
                 message = result.failure_message or f"{result.input_path} [{result.error}]"

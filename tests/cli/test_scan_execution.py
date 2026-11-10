@@ -239,7 +239,8 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path, language, 
             assert password_label in out.getvalue()
             assert ctx.t("cli.scan.parts", parts="first.bin") in out.getvalue()
             assert ctx.t("cli.scan.volumes", state=ctx.t("cli.scan.volumes.missing")) in out.getvalue()
-            assert err.getvalue() == "  " + ctx.t("cli.scan.error", error=damaged.message) + "\n"
+            assert err.getvalue() == (f"{items[2]['main_path']}: [256, ?): "
+                                     + ctx.t("cli.scan.error", error=damaged.message) + "\n")
         if not json_mode:
             assert damaged.message in err.getvalue()
         else:
@@ -266,7 +267,7 @@ def test_scan_keeps_unicode_carrier_segments_together(tmp_path):
     assert text.count(carrier) == text.count(other) == 1
     assert "Segment 1: [10, 20)" in text and "Segment 2: [30, 40)" in text
     assert "Volumes: incomplete" in text
-    assert err.getvalue() == "   Error: damaged segment\n"
+    assert err.getvalue() == f"{carrier}: [30, 40): Error: damaged segment\n"
 
 
 def test_rar_boundary_batch_preserves_later_success_and_truncated_password(tmp_path):

@@ -27,7 +27,6 @@ class CliReporter:
         self.verbose = verbose
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
-        self.logs: list[str] = []
 
     def info(self, message: str):
         if not self.json_mode and not self.quiet:

@@ -52,6 +52,41 @@ def test_i18n_catalogs_have_matching_keys_and_placeholders():
     validate_catalog()
 
 
+def test_extract_scan_early_errors_remain_visible_without_duplicate_json(tmp_path, monkeypatch):
+    # Pipeline reporting never runs on reservation/password-input failures.
+    # Exercise both commands' early exits; successful pipeline tests miss this
+    # silent nonzero-exit regression after removal of human emit_result logs.
+    import asyncio
+    import io
+    from types import SimpleNamespace
+    from sunpack.runtime.cli import runtime_state
+    from sunpack.runtime.cli.cli_reporter import CliReporter
+    from sunpack.runtime.cli.commands import extract, scan
+
+    async def bad_passwords(*_args, **_kwargs):
+        raise OSError("password input unavailable")
+
+    monkeypatch.setattr(extract, "load_request_config", lambda _cwd: {})
+    monkeypatch.setattr(extract, "collect_cli_passwords_async", bad_passwords)
+    for command in (extract, scan):
+        for json_mode in (False, True):
+            for origin in ("watch", "foreground", None):
+                conflict = SimpleNamespace(origin=origin, paths=(str(tmp_path),)) if origin else None
+                host = SimpleNamespace(archive_registry=SimpleNamespace(reserve=lambda *_: conflict))
+                monkeypatch.setattr(runtime_state, "runtime_host", lambda: host if conflict else None)
+                out, err = io.StringIO(), io.StringIO()
+                ctx = CliContext(language="en", cwd=str(tmp_path), stdout=out, stderr=err,
+                                 reporter=CliReporter(json_mode=json_mode, stdout=out, stderr=err))
+                args = build_cli_parser(ctx, command=command.COMMAND).parse_args([
+                    command.COMMAND, str(tmp_path), *(["--json"] if json_mode else []),
+                ])
+                code, result = asyncio.run(command.handle(args, ctx))
+                assert code != 0 and len(result.errors) == 1
+                assert result.command == command.COMMAND
+                assert err.getvalue() == ("" if json_mode else result.errors[0] + "\n")
+                assert not out.getvalue()
+
+
 def test_cli_parser_registers_discovered_commands():
     ctx = CliContext(language="en")
     parser = build_cli_parser(ctx)
