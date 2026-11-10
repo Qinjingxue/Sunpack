@@ -100,20 +100,24 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(tmp_path, monk
             assert await service.reload() is False  # Own flag write is metadata only.
             assert service.scheduler is scheduler
 
-            # Real file notification, equivalent paths, reordered roots and a comment.
+            # Real notifications from GUI-style saves must publish under the same
+            # mutex as the service reader, never expose a transient empty file.
+            # Equivalent paths, reordered roots and a comment preserve policy.
             alias = str(pending_root).upper().replace("\\", "/") + "/."
-            roots_path.write_text(
-                f"# changed without changing policy\n{alias} | {str(pending_out).upper()} | true | true\n"
-                f"{old_root} | {old_out} | false | true\n", encoding="utf-8",
-            )
+            with service_module._watch_roots_mutex(roots_path):
+                roots_path.write_text(
+                    f"# changed without changing policy\n{alias} | {str(pending_out).upper()} | true | true\n"
+                    f"{old_root} | {old_out} | false | true\n", encoding="utf-8",
+                )
             await wait_until(task, lambda: service.service_config["root_entries"][0].input_root == service_module.normalize_root(alias))
             assert service.scheduler is scheduler and len(scans) == 1
 
             # Resetting only a flag scans on the live scheduler.
-            roots_path.write_text(
-                f"{pending_root} | {pending_out} | true | true\n{old_root} | {old_out} | false | false\n",
-                encoding="utf-8",
-            )
+            with service_module._watch_roots_mutex(roots_path):
+                roots_path.write_text(
+                    f"{pending_root} | {pending_out} | true | true\n{old_root} | {old_out} | false | false\n",
+                    encoding="utf-8",
+                )
             await wait_until(task, lambda: marker_was_extracted(old_out, ignored.marker_name, ignored.marker_text))
             assert service.scheduler is scheduler
             assert len(scans) == 2 and scans[-1] == (service_module.path_key(str(old_root)),)
