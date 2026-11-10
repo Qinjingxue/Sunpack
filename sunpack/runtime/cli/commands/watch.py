@@ -27,7 +27,6 @@ def register(subparsers, ctx):
         aliases=COMMAND_ALIASES[COMMAND],
         parents=[common],
         help=ctx.t("cli.watch.help"),
-        usage="sunpack watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]",
     )
     parser.set_defaults(command=COMMAND)
     actions = parser.add_subparsers(dest="watch_action", required=True)
@@ -56,7 +55,10 @@ def register(subparsers, ctx):
     status_parser.set_defaults(watch_action="status")
 
     startup_parser = actions.add_parser("startup", parents=[common], help=ctx.t("cli.watch.startup"))
-    startup_parser.add_argument("startup_action", choices=["enable", "disable", "status"], help=ctx.t("cli.watch.startup_action"))
+    startup_parser.add_argument(
+        "startup_action", choices=["enable", "disable", "status"], metavar="action",
+        help=ctx.t("cli.watch.startup_action"),
+    )
 
 
 async def handle(args, ctx):

@@ -53,17 +53,7 @@ def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) 
     modules = discover_command_modules(command)
     ctx.commands = command_map(modules)
 
-    parser = _ContextArgumentParser(
-        description=ctx.t("cli.description"),
-        usage=ctx.t("cli.usage"),
-        epilog=(
-            f"{ctx.t('cli.examples')}\n"
-            '  sunpack e C:\\Archives -r "*" -c r\n'
-            "  sunpack s .\\fixtures -v -j\n"
-            "  sunpack pw -a\n"
-            "  sunpack w add C:\\Downloads -s -R"
-        ),
-    )
+    parser = _ContextArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True, parser_class=_ContextArgumentParser)
     for module in modules:
         module.register(subparsers, ctx)

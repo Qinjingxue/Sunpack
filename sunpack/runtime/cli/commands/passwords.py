@@ -20,7 +20,6 @@ def register(subparsers, ctx):
         aliases=COMMAND_ALIASES[COMMAND],
         parents=[build_json_parser(ctx), build_password_parser(ctx)],
         help=ctx.t("cli.passwords.help"),
-        usage="sunpack passwords [options]",
     )
     parser.set_defaults(command=COMMAND)
 

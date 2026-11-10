@@ -19,7 +19,7 @@ def register(subparsers, ctx):
     parser = subparsers.add_parser(
         COMMAND, aliases=COMMAND_ALIASES[COMMAND],
         parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx)],
-        help=ctx.t("cli.scan.help"), usage="sunpack scan [options] <paths...>",
+        help=ctx.t("cli.scan.help"),
     )
     parser.set_defaults(command=COMMAND)
     parser.add_argument("paths", nargs="+", help=ctx.t("cli.scan.paths"))

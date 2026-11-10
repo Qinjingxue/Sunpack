@@ -13,7 +13,6 @@ def register(subparsers, ctx):
         COMMAND,
         aliases=COMMAND_ALIASES[COMMAND],
         help=ctx.t("cli.version.help"),
-        usage="sunpack version",
     )
     parser.set_defaults(command=COMMAND)
 

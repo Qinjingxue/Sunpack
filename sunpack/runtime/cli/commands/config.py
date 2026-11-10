@@ -20,7 +20,6 @@ def register(subparsers, ctx):
         aliases=COMMAND_ALIASES[COMMAND],
         parents=[common_parser],
         help=ctx.t("cli.config.help"),
-        usage="sunpack config [options] <show|validate>",
     )
     config_parser.set_defaults(command=COMMAND)
     config_subparsers = config_parser.add_subparsers(dest="config_action", required=True)

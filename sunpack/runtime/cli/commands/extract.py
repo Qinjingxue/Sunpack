@@ -47,7 +47,6 @@ def register(subparsers, ctx):
         aliases=COMMAND_ALIASES[COMMAND],
         parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_extract_config_override_parser(ctx)],
         help=ctx.t("cli.extract.help"),
-        usage="sunpack extract [options] <paths...>",
     )
     parser.set_defaults(command=COMMAND)
     parser.add_argument("--direct-file", "--direct", dest="direct_file", action="store_true", help=ctx.t("cli.extract.direct_file"))

@@ -110,9 +110,11 @@ def test_cli_parser_uses_command_module_language_text():
     build_cli_parser(CliContext(language="en"))
     help_text = parser.format_help()
 
-    assert "解压压缩包" in help_text
+    assert help_text.startswith("位置参数:")
+    assert "extract (e)" in help_text and "解压压缩包" in help_text
     assert "查看或校验配置" in help_text
     assert "选项" in help_text
+    assert all(text not in help_text for text in ("{extract,", "示例", "用法", "压缩包解压与目录监控"))
 
 
 def test_cached_scan_parser_keeps_its_command_scope(monkeypatch):
@@ -126,32 +128,35 @@ def test_cached_scan_parser_keeps_its_command_scope(monkeypatch):
 def test_command_help_exposes_public_options(subtests, capsys):
     """Cover all command help contracts without launching persistent clients."""
     cases = {
-        "scan": (
+        ("scan",): (
             ("-h/--help", "-R/--recursive", "-p/--password PASSWORD"),
             ("--min-size", "--process-mode", "-p PASSWORD"),
         ),
-        "extract": (
+        ("extract",): (
             ("--recur", "--cleanup", "--out-dir",
              "--direct-file/--direct"),
             ("--color", "--worker-profile", "--min-size", "--write-manifest", "--manifest", "--process-mode"),
         ),
-        "watch": (("add", "start", "remove (rm)", "list", "startup", "rebuild-log"), ("--process-mode",)),
-        "passwords": (
+        ("watch",): (("add", "start", "remove (rm)", "list", "startup", "rebuild-log"), ("--process-mode",)),
+        ("watch", "startup"): (("enable", "disable", "status"), ()),
+        ("passwords",): (
             ("--json", "--password"),
             ("--clipboard-pw", "--quiet", "--verbose", "--pause"),
         ),
-        "config": (
-            ("{show,validate}",),
-            ("blacklist", "{show,validate,set", "{show,validate,rule",
-             "--verbose", "--pause"),
+        ("config",): (
+            ("show", "validate"),
+            ("blacklist", "--verbose", "--pause"),
         ),
+        ("doctor",): (("-h/--help",), ()),
+        ("version",): (("-h/--help",), ()),
     }
-    for command, (present, absent) in cases.items():
-        with subtests.test(command=command):
-            parser = build_cli_parser(CliContext(language="en"), command=command)
+    for argv, (present, absent) in cases.items():
+        with subtests.test(argv=argv):
+            parser = build_cli_parser(CliContext(language="en"), command=argv[0])
             with pytest.raises(SystemExit) as exc:
-                parser.parse_args([command, "-h"])
+                parser.parse_args([*argv, "-h"])
             assert exc.value.code == 0
             help_text = capsys.readouterr().out
+            assert not any(line.lstrip().startswith(("usage:", "Examples:", "{")) for line in help_text.splitlines())
             assert all(option in help_text for option in present)
             assert all(option not in help_text for option in absent)

@@ -52,7 +52,6 @@ def register(subparsers, ctx):
         aliases=COMMAND_ALIASES[COMMAND],
         parents=[common_parser],
         help=ctx.t("cli.doctor.help"),
-        usage="sunpack doctor [options]",
     )
     parser.set_defaults(command=COMMAND)
 

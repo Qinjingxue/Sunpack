@@ -6,15 +6,18 @@ from sunpack.runtime.cli.cli_values import parse_archive_cleanup_value, parse_re
 from sunpack.core.i18n import I18nContext
 
 
-class CliHelpFormatter(argparse.RawDescriptionHelpFormatter):
+class CliHelpFormatter(argparse.HelpFormatter):
     def __init__(self, prog: str, *, language: str):
         super().__init__(prog, max_help_position=44, width=120)
         self.language = language
 
-    def add_usage(self, usage, actions, groups, prefix=None):
-        if prefix is None and self.language == "zh":
-            prefix = I18nContext(self.language).t("cli.usage_prefix")
-        return super().add_usage(usage, actions, groups, prefix)
+    def add_argument(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            # Render the named commands without argparse's extra choice list.
+            for subcommand in action._get_subactions():
+                super().add_argument(subcommand)
+        else:
+            super().add_argument(action)
 
     def start_section(self, heading):
         if self.language == "zh":
@@ -42,6 +45,7 @@ def localize_parser(parser: argparse.ArgumentParser, ctx: CliContext) -> None:
     while pending:
         current = pending.pop()
         current.formatter_class = formatter
+        current.usage = argparse.SUPPRESS
         for action in current._actions:
             if "-h" in action.option_strings:
                 action.help = help_text
