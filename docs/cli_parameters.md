@@ -125,7 +125,7 @@ Usage:
 python sunpack.py scan [options] <paths...>
 ```
 
-`scan` shares extract's discovery, input planning, and password confirmation. Results are grouped by physical file and logical segment, showing only obtained format, range, volume, password, and error facts. Ordinary archives omit ranges; carriers show `[start, end)`, with `?` for an unknown end and a tree for multiple segments. Known encryption without a confirmed password is shown as unknown; confirmed passwords are printed directly.
+`scan` shares extract's discovery, input planning, and password confirmation. Results are grouped by physical file and logical segment, showing only obtained format, range, volume, password, and error facts. Ordinary archives omit ranges; carriers show `[start, end)`, with `?` for an unknown end and a tree for multiple segments. Known encryption without a confirmed password is shown as “Password: not in password list”, without a duplicate password error; confirmed passwords are printed directly.
 
 Ambiguous volumes retain compact slot candidates and layouts, without expanding combinations, and remain pending actual extraction. A bounded password test does not establish archive integrity or validate an entire volume set. Scan does not extract, create output directories, inspect contents that require extraction, verify outputs, flatten directories, or clean source files.
 

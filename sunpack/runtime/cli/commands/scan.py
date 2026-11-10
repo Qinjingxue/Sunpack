@@ -1,6 +1,7 @@
 import os
 from itertools import groupby
 
+from sunpack.core.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
 from sunpack.core.support.path_keys import path_key
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_parsers import (
@@ -50,8 +51,16 @@ def command_result(args, ctx, paths, summary):
                     ctx.reporter.info(branch + ctx.t("cli.scan.segment", index=index) + _range(item))
                 elif "offset" in item:
                     ctx.reporter.info(prefix + ctx.t("cli.scan.range", start=item["offset"], end=item.get("end_offset") if item.get("end_offset") is not None else "?"))
-                if item.get("error"):
-                    ctx.reporter.error(f"{path}{_range(item)}: {ctx.t('cli.scan.error', error=item['error'])}")
+                # Omit errors already explained by visible fact fields. Quiet
+                # mode has no headings or fields, so retain standalone errors.
+                if item.get("error") and (ctx.reporter.quiet or not (
+                    (item.get("error_kind") in PASSWORD_FAILURE_KINDS
+                     and item.get("password_used", "") is None)
+                    or (item.get("error_kind") == FailureKind.MISSING_VOLUME
+                        and item.get("volume_completeness") == "missing")
+                )):
+                    error_prefix = f"{path}{_range(item)}: " if ctx.reporter.quiet else prefix
+                    ctx.reporter.error(error_prefix + ctx.t("cli.scan.error", error=item["error"]))
                 for text in _details(item, ctx):
                     ctx.reporter.info(prefix + text)
         for failure in summary.scan_failures:

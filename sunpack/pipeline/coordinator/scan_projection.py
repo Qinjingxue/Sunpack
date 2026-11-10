@@ -1,6 +1,6 @@
 """Sparse reporting receipts from the shared execution, without retained tasks."""
 
-from sunpack.core.contracts.failures import FailureKind
+from sunpack.core.contracts.failures import PASSWORD_FAILURE_KINDS
 
 
 def scan_items(task, result, i18n):
@@ -25,7 +25,7 @@ def scan_items(task, result, i18n):
         elif node.password is not None:
             item["password_used"] = node.password
         elif (facts.get("encrypted") is True or descriptor.analysis.get("password_required") is True
-              or failure and failure.kind in {FailureKind.PASSWORD_REQUIRED, FailureKind.WRONG_PASSWORD}):
+              or failure and failure.kind in PASSWORD_FAILURE_KINDS):
             item["password_used"] = None
         completeness = "missing" if failure and failure.is_confirmed_missing_volume else node.volume_completeness
         plan = descriptor.volume_attempts
@@ -41,6 +41,7 @@ def scan_items(task, result, i18n):
                 if completeness in {"complete", "missing"}:
                     item["volume_completeness"] = completeness
         if failure is not None:
+            item["error_kind"] = failure.kind.value
             item["error"] = (i18n.t(failure.message_key, **failure.message_params)
                              if failure.message_key else failure.message)
         if task.discovery_source:

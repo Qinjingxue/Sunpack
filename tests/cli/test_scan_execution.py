@@ -68,6 +68,7 @@ def test_scan_shared_execution_preserves_sources_and_per_segment_passwords(tmp_p
     if not json_mode:
         assert all(str(path) in ctx.stdout.getvalue() for path in before)
         assert ctx.t("cli.scan.password", password=ctx.t("cli.scan.password_unknown")) in ctx.stdout.getvalue()
+        assert not ctx.stderr.getvalue()
 
 
 def test_scan_retains_volume_domains_and_never_confirms_empty_zipcrypto(tmp_path):
@@ -147,7 +148,8 @@ def test_scan_confirms_enc_password_with_damaged_recovery_framing(tmp_path, monk
     assert not output.exists() and source.read_bytes() == content
 
 
-def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
+@pytest.mark.parametrize("language, password_label", [("en", "Password: not in password list"), ("zh", "密码：未在密码表中")])
+def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path, language, password_label):
     # Real happy-path archives miss distinct blocked segments, different source
     # files within one task, and verbose/JSON/quiet projection combinations.
     from types import SimpleNamespace
@@ -169,22 +171,25 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
         PasswordResolution(None, PasswordResolutionStatus.MISSING_VOLUME),
     )
     password = FailureInfo(FailureKind.PASSWORD_REQUIRED, "embedded", "need password")
+    damaged = FailureInfo(FailureKind.DAMAGED, "embedded", "damaged encrypted input")
     nodes = tuple(LogicalArchiveInput(ArchiveInputDescriptor(
         str(tmp_path / name), format_hint="rar", open_mode="file_range",
         parts=[ArchiveInputPart(InputExtent(str(tmp_path / name), start, end))],
-        analysis={"volume_completeness": "complete"} if end is not None else {},
+        analysis={"volume_completeness": "complete"} if end is not None else {"password_required": True},
     ), position=i) for i, (name, start, end) in enumerate((
-        ("first.bin", 0, 64), ("second.bin", 128, None)), 1))
+        ("first.bin", 0, 64), ("second.bin", 128, None), ("third.bin", 256, None)), 1))
     task = ArchiveTask.from_archive_input(nodes[0].descriptor, discovery_source="embedded", logical_inputs=nodes)
     result = ExtractionResult(False, "", failure=missing, input_results=[
         InputExecutionResult(node, ExtractionResult(False, "", failure=failure))
-        for node, failure in zip(nodes, (missing, password))])
-    items = tuple(scan_items(task, result, I18nContext("en")))
+        for node, failure in zip(nodes, (missing, password, damaged))])
+    items = tuple(scan_items(task, result, I18nContext(language)))
     assert items[0]["main_path"].endswith("first.bin") and items[0]["offset"] == 0
     assert items[0]["volume_completeness"] == "missing" and "password_used" not in items[0]
     assert items[1]["main_path"].endswith("second.bin") and items[1]["end_offset"] is None
     assert items[1]["password_used"] is None and "all_parts" not in items[1]
     assert items[0]["error"] != items[1]["error"]
+    assert items[1]["error_kind"] == "password_required"
+    assert items[2]["password_used"] is None and items[2]["error_kind"] == "damaged"
     declared_missing = ArchiveInputDescriptor(
         entry_path=str(tmp_path / "partial.bin"), analysis={"volume_completeness": "missing"},
     )
@@ -193,7 +198,7 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
     assert gap["volume_completeness"] == "missing"
     for json_mode, verbose, quiet in ((True, False, False), (True, True, False), (False, False, True), (False, True, False)):
         out, err = io.StringIO(), io.StringIO()
-        ctx = CliContext(language="en", reporter=CliReporter(json_mode=json_mode, quiet=quiet,
+        ctx = CliContext(language=language, reporter=CliReporter(json_mode=json_mode, quiet=quiet,
                          verbose=verbose, stdout=out, stderr=err))
         summary = RunSummary(target_results=(TargetRunResult(task.main_path, OutcomeKind.FAILURE,
                           failure=missing, error=missing.message, scan_items=tuple(dict(i) for i in items)),))
@@ -202,9 +207,18 @@ def test_sparse_scan_facts_stay_with_their_physical_segment(tmp_path):
         assert all(("discovery_source" in item) == verbose for item in projected.items)
         if quiet:
             assert not out.getvalue() and "need password" in err.getvalue()
+            assert items[0]["error"] in err.getvalue()
+            assert items[2]["main_path"] in err.getvalue()
         elif not json_mode:
             assert out.getvalue().index("first.bin") < out.getvalue().index("second.bin")
-            assert "need password" in err.getvalue() and "need password" not in out.getvalue()
+            assert "need password" not in err.getvalue() and "need password" not in out.getvalue()
+            assert password_label in out.getvalue()
+            assert ctx.t("cli.scan.volumes", state=ctx.t("cli.scan.volumes.missing")) in out.getvalue()
+            assert err.getvalue() == "  " + ctx.t("cli.scan.error", error=damaged.message) + "\n"
+        if not json_mode:
+            assert damaged.message in err.getvalue()
+        else:
+            assert projected.items[1]["error"] == "need password"
 
 
 def test_scan_keeps_unicode_carrier_segments_together(tmp_path):
@@ -215,15 +229,19 @@ def test_scan_keeps_unicode_carrier_segments_together(tmp_path):
     other = str(tmp_path / "STRASSE.bin")  # Same Python casefold, different Windows path key.
     items = tuple(dict(main_path=path, offset=offset, end_offset=offset + 10)
                   for path, offset in ((carrier, 10), (other, 20), (carrier, 30)))
+    items[0].update(error="missing part", error_kind="missing_volume", volume_completeness="missing")
+    items[2].update(error="damaged segment", error_kind="damaged")
     summary = RunSummary(target_results=(
         TargetRunResult(carrier, OutcomeKind.SCANNED, scan_items=items),
     ))
-    out = io.StringIO()
-    ctx = CliContext(language="en", reporter=CliReporter(stdout=out))
+    out, err = io.StringIO(), io.StringIO()
+    ctx = CliContext(language="en", reporter=CliReporter(stdout=out, stderr=err))
     scan.command_result(SimpleNamespace(json=False, verbose=False, deep_detect=False), ctx, [carrier], summary)
     text = out.getvalue()
     assert text.count(carrier) == text.count(other) == 1
     assert "Segment 1: [10, 20)" in text and "Segment 2: [30, 40)" in text
+    assert "Volumes: incomplete" in text
+    assert err.getvalue() == "   Error: damaged segment\n"
 
 
 def test_rar_boundary_batch_preserves_later_success_and_truncated_password(tmp_path):
