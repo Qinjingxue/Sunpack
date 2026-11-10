@@ -93,13 +93,10 @@ class ArchiveDiscoveryPipeline:
             result.tasks = retained
             result.claimed_paths.difference_update(replaced)
             result.blocked_paths.difference_update(replaced)
-            result.traces = [trace for trace in result.traces if not (
-                path_key(trace.entry_path) in replaced
-            )]
         result.tasks.extend(embedded_result.tasks)
         result.claimed_paths.update(embedded_result.claimed_paths)
         result.blocked_paths.update(embedded_result.blocked_paths)
-        result.traces.extend(embedded_result.traces)
+        result.scan_failures.extend(embedded_result.scan_failures)
         if shared_candidates:
             EmbeddedDiscovery._combine_shared_inputs(result)
         result.validate()

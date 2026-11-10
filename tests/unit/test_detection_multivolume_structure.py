@@ -29,5 +29,5 @@ def test_native_discovery_keeps_complete_blocked_and_residual_families_separate(
     assert blocked.discovery_failure.kind is FailureKind.MISSING_VOLUME
     assert result.claimed_paths == {path_key(str(first)), path_key(str(second))}
     assert result.blocked_paths == {path_key(str(missing))}
-    assert all(trace.entry_path != str(unknown) for trace in result.traces)
+    assert all(failure.details.get("path") != str(unknown) for failure in result.scan_failures)
     result.validate()

@@ -1,6 +1,5 @@
 import asyncio
 import os
-import sys
 import subprocess
 from contextlib import nullcontext
 from typing import Any, Callable
@@ -76,7 +75,6 @@ class SingleArchiveExtractor:
         best_effort: bool = True,
         quiet: bool = False,
         language: str = "en",
-        output_stream=None,
         operation: str = "extract",
     ):
         self.password_store = password_store
@@ -85,7 +83,6 @@ class SingleArchiveExtractor:
         self.best_effort = bool(best_effort)
         self.quiet = bool(quiet)
         self.i18n = I18nContext(language)
-        self.output_stream = output_stream if output_stream is not None else sys.stdout
         self.scanning = operation == "scan"
 
     async def extract_asyncio(

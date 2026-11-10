@@ -32,7 +32,6 @@ def make_archive_task(
     task = ArchiveTask.from_archive_input(
         descriptor,
         discovery_source=discovery_source,
-        discovery_reason="test_fixture",
     )
     if key:
         task.key = key
@@ -48,7 +47,6 @@ def make_task_from_descriptor(
     task = ArchiveTask.from_archive_input(
         descriptor,
         discovery_source=discovery_source,
-        discovery_reason="test_fixture",
     )
     if key:
         task.key = key

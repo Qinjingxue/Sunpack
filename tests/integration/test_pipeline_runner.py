@@ -276,18 +276,13 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
 
     engine = PipelineEngine(config)
     call_order = []
-    postprocess_actions = engine_module.PostProcessActions
+    cleanup = engine_module.ArchiveCleanup.cleanup_success_archives
 
-    class TrackedPostProcessActions:
-        def __init__(self, *args, **kwargs):
-            self._delegate = postprocess_actions(*args, **kwargs)
-            self.flattener = self._delegate.flattener
+    def tracked_cleanup(self, archives):
+        call_order.append("cleanup")
+        return cleanup(self, archives)
 
-        def apply(self, **kwargs):
-            call_order.append("postprocess")
-            return self._delegate.apply(**kwargs)
-
-    monkeypatch.setattr(engine_module, "PostProcessActions", TrackedPostProcessActions)
+    monkeypatch.setattr(engine_module.ArchiveCleanup, "cleanup_success_archives", tracked_cleanup)
 
     async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
         out_path = tmp_path / "payload" / "inside.txt"
@@ -319,7 +314,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     assert (tmp_path / "payload" / "inside.txt").exists()
     # Source cleanup and subtree flattening both finish before the request closes.
     assert call_order[-1] == "progress_drained"
-    assert call_order.count("postprocess") >= 1
+    assert "cleanup" in call_order
 
 
 def test_pipeline_runner_exposes_recent_passwords_without_password_manager():

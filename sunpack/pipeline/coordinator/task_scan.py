@@ -50,7 +50,7 @@ class ArchiveTaskScanner:
         scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
     ) -> StageResult:
-        """Return discovery facts for reporting without changing extraction semantics."""
+        """Record discovery failures and return the tasks and physical claims."""
 
         scan_session = scan_session or DiscoveryScanSession(config=self.config)
         result = self.provider.discover_targets(
@@ -58,14 +58,7 @@ class ArchiveTaskScanner:
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
         )
-        self.context.record_failures(
-            (FailureInfo(
-                FailureKind.FILESYSTEM_ERROR, "embedded_boundary",
-                trace.error or "Unable to read archive input",
-                details={"path": trace.entry_path, "reason": trace.reason},
-            ) for trace in result.traces if trace.reason == "embedded_scan_io_error"),
-            self.config.get("cli", {}).get("language", "en"),
-        )
+        self.context.record_failures(result.scan_failures, self.config.get("cli", {}).get("language", "en"))
         self.record_scan_errors(scan_session)
         return result
 
@@ -151,7 +144,6 @@ def direct_file_task(path: str, all_parts: list[str] | None = None) -> ArchiveTa
     return ArchiveTask.from_archive_input(
         descriptor,
         discovery_source="direct",
-        discovery_reason="cli_direct_file",
         carrier_path=group.carrier_path if group is not None else path,
         cleanup_paths=group.owned_paths if group is not None else (),
         discovery_evidence=group.head_metadata if group is not None else None,

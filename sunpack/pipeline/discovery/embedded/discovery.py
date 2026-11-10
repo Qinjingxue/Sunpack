@@ -18,7 +18,6 @@ from sunpack.core.contracts.archive_input import (
 )
 from sunpack.core.contracts.discovery import (
     DiscoveryCandidate,
-    DiscoveryTrace,
     StageResult,
     discovery_failure,
 )
@@ -85,10 +84,9 @@ class EmbeddedDiscovery:
                     result.add_blocked(candidate, source="embedded", reason=reason, error=raw_scan["error"])
                     continue
                 result.blocked_paths.update(table.path_keys(index))
-                result.traces.append(DiscoveryTrace(
-                    entry_path=entry_path, source="embedded",
-                    format=format_hint, reason=reason, error=raw_scan["error"],
-                ))
+                failure = discovery_failure("embedded", reason, entry_path, raw_scan["error"] or "Unable to read archive input")
+                if failure is not None:
+                    result.scan_failures.append(failure)
                 continue
 
             candidate = session.project_native_candidate(table, index)

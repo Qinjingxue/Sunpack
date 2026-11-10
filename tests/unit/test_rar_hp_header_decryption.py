@@ -80,7 +80,7 @@ def test_ambiguous_encrypted_probe_is_terminal_damage_instead_of_a_watch_volume_
     discovered = ArchiveTaskProvider(config).discover_targets([path])
     assert len(discovered.tasks) == 1
     assert discovered.tasks[0].discovery_failure.kind is FailureKind.DAMAGED
-    assert discovered.tasks[0].discovery_reason == "needs_volume_or_tail_damaged"
+    assert discovered.tasks[0].discovery_failure.details["reason"] == "needs_volume_or_tail_damaged"
     monkeypatch.setattr(watch_module, "validate_ntfs_watch_roots", lambda roots: None)
     notices = []
 

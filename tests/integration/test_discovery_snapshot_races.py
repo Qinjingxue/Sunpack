@@ -281,7 +281,7 @@ def test_partially_departed_snapshot_rechecks_missing_members(tmp_path, monkeypa
 
                 def remove():
                     with promotion_barrier((removed,), cache_releasers=(release_archive_sessions_under_roots,), quiesce=False):
-                        [result] = ArchiveCleanup("delete", quiet=True).cleanup_success_archives([[str(removed)]])
+                        [result] = ArchiveCleanup("delete").cleanup_success_archives([[str(removed)]])
                         assert result.status == "deleted"
 
                 await asyncio.to_thread(remove)

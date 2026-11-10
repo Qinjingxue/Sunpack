@@ -10,7 +10,6 @@ from sunpack.core.contracts.results import OutcomeKind
 from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
 from sunpack.pipeline.coordinator.engine import _SourceCleanup
-from sunpack.pipeline.postprocess.actions import PostProcessActions
 from tests.helpers.fake_pipeline_engine import _InlineBroker
 
 
@@ -198,7 +197,7 @@ def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
     assert busy.exists()
 
 
-@pytest.mark.parametrize("failure_site", ["actions", "broker"])
+@pytest.mark.parametrize("failure_site", ["cleanup", "broker"])
 def test_unexpected_source_cleanup_error_reaches_summary_for_each_volume(tmp_path, monkeypatch, failure_site):
     paths = [tmp_path / "first.001", tmp_path / "second.disguised"]
     for path in paths:
@@ -209,15 +208,15 @@ def test_unexpected_source_cleanup_error_reaches_summary_for_each_volume(tmp_pat
     error = OSError("cleanup service unavailable")
     error.winerror = 5
 
-    def failing_actions(*_args, **_kwargs):
+    def failing_cleanup(*_args, **_kwargs):
         raise error
 
     class FailingBroker:
         async def run(self, *_args, **_kwargs):
             raise error
 
-    if failure_site == "actions":
-        monkeypatch.setattr(engine, "PostProcessActions", failing_actions)
+    if failure_site == "cleanup":
+        monkeypatch.setattr(engine, "ArchiveCleanup", failing_cleanup)
     outcome = asyncio.run(scope.apply(
         scope.release_task(task, outcome_kind=OutcomeKind.COMPLETE_SUCCESS),
         broker=FailingBroker() if failure_site == "broker" else _InlineBroker(),
@@ -301,8 +300,8 @@ def test_sweep_only_releases_unreported_refs_and_does_not_request_deletion(tmp_p
 def test_native_delete_reports_missing_and_deleted(tmp_path):
     path = tmp_path / "a.zip"
     path.write_text("data")
-    report = PostProcessActions(config("delete")).apply(
-        archives_to_clean=[[str(path), str(tmp_path / "missing")]]
+    report = cleanup.ArchiveCleanup("delete").cleanup_success_archives(
+        [[str(path), str(tmp_path / "missing")]]
     )
     assert {item.status for item in report} == {"deleted", "missing"}
     assert not path.exists()

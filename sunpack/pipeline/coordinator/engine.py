@@ -36,8 +36,8 @@ from sunpack.pipeline.postprocess.internal.blocked_input import (
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.i18n import I18nContext
-from sunpack.pipeline.postprocess.actions import PostProcessActions
 from sunpack.pipeline.postprocess.internal.cleanup import ArchiveCleanup
+from sunpack.pipeline.postprocess.internal.flatten import flatten_dirs
 from sunpack.core.passwords.internal.store import MAX_RECENT_PASSWORDS, PasswordStore
 from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.core.platform.windows.shell_notify import notify_shell_directories_updated
@@ -961,26 +961,17 @@ class _SourceCleanup:
             error = ""
             if existing:
                 try:
+                    cleanup = ArchiveCleanup(mode)
+                    archives = [[path] for path in existing]
                     if mode == "keep":
-                        cli = self._config.get("cli", {})
-                        cleanup = ArchiveCleanup("keep", cli.get("language", "en"), quiet=True)
-                        results.extend(cleanup.cleanup_success_archives(
-                            [[path] for path in existing],
-                        ))
+                        results.extend(cleanup.cleanup_success_archives(archives))
                     else:
-                        actions = PostProcessActions(
-                            {**self._config, "cli": {**self._config.get("cli", {}), "quiet": True}},
-                            cleanup_mode_override=mode,
-                        )
                         with promotion_barrier(
                             existing,
                             cache_releasers=(release_archive_sessions_under_roots,),
                             quiesce=False,
                         ):
-                            results.extend(actions.apply(
-                                archives_to_clean=[[path] for path in existing],
-                                flatten_targets=[],
-                            ))
+                            results.extend(cleanup.cleanup_success_archives(archives))
                 except (ResourceBusyError, ResourceLifecycleError) as exc:
                     error = str(exc)
                     code = int(getattr(exc, "winerror", 0) or 0)
@@ -1135,7 +1126,6 @@ class _RequestRuntime:
                 "language": self.language,
             },
             sevenzip_runner=request_runner,
-            output_stream=submission.stdout,
         )
         self.extractor.set_progress_callback(self._report_progress)
         self.job_executor = ArchiveJobExecutor(
@@ -1304,8 +1294,6 @@ class _RequestRuntime:
                 )
             else:
                 scan_session = DiscoveryScanSession(config=scanner.config)
-        await broker.run("report", "", self.reporter.scan_started, depth,
-                         request_id=self.submission.request_id, cancellation=cancellation)
         discovered = await broker.run(
             "discover_detect",
             self.submission.request_id,
@@ -1378,7 +1366,7 @@ class _RequestRuntime:
         # This registration is deliberately only a source-cleanup lifetime
         # guard. It never gates planning, extraction, verification or recursion.
         self.source_cleanup.register(tasks)
-        await broker.run("report", "", self.reporter.tasks_discovered, depth, tasks, direct=direct,
+        await broker.run("report", "", self.reporter.tasks_discovered, depth, tasks,
                          request_id=self.submission.request_id, cancellation=cancellation)
 
         if self.submission.origin == "watch" and tasks:
@@ -1924,10 +1912,7 @@ class _RequestRuntime:
                 cache_releasers=(release_archive_sessions_under_roots,),
                 quiesce=False,
             ):
-                result = PostProcessActions(
-                    self.config,
-                    stdout=self.submission.stdout,
-                ).flattener.flatten_dirs(output_dir, announce=False, work_path=work_path,
+                result = flatten_dirs(output_dir, work_path=work_path,
                     before_move=(lambda root, work, leaf: outputs.prepare_flatten(owner, root, work, leaf))
                         if outputs is not None else None)
             registered = outputs is not None and os.path.isdir(output_dir) and outputs.finish_flatten(output_dir)

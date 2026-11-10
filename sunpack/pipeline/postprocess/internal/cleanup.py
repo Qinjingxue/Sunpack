@@ -1,12 +1,10 @@
 import os
-import sys
 from typing import Iterable
 
 from send2trash import send2trash
 from sunpack.core.support.path_keys import case_key
 from sunpack_native import delete_files_batch as _native_delete_files_batch
 from sunpack.core.contracts.results import ArchiveCleanupResult
-from sunpack.core.i18n import I18nContext
 
 
 def _path_key(path: str) -> str:
@@ -14,15 +12,10 @@ def _path_key(path: str) -> str:
 
 
 class ArchiveCleanup:
-    def __init__(self, mode: str = "recycle", language: str = "en", *, stdout=None, quiet: bool = False):
+    def __init__(self, mode: str = "recycle"):
+        if mode not in {"keep", "recycle", "delete"}:
+            raise ValueError("archive_cleanup_mode must be normalized before ArchiveCleanup starts")
         self.mode = mode
-        self.i18n = I18nContext(language)
-        self.stdout = stdout if stdout is not None else sys.stdout
-        self.quiet = quiet
-
-    def _print(self, value: str) -> None:
-        if not self.quiet:
-            print(value, file=self.stdout, flush=True)
 
     def cleanup_success_archives(
         self,
@@ -33,9 +26,6 @@ class ArchiveCleanup:
             for path in parts:
                 unique_paths.setdefault(_path_key(path), os.path.normpath(path))
         paths = list(unique_paths.values())
-        self._print(self.i18n.t("cleanup.keep_done" if self.mode == "keep" else "cleanup.start"))
-        if not paths:
-            self._print(self.i18n.t("cleanup.none"))
         results: list[ArchiveCleanupResult] = []
         pending: list[str] = []
         for path in paths:
@@ -45,8 +35,6 @@ class ArchiveCleanup:
             if not os.path.exists(path):
                 results.append(ArchiveCleanupResult(path, self.mode, "missing"))
                 continue
-            self._print(self.i18n.t("cleanup.delete" if self.mode == "delete" else "cleanup.recycle",
-                                    reason=self.i18n.t("cleanup.label"), filename=os.path.basename(path)))
             pending.append(path)
         if self.mode == "delete":
             try:

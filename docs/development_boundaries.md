@@ -67,7 +67,7 @@ sunpack.runtime.watch
 | Passwords | `sunpack.core.passwords` | Candidate passwords, scheduling, fast verifiers, and worker confirmation. |
 | Extraction | `sunpack.pipeline.extraction.scheduler.ExtractionScheduler` | Per-archive output, password resolution, and worker extraction. |
 | Verification | `sunpack.pipeline.verification.scheduler.VerificationScheduler` | Extraction completeness, source integrity, and next-step decisions. |
-| Post-processing | `sunpack.pipeline.postprocess.actions.PostProcessActions` | Cleanup and flattening after success. |
+| Post-processing | `sunpack.pipeline.postprocess.internal.cleanup.ArchiveCleanup`, `sunpack.pipeline.postprocess.internal.flatten.flatten_dirs` | Cleanup and flattening after success. |
 
 ## Domain boundaries
 

@@ -19,7 +19,6 @@ class ExtractionScheduler:
         output_config: dict | None = None,
         extraction_config: dict | None = None,
         sevenzip_runner: SevenZipRunner | None = None,
-        output_stream=None,
         password_store: PasswordStore | None = None,
     ):
         self.password_store = password_store or PasswordStore.from_sources(
@@ -36,7 +35,6 @@ class ExtractionScheduler:
             for key, value in (process_config or {}).items()
             if value is not None
         })
-        self.output_stream = output_stream
 
     def set_progress_callback(self, callback: Callable[[ArchiveTask, dict], None] | None) -> None:
         self.sevenzip_runner.progress_callback = callback
@@ -114,6 +112,5 @@ class ExtractionScheduler:
             best_effort=True,
             quiet=bool(self.extraction_config.get("quiet", False)),
             language=str(self.extraction_config.get("language") or "en"),
-            output_stream=self.output_stream,
             operation=self.extraction_config.get("operation", "extract"),
         )

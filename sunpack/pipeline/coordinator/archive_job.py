@@ -211,7 +211,7 @@ class ArchiveJobExecutor:
 
         def preflight():
             if not retried_missing_volume:
-                self._report_task_started(task, depth)
+                self._report_task_started(task)
             if task.discovery_failure is not None:
                 failure = task.discovery_failure
                 if failure.message_key:
@@ -330,9 +330,9 @@ class ArchiveJobExecutor:
         if task.runtime.get("retry_output_dir"):
             task.runtime["retry_created_outputs"] = []
 
-    def _report_task_started(self, task: ArchiveTask, depth: int) -> None:
+    def _report_task_started(self, task: ArchiveTask) -> None:
         if self.progress_reporter is not None:
-            self.progress_reporter.task_started(task, depth)
+            self.progress_reporter.task_started(task)
 
     def _report_task_finished(self, task: ArchiveTask, outcome: ArchiveJobOutcome, depth: int) -> None:
         if self.progress_reporter is not None:

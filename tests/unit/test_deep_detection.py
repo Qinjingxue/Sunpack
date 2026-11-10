@@ -117,7 +117,7 @@ def test_embedded_layer_rejects_plain_data(tmp_path):
     result = ArchiveTaskProvider(make_config()).discover_targets([str(path)])
 
     assert result.tasks == []
-    assert result.traces == []
+    assert result.scan_failures == []
 
 
 def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_path):
@@ -218,7 +218,7 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path):
 
     assert result.tasks == []
     assert not result.blocked_paths
-    assert result.traces == []
+    assert result.scan_failures == []
 
 
 @pytest.mark.parametrize("status", ["password_required", "wrong_password"])

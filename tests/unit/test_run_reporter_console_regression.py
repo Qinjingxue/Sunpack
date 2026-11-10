@@ -46,8 +46,8 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         outer = ArchiveTask.from_archive_input(nodes[0].descriptor, discovery_source="embedded", logical_inputs=nodes)
         other = make_archive_task(tmp_path / "other.zip")
         reporter.tasks_discovered(1, [outer, other])
-        reporter.task_started(outer, 1)
-        reporter.task_started(other, 1)
+        reporter.task_started(outer)
+        reporter.task_started(other)
         for node in nodes:
             child = ArchiveTask.from_archive_input(node.descriptor, discovery_source="embedded", logical_inputs=(node,))
             reporter.task_progress(child, {"type": "progress", "completed_bytes": node.position, "total_bytes": 10})
@@ -57,9 +57,8 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.task_finished(outer, _success(tmp_path / "out"), 1)
         nested = make_archive_task(tmp_path / "out" / "2" / "nested.zip")
         reporter.tasks_discovered(2, [nested])
-        reporter.task_started(nested, 2)
+        reporter.task_started(nested)
         reporter.task_finished(nested, _success(tmp_path / "out" / "2" / "nested"), 2)
-        assert reporter._task_rows[nested.key]["parent"] == nodes[1].input_id
         ref = weakref.ref(nested)
         del nested, child
         gc.collect()
@@ -79,6 +78,7 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.resume_panel()
         text = stream.getvalue()
         assert text.index("段 1") < text.index("段 2") < text.index("nested.zip")
+        assert "   └─ nested.zip" in text.splitlines()
         assert "│" in text and "└─" in text
         assert nodes[0].input_id not in reporter._input_rows
         assert outer.key not in reporter._task_rows
@@ -88,7 +88,7 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         reporter.task_progress(other, {"event": "memory_blocked"})
         assert reporter._task_rows[other.key]["state"] == "complete"
         reporter.scope_finished(other, 1)
-        assert not reporter._task_rows and not reporter._input_rows and not reporter._output_lineages
+        assert not reporter._task_rows and not reporter._input_rows and not reporter._output_rows
 
         from dataclasses import replace
         from sunpack.core.contracts.failures import FailureInfo, FailureKind
@@ -99,7 +99,7 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         blocked = ArchiveTask.from_archive_input(blocked_nodes[0].descriptor,
                     discovery_source="embedded", logical_inputs=blocked_nodes)
         reporter.tasks_discovered(1, [blocked])
-        reporter.task_started(blocked, 1)
+        reporter.task_started(blocked)
         reporter.task_finished(blocked, SimpleNamespace(outcome_kind=OutcomeKind.FAILURE,
                                result=SimpleNamespace(error="blocked", out_dir="")), 1)
         stream.seek(0); stream.truncate(0)

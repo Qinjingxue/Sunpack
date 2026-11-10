@@ -26,7 +26,6 @@ class ArchiveTask:
     initial_discovery_source: InitVar[str] = ""
     discovery_evidence: InitVar[dict[str, Any] | None] = None
     initial_inputs: InitVar[tuple[LogicalArchiveInput, ...]] = ()
-    initial_discovery_reason: InitVar[str] = ""
     runtime: dict[str, Any] = field(default_factory=dict)
     discovery_failure: FailureInfo | None = None
     inputs: tuple[LogicalArchiveInput, ...] = field(default=(), init=False)
@@ -39,7 +38,6 @@ class ArchiveTask:
         initial_discovery_source: str,
         discovery_evidence: dict[str, Any] | None,
         initial_inputs: tuple[LogicalArchiveInput, ...],
-        initial_discovery_reason: str,
     ) -> None:
         descriptor = _archive_input
         if not descriptor.entry_path:
@@ -53,7 +51,6 @@ class ArchiveTask:
         self.inputs = (LogicalArchiveInput(descriptor, failure=self.discovery_failure),)
         self._initialize_knowledge(
             discovery_source=str(initial_discovery_source or ""),
-            discovery_reason=str(initial_discovery_reason or ""),
             discovery_evidence=dict(discovery_evidence or {}),
             initial_inputs=initial_inputs,
         )
@@ -68,7 +65,6 @@ class ArchiveTask:
         cleanup_paths: list[str] | tuple[str, ...] = (),
         discovery_evidence: dict[str, Any] | None = None,
         logical_inputs: tuple[LogicalArchiveInput, ...] = (),
-        discovery_reason: str = "",
         discovery_failure: FailureInfo | None = None,
     ) -> "ArchiveTask":
         return cls(
@@ -78,7 +74,6 @@ class ArchiveTask:
             initial_discovery_source=discovery_source,
             discovery_evidence=discovery_evidence,
             initial_inputs=logical_inputs,
-            initial_discovery_reason=discovery_reason,
             discovery_failure=discovery_failure,
         )
 
@@ -90,10 +85,6 @@ class ArchiveTask:
     @property
     def discovery_source(self) -> str:
         return str(self._knowledge.get("discovery.source", "") or "")
-
-    @property
-    def discovery_reason(self) -> str:
-        return str(self._knowledge.get("discovery.reason", "") or "")
 
     @property
     def main_path(self) -> str:
@@ -191,7 +182,6 @@ class ArchiveTask:
         self,
         *,
         discovery_source: str,
-        discovery_reason: str,
         discovery_evidence: dict[str, Any],
         initial_inputs: tuple[LogicalArchiveInput, ...],
     ) -> None:
@@ -199,7 +189,6 @@ class ArchiveTask:
         self._knowledge.merge({
             "discovery": {
                 "source": discovery_source,
-                "reason": discovery_reason,
                 "evidence": discovery_evidence,
             },
         }, source_layer="contracts", source_module="archive_task")

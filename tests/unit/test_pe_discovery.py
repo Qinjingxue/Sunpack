@@ -36,7 +36,7 @@ def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filenam
     for target in [path, tmp_path]:
         ordinary = ArchiveTaskProvider(_config()).discover_targets([str(target)])
         assert ordinary.tasks == []
-        assert ordinary.traces == []
+        assert ordinary.scan_failures == []
         deep = ArchiveTaskProvider(_config(), EmbeddedOptions(force_scan=True)).discover_targets([str(target)])
         [task] = deep.tasks
         assert task.discovery_source == "embedded"

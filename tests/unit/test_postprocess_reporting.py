@@ -9,7 +9,6 @@ from sunpack.core.contracts.results import ArchiveCleanupResult, DirectoryFlatte
 from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.engine import _RequestResults, _RequestRuntime
 from sunpack.pipeline.coordinator.reporting import RunReporter
-from sunpack.pipeline.postprocess.actions import PostProcessActions
 from tests.helpers.fake_pipeline_engine import _InlineBroker
 
 
@@ -89,17 +88,6 @@ def test_flatten_exception_is_a_postprocess_warning(tmp_path, monkeypatch):
     assert runtime.context.cleanup_results[0].mode == "flatten"
 
 
-def test_postprocess_actions_returns_flatten_warning_in_existing_cleanup_results(tmp_path, monkeypatch):
-    from sunpack.pipeline.postprocess.internal.flatten import DirectoryFlattener
-
-    monkeypatch.setattr(DirectoryFlattener, "flatten_dirs", lambda self, base, **kwargs:
-        DirectoryFlattenResult(base, base + ".work", errors=("publish failed",)))
-    results = PostProcessActions({"post_extract": {"archive_cleanup_mode": "keep"}}).apply(
-        cleanup_archives=False, flatten_targets=[str(tmp_path)],
-    )
-    assert results == [ArchiveCleanupResult(str(tmp_path) + ".work", "flatten", "failed", message="publish failed")]
-
-
 def test_flatten_projection_handles_removed_wrappers_and_other_drives():
     result = DirectoryFlattenResult("C:/output", "C:/output", "C:/output/outer/inner", moved=1)
     assert result.relocate("C:/output/outer") == "C:/output"
@@ -142,7 +130,7 @@ def test_output_target_ownership_survives_junction_flatten_and_forget(tmp_path):
     leaves target routing untested; a small directory rename is sufficient.
     """
     import subprocess
-    from sunpack.pipeline.postprocess.internal.flatten import DirectoryFlattener
+    from sunpack.pipeline.postprocess.internal.flatten import flatten_dirs
 
     first = tmp_path / "source-one"
     second = tmp_path / "source-two"
@@ -164,7 +152,7 @@ def test_output_target_ownership_survives_junction_flatten_and_forget(tmp_path):
         TargetRunResult(str(second / "two.zip"), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(child)),
     ])
     assert ownership._target_for_path(str(physical / "result" / "wrapper" / "inner" / "child" / "new.zip")) is two
-    flattened = DirectoryFlattener().flatten_dirs(str(output), announce=False)
+    flattened = flatten_dirs(str(output))
     assert not flattened.errors
     ownership.relocate_outputs(flattened)
     assert ownership._target_for_path(str(physical / "result" / "new.zip")) is one

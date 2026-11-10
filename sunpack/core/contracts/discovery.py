@@ -53,21 +53,12 @@ class DiscoveryCandidate:
         return {path_key(path) for path in self.physical_paths}
 
 
-@dataclass(frozen=True, slots=True)
-class DiscoveryTrace:
-    entry_path: str
-    source: str
-    format: str = ""
-    reason: str = ""
-    error: str = ""
-
-
 @dataclass
 class StageResult:
     tasks: list[ArchiveTask] = field(default_factory=list)
     claimed_paths: set[str] = field(default_factory=set)
     blocked_paths: set[str] = field(default_factory=set)
-    traces: list[DiscoveryTrace] = field(default_factory=list)
+    scan_failures: list[FailureInfo] = field(default_factory=list)
 
     def add_resolved(self, task: ArchiveTask) -> None:
         self.tasks.append(task)
@@ -80,11 +71,9 @@ class StageResult:
             self.tasks.append(ArchiveTask.from_archive_input(
                 candidate.archive_input, discovery_source=source,
                 carrier_path=candidate.carrier_path, cleanup_paths=candidate.cleanup_paths,
-                discovery_evidence=candidate.relation_anchor, discovery_reason=reason,
+                discovery_evidence=candidate.relation_anchor,
                 discovery_failure=failure,
             ))
-        if error and failure is None:
-            self.traces.append(DiscoveryTrace(candidate.entry_path, source, candidate.format_hint, reason, error))
 
     def validate(self) -> None:
         if self.claimed_paths & self.blocked_paths:

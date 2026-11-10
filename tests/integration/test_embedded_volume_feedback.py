@@ -82,7 +82,7 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
     parts[1].write_bytes(missing)
     found = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)])
     tasks = [task for task in found.tasks if not task.discovery_failure]
-    assert len(tasks) == 1, [(task.main_path, task.discovery_reason) for task in found.tasks]
+    assert len(tasks) == 1, [(task.main_path, task.discovery_failure) for task in found.tasks]
     assert len(found.tasks) == 1
     task = tasks[0]
     if password and archive_format in {"rar", "rar4"}:

@@ -47,11 +47,9 @@ class RunReporter:
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
         self._lock = threading.RLock()
-        self._total_tasks = 0
-        self._completed_tasks = 0
         self._nested_tasks = 0
         self._max_depth = 0
-        self._output_lineages = PathMap()
+        self._output_rows = PathMap()
         self._top_level_outputs = PathMap()
         self._interactive = not self.quiet and _terminal_supports_updates(self.stdout)
         self._scope_roots = {}
@@ -66,12 +64,8 @@ class RunReporter:
         self._pending_resource_progress: dict[tuple[int, str], tuple[Any, dict[str, Any]]] = {}
         self._resource_progress_task: asyncio.Task | None = None
 
-    def scan_started(self, depth: int) -> None:
-        pass
-
-    def tasks_discovered(self, depth: int, tasks: list[Any], direct: bool = False) -> None:
+    def tasks_discovered(self, depth: int, tasks: list[Any]) -> None:
         with self._lock:
-            self._total_tasks += len(tasks)
             if depth > 1:
                 self._nested_tasks += len(tasks)
             if tasks:
@@ -80,9 +74,8 @@ class RunReporter:
                 return
             for task in tasks:
                 key = str(task.key or task.main_path)
-                lineage = self._lineage_for_path(task.main_path)
-                parent = lineage[-1] if lineage else None
-                self._task_rows[key] = self._new_row(_task_name(task), depth, parent)
+                parent = self._parent_row_for_path(task.main_path)
+                self._task_rows[key] = self._new_row(_task_name(task))
                 if parent in self._task_rows:
                     self._task_rows[parent]["children"].append(key)
                 else:
@@ -90,9 +83,9 @@ class RunReporter:
             self._render_panel_locked(force=True)
 
     @staticmethod
-    def _new_row(name, depth, parent=None):
-        return dict(name=name, depth=depth, parent=parent, children=[], state="waiting",
-                    progress=0.0, progress_known=False, completed_bytes=0, total_bytes=0,
+    def _new_row(name):
+        return dict(name=name, children=[], state="waiting",
+                    progress=0.0, progress_known=False,
                     detail="", output="", container=False, input_ids=[])
 
     def _row_key(self, task):
@@ -102,7 +95,7 @@ class RunReporter:
             return self._input_rows[inputs[0].input_id]
         return key if key in self._task_rows else None
 
-    def task_started(self, task: Any, depth: int) -> None:
+    def task_started(self, task: Any) -> None:
         if self.quiet:
             return
         with self._lock:
@@ -124,7 +117,7 @@ class RunReporter:
                     name += f" ({node.descriptor.format_hint})"
                     if extent:
                         name += f" [{extent.start}, {extent.end if extent.end is not None else '?'})"
-                    self._task_rows[child] = self._new_row(name, depth + 1, key)
+                    self._task_rows[child] = self._new_row(name)
                     if node.failure is not None:
                         self._task_rows[child]["state"] = "error"
                         self._task_rows[child]["detail"] = self._format_failure(node.failure)
@@ -138,7 +131,14 @@ class RunReporter:
         if self.quiet:
             return
         with self._lock:
-            self._update_task_locked(task, state=state, detail=detail, force=True)
+            row = self._task_rows.get(self._row_key(task))
+            if row is None:
+                return
+            row["state"] = state
+            if state in {"waiting", "preparing", "extracting"} and (row.get("space_blocked") or row.get("memory_blocked")):
+                self._restore_progress_locked(row)
+            row["detail"] = detail
+            self._render_panel_locked(force=True)
 
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
@@ -223,7 +223,7 @@ class RunReporter:
                 row["detail"] = str(event.get("error") or "")
                 row["output"] = str(event.get("out_dir") or "")
                 if row["output"] and event.get("success"):
-                    self._output_lineages[row["output"]] = (task_id,)
+                    self._output_rows[row["output"]] = task_id
             elif self.verbose:
                 row["detail"] = str(event.get("detail") or "")
             self._render_panel_locked(force=True)
@@ -231,12 +231,10 @@ class RunReporter:
         if name in {"memory_blocked", "memory_resumed"}:
             row["memory_blocked"] = name == "memory_blocked"
             self._restore_progress_locked(row)
-            if self._interactive:
-                self._render_panel_locked(force=True, task_id=task_id)
-
+            self._render_panel_locked(force=True)
             return
         if name in _SPACE_EVENTS:
-            self._space_progress_locked(task, row, name, event)
+            self._space_progress_locked(row, name, event)
             return
         if event.get("type") != "progress":
             return
@@ -251,33 +249,23 @@ class RunReporter:
         old_state = row["state"]
         row["progress"] = progress
         row["progress_known"] = known
-        row["completed_bytes"] = completed
-        row["total_bytes"] = total
         if row.get("space_blocked") or row.get("memory_blocked"):
             return
         row["state"] = "extracting"
         if self._interactive:
             new_percent = int(progress * 100) if known else None
             if new_percent != old_percent or old_state != "extracting":
-                self._render_panel_locked(force=False, task_id=task_id)
+                self._render_panel_locked(force=False)
+
     # Transport filters stale episodes; only retain the visible state here.
     def _space_progress_locked(
-        self, task: Any, row: dict[str, Any], event: str, payload: dict[str, Any],
+        self, row: dict[str, Any], event: str, payload: dict[str, Any],
     ) -> None:
-        if event == "space_resumed":
-            row["space_blocked"] = False
-            row["detail"] = ""
-            self._restore_progress_locked(row)
-            if self._interactive:
-                self._render_panel_locked(force=True, task_id=id(task))
-
-            return
-
-        row["space_blocked"] = True
+        row["space_blocked"] = event != "space_resumed"
         self._restore_progress_locked(row)
         row["detail"] = self._space_status_detail(payload) if event == "space_status" else ""
-        if self._interactive:
-            self._render_panel_locked(force=True, task_id=id(task))
+        self._render_panel_locked(force=True)
+
     def _space_status_detail(self, payload: dict[str, Any]) -> str:
         # 卷查询失败（拔盘 / UNC 断开 / 权限变化）必须与"空间不足"可区分。
         if not bool(payload.get("volume_query_ok", True)):
@@ -292,7 +280,6 @@ class RunReporter:
 
     def task_finished(self, task: Any, outcome: Any, depth: int) -> None:
         with self._lock:
-            self._completed_tasks += 1
             if self.quiet:
                 return
             key = self._row_key(task)
@@ -309,7 +296,7 @@ class RunReporter:
                 row["progress"] = 1.0
                 row["progress_known"] = True
             if row["output"] and (success or getattr(result, "has_complete_inputs", False)):
-                self._output_lineages[row["output"]] = (key,)
+                self._output_rows[row["output"]] = key
                 if depth == 1:
                     self._top_level_outputs.setdefault(row["output"], row["output"])
             # Verification can reject a child after its worker completed.
@@ -347,7 +334,7 @@ class RunReporter:
             for input_id in row["input_ids"]:
                 self._input_rows.pop(input_id, None)
             if row["output"]:
-                self._output_lineages.pop(row["output"], None)
+                self._output_rows.pop(row["output"], None)
         self._scope_roots.pop(root, None)
         self._render_panel_locked(force=True)
         self.stdout.flush()
@@ -400,7 +387,7 @@ class RunReporter:
             for _path, original in self._top_level_outputs.pop_under(result.path):
                 relocated = result.relocate(original)
                 self._top_level_outputs[relocated] = relocated
-            self._output_lineages.relocate(result)
+            self._output_rows.relocate(result)
             for row in self._task_rows.values():
                 if row["output"]:
                     row["output"] = result.relocate(row["output"])
@@ -478,42 +465,19 @@ class RunReporter:
             print(value, file=self.stderr if error else self.stdout, flush=True)
             self._render_panel_locked(force=True)
 
-    def _lineage_for_path(self, path: str) -> tuple[str, ...]:
-        lineage = ()
-        if path and self._output_lineages:
-            for _, ancestor_lineage in self._output_lineages.ancestors(path):
-                lineage = ancestor_lineage
-        return lineage
-
-    def _update_task_locked(
-        self,
-        task: Any,
-        *,
-        state: str | None = None,
-        progress: float | None = None,
-        detail: str | None = None,
-        force: bool = False,
-    ) -> None:
-        row = self._task_rows.get(self._row_key(task))
-        if row is None:
-            return
-        if state is not None:
-            row["state"] = state
-            if state in {"waiting", "preparing", "extracting"} and (row.get("space_blocked") or row.get("memory_blocked")):
-                self._restore_progress_locked(row)
-        if progress is not None:
-            row["progress"] = min(1.0, max(0.0, float(progress)))
-            row["progress_known"] = True
-        if detail is not None:
-            row["detail"] = detail
-        self._render_panel_locked(force=force, task_id=id(task))
+    def _parent_row_for_path(self, path: str) -> str | None:
+        parent = None
+        if path and self._output_rows:
+            for _, row_key in self._output_rows.ancestors(path):
+                parent = row_key
+        return parent
 
     def _clear_panel_locked(self):
         if self._rendered_lines:
             self.stdout.write(f"\033[{self._rendered_lines}A\r\033[J")
             self._rendered_lines = 0
 
-    def _render_panel_locked(self, *, force: bool, task_id=None) -> None:
+    def _render_panel_locked(self, *, force: bool) -> None:
         if not self._interactive or self._panel_pauses:
             return
         now = time.monotonic()

@@ -144,7 +144,7 @@ def test_departed_middle_volume_remains_missing_and_recovers_when_restored(tmp_p
         with promotion_barrier(
             (middle,), cache_releasers=(release_archive_sessions_under_roots,), quiesce=False,
         ):
-            [result] = ArchiveCleanup("delete", quiet=True).cleanup_success_archives([[str(middle)]])
+            [result] = ArchiveCleanup("delete").cleanup_success_archives([[str(middle)]])
             assert result.status == "deleted"
 
     async def scenario():

@@ -1,6 +1,6 @@
 from weakref import ref
 
-from sunpack.core.contracts.discovery import DiscoveryTrace, StageResult
+from sunpack.core.contracts.discovery import StageResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
@@ -9,16 +9,14 @@ from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 def test_discovery_records_each_batch_and_releases_its_session(monkeypatch):
     context = RunState()
     scanner = ArchiveTaskScanner({}, context)
-    error = DiscoveryTrace("carrier.bin", "embedded",
-                           reason="embedded_scan_io_error", error="Unable to read input")
-    failure = FailureInfo(FailureKind.FILESYSTEM_ERROR, "embedded_boundary", error.error,
-                          details={"path": error.entry_path, "reason": error.reason})
+    failure = FailureInfo(FailureKind.FILESYSTEM_ERROR, "embedded_boundary", "Unable to read input",
+                          details={"path": "carrier.bin", "reason": "embedded_scan_io_error"})
     sessions = []
     reported = []
 
     def fake_discover_targets(roots, *, scan_session, **_kwargs):
         sessions.append(ref(scan_session))
-        return StageResult(traces=[error] if roots == ["carrier.bin"] else [])
+        return StageResult(scan_failures=[failure] if roots == ["carrier.bin"] else [])
 
     def record_failures(failures, language):
         failures = list(failures)

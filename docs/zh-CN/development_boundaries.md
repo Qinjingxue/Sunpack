@@ -67,7 +67,7 @@ sunpack.runtime.watch
 | 密码 | `sunpack.core.passwords` | 密码候选、调度、fast verifier 和 worker 确认。 |
 | 解压 | `sunpack.pipeline.extraction.scheduler.ExtractionScheduler` | 单归档输出、密码解析和 worker 解压。 |
 | 校验 | `sunpack.pipeline.verification.scheduler.VerificationScheduler` | 解压完整度、来源完整性和下一步决策。 |
-| 后处理 | `sunpack.pipeline.postprocess.actions.PostProcessActions` | 成功后清理和扁平化。 |
+| 后处理 | `sunpack.pipeline.postprocess.internal.cleanup.ArchiveCleanup`、`sunpack.pipeline.postprocess.internal.flatten.flatten_dirs` | 成功后清理和扁平化。 |
 
 ## 领域边界
 

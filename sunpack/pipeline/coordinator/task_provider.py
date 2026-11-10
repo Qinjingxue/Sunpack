@@ -50,7 +50,7 @@ class ArchiveTaskProvider:
                 result.tasks.extend(partial.tasks)
                 result.claimed_paths.update(partial.claimed_paths)
                 result.blocked_paths.update(partial.blocked_paths)
-                result.traces.extend(partial.traces)
+                result.scan_failures.extend(partial.scan_failures)
             result.validate()
         else:
             table = build_native_table_for_targets(
