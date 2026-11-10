@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.failures import PASSWORD_NOT_IN_LIST_KEY, FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.support.path_keys import path_key
 
@@ -93,10 +93,10 @@ def discovery_failure(source: str, reason: str, path: str, error: str = "") -> F
 
 
 _DISCOVERY_FAILURES = {
-    "embedded_password_required": (FailureKind.PASSWORD_REQUIRED, "failure.password_required", "request_password"),
-    "embedded_wrong_password": (FailureKind.WRONG_PASSWORD, "failure.wrong_password", "request_password"),
-    "needs_password": (FailureKind.PASSWORD_REQUIRED, "failure.password_required", "request_password"),
-    "wrong_password": (FailureKind.WRONG_PASSWORD, "failure.wrong_password", "request_password"),
+    "embedded_password_required": (FailureKind.PASSWORD_REQUIRED, PASSWORD_NOT_IN_LIST_KEY, "request_password"),
+    "embedded_wrong_password": (FailureKind.WRONG_PASSWORD, PASSWORD_NOT_IN_LIST_KEY, "request_password"),
+    "needs_password": (FailureKind.PASSWORD_REQUIRED, PASSWORD_NOT_IN_LIST_KEY, "request_password"),
+    "wrong_password": (FailureKind.WRONG_PASSWORD, PASSWORD_NOT_IN_LIST_KEY, "request_password"),
     "embedded_scan_io_error": (FailureKind.FILESYSTEM_ERROR, "", ""),
     "embedded_truncated": (FailureKind.DAMAGED, "failure.damaged", ""),
     "missing_volume": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),

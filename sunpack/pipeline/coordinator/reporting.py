@@ -481,8 +481,6 @@ class RunReporter:
                 self._print(self.i18n.t(key, task=message), error=True)
             if summary.scan_error_count:
                 self._print(self.i18n.t("report.scan_incomplete"), error=True)
-            if summary.failed_count and summary.failures and all(failure.is_password_failure for failure in summary.failures):
-                self._print(self.i18n.t("report.password_failure"), error=True)
         if not summary.failed_tasks and not self.quiet:
             self._print(self.i18n.t("report.partial_complete" if recovered else "report.all_success"))
 

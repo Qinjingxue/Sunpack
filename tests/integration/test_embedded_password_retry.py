@@ -66,10 +66,11 @@ def assert_outputs(tmp_path, count=4):
     return roots.pop()
 
 
-def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, carrier_case):
+def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, carrier_case, capsys):
     # Ordinary archive retry tests cannot see successful siblings re-extracted.
     # Two rounds also catch replay of an encrypted sibling unlocked in round one.
     case = carrier_case
+    case.config["cli"]["language"] = "zh"
     responses = []
     conflict = tmp_path / "out" / "capture"
     conflict.mkdir(parents=True)
@@ -82,6 +83,12 @@ def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, car
             return response
 
     answers = iter(["y", "wrong-retry", "", "y", case.passwords[1], "", "y", case.passwords[2], ""])
+    prompts = []
+
+    def read_answer(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
     monkeypatch.setattr(extract, "load_request_config", lambda cwd: case.config)
     monkeypatch.setattr(extract, "pipeline_engine", RecordingEngine)
     monkeypatch.setattr(extract, "collect_clipboard_passwords", lambda cfg: [])
@@ -92,12 +99,15 @@ def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, car
         quiet=False, verbose=False, recursive=False,
     )
     code, result = asyncio.run(extract.handle(args, CliContext(
-        language="en", reporter=CliReporter(quiet=True), cwd=str(tmp_path),
-        input_reader=lambda prompt: next(answers),
+        language="zh", reporter=CliReporter(), cwd=str(tmp_path), input_reader=read_answer,
     )))
     assert code == 0, result.errors
     assert result.summary["password_retry_count"] == 3
     assert [r.summary.failed_count for r in responses] == [1, 1, 1, 0]
+    output = capsys.readouterr()
+    assert "段 3 (zip)" in output.out and "密码未在密码表中" in output.out
+    assert output.err.splitlines() == ["[解压失败] capture.pcapng [密码未在密码表中]"] * 3
+    assert prompts[0] == "[命令行] 是否输入新密码并重试解压？(y/n)："
     root = assert_outputs(tmp_path)
     assert root == conflict.with_name("capture(1)")
     assert (conflict / "existing.txt").read_text(encoding="utf-8") == "keep"

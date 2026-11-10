@@ -3,7 +3,7 @@ import re
 import subprocess
 from typing import Optional
 
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.failures import PASSWORD_NOT_IN_LIST_KEY, FailureInfo, FailureKind
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
 from sunpack.core.i18n import I18nContext
 from sunpack.core.support.archive_error_signals import (
@@ -53,7 +53,7 @@ def classify_extract_failure(
                 user_action="request_password",
                 details={"evidence": "password_or_volume_inconclusive"})
         if worker_result.get("password_candidates_all_rejected"):
-            return _failure(FailureKind.WRONG_PASSWORD, "failure.wrong_password", user_action="request_password")
+            return _failure(FailureKind.WRONG_PASSWORD, PASSWORD_NOT_IN_LIST_KEY, user_action="request_password")
         if password_evidence == "zipcrypto_header_byte" or (
             password_evidence == "empty_password_direct" and worker_result.get("encrypted")
         ):
@@ -70,7 +70,7 @@ def classify_extract_failure(
                         "password_crc_proven_items": int(worker_result.get("password_crc_proven_items") or 0),
                     })
                 if password_evidence == "empty_password_direct":
-                    return _failure(FailureKind.WRONG_PASSWORD, "failure.wrong_password", user_action="request_password",
+                    return _failure(FailureKind.WRONG_PASSWORD, PASSWORD_NOT_IN_LIST_KEY, user_action="request_password",
                         details={"evidence": "empty_password_failed_without_crc_proof", "backend_operation_result": operation})
                 return _failure(FailureKind.PASSWORD_INCONCLUSIVE, "failure.password_state_unknown",
                     details={"evidence": "zipcrypto_failure_without_password_proof", "backend_operation_result": operation})
@@ -85,7 +85,7 @@ def classify_extract_failure(
                 ),
             )
         if _worker_reports_wrong_password(worker_result):
-            return _failure(FailureKind.WRONG_PASSWORD, "failure.wrong_password", user_action="request_password")
+            return _failure(FailureKind.WRONG_PASSWORD, PASSWORD_NOT_IN_LIST_KEY, user_action="request_password")
         if worker_result.get("missing_volume_suspected"):
             return _failure(
                 FailureKind.DAMAGED,

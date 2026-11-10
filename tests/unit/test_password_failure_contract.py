@@ -2,7 +2,7 @@ import pytest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.extraction import ExtractionResult
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.failures import PASSWORD_NOT_IN_LIST_KEY, FailureInfo, FailureKind
 from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_UNKNOWN,
     DECISION_REQUEST_PASSWORD,
@@ -93,12 +93,14 @@ def test_embedded_failure_retains_nested_password_cause():
         kind=FailureKind.WRONG_PASSWORD,
         stage="password_resolution",
         message="password rejected",
+        message_key="failure.password_wrong_or_unknown",
         user_action="request_password",
     )
     embedded = FailureInfo(
         kind=FailureKind.INPUTS_FAILED,
         stage="inputs",
         message="segment failed",
+        message_key="failure.embedded_wrong_password",
         causes=(password,),
     )
 
@@ -107,6 +109,7 @@ def test_embedded_failure_retains_nested_password_cause():
     assert restored is not None
     assert restored.is_password_failure
     assert restored.contains(FailureKind.WRONG_PASSWORD)
+    assert restored.message_key == restored.causes[0].message_key == PASSWORD_NOT_IN_LIST_KEY
 
 
 def test_password_failure_bypasses_verification(tmp_path):

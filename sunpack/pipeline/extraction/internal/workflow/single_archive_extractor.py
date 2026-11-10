@@ -10,7 +10,7 @@ from sunpack.core.support.output_paths import OutputPathAllocator
 from sunpack.core.support.path_keys import resolved_path_key
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
-from sunpack.core.contracts.failures import FailureInfo, FailureKind, aggregate_input_failures
+from sunpack.core.contracts.failures import PASSWORD_NOT_IN_LIST_KEY, FailureInfo, FailureKind, aggregate_input_failures
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
@@ -511,12 +511,12 @@ class SingleArchiveExtractor:
         mapping = {
             PasswordResolutionStatus.PASSWORD_REQUIRED: (
                 FailureKind.PASSWORD_REQUIRED,
-                "failure.password_required",
+                PASSWORD_NOT_IN_LIST_KEY,
                 "request_password",
             ),
             PasswordResolutionStatus.CANDIDATES_EXHAUSTED: (
                 FailureKind.WRONG_PASSWORD,
-                "failure.password_wrong_or_unknown",
+                PASSWORD_NOT_IN_LIST_KEY,
                 "request_password",
             ),
             PasswordResolutionStatus.INCONCLUSIVE: (

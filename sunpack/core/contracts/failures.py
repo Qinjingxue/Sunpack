@@ -22,9 +22,16 @@ class FailureKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+PASSWORD_NOT_IN_LIST_KEY = "failure.password_not_in_list"
 PASSWORD_FAILURE_KINDS = frozenset({
     FailureKind.PASSWORD_REQUIRED,
     FailureKind.WRONG_PASSWORD,
+})
+_LEGACY_PASSWORD_MESSAGE_KEYS = frozenset({
+    "failure.password_required",
+    "failure.wrong_password",
+    "failure.password_wrong_or_unknown",
+    "failure.embedded_wrong_password",
 })
 
 
@@ -82,6 +89,9 @@ class FailureInfo:
             kind = FailureKind(str(payload["kind"]))
         except ValueError:
             kind = FailureKind.UNKNOWN
+        message_key = str(payload.get("message_key") or "")
+        if message_key in _LEGACY_PASSWORD_MESSAGE_KEYS:
+            message_key = PASSWORD_NOT_IN_LIST_KEY
         causes = tuple(
             cause
             for item in payload.get("causes") or []
@@ -91,7 +101,7 @@ class FailureInfo:
             kind=kind,
             stage=str(payload.get("stage") or ""),
             message=str(payload.get("message") or ""),
-            message_key=str(payload.get("message_key") or ""),
+            message_key=message_key,
             message_params=dict(payload.get("message_params") or {}),
             user_action=str(payload.get("user_action") or ""),
             causes=causes,
@@ -115,12 +125,8 @@ def aggregate_input_failures(
             causes=(child,),
             details=details,
         )
-    if all(failure.kind == FailureKind.WRONG_PASSWORD for failure in failures):
-        key = "failure.embedded_wrong_password"
-    elif all(failure.kind == FailureKind.PASSWORD_REQUIRED for failure in failures):
-        key = "failure.password_required"
-    else:
-        key = "failure.embedded_extract_failed"
+    key = (PASSWORD_NOT_IN_LIST_KEY if all(failure.kind in PASSWORD_FAILURE_KINDS for failure in failures)
+           else "failure.embedded_extract_failed")
     return FailureInfo(
         kind=FailureKind.INPUTS_FAILED,
         stage="inputs",
