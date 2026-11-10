@@ -397,7 +397,7 @@ class RunReporter:
                 self._finished_scopes.clear()
                 self._render_panel_locked(force=True)
 
-    def _scope_lines(self, roots):
+    def _scope_lines(self, roots, *, columns=None):
         pending = [iter((key, "", True, True) for key in roots)]
         while pending:
             try:
@@ -410,7 +410,9 @@ class RunReporter:
             yield prefix + branch + str(row["name"]).replace("\n", " ").replace("\r", " ")
             child_prefix = prefix + ("" if root else "   " if last else "│  ")
             if not row["container"] or row["state"] == "error":
-                yield child_prefix + "  " + self._format_task_row(row)
+                status_prefix = child_prefix + "  "
+                available = None if columns is None else columns - 1 - _display_width(status_prefix)
+                yield status_prefix + self._format_task_row(row, max_width=available)
                 if row["detail"] and (self.verbose or row["state"] == "error"):
                     yield child_prefix + "  " + row["detail"].replace("\n", " ").replace("\r", " ")
                 if self.verbose and row["output"]:
@@ -538,7 +540,7 @@ class RunReporter:
         if height <= 0 or columns <= 1:
             return
         lines = []
-        for line in self._scope_lines(self._scope_roots):
+        for line in self._scope_lines(self._scope_roots, columns=columns):
             if len(lines) == height - 1:
                 lines.append(_truncate_display("…", columns - 1))
                 break
@@ -548,17 +550,27 @@ class RunReporter:
         self._rendered_lines = len(lines)
         self.stdout.flush()
 
-    def _format_task_row(self, row: dict[str, Any]) -> str:
+    def _format_task_row(self, row: dict[str, Any], *, max_width: int | None = None) -> str:
         state = row["state"]
         if state in {"disk_paused", "memory_paused"} and row.get("space_blocked") and row.get("memory_blocked"):
             state = "resources_paused"
         label = self.i18n.t("report.status." + state)
-        percent = f"{row['progress']:.0%}" if row["progress_known"] and state != "skipped" else "--%"
+        known = row["progress_known"] and state != "skipped"
+        progress = min(1.0, max(0.0, row["progress"]))
+        percent = f"{int(progress * 100):3d}%" if known else " --%"
+        # Preserve the original ASCII 20-cell bar and narrow-console fallback.
+        # The tree renderer supplies the width after indentation and keeps VT
+        # capability detection, viewport clipping and throttling in one place.
+        filled = int(progress * 20) if known else 0
+        bar = "#" * filled + "-" * (20 - filled)
+        status = f"[{label}] [{bar}] {percent}"
+        if state == "skipped" or (max_width is not None and _display_width(status) > max_width):
+            status = f"[{label}] {percent}"
         detail = ""
         if state in {"disk_paused", "memory_paused", "resources_paused"}:
             hint = {"disk_paused": "disk", "memory_paused": "memory", "resources_paused": "resources"}[state]
             detail = " " + (row["detail"] or self.i18n.t(f"report.status.{hint}_resume_hint"))
-        return f"[{label}] {percent}{detail}"
+        return status + detail
 
     def _output_location(self) -> str:
         outputs = [os.path.abspath(os.path.normpath(path)) for path in self._top_level_outputs.values() if path]

@@ -81,7 +81,7 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         text = stream.getvalue()
         assert text.index("段 1") < text.index("段 2") < text.index("nested.zip")
         assert "   └─ nested.zip" in text.splitlines()
-        assert text.count("[完成] 100%") == 3
+        assert text.count("[完成] [####################] 100%") == 3
         assert "│" in text and "└─" in text
         assert reporter._row_key(outer) not in reporter._task_rows
         if not interactive:
@@ -135,3 +135,43 @@ def test_windows_pipe_handle_is_not_mistaken_for_vt_console():
     finally:
         os.close(reader)
         os.close(writer)
+
+
+def test_progress_bar_survives_resize_and_plain_output(tmp_path):
+    # The tree test checks routing; this catches a missing bar, lost percent on
+    # narrow terminals, and VT leaking into clients that cannot update lines.
+    from tests.helpers.archive_tasks import make_archive_task
+
+    for updates in (True, False):
+        stream = io.StringIO()
+        stream.isatty = lambda: True
+        stream.supports_terminal_updates = updates
+        stream.terminal_size = os.terminal_size((100, 25))
+        reporter = RunReporter("zh", stdout=stream)
+        task = make_archive_task(tmp_path / ("中文长名称" * 30 + ".zip"))
+        reporter.tasks_discovered(1, [task])
+        reporter.task_started(task)
+        if updates:
+            assert "[--------------------]  --%" in stream.getvalue()
+        reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
+        for width in (100, 30, 1, 100):
+            stream.seek(0); stream.truncate(0)
+            stream.terminal_size = os.terminal_size((width, 25))
+            reporter.task_status(task, "extracting")  # Force a semantic refresh, without sleeping.
+            text = stream.getvalue()
+            if updates:
+                for line in text.splitlines():
+                    plain = re.sub(r"\033\[[0-9;]*[A-Za-z]", "", line).replace("\r", "")
+                    assert reporting._display_width(plain) < width
+                if width == 100:
+                    assert "[##########----------]  50%" in text
+                elif width == 30:
+                    assert "50%" in text and "##########" not in text
+            else:
+                assert not text
+        reporter.task_finished(task, _success(tmp_path / "out"), 1)
+        reporter.scope_finished(task)
+        assert "[####################] 100%" in stream.getvalue()
+        if not updates:
+            assert "\033[" not in stream.getvalue()
+        assert not reporter._task_rows

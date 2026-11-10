@@ -574,9 +574,9 @@ def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp
         reporters.append(reporter)
         original = reporter._format_task_row
 
-        def format_row(row):
+        def format_row(row, **kwargs):
             rendered.append(dict(row))
-            return original(row)
+            return original(row, **kwargs)
 
         reporter._format_task_row = format_row
 
@@ -602,4 +602,4 @@ def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp
     assert rendered[-1]["state"] == "complete"
     assert rendered[-1]["progress_known"] is True
     assert rendered[-1]["progress"] == 1.0
-    assert "100%" in output.getvalue()
+    assert "[####################] 100%" in output.getvalue()

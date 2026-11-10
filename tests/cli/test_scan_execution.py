@@ -8,6 +8,8 @@ import io
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from sunpack.runtime.cli.cli import build_cli_parser
 from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_reporter import CliReporter
@@ -17,7 +19,8 @@ from tests.helpers.config_factory import make_config
 from tests.helpers.real_archives import create_encrypted_zip_archive, create_encrypted_7z_archive
 
 
-def test_scan_shared_execution_preserves_sources_and_per_segment_passwords(tmp_path, monkeypatch):
+@pytest.mark.parametrize("json_mode, password", [(False, None), (False, "found-password"), (True, "found-password")])
+def test_scan_shared_execution_preserves_sources_and_per_segment_passwords(tmp_path, monkeypatch, json_mode, password):
     secret = create_encrypted_zip_archive(tmp_path, "secret", password="found-password")
     hidden = create_encrypted_7z_archive(tmp_path, "hidden", password="unlisted-password")
     source = tmp_path / "inputs"
@@ -36,10 +39,16 @@ def test_scan_shared_execution_preserves_sources_and_per_segment_passwords(tmp_p
     config = make_config({"output": {"root": str(output)}, "post_extract": {"archive_cleanup_mode": "d"}})
     monkeypatch.setattr(extract, "load_request_config", lambda _cwd: config)
     monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
-    ctx = CliContext(language="en", cwd=str(tmp_path), stdout=io.StringIO(), stderr=io.StringIO())
-    ctx.reporter = CliReporter(json_mode=True, stdout=ctx.stdout, stderr=ctx.stderr)
+    def unexpected_prompt(prompt):
+        pytest.fail(f"Scan must report unknown passwords without a retry prompt: {prompt}")
+
+    ctx = CliContext(language="en", cwd=str(tmp_path), stdout=io.StringIO(), stderr=io.StringIO(),
+                     input_reader=unexpected_prompt)
+    ctx.reporter = CliReporter(json_mode=json_mode, stdout=ctx.stdout, stderr=ctx.stderr)
     args = build_cli_parser(ctx, command="scan").parse_args([
-        "scan", str(source), "--json", "--deep-detect", "--no-builtin-pw", "-p", "found-password",
+        "scan", str(source), "--deep-detect", "--no-builtin-pw",
+        *(["-p", password] if password else []),
+        *(["--json"] if json_mode else []),
     ])
     code, result = asyncio.run(scan.handle(args, ctx))
     assert code != 0  # Known encryption, but no matching password for hidden.
@@ -50,12 +59,15 @@ def test_scan_shared_execution_preserves_sources_and_per_segment_passwords(tmp_p
     assert len(mixed) == 2, items
     assert mixed[0]["offset"] == len(prefix)
     assert "password_used" not in mixed[0]
-    assert mixed[1]["password_used"] == "found-password", mixed[1]
+    assert mixed[1]["password_used"] == password, mixed[1]
     ordinary = next(item for item in items if Path(item["main_path"]).name == "ordinary.disguised")
     assert "offset" not in ordinary and "password_used" not in ordinary
     unknown = next(item for item in items if Path(item["main_path"]).name == "unknown-password.blob")
     assert unknown["password_used"] is None and "all_parts" not in unknown
     assert all("status" not in item and "discovery_source" not in item for item in items)
+    if not json_mode:
+        assert all(str(path) in ctx.stdout.getvalue() for path in before)
+        assert ctx.t("cli.scan.password", password=ctx.t("cli.scan.password_unknown")) in ctx.stdout.getvalue()
 
 
 def test_scan_retains_volume_domains_and_never_confirms_empty_zipcrypto(tmp_path):

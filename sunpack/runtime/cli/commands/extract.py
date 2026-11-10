@@ -168,6 +168,10 @@ async def handle(args, ctx, *, operation="extract"):
             summary = response.summary
             if response.interrupted:
                 return interrupted_result(ctx, operation, {"paths": target_paths}, response.interruption_cleanup_errors)
+            # Scan reports the facts from this whole pass, including unknown
+            # passwords. Only extraction offers interactive retry rounds.
+            if operation == "scan":
+                break
             failures = list(summary.failures)
             scan_report.record_failures(summary.scan_failures, ctx.language)
             processed_keys = list(summary.processed_keys)
@@ -219,6 +223,11 @@ async def handle(args, ctx, *, operation="extract"):
             reporter.info(ctx.t("cli.extract.retry_round"))
         recent_passwords = engine.recent_passwords
 
+    if operation == "scan":
+        from sunpack.runtime.cli.commands.scan import command_result
+        async with command_work_broker(ctx) as broker:
+            return await broker.run("cli_output", "", command_result, args, ctx, target_paths, summary)
+
     password_summary = build_password_summary(
         passwords,
         use_builtin_passwords=not args.no_builtin_passwords,
@@ -230,10 +239,6 @@ async def handle(args, ctx, *, operation="extract"):
     final_summary = RunSummary(
         target_results=tuple(latest_target_results.values()), scan_failures=tuple(scan_report.scan_failures),
     )
-    if operation == "scan":
-        from sunpack.runtime.cli.commands.scan import command_result
-        async with command_work_broker(ctx) as broker:
-            return await broker.run("cli_output", "", command_result, args, ctx, target_paths, final_summary)
     failed_tasks = final_summary.failed_tasks
     result = CliCommandResult(
         command=operation,
