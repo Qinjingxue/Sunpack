@@ -301,7 +301,10 @@ class RunReporter:
             success = kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}
             detail = str(getattr(result, "error", "") or "")
             failure = getattr(result, "failure", None)
-            if not success and not detail:
+            if row["container"] and failure and failure.kind == FailureKind.INPUTS_FAILED and failure.causes:
+                # Each cause belongs to a segment with its own error line.
+                detail = ""
+            elif not success and not detail:
                 detail = self._format_failure(failure) if failure else self.i18n.t("failure.verification_failed")
             state = "partial" if kind == OutcomeKind.PARTIAL_SUCCESS else "complete" if success else "error"
             self._finish_row(row, state, detail)
@@ -448,8 +451,7 @@ class RunReporter:
         elapsed = max(0.0, time.time() - start_time)
 
         if not self.quiet:
-            self._print("\n" + self.i18n.t("report.complete_title"))
-            self._print("-" * 54)
+            self._print("\n" + "-" * 54)
             self._print(self.i18n.t("report.time", duration=self.i18n.format_duration(elapsed)))
             self._print(self.i18n.t("report.counts", complete=complete_count, partial=partial_count,
                                     failed=summary.failed_count, scan_errors=summary.scan_error_count,
@@ -487,8 +489,8 @@ class RunReporter:
                 self._print(self.i18n.t(key, task=message), error=True)
             if summary.scan_error_count:
                 self._print(self.i18n.t("report.scan_incomplete"), error=True)
-        if not self.quiet and not summary.failed_tasks:
-            self._print(self.i18n.t("report.partial_complete" if recovered else "report.all_success"))
+        if recovered and not self.quiet and not summary.failed_tasks:
+            self._print(self.i18n.t("report.partial_complete"))
 
         cleanup_failures = [
             item for item in summary.cleanup_results if item.status == "failed"

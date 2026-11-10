@@ -220,7 +220,6 @@ async def handle(args, ctx, *, operation="extract"):
             current_targets = retry_targets
             run_config["password_retry_failures"] = password_retry_failures(summary)
             retry_count += 1
-            reporter.info(ctx.t("cli.extract.retry_round"))
         recent_passwords = engine.recent_passwords
 
     if operation == "scan":

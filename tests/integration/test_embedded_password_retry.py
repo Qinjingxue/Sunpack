@@ -105,7 +105,10 @@ def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, car
     assert result.summary["password_retry_count"] == 3
     assert [r.summary.failed_count for r in responses] == [1, 1, 1, 0]
     output = capsys.readouterr()
-    assert "段 3 (zip)" in output.out and "密码未在密码表中" in output.out
+    first_tree = output.out.split("耗时：", 1)[0]
+    assert "段 3 (zip)" in first_tree and first_tree.count("密码未在密码表中") == 2
+    assert "\n处理完成\n" not in output.out
+    assert "使用新输入的密码再解压一轮" not in output.out
     assert not output.err
     assert prompts[0] == "[命令行] 是否输入新密码并重试解压？(y/n)："
     root = assert_outputs(tmp_path)

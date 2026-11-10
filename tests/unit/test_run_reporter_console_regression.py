@@ -93,7 +93,7 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
         assert not reporter._task_rows and not reporter._output_rows
 
         from dataclasses import replace
-        from sunpack.core.contracts.failures import FailureInfo, FailureKind
+        from sunpack.core.contracts.failures import FailureInfo, FailureKind, aggregate_input_failures
         blocked_nodes = tuple(replace(node,
             descriptor=node.descriptor.with_path_mapping(lambda path: path.replace("carrier.bin", "blocked.bin")),
             input_id="", failure=FailureInfo(FailureKind.DAMAGED, "embedded", f"segment {node.position} damaged"),
@@ -102,11 +102,15 @@ def test_scope_tree_keeps_segments_and_recursive_output_with_bounded_terminal(tm
                     discovery_source="embedded", logical_inputs=blocked_nodes)
         reporter.tasks_discovered(1, [blocked])
         reporter.task_started(blocked)
+        failure = aggregate_input_failures(
+            [node.failure for node in blocked_nodes], segment_count=len(blocked_nodes), i18n=reporter.i18n,
+        )
         reporter.task_finished(blocked, SimpleNamespace(outcome_kind=OutcomeKind.FAILURE,
-                               result=SimpleNamespace(error="blocked", out_dir="")), 1)
+                               result=SimpleNamespace(error=failure.message, out_dir="", failure=failure)), 1)
         stream.seek(0); stream.truncate(0)
         reporter.scope_finished(blocked)
         assert "segment 1 damaged" in stream.getvalue() and "segment 2 damaged" in stream.getvalue()
+        assert failure.message not in stream.getvalue()
         assert not reporter._task_rows
 
         reporter.tasks_discovered(1, [outer])

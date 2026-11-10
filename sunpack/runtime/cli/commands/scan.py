@@ -1,4 +1,5 @@
 import os
+from collections import Counter, defaultdict
 from itertools import groupby
 
 from sunpack.core.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
@@ -91,15 +92,7 @@ def _details(item, ctx):
         yield ctx.t("cli.scan.format", format=item["format"])
     plan = item.get("volume_attempts")
     if plan:
-        domains = []
-        for domain in plan["domains"]:
-            names = [_source_name(plan["sources"][i]) for i in domain["choices"]]
-            domains.append(names[0] if len(names) == 1 else "(" + ", ".join(names) + ")")
-        for layout in plan["layouts"]:
-            yield ctx.t("cli.scan.parts", parts=", ".join(domains[slot["domain"]] for slot in layout["slots"]))
-            if layout.get("minimum_slots"):
-                yield ctx.t("cli.scan.volume_count", minimum=layout["minimum_slots"], maximum=len(layout["slots"]))
-        yield ctx.t("cli.scan.constraints")
+        yield from _volume_candidates(plan, ctx)
     elif parts := item.get("all_parts"):
         yield ctx.t("cli.scan.parts", parts=", ".join(map(os.path.basename, parts)))
     if "volume_completeness" in item:
@@ -111,6 +104,38 @@ def _details(item, ctx):
         yield ctx.t("cli.scan.source", source=item["discovery_source"])
     if item.get("damage_flags"):
         yield ctx.t("cli.scan.damage", flags=", ".join(item["damage_flags"]))
+
+
+def _volume_candidates(plan, ctx):
+    layouts = plan["layouts"]
+    by_position = defaultdict(set)
+    required_in = Counter()
+    for layout in layouts:
+        slots = layout["slots"]
+        minimum = layout.get("minimum_slots") or len(slots)
+        for index, slot in enumerate(slots, 1):
+            number = slot["number"]
+            by_position[number].add(slot["domain"])
+            if index <= minimum:
+                required_in[number] += 1
+            if index >= minimum:
+                # A shorter prefix takes its tail from the final domain.
+                by_position[number].add(slots[-1]["domain"])
+
+    groups = defaultdict(list)
+    for number, domains in sorted(by_position.items()):
+        groups[tuple(sorted(domains)), required_in[number] < len(layouts)].append(number)
+    for (domains, optional), positions in groups.items():
+        choices = sorted({i for domain in domains for i in plan["domains"][domain]["choices"]})
+        if len(choices) > 1 or optional:
+            key = "cli.scan.optional_volume_candidates" if optional else "cli.scan.volume_candidates"
+            yield ctx.t(key, positions=", ".join(map(str, positions)),
+                        candidates=", ".join(_source_name(plan["sources"][i]) for i in choices))
+
+    minimum = min(layout.get("minimum_slots") or len(layout["slots"]) for layout in layouts)
+    maximum = max(len(layout["slots"]) for layout in layouts)
+    if minimum < maximum:
+        yield ctx.t("cli.scan.volume_count", minimum=minimum, maximum=maximum)
 
 
 def _source_name(source):

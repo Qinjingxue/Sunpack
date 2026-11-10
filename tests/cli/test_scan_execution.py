@@ -99,9 +99,16 @@ def test_scan_retains_volume_domains_and_never_confirms_empty_zipcrypto(tmp_path
     receipts = list(scan_items(task, result, I18nContext("en")))
     assert receipts and all(item["volume_completeness"] == "pending" for item in receipts)
     assert all("volume_attempts" in item for item in receipts)
-    # Text and JSON use the same compact plan rather than enumerating products.
+    # The conflicting layouts share one candidate line. Fixed slots are
+    # irrelevant to the text, while the full plan is available in JSON.
     ctx = CliContext(language="en")
-    assert ctx.t("cli.scan.volumes.pending") in " ".join(scan._details(receipts[0], ctx))
+    details = list(scan._details(receipts[0], ctx))
+    assert details == [
+        "Format: 7z",
+        "Volume candidates (2, 3): shared.build02.chunk03.opaque[0, 49152), shared.build03.chunk02.opaque[0, 49152)",
+        ctx.t("cli.scan.volumes", state=ctx.t("cli.scan.volumes.pending")),
+        ctx.t("cli.scan.source", source=receipts[0]["discovery_source"]),
+    ]
 
     empty = tmp_path / "empty.txt"
     empty.write_bytes(b"")
@@ -117,6 +124,23 @@ def test_scan_retains_volume_domains_and_never_confirms_empty_zipcrypto(tmp_path
     assert not final["password_verified"], final
     assert final["encrypted"] and final["status"] == "failed", final
     assert not output.exists()
+
+
+def test_scan_shows_movable_tail_at_its_possible_positions():
+    # The shorter layout borrows the terminal domain for an earlier slot.
+    from sunpack.core.contracts.archive_input import InputExtent, VolumeAttemptPlan, VolumeAttemptSlot
+
+    plan = VolumeAttemptPlan(
+        sources=tuple(InputExtent(name) for name in ("head", "middle", "tail")),
+        layouts=(tuple(VolumeAttemptSlot(i, name, (i - 1,))
+                       for i, name in enumerate(("head", "middle", "tail"), 1)),),
+        minimum_slots=(2,),
+    )
+    assert list(scan._details({"volume_attempts": plan.to_dict()}, CliContext(language="en"))) == [
+        "Volume candidates (2): middle, tail",
+        "Volume candidates (3, may be absent): tail",
+        "Volume count range: 2–3",
+    ]
 
 
 def test_scan_confirms_enc_password_with_damaged_recovery_framing(tmp_path, monkeypatch):
