@@ -44,6 +44,7 @@ def test_coalesced_followers_keep_the_owner_result_without_owning_its_lifetime(
         class Runtime:
             def __init__(self, services, submission, leases):
                 self.submission, self.leases = submission, leases
+                self.reporter = None
 
             async def execute_async(self, broker, cancellation):
                 nonlocal owner_request_id

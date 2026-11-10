@@ -761,6 +761,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
         class Runtime:
             def __init__(self, services, submission, leases):
                 self.submission, self.leases = submission, leases
+                self.reporter = None
 
             async def execute_async(self, broker, cancellation):
                 await self.leases.acquire(self.submission.request_id, [str(worker)])

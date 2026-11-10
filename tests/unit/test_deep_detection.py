@@ -60,6 +60,7 @@ def test_one_engine_keeps_watch_and_cli_detection_modes_per_request(tmp_path, mo
         class Runtime:
             def __init__(self, _services, submission, _leases):
                 self.submission = submission
+                self.reporter = None
 
             async def execute_async(self, _broker, _cancellation):
                 observed.append(self.submission)
