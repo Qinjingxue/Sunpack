@@ -440,9 +440,13 @@ class ArchiveJobExecutor:
             res.failure,
             self.i18n,
         )
-        if outcome.outcome_kind == OutcomeKind.FAILURE and possible_missing_volume is not None:
-            res.failure = possible_missing_volume
-            res.error = possible_missing_volume.message
+        failed = outcome.outcome_kind == OutcomeKind.FAILURE
+        if failed:
+            if possible_missing_volume is not None:
+                res.failure = possible_missing_volume
+                res.error = possible_missing_volume.message
+            elif res.success and outcome.verification is not None and not res.error:
+                res.error = self._verification_failure_summary(outcome.verification, outcome.attempts)
 
         recovery = None
         if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS and outcome.verification is not None:
@@ -474,11 +478,7 @@ class ArchiveJobExecutor:
                 else str(res.error or "")
             ),
             failure=(possible_missing_volume if possible_missing_volume is not None else outcome.result.failure),
-            failure_message=(
-                self._failure_message(task, outcome)
-                if outcome.outcome_kind == OutcomeKind.FAILURE
-                else ""
-            ),
+            failure_message=f"{os.path.basename(task.main_path)} [{res.error}]" if failed else "",
             recovery=recovery,
         )
         with self.context.lock:
@@ -487,16 +487,7 @@ class ArchiveJobExecutor:
             self.context.add_target_result(result)
         return result
 
-    def _failure_message(self, task: ArchiveTask, outcome: ArchiveJobOutcome) -> str:
-        name = os.path.basename(task.main_path)
-        if outcome.result.success and outcome.verification is not None and outcome.outcome_kind == OutcomeKind.FAILURE:
-            return f"{name} [{self._verification_failure_summary(outcome)}]"
-        return f"{name} [{outcome.result.error}]"
-
-    def _verification_failure_summary(self, outcome: ArchiveJobOutcome) -> str:
-        verification = outcome.verification
-        if verification is None:
-            return self.i18n.t("failure.verification_failed")
+    def _verification_failure_summary(self, verification: VerificationResult, attempts: int) -> str:
         steps = "; ".join(f"{step.method}:{step.status}" for step in verification.steps) or "none"
         return self.i18n.t(
             "failure.verification_failed_detail",
@@ -504,7 +495,7 @@ class ArchiveJobExecutor:
             integrity=verification.assessment_status,
             decision=verification.decision_hint,
             coverage=verification.archive_coverage.completeness,
-            attempts=outcome.attempts,
+            attempts=attempts,
             steps=steps,
         )
 

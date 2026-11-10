@@ -136,6 +136,8 @@ def test_terminal_policy_is_shared_by_cleanup_report_and_result(tmp_path, monkey
             assert events == ["cleanup"]
             assert finalized.outcome_kind == expected
             assert finalized.policy_rejected_partial_output is force_cleanup
+            if success and expected == OutcomeKind.FAILURE:
+                assert finalized.result.error.startswith("Verification failed:")
             events.append("reported")
 
         async def extracted(*_args, **_kwargs):

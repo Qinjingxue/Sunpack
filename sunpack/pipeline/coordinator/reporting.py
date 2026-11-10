@@ -476,12 +476,18 @@ class RunReporter:
             for result in summary.target_results:
                 if result.outcome_kind != OutcomeKind.FAILURE:
                     continue
+                # Task failures already appear in the tree unless progress is
+                # hidden or a later post-processing step failed.
+                if not self.quiet and result.task_key and (
+                    result.failure is None or result.failure.stage != "postprocess"
+                ):
+                    continue
                 key = "report.input_error" if result.failure is not None and result.failure.kind == FailureKind.INVALID_INPUT else "report.failed"
                 message = result.failure_message or f"{result.input_path} [{result.error}]"
                 self._print(self.i18n.t(key, task=message), error=True)
             if summary.scan_error_count:
                 self._print(self.i18n.t("report.scan_incomplete"), error=True)
-        if not summary.failed_tasks and not self.quiet:
+        if not self.quiet and not summary.failed_tasks:
             self._print(self.i18n.t("report.partial_complete" if recovered else "report.all_success"))
 
         cleanup_failures = [

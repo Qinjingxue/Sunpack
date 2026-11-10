@@ -29,7 +29,7 @@ def test_partial_recovery_prints_possible_missing_volume_warning(tmp_path, capsy
     warning = FailureInfo(
         FailureKind.MISSING_VOLUME,
         "extraction_report",
-        "压缩包内容不完整；可能缺少一个或多个分卷",
+        "压缩包内容不完整，可能缺少分卷",
         details={"missing_volume_confirmed": False, "partial_recovery": True},
     )
 
@@ -44,7 +44,7 @@ def test_partial_recovery_prints_possible_missing_volume_warning(tmp_path, capsy
 
     output = capsys.readouterr().out
     assert "[部分恢复] sample.zip.001" in output
-    assert "[警告] 压缩包内容不完整；可能缺少一个或多个分卷" in output
+    assert "[警告] 压缩包内容不完整，可能缺少分卷" in output
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
@@ -68,18 +68,28 @@ def test_final_summary_distinguishes_scan_and_archive_errors(tmp_path, language,
     # Classification must survive a processing error sharing the scan text.
     from dataclasses import replace
     failure = replace(failure, message=scan_failures[0].message)
+    target_results = (
+        TargetRunResult("shown.7z", OutcomeKind.FAILURE, task_key="shown", error="shown in tree"),
+        TargetRunResult("bad-input", OutcomeKind.FAILURE, error="invalid target",
+                        failure=FailureInfo(FailureKind.INVALID_INPUT, "input", "invalid target")),
+        TargetRunResult("nested.7z", OutcomeKind.FAILURE, task_key="nested", error="promotion failed",
+                        failure=FailureInfo(FailureKind.FILESYSTEM_ERROR, "postprocess", "promotion failed")),
+    )
 
     RunReporter(language, quiet=quiet, emit_errors=emit_errors, stdout=output, stderr=errors).log_final_summary(
         0,
-        RunSummary(scan_failures=(failure, *scan_failures)),
+        RunSummary(target_results=target_results, scan_failures=(failure, *scan_failures)),
     )
 
-    labels = ("[解压失败]", "[扫描错误]", "[扫描不完整]", "压缩包损坏", "解压失败：1  扫描错误：5") if language == "zh" else (
-        "[Extraction failed]", "[Scan error]", "[Scan incomplete]", "Archive is damaged", "Extraction failed: 1  Scan errors: 5",
+    labels = ("[解压失败]", "[扫描错误]", "[扫描不完整]", "压缩包损坏", "解压失败：3  扫描错误：5") if language == "zh" else (
+        "[Extraction failed]", "[Scan error]", "[Scan incomplete]", "Archive is damaged", "Extraction failed: 3  Scan errors: 5",
     )
     if emit_errors:
         assert f"{path}: {labels[3]}" in errors.getvalue()
-        assert errors.getvalue().count(labels[0]) == 1
+        assert errors.getvalue().count(labels[0]) == 2 + quiet
+        assert ("shown.7z [shown in tree]" in errors.getvalue()) == quiet
+        assert "bad-input [invalid target]" in errors.getvalue()
+        assert "nested.7z [promotion failed]" in errors.getvalue()
         assert errors.getvalue().count(labels[1]) == 2
         assert labels[2] in errors.getvalue()
     else:

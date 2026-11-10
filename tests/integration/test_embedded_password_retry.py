@@ -106,7 +106,7 @@ def test_cli_retries_only_remaining_password_segments(tmp_path, monkeypatch, car
     assert [r.summary.failed_count for r in responses] == [1, 1, 1, 0]
     output = capsys.readouterr()
     assert "段 3 (zip)" in output.out and "密码未在密码表中" in output.out
-    assert output.err.splitlines() == ["[解压失败] capture.pcapng [密码未在密码表中]"] * 3
+    assert not output.err
     assert prompts[0] == "[命令行] 是否输入新密码并重试解压？(y/n)："
     root = assert_outputs(tmp_path)
     assert root == conflict.with_name("capture(1)")
