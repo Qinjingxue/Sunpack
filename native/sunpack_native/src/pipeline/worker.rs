@@ -11,19 +11,16 @@ use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 
 pub(super) struct Process {
-    input: Mutex<Option<ChildStdin>>,
-    child: Arc<Mutex<Child>>,
-    reader: Option<JoinHandle<()>>,
+    owner: Option<JoinHandle<()>>,
+    child: Arc<Mutex<Option<Child>>>,
     shared: Arc<Shared>,
-    #[cfg(windows)]
-    _job: Option<crate::core::process::KillOnCloseJob>,
 }
 
 #[derive(Default)]
@@ -38,13 +35,82 @@ struct State {
     jobs: HashMap<String, Job>,
     parked: VecDeque<(String, Arc<Mailbox>)>,
     ready: bool,
+    startup_mode: Option<ProcessMode>,
+    startup_command: Option<ProcessMode>,
+    ready_waiters: HashMap<u64, Option<Waker>>,
+    next_waiter: u64,
+    abort_startup: Option<WorkerExit>,
+    startup_abandoned: bool,
     applied_mode: Option<ProcessMode>,
     mode_reply: Option<(Option<ProcessMode>, bool)>,
     closed: Option<WorkerExit>,
+    input_closed: bool,
+    writes: VecDeque<InputFrame>,
     completion_epoch: u64,
     claimed_epoch: u64,
 }
 
+// One outstanding write per awaiting sender. Queue entries share the sender's
+// encoded bytes, including retries; the writer never holds the state lock while
+// touching the pipe. Awaiting its receipt gives submit/cancel drain backpressure
+// without retaining a scheduler slot or creating a thread per request.
+struct InputFrame {
+    bytes: Arc<Vec<u8>>,
+    completion: Arc<WriteCompletion>,
+}
+
+#[derive(Default)]
+struct WriteCompletion {
+    state: Mutex<WriteState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct WriteState {
+    result: Option<io::Result<()>>,
+    waker: Option<Waker>,
+}
+
+impl WriteCompletion {
+    fn finish(&self, result: io::Result<()>) {
+        let wake = {
+            let mut state = self.state.lock().unwrap();
+            state.result = Some(result);
+            state.waker.take()
+        };
+        self.changed.notify_all();
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(result) = state.result.take() {
+            Poll::Ready(result)
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    async fn wait(&self) -> io::Result<()> {
+        poll_fn(|cx| self.poll(cx)).await
+    }
+
+    // Process-mode changes and final shutdown run on their owning caller,
+    // outside the shared scheduler. They use the same ordered writer.
+    fn wait_blocking(&self) -> io::Result<()> {
+        let state = self.state.lock().unwrap();
+        let mut state = self
+            .changed
+            .wait_while(state, |state| state.result.is_none())
+            .unwrap();
+        state.result.take().unwrap()
+    }
+}
+
+#[derive(Clone)]
 struct WorkerExit {
     message: String,
     kind: io::ErrorKind,
@@ -189,76 +255,89 @@ impl Process {
         if let Some(directory) = path.parent().filter(|path| path.is_absolute()) {
             command.current_dir(directory);
         }
-        let mut child = command.spawn()?;
-        #[cfg(windows)]
-        let job = crate::core::process::KillOnCloseJob::attach(&child).ok();
-        let input = child.stdin.take();
-        let output = child.stdout.take().expect("worker stdout is piped");
-        let child = Arc::new(Mutex::new(child));
+        Self::launch(move || command.spawn(), mode)
+    }
+
+    fn launch(
+        spawn: impl FnOnce() -> io::Result<Child> + Send + 'static,
+        mode: ProcessMode,
+    ) -> io::Result<Self> {
         let shared = Arc::new(Shared::default());
+        shared.state.lock().unwrap().startup_mode = Some(mode);
+        let child = Arc::new(Mutex::new(None));
         let owner = Arc::clone(&shared);
         let owner_child = Arc::clone(&child);
-        let reader = match thread::Builder::new()
+        // Process creation and the handshake belong to this existing IO owner,
+        // not to a request poll. All borrowers await the same retained result.
+        let owner = thread::Builder::new()
             .name("sunpack-worker-stdout".into())
-            .spawn(move || {
-                let result = dispatch_stdout(output, &owner);
-                // EOF or invalid protocol ends every affected attempt. Reap the
-                // child first so another request cannot race an old native writer.
-                let mut child = owner_child.lock().unwrap();
-                let exited = child.try_wait().ok().flatten();
-                if exited.is_none()
-                    && (result.is_err() || !owner.shutting_down.load(Ordering::Acquire))
-                {
-                    let _ = child.kill();
-                }
-                let status = exited.map_or_else(|| child.wait(), Ok);
-                drop(child);
-                let out_of_memory = status
-                    .ok()
-                    .and_then(|status| status.code())
-                    .is_some_and(|code| matches!(code as u32, 0xc0000017 | 0xc000012d));
-                owner.fail(
-                    result.err().map_or_else(
-                        || "sevenzip_worker exited before job completion".to_owned(),
-                        |error| format!("sevenzip_worker transport failed: {error}"),
-                    ),
-                    if out_of_memory {
-                        io::ErrorKind::OutOfMemory
-                    } else {
-                        io::ErrorKind::BrokenPipe
-                    },
-                );
-            }) {
-            Ok(reader) => reader,
-            Err(error) => {
-                let mut child = child.lock().unwrap();
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
+            .spawn(move || run_process(spawn, &owner_child, &owner))?;
+        Ok(Self { owner: Some(owner), child, shared })
+    }
+
+    pub(super) async fn ready(&self, cancellation: &Cancellation) -> io::Result<()> {
+        {
+            let state = self.shared.state.lock().unwrap();
+            if let Some(reason) = &state.closed {
+                cancellation.check_io()?;
+                return Err(reason.error());
             }
-        };
-        let process = Self {
-            input: Mutex::new(input),
-            child,
-            reader: Some(reader),
-            shared,
-            #[cfg(windows)]
-            _job: job,
-        };
-        let state = process.shared.state.lock().unwrap();
-        let state = process
-            .shared
-            .changed
-            .wait_while(state, |state| !state.ready && state.closed.is_none())
-            .unwrap();
-        if let Some(reason) = &state.closed {
-            let error = reason.error();
-            drop(state);
-            process.abort(error.to_string());
-            return Err(error);
+            if state.ready {
+                return cancellation.check_io();
+            }
         }
-        drop(state);
-        Ok(process)
+        // Register before checking cancellation: even a cancellation between
+        // publication and this first poll must retire an unneeded startup.
+        let waiter = ReadyWaiter::new(&self.shared);
+        let shared = Arc::clone(&self.shared);
+        let id = waiter.id;
+        let _subscription = cancellation.subscribe(move || {
+            let wake = shared.state.lock().unwrap().ready_waiters
+                .get_mut(&id).and_then(Option::take);
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+        });
+        poll_fn(|cx| {
+            let mut state = self.shared.state.lock().unwrap();
+            if cancellation.cancelled() {
+                if state.ready || state.closed.is_some()
+                    || (state.ready_waiters.len() > 1 && !state.startup_abandoned)
+                {
+                    // Retire interest atomically with this decision. Two
+                    // concurrent cancellations must not both count each other
+                    // as a surviving borrower and skip the final cleanup wait.
+                    state.ready_waiters.remove(&waiter.id);
+                    return Poll::Ready(cancellation.check_io());
+                }
+                // The last borrower owns cancellation cleanup, but not a host
+                // slot. Keep its future until spawn/child reaping completes so
+                // the engine's caller cannot exit before the child is attached
+                // to its Windows job or killed. Other borrowers cancel promptly.
+                state.abandon_startup();
+                self.shared.changed.notify_all();
+            } else {
+                if let Some(reason) = &state.closed {
+                    return Poll::Ready(Err(reason.error()));
+                }
+                if state.ready {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            *state.ready_waiters.get_mut(&waiter.id).unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }).await
+    }
+
+    pub(super) fn startup_abandoned(&self) -> bool {
+        self.shared.state.lock().unwrap().startup_abandoned
+    }
+
+    pub(super) fn desire_mode(&self, mode: ProcessMode) {
+        let mut state = self.shared.state.lock().unwrap();
+        if !state.ready {
+            state.startup_mode = Some(mode);
+        }
     }
 
     pub(super) fn alive(&self) -> bool {
@@ -270,6 +349,22 @@ impl Process {
     pub(super) fn set_process_mode(&self, mode: ProcessMode) -> io::Result<bool> {
         {
             let mut state = self.shared.state.lock().unwrap();
+            if !state.ready && state.closed.is_none() {
+                // A mode change during startup joins the handshake instead of
+                // racing an independent control command or publishing early.
+                state.startup_mode = Some(mode);
+                self.shared.changed.notify_all();
+                state = self.shared.changed.wait_while(state, |state| {
+                    !state.ready && state.closed.is_none()
+                }).unwrap();
+                if let Some(reason) = &state.closed {
+                    return Err(reason.error());
+                }
+                return Ok(state.applied_mode == Some(mode));
+            }
+            if let Some(reason) = &state.closed {
+                return Err(reason.error());
+            }
             if state.applied_mode == Some(mode) {
                 return Ok(true);
             }
@@ -279,7 +374,7 @@ impl Process {
         let frame = encode_worker_frame(
             &json!({"worker_command":"set_process_mode", "mode":mode_name(mode)}),
         )?;
-        self.send(&frame)?;
+        self.send(Arc::new(frame)).wait_blocking()?;
         let state = self.shared.state.lock().unwrap();
         let mut state = self
             .shared
@@ -316,7 +411,7 @@ impl Process {
         interest: WorkerUpdates,
         mut on_update: impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
-        let frame = encode_worker_frame(&request)?;
+        let frame = Arc::new(encode_worker_frame(&request)?);
         drop(request);
         let mailbox = Arc::new(Mailbox {
             interest,
@@ -330,7 +425,7 @@ impl Process {
         let mut active = ActiveSubmission(Some(self));
         let result = async {
             loop {
-                self.send(&frame)?;
+                self.send(Arc::clone(&frame)).wait().await?;
                 let result = self
                     .wait(job_id, &mailbox, cancellation, &mut on_update)
                     .await?;
@@ -353,6 +448,7 @@ impl Process {
         on_update: &mut impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
         let mut sent_cancel = false;
+        let mut cancel_write: Option<Arc<WriteCompletion>> = None;
         poll_fn(|cx| {
             let (started, progress, resources, result) = {
                 let mut updates = mailbox.updates.lock().unwrap();
@@ -381,9 +477,15 @@ impl Process {
             if !sent_cancel && cancellation.cancelled() {
                 let cancel =
                     encode_worker_frame(&json!({"worker_command":"cancel", "job_id":job_id}))?;
-                self.send(&cancel)?;
+                cancel_write = Some(self.send(Arc::new(cancel)));
                 // Keep the path/output leases until native writers and callbacks stop.
                 sent_cancel = true;
+            }
+            if let Some(write) = &cancel_write {
+                if let Poll::Ready(result) = write.poll(cx) {
+                    result?;
+                    cancel_write = None;
+                }
             }
             // Only one coalesced update per poll. Sustained progress from a
             // large archive must leave room for other requests' stages.
@@ -392,26 +494,12 @@ impl Process {
         .await
     }
 
-    fn send(&self, frame: &[u8]) -> io::Result<()> {
-        let result = self
-            .input
-            .lock()
-            .unwrap()
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker input is closed"))
-            .and_then(|input| input.write_all(frame));
-        if let Err(error) = &result {
-            // A partial write may have admitted this job. Confirm the process
-            // has stopped before releasing any pending caller's output lease.
-            self.abort(error.to_string());
-        }
-        result
+    fn send(&self, bytes: Arc<Vec<u8>>) -> Arc<WriteCompletion> {
+        self.shared.send(bytes)
     }
 
     fn abort(&self, message: String) {
-        let mut child = self.child.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        stop_child(&self.child);
         self.shared.fail(message, io::ErrorKind::BrokenPipe);
     }
 }
@@ -430,21 +518,147 @@ impl Drop for ActiveSubmission<'_> {
 
 impl Drop for Process {
     fn drop(&mut self) {
+        let mut state = self.shared.state.lock().unwrap();
+        if !state.ready || state.closed.is_some() {
+            // No job can have entered an unfinished startup. Its IO owner
+            // handles abort/reap, including a spawn still in progress. A failed
+            // owner has already reaped; do not join its tail on a scheduler poll.
+            state.abandon_startup();
+            drop(state);
+            self.shared.changed.notify_all();
+            return;
+        }
+        drop(state);
         self.shared.shutting_down.store(true, Ordering::Release);
-        if self.alive() {
-            if let Ok(frame) = encode_worker_frame(&json!({"worker_command":"shutdown"})) {
-                let _ = self.send(&frame);
-            }
+        if let Ok(frame) = encode_worker_frame(&json!({"worker_command":"shutdown"})) {
+            let _ = self.send(Arc::new(frame)).wait_blocking();
         }
-        self.input.get_mut().unwrap().take();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        self.shared.close_input();
+        if let Some(owner) = self.owner.take() {
+            let _ = owner.join();
         }
-        let _ = self.child.lock().unwrap().wait();
     }
 }
 
+struct ReadyWaiter<'a> {
+    shared: &'a Shared,
+    id: u64,
+}
+
+impl<'a> ReadyWaiter<'a> {
+    fn new(shared: &'a Shared) -> Self {
+        let mut state = shared.state.lock().unwrap();
+        let id = state.next_waiter;
+        state.next_waiter += 1;
+        state.ready_waiters.insert(id, None);
+        Self { shared, id }
+    }
+}
+
+impl Drop for ReadyWaiter<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.ready_waiters.remove(&self.id);
+        if state.ready_waiters.capacity() > 256 {
+            crate::collections::trim_map(&mut state.ready_waiters);
+        }
+        if state.ready_waiters.is_empty() {
+            state.abandon_startup();
+            self.shared.changed.notify_all();
+        }
+    }
+}
+
+fn run_process(
+    spawn: impl FnOnce() -> io::Result<Child>,
+    child: &Arc<Mutex<Option<Child>>>,
+    shared: &Arc<Shared>,
+) {
+    let mut spawned = match spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            shared.fail(error.to_string(), error.kind());
+            return;
+        }
+    };
+    #[cfg(windows)]
+    let _job = crate::core::process::KillOnCloseJob::attach(&spawned).ok();
+    let input = spawned.stdin.take().expect("worker stdin is piped");
+    let output = spawned.stdout.take().expect("worker stdout is piped");
+    *child.lock().unwrap() = Some(spawned);
+    let abandoned = shared.state.lock().unwrap().abort_startup.clone();
+    if let Some(reason) = abandoned {
+        stop_child(child);
+        shared.fail(reason.message, reason.kind);
+        return;
+    }
+    let owner = Arc::clone(shared);
+    let owner_child = Arc::clone(child);
+    let writer = match thread::Builder::new()
+        .name("sunpack-worker-stdin".into())
+        .spawn(move || {
+            dispatch_stdin(input, &owner, |error| {
+                stop_child(&owner_child);
+                owner.fail(error.to_string(), io::ErrorKind::BrokenPipe);
+            });
+        }) {
+        Ok(writer) => writer,
+        Err(error) => {
+            stop_child(child);
+            shared.fail(error.to_string(), error.kind());
+            return;
+        }
+    };
+    let result = dispatch_stdout(output, shared);
+    // EOF or invalid protocol ends every affected attempt. Reap before any
+    // result/failure wake can release leases or start a replacement process.
+    let mut child_guard = child.lock().unwrap();
+    let child = child_guard.as_mut().expect("spawned worker");
+    let exited = child.try_wait().ok().flatten();
+    if exited.is_none() && (result.is_err() || !shared.shutting_down.load(Ordering::Acquire)) {
+        let _ = child.kill();
+    }
+    let status = exited.map_or_else(|| child.wait(), Ok);
+    let out_of_memory = status.ok().and_then(|status| status.code())
+        .is_some_and(|code| matches!(code as u32, 0xc0000017 | 0xc000012d));
+    // Release the child lock before publication; a failed write may be reaping too.
+    drop(child_guard);
+    shared.fail(
+        result.err().map_or_else(
+            || "sevenzip_worker exited before job completion".to_owned(),
+            |error| format!("sevenzip_worker transport failed: {error}"),
+        ),
+        if out_of_memory { io::ErrorKind::OutOfMemory } else { io::ErrorKind::BrokenPipe },
+    );
+    let _ = writer.join();
+}
+
 impl Shared {
+    fn send(&self, bytes: Arc<Vec<u8>>) -> Arc<WriteCompletion> {
+        let completion = Arc::new(WriteCompletion::default());
+        let mut state = self.state.lock().unwrap();
+        if let Some(reason) = &state.closed {
+            completion.finish(Err(reason.error()));
+        } else if state.input_closed {
+            completion.finish(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker input is closed",
+            )));
+        } else {
+            state.writes.push_back(InputFrame {
+                bytes,
+                completion: Arc::clone(&completion),
+            });
+            self.changed.notify_all();
+        }
+        completion
+    }
+
+    fn close_input(&self) {
+        self.state.lock().unwrap().input_closed = true;
+        self.changed.notify_all();
+    }
+
     fn register(&self, job_id: &str, mailbox: Arc<Mailbox>) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
         if let Some(reason) = &state.closed {
@@ -496,25 +710,47 @@ impl Shared {
     fn event(&self, frame: WorkerFrame) {
         let mut state = self.state.lock().unwrap();
         let kind = string(&frame.summary, "type");
-        if kind == "worker_ready" {
-            state.ready = true;
-            if frame
-                .summary
-                .get("process_mode_applied")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                state.applied_mode = parse_mode(string(&frame.summary, "process_mode"));
-            }
-            self.changed.notify_all();
+        if state.closed.is_some() || state.abort_startup.is_some() {
             return;
         }
-        if kind == "process_mode_ack" {
+        if kind == "worker_ready" {
+            if frame.summary.get("process_mode_applied").and_then(Value::as_bool) == Some(true) {
+                state.applied_mode = parse_mode(string(&frame.summary, "process_mode"));
+            }
+            state.advance_startup();
+        } else if kind == "process_mode_ack" {
             let applied = frame.summary.get("applied").and_then(Value::as_bool) == Some(true);
             let mode = parse_mode(string(&frame.summary, "mode"));
-            state.mode_reply = Some((mode, applied));
             state.applied_mode = mode.filter(|_| applied);
+            if let Some(expected) = state.startup_command.take() {
+                if mode != Some(expected) {
+                    state.abort_startup = Some(WorkerExit {
+                        message: "worker acknowledged a different process mode".into(),
+                        kind: io::ErrorKind::InvalidData,
+                    });
+                } else if state.startup_mode == mode {
+                    // applied=false is an acknowledged refusal, not a reason
+                    // to retry forever or strand every startup borrower.
+                    state.ready = true;
+                    state.startup_mode = None;
+                } else {
+                    state.advance_startup();
+                }
+            } else {
+                state.mode_reply = Some((mode, applied));
+            }
+        }
+        if matches!(kind, "worker_ready" | "process_mode_ack") {
+            let wakes = if state.ready {
+                state.ready_waiters.values_mut().filter_map(Option::take).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            drop(state);
             self.changed.notify_all();
+            for wake in wakes {
+                wake.wake();
+            }
             return;
         }
         let job_id = string(&frame.summary, "job_id").to_owned();
@@ -599,7 +835,7 @@ impl Shared {
         if state.closed.is_some() {
             return;
         }
-        let exit = WorkerExit { message, kind };
+        let exit = state.abort_startup.take().unwrap_or(WorkerExit { message, kind });
         for (_, job) in state.jobs.drain() {
             job.mailbox
                 .update(|updates| updates.result = Some(Err(exit.error())));
@@ -607,12 +843,56 @@ impl Shared {
         for (_, mailbox) in state.parked.drain(..) {
             mailbox.update(|updates| updates.result = Some(Err(exit.error())));
         }
+        for write in state.writes.drain(..) {
+            write.completion.finish(Err(exit.error()));
+        }
+        state.input_closed = true;
         state.closed = Some(exit);
+        let wakes: Vec<_> = state.ready_waiters.values_mut().filter_map(Option::take).collect();
+        drop(state);
         self.changed.notify_all();
+        for wake in wakes {
+            wake.wake();
+        }
     }
 }
 
 impl State {
+    fn abandon_startup(&mut self) {
+        if !self.ready && self.closed.is_none() && self.abort_startup.is_none() {
+            self.startup_abandoned = true;
+            self.abort_startup = Some(WorkerExit {
+                message: "worker startup abandoned".into(),
+                kind: io::ErrorKind::BrokenPipe,
+            });
+        }
+    }
+
+    fn advance_startup(&mut self) {
+        if self.ready || self.abort_startup.is_some() || self.startup_command.is_some() {
+            return;
+        }
+        let Some(mode) = self.startup_mode else {
+            self.ready = true;
+            return;
+        };
+        if self.applied_mode == Some(mode) {
+            self.ready = true;
+            self.startup_mode = None;
+        } else {
+            match encode_worker_frame(&json!({"worker_command":"set_process_mode", "mode":mode_name(mode)})) {
+                Ok(bytes) => {
+                    self.startup_command = Some(mode);
+                    self.writes.push_back(InputFrame {
+                        bytes: Arc::new(bytes),
+                        completion: Arc::new(WriteCompletion::default()),
+                    });
+                }
+                Err(error) => self.abort_startup = Some(WorkerExit { message: error.to_string(), kind: error.kind() }),
+            }
+        }
+    }
+
     fn grant_retry(&mut self) -> bool {
         if let Some((id, mailbox)) = self.parked.pop_front() {
             if self.parked.capacity() > 256 {
@@ -625,6 +905,47 @@ impl State {
         } else {
             false
         }
+    }
+}
+
+fn stop_child(child: &Mutex<Option<Child>>) {
+    if let Some(child) = child.lock().unwrap().as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn dispatch_stdin(mut input: impl Write, shared: &Shared, failed: impl FnOnce(&io::Error)) {
+    loop {
+        let write = {
+            let state = shared.state.lock().unwrap();
+            let mut state = shared
+                .changed
+                .wait_while(state, |state| state.writes.is_empty() && !state.input_closed && state.abort_startup.is_none())
+                .unwrap();
+            if let Some(reason) = &state.abort_startup {
+                let error = reason.error();
+                drop(state);
+                failed(&error);
+                return;
+            }
+            let Some(write) = state.writes.pop_front() else {
+                return;
+            };
+            if state.writes.capacity() > 256 {
+                crate::collections::trim_deque(&mut state.writes);
+            }
+            write
+        };
+        let result = input.write_all(&write.bytes);
+        if let Err(error) = &result {
+            // Even a partial write may have admitted a native job. The owner
+            // reaps the child before any caller can release its output lease.
+            failed(error);
+            write.completion.finish(result);
+            return;
+        }
+        write.completion.finish(result);
     }
 }
 
@@ -674,8 +995,483 @@ fn parse_mode(value: &str) -> Option<ProcessMode> {
 }
 
 #[cfg(test)]
+impl Process {
+    pub(super) fn with_test_start(spawn: impl FnOnce() -> io::Result<Child> + Send + 'static) -> Arc<Self> {
+        Arc::new(Self::launch(spawn, ProcessMode::Normal).unwrap())
+    }
+
+    // Exercise the real Process and Engine wait/cleanup paths with controllable
+    // pipe writes, without needing the separately built native worker binary.
+    pub(super) fn with_test_input(input: impl Write + Send + 'static) -> Arc<Self> {
+        let shared = Arc::new(Shared::default());
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        let child = Arc::new(Mutex::new(Some(child)));
+        let owner = Arc::clone(&shared);
+        let owner_child = Arc::clone(&child);
+        let writer = thread::spawn(move || {
+            dispatch_stdin(input, &owner, |error| {
+                stop_child(&owner_child);
+                owner.fail(error.to_string(), io::ErrorKind::BrokenPipe);
+            });
+        });
+        shared.state.lock().unwrap().ready = true;
+        Arc::new(Self {
+            owner: Some(writer),
+            child,
+            shared,
+        })
+    }
+
+    pub(super) fn test_event(&self, summary: Value) {
+        let bytes = encode_worker_frame(&summary).unwrap();
+        let mut decoder = NativeWorkerFrameDecoder::default();
+        for frame in decoder.feed(&bytes).unwrap() {
+            self.shared.event(frame);
+        }
+        decoder.finish().unwrap();
+    }
+
+    pub(super) fn test_wait_startup_abandoned(&self) {
+        let state = self.shared.state.lock().unwrap();
+        let (_state, timeout) = self.shared.changed.wait_timeout_while(
+            state, std::time::Duration::from_secs(10), |state| !state.startup_abandoned,
+        ).unwrap();
+        assert!(!timeout.timed_out());
+    }
+
+    pub(super) fn test_exit(&self) {
+        self.abort("injected worker exit".into());
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::super::{scheduling::Scheduler, Origin};
     use super::*;
+    use std::future::Future;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct GatedInput {
+        entered: mpsc::SyncSender<Vec<u8>>,
+        release: mpsc::Receiver<()>,
+        barriers: usize,
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for GatedInput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.barriers != 0 {
+                self.entered.send(bytes.to_vec()).unwrap();
+                self.release.recv().unwrap();
+                self.barriers -= 1;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn foreground(
+        scheduler: &Arc<Scheduler>,
+        request: u64,
+    ) -> (JoinHandle<()>, mpsc::Receiver<()>) {
+        let scheduler = Arc::clone(scheduler);
+        let (done, finished) = mpsc::channel();
+        let task = thread::spawn(move || {
+            scheduler.run(request, Origin::Foreground, &Cancellation::new(), |_| {
+                Box::pin(async move {
+                    done.send(()).unwrap();
+                })
+            });
+        });
+        (task, finished)
+    }
+
+    fn readiness(
+        scheduler: &Arc<Scheduler>,
+        process: &Arc<Process>,
+        cancel: &Cancellation,
+        id: u64,
+    ) -> (JoinHandle<io::Result<()>>, mpsc::Receiver<()>) {
+        let scheduler = Arc::clone(scheduler);
+        let process = Arc::clone(process);
+        let cancel = cancel.clone();
+        let (pending, parked) = mpsc::channel();
+        let task = thread::spawn(move || {
+            scheduler.run(id, Origin::Watch, &cancel, |_| {
+                Box::pin(async {
+                    let mut ready = Box::pin(process.ready(&cancel));
+                    let mut pending = Some(pending);
+                    poll_fn(|cx| {
+                        let result = ready.as_mut().poll(cx);
+                        if result.is_pending() {
+                            if let Some(pending) = pending.take() {
+                                let _ = pending.send(());
+                            }
+                        }
+                        result
+                    }).await
+                })
+            })
+        });
+        (task, parked)
+    }
+
+    #[test]
+    fn slow_ready_shares_waiters_cancellation_and_startup_mode_without_host_slots() {
+        // Transport-write tests start with a ready process and miss both
+        // readiness wake fan-out and cancellation losing sibling wakes.
+        // One gated handshake also covers desired-mode reconciliation/refusal.
+        let timeout = Duration::from_secs(10);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let scheduler = pool.install(Scheduler::new);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (entered, writing) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::channel();
+        let process = Process::with_test_input(GatedInput {
+            entered, release: released, barriers: 1, bytes: Arc::clone(&bytes),
+        });
+        {
+            let mut state = process.shared.state.lock().unwrap();
+            state.ready = false;
+            state.startup_mode = Some(ProcessMode::Normal);
+        }
+        let cancelled = Cancellation::new();
+        let (first, first_pending) = readiness(&scheduler, &process, &cancelled, 1);
+        first_pending.recv_timeout(timeout).unwrap();
+        let (second, second_pending) = readiness(&scheduler, &process, &Cancellation::new(), 2);
+        second_pending.recv_timeout(timeout).unwrap();
+        let (third, third_pending) = readiness(&scheduler, &process, &Cancellation::new(), 3);
+        third_pending.recv_timeout(timeout).unwrap();
+        let (independent, finished) = foreground(&scheduler, 4);
+        let responsive = finished.recv_timeout(timeout);
+        cancelled.cancel();
+        assert!(crate::io::cancellation::is_cancellation(&first.join().unwrap().unwrap_err()));
+        assert!(process.alive());
+        assert!(!process.startup_abandoned());
+        assert_eq!(process.shared.state.lock().unwrap().ready_waiters.len(), 2);
+
+        let changing = Arc::clone(&process);
+        let control = thread::spawn(move || changing.set_process_mode(ProcessMode::High));
+        {
+            let state = process.shared.state.lock().unwrap();
+            let (state, timeout) = process.shared.changed.wait_timeout_while(state, timeout, |state| {
+                state.startup_mode != Some(ProcessMode::High)
+            }).unwrap();
+            assert!(!timeout.timed_out());
+            assert_eq!(state.startup_mode, Some(ProcessMode::High));
+        }
+        process.test_event(json!({
+            "type": "worker_ready", "process_mode": "normal", "process_mode_applied": true,
+        }));
+        let mode_write = writing.recv_timeout(timeout).unwrap();
+        assert_eq!(mode_write, encode_worker_frame(&json!({
+            "worker_command": "set_process_mode", "mode": "high",
+        })).unwrap());
+        assert!(!process.shared.state.lock().unwrap().ready);
+        let (during_mode, mode_finished) = foreground(&scheduler, 5);
+        let mode_responsive = mode_finished.recv_timeout(timeout);
+        release.send(()).unwrap();
+        process.test_event(json!({"type":"process_mode_ack", "mode":"high", "applied":false}));
+        second.join().unwrap().unwrap();
+        third.join().unwrap().unwrap();
+        assert!(!control.join().unwrap().unwrap());
+        assert!(process.shared.state.lock().unwrap().ready_waiters.is_empty());
+        assert!(process.shared.state.lock().unwrap().startup_command.is_none());
+        independent.join().unwrap();
+        during_mode.join().unwrap();
+        responsive.expect("slow ready retained the shared host slot");
+        mode_responsive.expect("startup mode retained the shared host slot");
+        drop(process);
+        let shutdown = encode_worker_frame(&json!({"worker_command":"shutdown"})).unwrap();
+        assert_eq!(*bytes.lock().unwrap(), [mode_write, shutdown].concat());
+    }
+
+    #[test]
+    fn last_startup_cancellation_releases_a_waiting_mode_setter() {
+        // A mode setter is not a worker borrower. Counting it as one keeps a
+        // never-ready worker alive after every actual request has cancelled.
+        let timeout = Duration::from_secs(10);
+        let scheduler = Scheduler::new();
+        let process = Process::with_test_input(Vec::new());
+        {
+            let mut state = process.shared.state.lock().unwrap();
+            state.ready = false;
+            state.startup_mode = Some(ProcessMode::Normal);
+        }
+        let cancel = Cancellation::new();
+        let (borrower, pending) = readiness(&scheduler, &process, &cancel, 1);
+        pending.recv_timeout(timeout).unwrap();
+        let changing = Arc::clone(&process);
+        let (completed, completion) = mpsc::channel();
+        let control = thread::spawn(move || {
+            completed.send(changing.set_process_mode(ProcessMode::High)).unwrap();
+        });
+        {
+            let state = process.shared.state.lock().unwrap();
+            let (_state, timed_out) = process.shared.changed.wait_timeout_while(state, timeout, |state| {
+                state.startup_mode != Some(ProcessMode::High)
+            }).unwrap();
+            assert!(!timed_out.timed_out());
+        }
+        cancel.cancel();
+        assert!(crate::io::cancellation::is_cancellation(&borrower.join().unwrap().unwrap_err()));
+        let result = completion.recv_timeout(timeout);
+        if result.is_err() {
+            process.test_exit();
+        }
+        control.join().unwrap();
+        assert!(result.expect("mode setter kept abandoned startup alive").is_err());
+        assert!(!process.alive());
+        assert!(process.shared.state.lock().unwrap().ready_waiters.is_empty());
+    }
+
+    #[test]
+    fn slow_spawn_failure_wakes_all_and_abandoned_owner_reaps_after_drop() {
+        // A fake ready event cannot detect blocking Command::spawn, a consumed
+        // startup error, or teardown missing a child that did not exist yet.
+        let timeout = Duration::from_secs(10);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let scheduler = pool.install(Scheduler::new);
+        let (entered, spawning) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (published, process_rx) = mpsc::channel();
+        let starter_scheduler = Arc::clone(&scheduler);
+        let starter = thread::spawn(move || {
+            starter_scheduler.run(1, Origin::Watch, &Cancellation::new(), |_| {
+                Box::pin(async move {
+                    let process = Process::with_test_start(move || {
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                        Err(io::Error::new(io::ErrorKind::NotFound, "injected spawn failure"))
+                    });
+                    published.send(Arc::clone(&process)).unwrap();
+                    process.ready(&Cancellation::new()).await
+                })
+            })
+        });
+        spawning.recv_timeout(timeout).unwrap();
+        let process = process_rx.recv_timeout(timeout).expect("spawn blocked its scheduler poll");
+        let (second, pending) = readiness(&scheduler, &process, &Cancellation::new(), 2);
+        pending.recv_timeout(timeout).unwrap();
+        let (independent, completed) = foreground(&scheduler, 3);
+        let responsive = completed.recv_timeout(timeout);
+        release.send(()).unwrap();
+        for result in [starter.join().unwrap(), second.join().unwrap()] {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        }
+        assert!(!process.alive());
+        assert!(process.shared.state.lock().unwrap().ready_waiters.is_empty());
+        independent.join().unwrap();
+        responsive.expect("slow spawn retained the shared host slot");
+
+        let (entered, spawning) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let process = Process::with_test_start(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Command::new(std::env::current_exe().unwrap()).arg("--list")
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+        });
+        spawning.recv_timeout(timeout).unwrap();
+        let shared = Arc::clone(&process.shared);
+        let child = Arc::clone(&process.child);
+        let cancel = Cancellation::new();
+        let mut borrower = Box::pin(process.ready(&cancel));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(borrower.as_mut().poll(&mut cx).is_pending());
+        cancel.cancel();
+        assert!(borrower.as_mut().poll(&mut cx).is_pending(), "last cancellation skipped child cleanup");
+        assert!(process.startup_abandoned());
+        assert!(process.alive(), "unfinished cleanup became replaceable");
+        release.send(()).unwrap();
+        let state = shared.state.lock().unwrap();
+        let (state, timed_out) = shared.changed.wait_timeout_while(state, timeout, |state| {
+            state.closed.is_none()
+        }).unwrap();
+        assert!(!timed_out.timed_out());
+        drop(state);
+        assert!(child.lock().unwrap().as_mut().unwrap().try_wait().unwrap().is_some());
+        let Poll::Ready(result) = borrower.as_mut().poll(&mut cx) else {
+            panic!("reaped startup did not finish cancellation");
+        };
+        assert!(crate::io::cancellation::is_cancellation(&result.unwrap_err()));
+        drop(borrower);
+        assert!(shared.state.lock().unwrap().ready_waiters.is_empty());
+        drop(process);
+
+        // Engine teardown can also happen before any readiness future is
+        // polled. In that case Drop itself must retire the pending startup.
+        let (release, released) = mpsc::channel();
+        let process = Process::with_test_start(move || {
+            released.recv().unwrap();
+            Err(io::Error::other("owner dropped before spawn finished"))
+        });
+        let shared = Arc::clone(&process.shared);
+        drop(process);
+        assert!(shared.state.lock().unwrap().startup_abandoned);
+        release.send(()).unwrap();
+        let state = shared.state.lock().unwrap();
+        let (_state, timed_out) = shared.changed.wait_timeout_while(state, timeout, |state| {
+            state.closed.is_none()
+        }).unwrap();
+        assert!(!timed_out.timed_out());
+    }
+
+    #[test]
+    fn blocked_submit_and_cancel_release_the_only_host_slot_and_drain_in_order() {
+        // Unlike a mailbox-only test, exercise Process::submit and its cancel
+        // path on a real one-slot Scheduler. Neither pipe write is released
+        // until an independent foreground request has had a chance to run.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let scheduler = pool.install(Scheduler::new);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (entered, writing) = mpsc::sync_channel(2);
+        let (release, released) = mpsc::channel();
+        let input = GatedInput {
+            entered,
+            release: released,
+            barriers: 2,
+            bytes: Arc::clone(&bytes),
+        };
+        let process = Process::with_test_input(input);
+        let shared = Arc::clone(&process.shared);
+        let cancellation = Cancellation::new();
+        let watch_cancel = cancellation.clone();
+        let watch_process = Arc::clone(&process);
+        let watch_scheduler = Arc::clone(&scheduler);
+        let request = json!({
+            "job_id": "slow", "operation": "extract", "password": "x".repeat(128 * 1024),
+        });
+        let expected = encode_worker_frame(&request).unwrap();
+        let (completed, completion) = mpsc::channel();
+        let watch = thread::spawn(move || {
+            let result = watch_scheduler.run(1, Origin::Watch, &watch_cancel, |_| {
+                Box::pin(watch_process.submit(
+                    "slow", request, &watch_cancel, WorkerUpdates::None, |_| {},
+                ))
+            });
+            completed.send(result.is_ok()).unwrap();
+            result
+        });
+        let submitted = writing.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (first, first_done) = foreground(&scheduler, 2);
+        let submit_independent = first_done.recv_timeout(Duration::from_secs(10));
+        cancellation.cancel();
+        release.send(()).unwrap();
+        let cancel = writing.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (second, second_done) = foreground(&scheduler, 3);
+        let cancel_independent = second_done.recv_timeout(Duration::from_secs(10));
+        let retained_lease = completion.try_recv().is_err();
+        release.send(()).unwrap();
+        finish(&shared, "slow", false);
+        watch.join().unwrap().unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        drop(process); // Ordered shutdown, pipe close and writer join.
+
+        submit_independent.expect("blocked submit retained the shared host slot");
+        cancel_independent.expect("blocked cancellation retained the shared host slot");
+        assert!(
+            retained_lease,
+            "cancellation returned before native job_finished",
+        );
+        assert_eq!(submitted, expected);
+        let expected_cancel =
+            encode_worker_frame(&json!({"worker_command": "cancel", "job_id": "slow"})).unwrap();
+        assert_eq!(cancel, expected_cancel);
+        let shutdown = encode_worker_frame(&json!({"worker_command": "shutdown"})).unwrap();
+        assert_eq!(
+            *bytes.lock().unwrap(),
+            [expected, expected_cancel, shutdown].concat(),
+        );
+        assert!(shared.state.lock().unwrap().writes.is_empty());
+        assert_eq!(
+            Arc::strong_count(&shared), 1,
+            "writer retained the process after shutdown",
+        );
+    }
+
+    #[test]
+    fn partial_write_failure_reaps_before_waking_senders_and_exit_stops_idle_writer() {
+        // Completion/retry tests cannot detect leases released after a partial
+        // frame, stranded queued senders, or an idle stdin thread leaked on EOF.
+        struct PartialFailure(bool);
+        impl Write for PartialFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if std::mem::replace(&mut self.0, false) {
+                    Ok(bytes.len().min(2))
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "injected partial write",
+                    ))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let shared = Arc::new(Shared::default());
+        let mailbox = register(&shared, "admitted");
+        let first = shared.send(Arc::new(vec![1; 8]));
+        let queued = shared.send(Arc::new(vec![2; 8]));
+        let (stopping, stopped) = mpsc::channel();
+        let (reap, reaped) = mpsc::channel();
+        let owner = Arc::clone(&shared);
+        let writer = thread::spawn(move || {
+            dispatch_stdin(PartialFailure(true), &owner, |error| {
+                stopping.send(()).unwrap();
+                reaped.recv().unwrap();
+                owner.fail(error.to_string(), io::ErrorKind::BrokenPipe);
+            });
+        });
+        stopped.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(first.poll(&mut cx).is_pending());
+        assert!(queued.poll(&mut cx).is_pending());
+        assert!(mailbox.updates.lock().unwrap().result.is_none());
+        reap.send(()).unwrap();
+        writer.join().unwrap();
+        for write in [first, queued, shared.send(Arc::new(vec![3]))] {
+            assert_eq!(
+                write.wait_blocking().unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+        }
+        assert_eq!(
+            mailbox.updates.lock().unwrap().result.take().unwrap().err().unwrap().kind(),
+            io::ErrorKind::BrokenPipe,
+        );
+        assert!(shared.state.lock().unwrap().writes.is_empty());
+
+        let idle = Arc::new(Shared::default());
+        let owner = Arc::clone(&idle);
+        let (finished, done) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            dispatch_stdin(Vec::new(), &owner, |_| panic!("unexpected write failure"));
+            finished.send(()).unwrap();
+        });
+        idle.fail("worker stdout exited".into(), io::ErrorKind::BrokenPipe);
+        done.recv_timeout(Duration::from_secs(10))
+            .expect("EOF left an idle writer asleep");
+        writer.join().unwrap();
+        assert_eq!(Arc::strong_count(&idle), 1);
+    }
 
     fn dispatch(shared: &Shared, summary: Value) {
         let bytes = encode_worker_frame(&summary).unwrap();

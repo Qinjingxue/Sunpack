@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+mod owned_outputs;
+
 fn recorded_file_presence(path: &str) -> Option<bool> {
     match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata.is_file()),
@@ -1055,10 +1057,9 @@ impl NativeWatchState {
         task: String,
         output: String,
         keep: Option<bool>,
-        owned_paths: Vec<String>,
+        new_output_scopes: Option<&[crate::scan::scope::NativeDiscoveryScope]>,
     ) -> std::io::Result<Option<NativeWatchOperations>> {
-        let register = !owned_paths.is_empty();
-        if register && keep.is_some() {
+        if new_output_scopes.is_some() && keep.is_some() {
             return Err(invalid("output registration requires a start"));
         }
         let key = path_key(owner);
@@ -1070,9 +1071,13 @@ impl NativeWatchState {
             if let Some(keep) = keep {
                 if !record.active_outputs.contains(&task, &output) {
                     if !keep {
-                        return Ok(None);
-                    }
-                    if !record.committed_roots.contains(&output) {
+                        // Rollback can remove a previously committed output.
+                        // Finish must revoke its recovery and owned exclusions
+                        // even after the active reservation has been cleared.
+                        if !record.committed_roots.covers(&output) {
+                            return Ok(None);
+                        }
+                    } else if !record.committed_roots.contains(&output) {
                         return Ok(record.committed_roots.covers(&output).then(|| {
                             NativeWatchOperations {
                                 operations: Arc::new(Operations::default()),
@@ -1086,11 +1091,21 @@ impl NativeWatchState {
                 true
             }
         };
+        let mut owned_paths = Vec::new();
         let identity = (|| -> std::io::Result<Option<String>> {
             let path = Path::new(&output);
-            if register {
+            if let Some(scopes) = new_output_scopes {
                 crate::scan::scope::create_output_root_exclusive(path)
                     .map_err(crate::pipeline::OutputCreateError::wrap)?;
+                // Relevance is sampled after mkdir, under the publication
+                // gate. An alias retargeted since reservation cannot create an
+                // unregistered tree in another watched namespace.
+                let paths = crate::path_keys::output_path_aliases(path)?;
+                if paths.iter().any(|path| scopes.iter().any(|scope| scope.intersects_output(path)))
+                    && !paths.iter().any(|path| self.owned_root(path).is_some())
+                {
+                    owned_paths = paths;
+                }
             } else if keep.is_none() {
                 std::fs::create_dir_all(path)?;
             }
@@ -1101,7 +1116,12 @@ impl NativeWatchState {
                 Ok(None)
             }
         })()?;
-        let mut operations = Vec::with_capacity(1 + owned_paths.len());
+        let register = !owned_paths.is_empty();
+        let mut operations = if keep == Some(false) {
+            self.discarded_owned_operations(&output)
+        } else {
+            Vec::with_capacity(1 + owned_paths.len())
+        };
         let change = if let Some(keep) = keep {
             OutputChange::Finish {
                 task,
@@ -1124,10 +1144,8 @@ impl NativeWatchState {
                 }));
             }
             if register {
-                let record = serde_json::json!({ "path": output, "identities": [&identity] });
-                operations.extend(owned_paths.into_iter().map(|path| {
-                    Operation::Runtime(format!("owned|{}", path_key(&path)), Some(record.clone()))
-                }));
+                operations.extend(NativeWatchOperations::owned_outputs(&owned_paths, &[&identity])
+                    .operations.0.iter().cloned());
             }
             OutputChange::Start {
                 task,
@@ -1154,47 +1172,18 @@ impl NativeWatchState {
             .collect()
     }
 
-    pub(crate) fn output_root_in_use(&self, path: &str) -> bool {
-        let root = path_key(path);
-        let intersects = |path: &str| {
-            let key = path_key(path);
-            key == root || is_path_under(&key, &root) || is_path_under(&root, &key)
-        };
-        let data = self.lock();
-        data.runtime
-            .range("flatten|".to_owned()..)
-            .take_while(|(key, _)| key.starts_with("flatten|"))
-            .any(|(_, record)| {
-                ["root", "work"]
-                    .iter()
-                    .any(|field| record[*field].as_str().is_some_and(intersects))
-            })
-            || data.pending.values().any(|record| {
-                let source = path_key(&record.path);
-                source == root
-                    || is_path_under(&source, &root)
-                    || record.active_outputs.values().any(|path| intersects(path))
-                    || record.committed_roots.iter().any(|path| intersects(path))
-            })
-    }
-
     pub(crate) fn owned_root(&self, path: &str) -> Option<String> {
-        let key = crate::path_keys::path_key(path);
-        let mut current = key.trim_end_matches('\\');
-        let data = self.lock();
-        loop {
-            if data
-                .runtime
-                .get(&format!("owned|{current}"))
-                .is_some_and(output_identity_matches)
-            {
-                return Some(current.to_owned());
-            }
-            let Some((parent, _)) = current.rsplit_once('\\') else {
-                return None;
-            };
-            current = parent;
-        }
+        let key = path_key(path);
+        let records = {
+            let data = self.lock();
+            crate::path_keys::path_ancestors(&key).filter_map(|ancestor| {
+                data.runtime.get(&format!("owned|{ancestor}"))
+                    .map(|record| (ancestor.to_owned(), record.clone()))
+            }).collect::<Vec<_>>()
+        };
+        records.into_iter().find_map(|(path, record)| {
+            output_identity_matches(&record).then_some(path)
+        })
     }
 
     pub(crate) fn new() -> Self {
@@ -1887,7 +1876,7 @@ mod tests {
         // but the unfinished sibling remains an independently disposable root.
         assert_eq!(pending.active_outputs.values()
             .filter(|output| !pending.committed_roots.contains(output)).collect::<Vec<_>>(), vec![&second]);
-        assert!(resumed.output_operation(&owner, task.clone(), first.clone(), Some(false), Vec::new()).unwrap().is_none());
+        assert!(resumed.output_operation(&owner, task.clone(), first.clone(), Some(false), None).unwrap().is_none());
         append(4, vec![OutputChange::Finish {
             task: task.clone(), output: second.clone(), keep: false, identity: None,
         }, OutputChange::Relocate {
@@ -1970,14 +1959,5 @@ mod tests {
 
 /// Ignore only the directory actually recorded; a reused path is ordinary input.
 pub(crate) fn output_identity_matches(record: &Value) -> bool {
-    let Some(path) = record["path"].as_str() else {
-        return false;
-    };
-    match crate::filesystem::watch_path_identity(path) {
-        Ok((volume, id, _)) => record["identities"].as_array().is_some_and(|ids| {
-            ids.iter()
-                .any(|value| value.as_str() == Some(&format!("{volume}|{id}")))
-        }),
-        Err(_) => false,
-    }
+    owned_outputs::identity_matches(record)
 }

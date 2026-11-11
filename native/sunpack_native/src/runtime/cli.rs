@@ -482,7 +482,7 @@ pub(super) fn run(
         "config" => show_config(cwd, &options, session, language),
         "version" => show_version(cwd, session),
         "doctor" => doctor(cwd, session, options.json, language),
-        "watch" => watch_command(host, cwd, &options, session, language),
+        "watch" => watch_command(host, cwd, &options, session, language, &cancel),
         _ => unreachable!(),
     };
     let (code, result) = match execution {
@@ -2189,13 +2189,14 @@ fn watch_command(
     options: &Options,
     session: &dyn Session,
     language: Language,
+    cancel: &Cancellation,
 ) -> io::Result<(i32, CommandResult)> {
     let mut result = CommandResult::new("watch");
     result.inputs = json!({"action": options.action});
     let mut code = 0;
     match options.action.as_str() {
         "start" if options.once => {
-            code = host.watch.run_once(cwd, host.engine(cwd)?)?;
+            code = host.watch.run_once(cwd, host.engine(cwd)?, cancel)?;
             result.inputs["once"] = Value::Bool(true);
             result.summary = json!({"exit_code": code});
         }

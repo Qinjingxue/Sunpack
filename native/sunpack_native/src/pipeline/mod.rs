@@ -23,6 +23,7 @@ pub(crate) use checkpoint::PromotedSource;
 pub use coordinator::Engine;
 pub(crate) use coordinator::{common_ancestor, common_output_base};
 pub(crate) use discovery::scan_options;
+pub(crate) use scheduling::MAX_PENDING_JOBS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {

@@ -59,6 +59,35 @@ pub(crate) fn normalize_windows_extended_prefix(mut path: String) -> String {
     path
 }
 
+/// Resolve the existing prefix too: outputs below a junction need their real
+/// namespace before mkdir, even when more than one suffix component is absent.
+pub(crate) fn resolved_path_key(path: &std::path::Path) -> String {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            if let Ok(relative) = path.strip_prefix(ancestor) {
+                return path_key(&normalize_windows_extended_prefix(
+                    canonical.join(relative).to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
+    path_key(&normalize_windows_extended_prefix(path.to_string_lossy().into_owned()))
+}
+
+/// Persist both names once at output publication. Event lookup stays lexical
+/// and must never resolve a retargeted junction to guess an old alias pair.
+pub(crate) fn output_path_aliases(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let absolute = normalize_windows_extended_prefix(
+        std::path::absolute(path)?.to_string_lossy().into_owned(),
+    );
+    let resolved = resolved_path_key(std::path::Path::new(&absolute));
+    if path_key(&absolute) == resolved {
+        Ok(vec![absolute])
+    } else {
+        Ok(vec![absolute, resolved])
+    }
+}
+
 /// A trailing separator keeps each parent's descendants adjacent in sort order,
 /// even when a sibling name contains punctuation before '\\'. Only the last
 /// retained root can contain the next key, so reduction is linear after sorting.

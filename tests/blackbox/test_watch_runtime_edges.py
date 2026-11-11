@@ -144,3 +144,97 @@ exit $result
     assert [p.read_bytes() for p in output.rglob(payload.name)] == [payload.read_bytes()]
     document = json.loads((package.data / "builtin_passwords.json").read_text(encoding="utf-8"))
     assert document["clipboard_history"] == ["retained", "clipboard-only-key"]
+
+
+def test_once_drains_admitted_work_without_waiting_for_a_busy_pending_file(package, tmp_path):
+    import ctypes
+    from ctypes import wintypes
+
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    output = tmp_path / "out"
+    busy = watched / "busy.zip"
+    _zip(busy, "busy.txt", b"recover after unlock")
+    _zip(watched / "ready.zip", "ready.txt", b"drain this round")
+    package.json("watch", "add", watched, "-o", output)
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    # Share metadata reads so Watch can durably observe the candidate, while
+    # our WRITE access conflicts with its exclusive readiness boundary.
+    handle = kernel.CreateFileW(str(busy), 0x40000000, 7, None, 3, 0x80, None)
+    assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
+    try:
+        package.json("watch", "start", "--once", "--no-tray", timeout=30)
+        assert [path.read_bytes() for path in output.rglob("ready.txt")] == [b"drain this round"]
+        assert not list(output.rglob("busy.txt"))
+        assert not package.json("watch", "status")["summary"]["running"]
+        # Close/reopen stores, not merely the scheduler: deferred work must be
+        # in the journal, rather than surviving only in a resident pending map.
+        assert package.run("--persistent-shutdown").returncode == 0
+    finally:
+        assert kernel.CloseHandle(handle), ctypes.get_last_error()
+    package.json("watch", "start", "--once", "--no-tray")
+    assert [path.read_bytes() for path in output.rglob("busy.txt")] == [b"recover after unlock"]
+    assert [path.read_bytes() for path in output.rglob("ready.txt")] == [b"drain this round"]
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+@pytest.mark.parametrize("inside", [False, True], ids=["outside-alias", "inside-alias"])
+def test_junction_outputs_exclude_both_names_after_restart_but_admit_replacement(
+    package, tmp_path, origin, inside,
+):
+    """Real extraction covers both registration routes and physical admission.
+
+    Lexical lifecycle tests miss outputs created outside a scope through a
+    junction. One nested archive also catches re-entry after WAL reopen, while
+    replacing the directory proves exclusion is identity-based, not permanent.
+    """
+    watched = tmp_path / "watched"
+    real = watched / "physical"
+    real.mkdir(parents=True)
+    alias = (watched if inside else tmp_path) / "junction"
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(real)],
+        check=True, capture_output=True,
+    )
+    inner = tmp_path / "inner.zip"
+    _zip(inner, "generated.txt", b"must stay inside the nested archive")
+    source = tmp_path / "outer.zip"
+    _zip(source, inner.name, inner.read_bytes())
+    package.configure(recursive_extract=1, post_extract={"flatten_single_directory": False})
+    package.json("watch", "add", watched, "-R", "-o", alias / "results")
+    try:
+        package.json("watch", "start", "--no-tray")
+        if origin == "foreground":
+            package.json("extract", "-r", "1", "-o", alias / "results", source)
+        else:
+            source.replace(watched / source.name)
+        _wait_for_output(real, inner.name, inner.read_bytes())
+        # A real admission round and drain, not a sleep-based negative check.
+        package.json("watch", "start", "--once", "--no-tray")
+        assert package.json("watch", "stop")["summary"]["stopped"]
+        assert not list(real.rglob("generated.txt"))
+        assert package.run("--persistent-shutdown").returncode == 0
+        package.json("watch", "start", "--once", "--no-tray")
+        assert not list(real.rglob("generated.txt"))
+        nested, = real.rglob(inner.name)
+        output = nested.parent
+        # Keep the old directory alive so an ID cannot be immediately reused.
+        output.rename(tmp_path / "previous-output")
+        output.mkdir()
+        package.json("watch", "start", "--no-tray")
+        incoming = tmp_path / "external.zip"
+        _zip(incoming, "external.txt", b"new input at the old output path")
+        incoming.replace(output / incoming.name)
+        _wait_for_output(real, "external.txt", b"new input at the old output path")
+        package.json("watch", "start", "--once", "--no-tray")
+        assert package.json("watch", "stop")["summary"]["stopped"]
+        assert not list(real.rglob("generated.txt"))
+    finally:
+        package.run("watch", "stop")
+        alias.rmdir()

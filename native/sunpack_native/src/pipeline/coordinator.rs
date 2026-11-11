@@ -45,6 +45,7 @@ use std::task::{Poll, Waker};
 pub struct Engine {
     worker_path: PathBuf,
     worker: Mutex<WorkerOwner>,
+    mode_changes: Mutex<()>,
     leases: Arc<Leases>,
     next_job: AtomicU64,
     password_attempts: AttemptCache,
@@ -66,6 +67,7 @@ impl Engine {
                 process: None,
                 desired_mode: ProcessMode::Normal,
             }),
+            mode_changes: Mutex::new(()),
             leases: Arc::new(Leases::default()),
             next_job: AtomicU64::new(1),
             password_attempts: AttemptCache::default(),
@@ -259,28 +261,46 @@ impl Engine {
         Ok(outcome)
     }
 
-    fn worker(&self, config: &WorkerConfig) -> io::Result<Arc<Process>> {
-        let mut owner = self.worker.lock().unwrap();
-        if let Some(worker) = owner.process.as_ref().filter(|worker| worker.alive()) {
-            return Ok(Arc::clone(worker));
+    async fn worker(&self, config: &WorkerConfig, cancel: &Cancellation) -> io::Result<Arc<Process>> {
+        loop {
+            cancel.check_io()?;
+            let process = {
+                let mut owner = self.worker.lock().unwrap();
+                if let Some(worker) = owner.process.as_ref().filter(|worker| worker.alive()) {
+                    Arc::clone(worker)
+                } else {
+                    let process = Arc::new(Process::start(&self.worker_path, config, owner.desired_mode)?);
+                    owner.process = Some(Arc::clone(&process));
+                    process
+                }
+            };
+            match process.ready(cancel).await {
+                Ok(()) => return Ok(process),
+                // A new borrower may arrive while an abandoned generation is
+                // reaping. Await that cleanup, then retry instead of inheriting
+                // another request's cancellation. Genuine failures still return.
+                Err(_) if !cancel.cancelled() && process.startup_abandoned() => continue,
+                Err(error) => return Err(error),
+            }
         }
-        let process = Arc::new(Process::start(
-            &self.worker_path,
-            config,
-            owner.desired_mode,
-        )?);
-        owner.process = Some(Arc::clone(&process));
-        Ok(process)
     }
 
     pub(crate) fn set_process_mode(&self, mode: ProcessMode) -> io::Result<bool> {
-        let mut owner = self.worker.lock().unwrap();
-        owner.desired_mode = mode;
-        owner
-            .process
-            .as_ref()
-            .filter(|process| process.alive())
-            .map_or(Ok(false), |process| process.set_process_mode(mode))
+        // Serialize control acknowledgments, but never hold the ownership lock
+        // while stdin or its ACK is pending: scheduled jobs need that lock to
+        // borrow the live worker. A replacement starts with desired_mode even
+        // if the old process exits during this transition.
+        let _change = self.mode_changes.lock().unwrap();
+        let process = {
+            let mut owner = self.worker.lock().unwrap();
+            owner.desired_mode = mode;
+            let process = owner.process.as_ref().filter(|process| process.alive()).cloned();
+            if let Some(process) = &process {
+                process.desire_mode(mode);
+            }
+            process
+        };
+        process.map_or(Ok(false), |process| process.set_process_mode(mode))
     }
 
     pub(crate) fn clear_idle_passwords(&self) {
@@ -632,14 +652,7 @@ fn conflicting_output_base<'a>(
 /// Canonicalize the existing prefix too: a new leaf below a directory alias
 /// must collide with a reservation reached through its physical spelling.
 fn output_key(path: &Path) -> String {
-    for ancestor in path.ancestors() {
-        if let Ok(canonical) = fs::canonicalize(ancestor) {
-            if let Ok(relative) = path.strip_prefix(ancestor) {
-                return namespace_key(&canonical.join(relative));
-            }
-        }
-    }
-    namespace_key(path)
+    crate::path_keys::resolved_path_key(path)
 }
 
 /// Newly created trees only. Continued roots are never registered here; their
@@ -1137,43 +1150,23 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 let mut descendants = Outcome::default();
                 let mut ran_recursive_children = false;
-                if let Some(inventory) = inventory.filter(|inventory| {
-                    inventory.file_count() > 0 || inventory.unreadable_count() > 0
-                }) {
-                    if depth <= self.request.max_depth && !cancel.cancelled() {
-                        let nested = match discovery::discover_output(
-                            &inventory,
-                            &self.options,
-                            &candidates,
-                            self.request,
-                        ) {
-                            Ok(nested) => nested,
-                            Err(error) if is_cancellation(&error) => Discovered {
-                                tasks: Vec::new(),
-                                errors: Vec::new(),
-                                scan_errors: DirectoryReadErrors::report(),
-                            },
-                            Err(error) => return Err(error),
-                        };
-                        drop(inventory);
-                        if !nested.tasks.is_empty()
-                            && self.allow_recursive(depth + 1, nested.tasks.len()).await
-                        {
-                            ran_recursive_children = true;
-                            descendants = self
-                                .execute_batch(
-                                    nested,
-                                    depth + 1,
-                                    source_scope.map(Arc::from),
-                                    Some((id, &result)),
-                                    spawner.clone(),
-                                )
-                                .await?;
-                        } else {
-                            descendants.errors.extend(nested.errors);
-                            descendants.scan_incomplete =
-                                self.record_scan_errors(nested.scan_errors);
-                        }
+                if let Some(inventory) = inventory {
+                    let (nested, scanned) =
+                        self.discover_children(inventory, depth, &candidates).await?;
+                    ran_recursive_children = scanned;
+                    if scanned {
+                        descendants = self
+                            .execute_batch(
+                                nested,
+                                depth + 1,
+                                source_scope.map(Arc::from),
+                                Some((id, &result)),
+                                spawner.clone(),
+                            )
+                            .await?;
+                    } else {
+                        descendants.errors.extend(nested.errors);
+                        descendants.scan_incomplete = self.record_scan_errors(nested.scan_errors);
                     }
                 }
                 let children_complete = children_already_complete
@@ -1834,7 +1827,7 @@ impl<'run, O: Observer> Run<'run, O> {
             request["codepage"] = Value::from(codepage);
         }
         self.observer.notify(Event::Waiting { id });
-        let native = match self.engine.worker(&self.request.config.performance.worker) {
+        let native = match self.engine.worker(&self.request.config.performance.worker, &self.request.cancel).await {
             Ok(worker) => {
                 worker
                     .submit(
@@ -1999,6 +1992,34 @@ impl<'run, O: Observer> Run<'run, O> {
         } else {
             file_failure(error)
         }
+    }
+
+    async fn discover_children(
+        &self,
+        inventory: NativeOutputInventory,
+        depth: usize,
+        candidates: &CandidateSet<'_>,
+    ) -> io::Result<(Discovered, bool)> {
+        let mut nested = Discovered::default();
+        if depth > self.request.max_depth || self.request.cancel.cancelled() {
+            return Ok((nested, false));
+        }
+        let output = discovery::OutputDiscovery::prepare(inventory, &self.options)?;
+        nested.scan_errors.extend(output.scan_errors());
+        // Main asks once per depth when the filtered output has files, even if
+        // discovery will find no archives or nested authorization rejects them.
+        // Never do relation/embedded detection or password work before consent.
+        // One logical output root is pending; its archive count is not known yet.
+        let scan = output.has_files() && self.allow_recursive(depth + 1, 1).await;
+        if scan {
+            if let Err(error) = output.discover(candidates, self.request, &mut nested) {
+                if !is_cancellation(&error) {
+                    return Err(error);
+                }
+                nested.tasks.clear();
+            }
+        }
+        Ok((nested, scan))
     }
 
     async fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
@@ -3003,6 +3024,257 @@ impl Drop for Lease<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cancelled_startup_is_shared_until_cleanup_then_live_borrowers_retry() {
+        use std::future::Future;
+        use std::thread;
+        use std::time::Duration;
+
+        // Process-only tests cannot catch Engine publishing a second process
+        // before cleanup, returning another request's cancellation, or retaining
+        // a failed generation forever. Exercise both borrow paths on one slot.
+        fn borrow(
+            scheduler: &Arc<Scheduler>, engine: &Arc<Engine>, cancel: &Cancellation, id: u64,
+        ) -> (thread::JoinHandle<io::Result<Arc<Process>>>, mpsc::Receiver<()>) {
+            let scheduler = Arc::clone(scheduler);
+            let engine = Arc::clone(engine);
+            let cancel = cancel.clone();
+            let (pending, parked) = mpsc::channel();
+            let task = thread::spawn(move || {
+                scheduler.run(id, Origin::Watch, &cancel, |_| {
+                    Box::pin(async {
+                        let config = WorkerConfig { space_poll_interval_ms: 1000, space_status_report_interval_ms: 1000 };
+                        let mut worker = Box::pin(engine.worker(&config, &cancel));
+                        let mut pending = Some(pending);
+                        poll_fn(|cx| {
+                            let result = worker.as_mut().poll(cx);
+                            if result.is_pending() {
+                                if let Some(pending) = pending.take() {
+                                    let _ = pending.send(());
+                                }
+                            }
+                            result
+                        }).await
+                    })
+                })
+            });
+            (task, parked)
+        }
+        let timeout = Duration::from_secs(10);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let scheduler = pool.install(Scheduler::new);
+        let worker_path = std::env::temp_dir().join(format!(
+            "sunpack_missing_startup_worker_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let engine = Arc::new(Engine::new(worker_path));
+        let (entered, spawning) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let initial = Process::with_test_start(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "abandoned spawn failure"))
+        });
+        spawning.recv_timeout(timeout).unwrap();
+        engine.worker.lock().unwrap().process = Some(Arc::clone(&initial));
+        let cancel = Cancellation::new();
+        let (first, pending) = borrow(&scheduler, &engine, &cancel, 1);
+        pending.recv_timeout(timeout).unwrap();
+        cancel.cancel();
+        initial.test_wait_startup_abandoned();
+        assert!(!first.is_finished(), "last borrower returned before cleanup");
+        assert!(initial.startup_abandoned());
+        assert!(initial.alive());
+        let (next, pending) = borrow(&scheduler, &engine, &Cancellation::new(), 2);
+        pending.recv_timeout(timeout).unwrap();
+        assert!(Arc::ptr_eq(engine.worker.lock().unwrap().process.as_ref().unwrap(), &initial));
+        let (done, finished) = mpsc::channel();
+        let independent_scheduler = Arc::clone(&scheduler);
+        let independent = thread::spawn(move || {
+            independent_scheduler.run(3, Origin::Foreground, &Cancellation::new(), |_| {
+                Box::pin(async move { done.send(()).unwrap(); })
+            });
+        });
+        let responsive = finished.recv_timeout(timeout);
+        release.send(()).unwrap();
+        assert!(is_cancellation(&first.join().unwrap().err().unwrap()));
+        let error = next.join().unwrap().err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "borrower inherited an abandoned generation");
+        let replacement = Arc::clone(engine.worker.lock().unwrap().process.as_ref().unwrap());
+        assert!(!Arc::ptr_eq(&initial, &replacement));
+        assert!(!initial.alive());
+        independent.join().unwrap();
+        responsive.expect("abandoned startup cleanup retained the only host slot");
+
+        // Genuine startup errors return to the current request, but do not
+        // prevent a later request from starting a fresh generation.
+        assert!(!engine.set_process_mode(ProcessMode::High).unwrap());
+        let (later, _) = borrow(&scheduler, &engine, &Cancellation::new(), 4);
+        assert_eq!(later.join().unwrap().err().unwrap().kind(), io::ErrorKind::NotFound);
+        let owner = engine.worker.lock().unwrap();
+        assert!(!Arc::ptr_eq(owner.process.as_ref().unwrap(), &replacement));
+        assert_eq!(owner.desired_mode, ProcessMode::High);
+        drop(owner);
+        let ready = Process::with_test_input(Vec::new());
+        engine.worker.lock().unwrap().process = Some(Arc::clone(&ready));
+        let (later, _) = borrow(&scheduler, &engine, &Cancellation::new(), 5);
+        assert!(Arc::ptr_eq(&later.join().unwrap().unwrap(), &ready));
+    }
+
+    #[test]
+    fn process_mode_waits_do_not_block_worker_borrows_and_survive_replacement() {
+        use crate::scan::worker_wire::encode_worker_frame;
+        use std::thread;
+        use std::time::Duration;
+
+        // Direct Process tests miss the ownership mutex above the transport.
+        // Hold both the pipe write and the ACK while a real scheduled poll
+        // borrows the worker, then cover serialized changes across replacement.
+        struct ModeInput {
+            writes: mpsc::Sender<Vec<u8>>,
+            release: mpsc::Receiver<()>,
+            shutdown: Vec<u8>,
+        }
+        impl io::Write for ModeInput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes != self.shutdown.as_slice() {
+                    self.writes.send(bytes.to_vec()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        fn process() -> (Arc<Process>, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
+            let (writes, written) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let input = ModeInput {
+                writes,
+                release: released,
+                shutdown: encode_worker_frame(&json!({"worker_command": "shutdown"})).unwrap(),
+            };
+            (Process::with_test_input(input), written, release)
+        }
+        fn borrow_on_scheduler(
+            scheduler: &Arc<Scheduler>,
+            engine: &Arc<Engine>,
+            expected: &Arc<Process>,
+            id: u64,
+        ) -> (thread::JoinHandle<()>, mpsc::Receiver<bool>) {
+            let scheduler = Arc::clone(scheduler);
+            let engine = Arc::clone(engine);
+            let expected = Arc::clone(expected);
+            let (borrowed, received) = mpsc::channel();
+            let task = thread::spawn(move || {
+                scheduler.run(id, Origin::Foreground, &Cancellation::new(), |_| {
+                    Box::pin(async move {
+                        let process = engine
+                            .worker(&WorkerConfig {
+                                space_poll_interval_ms: 1000,
+                                space_status_report_interval_ms: 1000,
+                            }, &Cancellation::new())
+                            .await
+                            .unwrap();
+                        borrowed.send(Arc::ptr_eq(&process, &expected)).unwrap();
+                    })
+                });
+            });
+            (task, received)
+        }
+        fn change(engine: &Arc<Engine>, mode: ProcessMode) -> thread::JoinHandle<io::Result<bool>> {
+            let engine = Arc::clone(engine);
+            thread::spawn(move || engine.set_process_mode(mode))
+        }
+        fn ack(process: &Process, mode: &str) {
+            process.test_event(json!({"type": "process_mode_ack", "mode": mode, "applied": true}));
+        }
+        fn command(mode: &str) -> Vec<u8> {
+            encode_worker_frame(&json!({"worker_command": "set_process_mode", "mode": mode})).unwrap()
+        }
+
+        let timeout = Duration::from_secs(10);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let scheduler = pool.install(Scheduler::new);
+        let engine = Arc::new(Engine::new(PathBuf::from("unused-worker")));
+        let (initial, writing, release) = process();
+        engine.worker.lock().unwrap().process = Some(Arc::clone(&initial));
+        let background = change(&engine, ProcessMode::Background);
+        assert_eq!(writing.recv_timeout(timeout).unwrap(), command("background"));
+        let (first, first_done) = borrow_on_scheduler(&scheduler, &engine, &initial, 1);
+        let during_write = first_done.recv_timeout(timeout);
+        release.send(()).unwrap();
+        let (second, second_done) = borrow_on_scheduler(&scheduler, &engine, &initial, 2);
+        let during_ack = second_done.recv_timeout(timeout);
+        let high = change(&engine, ProcessMode::High);
+        ack(&initial, "background");
+        assert!(background.join().unwrap().unwrap());
+        assert_eq!(writing.recv_timeout(timeout).unwrap(), command("high"));
+        release.send(()).unwrap();
+        ack(&initial, "high");
+        assert!(high.join().unwrap().unwrap());
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(during_write.expect("mode write held the worker ownership mutex"));
+        assert!(during_ack.expect("mode ACK held the worker ownership mutex"));
+
+        let normal = change(&engine, ProcessMode::Normal);
+        assert_eq!(writing.recv_timeout(timeout).unwrap(), command("normal"));
+        release.send(()).unwrap();
+        let (replacement, replacement_writing, replacement_release) = process();
+        {
+            // Model worker() publishing its replacement under this same owner
+            // lock, using the desired mode already published by the transition.
+            let mut owner = engine.worker.lock().unwrap();
+            assert!(matches!(owner.desired_mode, ProcessMode::Normal));
+            replacement.test_event(json!({
+                "type": "worker_ready", "process_mode": "normal", "process_mode_applied": true,
+            }));
+            owner.process = Some(Arc::clone(&replacement));
+            initial.test_exit();
+        }
+        assert!(normal.join().unwrap().is_err());
+        let final_change = change(&engine, ProcessMode::Background);
+        assert_eq!(
+            replacement_writing.recv_timeout(timeout).unwrap(),
+            command("background"),
+        );
+        replacement_release.send(()).unwrap();
+        ack(&initial, "normal"); // An obsolete ACK cannot rewrite the new owner's state.
+        ack(&replacement, "background");
+        assert!(final_change.join().unwrap().unwrap());
+        let (borrowed, received) = borrow_on_scheduler(&scheduler, &engine, &replacement, 3);
+        assert!(received.recv_timeout(timeout).unwrap());
+        borrowed.join().unwrap();
+        let cached_engine = Arc::clone(&engine);
+        let (cached_done, cached_result) = mpsc::channel();
+        let cached = thread::spawn(move || {
+            cached_done.send(cached_engine.set_process_mode(ProcessMode::Background)).unwrap();
+        });
+        let cached_result = cached_result.recv_timeout(timeout);
+        if cached_result.is_err() {
+            // A cache regression must fail rather than leave this test's
+            // writer/control thread blocked on an unexpected extra command.
+            if replacement_writing.recv_timeout(timeout).is_ok() {
+                replacement_release.send(()).unwrap();
+                ack(&replacement, "background");
+            } else {
+                replacement.test_exit();
+            }
+        }
+        cached.join().unwrap();
+        assert!(cached_result.expect("applied mode cache was lost").unwrap());
+        assert!(replacement_writing.try_recv().is_err());
+        assert!(matches!(
+            engine.worker.lock().unwrap().desired_mode,
+            ProcessMode::Background,
+        ));
+    }
+
     fn test_run<'a, O: Observer>(
         engine: &'a Engine,
         request: &'a Request,
@@ -3025,6 +3297,163 @@ mod tests {
             promoted_sources: HashMap::new(),
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
         }
+    }
+
+    fn output_manifest(files: &[(&str, &[u8])]) -> crate::scan::directory::NativeWorkerManifest {
+        use crate::scan::directory::{NativeWorkerManifest, OutputFileRecord};
+
+        let records = files.iter().map(|(path, data)| OutputFileRecord {
+            path: (*path).to_owned(),
+            size: data.len() as u64,
+            status: 1,
+            mtime_ns: Some(1),
+            magic: Box::from(&data[..data.len().min(512)]),
+        }).collect();
+        NativeWorkerManifest::from_parts(records, [
+            1, files.len() as u64, 0,
+            files.iter().map(|(_, data)| data.len() as u64).sum(), 1,
+        ]).unwrap()
+    }
+
+    #[test]
+    fn recursive_discovery_waits_for_consent_and_releases_the_manifest() {
+        // Real RAR5 -hp fixture (password "secret"). A real successful probe
+        // changes this request's password cache, so this catches discovery moved
+        // above the prompt without a mock or process-global test counters.
+        let hex = "526172211a07010074de7b1c21040000010f7b64253244702e2a32eb93579555a37d38b616cb97898c463d3682920551724ed0c1c974029cc2b8ef8491fc816311daa1b0410f6115608170466e4948a8c6d4f17e28b08c727b4acfc116d3d075ce011963dc0c72e50a803d9036619810e92352e809830c9463ab4a0abdaab61e008218673e9c51409f76b2064bf7982e56d8173f1e387329bd5aca3bac49063545fcbfc19547d2be214b4fe1dae172b250e168f2a258548930b1763fb500c7869d70f2539d86fd19214dcc3bca1363154b0a0f2b0bba7dcc224ec1893cbc31cfa95158ccf5e96d74921de6f268ea4429e2ddf63d49220005742fef059f868372345f071322a7e690d56d5ac17b563fa9e923076fa2c58aa8e88e9843df17b7e79a30ca936d8215c92f6832f86887c3c3160ecfddfcdf7712382f84f39eb8";
+        let rar: Vec<_> = (0..hex.len()).step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap()).collect();
+        let source = crate::test_support::temp_file("recursive_consent", b"source");
+        let root = source.with_extension("output");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("encrypted.bin"), &rar).unwrap();
+        // The manifest head is sufficient for cheap preparation, but this
+        // departed carrier makes a full embedded scan observable as an error.
+        let carrier = [0; 1024];
+        for answer in [false, true] {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let mut request = Request::new(Vec::new(), Mode::Extract);
+            request.max_depth = usize::MAX;
+            let config = Arc::make_mut(&mut request.config);
+            config.recursive_extract = Recursion::Prompt;
+            config.recursive_authorization.enabled = false;
+            config.filesystem.scan_filters_enabled = false;
+            config.embedded_scan.enabled = true;
+            config.embedded_scan.recursive_candidate_ratio = 0.3;
+            let observer = |_: Event| {};
+            let mut run = test_run(&engine, &request, &observer);
+            run.candidates = CandidateSet::new(
+                Arc::from([Arc::from("secret")]), None, &engine.password_attempts, None,
+            );
+            let manifest = output_manifest(&[("encrypted.bin", &rar), ("carrier.bin", &carrier)]);
+            let retained = Arc::downgrade(manifest.records());
+            let inventory = manifest.to_output_inventory(root.to_string_lossy().into_owned());
+            drop(manifest);
+            let prompted = Mutex::new(Vec::new());
+            let scheduler = Scheduler::new();
+            let (nested, scanned) = run.recursion.serve(&request.cancel, |depth, pending| {
+                assert!(retained.upgrade().is_none(), "prompt retained the worker manifest");
+                assert!(engine.recent_passwords().is_empty(), "password probe ran before consent");
+                prompted.lock().unwrap().push((depth, pending));
+                answer
+            }, || scheduler.run(1, Origin::Foreground, &request.cancel, |_| {
+                Box::pin(run.discover_children(inventory, 1, &run.candidates))
+            })).unwrap();
+            assert_eq!(*prompted.lock().unwrap(), [(2, 1)]);
+            assert_eq!(scanned, answer);
+            if answer {
+                assert_eq!(engine.recent_passwords().as_slice(), [Arc::<str>::from("secret")]);
+                assert!(!nested.tasks.is_empty(), "approved archive was not discovered");
+                assert!(nested.scan_errors.into_messages().iter()
+                    .any(|(operation, _, _)| operation == "embedded_scan"));
+            } else {
+                assert!(engine.recent_passwords().is_empty());
+                assert!(nested.tasks.is_empty());
+                assert!(nested.scan_errors.is_empty(), "decline still scanned the carrier");
+            }
+        }
+        release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn recursive_prompt_uses_filtered_outputs_before_candidate_authorization() {
+        use crate::core::config::{ScanFilter, ScanFilterKind};
+        use std::io::Write;
+
+        // Main's boundary is a filtered file, not an archive candidate. Cover
+        // the complementary no-prompt cases and post-prompt policy rejection
+        // together so moving either policy to the wrong side is observable.
+        let source = crate::test_support::temp_file("recursive_boundaries", b"source");
+        let root = source.with_extension("output");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let plain = [b'x'; 1024];
+        fs::write(root.join("sub/plain.bin"), plain).unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(b"nested payload").unwrap();
+        let gzip = gzip.finish().unwrap();
+        fs::write(root.join("nested.bin"), &gzip).unwrap();
+        for (case, expected_prompt, expected_scan, expected_tasks) in [
+            ("empty", false, false, 0),
+            ("unreadable", false, false, 0),
+            ("filtered", false, false, 0),
+            ("depth", false, false, 0),
+            ("cancelled", false, false, 0),
+            ("plain", true, true, 0),
+            ("archive", true, true, 1),
+            ("policy_rejected", true, true, 0),
+            ("fixed", false, true, 1),
+        ] {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let mut request = Request::new(Vec::new(), Mode::Extract);
+            request.max_depth = if case == "depth" { 0 } else { usize::MAX };
+            let config = Arc::make_mut(&mut request.config);
+            config.recursive_extract = if case == "fixed" { Recursion::Fixed(2) } else { Recursion::Prompt };
+            config.recursive_authorization.enabled = case == "policy_rejected";
+            config.recursive_authorization.minimum_authorization_score = 1.0;
+            config.embedded_scan.enabled = false;
+            config.filesystem.scan_filters_enabled = false;
+            if case == "filtered" {
+                config.filesystem.scan_filters_enabled = true;
+                config.filesystem.scan_filters = Arc::from([ScanFilter {
+                    enabled: true,
+                    kind: ScanFilterKind::MtimeRange([Some(1), None, None, None, None]),
+                }]);
+            }
+            let files: Vec<(&str, &[u8])> = match case {
+                "empty" | "unreadable" => Vec::new(),
+                "archive" | "policy_rejected" | "fixed" => vec![
+                    ("sub/plain.bin", &plain), ("nested.bin", &gzip),
+                ],
+                _ => vec![("sub/plain.bin", &plain)],
+            };
+            let inventory = if case == "unreadable" {
+                scan_output_inventory_impl(&root.join("absent").to_string_lossy())
+            } else {
+                output_manifest(&files).to_output_inventory(root.to_string_lossy().into_owned())
+            };
+            if case == "cancelled" {
+                request.cancel.cancel();
+            }
+            let observer = |_: Event| {};
+            let run = test_run(&engine, &request, &observer);
+            let prompted = Mutex::new(Vec::new());
+            let scheduler = Scheduler::new();
+            let (nested, scanned) = run.recursion.serve(&request.cancel, |depth, pending| {
+                prompted.lock().unwrap().push((depth, pending));
+                true
+            }, || scheduler.run(1, Origin::Foreground, &request.cancel, |_| {
+                Box::pin(run.discover_children(inventory, 1, &run.candidates))
+            })).unwrap();
+            assert_eq!(!prompted.lock().unwrap().is_empty(), expected_prompt, "{case}");
+            assert_eq!(scanned, expected_scan, "{case}");
+            assert_eq!(nested.tasks.len(), expected_tasks, "{case}");
+            assert_eq!(!nested.scan_errors.is_empty(), case == "unreadable", "{case}");
+        }
+        release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(source).unwrap();
     }
 
     #[test]

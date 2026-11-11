@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
+pub(crate) const MAX_PENDING_JOBS: usize = 4096;
+
 pub(super) struct Scheduler {
     capacity: usize,
     state: Mutex<Admission>,
@@ -142,7 +144,7 @@ impl Scheduler {
             signals,
             // Match main's request-level consumer budget. Rayon limits polls;
             // this separately bounds retained recursive consumer futures.
-            consumers: Arc::new(AtomicUsize::new(4096.max(self.capacity))),
+            consumers: Arc::new(AtomicUsize::new(MAX_PENDING_JOBS.max(self.capacity))),
         };
         let mut result = spawner.spawn(run(spawner.clone()));
         let mut tasks = HashMap::new();

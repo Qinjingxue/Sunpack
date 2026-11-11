@@ -184,6 +184,16 @@ impl Journal {
         Ok(())
     }
 
+    /// Use the existing publication gate without emitting a WAL record or
+    /// advancing a cursor. An output's mkdir and durable registration cannot
+    /// be observed halfway through by a directory-notification callback.
+    pub(super) fn filter_owned_events(&self, paths: &mut Vec<PathBuf>, boundary: &Path) {
+        let frontier = self.frontier.lock().unwrap();
+        if frontier.fault.is_none() {
+            self.state.retain_unowned_events(paths, boundary);
+        }
+    }
+
     pub(super) fn flush(&self) -> io::Result<()> {
         let ticket = {
             let frontier = self.frontier.lock().unwrap();
@@ -307,6 +317,67 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_filter_waits_for_output_publication_without_advancing_the_journal() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let marker = crate::test_support::temp_file("owned_publication", b"");
+        let directory = marker.with_extension("watch");
+        let alias = marker.with_extension("junction");
+        let output = alias.join("output");
+        let physical = directory.join("output");
+        let state_directory = marker.with_extension("state");
+        fs::create_dir_all(&directory).unwrap();
+        let junction = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&alias).arg(&directory).output().unwrap();
+        assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
+        let journal = Arc::new(Journal::open(&state_directory).unwrap());
+        let (start, ready) = mpsc::sync_channel(1);
+        let (attempt, entered) = mpsc::sync_channel(1);
+        let (finish, filtered) = mpsc::sync_channel(1);
+        let reader = Arc::clone(&journal);
+        let observed = physical.clone();
+        let literal = output.clone();
+        let boundary = directory.clone();
+        let worker = thread::spawn(move || {
+            ready.recv().unwrap();
+            attempt.send(()).unwrap();
+            let mut paths = vec![boundary.clone(), observed.clone(), observed.join("generated.zip"),
+                literal.clone(), literal.join("generated.zip")];
+            reader.filter_owned_events(&mut paths, &boundary);
+            finish.send(paths).unwrap();
+        });
+        journal.commit(true, |_| {
+            crate::scan::scope::create_output_root_exclusive(&output)?;
+            start.send(()).unwrap();
+            entered.recv().unwrap();
+            assert_eq!(filtered.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout));
+            let (volume, id, _) = crate::filesystem::watch_path_identity(output.to_str().unwrap())?;
+            Ok(NativeWatchOperations::owned_outputs(
+                &crate::path_keys::output_path_aliases(&output)?, &[&format!("{volume}|{id}")],
+            ))
+        }).unwrap();
+        assert_eq!(filtered.recv_timeout(Duration::from_secs(5)).unwrap(), vec![directory.clone()]);
+        worker.join().unwrap();
+        assert_eq!(journal.frontier.lock().unwrap().seq, 1);
+        assert!(journal.state().watch_cursors().is_empty());
+        drop(journal);
+        let journal = Journal::open(&state_directory).unwrap();
+        let mut paths = vec![output.join("nested.blob"), physical.join("nested.blob")];
+        journal.filter_owned_events(&mut paths, &directory);
+        assert!(paths.is_empty());
+        assert_eq!(journal.state().runtime_keys("owned|").len(), 2);
+        assert!(journal.state().watch_cursors().is_empty());
+        drop(journal);
+        fs::remove_dir(alias).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
 
     #[test]
     fn checkpoint_replays_append_after_the_sealed_prefix() {

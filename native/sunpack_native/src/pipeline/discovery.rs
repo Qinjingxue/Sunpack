@@ -4,7 +4,7 @@ use crate::core::config::{Config, ScanFilterKind};
 use crate::io::archive_state::{
     ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
 };
-use crate::io::directory_errors::DirectoryReadErrors;
+use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use crate::password::rar::resolve_embedded_rar_boundaries;
 use crate::path_keys::{path_ancestors, path_key};
 use crate::scan::directory::{
@@ -386,43 +386,71 @@ pub(super) fn discover(
     Ok(result)
 }
 
-pub(super) fn discover_output(
-    inventory: &NativeOutputInventory,
-    options: &NativeDirectoryScanOptions,
-    candidates: &CandidateSet<'_>,
-    request: &Request,
-) -> io::Result<Discovered> {
-    let (filtered, raw) = inventory.build_directory_snapshots(options)?;
-    let mut result = Discovered::default();
-    result.scan_errors.extend(filtered.scan_errors());
-    let mut verified = HashMap::new();
-    let mut table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
-    result.project(&mut table, candidates, &verified, request, true)?;
-    let policy = request.config.recursive_authorization;
-    if policy.enabled && !result.tasks.is_empty() {
-        let allowed = authorize_nested_candidates(
-            &raw,
-            Path::new(inventory.root()),
-            result.tasks.iter().map(|task| {
-                (
-                    task.entry().entry_path.as_str(),
-                    task.owned_paths.as_slice(),
-                )
-            }),
-            policy,
-        );
-        let mut allowed = allowed.into_iter();
-        result.tasks.retain(|_| allowed.next() == Some(true));
+/// The filtered/raw output snapshot is cheap preparation, not archive discovery.
+/// Own it across the prompt so the worker manifest can be dropped before waiting.
+pub(super) struct OutputDiscovery {
+    root: String,
+    filtered: NativeDirectorySnapshot,
+    raw: NativeDirectorySnapshot,
+}
+
+impl OutputDiscovery {
+    pub(super) fn prepare(
+        inventory: NativeOutputInventory,
+        options: &NativeDirectoryScanOptions,
+    ) -> io::Result<Self> {
+        let (filtered, raw) = inventory.build_directory_snapshots(options)?;
+        Ok(Self {
+            root: inventory.root().to_owned(),
+            filtered,
+            raw,
+        })
     }
-    assign_retry_scopes(
-        &mut result.tasks,
-        &[Arc::new(RetryScope {
-            scope: NativeDiscoveryScope::new(inventory.root().to_owned(), None, Vec::new()),
-            snapshot: raw,
-            bucket: String::new(),
-        })],
-    );
-    Ok(result)
+
+    pub(super) fn has_files(&self) -> bool {
+        self.filtered.records().any(|(_, is_dir, _, _)| !is_dir)
+    }
+
+    pub(super) fn scan_errors(&self) -> Vec<DirectoryReadError> {
+        self.filtered.scan_errors()
+    }
+
+    pub(super) fn discover(
+        self,
+        candidates: &CandidateSet<'_>,
+        request: &Request,
+        result: &mut Discovered,
+    ) -> io::Result<()> {
+        let Self { root, filtered, raw } = self;
+        let mut verified = HashMap::new();
+        let mut table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
+        result.project(&mut table, candidates, &verified, request, true)?;
+        let policy = request.config.recursive_authorization;
+        if policy.enabled && !result.tasks.is_empty() {
+            let allowed = authorize_nested_candidates(
+                &raw,
+                Path::new(&root),
+                result.tasks.iter().map(|task| {
+                    (
+                        task.entry().entry_path.as_str(),
+                        task.owned_paths.as_slice(),
+                    )
+                }),
+                policy,
+            );
+            let mut allowed = allowed.into_iter();
+            result.tasks.retain(|_| allowed.next() == Some(true));
+        }
+        assign_retry_scopes(
+            &mut result.tasks,
+            &[Arc::new(RetryScope {
+                scope: NativeDiscoveryScope::new(root, None, Vec::new()),
+                snapshot: raw,
+                bucket: String::new(),
+            })],
+        );
+        Ok(())
+    }
 }
 
 fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {

@@ -235,7 +235,7 @@ pub(super) struct Watch {
 
 struct ExternalOutputs {
     journal: Weak<journal::Journal>,
-    scopes: Vec<NativeDiscoveryScope>,
+    scopes: Arc<[NativeDiscoveryScope]>,
 }
 
 impl Watch {
@@ -280,51 +280,77 @@ impl Watch {
         let mut slot = self.running.lock().unwrap();
         if slot
             .as_ref()
-            .is_some_and(|running| !running.thread.is_finished())
+            .is_some_and(|running| running.continuous && !running.thread.is_finished())
         {
             return Ok(
                 json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}),
             );
         }
         if let Some(previous) = slot.take() {
+            previous.hub.stop();
+            drop(slot);
             let _ = previous.thread.join();
+            slot = self.running.lock().unwrap();
         }
+        let (running, _) = self.spawn_run(cwd, engine, tray, false, Cancellation::default())?;
+        *slot = Some(running);
+        (self.wake_host)();
+        Ok(json!({"running":true,"started":true,"generation":self.generation.load(Ordering::Relaxed)}))
+    }
+
+    // Publish one-shot work in the same lifecycle slot as continuous Watch.
+    // No lifecycle/running mutex is held while already-submitted work drains.
+    fn spawn_run(
+        &self,
+        cwd: &Path,
+        engine: Arc<Engine>,
+        tray: bool,
+        once: bool,
+        cancel: Cancellation,
+    ) -> io::Result<(Running, mpsc::Receiver<io::Result<i32>>)> {
         let cwd = cwd.to_path_buf();
         let hub = Arc::new(Hub::new());
         let worker_hub = Arc::clone(&hub);
         let wake = Arc::clone(&self.wake_host);
         let external = Arc::clone(&self.external);
         let last_error = Arc::clone(&self.last_error);
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.generation.fetch_add(1, Ordering::Relaxed);
         let (ready, wait) = mpsc::sync_channel(1);
+        let (finished, completion) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("sunpack-watch".into())
             .spawn(move || {
-                let result = match Scheduler::open(cwd, engine, worker_hub, true, tray, external) {
+                let cancel_hub = Arc::clone(&worker_hub);
+                let _cancel = cancel.subscribe(move || cancel_hub.cancel());
+                let result = match cancel.run(|| {
+                    cancel.check()?;
+                    Scheduler::open(cwd, engine, worker_hub, !once, tray, external)
+                }) {
                     Ok(mut scheduler) => {
                         let _ = ready.send(Ok(()));
-                        scheduler.run(false).map(|_| ())
+                        scheduler.run(once)
                     }
                     Err(error) => {
-                        *last_error.lock().unwrap() = Some(error.to_string());
-                        let _ = ready.send(Err(error));
-                        Ok(())
+                        let _ = ready.send(Err(io::Error::new(error.kind(), error.to_string())));
+                        Err(error)
                     }
                 };
                 if let Err(error) = &result {
-                    *last_error.lock().unwrap() = Some(error.to_string());
+                    if !cancel.cancelled() {
+                        *last_error.lock().unwrap() = Some(error.to_string());
+                    }
                 }
+                let _ = finished.send(result.as_ref().copied()
+                    .map_err(|error| io::Error::new(error.kind(), error.to_string())));
                 wake();
-                result
+                result.map(|_| ())
             })?;
         let startup = wait.recv().map_err(io::Error::other)?;
         if let Err(error) = startup {
             let _ = thread.join();
             return Err(error);
         }
-        *slot = Some(Running { hub, thread });
-        (self.wake_host)();
-        Ok(json!({"running":true,"started":true,"generation":generation}))
+        Ok((Running { hub, thread, continuous: !once }, completion))
     }
 
     pub(super) fn stop(&self) -> io::Result<Value> {
@@ -348,28 +374,50 @@ impl Watch {
         Ok(json!({"running":false,"stopped":true,"generation":generation}))
     }
 
-    pub(super) fn run_once(&self, cwd: &Path, engine: Arc<Engine>) -> io::Result<i32> {
-        let _lifecycle = self.lifecycle.lock().unwrap();
-        let slot = self.running.lock().unwrap();
+    pub(super) fn run_once(
+        &self,
+        cwd: &Path,
+        engine: Arc<Engine>,
+        cancel: &Cancellation,
+    ) -> io::Result<i32> {
+        cancel.check()?;
+        let lifecycle = self.lifecycle.lock().unwrap();
+        let mut slot = self.running.lock().unwrap();
         if let Some(run) = slot.as_ref().filter(|run| !run.thread.is_finished()) {
             let hub = Arc::clone(&run.hub);
             drop(slot);
-            drop(_lifecycle);
+            drop(lifecycle);
             let (send, receive) = mpsc::sync_channel(1);
-            hub.update(|signals| signals.once.push(send));
+            let interrupted = send.clone();
+            let _cancel = cancel.subscribe(move || {
+                let _ = interrupted.try_send(Err(crate::io::cancellation::cancelled_io()));
+            });
+            if !hub.queue_once(send) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             receive.recv().map_err(io::Error::other)??;
+            cancel.check()?;
             return Ok(0);
         }
+        if let Some(previous) = slot.take() {
+            let _ = previous.thread.join();
+        }
+        let (running, completion) = self.spawn_run(cwd, engine, false, true, cancel.clone())?;
+        let hub = Arc::clone(&running.hub);
+        *slot = Some(running);
         drop(slot);
-        let mut scheduler = Scheduler::open(
-            cwd.to_owned(),
-            engine,
-            Arc::new(Hub::new()),
-            false,
-            false,
-            Arc::clone(&self.external),
-        )?;
-        scheduler.run(true)
+        drop(lifecycle);
+        (self.wake_host)();
+        let result = completion.recv().map_err(io::Error::other)?;
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        let mut slot = self.running.lock().unwrap();
+        // stop/start may already have replaced this generation while it drained.
+        if slot.as_ref().is_some_and(|run| Arc::ptr_eq(&run.hub, &hub)) {
+            let _ = slot.take().unwrap().thread.join();
+        }
+        drop(slot);
+        cancel.check()?;
+        result
     }
 
     pub(super) fn reload(&self) -> io::Result<Value> {
@@ -538,28 +586,31 @@ impl Watch {
 }
 
 impl Watch {
-    fn external_journal(&self, path: &Path) -> Option<Arc<journal::Journal>> {
+    fn external_journal(&self) -> Option<(Arc<journal::Journal>, Arc<[NativeDiscoveryScope]>)> {
         let external = self.external.lock().unwrap();
         let external = external.as_ref()?;
-        let path = path.to_string_lossy();
-        external
-            .scopes
-            .iter()
-            .any(|scope| scope.intersects_output(&path))
-            .then(|| external.journal.upgrade())
-            .flatten()
+        Some((external.journal.upgrade()?, Arc::clone(&external.scopes)))
     }
 
     pub(super) fn register_external_output(&self, path: &Path) -> io::Result<()> {
-        let journal = self.external_journal(path);
-        crate::scan::scope::create_output_root_exclusive(path)
-            .map_err(crate::pipeline::OutputCreateError::wrap)?;
-        if let Some(journal) = journal {
-            let text = path.to_string_lossy();
-            let identity = output_identity(&text)?;
-            let operation = json!({"op":"runtime","key":format!("owned|{}", key(path)),
-                "value":{"path":path,"identities":[identity]}});
-            journal.commit(true, |state| state.decode_operations(&[operation]))?;
+        if let Some((journal, scopes)) = self.external_journal() {
+            // Notification classification takes this same publication gate.
+            // Never expose a created output before its owned identity exists.
+            journal.commit(true, |state| {
+                crate::scan::scope::create_output_root_exclusive(path)
+                    .map_err(crate::pipeline::OutputCreateError::wrap)?;
+                let paths = crate::path_keys::output_path_aliases(path)?;
+                if !paths.iter().any(|path| scopes.iter().any(|scope| scope.intersects_output(path)))
+                    || paths.iter().any(|path| state.owned_root(path).is_some())
+                {
+                    return Ok(crate::watch_store::NativeWatchOperations::empty());
+                }
+                let identity = output_identity(&path.to_string_lossy())?;
+                Ok(crate::watch_store::NativeWatchOperations::owned_outputs(&paths, &[&identity]))
+            })?;
+        } else {
+            crate::scan::scope::create_output_root_exclusive(path)
+                .map_err(crate::pipeline::OutputCreateError::wrap)?;
         }
         Ok(())
     }
@@ -570,14 +621,17 @@ impl Watch {
         work: &Path,
         leaf: &Path,
     ) -> io::Result<()> {
-        if let Some(journal) = self.external_journal(output) {
-            prepare_flatten(&journal, "", output, work, leaf)?;
+        if let Some((journal, scopes)) = self.external_journal() {
+            let paths = crate::path_keys::output_path_aliases(output)?;
+            if paths.iter().any(|path| scopes.iter().any(|scope| scope.intersects_output(path))) {
+                prepare_flatten(&journal, "", output, work, leaf)?;
+            }
         }
         Ok(())
     }
 
     pub(super) fn finish_external_flatten(&self, output: &Path) -> io::Result<()> {
-        if let Some(journal) = self.external_journal(output) {
+        if let Some((journal, _)) = self.external_journal() {
             finish_flatten(&journal, &output.to_string_lossy())?;
         }
         Ok(())
@@ -610,6 +664,7 @@ fn validate_outputs(roots: &[Root]) -> io::Result<()> {
 struct Running {
     hub: Arc<Hub>,
     thread: JoinHandle<io::Result<()>>,
+    continuous: bool,
 }
 
 #[derive(Default)]
@@ -629,6 +684,7 @@ struct Signals {
 
 struct Hub {
     stopped: AtomicBool,
+    cancelled: AtomicBool,
     signals: Mutex<Signals>,
     wake: std::sync::Condvar,
     claims: Mutex<HashMap<String, Arc<str>>>,
@@ -647,6 +703,7 @@ impl Hub {
     fn new() -> Self {
         Self {
             stopped: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             signals: Mutex::default(),
             wake: std::sync::Condvar::new(),
             claims: Mutex::default(),
@@ -687,6 +744,39 @@ impl Hub {
             self.stopped.store(true, Ordering::Release);
         }
         self.wake.notify_one();
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.stop();
+    }
+
+    fn queue_once(&self, waiter: mpsc::SyncSender<io::Result<()>>) -> bool {
+        let mut signals = self.signals.lock().unwrap();
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        signals.once.push(waiter);
+        drop(signals);
+        self.wake.notify_one();
+        true
+    }
+
+    fn batch_completed(&self, batch: String) {
+        // Intake is stopped before drain, but in-flight completions still own
+        // the wake that lets drain finish without polling or blocking joins.
+        self.signals.lock().unwrap().completed.push(batch);
+        self.wake.notify_one();
+    }
+
+    fn wait_drain(&self, cancellation_observed: bool) -> Signals {
+        let guard = self.signals.lock().unwrap();
+        let mut guard = self.wake.wait_while(guard, |signals| {
+            signals.completed.is_empty()
+                && signals.cancel.is_empty()
+                && (cancellation_observed || !self.cancelled.load(Ordering::Acquire))
+        }).unwrap();
+        std::mem::take(&mut *guard)
     }
 
     fn update(&self, update: impl FnOnce(&mut Signals)) {
@@ -809,14 +899,16 @@ impl RootObserver {
         root: &Root,
         scope: Option<NativeDiscoveryScope>,
         hub: &Arc<Hub>,
+        journal: &Arc<journal::Journal>,
     ) -> io::Result<Self> {
         let identity = output_identity(&directory.to_string_lossy())?;
         let id = key(&root.path);
         let watched_dir = directory.to_owned();
         let recursive = scope.is_some() && root.recursive;
         let hub = Arc::clone(hub);
+        let journal = Arc::clone(journal);
         let observer = FileObserver::start(directory, recursive, move |names| {
-            let paths = names.map(|names| {
+            let mut paths = names.map(|names| {
                 names.into_iter().map(|name| watched_dir.join(name)).filter(|path| {
                     scope.as_ref().map_or_else(
                         // A parent sentinel only reacts to the root or a
@@ -826,6 +918,11 @@ impl RootObserver {
                     )
                 }).collect::<Vec<_>>()
             });
+            if scope.is_some() {
+                if let Some(paths) = paths.as_mut() {
+                    journal.filter_owned_events(paths, &watched_dir);
+                }
+            }
             if paths.as_ref().is_none_or(|paths| !paths.is_empty()) {
                 hub.update(|signals| {
                     signals.changed_roots.entry(id.clone()).or_default()
@@ -849,6 +946,7 @@ impl RootObservers {
         root: &Root,
         scope: &NativeDiscoveryScope,
         hub: &Arc<Hub>,
+        journal: &Arc<journal::Journal>,
     ) -> (bool, Vec<io::Error>) {
         // Arm the parent first. A rename between the identity probe and the
         // root subscription is then replayed through the existing Hub loop.
@@ -861,7 +959,7 @@ impl RootObservers {
         }
         if self.parent.is_none() {
             if let Some(parent) = parent {
-                match RootObserver::start(parent, root, None, hub) {
+                match RootObserver::start(parent, root, None, hub, journal) {
                     Ok(observer) => self.parent = Some(observer),
                     Err(error) => errors.push(io::Error::new(error.kind(), format!(
                         "Parent observer {}: {error}", parent.display(),
@@ -876,13 +974,29 @@ impl RootObservers {
             self.root.take();
         }
         if self.root.is_none() && root.path.is_dir() {
-            match RootObserver::start(&root.path, root, Some(scope.clone()), hub) {
+            match RootObserver::start(&root.path, root, Some(scope.clone()), hub, journal) {
                 Ok(observer) => self.root = Some(observer),
                 Err(error) => errors.push(error),
             }
         }
         (replaced, errors)
     }
+}
+
+// Like main's _pop_ready, bound both the readiness probes in this round and
+// the temporary key snapshot. Unselected due entries keep their old deadlines.
+fn due_admissions(
+    due: &BTreeMap<(Instant, String), ()>,
+    now: Instant,
+    limit: usize,
+    mut eligible: impl FnMut(&str) -> bool,
+) -> Vec<(Instant, String)> {
+    due.keys()
+        .take_while(|(deadline, _)| *deadline <= now)
+        .filter(|(_, path)| eligible(path))
+        .take(limit)
+        .cloned()
+        .collect()
 }
 
 struct Pending {
@@ -975,6 +1089,17 @@ struct Active {
     claimed: Arc<Mutex<ClaimedSources>>,
     toast: Option<super::toast::Activity>,
     thread: JoinHandle<Completed>,
+}
+
+struct BatchCompletion {
+    hub: Arc<Hub>,
+    batch: Option<String>,
+}
+
+impl Drop for BatchCompletion {
+    fn drop(&mut self) {
+        self.hub.batch_completed(self.batch.take().unwrap());
+    }
 }
 
 struct Completed {
@@ -1342,11 +1467,12 @@ impl Scheduler {
             )?;
             *self.external.lock().unwrap() = Some(ExternalOutputs {
                 journal: Arc::downgrade(&self.journal),
-                scopes,
+                scopes: scopes.into(),
             });
         }
         self.available_roots.retain(|id| next.contains_key(id));
         self.roots = next;
+        self.retire_owned_outputs(None)?;
         self.rearm_root_observers(None);
         Ok(())
     }
@@ -1357,7 +1483,7 @@ impl Scheduler {
             .filter(|(id, _)| changed.is_none_or(|changed| changed.contains_key(*id)))
         {
             let (replaced, errors) = self.root_observers.entry(id.clone()).or_default()
-                .rearm(root, scope, &self.hub);
+                .rearm(root, scope, &self.hub, &self.journal);
             if replaced {
                 self.available_roots.remove(id);
             }
@@ -1387,18 +1513,42 @@ impl Scheduler {
     fn run(&mut self, once: bool) -> io::Result<i32> {
         let mut result = self.run_inner(once);
         self.hub.stop();
-        while let Some(batch) = self.active.keys().next().cloned() {
-            if result.is_ok() {
-                if let Err(error) = self.complete(&batch) {
-                    result = Err(error);
+        let mut cancellation_observed = false;
+        let mut failure_observed = false;
+        while !self.active.is_empty() {
+            if !cancellation_observed && self.hub.cancelled.load(Ordering::Acquire) {
+                for batch in self.active.keys().cloned().collect::<Vec<_>>() {
+                    self.cancel_batch(&batch);
                 }
-            } else {
+                cancellation_observed = true;
+            }
+            if result.is_err() && !failure_observed {
+                // An internal failure is not user cancellation. Leave pending
+                // WAL intent for restart rather than suppressing its generation.
                 for active in self.active.values() {
                     active.cancel.cancel();
                 }
-                for (_, active) in self.active.drain() {
-                    let _ = active.thread.join();
+                failure_observed = true;
+            }
+            let signals = self.hub.wait_drain(cancellation_observed);
+            for (batch, waiter) in signals.cancel {
+                let _ = waiter.send(self.cancel_display_batch(&batch));
+            }
+            for completed in signals.completed {
+                if result.is_err() {
+                    self.abandon_completed(&completed);
+                } else if let Err(error) = self.complete(&completed) {
+                    result = Err(error);
                 }
+            }
+            for waiter in signals.reload_waiters {
+                let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
+            }
+            for waiter in signals.once {
+                let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
+            }
+            for waiter in signals.rebuild {
+                let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
             }
         }
         let signals = self.hub.wait(None);
@@ -1419,7 +1569,10 @@ impl Scheduler {
         self.catalog.close();
         self.journal.log(json!({"event":"watch_stopped"}));
         self.journal.flush()?;
-        result
+        if self.hub.cancelled.load(Ordering::Acquire) {
+            return Err(crate::io::cancellation::cancelled_io());
+        }
+        result.map(|_| i32::from(self.failed > 0))
     }
 
     fn run_inner(&mut self, once: bool) -> io::Result<i32> {
@@ -1428,20 +1581,17 @@ impl Scheduler {
             self.hub
                 .pending_count
                 .store(self.pending.len(), Ordering::Relaxed);
+            // main's --once performs one admission round, then drains only
+            // requests submitted in that round. Unready pending is durable,
+            // and is intentionally not a reason to keep this command alive.
+            if once {
+                break;
+            }
             if self.active.is_empty() && self.pending.is_empty() {
                 self.catalog.commit(true);
                 self.journal.compact()?;
-                if once {
-                    break;
-                }
             }
-            let due = {
-                let claims = self.hub.claims.lock().unwrap();
-                self.due.keys().find_map(|(due, path)| {
-                    (!self.active_paths.contains_key(path) && !claims.contains_key(path))
-                        .then_some(*due)
-                })
-            };
+            let due = self.next_admission();
             let deadline = match (due, self.cache_deadline) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -1450,8 +1600,19 @@ impl Scheduler {
             for (batch, waiter) in signals.cancel {
                 let _ = waiter.send(self.cancel_display_batch(&batch));
             }
+            let mut completion_error = None;
             for completed in signals.completed {
-                self.complete(&completed)?;
+                if completion_error.is_some() {
+                    self.abandon_completed(&completed);
+                } else if let Err(error) = self.complete(&completed) {
+                    completion_error = Some(error);
+                }
+            }
+            // Every notification in this taken batch must be harvested, even
+            // when an earlier completion failed. Drain cannot wait for a wake
+            // that was already removed from the Hub.
+            if let Some(error) = completion_error {
+                return Err(error);
             }
             for waiter in signals.rebuild {
                 let _ = waiter.send(self.journal.rebuild_log());
@@ -1545,6 +1706,13 @@ impl Scheduler {
         }
     }
 
+    fn retire_owned_outputs(&self, paths: Option<&[String]>) -> io::Result<()> {
+        let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
+        self.journal.commit(true, |state| {
+            Ok(state.owned_retirement_operations(&scopes, paths))
+        })
+    }
+
     fn checkpoint(
         &mut self,
         changed: &HashMap<String, HashSet<PathBuf>>,
@@ -1557,6 +1725,13 @@ impl Scheduler {
             .filter(|(id, _)| all_roots || changed.contains_key(*id))
             .map(|(id, (root, scope))| (id.clone(), root.clone(), scope.clone()))
             .collect::<Vec<_>>();
+        let affected = selected.iter().flat_map(|(id, root, _)| {
+            changed.get(id).filter(|paths| !paths.is_empty()).map_or_else(
+                || vec![root.path.to_string_lossy().into_owned()],
+                |paths| paths.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
+            )
+        }).collect::<Vec<String>>();
+        self.retire_owned_outputs(Some(&affected))?;
         let mut groups: HashMap<(String, u64), (i64, i64, Vec<NativeDiscoveryScope>)> =
             HashMap::new();
         let mut probes = Vec::new();
@@ -1597,6 +1772,10 @@ impl Scheduler {
             probes.push((id, root, scope, current, cached));
         }
         if !reopened.is_empty() {
+            // Old snapshots can have only an outside literal name while its
+            // physical watched volume is offline. Resolve those legacy names
+            // once when a root returns, before catalog recovery or admission.
+            self.retire_owned_outputs(None)?;
             // A returning root can have durable work with the same inventory
             // and no USN delta. Resume only the affected ownership scopes.
             self.recover_pending(Some(&reopened))?;
@@ -2666,21 +2845,44 @@ fn recovery_output_matches(
 }
 
 impl Scheduler {
+    fn admission_available(&self) -> usize {
+        // Match main's bounded request window. One caller thread owns each
+        // batch, so the same window bounds parked OS threads. Keep batching:
+        // a slow sibling must not reserve a slot for every completed input.
+        crate::pipeline::MAX_PENDING_JOBS.max(rayon::current_num_threads())
+            .saturating_sub(self.active.len())
+    }
+
+    fn next_admission(&self) -> Option<Instant> {
+        if self.admission_available() == 0 {
+            // Completions wake the Hub. A full window must not turn an old
+            // pending deadline into an idle spin while extraction is parked.
+            return None;
+        }
+        let claims = self.hub.claims.lock().unwrap();
+        self.due.keys().find_map(|(due, path)| {
+            (!self.active_paths.contains_key(path) && !claims.contains_key(path))
+                .then_some(*due)
+        })
+    }
+
     fn dispatch_ready(&mut self) -> io::Result<()> {
+        let available = self.admission_available();
+        if available == 0 {
+            return Ok(());
+        }
         let now = Instant::now();
         let ready = {
             let claims = self.hub.claims.lock().unwrap();
-            self.due
-                .keys()
-                .take_while(|(due, _)| *due <= now)
-                .filter(|(_, path)| {
-                    !self.active_paths.contains_key(path) && !claims.contains_key(path)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
+            due_admissions(&self.due, now, available, |path| {
+                !self.active_paths.contains_key(path) && !claims.contains_key(path)
+            })
         };
         let mut groups = BTreeMap::new();
         for (due, id) in ready {
+            if self.hub.stopped.load(Ordering::Acquire) {
+                break;
+            }
             let Some(mut pending) = self.pending.remove(&id) else {
                 continue;
             };
@@ -2780,6 +2982,11 @@ impl Scheduler {
         }
         self.persist_candidates(BTreeMap::new(), false)?;
         for ((root, _), (recovery, candidates)) in groups {
+            if self.hub.stopped.load(Ordering::Acquire) {
+                // These candidates still have durable pending intent. A stop
+                // between readiness and submit must not start more requests.
+                break;
+            }
             self.start_batch(root, candidates, recovery)?;
         }
         Ok(())
@@ -2886,7 +3093,9 @@ impl Scheduler {
             .iter()
             .map(|input| (watch_path_key(&input.path), input.path.clone()))
             .collect();
-        let scope = scope.clone();
+        let output_scopes = self.external.lock().unwrap().as_ref()
+            .map(|external| Arc::clone(&external.scopes))
+            .unwrap_or_else(|| Arc::from([scope.clone()]));
         let toast = self
             .toast
             .as_ref()
@@ -2908,10 +3117,11 @@ impl Scheduler {
             .name("sunpack-watch-batch".into())
             .stack_size(512 * 1024)
             .spawn(move || {
+                let _completion = BatchCompletion { hub: Arc::clone(&hub), batch: Some(send_batch) };
                 let observer = WatchObserver {
                     journal,
                     owners,
-                    scope,
+                    output_scopes,
                     outputs: Mutex::new(outputs),
                     batch: worker_batch,
                     toast: worker_toast,
@@ -2931,7 +3141,6 @@ impl Scheduler {
                     );
                 }
                 let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
-                hub.update(|signals| signals.completed.push(send_batch));
                 Completed {
                     cancelled,
                     result,
@@ -3024,6 +3233,14 @@ impl Scheduler {
         // Stop the workers even when the state volume failed the durable write.
         active.cancel.cancel();
         true
+    }
+
+    fn abandon_completed(&mut self, batch: &str) {
+        if let Some(active) = self.active.remove(batch) {
+            // Its completion notification guarantees the join cannot depend
+            // on another scheduler turn. Preserve all durable recovery intent.
+            let _ = active.thread.join();
+        }
     }
 
     fn complete(&mut self, batch: &str) -> io::Result<()> {
@@ -3501,7 +3718,7 @@ fn entry_changed(entry: &crate::watch_store::EntryRecord, candidate: &WatchCandi
 struct WatchObserver {
     journal: Arc<journal::Journal>,
     owners: HashMap<String, String>,
-    scope: NativeDiscoveryScope,
+    output_scopes: Arc<[NativeDiscoveryScope]>,
     outputs: Mutex<BTreeMap<String, String>>,
     batch: Arc<str>,
     toast: Option<super::toast::Activity>,
@@ -3737,18 +3954,8 @@ impl Observer for WatchObserver {
         let output = path.to_string_lossy().into_owned();
         let task = archive.path.to_string_lossy().into_owned();
         self.journal.commit(true, |state| {
-            let owned =
-                if self.scope.intersects_output(&output) && state.owned_root(&output).is_none() {
-                    vec![output.clone()]
-                } else {
-                    // Physical output directories still require an exclusive
-                    // reservation when a parent is already excluded from Watch.
-                    crate::scan::scope::create_output_root_exclusive(path)
-                        .map_err(crate::pipeline::OutputCreateError::wrap)?;
-                    Vec::new()
-                };
             state
-                .output_operation(&owner, task, output, None, owned)?
+                .output_operation(&owner, task, output, None, Some(&self.output_scopes))?
                 .ok_or_else(|| io::Error::other("Watch input owner was retired before output"))
         })?;
         self.outputs.lock().unwrap().insert(key(path), owner);
@@ -3781,7 +3988,7 @@ impl Observer for WatchObserver {
                     task,
                     output,
                     Some(archive.failure.is_none() || archive.partial),
-                    Vec::new(),
+                    None,
                 )?
                 .unwrap_or_else(crate::watch_store::NativeWatchOperations::empty))
         })
@@ -3808,7 +4015,7 @@ impl Observer for WatchObserver {
                     task,
                     output.clone(),
                     Some(archive.failure.is_none() || archive.partial),
-                    Vec::new(),
+                    None,
                 )?
                 .unwrap_or_else(crate::watch_store::NativeWatchOperations::empty);
             if let Some(checkpoint) = checkpoint {
@@ -3830,7 +4037,7 @@ impl Observer for WatchObserver {
         let output = output.to_string_lossy().into_owned();
         self.journal.commit(true, |state| {
             let mut operations = state
-                .output_operation(&owner, task, output.clone(), Some(false), Vec::new())?
+                .output_operation(&owner, task, output.clone(), Some(false), None)?
                 .unwrap_or_else(crate::watch_store::NativeWatchOperations::empty);
             operations.extend(crate::watch_store::NativeWatchOperations::checkpoint(
                 &owner, &output, None,
@@ -3847,70 +4054,88 @@ fn prepare_flatten(
     work: &Path,
     leaf: &Path,
 ) -> io::Result<()> {
-    let old = output_identity(&root.to_string_lossy())?;
-    let new = output_identity(&leaf.to_string_lossy())?;
-    let wrapper = (!owner.is_empty())
-        .then(|| crate::io::reader::capture_directory_identity(root))
-        .transpose()?;
-    let mut operations = vec![
-        json!({"op":"runtime","key":format!("flatten|{}",key(root)),
-            "value":{"owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,"new_identity":new,
-                "checkpoint_wrapper_identity":wrapper}}),
-        json!({"op":"runtime","key":format!("owned|{}",key(root)),
-            "value":{"path":root,"identities":[old,new]}}),
-        json!({"op":"runtime","key":format!("owned|{}",key(work)),
-            "value":{"path":work,"identities":[old]}}),
-    ];
-    if !owner.is_empty() {
-        operations.push(json!({"op":"checkpoint_output","owner":owner,"output":root}));
-    }
-    journal.commit(true, |state| state.decode_operations(&operations))
+    journal.commit(true, |state| {
+        let old = output_identity(&root.to_string_lossy())?;
+        let new = output_identity(&leaf.to_string_lossy())?;
+        let root_paths = crate::path_keys::output_path_aliases(root)?;
+        let work_paths = crate::path_keys::output_path_aliases(work)?;
+        let wrapper = (!owner.is_empty())
+            .then(|| crate::io::reader::capture_directory_identity(root))
+            .transpose()?;
+        let mut values = vec![
+            json!({"op":"runtime","key":format!("flatten|{}",key(root)),
+                "value":{"owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,"new_identity":new,
+                    "checkpoint_wrapper_identity":wrapper,"root_paths":root_paths,"work_paths":work_paths}}),
+        ];
+        if !owner.is_empty() {
+            values.push(json!({"op":"checkpoint_output","owner":owner,"output":root}));
+        }
+        let mut operations = state.decode_operations(&values)?;
+        operations.extend(crate::watch_store::NativeWatchOperations::owned_outputs(
+            &root_paths, &[&old, &new],
+        ));
+        operations.extend(crate::watch_store::NativeWatchOperations::owned_outputs(
+            &work_paths, &[&old],
+        ));
+        Ok(operations)
+    })
 }
 
 fn finish_flatten(journal: &journal::Journal, root: &str) -> io::Result<()> {
-    let record_key = format!("flatten|{}", watch_path_key(root));
-    let Some(record) = journal.state().runtime_record(&record_key) else {
-        return Ok(());
-    };
-    let (Some(work), Some(leaf)) = (record["work"].as_str(), record["leaf"].as_str()) else {
-        return Ok(());
-    };
-    let current = output_identity(root)?;
-    let work_exists = Path::new(work).try_exists()?;
-    let published = record["new_identity"].as_str() == Some(&current);
-    if !published && (work_exists || record["old_identity"].as_str() != Some(&current)) {
-        return Ok(());
-    }
-    let already_rebased = record["outputs_rebased"].as_bool() == Some(true);
-    if work_exists && already_rebased {
-        return Ok(());
-    }
-    let mut operations = vec![
-        json!({"op":"runtime","key":format!("owned|{}",watch_path_key(root)),
-        "value":{"path":root,"identities":[current]}}),
-    ];
-    if !work_exists {
-        operations.extend([
-            json!({"op":"runtime","key":record_key}),
-            json!({"op":"runtime","key":format!("owned|{}",watch_path_key(work))}),
-        ]);
-    } else {
-        let mut next = record.clone();
-        next["outputs_rebased"] = Value::Bool(true);
-        operations.push(json!({"op":"runtime","key":record_key,"value":next}));
-    }
-    let owner = record["owner"]
-        .as_str()
-        .filter(|owner| published && !already_rebased && !owner.is_empty());
-    if let Some(owner) = owner {
-        for source in [work, leaf] {
-            operations.push(json!({"op":"relocate_output","owner":owner,"source":source,
-                "destination":root,"identity":current}));
-        }
-    }
     journal.commit(true, |state| {
+        let record_key = format!("flatten|{}", watch_path_key(root));
+        let Some(record) = state.runtime_record(&record_key) else {
+            return Ok(crate::watch_store::NativeWatchOperations::empty());
+        };
+        let (Some(work), Some(leaf)) = (record["work"].as_str(), record["leaf"].as_str()) else {
+            return Ok(crate::watch_store::NativeWatchOperations::empty());
+        };
+        let current = output_identity(root)?;
+        let work_paths = record["work_paths"].as_array().map(|paths| {
+            paths.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()
+        }).unwrap_or_else(|| state.owned_output_paths(work, record["old_identity"].as_str().unwrap_or_default()));
+        let mut work_exists = false;
+        for alias in &work_paths {
+            work_exists |= Path::new(alias).try_exists()?;
+        }
+        let published = record["new_identity"].as_str() == Some(&current);
+        if !published && (work_exists || record["old_identity"].as_str() != Some(&current)) {
+            return Ok(crate::watch_store::NativeWatchOperations::empty());
+        }
+        let already_rebased = record["outputs_rebased"].as_bool() == Some(true);
+        if work_exists && already_rebased {
+            return Ok(crate::watch_store::NativeWatchOperations::empty());
+        }
+        let root_paths = crate::path_keys::output_path_aliases(Path::new(root))?;
+        let mut operations = Vec::new();
+        if !work_exists {
+            operations.push(json!({"op":"runtime","key":record_key}));
+        } else {
+            let mut next = record.clone();
+            next["outputs_rebased"] = Value::Bool(true);
+            next["root_paths"] = json!(root_paths);
+            next["work_paths"] = json!(work_paths);
+            operations.push(json!({"op":"runtime","key":record_key,"value":next}));
+        }
+        let owner = record["owner"]
+            .as_str()
+            .filter(|owner| published && !already_rebased && !owner.is_empty());
+        if let Some(owner) = owner {
+            for source in [work, leaf] {
+                operations.push(json!({"op":"relocate_output","owner":owner,"source":source,
+                    "destination":root,"identity":current}));
+            }
+        }
         use crate::watch_store::NativeWatchOperations;
         let mut operations = state.decode_operations(&operations)?;
+        operations.extend(NativeWatchOperations::owned_outputs(
+            &root_paths, &[&current],
+        ));
+        if !work_exists {
+            if let Some(old) = record["old_identity"].as_str() {
+                operations.extend(state.remove_owned_output(&work_paths, old));
+            }
+        }
         if let Some(owner) = owner {
             let mut checkpoints = input_checkpoints(state, owner).peekable();
             if checkpoints.peek().is_some() {
@@ -4055,6 +4280,89 @@ mod tests {
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
 
     #[test]
+    fn admission_round_is_bounded_ordered_and_leaves_backlog_untouched() {
+        let now = Instant::now();
+        let old = now - std::time::Duration::from_secs(1);
+        let mut due = (0..8).map(|index| ((old, format!("input-{index}")), ()))
+            .collect::<BTreeMap<_, _>>();
+        due.insert((now + std::time::Duration::from_secs(1), "future".into()), ());
+        let original = due.clone();
+        let selected = due_admissions(&due, now, 2, |path| path != "input-0" && path != "input-2");
+        assert_eq!(selected.iter().map(|(_, path)| path.as_str()).collect::<Vec<_>>(),
+            ["input-1", "input-3"]);
+        assert_eq!(due, original, "selection must not remove durable backlog or change its order");
+        assert!(due_admissions(&due, now, 0, |_| panic!("full window probed an input")).is_empty());
+        for entry in selected { due.remove(&entry); }
+        assert_eq!(due_admissions(&due, now, 2, |path| path != "input-0" && path != "input-2")
+            .iter().map(|(_, path)| path.as_str()).collect::<Vec<_>>(), ["input-4", "input-5"]);
+        assert_eq!(due_admissions(&due, now, usize::MAX, |_| true).len(), 6);
+    }
+
+    #[test]
+    fn drain_wakes_after_stop_cancellation_and_panicking_batch_completion() {
+        let hub = Arc::new(Hub::new());
+        hub.stop();
+        let (waiter, _) = mpsc::sync_channel(1);
+        assert!(!hub.queue_once(waiter));
+        let (send, receive) = mpsc::channel();
+        let worker_hub = Arc::clone(&hub);
+        let waiter = thread::spawn(move || {
+            let cancelled = worker_hub.wait_drain(false);
+            assert!(cancelled.completed.is_empty());
+            assert!(worker_hub.cancelled.load(Ordering::Acquire));
+            send.send(()).unwrap();
+            // An already-observed cancellation must not spin through drain.
+            let completed = worker_hub.wait_drain(true);
+            assert_eq!(completed.completed, ["panicking-batch"]);
+        });
+        hub.cancel();
+        receive.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let worker_hub = Arc::clone(&hub);
+        let failed = thread::spawn(move || {
+            let _completion = BatchCompletion { hub: worker_hub, batch: Some("panicking-batch".into()) };
+            panic!("a batch failed before returning its result");
+        });
+        assert!(failed.join().is_err());
+        waiter.join().unwrap();
+        let hub = Hub::new();
+        hub.cancel();
+        assert!(hub.wait_drain(false).completed.is_empty());
+    }
+
+    #[test]
+    fn cancelling_shared_once_waiter_does_not_stop_continuous_watch() {
+        let watch = Arc::new(Watch::new(Arc::new(|| {})));
+        let hub = Arc::new(Hub::new());
+        let worker_hub = Arc::clone(&hub);
+        let (entered, wait_entered) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let pending = worker_hub.wait(None);
+            assert_eq!(pending.once.len(), 1);
+            entered.send(()).unwrap();
+            worker_hub.wait(None);
+            drop(pending);
+            Ok(())
+        });
+        *watch.running.lock().unwrap() = Some(Running { hub: Arc::clone(&hub), thread: worker, continuous: true });
+        let cancel = Cancellation::new();
+        let request_cancel = cancel.clone();
+        let caller_watch = Arc::clone(&watch);
+        let (reply, response) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            reply.send(caller_watch.run_once(Path::new("."),
+                Arc::new(Engine::new(PathBuf::from("unused-worker"))), &request_cancel)).unwrap();
+        });
+        wait_entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        cancel.cancel();
+        assert!(crate::io::cancellation::is_cancellation(&response
+            .recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap_err()));
+        caller.join().unwrap();
+        assert!(!hub.stopped.load(Ordering::Acquire));
+        assert!(watch.is_running());
+        watch.stop().unwrap();
+    }
+
+    #[test]
     fn stopping_watch_allows_worker_foreground_callbacks() {
         let watch = Arc::new(Watch::new(Arc::new(|| {})));
         let hub = Arc::new(Hub::new());
@@ -4065,7 +4373,7 @@ mod tests {
             worker_watch.foreground_finished();
             Ok(())
         });
-        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker });
+        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true });
         let (send, receive) = mpsc::channel();
         let stop = thread::spawn(move || {
             let _ = send.send(watch.stop());
@@ -4149,11 +4457,11 @@ mod tests {
             }).unwrap();
             journal.commit(true, |state| {
                 Ok(state.output_operation(owner, owner.to_owned(),
-                    container.to_str().unwrap().to_owned(), None, Vec::new())?.unwrap())
+                    container.to_str().unwrap().to_owned(), None, None)?.unwrap())
             }).unwrap();
             journal.commit(true, |state| {
                 let mut operations = state.output_operation(owner, owner.to_owned(),
-                    container.to_str().unwrap().to_owned(), Some(true), Vec::new())?.unwrap();
+                    container.to_str().unwrap().to_owned(), Some(true), None)?.unwrap();
                 operations.extend(NativeWatchOperations::checkpoint(owner, output.to_str().unwrap(), Some(json!({
                     "schema_version":1,"carrier":source,
                     "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
@@ -4175,7 +4483,7 @@ mod tests {
             let observer = WatchObserver {
                 journal: Arc::clone(&journal),
                 owners: HashMap::from([(key(&source), owner.to_owned())]),
-                scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
+                output_scopes: Arc::from([NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new())]),
                 outputs: Mutex::new(outputs),
                 batch: Arc::from("restored"),
                 toast: None,
@@ -4213,8 +4521,14 @@ mod tests {
     fn flatten_recovery_rebases_durable_parent_and_nested_receipts() {
         let owner_file = crate::test_support::temp_file("flatten_watch_owner", b"outer archive");
         let directory = owner_file.with_extension("state");
-        let root = directory.join("output");
-        let work = directory.join("work");
+        let real = directory.join("real");
+        let alias = directory.join("junction");
+        fs::create_dir_all(&real).unwrap();
+        let junction = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&real).output().unwrap();
+        assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
+        let root = alias.join("output");
+        let work = alias.join("work");
         let leaf = root.join("wrapper").join("inner");
         let work_leaf = work.join("wrapper").join("inner");
         let nested = work_leaf.join("nested.zip");
@@ -4253,18 +4567,19 @@ mod tests {
                             owner.to_owned(),
                             root_text.to_owned(),
                             None,
-                            Vec::new(),
+                            None,
                         )?
                         .unwrap())
                 })
                 .unwrap();
             prepare_flatten(&journal, owner, &root, &work, &leaf).unwrap();
+            assert_eq!(journal.state().runtime_keys("owned|").len(), 4);
             fs::rename(&root, &work).unwrap();
             // Simulate a collision after the first rename. The task can finish
             // with a committed output and durable receipts at the work path.
             journal.commit(true, |state| {
                 let mut operations = state.output_operation(
-                    owner, owner.to_owned(), work.to_str().unwrap().to_owned(), Some(true), Vec::new(),
+                    owner, owner.to_owned(), work.to_str().unwrap().to_owned(), Some(true), None,
                 )?.unwrap();
                 for (source, output) in [(&owner_file, &work), (&nested, &nested_output)] {
                     let value = json!({
@@ -4291,6 +4606,14 @@ mod tests {
             assert_eq!(fs::read(root.join("nested/payload")).unwrap(), b"extracted");
             assert!(!work.exists());
             assert!(journal.state().runtime_keys("flatten|").is_empty());
+            assert_eq!(journal.state().runtime_keys("owned|").len(), 2);
+            let catalog = NativeWatchCatalog::new(journal.state(), None);
+            for output in [&root, &real.join("output")] {
+                assert!(catalog.is_owned(output.join("nested.zip").to_str().unwrap()));
+            }
+            for output in [&work, &real.join("work")] {
+                assert!(journal.state().owned_root(output.to_str().unwrap()).is_none());
+            }
             let pending = journal.state().pending(owner).unwrap();
             assert_eq!(
                 pending
@@ -4319,7 +4642,51 @@ mod tests {
                 assert_eq!(receipt["container"]["identity"], identity);
             }
         }
+        fs::remove_dir(alias).unwrap();
         fs::remove_dir_all(directory).unwrap();
         fs::remove_file(owner_file).unwrap();
     }
+
+    #[test]
+    fn flatten_keeps_physical_work_when_its_literal_junction_disappears() {
+        let marker = crate::test_support::temp_file("flatten_detached_work", b"");
+        let base = marker.with_extension("outputs");
+        let real = base.join("real");
+        let alias = base.join("junction");
+        let root = real.join("output");
+        let leaf = root.join("leaf");
+        let work = alias.join("work");
+        let physical_work = real.join("work");
+        fs::create_dir_all(&leaf).unwrap();
+        let junction = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&real).output().unwrap();
+        assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
+        let journal = journal::Journal::open(&base.join("state")).unwrap();
+        prepare_flatten(&journal, "", &root, &work, &leaf).unwrap();
+        // Older intents had no path list. Their persisted owned aliases must
+        // still prevent a detached literal path from discarding physical work.
+        journal.commit(true, |state| {
+            let key = format!("flatten|{}", key(&root));
+            let mut record = state.runtime_record(&key).unwrap();
+            record.as_object_mut().unwrap().remove("work_paths");
+            state.decode_operations(&[json!({"op":"runtime","key":key,"value":record})])
+        }).unwrap();
+        fs::rename(&root, &work).unwrap();
+        fs::rename(physical_work.join("leaf"), &root).unwrap();
+        fs::remove_dir(alias).unwrap();
+        finish_flatten(&journal, root.to_str().unwrap()).unwrap();
+        assert_eq!(journal.state().runtime_keys("flatten|").len(), 1);
+        assert!(journal.state().owned_root(physical_work.to_str().unwrap()).is_some());
+        journal.commit(true, |state| Ok(state.owned_retirement_operations(
+            &[NativeDiscoveryScope::new(real.to_string_lossy().into_owned(), None, Vec::new())], None,
+        ))).unwrap();
+        fs::remove_dir(&physical_work).unwrap();
+        finish_flatten(&journal, root.to_str().unwrap()).unwrap();
+        assert!(journal.state().runtime_keys("flatten|").is_empty());
+        assert_eq!(journal.state().runtime_keys("owned|").len(), 1);
+        drop(journal);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
 }

@@ -409,8 +409,10 @@ std::string read_input_line() {
 enum class RequestOutcome { NotDelivered, Completed, DeliveryUncertain };
 
 bool supports_cancellation(const std::vector<std::wstring>& arguments) {
-    return !arguments.empty() &&
-        (arguments[0] == L"extract" || arguments[0] == L"e" || arguments[0] == L"scan" || arguments[0] == L"s");
+    if (arguments.empty()) return false;
+    if (arguments[0] == L"extract" || arguments[0] == L"e" || arguments[0] == L"scan" || arguments[0] == L"s") return true;
+    return (arguments[0] == L"watch" || arguments[0] == L"w") &&
+        std::find(arguments.begin(), arguments.end(), L"--once") != arguments.end();
 }
 
 class ConsoleCancellation {
