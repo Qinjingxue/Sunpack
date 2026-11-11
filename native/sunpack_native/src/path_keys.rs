@@ -35,7 +35,6 @@ pub(crate) fn case_key(value: &str) -> String {
         .collect()
 }
 
-#[pyo3::pyfunction(name = "windows_path_key")]
 pub(crate) fn path_key(value: &str) -> String {
     let key = case_key(value);
     if key.contains('/') {
@@ -75,7 +74,6 @@ pub(crate) fn merge_roots<T>(
     merged.into_iter().map(|(_, root)| root).collect()
 }
 
-#[pyo3::pyfunction]
-pub(crate) fn merge_release_roots(py: pyo3::Python<'_>, paths: Vec<String>) -> Vec<String> {
-    py.detach(|| merge_roots(paths, |path| path_key(path)))
+pub(crate) fn merge_release_roots(paths: Vec<String>) -> Vec<String> {
+    merge_roots(paths, |path| path_key(path))
 }

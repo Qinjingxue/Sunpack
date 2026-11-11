@@ -13,7 +13,7 @@ on:
         default: false
         type: boolean
       fast_build:
-        description: "Skip Nuitka LTO for manual build-only runs. Publishing always uses full optimization."
+        description: "Skip Rust LTO for manual build-only runs. Publishing always uses full optimization."
         required: false
         default: false
         type: boolean
@@ -199,16 +199,7 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           profile: release
-          python-version: ${{ matrix.python_version }}
-          source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest') }}
-
-      - name: Restore Nuitka compiler cache
-        uses: actions/cache@v4
-        with:
-          path: .cache/nuitka/${{ matrix.arch }}
-          key: nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && inputs.fast_build && 'fast' || 'lto' }}-${{ hashFiles('sunpack/**', 'sunpack.py', 'scripts/build_windows.ps1') }}
-          restore-keys: |
-            nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && inputs.fast_build && 'fast' || 'lto' }}-
+          source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
 
       - name: Bootstrap Python and external tools
         shell: pwsh
@@ -267,8 +258,6 @@ jobs:
           GIT_REF_NAME: ${{ github.ref_name }}
           IS_TAG_REF: ${{ startsWith(github.ref, 'refs/tags/') }}
           FAST_BUILD: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && inputs.fast_build && 'true' || 'false' }}
-          NUITKA_CACHE_DIR: ${{ github.workspace }}\.cache\nuitka\${{ matrix.arch }}
-          CLCACHE_BASEDIR: ${{ github.workspace }}
         run: |
           $version = ""
           if ($env:GIT_EVENT_NAME -eq "workflow_dispatch" -and $env:RELEASE_TAG_INPUT) {

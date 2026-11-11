@@ -2,13 +2,13 @@
 
 **English** | [简体中文](zh-CN/development_setup.md)
 
-SunPack is a Windows-only project. Python dependencies are declared uniformly in the root `pyproject.toml` and locked by `uv.lock`; Rust, C++, and the Windows service share the same build pipeline.
+SunPack is a Windows-only project. Cargo builds the Rust runtime and Watch Broker. CMake builds the native worker, launcher, GUI, and toast DLL. `uv.lock` pins the Python test dependencies.
 
 ## Requirements
 
 - Windows 10/11
 - PowerShell 5.1 or newer
-- Python 3.10 or newer, with an architecture matching the target distribution package
+- Python 3.10 or newer for boundary tests and development scripts
 - `uv` 0.12 or newer
 - Rust MSVC toolchain, providing `cargo`
 - Visual Studio Build Tools 2022, including a C++17 compiler
@@ -18,8 +18,7 @@ SunPack is a Windows-only project. Python dependencies are declared uniformly in
 Main project directories:
 
 ```text
-sunpack/                    Product runtime code
-native/sunpack_native/      Rust/PyO3 extension
+native/sunpack_native/      Rust orchestration and computation, CLI and Watch
 native/sunpack_usn_core/    Shared NTFS/USN Rust core
 native/sunpack_watch_broker/Windows Watch Broker service
 native/sevenzip_bridge/     Windows 7z.dll bridge and worker
@@ -34,9 +33,8 @@ Installable extras:
 
 | Extra | Purpose |
 | --- | --- |
-| default | SunPack runtime dependencies |
 | `test` | pytest and test data generation dependencies |
-| `build` | Nuitka, maturin, CMake |
+| `build` | CMake |
 | `dev` | Union of build and test |
 
 Common install commands:
@@ -47,7 +45,7 @@ uv sync --locked --extra test
 uv sync --locked --extra dev
 ```
 
-The development environment directory is `.venv`. If that environment has global site-packages enabled, the setup script rebuilds it so that global packages cannot interfere with dependency resolution.
+The development environment directory is `.venv`. If that environment has global site-packages enabled, the setup script disables that option.
 
 ## One-step development environment setup
 
@@ -58,12 +56,12 @@ The development environment directory is `.venv`. If that environment has global
 The script will:
 
 1. Prepare an isolated `.venv` with `uv sync --locked --extra dev`
-2. Build and install the Rust/PyO3 wheel for the current architecture
+2. Build the Rust runtime and native fixture generator
 3. Build `sunpack-watch-broker.exe`
 4. Prepare `7z.exe`, `7z.dll`, and the license for the matching architecture
 5. Build `sunpack_sevenzip_worker.exe` and `sunpack_toast.dll`
 6. Copy the native artifacts into the tools directory
-7. Run Python, Rust, C++, and CLI smoke checks
+7. Run the worker and toast CTest suites
 
 Options:
 
@@ -73,13 +71,11 @@ Options:
 .\scripts\setup_windows_dev.ps1 -SkipAcceptanceTestTools
 ```
 
-The target architecture must match the architecture of the current Python process.
-
 On x64, setup also prepares the acceptance fixture generators under `.sunpack_test_tools/`: WinRAR 6.22, zstd 1.5.7, and [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4). The LZ4 writer is installed at `7zip-zstd/7z.exe` with its companion `7z.dll`; setup checks that it runs and exposes the LZ4 encoder. These tools are excluded from release packages. `-SkipAcceptanceTestTools` skips their preparation.
 
 ## USN Watch Broker
 
-watch uses the NTFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `native/sunpack_usn_core` and `native/sunpack_watch_broker`; Python only consumes file observation results and watch state.
+watch uses the NTFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `native/sunpack_usn_core` and `native/sunpack_watch_broker`. Watch consumes the typed file observations and state directly.
 
 ### Components and lifecycle
 
@@ -145,16 +141,10 @@ Repository scripts can install or uninstall a temporary service; the scripts rej
 
 ## Building native components manually
 
-### Rust/PyO3
+### Rust runtime
 
 ```powershell
-uv sync --locked --extra build
-.\.venv\Scripts\maturin.exe build --manifest-path native\sunpack_native\Cargo.toml --release --target-dir .cache\rust-target\x64 --out build\native-wheels-dev
-$wheel = Get-ChildItem build\native-wheels-dev\sunpack_native-*.whl |
-    Sort-Object LastWriteTimeUtc -Descending |
-    Select-Object -First 1 -ExpandProperty FullName
-uv pip uninstall --python .\.venv\Scripts\python.exe sunpack-native
-uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
+cargo build --locked --manifest-path native\Cargo.toml -p sunpack-native --bin sunpack-runtime --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
 ```
 
 ### C++ embedded 7-Zip worker
@@ -182,22 +172,18 @@ A continuously running watch creates Windows notification capability according t
 ## Smoke checks
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import sunpack_native as n; assert callable(n.NativeDirectoryScanOptions)"
-.\.venv\Scripts\python.exe -c "from sunpack.core.support.resources import get_sevenzip_bridge_worker_path; print(get_sevenzip_bridge_worker_path())"
-.\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
+cargo test --locked --manifest-path native\Cargo.toml --workspace --profile ci
 ```
-
-The first two commands verify the Rust extension and the C++ worker path respectively; the third verifies configuration loading.
 
 ## Testing
 
-Plain pytest:
+Run the CLI boundary tests after building the development artifacts:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q tests\blackbox
 ```
 
-When pytest is run directly, cases that need the Windows NTFS Watch Broker are skipped. Full acceptance is done through `run_acceptance_tests.ps1`, which prepares an isolated test service, runs unit, functional, integration, real-scenario, disk-space, and CLI smoke tests, and automatically uninstalls the test service at the end:
+When pytest is run directly, cases that need the Windows NTFS Watch Broker are skipped. Full acceptance is done through `run_acceptance_tests.ps1`, which prepares an isolated test service, runs Rust correctness tests and the CLI and Watch boundary tests, and automatically uninstalls the test service at the end:
 
 ```powershell
 .\run_acceptance_tests.ps1 -NoWait
@@ -232,52 +218,8 @@ The release artifact is a Windows installer. The build environment must have Inn
 
 The build process:
 
-1. Create or reuse `.venv` (cleaned and recreated with `-Clean`)
-2. Install the project `dev` extra
-3. Build and install the Rust wheel
-4. Build the Watch Broker
-5. Build and test the C++ bridge/worker and the toast DLL
-6. Optionally run acceptance tests
-7. Build the console-less runtime and the CLI launcher
-8. Copy the configuration, password table, tools, Watch Broker, third-party license files, and notices
-9. Validate the architecture of the key PE files
-10. Run packaged CLI, bridge, and worker smoke checks
-11. Create the Windows installer with Inno Setup
-
-Output:
-
-```text
-dist\sunpack-<arch>\
-dist\sunpack-<arch>\service\sunpack-watch-broker.exe
-dist\sunpack-<arch>\licenses\SunPack-MIT.txt
-dist\sunpack-<arch>\licenses\7zip-license.txt
-dist\sunpack-<arch>\licenses\7zip-source-license.txt
-dist\sunpack-<arch>\licenses\LGPL-2.1.txt
-dist\sunpack-<arch>\THIRD_PARTY_NOTICES.md
-release\sunpack-windows-<arch>-<version>-setup.exe
-```
-
-ARM64 must be built on ARM64 Windows with an ARM64 Python environment. An existing directory can be validated independently:
-
-```powershell
-.\scripts\verify_windows_package_arch.ps1 -PackageRoot dist\sunpack-x64 -Arch x64
-```
-
-## Runtime native files
-
-The x64 development environment uses the following by default:
-
-```text
-tools\7z.exe
-tools\7z.dll
-tools\sunpack_sevenzip_worker.exe
-tools\sunpack_toast.dll
-```
-
-The installer package additionally contains:
-
-```text
-service\sunpack-watch-broker.exe
-```
-
-`sunpack_sevenzip_worker.exe` reads binary job frames and extracts files, volumes, and virtual inputs through the embedded 7-Zip backend. `7z.exe` and its adjacent development `7z.dll` are used for fixtures, manual diagnostics, file provenance, and preparing release resources; they are not product extraction runtime dependencies.
+1. Build the Rust runtime and Watch Broker with Cargo
+2. Build the CLI launcher, worker, GUI, and toast DLL with CMake
+3. Stage configuration, password data, scripts, and license files
+4. Check PE architecture and run packaged CLI smoke tests
+5. Run the selected acceptance tests and create the installer with Inno Setup

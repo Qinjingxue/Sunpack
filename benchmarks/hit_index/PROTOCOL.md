@@ -1,3 +1,8 @@
+> 历史研究协议：原来的 Python 扩展捕获和整套 campaign 入口已随纯 Rust 迁移删除。
+> 此目录只保留独立 C ABI 索引 probe、锁定的原生比较实现及实验材料。
+> 当前应用吞吐和内存测量使用 `python -m benchmarks --list` 列出的真实 CLI 场景。
+> 以下旧命令和确认性 release gates 描述历史实验，不代表当前应用验收结果。
+
 # SunPack 命中索引评估协议
 
 协议日期：2026-11-03。机器可读参数在 `protocol.json`，源码锁定在 `sources.lock.json`。

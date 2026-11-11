@@ -1,17 +1,19 @@
+use super::PasswordVerification;
+use crate::io::archive_state::{InputExtent, InputPart};
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
+use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use crate::password::input::{
     parse_ranges, parse_volumes, ranges_key, ranges_total_len, VirtualRangeReader, VolumeSet,
 };
 use hmac::{Hmac, Mac};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
 use rayon::prelude::*;
 use sha1::Sha1;
 use std::borrow::Cow;
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_CENTRAL: &[u8] = b"PK\x01\x02";
@@ -20,53 +22,28 @@ const MAX_EOCD_SCAN: usize = 65_557;
 const AES_PARALLEL_PASSWORD_THRESHOLD: usize = 4;
 const ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD: usize = 256;
 
-#[pyfunction]
-#[pyo3(signature = (archive_path, passwords, eocd_offset=None))]
-pub(crate) fn zip_fast_verify_passwords(
-    py: Python<'_>,
-    archive_path: String,
-    passwords: &Bound<'_, PyList>,
-    eocd_offset: Option<u64>,
-) -> PyResult<Py<PyAny>> {
-    let reader = py.detach(|| ManagedReader::open(&archive_path))?;
-    zip_fast_verify_passwords_with_reader(py, &reader, passwords, eocd_offset)
-}
-
 pub(crate) fn zip_fast_verify_passwords_with_reader(
-    py: Python<'_>,
     reader: &ManagedReader,
-    passwords: &Bound<'_, PyList>,
+    candidates: &[Arc<str>],
     eocd_offset: Option<u64>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
-
+) -> std::io::Result<PasswordVerification> {
     let key = InputKey::file("zip", reader)?;
-    verify_prepared(py, key, &candidates, || {
+    verify_prepared(key, candidates, || {
         prepare_zip_stream(&mut reader.cursor(), reader.len(), eocd_offset)
             .map(PasswordContext::Zip)
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (ranges, passwords, eocd_offset=None, *, sessions=None))]
 pub(crate) fn zip_fast_verify_passwords_from_ranges(
-    py: Python<'_>,
-    ranges: &Bound<'_, PyList>,
-    passwords: &Bound<'_, PyList>,
+    ranges: &[&InputExtent],
+    candidates: &[Arc<str>],
     eocd_offset: Option<u64>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges, sessions)?;
     let total_len = ranges_total_len(&parsed);
     let key = ranges_key("zip", &parsed)?;
-    verify_prepared(py, key, &candidates, || {
+    verify_prepared(key, candidates, || {
         prepare_zip_stream(
             &mut VirtualRangeReader::new(parsed.into()),
             total_len,
@@ -76,21 +53,14 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (parts, passwords, eocd_offset=None, *, sessions=None))]
 pub(crate) fn zip_fast_verify_passwords_from_volumes(
-    py: Python<'_>,
-    parts: &Bound<'_, PyList>,
-    passwords: &Bound<'_, PyList>,
+    parts: &[InputPart],
+    candidates: &[Arc<str>],
     eocd_offset: Option<u64>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<PasswordVerification> {
     let volumes = VolumeSet::new(parse_volumes(parts, sessions)?);
-    verify_prepared(py, volumes.key("zip")?, &candidates, || {
+    verify_prepared(volumes.key("zip")?, candidates, || {
         prepare_zip_volumes(&volumes, eocd_offset).map(PasswordContext::Zip)
     })
 }
@@ -363,15 +333,15 @@ impl ZipPasswordContext {
         }
     }
 
-    pub(crate) fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
+    pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         match self {
             Self::Aes {
                 key_len,
                 salt,
                 verifier,
-            } => verify_winzip_aes_candidates(py, candidates, *key_len, salt, verifier),
+            } => verify_winzip_aes_candidates(candidates, *key_len, salt, verifier),
             Self::ZipCrypto { header, check_byte } => {
-                verify_zipcrypto_material(py, candidates, header, *check_byte)
+                verify_zipcrypto_material(candidates, header, *check_byte)
             }
         }
     }
@@ -692,15 +662,14 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
 }
 
 fn verify_winzip_aes_candidates(
-    py: Python<'_>,
-    candidates: &[String],
+    candidates: &[Arc<str>],
     key_len: usize,
     salt: &[u8],
     verifier: &[u8; 2],
-) -> PyResult<Py<PyAny>> {
-    let attempts = candidates.len() as i32;
+) -> std::io::Result<PasswordVerification> {
+    let attempts = candidates.len();
     let cancellation = Cancellation::current();
-    let matched_indices = py.detach(|| {
+    let matched_indices = (|| {
         let mut matched_indices = if candidates.len() >= AES_PARALLEL_PASSWORD_THRESHOLD {
             candidates
                 .par_iter()
@@ -715,7 +684,7 @@ fn verify_winzip_aes_candidates(
                                 key_len,
                             )
                         }))
-                    .then_some(index as i32)
+                    .then_some(index)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -732,40 +701,39 @@ fn verify_winzip_aes_candidates(
                                 key_len,
                             )
                         }))
-                    .then_some(index as i32)
+                    .then_some(index)
                 })
                 .collect::<Vec<_>>()
         };
         matched_indices.sort_unstable();
         matched_indices
-    });
+    })();
 
-    let result = PyDict::new(py);
-    if let Some(first) = matched_indices.first().copied() {
-        result.set_item("status", "match")?;
-        result.set_item("matched_index", first)?;
-        result.set_item("matched_indices", matched_indices)?;
-        result.set_item("attempts", attempts)?;
-        result.set_item("match_evidence", "winzip_aes_password_verifier")?;
-        result.set_item("message", "winzip aes password verifiers matched")?;
-        return Ok(result.into());
-    }
-    result.set_item("status", "no_match")?;
-    result.set_item("matched_index", -1)?;
-    result.set_item("attempts", attempts)?;
-    result.set_item("message", "winzip aes password verifier did not match")?;
-    Ok(result.into())
+    let result = if let Some(first) = matched_indices.first().copied() {
+        PasswordVerification {
+            matched_index: Some(first),
+            matched_indices,
+            attempts,
+            match_evidence: Some("winzip_aes_password_verifier"),
+            ..PasswordVerification::status("match", "winzip aes password verifiers matched")
+        }
+    } else {
+        PasswordVerification {
+            attempts,
+            ..PasswordVerification::status("no_match", "winzip aes password verifier did not match")
+        }
+    };
+    Ok(result)
 }
 
 fn verify_zipcrypto_material(
-    py: Python<'_>,
-    candidates: &[String],
+    candidates: &[Arc<str>],
     encryption_header: &[u8; 12],
     check_byte: u8,
-) -> PyResult<Py<PyAny>> {
-    let attempts = candidates.len() as i32;
+) -> std::io::Result<PasswordVerification> {
+    let attempts = candidates.len();
     let cancellation = Cancellation::current();
-    let matched_indices = py.detach(|| {
+    let matched_indices = (|| {
         let mut matched_indices = if candidates.len() >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD {
             candidates
                 .par_iter()
@@ -777,7 +745,7 @@ fn verify_zipcrypto_material(
                             encryption_header,
                             check_byte,
                         ))
-                    .then_some(index as i32)
+                    .then_some(index)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -791,29 +759,29 @@ fn verify_zipcrypto_material(
                             encryption_header,
                             check_byte,
                         ))
-                    .then_some(index as i32)
+                    .then_some(index)
                 })
                 .collect::<Vec<_>>()
         };
         matched_indices.sort_unstable();
         matched_indices
-    });
+    })();
 
-    let result = PyDict::new(py);
-    if let Some(first) = matched_indices.first().copied() {
-        result.set_item("status", "match")?;
-        result.set_item("matched_index", first)?;
-        result.set_item("matched_indices", matched_indices)?;
-        result.set_item("attempts", attempts)?;
-        result.set_item("match_evidence", "zipcrypto_header_byte")?;
-        result.set_item("message", "zipcrypto password headers matched")?;
-        return Ok(result.into());
-    }
-    result.set_item("status", "no_match")?;
-    result.set_item("matched_index", -1)?;
-    result.set_item("attempts", attempts)?;
-    result.set_item("message", "zipcrypto password header did not match")?;
-    Ok(result.into())
+    let result = if let Some(first) = matched_indices.first().copied() {
+        PasswordVerification {
+            matched_index: Some(first),
+            matched_indices,
+            attempts,
+            match_evidence: Some("zipcrypto_header_byte"),
+            ..PasswordVerification::status("match", "zipcrypto password headers matched")
+        }
+    } else {
+        PasswordVerification {
+            attempts,
+            ..PasswordVerification::status("no_match", "zipcrypto password header did not match")
+        }
+    };
+    Ok(result)
 }
 
 fn parse_winzip_aes_strength(extra: &[u8]) -> Option<u8> {
@@ -990,7 +958,9 @@ mod aes_verifier_tests {
 
 fn zipcrypto_header_matches(password: &[u8], encrypted_header: &[u8; 12], expected: u8) -> bool {
     let mut state = ZipCryptoState::new();
-    for byte in password { state.update_keys(*byte); }
+    for byte in password {
+        state.update_keys(*byte);
+    }
     let mut last = 0;
     for encrypted in encrypted_header {
         last = encrypted ^ state.decrypt_byte();

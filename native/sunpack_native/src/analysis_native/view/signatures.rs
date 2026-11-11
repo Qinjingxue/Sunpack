@@ -1,5 +1,4 @@
-// Compact immutable rows remain native across report reuse. Python only creates
-// a dictionary for a row explicitly inspected by a caller.
+// Compact immutable signature observations.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SignatureHit {
     offset: [u8; 8],
@@ -22,79 +21,7 @@ impl SignatureHit {
     }
 }
 
-#[pyclass(frozen, module = "sunpack_native")]
-struct NativeSignatureHits {
-    rows: Arc<[SignatureHit]>,
-}
-
-#[pymethods]
-impl NativeSignatureHits {
-    fn __len__(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyDict>> {
-        let index = if index < 0 {
-            self.rows.len() as isize + index
-        } else {
-            index
-        };
-        let row = usize::try_from(index)
-            .ok()
-            .and_then(|index| self.rows.get(index))
-            .ok_or_else(|| {
-                pyo3::exceptions::PyIndexError::new_err("signature hit index out of range")
-            })?;
-        let hit = PyDict::new(py);
-        hit.set_item("name", row.name())?;
-        hit.set_item("offset", row.offset())?;
-        Ok(hit.unbind())
-    }
-
-    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
-        other
-            .cast::<Self>()
-            .is_ok_and(|other| self.rows == other.get().rows)
-    }
-
-    fn __deepcopy__(slf: Py<Self>, _memo: &Bound<'_, PyAny>) -> Py<Self> {
-        slf
-    }
-}
-
-fn signature_hits_from_prepass(prepass: &Bound<'_, PyDict>) -> PyResult<Arc<[SignatureHit]>> {
-    if let Some(hits) = prepass.get_item("hits")? {
-        if let Ok(hits) = hits.cast::<NativeSignatureHits>() {
-            return Ok(Arc::clone(&hits.get().rows));
-        }
-    }
-    // Full embedded scans already project only validated roots. Accept their
-    // small dictionaries without expanding native prepass rows back to Python.
-    let mut rows = Vec::new();
-    for hit in prepass_dicts(prepass, "hits")? {
-        let name = str_of(&hit, "name")?;
-        let pattern = ANALYSIS_SIGNATURES
-            .iter()
-            .position(|(item, _)| *item == name)
-            .or_else(|| {
-                name.starts_with("zip_")
-                    .then_some(ANALYSIS_SIGNATURES.len() - 1)
-            });
-        if let Some(pattern) = pattern {
-            rows.push(SignatureHit::new(pattern, u64_of(&hit, "offset")?));
-        }
-    }
-    Ok(rows.into())
-}
-
-struct SignaturePrepassData {
-    hits: Arc<[SignatureHit]>,
-    formats: Vec<&'static str>,
-    scanned_head: usize,
-    scanned_tail: usize,
-}
-
-fn signature_prepass_native(reader: &ManagedReader) -> io::Result<SignaturePrepassData> {
+fn signature_prepass_native(reader: &ManagedReader) -> io::Result<Arc<[SignatureHit]>> {
     let size = reader.len();
     // This view already represents a logical input. Its origin is zero;
     // embedded discovery supplies its own validated roots through prepass.
@@ -139,20 +66,7 @@ fn signature_prepass_native(reader: &ManagedReader) -> io::Result<SignaturePrepa
     }
     hits.sort_unstable_by_key(|hit| (hit.offset(), hit.pattern));
     hits.dedup();
-    let mut formats = Vec::new();
-    for hit in &hits {
-        let format = format_for_hit(hit.name());
-        if !formats.contains(&format) {
-            formats.push(format);
-        }
-    }
-    formats.sort_unstable();
-    Ok(SignaturePrepassData {
-        hits: hits.into(),
-        formats,
-        scanned_head: head.len(),
-        scanned_tail: tail_bytes as usize,
-    })
+    Ok(hits.into())
 }
 
 // Initial standard headers only. Variable fields and subsequent records are
@@ -189,41 +103,5 @@ fn standard_header_len(head: &[u8]) -> usize {
     // origin and leave checksum/PAX/GNU validation to the canonical walker.
     else {
         TAR_BLOCK_SIZE
-    }
-}
-
-fn signature_prepass_to_python(py: Python<'_>, data: SignaturePrepassData) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "hits",
-        Py::new(py, NativeSignatureHits { rows: data.hits })?,
-    )?;
-    dict.set_item("formats", data.formats)?;
-    dict.set_item("head_bytes", data.scanned_head)?;
-    dict.set_item("tail_bytes", data.scanned_tail)?;
-    Ok(dict.unbind())
-}
-
-fn format_for_hit(name: &str) -> &'static str {
-    if name.starts_with("zip_") {
-        "zip"
-    } else if name.starts_with("rar") {
-        "rar"
-    } else if name == "7z" {
-        "7z"
-    } else if name == "tar_ustar" {
-        "tar"
-    } else if name == "gzip" {
-        "gzip"
-    } else if name == "bzip2" {
-        "bzip2"
-    } else if name == "xz" {
-        "xz"
-    } else if name == "zstd" {
-        "zstd"
-    } else if name == "lz4" {
-        "lz4"
-    } else {
-        ""
     }
 }

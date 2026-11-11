@@ -165,7 +165,7 @@ The main configuration automatically overrides the advanced configuration, and f
 Configuration validation command:
 
 ```powershell
-python sunpack.py config validate
+sunpack config validate
 ```
 
 See the [configuration guide](docs/configuration.md) for common settings and examples.

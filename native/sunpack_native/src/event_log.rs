@@ -1,10 +1,7 @@
 //! Best-effort display history. Business state remains in the existing task store.
 use crate::io::display_store::{utc_us, Store, DAY_US};
 use crate::io::display_wake::Wake;
-use crate::watch_store::{py_to_json, NativeWatchState};
-use pyo3::exceptions::{PyOSError, PyRuntimeError};
-use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySlice, PyString, PyTuple};
+use crate::watch_store::NativeWatchState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -34,149 +31,75 @@ pub(crate) fn diagnostic_text(text: &str) -> &str {
     }
     &text[..end]
 }
-fn short_string<'py>(
-    text: &Bound<'py, PyString>,
-    chars: usize,
-    truncated: &mut bool,
-) -> PyResult<Bound<'py, PyString>> {
-    if text.len()? <= chars {
-        return Ok(text.clone());
+fn short_string<'a>(text: &'a str, max_bytes: usize, truncated: &mut bool) -> &'a str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    *truncated = true;
-    // Slice before requesting UTF-8: PyUnicode's UTF-8 cache would otherwise
-    // convert/copy the entire huge original string just to retain its prefix.
-    Ok(text
-        .get_item(PySlice::new(text.py(), 0, chars as isize, 1))?
-        .cast_into::<PyString>()?)
+    *truncated |= end != text.len();
+    &text[..end]
 }
-#[derive(Default)]
-struct DiagnosticTypes<'py> {
-    // Resolve only if a non-builtin container occurs, once per event traversal.
-    abc: Option<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
-}
-impl<'py> DiagnosticTypes<'py> {
-    fn get(&mut self, py: Python<'py>) -> PyResult<&(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
-        if self.abc.is_none() {
-            let abc = py.import("collections.abc")?;
-            self.abc = Some((abc.getattr("Mapping")?, abc.getattr("Sequence")?));
-        }
-        Ok(self.abc.as_ref().unwrap())
-    }
-}
-fn bounded_value<'py>(
-    value: &Bound<'py, PyAny>,
-    budget: &mut usize,
-    depth: usize,
-    truncated: &mut bool,
-    types: &mut DiagnosticTypes<'py>,
-) -> PyResult<Value> {
+
+fn bounded_value(value: Value, budget: &mut usize, depth: usize, truncated: &mut bool) -> Value {
     if *budget == 0 || depth == 8 {
         *truncated = true;
-        return Ok(Value::Null);
+        return Value::Null;
     }
     *budget = budget.saturating_sub(8);
-    if let Ok(text) = value.cast::<PyString>() {
-        let text = short_string(text, *budget, truncated)?;
-        let text = text.to_str()?;
-        let mut end = text.len().min(*budget);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        *truncated |= end != text.len();
-        *budget -= end;
-        return Ok(Value::String(text[..end].to_owned()));
-    }
-    if let Ok(dict) = value.cast::<PyDict>() {
-        let mut result = serde_json::Map::new();
-        *truncated |= dict.len() > 64;
-        for (key, item) in dict.iter().take(64) {
-            if *budget == 0 {
-                *truncated = true;
-                break;
+    match value {
+        Value::String(mut text) => {
+            let length = short_string(&text, *budget, truncated).len();
+            *budget -= length;
+            text.truncate(length);
+            if text.capacity() > length.saturating_mul(2) {
+                text.shrink_to_fit();
             }
-            let key = short_string(key.cast::<PyString>()?, (*budget).min(64), truncated)?;
-            let key = key.to_str()?;
-            *budget = budget.saturating_sub(key.len());
-            result.insert(
-                key.to_owned(),
-                bounded_value(&item, budget, depth + 1, truncated, types)?,
-            );
+            Value::String(text)
         }
-        return Ok(Value::Object(result));
-    }
-    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
-        let mut items = Vec::new();
-        *truncated |= value.len()? > 64;
-        for item in value.try_iter()?.take(64) {
-            if *budget == 0 {
-                *truncated = true;
-                break;
+        Value::Array(values) => {
+            *truncated |= values.len() > 64;
+            let mut result = Vec::with_capacity(values.len().min(64));
+            for value in values.into_iter().take(64) {
+                if *budget == 0 {
+                    *truncated = true;
+                    break;
+                }
+                result.push(bounded_value(value, budget, depth + 1, truncated));
             }
-            items.push(bounded_value(&item?, budget, depth + 1, truncated, types)?);
+            Value::Array(result)
         }
-        return Ok(Value::Array(items));
-    }
-    if value.is_none()
-        || value.is_instance_of::<PyBool>()
-        || value.is_instance_of::<PyInt>()
-        || value.is_instance_of::<PyFloat>()
-    {
-        return py_to_json(value);
-    }
-    let (mapping_type, sequence_type) = types.get(value.py())?;
-    let mapping = value.is_instance(mapping_type)?;
-    let sequence = !mapping
-        && !value.is_instance_of::<pyo3::types::PyBytes>()
-        && !value.is_instance_of::<pyo3::types::PyByteArray>()
-        && value.is_instance(sequence_type)?;
-    if mapping {
-        let mut result = serde_json::Map::new();
-        // Iterate keys directly: never collect keys/items from a large mapping.
-        *truncated |= value.len()? > 64;
-        for key in value.try_iter()?.take(64) {
-            if *budget == 0 {
-                *truncated = true;
-                break;
+        Value::Object(values) => {
+            *truncated |= values.len() > 64;
+            let mut result = serde_json::Map::new();
+            for (key, value) in values.into_iter().take(64) {
+                if *budget == 0 {
+                    *truncated = true;
+                    break;
+                }
+                let key = short_string(&key, (*budget).min(64), truncated);
+                *budget -= key.len();
+                result.insert(
+                    key.to_owned(),
+                    bounded_value(value, budget, depth + 1, truncated),
+                );
             }
-            let key = key?;
-            let item = value.get_item(&key)?;
-            let short = short_string(key.cast::<PyString>()?, (*budget).min(64), truncated)?;
-            let short = short.to_str()?;
-            *budget = budget.saturating_sub(short.len());
-            result.insert(
-                short.to_owned(),
-                bounded_value(&item, budget, depth + 1, truncated, types)?,
-            );
+            Value::Object(result)
         }
-        return Ok(Value::Object(result));
+        scalar => scalar,
     }
-    if sequence {
-        let mut result = Vec::new();
-        *truncated |= value.len()? > 64;
-        for item in value.try_iter()?.take(64) {
-            if *budget == 0 {
-                *truncated = true;
-                break;
-            }
-            result.push(bounded_value(&item?, budget, depth + 1, truncated, types)?);
-        }
-        return Ok(Value::Array(result));
-    }
-    Ok(Value::Null)
 }
-fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
-    let dict = value.cast::<PyDict>()?;
+
+fn event_value(value: Value) -> std::io::Result<Value> {
+    let Value::Object(mut fields) = value else {
+        return Err(std::io::Error::other("event must be an object"));
+    };
+    let event_value = fields.remove("event");
     let mut truncated = false;
-    let event = dict.get_item("event")?;
-    let event = event
-        .as_ref()
-        .map(|v| short_string(v.cast::<PyString>()?, 64, &mut truncated))
-        .transpose()?;
-    let event = event
-        .as_ref()
-        .map(|v| v.to_str())
-        .transpose()?
-        .unwrap_or("");
+    let event = short_string(
+        event_value.as_ref().and_then(Value::as_str).unwrap_or(""),
+        64,
+        &mut truncated,
+    );
     let state = matches!(
         event,
         "pipeline_sources_claimed"
@@ -194,10 +117,8 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
             | "pipeline_sources_released"
     );
     let mut budget = DIAGNOSTIC_TEXT_BYTES;
-    let mut types = DiagnosticTypes::default();
     let mut result = serde_json::Map::new();
-    // Preserve identity/relations regardless of diagnostic field order/size.
-    result.insert("event".into(), json!(diagnostic_text(event)));
+    result.insert("event".into(), Value::String(event.to_owned()));
     for name in [
         "ts",
         "path",
@@ -213,38 +134,28 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         "task_id",
     ] {
         if state || name == "ts" {
-            if let Some(item) = dict.get_item(name)? {
-                result.insert(name.to_owned(), py_to_json(&item)?);
+            if let Some(item) = fields.remove(name) {
+                result.insert(name.to_owned(), item);
             }
         }
     }
-    for (i, (key, item)) in dict.iter().enumerate() {
+    for (i, (key, item)) in fields.into_iter().enumerate() {
         if i == 64 {
             truncated = true;
             break;
         }
-        let key = short_string(key.cast::<PyString>()?, 64, &mut truncated)?;
-        let key = key.to_str()?;
+        let key = short_string(&key, budget.min(64), &mut truncated);
         if result.contains_key(key) {
             continue;
         }
-        if budget == 0 {
-            truncated = true;
-            continue;
-        }
-        let mut end = key.len().min(budget);
-        while !key.is_char_boundary(end) {
-            end -= 1;
-        }
-        truncated |= end != key.len();
-        budget -= end;
+        budget -= key.len();
         result.insert(
-            key[..end].to_owned(),
-            bounded_value(&item, &mut budget, 0, &mut truncated, &mut types)?,
+            key.to_owned(),
+            bounded_value(item, &mut budget, 0, &mut truncated),
         );
     }
     if truncated {
-        result.insert("truncated".into(), json!(true));
+        result.insert("truncated".into(), Value::Bool(true));
     }
     Ok(Value::Object(result))
 }
@@ -969,23 +880,19 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
     }
 }
 
-#[pyclass(module = "sunpack_native")]
 pub(crate) struct NativeEventLog {
     owner: Option<Arc<Owner>>,
 }
 impl NativeEventLog {
-    pub(crate) fn shared(&self) -> PyResult<&Arc<Shared>> {
+    pub(crate) fn shared(&self) -> std::io::Result<&Arc<Shared>> {
         self.owner
             .as_ref()
             .map(|o| &o.shared)
-            .ok_or_else(|| PyRuntimeError::new_err("event log is closed"))
+            .ok_or_else(|| std::io::Error::other("event log is closed"))
     }
 }
-#[pymethods]
 impl NativeEventLog {
-    #[new]
-    #[pyo3(signature=(path, retention_days=7, stateful=true))]
-    fn new(path: PathBuf, retention_days: u32, stateful: bool) -> PyResult<Self> {
+    pub(crate) fn new(path: PathBuf, retention_days: u32, stateful: bool) -> std::io::Result<Self> {
         let path = std::path::absolute(path)?;
         let (registry, retired) = owners();
         let mut owners = registry.lock().unwrap();
@@ -1029,22 +936,21 @@ impl NativeEventLog {
         owners.insert(id, Arc::downgrade(&owner));
         Ok(Self { owner: Some(owner) })
     }
-    fn configure_retention(&self, retention_days: u32) -> PyResult<()> {
+    pub(crate) fn configure_retention(&self, retention_days: u32) -> std::io::Result<()> {
         self.shared()?.configure_retention(retention_days);
         Ok(())
     }
-    fn write(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    pub(crate) fn write(&self, value: Value) -> std::io::Result<()> {
         self.shared()?.submit(event_value(value)?);
         Ok(())
     }
-    #[pyo3(signature=(state=None))]
-    fn recover(&self, state: Option<PyRef<'_, NativeWatchState>>) -> PyResult<()> {
+    pub(crate) fn recover(&self, state: Option<&NativeWatchState>) -> std::io::Result<()> {
         match state {
             Some(state) => state.with_event_projection(|rows| self.reset(rows)),
             None => self.reset(Vec::new()),
         }
     }
-    fn rebuild(&self) -> PyResult<()> {
+    pub(crate) fn rebuild(&self) -> std::io::Result<()> {
         let shared = self.shared()?;
         let mut state = shared.state.lock().unwrap();
         state.rebuild = true;
@@ -1052,9 +958,9 @@ impl NativeEventLog {
         shared.wake.notify();
         Ok(())
     }
-    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn flush(&self) -> std::io::Result<()> {
         let shared = Arc::clone(self.shared()?);
-        py.detach(move || {
+        (move || {
             let mut state = shared.state.lock().unwrap();
             if state.error.is_some() && !state.stopping {
                 state.revision += 1;
@@ -1064,22 +970,21 @@ impl NativeEventLog {
                 state = shared.drained.wait(state).unwrap();
             }
             match &state.error {
-                Some(e) => Err(PyOSError::new_err(e.clone())),
+                Some(e) => Err(std::io::Error::other(e.clone())),
                 None => Ok(()),
             }
-        })
+        })()
     }
-    #[getter]
-    fn error(&self) -> PyResult<Option<String>> {
+    pub(crate) fn error(&self) -> std::io::Result<Option<String>> {
         Ok(self.shared()?.state.lock().unwrap().error.clone())
     }
-    fn close(&mut self, py: Python<'_>) {
+    pub(crate) fn close(&mut self) {
         let owner = self.owner.take();
-        py.detach(move || drop(owner));
+        (drop(owner));
     }
 }
 impl NativeEventLog {
-    fn reset(&self, rows: Vec<Value>) -> PyResult<()> {
+    pub(crate) fn reset(&self, rows: Vec<Value>) -> std::io::Result<()> {
         let shared = self.shared()?;
         let mut state = shared.state.lock().unwrap();
         state.reset_live = true;

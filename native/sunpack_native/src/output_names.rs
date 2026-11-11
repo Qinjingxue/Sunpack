@@ -52,7 +52,6 @@ fn windows_output_part(part: &str) -> String {
 }
 
 /// One ordinary Windows filename component, shared by logical names and output routing.
-#[pyo3::pyfunction]
 pub(crate) fn output_name_component(value: &str) -> String {
     let part = value.rsplit(['\\', '/']).next().unwrap_or(value);
     if part.is_empty() {

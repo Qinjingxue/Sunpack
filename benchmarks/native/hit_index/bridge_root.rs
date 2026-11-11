@@ -33,6 +33,8 @@ unsafe impl GlobalAlloc for Meter {
 #[cfg(feature = "allocation-meter")]
 #[global_allocator]
 static ALLOC: Meter = Meter;
+#[path = "COLLECTIONS"]
+mod collections;
 #[path = "FAST_HASH_CORE"]
 mod fast_hash_core;
 #[path = "PATH_KEYS"]

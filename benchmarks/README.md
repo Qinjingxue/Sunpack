@@ -1,321 +1,73 @@
-# Performance benchmarks
+# Native performance workloads
 
-Performance measurements and diagnostic profiles live here; behavioural assertions live under `tests/`.
+Benchmarks invoke the real Windows launcher, resident Rust runtime and native
+worker. Python only generates fixtures, samples process metadata and writes
+reports. No application Python package or PyO3 extension is imported.
+Correctness regressions belong in `tests/`; these workloads measure coarse
+latency, throughput and memory rather than duplicate implementation tests.
 
-The typed-hit index protocol, pinned baselines, corpus recipes, statistics and
-release gates are documented in [hit_index/PROTOCOL.md](hit_index/PROTOCOL.md).
-`scan hit-index` runs exact semantic conformance separately from timing and
-can replay actual post-filter traces through the production Rust Builder.
-The hit-index campaign defaults to 16 concurrent native jobs across validation,
-index timing, Builder, lifecycle and full scans. Use `--parallel-jobs` (`--jobs`)
-to change this. Reports record concurrency; use `--parallel-jobs 1` for isolated
-latency measurements, separately from concurrent campaign timings.
-
-List the supported scenarios:
-
-```powershell
-uv run --locked python -m benchmarks --list
-```
-
-Run a scenario by group and name. Arguments after the scenario are passed to that scenario:
-
-The `watch` group automatically builds and installs a uniquely named ephemeral
-Watch Broker test service, launches the benchmark with an ordinary user token,
-and removes only that service afterward. It never reuses, stops, or deletes an
-installed release `SunPackWatchBroker` service. CI must already run with an
-elevated account; interactive UAC is deliberately disabled there. Watch reports
-include the test service/pipe identity, Broker binary XXH128 (the two-seed Rust XXH64 identity), and connection state.
+Build the native release artifacts first (`scripts/setup_windows_dev.ps1 -BuildProfile release`), or
+pass `--profile ci` for existing CI artifacts. `--launcher C:\package\sunpack.exe`
+uses a complete unpacked package, including its sibling runtime and tools.
+Each run stages a unique installation and ProgramData directory and shuts its
+own persistent runtime down on exit. It does not attach to an installed runtime.
 
 ```powershell
-uv run --locked python -m benchmarks reader password-fast-path --rounds 5
-uv run --locked python -m benchmarks reader embedded-scan --generate-gib 10 --rounds 3 --skip-cli `
-  --iocp-chunk-mib 2 --iocp-buffers 8 --iocp-workers 2
-uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 500 --rounds 3 --skip-cli `
-  --baseline-report benchmarks/results/reader.embedded-scan/<baseline-run>/report.json `
-  --max-regression-percent 5
-uv run --locked python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
-uv run --no-sync python -m benchmarks scan hit-index --fetch --real --full-scan --strict
-uv run --no-sync python -m benchmarks scan watch-catalog --files 30000 --protected-files 100000 --bucket-size 8 --rounds 20 --event-batch-size 64
-uv run --no-sync python -m benchmarks watch catalog-recovery --directories 500 --changes 3000 --rounds 3
-uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
-uv run --locked python -m benchmarks extraction cli-format-matrix --runs 3 --prefetch on --json-out benchmarks/results/cli-format-matrix-prefetch-on.json
-uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --format enc --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-enc-prefetch-on.json
-uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-prefetch-on.json
-uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch off --json-out benchmarks/results/cli-zipx-lz4-prefetch-off.json
-uv run --locked python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
-uv run --locked python -m benchmarks extraction worker-vs-7z-300m `
-  --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
-  --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 `
-  --json-out benchmarks/results/worker-vs-7z-300m.json
-uv run --locked python -m benchmarks extraction worker-concurrency-300m --concurrency 8 --runs 2 --json-out benchmarks/results/worker-concurrency-300m.json
-uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
-uv run --locked python -m benchmarks watch cli-format-matrix --runs 3 --json-out benchmarks/results/watch-cli-format-matrix.json
-uv run --locked python -m benchmarks watch cli-format-matrix --format zipx --format lz4 --runs 3 --json-out benchmarks/results/watch-cli-zipx-lz4-baseline.json
-uv run --locked python -m benchmarks watch arrival-matrix C:\path\to\sample.jpg --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
-uv run --locked python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
-uv run --locked python -m benchmarks watch format-matrix --runs 3 --warmups 1 --json-out benchmarks/results/watch-format-matrix.json
-uv run --locked python -m benchmarks watch format-matrix --formats 7z,zip,rar --variants plain,encrypted --workloads many_small --runs 3
-# A/B the post-extract flatten stage (post_extract.flatten_single_directory) on real outputs
-uv run --locked python -m benchmarks watch format-matrix --formats zip,rar,tar,7z --flatten-modes on,off --runs 1
-uv run --locked python -m benchmarks extraction split-pressure --profile acceptance --strict
-uv run --locked python -m benchmarks memory residual-rss
-uv run --locked python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --json-out benchmarks/results/memory-growth.json
-uv run --no-sync python -m benchmarks scheduling event-log --tasks 5000 --rounds 5 --cold-starts 40
-uv run --no-sync python -m benchmarks scheduling event-log --tasks 1 --rounds 1 --cold-starts 1 --lifetime-batches 1 --compaction-tasks 10000 100000
+uv run --locked --extra test python -m benchmarks --list
+uv run --locked --extra test python -m benchmarks scan directory --runs 5 --ordinary-files 100000
+uv run --locked --extra test python -m benchmarks scan directory --shape carrier --formats zip,7z
+uv run --locked --extra test python -m benchmarks extraction format-matrix --runs 5
+uv run --locked --extra test python -m benchmarks extraction format-matrix --shape disguised
+uv run --locked --extra test python -m benchmarks extraction format-matrix --shape carrier --formats zip,7z
+uv run --locked --extra test python -m benchmarks extraction real-archive --archive C:\archives\sample.7z --password secret
+uv run --locked --extra test python -m benchmarks extraction cli-vs-7z --formats zip,7z,xz
+uv run --locked --extra test python -m benchmarks memory residual-rss --runs 20
+uv run --locked --extra test python -m benchmarks memory many-tasks --copies 16 --runs 10
+uv run --locked --extra test python -m benchmarks memory password-store --password-entries 100000 --runs 10
+uv run --locked --extra test python -m benchmarks watch state-persistence --copies 100 --runs 5
 ```
 
-The catalog scenario includes the final Written barrier in each event batch;
---event-batch-size 1 measures isolated events and 64 measures bursts. It also
-reports snapshot/WAL bytes and process memory before indexing, while resident,
-and after release. The recovery scenario compares both APIs on the same fixed
-NTFS journal interval and checks that they return identical paths. The watch
-runner supplies its existing temporary Broker service.
+Generated fixtures reuse the deterministic many-small-file and few-large-file
+corpora. ZIP, 7z, RAR, TAR, gzip, bzip2, XZ, Zstandard and available split variants
+are supported; missing optional generators are recorded as skipped. ZIPX, LZ4,
+ENC, nested and other real archives can be supplied through `--archive` without
+any test helper dependency. Extraction uses recursive discovery by default.
+The external archive is preserved; known numbered/RAR volume siblings are copied
+into the isolated input directory. Supply `--archive-format` for composite-stream
+7-Zip comparisons where the filename alone is insufficient.
 
-The catalog commits at existing Watch processing boundaries, cursor publication,
-checkpoint, and close, with a 64-delta/256 KiB batch ceiling. Checkpoint normally
-runs at existing idle maintenance when the WAL exceeds both 4 MiB and the previous
-snapshot size (and at least 1024 edits); 64 MiB forces synchronous reclamation.
-These measurements include filesystem metadata and file updates and do not predict
-archive extraction throughput.
+Generation and package staging are outside measurements. The fixture cache is
+keyed by settings and tool metadata. `--cache-root`, `--rebuild-corpus`,
+`--small-files`, `--large-files` and `--large-file-mib` control it. No output-content
+hashing is performed. Reports include native command responses and output file
+counts/bytes as workload metadata. Raw 7-Zip comparison includes the second TAR
+extraction for compressed TAR formats; it measures the original archive rather
+than a carrier wrapper.
 
-## GUI benchmark
+Each request records wall time, sampled native process-tree peak RSS/private
+memory, and resident RSS/private memory, handles and threads. The sampled peak
+is a lower bound. The benchmark interpreter and isolated Watch Broker service
+are excluded. Keep the runtime warm across requests by default, or use `--cold`
+for process-start costs. `memory password-store` probes a header-encrypted archive
+with one matching scope and many unrelated scopes; later rounds reuse the real
+password and reader caches.
 
-The manager window has its own in-process benchmark. It seeds an event log with 5000
-tasks, 3000 passwords and 250 watch roots, opens the real `Application`, and drives
-click/type/scroll through the Core UI debug API while recording wall time, process
-CPU cycles and Core UI trace durations per action:
+Watch runs install a uniquely named temporary Broker service using the existing
+service-management script, and remove it afterward. They do not reuse or alter
+the installed release service. The first `watch start --once` measures bootstrap
+and extraction; later rounds restart the persistent runtime and measure recovery
+of completed state. This is a restart workload, not a live arrival latency metric.
+`--copies` controls the number of independently retained archive entries.
 
-```powershell
-pwsh scripts/build_gui.ps1 -SkipTests
-cmake --build .cache/gui-x64 --config Release --target sunpack_gui_performance --parallel
-.cache/gui-x64/Release/sunpack_gui_performance.exe --rounds 30 > gui-perf.json
-```
+Results and metadata are written under `benchmarks/results/native-<mode>/`.
+`--results-root` changes that location; `--keep-workdir` retains generated inputs
+and outputs. `python -m benchmarks clean --cache --work` removes regenerable
+artifacts. No implicit timeout is imposed; an operator can supply a whole-run
+budget with `--timeout` before the group name or `SUNPACK_BENCH_TIMEOUT`.
 
-Options are `--tasks`, `--passwords`, `--history`, `--roots` and `--rounds` (5..100).
-See [gui/README.md](gui/README.md) for the report fields, the current baseline and the
-observed hotspots.
-
-## Run timeout
-
-Every scenario runs in a child process under a hard wall-clock deadline, so a
-stale scenario that calls a removed API and blocks forever is killed instead
-of hanging the whole benchmark run. The global limit defaults to 3600 seconds
-and can be overridden before the scenario name, or via
-`SUNPACK_BENCH_TIMEOUT`:
-
-```powershell
-uv run --locked python -m benchmarks --timeout 600 extraction format-matrix --runs 3
-```
-
-A killed scenario exits with code 124. Scenario-internal subprocesses (7-Zip,
-the CLI client, native workers, worker children) all carry their own timeouts
-too; they honour `SUNPACK_BENCH_SUBPROCESS_TIMEOUT` (default 600s) where
-applicable.
-
-## Real archive workspace lifecycle
-
-Scenarios that generate real archives use `BenchmarkWorkspace` and share this lifecycle:
-
-1. Create corpus, work, and extraction-output directories under `benchmarks/.work/`.
-2. Generate archives through the existing `ArchiveFixtureFactory` or scenario corpus builder.
-3. Always write `report.json` and `manifest.json` under
-   `benchmarks/results/<scenario>/<UTC timestamp>-<run id>/`.
-4. Remove the complete temporary work directory when the scenario exits, including on failure.
-
-Use `--results-root PATH` to put durable results elsewhere. By default, durable benchmark
-results are stored under `benchmarks/results/`. Use `--keep-workdir` only when
-debugging a generated archive; the retained path is recorded in `manifest.json`. Temporary
-archives are never copied to the durable result directory implicitly, so large corpora do not
-accumulate. A scenario may explicitly preserve a small diagnostic artifact with the workspace API.
-
-Remove regenerable benchmark data without touching versioned reports:
-
-```powershell
-uv run --locked python -m benchmarks clean --cache --work
-```
-
-`extraction format-matrix` builds ZIP, 7z, split 7z, RAR, split RAR, TAR, gzip,
-bzip2, xz, zstd and the conventional compressed-TAR aliases. It uses the bundled
-binaries under `tools/`. Each archive is placed in an isolated scanner input directory,
-then both SunPack's complete detection/extraction flow and raw 7-Zip are timed. Only
-cases where both extractors exit successfully contribute to the comparison ratio;
-payload-content correctness is covered by dedicated correctness tests, so the matrix
-does not re-hash extracted files.
-The matrix starts extractor commands strictly one at a time, while leaving SunPack's internal scheduler at its program-controlled
-default and using unlimited recursive extraction. Generated scanner entry files are
-rejected when they fall below the project's 1 MiB recognition floor.
-
-The format matrix now uses an adaptive host-pressure gate before every extractor launch.
-Tune it with `--max-cpu-percent`, `--min-available-memory-percent`, and
-`--pressure-max-wait-seconds`; `--case-cooldown-seconds` is an optional extra fixed delay.
-Generated corpora are content-addressed under `benchmarks/.cache/` and can be refreshed
-with `--rebuild-corpus-cache` or disabled with `--no-corpus-cache`. Use repeated `--format`
-options for a focused run. One diagnostic extraction per case reuses the large-archive
-runtime profiler and writes phase medians and per-format aggregates into the report; use
-`--no-phase-profile` when only end-to-end timing is needed. For stable internal medians,
-set `--phase-profile-warmups 1 --phase-profile-runs 3`.
-
-The format matrix reports live progress by default: timestamped lines on stderr show the
-current phase (`corpus`, `detection`, `extraction_matrix`, `phase_profiles`, `report`),
-the case/run/label being executed, and each operation's wall time. The cumulative phase
-breakdown is recorded in the report's `phase_timing_seconds` and printed to stderr at the
-end. Disable this with `--no-progress`. Progress always goes to stderr, so the
-detection-worker subprocess keeps its stdout JSON contract intact; the parent forwards the
-worker's stderr so per-archive scan progress is visible live.
-
-The reusable harness in `benchmarks/harness` defines the common wall/CPU clocks,
-RSS/Private Bytes process-tree memory sampling, real-archive workspace lifecycle, and
-versioned JSON report envelope. New scenarios must use those components instead of
-adding another local timer, memory sampler, or temporary-directory policy.
-
-`watch format-matrix` measures the internal stages of the production watch path
-(`WatchScheduler` -> `PipelineEngine`) for every generated archive format. It reuses the
-format-matrix corpus builder, so ZIP, 7z, split 7z, RAR, split RAR, TAR, gzip, bzip2, xz,
-zstd and the compressed-TAR aliases all arrive through the same watched directory, and it
-instruments every submitted request with the same `RequestRuntimeProfiler` that
-`extraction large-archive-profile` uses. Variants reproduce the input shapes the product
-must handle: `plain`, `disguised` (`.jpg` extension), `carrier`
-(`[garbage][archive][garbage]`), `encrypted` (real encryption with wrong password
-candidates first, so password resolution is measured), and `nested` (an archive inside an
-archive, so the recursive pass runs inside one watch request). Split formats only run
-`plain`, because renaming or re-wrapping individual volumes changes the volume chain
-itself; every skipped case is recorded with its reason.
-
-Per case the report keeps the wall-clock arrival view (`feed`, `feed_to_first_processing`,
-`post_feed_to_completion`, `case_wall`), the terminal outcome, and the full per-stage
-breakdown (`stage_seconds`, `stage_seconds_by_request`) plus a `headline_seconds` rollup
-whose columns are printed as a table: pipeline run, planning, batch execute, extract,
-verify, output scan, and native worker time. `aggregates` holds the median of every stage
-per `workload:format:variant` case. A successful request clears its watch-state entry, so
-the terminal outcome is taken from the completed pipeline reply and the durable state
-statuses are reported separately as informational `state_statuses`/`blocked_statuses`.
-`--flatten-modes on,off` repeats every case with `post_extract.flatten_single_directory`
-forced on or off, which isolates the post-extract flatten stage from extraction itself.
-Rounds alternate case order to avoid thermal and ordering bias, `--warmups` samples are
-recorded but excluded from `aggregates`, and every case has its own `--timeout` so one
-stuck format cannot consume the whole scenario budget.
-
-`extraction sevenzip-worker-matrix` measures the native persistent
-`sunpack_sevenzip_worker.exe` directly through the production asynchronous transport.
-It reuses the format-matrix corpus builder, generates tiny/small/medium/large profiles
-by default, and records per-run worker wall time,
-worker CPU time, child-process RSS peak, output statistics, native status, and failures.
-Use repeated or comma-separated `--profile` values and repeated `--format` values to
-focus the matrix. Durable results contain both `report.json` and `results.csv`.
-
-`extraction worker-vs-7z-300m` is the standalone reproduction of the documented
-300 MiB end-to-end comparison. It builds the deterministic `few_large` corpus
-(one repeated-text 150 MiB member plus one fixed-seed random 150 MiB member),
-adds explicit 7z/RAR5/RAR4 solid and non-solid variants, and covers 7z split,
-RAR split, ZIP, TAR, Gzip, BZip2, XZ, Zstandard, and their compressed-TAR
-aliases. Each case reuses one persistent native worker for its measured runs;
-each reference run starts a new `7z.exe` process. Both process trees' RSS is
-sampled every 20 ms and each measured run records its peak. The result records the exact
-archive volume sizes, archive-listing method/solid fields, payload-to-archive
-ratio, CPU/memory/disk inventory, active power scheme, tool hashes, all raw
-samples, and per-case time/RSS medians. `--metadata-only` generates only the corpus
-catalog. The full interpretation, machine identity, and recorded v0.7.0 result
-are documented in [English](../docs/benchmark_worker_vs_7z_300m.md) and
-[简体中文](../docs/zh-CN/benchmark_worker_vs_7z_300m.md).
-
-Both `extraction cli-format-matrix` and `watch cli-format-matrix` use the fixed
-300 MiB `few_large` payload. ZIPX is rebuilt from the existing payload members;
-LZ4 is one frame containing the concatenated 300 MiB raw members; ENC is an
-authenticated SSE v4 stream generated from a deterministic 300 MiB payload
-with the reference Java encoder. Each case validates exactly 300 MiB of output.
-ENC fixture generation requires Java 17+, `javac`, and the repository's
-`reference/implementations/SSEFilePC/.../ssefenc.jar`; the fixture password is
-`sunpack-test`. The LZ4 corpus writer is part of `sunpack_sevenzip_lz4`; build it with
-`cmake --build native/sevenzip_bridge/build-x64 --config Release --target sunpack_sevenzip_lz4`
-when it is missing. `--prefetch on|off` controls the native worker's input
-prefetch setting before the persistent worker starts. Run the ZIPX/LZ4 command
-once per setting in separate benchmark processes for an apples-to-apples A/B.
-The worker disables prefetch by default when the request's `format_hint` is
-`lz4` or `tar.lz4`; an explicit `SUNPACK_SEVENZIP_PREFETCH=1` still enables it
-for comparison runs. To compare with revisions that predate ENC support, select
-only ZIPX and LZ4 in both CLI and watch commands.
-
-`extraction worker-concurrency-300m` compares one persistent native worker with
-concurrent fresh `7z.exe` processes on all 18 generated 300 MiB format/variant
-cases. It reuses the format builder with payloads written by a standalone Rust
-fixture generator (requires `rustc`), caches fixtures, passes the real output
-volume identity, and validates output counts and sizes outside the timer.
-Each homogeneous burst contains as many jobs as the requested concurrency;
-the mixed batch contains two rounds of all cases at every concurrency. Reports
-include paired trials with alternating engine order, throughput, sampled RSS,
-process CPU time, and worker start/finish timelines. `--resume` continues completed
-batches after checking binary and configuration fingerprints. For diagnosis,
-`--dry-run` compares decode/verify against `7z t`. `--profile` enables read diagnostics
-and collects pipeline timing when the worker is built with `-DSUP7Z_DEBUG=ON`.
-Writer thread counts use each worker binary's internal defaults.
-`--format` and `--no-mixed` restrict diagnostic runs. These direct worker tests
-exclude CLI/watch planning, recursive extraction, and post-extract finalization.
-Compressed TAR codecs are measured as one outer stream layer for both engines.
-
-`memory many-tasks` measures memory _growth_ (not peak) of the two long-lived
-components under a large task count across every format: the Python pipeline and
-the native 7z worker. One mixed-format corpus is built with the format-matrix
-builder (archives kept above the 1 MiB scanner floor, e.g.
-`--small-files 1100 --large-files 2 --large-file-mib 1`), then:
-
-- phase `python` re-runs the whole corpus through the persistent-runtime
-  `extract` pipeline once per round (`--python-rounds`, default 5) and samples
-  the Python process RSS/private/tracemalloc/native reader cache after every
-  round, plus the residual after the engine closes;
-- phase `worker` feeds every archive through one persistent
-  `sunpack_sevenzip_worker.exe` (`--worker-rounds`, default 3) and samples the
-  worker process RSS after every job, so per-format and cumulative growth come
-  straight out of the trajectory.
-
-Use `--format` to restrict formats, `--skip-python` / `--skip-worker` to run a
-single phase, and `--json-out` for a durable copy.
-
-`reader embedded-scan --generate-gib 10 --rounds 1 --skip-cli` creates a streamed
-ZIP64 fixture under the benchmark workspace, measures native embedded-scan wall/CPU
-time and process memory peaks, and writes the report to the durable `benchmarks/results`
-directory. The generated archive is removed automatically unless `--keep-workdir` is
-supplied. The 10 GiB member is stored (not highly compressed), so generation is not
-part of the measured scan operation and the run exercises a large-file scan directly.
-The embedded scanner uses the bounded `ReadFile(OVERLAPPED)`/IOCP pipeline by
-default. IOCP uses a separate scan-local handle and reports `scan_read_bytes` and
-`scan_read_operations`; tune it
-with `--iocp-chunk-mib`, `--iocp-buffers`, and `--iocp-workers` without changing
-the normal reader cache or `read_at()` behavior. `iocp-buffers` controls the
-bounded in-flight read depth; `iocp-workers` controls parallel signature
-scanning independently.
-
-`reader embedded-scan --generate-plan5-mib 500 --rounds 3 --skip-cli` creates a
-500 MiB carrier around the real Plan 5 embedded-archive matrix. The matrix has
-128 independently generated archives and covers ZIP, 7z, RAR4/5, TAR, gzip,
-bzip2, xz, and zstd plus their container/codec variants. The scenario verifies
-every expected format/offset on every measured run, so throughput results cannot
-hide candidate-validation regressions or missed archives.
-
-`extraction real-archive` measures the current architecture: `sunpack extract`
-delegates to the long-lived persistent server process, so RSS accounting
-includes the CLI client's process tree plus the persistent server and its
-native 7-Zip worker (baseline service RSS is subtracted as idle overhead).
-Each run has a per-run timeout (`--timeout`, default 600s); a timed-out run is
-reported with exit code -124 and the server is shut down so the next run
-starts from a clean baseline.
-
-`extraction split-pressure` and `extraction large-archive-profile` drive the
-async `PipelineEngine` (one event loop per submission) and instrument the
-per-request runtime through the private runtime-factory seam. Timing columns
-reflect the current pipeline stages: `pipeline_scan`, `input_planning`,
-`batch_prepare`/`batch_execute`/`batch_collect_result`, `output_scan`,
-`password_resolve`, `verify`, and `extract_ms` (the pipeline wall
-minus every measured stage, since native extraction runs asynchronously
-through the worker). Stages removed by the refactor report 0.0.
-
-The following obsolete probes were intentionally removed during consolidation:
-
-- cache saturation and idle-thread scripts that inspected `_ENGINE`, `_runtime`, and `_SESSIONS`;
-- the standalone scan-layer probe, subsumed by `scan hotspots --mode ...`;
-- the hard-coded nested-authorization microbenchmark;
-- the PowerShell memory stress script;
-- the separate SunPack-versus-7-Zip runner, subsumed by the format matrix baseline.
-
-Use pytest only for stable product contracts. Opt-in timing/resource assertions are
-marked `performance` and run with `pytest --run-performance`; multi-GB large-archive
-tests additionally require `--run-large-archive-performance`.
+The previous Python allocation, extension object, scheduler monkeypatch, private
+worker-wire and extension-capture scenarios were removed with their implementation.
+Their results cannot be compared directly to the native process metrics. Historical
+index experiment material remains in `hit_index/`; its independent C ABI probe
+and native algorithm comparison build tools require no Python extension. The
+[GUI benchmark](gui/README.md) remains a native executable.

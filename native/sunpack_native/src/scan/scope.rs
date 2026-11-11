@@ -1,14 +1,10 @@
 //! The filesystem boundary shared by discovery, relation recovery and Watch.
 use crate::path_keys::path_key;
-use pyo3::prelude::*;
 use std::collections::HashSet;
 
-#[pyclass(module = "sunpack_native", frozen, skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub(crate) struct NativeDiscoveryScope {
-    #[pyo3(get)]
     pub root: String,
-    #[pyo3(get)]
     pub max_depth: Option<usize>,
     key: String,
     excluded: HashSet<String>,
@@ -70,10 +66,7 @@ impl NativeDiscoveryScope {
     }
 }
 
-#[pymethods]
 impl NativeDiscoveryScope {
-    #[new]
-    #[pyo3(signature = (root, max_depth=Some(0), excluded_subtrees=Vec::new()))]
     pub fn new(root: String, max_depth: Option<usize>, excluded_subtrees: Vec<String>) -> Self {
         let key = path_key(&root).trim_end_matches('\\').to_owned();
         Self {
@@ -87,7 +80,6 @@ impl NativeDiscoveryScope {
         }
     }
 
-    #[getter]
     pub(crate) fn excluded_subtrees(&self) -> Vec<String> {
         self.excluded.iter().cloned().collect()
     }
@@ -108,12 +100,6 @@ impl NativeDiscoveryScope {
     pub fn excludes(&self, path: &str) -> bool {
         self.has_exclusions() && self.excludes_key(&path_key(path))
     }
-}
-
-#[pyfunction]
-pub(crate) fn create_output_root(py: Python<'_>, path: String) -> PyResult<()> {
-    py.detach(|| create_output_root_exclusive(std::path::Path::new(&path)))
-        .map_err(Into::into)
 }
 
 pub(crate) fn create_output_root_exclusive(path: &std::path::Path) -> std::io::Result<()> {

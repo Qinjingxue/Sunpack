@@ -1,23 +1,24 @@
-use pyo3::prelude::*;
-
 mod analysis_native;
 mod collections;
 mod event_log;
 mod failure_report;
-mod fast_hash;
 mod fast_hash_core;
 mod filesystem;
 mod formats;
 mod io;
+mod output_names;
 mod password;
 mod path_keys;
 mod postprocess;
 mod relations;
 mod scan;
-mod output_names;
 mod wal;
 mod watch_journal;
 mod watch_store;
+
+pub mod core;
+pub mod pipeline;
+pub mod runtime;
 
 #[cfg(test)]
 mod test_support {
@@ -34,240 +35,4 @@ mod test_support {
         fs::write(&path, contents).expect("write test file");
         path
     }
-}
-
-#[pymodule]
-fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(
-        io::archive_state::archive_input_slices,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(failure_report::append_failure_report, m)?)?;
-    m.add_function(wrap_pyfunction!(failure_report::publish_failure_report, m)?)?;
-    m.add_function(wrap_pyfunction!(failure_report::stream_json, m)?)?;
-    m.add_function(wrap_pyfunction!(password::lists::read_password_file, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        io::resource_lifecycle::read_shared_utf8_text,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::resource_lifecycle::read_changed_shared_utf8_text,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(path_keys::path_key, m)?)?;
-    m.add_function(wrap_pyfunction!(path_keys::merge_release_roots, m)?)?;
-    m.add_function(wrap_pyfunction!(fast_hash::fast_hash64, m)?)?;
-    m.add_function(wrap_pyfunction!(fast_hash::fast_hash128, m)?)?;
-    m.add_function(wrap_pyfunction!(fast_hash::fast_hash128_file, m)?)?;
-    m.add_class::<fast_hash::FastHash128>()?;
-    #[cfg(windows)]
-    m.add_class::<io::config_changes::NativeConfigChanges>()?;
-    m.add_class::<watch_store::NativeWatchState>()?;
-    m.add_class::<event_log::NativeEventLog>()?;
-    m.add_class::<watch_journal::NativeJournalStream>()?;
-    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_open, m)?)?;
-    m.add_class::<watch_store::NativeWatchOperations>()?;
-    m.add_class::<watch_store::NativeWatchSnapshot>()?;
-    m.add_class::<watch_store::NativeWatchReplay>()?;
-    m.add_function(wrap_pyfunction!(watch_store::watch_path_key, m)?)?;
-    m.add_class::<watch_journal::NativeJournalTicket>()?;
-    m.add_function(wrap_pyfunction!(
-        watch_journal::watch_journal_submit_append,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        watch_journal::watch_journal_submit_seal,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        watch_journal::watch_journal_request_flush,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_seed, m)?)?;
-    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_flush_all, m)?)?;
-    m.add_function(wrap_pyfunction!(io::reader::reader_cache_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(io::reader::clear_reader_resources, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        io::runtime_binary::runtime_binary_build_id,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::resource_lifecycle::native_resource_snapshot,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::resource_lifecycle::native_wait_for_resources,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::resource_lifecycle::native_begin_promotion,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::resource_lifecycle::native_end_promotion,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::reader::release_reader_resources_under_roots,
-        m
-    )?)?;
-    m.add_class::<analysis_native::AnalysisBinaryView>()?;
-    m.add_class::<analysis_native::AnalysisMultiVolumeView>()?;
-    m.add_class::<analysis_native::NativeAnalysisConfig>()?;
-    m.add_function(wrap_pyfunction!(
-        analysis_native::confirm_format_identity,
-        m
-    )?)?;
-    m.add_class::<io::reader::NativeArchiveSession>()?;
-    m.add_class::<io::cancellation::NativeCancellation>()?;
-    m.add(
-        "NativeOperationCancelled",
-        m.py()
-            .get_type::<io::cancellation::NativeOperationCancelled>(),
-    )?;
-    m.add_class::<scan::scope::NativeDiscoveryScope>()?;
-    m.add_function(wrap_pyfunction!(scan::scope::create_output_root, m)?)?;
-    m.add_class::<scan::directory::NativeDirectorySnapshot>()?;
-    m.add_class::<scan::directory::NativeWatchCatalog>()?;
-    m.add_class::<scan::catalog::NativeWatchObservation>()?;
-    m.add_class::<scan::directory::NativeDirectoryScanOptions>()?;
-    m.add_class::<scan::path_filter::NativePathRule>()?;
-    m.add_class::<scan::discovery::NativeCandidateTable>()?;
-    m.add_class::<scan::discovery::NativeDiscoveryRoutes>()?;
-    m.add_class::<scan::discovery::NativeEmbeddedBatch>()?;
-    m.add_class::<scan::directory::NativeOutputInventory>()?;
-    m.add_class::<scan::directory::NativeWorkerManifest>()?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_broker_acquire, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_broker_release, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_volume_cursor, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_path_identity, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_root_changes, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_directories_changes, m)?)?;
-    m.add_function(wrap_pyfunction!(analysis_native::probe_volume_anchors, m)?)?;
-    m.add_function(wrap_pyfunction!(scan::embedded::scan_embedded_archives, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        formats::zip::analyze_zip_filename_encoding,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::directory_snapshot_from_columns,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::profile_directory_scan,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::nested_authorization::authorize_nested_candidates,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(relations::relations_detect_split_role, m)?)?;
-    m.add_function(wrap_pyfunction!(relations::relations_logical_name, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        output_names::output_name_component,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        relations::relations_parse_numbered_volume,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        relations::relations_resolve_volume_once,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(scan::directory::scan_output_inventory, m)?)?;
-    m.add_function(wrap_pyfunction!(scan::directory::classify_scan_targets, m)?)?;
-    m.add(
-        "DIRECTORY_ERROR_REPORT_LIMIT",
-        io::directory_errors::DIRECTORY_ERROR_REPORT_LIMIT,
-    )?;
-    m.add_class::<scan::worker_event::NativeOutputTrace>()?;
-    m.add_class::<scan::worker_wire::NativeWorkerFrameDecoder>()?;
-    m.add_class::<scan::worker_event::NativeWorkerResultAccumulator>()?;
-    m.add_function(wrap_pyfunction!(scan::worker_wire::encode_worker_frame, m)?)?;
-    m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_event, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::worker_event::parse_worker_transport_event,
-        m
-    )?)?;
-    m.add_class::<scan::progress_manifest::NativeProgressManifest>()?;
-    m.add_function(wrap_pyfunction!(
-        scan::progress_manifest::build_progress_manifest,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::progress_manifest::complete_progress_manifest,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        analysis_native::inspect_compression_stream_identity,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        analysis_native::inspect_compression_stream_structure,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(postprocess::scan_watch_candidates, m)?)?;
-    m.add_function(wrap_pyfunction!(postprocess::watch_candidate_for_path, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_filesystem_type, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        filesystem::resolve_output_volume_key_python,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(filesystem::validate_ntfs_watch_root, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_file_is_ready, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_broker_is_connected, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_broker_ping_seconds, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        postprocess::flatten_single_branch_directories,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(postprocess::delete_files_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(postprocess::remove_output_path, m)?)?;
-    m.add_class::<postprocess::NativeBlockedInputPromotion>()?;
-    m.add_function(wrap_pyfunction!(
-        password::enc::enc_fast_verify_passwords,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::enc::enc_fast_verify_passwords_from_ranges,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::seven_zip::seven_zip_fast_verify_passwords,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::seven_zip::seven_zip_fast_verify_passwords_from_ranges,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::rar::rar_fast_verify_passwords,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::rar::rar_fast_verify_passwords_from_ranges,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::rar::rar_fast_verify_passwords_from_volumes,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::rar::resolve_embedded_rar_boundaries,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::zip::zip_fast_verify_passwords,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::zip::zip_fast_verify_passwords_from_ranges,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        password::zip::zip_fast_verify_passwords_from_volumes,
-        m
-    )?)?;
-    Ok(())
 }

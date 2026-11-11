@@ -331,94 +331,6 @@ function Invoke-Native {
         throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $joined"
     }
 }
-function ConvertTo-NormalizedFullPath {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') -replace '/', '\').ToLowerInvariant()
-}
-
-function Wait-ExecutableExit {
-    param(
-        [Parameter(Mandatory = $true)][string]$ExecutablePath,
-        [int]$TimeoutSeconds = 15
-    )
-
-    $expectedPath = ConvertTo-NormalizedFullPath -Path $ExecutablePath
-    $executableName = [System.IO.Path]::GetFileName($ExecutablePath).Replace("'", "''")
-    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
-    do {
-        $matching = @(
-            Get-CimInstance Win32_Process -Filter "Name='$executableName'" -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.ExecutablePath -and
-                    (ConvertTo-NormalizedFullPath -Path $_.ExecutablePath) -eq $expectedPath
-                }
-        )
-        if ($matching.Count -eq 0) {
-            return
-        }
-        Start-Sleep -Milliseconds 100
-    } while ((Get-Date) -lt $deadline)
-
-    $processIds = ($matching | ForEach-Object ProcessId) -join ", "
-    throw "Executable did not exit within $TimeoutSeconds seconds: $ExecutablePath (PID: $processIds)"
-}
-
-function Stop-SourcePersistentRuntime {
-    param(
-        [Parameter(Mandatory = $true)][string]$PythonPath,
-        [Parameter(Mandatory = $true)][string]$RepoRoot
-    )
-
-    if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
-        return
-    }
-
-    # Match normal acceptance commands: when this script is elevated, send the
-    # shutdown request with the interactive user token so it reaches the same
-    # source-runtime pipe that the CLI smoke tests used.
-    $runnerArguments = @(
-        $unelevatedRunner,
-        "--cwd", $RepoRoot,
-        "--timeout-seconds", "15",
-        "--",
-        $PythonPath,
-        "sunpack.py", "--persistent-shutdown"
-    )
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        & $PythonPath @runnerArguments *> $null
-        $shutdownExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($shutdownExitCode -ne 0) {
-        throw "Source persistent runtime shutdown returned exit code $shutdownExitCode"
-    }
-
-    # The server acknowledges shutdown before all runtime cleanup has finished.
-    # Wait for the exact venv interpreter to leave so CI cannot retain a locked
-    # .venv or report an orphan Python process.
-    Wait-ExecutableExit -ExecutablePath $PythonPath
-}
-
-function Get-NativeSmokeCode {
-    return @"
-import sunpack_native as n
-required = [
-    'NativeDirectoryScanOptions', 'NativeCandidateTable',
-    'directory_snapshot_from_columns',
-    'authorize_nested_candidates',
-    'scan_embedded_archives',
-    'analyze_zip_filename_encoding', 'AnalysisBinaryView',
-    'watch_broker_acquire', 'watch_broker_release',
-    'watch_broker_is_connected', 'watch_broker_ping_seconds',
-]
-missing = [name for name in required if not callable(getattr(n, name, None))]
-assert not missing, missing
-"@
-}
-
 function Test-PythonImports {
     param(
         [Parameter(Mandatory = $true)]
@@ -440,100 +352,6 @@ function Test-PythonImports {
     }
 }
 
-function Get-AcceptanceTestToolRequirements {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    $testToolsRoot = Join-Path $RepoRoot ".sunpack_test_tools"
-    $rarRoot = Join-Path $testToolsRoot "winrar"
-    $zstdRoot = Join-Path $testToolsRoot "zstd"
-    return @(
-        [pscustomobject]@{
-            Path = Join-Path $rarRoot "Rar.exe"
-            Description = "RAR archive generator"
-            Arguments = @()
-        },
-        [pscustomobject]@{
-            Path = Join-Path $rarRoot "Default.SFX"
-            Description = "RAR SFX module"
-            Arguments = $null
-        },
-        [pscustomobject]@{
-            Path = Join-Path $rarRoot "WinRAR.exe"
-            Description = "WinRAR archive generator"
-            Arguments = $null
-        },
-        [pscustomobject]@{
-            Path = Join-Path $zstdRoot "zstd.exe"
-            Description = "zstd stream generator"
-            Arguments = @("--version")
-        }
-    )
-}
-
-function Test-AcceptanceTestToolRuns {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [string[]]$Arguments = @()
-    )
-
-    try {
-        & $Path @Arguments *> $null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
-}
-
-function Test-AcceptanceRarGeneratorVersion {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [string]$RequiredVersion = "6.22"
-    )
-
-    try {
-        $output = (& $Path "iver" 2>&1 | Out-String)
-        # Rar.exe returns exit code 7 for the informational iver command.
-        return ($output -match ("RAR " + [regex]::Escape($RequiredVersion) + " x64"))
-    } catch {
-        return $false
-    }
-}
-
-function Assert-AcceptanceTestTools {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    $missing = New-Object System.Collections.Generic.List[string]
-    foreach ($tool in @(Get-AcceptanceTestToolRequirements -RepoRoot $RepoRoot)) {
-        if (-not (Test-Path -LiteralPath $tool.Path -PathType Leaf)) {
-            $missing.Add("$($tool.Description): $($tool.Path)")
-            continue
-        }
-        if ($tool.Description -eq "RAR archive generator" -and
-            -not (Test-AcceptanceRarGeneratorVersion -Path $tool.Path)) {
-            $missing.Add("$($tool.Description) must be WinRAR 6.22 x64 for RAR4 fixtures: $($tool.Path)")
-        } elseif ($null -ne $tool.Arguments -and
-            -not (Test-AcceptanceTestToolRuns -Path $tool.Path -Arguments $tool.Arguments)) {
-            $missing.Add("$($tool.Description) is not executable: $($tool.Path)")
-        }
-    }
-    if ($missing.Count -gt 0) {
-        throw (
-            "Acceptance test generator tools are incomplete:`n  - " +
-            ($missing -join "`n  - ") +
-            "`nRun scripts\setup_windows_dev.ps1 on a Windows x64 environment or configure the test tool paths."
-        )
-    }
-    Write-Host "    Acceptance generator tools are present and executable" -ForegroundColor Green
-}
-
 function Get-EnvironmentRefreshReasons {
     param(
         [Parameter(Mandatory = $true)]
@@ -551,56 +369,21 @@ function Get-EnvironmentRefreshReasons {
     $requiredPythonModules = @(
         "pytest",
         "xdist",
-        "psutil",
-        "send2trash",
-        "watchdog",
-        "zstandard"
+        "psutil"
     )
     if (-not (Test-PythonImports -PythonPath $VenvPython -Modules $requiredPythonModules)) {
-        $reasons.Add(".venv is missing or cannot import runtime or test modules")
+        $reasons.Add(".venv is missing or cannot import test modules")
     }
 
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        & $VenvPython -c (Get-NativeSmokeCode) *> $null
-        $nativeSmokeExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($nativeSmokeExitCode -ne 0) {
-        $reasons.Add("sunpack_native native smoke check failed")
-    }
-
-    $nativeExtension = Get-NativeExtensionPath -PythonPath $VenvPython
-    foreach ($reason in @(Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension $nativeExtension -BuildProfile $BuildProfile)) {
+    foreach ($reason in @(Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile)) {
         $reasons.Add($reason)
     }
 
     $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
 
-    # Fixture generators. 7z.dll belongs here: it is the companion module of the
-    # 7z.exe command line tool the suite uses to BUILD archives, not a runtime
-    # dependency of SunPack.
-    $fixtureGenerators = @(
-        (Join-Path $toolsRoot "7z.exe"),
-        (Join-Path $toolsRoot "7z.dll"),
-        (Join-Path $toolsRoot "7zCon.sfx")
-    )
-    foreach ($generatorPath in $fixtureGenerators) {
-        if (-not (Test-Path -LiteralPath $generatorPath)) {
-            $reasons.Add("required fixture generator is missing: $generatorPath")
-        }
-    }
-    foreach ($tool in @(Get-AcceptanceTestToolRequirements -RepoRoot $RepoRoot)) {
-        if (-not (Test-Path -LiteralPath $tool.Path -PathType Leaf)) {
-            $reasons.Add("acceptance test generator is missing: $($tool.Path)")
-        } elseif ($tool.Description -eq "RAR archive generator" -and
-            -not (Test-AcceptanceRarGeneratorVersion -Path $tool.Path)) {
-            $reasons.Add("acceptance RAR generator must be WinRAR 6.22 x64: $($tool.Path)")
-        } elseif ($null -ne $tool.Arguments -and
-            -not (Test-AcceptanceTestToolRuns -Path $tool.Path -Arguments $tool.Arguments)) {
-            $reasons.Add("acceptance test generator cannot run: $($tool.Path)")
+    foreach ($name in @("7z.exe", "7z.dll")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $toolsRoot $name) -PathType Leaf)) {
+            $reasons.Add("Required archive fixture generator is missing: $name")
         }
     }
     return $reasons
@@ -638,7 +421,7 @@ function Ensure-AcceptanceEnvironment {
     Invoke-Native -FilePath "powershell" -Arguments @(
         "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1"),
-        "-Arch", $Arch, "-BuildProfile", $BuildProfile
+        "-Arch", $Arch, "-BuildProfile", $BuildProfile, "-SkipAcceptanceTestTools"
     )
 
     # Verify persistence immediately; a successful setup subprocess is not
@@ -687,7 +470,6 @@ trap {
 
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 Ensure-AcceptanceEnvironment -RepoRoot $repoRoot -VenvPython $venvPython
-Assert-AcceptanceTestTools -RepoRoot $repoRoot
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     $bootstrapPython = Get-UvBootstrapPythonCommand
     Write-Host "==> Preparing .venv with uv" -ForegroundColor Cyan
@@ -711,14 +493,10 @@ $powerShellHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $watchServiceRunId = [guid]::NewGuid().ToString("N")
 $watchServiceName = "SunPackWatchBrokerTest_$watchServiceRunId"
 $watchPipeName = "\\.\pipe\SunPack.WatchBroker.Test.$watchServiceRunId"
-$watchBrokerXxh128 = & $python -c "import sys; from sunpack_native import fast_hash128_file; print(fast_hash128_file(sys.argv[1]))" $brokerPath
-if ($LASTEXITCODE -ne 0) { throw "Cannot hash the Watch Broker executable" }
-$watchBrokerXxh128 = ([string]$watchBrokerXxh128).Trim()
 $watchEnvironmentNames = @(
     "SUNPACK_WATCH_BROKER_SERVICE_NAME",
     "SUNPACK_WATCH_BROKER_PIPE_NAME",
     "SUNPACK_WATCH_BROKER_BINARY_PATH",
-    "SUNPACK_WATCH_BROKER_BINARY_XXH128",
     "SUNPACK_TEST_ARCH",
     "SUNPACK_TEST_BUILD_PROFILE"
 )
@@ -728,16 +506,15 @@ foreach ($name in $watchEnvironmentNames) {
 }
 $watchServiceInstalled = $false
 $watchServiceCleanupFailed = $false
-$persistentRuntimeCleanupFailed = $false
 
 try {
     $env:SUNPACK_TEST_ARCH = $Arch.ToLowerInvariant()
     $env:SUNPACK_TEST_BUILD_PROFILE = $BuildProfile.ToLowerInvariant()
+    $target = if ($Arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
     Write-Host "Native test build: $Arch/$BuildProfile"
     $env:SUNPACK_WATCH_BROKER_SERVICE_NAME = $watchServiceName
     $env:SUNPACK_WATCH_BROKER_PIPE_NAME = $watchPipeName
     $env:SUNPACK_WATCH_BROKER_BINARY_PATH = $brokerPath
-    $env:SUNPACK_WATCH_BROKER_BINARY_XXH128 = $watchBrokerXxh128
 
     Write-Host ""
     Write-Host "==> Installing temporary Watch Broker service" -ForegroundColor Cyan
@@ -750,45 +527,17 @@ try {
         -BrokerPath $brokerPath
     $watchServiceInstalled = $true
 
-    Invoke-TestStep -Label "Parallel CLI, unit, and functional tests" -Command @(
-        $python,
-        "-m", "pytest", "-q", "-rs",
-        "-n", [string]$ParallelWorkers,
-        "--dist", "worksteal",
-        "tests/cli", "tests/unit", "tests/functional",
-        "--durations=20"
+    Invoke-TestStep -Label "Rust correctness tests" -Command @(
+        "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
+        "--workspace", "--profile", $BuildProfile, "--target", $target,
+        "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
     )
-    Invoke-TestStep -Label "Parallel integration and real tests" -Command @(
-        $python,
-        "-m", "pytest", "-q", "-rs",
-        "-n", [string]$ParallelWorkers,
-        "--dist", "worksteal",
-        "tests/integration", "tests/real",
-        "--ignore", "tests/integration/test_disk_full_pause_resume.py",
-        "--durations=20"
+    Invoke-TestStep -Label "CLI and Watch boundary tests" -Command @(
+        $python, "-m", "pytest", "-q", "-rs", "-n", [string]$ParallelWorkers,
+        "--dist", "worksteal", "tests/blackbox", "tests/unit",
+        "tests/integration/test_config_upgrade.py", "tests/integration/test_installer_language.py"
     )
-    Invoke-TestStep -Label "Parallel administrator VHD disk-full tests" -KeepElevationIfAdministrator -Command @(
-        $python,
-        "-m", "pytest", "-q", "-rs",
-        "-n", [string]$ParallelWorkers,
-        "--dist", "worksteal",
-        "tests/integration/test_disk_full_pause_resume.py",
-        "--durations=20"
-    )
-    Invoke-TestStep -Label "CLI help smoke test" -Command @($python, "sunpack.py", "--help") -QuietOutput
-    Invoke-TestStep -Label "CLI passwords smoke test" -Command @($python, "sunpack.py", "passwords", "--json") -QuietOutput
-    Invoke-TestStep -Label "CLI scan smoke test" -Command @($python, "sunpack.py", "scan", (Join-Path $repoRoot "tests"), "--json") -QuietOutput
-    Invoke-TestStep -Label "CLI config smoke test" -Command @($python, "sunpack.py", "config", "--json", "show") -QuietOutput
 } finally {
-    Write-Host ""
-    Write-Host "==> Stopping source persistent runtime" -ForegroundColor Cyan
-    try {
-        Stop-SourcePersistentRuntime -PythonPath $python -RepoRoot $repoRoot
-    } catch {
-        $persistentRuntimeCleanupFailed = $true
-        Write-Host ("    FAIL - could not stop source persistent runtime: " + $_.Exception.Message) -ForegroundColor Red
-    }
-
     if ($watchServiceInstalled) {
         Write-Host ""
         Write-Host "==> Uninstalling temporary Watch Broker service" -ForegroundColor Cyan
@@ -828,9 +577,6 @@ Write-Host ""
 $failedResults = @($script:StepResults | Where-Object { $_.ExitCode -ne 0 })
 if ($watchServiceCleanupFailed) {
     $failedResults += [pscustomobject]@{ Label = "Temporary Watch Broker service cleanup"; ExitCode = -1; DurationSeconds = 0 }
-}
-if ($persistentRuntimeCleanupFailed) {
-    $failedResults += [pscustomobject]@{ Label = "Source persistent runtime cleanup"; ExitCode = -1; DurationSeconds = 0 }
 }
 if ($failedResults.Count -gt 0) {
     Write-Host ("{0} acceptance test step(s) failed; all scheduled steps have completed" -f $failedResults.Count) -ForegroundColor Red

@@ -1,1 +1,0 @@
-"""Windows platform integration helpers."""

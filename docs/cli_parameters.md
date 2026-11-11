@@ -2,14 +2,6 @@
 
 **English** | [简体中文](zh-CN/cli_parameters.md)
 
-Entry script:
-
-```powershell
-python sunpack.py <command> [options] [paths...]
-```
-
-The packaged Windows program is usually invoked directly:
-
 ```powershell
 sunpack.exe <command> [options] [paths...]
 ```
@@ -65,7 +57,7 @@ For `extract`, `summary.failed_count` and each attempt's `failed_count` count ar
 Usage:
 
 ```powershell
-python sunpack.py extract [options] <paths...>
+sunpack.exe extract [options] <paths...>
 ```
 
 `paths` may be one or more files or directories. Directories are scanned shallowly by default; `--recursive` includes their subdirectories.
@@ -97,12 +89,12 @@ Values for `--recur`:
 Examples:
 
 ```powershell
-python sunpack.py extract D:\Downloads
-python sunpack.py extract D:\A.7z -p 123456 -p secret
-python sunpack.py extract D:\Archives --pw-file .\passwords.txt --cleanup r
-python sunpack.py extract D:\Nested --recur * --no-flatten
-python sunpack.py extract --direct-file D:\MaybeArchive.bin
-python sunpack.py extract D:\Archives -o E:\Unpacked
+sunpack.exe extract D:\Downloads
+sunpack.exe extract D:\A.7z -p 123456 -p secret
+sunpack.exe extract D:\Archives --pw-file .\passwords.txt --cleanup r
+sunpack.exe extract D:\Nested --recur * --no-flatten
+sunpack.exe extract --direct-file D:\MaybeArchive.bin
+sunpack.exe extract D:\Archives -o E:\Unpacked
 ```
 
 Exit codes:
@@ -120,7 +112,7 @@ Extraction displays a tree of logical task scopes. Each carrier segment and nest
 Usage:
 
 ```powershell
-python sunpack.py scan [options] <paths...>
+sunpack.exe scan [options] <paths...>
 ```
 
 `scan` shares extract's discovery, input planning, and password confirmation. Results are grouped by physical file and logical segment, showing only obtained format, range, volume, password, and error facts. Ordinary archives omit ranges; carriers show `[start, end)`, with `?` for an unknown end and a tree for multiple segments. Known encryption without a confirmed password is shown as “Password: not in password list”, without a duplicate password error; confirmed passwords are printed directly.
@@ -134,9 +126,9 @@ The password input options are shared with extract. `-v` adds existing discovery
 Examples:
 
 ```powershell
-python sunpack.py scan D:\Downloads
-python sunpack.py scan D:\Downloads --deep-detect --json
-python sunpack.py scan D:\Downloads -v
+sunpack.exe scan D:\Downloads
+sunpack.exe scan D:\Downloads --deep-detect --json
+sunpack.exe scan D:\Downloads -v
 ```
 
 ## watch
@@ -144,7 +136,7 @@ python sunpack.py scan D:\Downloads -v
 Usage:
 
 ```powershell
-python sunpack.py watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
+sunpack.exe watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
 ```
 
 Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned | recursive`; the last four columns are optional:
@@ -197,7 +189,7 @@ The directory and directory-background context menus contain four entries: "Extr
 Usage:
 
 ```powershell
-python sunpack.py passwords [options]
+sunpack.exe passwords [options]
 ```
 
 Options:
@@ -215,9 +207,9 @@ Options:
 Examples:
 
 ```powershell
-python sunpack.py passwords
-python sunpack.py passwords -p 123456 --no-builtin-pw
-python sunpack.py passwords --pw-file .\passwords.txt --json
+sunpack.exe passwords
+sunpack.exe passwords -p 123456 --no-builtin-pw
+sunpack.exe passwords --pw-file .\passwords.txt --json
 ```
 
 ## config
@@ -225,7 +217,7 @@ python sunpack.py passwords --pw-file .\passwords.txt --json
 Usage:
 
 ```powershell
-python sunpack.py config [options] <show|validate>
+sunpack.exe config [options] <show|validate>
 ```
 
 | Subcommand | Description |
@@ -242,9 +234,9 @@ Options:
 Examples:
 
 ```powershell
-python sunpack.py config show
-python sunpack.py config validate
-python sunpack.py config validate --json
+sunpack.exe config show
+sunpack.exe config validate
+sunpack.exe config validate --json
 ```
 
 ## doctor
@@ -252,8 +244,8 @@ python sunpack.py config validate --json
 Usage:
 
 ```powershell
-python sunpack.py doctor [--json]
-python sunpack.py d [-j]
+sunpack.exe doctor [--json]
+sunpack.exe d [-j]
 ```
 
 `doctor` performs a read-only check of the configuration, the native extension, `7z.dll`, the SevenZip worker, Windows notification capability, and the configured monitored roots. A monitored root that does not exist is reported as a warning; the command never starts continuous monitoring or a real extraction, and never modifies the registry. The exit code is `1` when any check fails, and `0` when there are only warnings or skipped items.
@@ -263,7 +255,7 @@ python sunpack.py d [-j]
 Usage:
 
 ```powershell
-python sunpack.py version
+sunpack.exe version
 ```
 
 `version` reads `VERSION.txt` next to the running SunPack executable and prints the value after `version=`. The packaged executable can also be invoked as `sunpack.exe version`.
@@ -277,7 +269,7 @@ Run these scripts in a regular PowerShell session to manage the current user's c
 .\scripts\unregister_context_menu.ps1
 ```
 
-The registration script inside the distribution package uses the `sunpack.exe` in its own parent directory. When run from the source tree, the script detects the single unique `dist/sunpack-*/sunpack.exe`; when several build outputs exist, specify one explicitly with `-AppPath`. When no packaged program is found, `python sunpack.py` is used.
+The registration script inside the distribution package uses the `sunpack.exe` in its own parent directory. When run from the source tree, the script detects the single unique `dist/sunpack-*/sunpack.exe`; when several build outputs exist, specify one explicitly with `-AppPath`.
 
 The folder and folder-background menus offer "Extract files in this folder" and "Enter password to extract files in this folder", plus watch and unwatch actions. The menu for any file offers "Extract this file" and "Enter password to extract this file", equivalent to:
 

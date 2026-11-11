@@ -1,15 +1,8 @@
 //! Request cancellation shared by native IO, analysis and password work.
-use pyo3::prelude::*;
 use std::cell::RefCell;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-
-pyo3::create_exception!(
-    sunpack_native,
-    NativeOperationCancelled,
-    pyo3::exceptions::PyBaseException
-);
 
 thread_local! {
     static SCOPES: RefCell<Vec<Cancellation>> = const { RefCell::new(Vec::new()) };
@@ -60,14 +53,18 @@ impl Cancellation {
         operation()
     }
 
-    pub(crate) fn check(&self) -> PyResult<()> {
-        if self.cancelled() {
-            Err(NativeOperationCancelled::new_err(
-                "native operation cancelled",
-            ))
-        } else {
-            Ok(())
+    pub(crate) fn new() -> Self {
+        Self(Some(Arc::new(State::default())))
+    }
+
+    pub(crate) fn cancel(&self) {
+        if let Some(state) = &self.0 {
+            state.cancel();
         }
+    }
+
+    pub(crate) fn check(&self) -> io::Result<()> {
+        self.check_io()
     }
 
     pub(crate) fn check_io(&self) -> io::Result<()> {
@@ -169,130 +166,11 @@ impl Drop for Scope {
     }
 }
 
-#[pyclass(frozen, module = "sunpack_native")]
-pub(crate) struct NativeCancellation {
-    state: Arc<State>,
-}
-
-#[pymethods]
-impl NativeCancellation {
-    #[new]
-    fn new() -> Self {
-        Self {
-            state: Arc::new(State::default()),
-        }
-    }
-
-    fn cancel(&self, py: Python<'_>) {
-        py.detach(|| self.state.cancel());
-    }
-
-    fn __enter__(&self) {
-        SCOPES.with(|scopes| {
-            scopes
-                .borrow_mut()
-                .push(Cancellation(Some(Arc::clone(&self.state))))
-        });
-    }
-
-    fn __exit__(
-        &self,
-        _ty: &Bound<'_, PyAny>,
-        _value: &Bound<'_, PyAny>,
-        _traceback: &Bound<'_, PyAny>,
-    ) {
-        drop(Scope);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::{iocp, ScanBatch};
     use std::sync::mpsc;
-
-    #[test]
-    fn cancelled_initializer_does_not_publish_damage_to_shared_password_input() {
-        // KDF/IO stop tests cannot detect a cancelled initializer poisoning a
-        // concurrent borrower's archive facts. One shared physical generation
-        // checks isolation, retry and reuse together without decoding a payload.
-        use crate::io::reader::ManagedReader;
-        use crate::password::context::{verify_prepared, InputKey, PreparedStatus};
-
-        Python::initialize();
-        let path = std::env::temp_dir().join(format!(
-            "sunpack_cancel_prepare_{}_{}.bin",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, b"physical generation").unwrap();
-        let reader = ManagedReader::open(&path).unwrap();
-        let key = InputKey::file("rar", &reader).unwrap();
-        let owner_key = key.clone();
-        let borrower_key = key.clone();
-        let state = Arc::new(State::default());
-        let owner_signal = Arc::clone(&state);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let owner = std::thread::spawn(move || {
-            Python::attach(|py| {
-                Cancellation(Some(owner_signal)).run(|| {
-                    verify_prepared(py, owner_key, &[], move || {
-                        entered_tx.send(()).unwrap();
-                        release_rx.recv().unwrap();
-                        Err(PreparedStatus::new("damaged", "abandoned initializer"))
-                    })
-                    .unwrap_err()
-                    .is_instance_of::<NativeOperationCancelled>(py)
-                })
-            })
-        });
-        entered_rx.recv().unwrap();
-        let (borrow_tx, borrow_rx) = mpsc::channel();
-        let borrower = std::thread::spawn(move || {
-            Python::attach(|py| {
-                borrow_tx.send(()).unwrap();
-                verify_prepared(py, borrower_key, &[], || {
-                    Err(PreparedStatus::new("not_required", "surviving initializer"))
-                })
-                .unwrap()
-                .bind(py)
-                .get_item("status")
-                .unwrap()
-                .extract::<String>()
-                .unwrap()
-            })
-        });
-        borrow_rx.recv().unwrap();
-        // The borrower holds the GIL until it joins the shared initializer.
-        // Acquiring it here proves the concurrent read is already waiting.
-        Python::attach(|_| {
-            state.cancel();
-            release_tx.send(()).unwrap();
-        });
-        assert!(owner.join().unwrap());
-        assert_eq!(borrower.join().unwrap(), "not_required");
-        Python::attach(|py| {
-            let reused =
-                verify_prepared(py, key, &[], || panic!("successful facts must be reused"))
-                    .unwrap();
-            assert_eq!(
-                reused
-                    .bind(py)
-                    .get_item("status")
-                    .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
-                "not_required"
-            );
-        });
-        crate::password::context::release_under_roots(std::slice::from_ref(&path));
-        drop(reader);
-        std::fs::remove_file(path).unwrap();
-    }
 
     #[test]
     fn cancellation_drains_live_scan_and_preserves_other_requests() {

@@ -1,8 +1,7 @@
 use super::context::{InputKey, InputMember, PreparedStatus};
+use crate::io::archive_state::{InputExtent, InputPart};
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -21,14 +20,11 @@ pub(crate) struct RangeSpec {
 struct InputReaders(HashMap<String, ManagedReader>);
 
 impl InputReaders {
-    fn new(sessions: Option<&Bound<'_, PyTuple>>) -> PyResult<Self> {
+    fn new(sessions: &[NativeArchiveSession]) -> std::io::Result<Self> {
         let mut readers = HashMap::new();
-        if let Some(sessions) = sessions {
-            for session in sessions.iter() {
-                let session = session.extract::<PyRef<'_, NativeArchiveSession>>()?;
-                let (path, reader) = session.borrowed_reader()?;
-                readers.insert(Self::key(path)?, reader);
-            }
+        for session in sessions {
+            let (path, reader) = session.borrowed_reader();
+            readers.insert(Self::key(path)?, reader);
         }
         Ok(Self(readers))
     }
@@ -39,50 +35,31 @@ impl InputReaders {
         ))
     }
 
-    fn open(&self, py: Python<'_>, path: &str) -> PyResult<ManagedReader> {
+    fn open(&self, path: &str) -> std::io::Result<ManagedReader> {
         if let Some(reader) = self.0.get(&Self::key(path)?) {
             return Ok(reader.clone());
         }
-        Ok(py.detach(|| ManagedReader::open(path))?)
+        Ok((ManagedReader::open(path))?)
     }
 }
 
 pub(crate) fn parse_ranges(
-    ranges: &Bound<'_, PyList>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Vec<RangeSpec>> {
+    ranges: &[&InputExtent],
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<Vec<RangeSpec>> {
     let readers = InputReaders::new(sessions)?;
     let mut parsed = Vec::new();
     let mut cursor = 0u64;
-    for item in ranges.iter() {
-        let dict = item.cast::<PyDict>()?;
-        let path = dict
-            .get_item("path")?
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("range path is required")
-            })?
-            .extract::<String>()?;
-        let start = dict
-            .get_item("start")?
-            .map(|value| value.extract::<u64>())
-            .transpose()?
-            .unwrap_or(0);
-        let end = dict
-            .get_item("end")?
-            .map(|value| value.extract::<u64>())
-            .transpose()?;
-        let reader = readers.open(ranges.py(), &path)?;
+    for range in ranges {
+        let (path, start, end) = (&range.path, range.start, range.end);
+        let reader = readers.open(path)?;
         let file_len = reader.len();
         if start > file_len {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "range start is beyond file length",
-            ));
+            return Err(std::io::Error::other("range start is beyond file length"));
         }
         let effective_end = end.unwrap_or(file_len).min(file_len);
         if effective_end < start {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "range end is before start",
-            ));
+            return Err(std::io::Error::other("range end is before start"));
         }
         let len = effective_end - start;
         parsed.push(RangeSpec {
@@ -222,48 +199,24 @@ pub(crate) struct VolumeSpec {
 }
 
 pub(crate) fn parse_volumes(
-    parts: &Bound<'_, PyList>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Vec<VolumeSpec>> {
+    parts: &[InputPart],
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<Vec<VolumeSpec>> {
     let readers = InputReaders::new(sessions)?;
     let mut parsed = Vec::new();
-    for item in parts.iter() {
-        let dict = item.cast::<PyDict>()?;
-        let path = dict
-            .get_item("path")?
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("volume path is required")
-            })?
-            .extract::<String>()?;
-        let number = dict
-            .get_item("volume_number")?
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("volume_number is required")
-            })?
-            .extract::<u32>()?;
-        let start = dict
-            .get_item("start")?
-            .map(|value| value.extract::<u64>())
-            .transpose()?
-            .unwrap_or(0);
-        let reader = readers.open(parts.py(), &path)?;
-        let end = dict
-            .get_item("end")?
-            .map(|value| value.extract::<u64>())
-            .transpose()?;
+    for item in parts {
+        let number = item
+            .volume_number
+            .ok_or_else(|| std::io::Error::other("volume_number is required"))?;
+        let InputExtent { path, start, end } = &item.extent;
+        let (start, end) = (*start, *end);
+        let reader = readers.open(path)?;
         if start > end.unwrap_or(reader.len()).min(reader.len()) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "volume range is outside file length",
-            ));
+            return Err(std::io::Error::other("volume range is outside file length"));
         }
-        let canonical_name = dict
-            .get_item("canonical_name")?
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("canonical_name is required")
-            })?
-            .extract::<String>()?;
+        let canonical_name = &item.canonical_name;
         if number == 0 || canonical_name.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            return Err(std::io::Error::other(
                 "structured volumes require positive numbers and canonical names",
             ));
         }
@@ -279,7 +232,7 @@ pub(crate) fn parse_volumes(
         .windows(2)
         .any(|pair| pair[0].number == pair[1].number)
     {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+        return Err(std::io::Error::other(
             "structured volume numbers must be unique",
         ));
     }

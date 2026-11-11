@@ -6,7 +6,6 @@ pub(crate) mod executable_carrier;
 pub(crate) mod nested_authorization;
 pub(crate) mod path_filter;
 pub(crate) mod pe_overlay;
-pub(crate) mod progress_manifest;
 pub(crate) mod scope;
 pub(crate) mod worker_event;
 pub(crate) mod worker_wire;

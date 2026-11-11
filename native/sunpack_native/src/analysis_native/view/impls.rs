@@ -1,14 +1,4 @@
 impl AnalysisBinaryView {
-    fn ensure_open(&self) -> PyResult<()> {
-        if self.closed {
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "analysis binary view is closed",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
     fn read_field_at_bytes(
         &self,
         offset: u64,
@@ -20,143 +10,50 @@ impl AnalysisBinaryView {
             .read_exact_field_at(offset, size, field, location)
     }
 
-    fn read_at_bytes(&self, offset: u64, size: usize) -> PyResult<Vec<u8>> {
-        self.ensure_open()?;
-        self.reader
-            .read_at(offset, size)
-            .map_err(reader_error_to_py)
+    fn read_at_bytes(&self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
+        self.reader.read_at(offset, size).map_err(reader_error)
     }
 
-    fn read_tail_bytes(&self, py: Python<'_>, size: usize) -> PyResult<Vec<u8>> {
+    fn read_tail_bytes(&self, size: usize) -> std::io::Result<Vec<u8>> {
         let view_size = self.reader.len();
         let read_size = size.min(view_size as usize);
         let offset = view_size.saturating_sub(read_size as u64);
-        self.read_at_bytes_detached(py, offset, read_size)
-    }
-
-    fn read_at_bytes_detached(
-        &self,
-        py: Python<'_>,
-        offset: u64,
-        size: usize,
-    ) -> PyResult<Vec<u8>> {
-        py.detach(|| self.read_at_bytes(offset, size))
-    }
-
-    fn read_field_at_bytes_detached(
-        &self,
-        py: Python<'_>,
-        offset: u64,
-        size: usize,
-        field: &'static str,
-        location: FieldLocation,
-    ) -> Result<Vec<u8>, ReadFault> {
-        py.detach(|| self.read_field_at_bytes(offset, size, field, location))
-    }
-
-    pub(crate) fn probe_zip_local_header_native(
-        &self,
-        py: Python<'_>,
-        offset: u64,
-    ) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        let result = PyDict::new(py);
-        result.set_item("offset", offset)?;
-        result.set_item("magic_matched", false)?;
-        result.set_item("plausible", false)?;
-        result.set_item("error", "")?;
-        result.set_item("version_needed", 0u16)?;
-        result.set_item("compression_method", 0u16)?;
-        result.set_item("filename_len", 0u16)?;
-        result.set_item("extra_len", 0u16)?;
-
-        let header = self.read_at_bytes_detached(py, offset, 30)?;
-        if header.len() < 30 {
-            let fault =
-                ReadFault::short_read("read_exact_at", offset, 30, header.len(), self.reader.len())
-                    .with_field("zip.local_header.fixed", FieldLocation::Body);
-            set_view_read_fault(&result, &fault, "short_header")?;
-            result.set_item("magic_matched", header.starts_with(b"PK"))?;
-            return Ok(result.unbind());
-        }
-        if &header[..4] != ZIP_LOCAL {
-            result.set_item(
-                "magic_matched",
-                header.starts_with(ZIP_LOCAL)
-                    || header.starts_with(ZIP_EOCD)
-                    || header.starts_with(b"PK\x07\x08"),
-            )?;
-            result.set_item("error", "bad_signature")?;
-            return Ok(result.unbind());
-        }
-
-        let version_needed = u16_le(&header, 4);
-        let compression_method = u16_le(&header, 8);
-        let filename_len = u16_le(&header, 26);
-        let extra_len = u16_le(&header, 28);
-        result.set_item("magic_matched", true)?;
-        result.set_item("version_needed", version_needed)?;
-        result.set_item("compression_method", compression_method)?;
-        result.set_item("filename_len", filename_len)?;
-        result.set_item("extra_len", extra_len)?;
-
-        if version_needed > 63 {
-            result.set_item("error", "unsupported_version")?;
-        } else if !matches!(
-            compression_method,
-            0 | 1 | 6 | 8 | 9 | 12 | 14 | 93 | 95 | 96 | 98 | 99
-        ) {
-            result.set_item("error", "unknown_compression_method")?;
-        } else if filename_len == 0 {
-            result.set_item("error", "invalid_filename_length")?;
-        } else {
-            let header_end = offset
-                .checked_add(30)
-                .and_then(|value| value.checked_add(u64::from(filename_len)))
-                .and_then(|value| value.checked_add(u64::from(extra_len)));
-            if header_end.is_none_or(|end| end > self.reader.len()) {
-                result.set_item("error", "header_exceeds_file_size")?;
-            } else {
-                result.set_item("plausible", true)?;
-            }
-        }
-        Ok(result.unbind())
+        self.read_at_bytes(offset, read_size)
     }
 
     pub(crate) fn locate_zip_eocd_native(
         &self,
-        py: Python<'_>,
+
         requested_offset: Option<u64>,
-    ) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        let result = PyDict::new(py);
-        result.set_item("eocd_candidate_found", false)?;
-        result.set_item("eocd_candidate_offset", 0u64)?;
-        result.set_item("eocd_candidate_comment_length", 0u16)?;
-        result.set_item("eocd_candidate_comment_available_delta", 0i64)?;
-        result.set_item("eocd_candidate_declared_entry_count_present", false)?;
-        result.set_item("eocd_candidate_declared_cd_offset_present", false)?;
-        result.set_item("eocd_candidate_total_entries", 0u16)?;
-        result.set_item("eocd_candidate_cd_offset", 0u32)?;
-        result.set_item("eocd_candidate_cd_size", 0u32)?;
+    ) -> std::io::Result<DiagnosticFields> {
+        let mut result = DiagnosticFields::new();
+        result.put("eocd_candidate_found", false)?;
+        result.put("eocd_candidate_offset", 0u64)?;
+        result.put("eocd_candidate_comment_length", 0u16)?;
+        result.put("eocd_candidate_comment_available_delta", 0i64)?;
+        result.put("eocd_candidate_declared_entry_count_present", false)?;
+        result.put("eocd_candidate_declared_cd_offset_present", false)?;
+        result.put("eocd_candidate_total_entries", 0u16)?;
+        result.put("eocd_candidate_cd_offset", 0u32)?;
+        result.put("eocd_candidate_cd_size", 0u32)?;
 
         let size = self.reader.len();
         if let Some(offset) = requested_offset {
-            let record = self.read_at_bytes_detached(py, offset, 22)?;
+            let record = self.read_at_bytes(offset, 22)?;
             if record.len() == 22 && record.starts_with(ZIP_EOCD) {
                 let available = size
                     .saturating_sub(offset.saturating_add(22))
                     .min(i64::MAX as u64) as i64;
-                set_zip_eocd_candidate(&result, offset, &record, available)?;
+                set_zip_eocd_candidate(&mut result, offset, &record, available)?;
             }
-            return Ok(result.unbind());
+            return Ok(result);
         }
 
         let read_size = size.min((22 + 65_535) as u64) as usize;
         if read_size < 4 {
-            return Ok(result.unbind());
+            return Ok(result);
         }
-        let tail = self.read_tail_bytes(py, read_size)?;
+        let tail = self.read_tail_bytes(read_size)?;
         let base = size.saturating_sub(tail.len() as u64);
         let mut search_end = tail.len();
         let mut fallback: Option<(u64, [u8; 22], i64)> = None;
@@ -176,8 +73,8 @@ impl AnalysisBinaryView {
                     fallback = Some((offset, record, available));
                 }
                 if available == i64::from(u16_le(&record, 20)) {
-                    set_zip_eocd_candidate(&result, offset, &record, available)?;
-                    return Ok(result.unbind());
+                    set_zip_eocd_candidate(&mut result, offset, &record, available)?;
+                    return Ok(result);
                 }
             }
             if index == 0 {
@@ -186,66 +83,60 @@ impl AnalysisBinaryView {
             search_end = index;
         }
         if let Some((offset, record, available)) = fallback {
-            set_zip_eocd_candidate(&result, offset, &record, available)?;
+            set_zip_eocd_candidate(&mut result, offset, &record, available)?;
         }
-        Ok(result.unbind())
+        Ok(result)
     }
 
     fn probe_zip_with_disk_starts(
         &self,
-        py: Python<'_>,
+
         eocd_offset: u64,
         disk_starts: Option<&[u64]>,
-    ) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        let result = PyDict::new(py);
-        result.set_item("format", "zip")?;
-        result.set_item("plausible", false)?;
-        result.set_item("magic_matched", false)?;
-        result.set_item("error", "")?;
-        result.set_item("eocd_offset", eocd_offset)?;
-        result.set_item("archive_offset", 0u64)?;
-        result.set_item("segment_end", 0u64)?;
-        result.set_item("central_directory_offset", 0u64)?;
-        result.set_item("central_directory_size", 0u64)?;
-        result.set_item("total_entries", 0u16)?;
-        result.set_item("is_multi_disk", false)?;
-        result.set_item("disk_number", 0u16)?;
-        result.set_item("central_directory_disk", 0u16)?;
-        result.set_item("disk_entries", 0u16)?;
-        result.set_item("declared_total_disks", 1u32)?;
-        result.set_item("central_directory_present", false)?;
-        result.set_item("central_directory_walk_ok", false)?;
-        result.set_item("central_directory_entries_checked", 0usize)?;
-        result.set_item("central_directory_encrypted_entries", 0usize)?;
-        result.set_item("password_required", false)?;
-        result.set_item("password_state", "unknown")?;
-        result.set_item("encryption_scan_complete", false)?;
-        result.set_item("local_header_links_ok", false)?;
-        result.set_item("local_header_links_checked", 0usize)?;
-        result.set_item("archive_starts_at_zero", false)?;
-        result.set_item("archive_start_kind", "")?;
-        result.set_item("content_integrity_warning", "")?;
-        result.set_item("evidence", PyList::empty(py))?;
+    ) -> std::io::Result<DiagnosticFields> {
+        let mut result = DiagnosticFields::new();
+        result.put("format", "zip")?;
+        result.put("plausible", false)?;
+        result.put("magic_matched", false)?;
+        result.put("error", "")?;
+        result.put("eocd_offset", eocd_offset)?;
+        result.put("archive_offset", 0u64)?;
+        result.put("segment_end", 0u64)?;
+        result.put("central_directory_offset", 0u64)?;
+        result.put("central_directory_size", 0u64)?;
+        result.put("total_entries", 0u16)?;
+        result.put("is_multi_disk", false)?;
+        result.put("disk_number", 0u16)?;
+        result.put("central_directory_disk", 0u16)?;
+        result.put("disk_entries", 0u16)?;
+        result.put("declared_total_disks", 1u32)?;
+        result.put("central_directory_present", false)?;
+        result.put("central_directory_walk_ok", false)?;
+        result.put("central_directory_entries_checked", 0usize)?;
+        result.put("central_directory_encrypted_entries", 0usize)?;
+        result.put("password_required", false)?;
+        result.put("password_state", "unknown")?;
+        result.put("encryption_scan_complete", false)?;
+        result.put("local_header_links_ok", false)?;
+        result.put("local_header_links_checked", 0usize)?;
+        result.put("archive_starts_at_zero", false)?;
+        result.put("archive_start_kind", "")?;
+        result.put("content_integrity_warning", "")?;
+        result.put("evidence", Vec::<&str>::new())?;
 
-        let eocd = match self.read_field_at_bytes_detached(
-            py,
-            eocd_offset,
-            22,
-            "zip.eocd",
-            FieldLocation::Tail,
-        ) {
+        let eocd = match self.read_field_at_bytes(eocd_offset, 22, "zip.eocd", FieldLocation::Tail)
+        {
             Ok(data) => data,
             Err(fault) => {
-                set_view_read_fault(&result, &fault, "eocd_too_small")?;
-                return Ok(result.unbind());
+                set_view_read_fault(&mut result, &fault, "eocd_too_small")?;
+                return Ok(result);
             }
         };
         if &eocd[0..4] != ZIP_EOCD {
-            result.set_item("error", "bad_eocd_signature")?;
-            return Ok(result.unbind());
+            result.put("error", "bad_eocd_signature")?;
+            return Ok(result);
         }
-        result.set_item("magic_matched", true)?;
+        result.put("magic_matched", true)?;
         let disk_number = u16_le(&eocd, 4);
         let central_directory_disk = u16_le(&eocd, 6);
         let disk_entries = u16_le(&eocd, 8);
@@ -272,13 +163,13 @@ impl AnalysisBinaryView {
         let mut zip64_locator_present = false;
         let mut zip64_eocd_offset = 0u64;
         let mut zip64_declared_total_disks = 1u32;
-        let zip64 = py.detach(|| {
+        let zip64 = (|| {
             crate::formats::zip::zip64::locate_end_record(
                 eocd_offset,
                 disk_starts,
                 |offset, size| self.reader.read_at(offset, size),
             )
-        });
+        })();
         match zip64 {
             Ok(Some(found)) => {
                 zip64_present = true;
@@ -295,22 +186,22 @@ impl AnalysisBinaryView {
             }
             Ok(None) => {}
             Err(crate::formats::zip::zip64::LocateError::Invalid(error)) => {
-                result.set_item("zip64", true)?;
-                result.set_item("error", error)?;
-                return Ok(result.unbind());
+                result.put("zip64", true)?;
+                result.put("error", error)?;
+                return Ok(result);
             }
             Err(crate::formats::zip::zip64::LocateError::Read(error)) => {
-                return Err(reader_error_to_py(error));
+                return Err(reader_error(error));
             }
         }
-        result.set_item("segment_end", segment_end)?;
-        result.set_item("central_directory_size", effective_central_directory_size)?;
-        result.set_item("total_entries", effective_total_entries)?;
-        result.set_item("zip64", zip64_present)?;
-        result.set_item("zip64_locator_present", zip64_locator_present)?;
-        result.set_item("zip64_eocd_present", zip64_present)?;
-        result.set_item("zip64_eocd_offset", zip64_eocd_offset)?;
-        result.set_item(
+        result.put("segment_end", segment_end)?;
+        result.put("central_directory_size", effective_central_directory_size)?;
+        result.put("total_entries", effective_total_entries)?;
+        result.put("zip64", zip64_present)?;
+        result.put("zip64_locator_present", zip64_locator_present)?;
+        result.put("zip64_eocd_present", zip64_present)?;
+        result.put("zip64_eocd_offset", zip64_eocd_offset)?;
+        result.put(
             "zip64_locator_offset",
             if zip64_present {
                 eocd_offset - 20
@@ -319,11 +210,11 @@ impl AnalysisBinaryView {
             },
         )?;
         let is_multi_disk = effective_disk_number != 0 || effective_central_directory_disk != 0;
-        result.set_item("is_multi_disk", is_multi_disk)?;
-        result.set_item("disk_number", effective_disk_number)?;
-        result.set_item("central_directory_disk", effective_central_directory_disk)?;
-        result.set_item("disk_entries", effective_disk_entries)?;
-        result.set_item(
+        result.put("is_multi_disk", is_multi_disk)?;
+        result.put("disk_number", effective_disk_number)?;
+        result.put("central_directory_disk", effective_central_directory_disk)?;
+        result.put("disk_entries", effective_disk_entries)?;
+        result.put(
             "declared_total_disks",
             if zip64_present {
                 zip64_declared_total_disks
@@ -337,20 +228,20 @@ impl AnalysisBinaryView {
             effective_total_entries == 0 && effective_central_directory_size == 0,
             zip64_present.then_some(zip64_eocd_offset),
         )?;
-        result.set_item("archive_starts_at_zero", !archive_start_kind.is_empty())?;
-        result.set_item("archive_start_kind", archive_start_kind)?;
+        result.put("archive_starts_at_zero", !archive_start_kind.is_empty())?;
+        result.put("archive_start_kind", archive_start_kind)?;
         if is_multi_disk && disk_starts.is_none() {
             // A single physical input cannot resolve PKZIP disk-relative
             // offsets.  MultiVolumeBinaryView supplies the Rust-owned layout.
-            result.set_item("error", "zip_multi_disk")?;
-            let evidence = PyList::empty(py);
-            evidence.append("zip:eocd_multi_disk")?;
-            result.set_item("evidence", evidence)?;
-            return Ok(result.unbind());
+            result.put("error", "zip_multi_disk")?;
+            let mut evidence = Vec::<&str>::new();
+            evidence.push("zip:eocd_multi_disk");
+            result.put("evidence", evidence)?;
+            return Ok(result);
         }
         if effective_disk_entries != effective_total_entries && !is_multi_disk {
-            result.set_item("error", "entry_count_mismatch")?;
-            return Ok(result.unbind());
+            result.put("error", "entry_count_mismatch")?;
+            return Ok(result);
         }
         if let Some(starts) = disk_starts.filter(|_| is_multi_disk) {
             let disk_ok = usize::try_from(effective_disk_number)
@@ -360,20 +251,20 @@ impl AnalysisBinaryView {
                 .ok()
                 .is_some_and(|disk| disk < starts.len());
             if !disk_ok || !cd_disk_ok {
-                result.set_item("error", "central_directory_disk_offset_out_of_range")?;
-                return Ok(result.unbind());
+                result.put("error", "central_directory_disk_offset_out_of_range")?;
+                return Ok(result);
             }
             if zip64_present
                 && (zip64_declared_total_disks as usize != starts.len()
                     || effective_disk_number as usize + 1 != starts.len())
             {
-                result.set_item("error", "zip64_disk_count_mismatch")?;
-                return Ok(result.unbind());
+                result.put("error", "zip64_disk_count_mismatch")?;
+                return Ok(result);
             }
         }
         if !is_multi_disk && directory_end < effective_central_directory_size {
-            result.set_item("error", "central_directory_size_out_of_range")?;
-            return Ok(result.unbind());
+            result.put("error", "central_directory_size_out_of_range")?;
+            return Ok(result);
         }
         let physical_central_offset = if is_multi_disk {
             let starts = disk_starts.expect("multi-disk ZIP requires a volume layout");
@@ -382,8 +273,8 @@ impl AnalysisBinaryView {
                 effective_central_directory_disk,
                 effective_central_directory_offset,
             ) else {
-                result.set_item("error", "central_directory_disk_offset_out_of_range")?;
-                return Ok(result.unbind());
+                result.put("error", "central_directory_disk_offset_out_of_range")?;
+                return Ok(result);
             };
             offset
         } else {
@@ -394,8 +285,7 @@ impl AnalysisBinaryView {
             // naive position so carrier/SFX prefixes retain archive_offset.
             if naive_physical_central_offset != declared_physical_central_offset {
                 let naive_ok = self
-                    .read_field_at_bytes_detached(
-                        py,
+                    .read_field_at_bytes(
                         naive_physical_central_offset,
                         4,
                         "zip.central_directory.signature",
@@ -403,8 +293,7 @@ impl AnalysisBinaryView {
                     )
                     .is_ok_and(|sig| sig.as_slice() == ZIP_CENTRAL);
                 let declared_ok = self
-                    .read_field_at_bytes_detached(
-                        py,
+                    .read_field_at_bytes(
                         declared_physical_central_offset,
                         4,
                         "zip.central_directory.signature",
@@ -424,31 +313,30 @@ impl AnalysisBinaryView {
             0
         } else {
             if physical_central_offset < effective_central_directory_offset {
-                result.set_item("error", "archive_offset_underflow")?;
-                return Ok(result.unbind());
+                result.put("error", "archive_offset_underflow")?;
+                return Ok(result);
             }
             physical_central_offset - effective_central_directory_offset
         };
-        result.set_item("archive_offset", archive_offset)?;
-        result.set_item("central_directory_offset", physical_central_offset)?;
+        result.put("archive_offset", archive_offset)?;
+        result.put("central_directory_offset", physical_central_offset)?;
         if physical_central_offset
             .checked_add(effective_central_directory_size)
             .is_none_or(|end| end != directory_end)
         {
-            result.set_item("error", "central_directory_size_mismatch")?;
-            return Ok(result.unbind());
+            result.put("error", "central_directory_size_mismatch")?;
+            return Ok(result);
         }
         if effective_total_entries == 0 && effective_central_directory_size == 0 {
-            result.set_item("plausible", true)?;
-            result.set_item("central_directory_walk_ok", true)?;
-            result.set_item("local_header_links_ok", true)?;
-            result.set_item("encryption_scan_complete", true)?;
-            result.set_item("password_state", "not_required")?;
-            return Ok(result.unbind());
+            result.put("plausible", true)?;
+            result.put("central_directory_walk_ok", true)?;
+            result.put("local_header_links_ok", true)?;
+            result.put("encryption_scan_complete", true)?;
+            result.put("password_state", "not_required")?;
+            return Ok(result);
         }
 
-        let central_sig = match self.read_field_at_bytes_detached(
-            py,
+        let central_sig = match self.read_field_at_bytes(
             physical_central_offset,
             4,
             "zip.central_directory.signature",
@@ -456,16 +344,16 @@ impl AnalysisBinaryView {
         ) {
             Ok(data) => data,
             Err(fault) => {
-                set_view_read_fault(&result, &fault, "central_directory_read_failed")?;
-                return Ok(result.unbind());
+                set_view_read_fault(&mut result, &fault, "central_directory_read_failed")?;
+                return Ok(result);
             }
         };
         if central_sig.as_slice() != ZIP_CENTRAL {
-            result.set_item("error", "bad_central_directory_signature")?;
-            return Ok(result.unbind());
+            result.put("error", "bad_central_directory_signature")?;
+            return Ok(result);
         }
-        result.set_item("central_directory_present", true)?;
-        let walk = py.detach(|| {
+        result.put("central_directory_present", true)?;
+        let walk = (|| {
             self.walk_zip_central_directory(
                 archive_offset,
                 physical_central_offset,
@@ -473,7 +361,7 @@ impl AnalysisBinaryView {
                 effective_total_entries as usize,
                 disk_starts.filter(|_| is_multi_disk),
             )
-        })?;
+        })()?;
         let ZipDirectoryWalk {
             entries_checked,
             directory_ok: cd_ok,
@@ -483,16 +371,16 @@ impl AnalysisBinaryView {
             error,
             content_warning,
         } = walk;
-        result.set_item("central_directory_entries_checked", entries_checked)?;
-        result.set_item("central_directory_encrypted_entries", encrypted_entries)?;
-        result.set_item("central_directory_walk_ok", cd_ok)?;
-        result.set_item("local_header_links_checked", links_checked)?;
-        result.set_item("local_header_links_ok", links_ok)?;
+        result.put("central_directory_entries_checked", entries_checked)?;
+        result.put("central_directory_encrypted_entries", encrypted_entries)?;
+        result.put("central_directory_walk_ok", cd_ok)?;
+        result.put("local_header_links_checked", links_checked)?;
+        result.put("local_header_links_ok", links_ok)?;
         let encryption_scan_complete =
             error.is_empty() && cd_ok && entries_checked == effective_total_entries as usize;
-        result.set_item("encryption_scan_complete", encryption_scan_complete)?;
-        result.set_item("password_required", encrypted_entries > 0)?;
-        result.set_item(
+        result.put("encryption_scan_complete", encryption_scan_complete)?;
+        result.put("password_required", encrypted_entries > 0)?;
+        result.put(
             "password_state",
             if encrypted_entries > 0 {
                 "required"
@@ -503,25 +391,25 @@ impl AnalysisBinaryView {
             },
         )?;
         if error.is_empty() {
-            result.set_item("plausible", true)?;
-            result.set_item("content_integrity_warning", content_warning)?;
-            let evidence = PyList::empty(py);
-            evidence.append("zip:eocd")?;
-            evidence.append("zip:central_directory")?;
+            result.put("plausible", true)?;
+            result.put("content_integrity_warning", content_warning)?;
+            let mut evidence = Vec::<&str>::new();
+            evidence.push("zip:eocd");
+            evidence.push("zip:central_directory");
             if cd_ok {
-                evidence.append("zip:central_directory_walk")?;
+                evidence.push("zip:central_directory_walk");
             }
             if links_ok {
-                evidence.append("zip:local_header_links")?;
+                evidence.push("zip:local_header_links");
             }
             if is_multi_disk {
-                evidence.append("zip:multi_disk_offsets")?;
+                evidence.push("zip:multi_disk_offsets");
             }
-            result.set_item("evidence", evidence)?;
+            result.put("evidence", evidence)?;
         } else {
-            result.set_item("error", error)?;
+            result.put("error", error)?;
         }
-        Ok(result.unbind())
+        Ok(result)
     }
 
     fn zip_logical_offset_for_disk(
@@ -547,7 +435,7 @@ impl AnalysisBinaryView {
         central_directory_size: u64,
         total_entries: usize,
         disk_starts: Option<&[u64]>,
-    ) -> PyResult<ZipDirectoryWalk> {
+    ) -> std::io::Result<ZipDirectoryWalk> {
         // Independent bounded windows retain directory and local-header locality
         // without making a one-pass validation occupy the global block cache.
         let mut directory =
@@ -627,31 +515,31 @@ impl AnalysisBinaryView {
         Ok(walk)
     }
 
-    fn walk_tar<'py>(&self, py: Python<'py>, start_offset: u64) -> PyResult<Bound<'py, PyDict>> {
-        let result = PyDict::new(py);
-        result.set_item("format", "tar")?;
-        result.set_item("magic_matched", false)?;
-        result.set_item("plausible", false)?;
-        result.set_item("error", "")?;
-        result.set_item("file_size", self.reader.len())?;
-        result.set_item("stored_checksum", 0u64)?;
-        result.set_item("computed_checksum", 0u64)?;
-        result.set_item("member_size", 0u64)?;
-        result.set_item("ustar_magic", false)?;
-        result.set_item("zero_block", false)?;
-        result.set_item("fuzzy_name_nonempty", false)?;
-        result.set_item("fuzzy_numeric_fields_valid", false)?;
-        result.set_item("fuzzy_typeflag_valid", false)?;
-        result.set_item("fuzzy_payload_in_range", false)?;
-        result.set_item("entries_checked", 0usize)?;
-        result.set_item("entry_walk_ok", false)?;
-        result.set_item("walk_complete", false)?;
-        result.set_item("end_zero_blocks", false)?;
-        result.set_item("segment_end", py.None())?;
-        result.set_item("boundary_confidence", "none")?;
-        result.set_item("integrity_confidence", "unknown")?;
-        result.set_item("evidence", PyList::empty(py))?;
-        result.set_item("damage_flags", PyList::empty(py))?;
+    fn walk_tar(&self, start_offset: u64) -> std::io::Result<DiagnosticFields> {
+        let mut result = DiagnosticFields::new();
+        result.put("format", "tar")?;
+        result.put("magic_matched", false)?;
+        result.put("plausible", false)?;
+        result.put("error", "")?;
+        result.put("file_size", self.reader.len())?;
+        result.put("stored_checksum", 0u64)?;
+        result.put("computed_checksum", 0u64)?;
+        result.put("member_size", 0u64)?;
+        result.put("ustar_magic", false)?;
+        result.put("zero_block", false)?;
+        result.put("fuzzy_name_nonempty", false)?;
+        result.put("fuzzy_numeric_fields_valid", false)?;
+        result.put("fuzzy_typeflag_valid", false)?;
+        result.put("fuzzy_payload_in_range", false)?;
+        result.put("entries_checked", 0usize)?;
+        result.put("entry_walk_ok", false)?;
+        result.put("walk_complete", false)?;
+        result.put("end_zero_blocks", false)?;
+        result.put("segment_end", Value::Null)?;
+        result.put("boundary_confidence", "none")?;
+        result.put("integrity_confidence", "unknown")?;
+        result.put("evidence", Vec::<&str>::new())?;
+        result.put("damage_flags", Vec::<&str>::new())?;
 
         let size = self.reader.len();
         let mut cursor = start_offset;
@@ -668,7 +556,7 @@ impl AnalysisBinaryView {
                 size,
             )
             .with_field("tar.member.header", FieldLocation::Head);
-            set_view_read_fault(&result, &fault, "short_tar_header")?;
+            set_view_read_fault(&mut result, &fault, "short_tar_header")?;
             return Ok(result);
         }
         while cursor.saturating_add(TAR_BLOCK_SIZE as u64) <= size {
@@ -677,8 +565,7 @@ impl AnalysisBinaryView {
             } else {
                 FieldLocation::Body
             };
-            let header = match self.read_field_at_bytes_detached(
-                py,
+            let header = match self.read_field_at_bytes(
                 cursor,
                 TAR_BLOCK_SIZE,
                 "tar.member.header",
@@ -686,63 +573,60 @@ impl AnalysisBinaryView {
             ) {
                 Ok(data) => data,
                 Err(fault) => {
-                    set_view_read_fault(&result, &fault, "tar_header_read_failed")?;
+                    set_view_read_fault(&mut result, &fault, "tar_header_read_failed")?;
                     return Ok(result);
                 }
             };
             if header.iter().all(|byte| *byte == 0) {
                 if checked == 0 {
-                    result.set_item("zero_block", true)?;
-                    result.set_item("error", "leading_zero_block")?;
+                    result.put("zero_block", true)?;
+                    result.put("error", "leading_zero_block")?;
                     return Ok(result);
                 }
                 zero_blocks += 1;
                 cursor += TAR_BLOCK_SIZE as u64;
                 if zero_blocks >= 2 {
-                    result.set_item("plausible", checked > 0)?;
-                    result.set_item("entries_checked", checked)?;
-                    result.set_item("entry_walk_ok", checked > 0)?;
-                    result.set_item("walk_complete", true)?;
-                    result.set_item("end_zero_blocks", true)?;
-                    result.set_item("segment_end", cursor)?;
-                    result.set_item("boundary_confidence", "high")?;
-                    result.set_item(
+                    result.put("plausible", checked > 0)?;
+                    result.put("entries_checked", checked)?;
+                    result.put("entry_walk_ok", checked > 0)?;
+                    result.put("walk_complete", true)?;
+                    result.put("end_zero_blocks", true)?;
+                    result.put("segment_end", cursor)?;
+                    result.put("boundary_confidence", "high")?;
+                    result.put(
                         "evidence",
-                        PyList::new(
-                            py,
-                            [
-                                "tar:header_checksum",
-                                "tar:block_walk",
-                                "tar:end_zero_blocks",
-                            ],
-                        )?,
+                        [
+                            "tar:header_checksum",
+                            "tar:block_walk",
+                            "tar:end_zero_blocks",
+                        ],
                     )?;
                     return Ok(result);
                 }
                 continue;
             }
             // Candidate recognition belongs to the native walker.  This lets
-            // Python dispatch damaged TAR files without re-reading or parsing
+            // The extraction planner can dispatch damaged TAR files without re-reading or parsing
             // archive bytes as a fallback.
             zero_blocks = 0;
             let first_identity = (checked == 0).then(|| tar_header_identity(&header, cursor, size));
             if let Some(identity) = first_identity {
-                result.set_item(
+                result.put(
                     "magic_matched",
                     identity.ustar_magic
                         || (identity.name_nonempty
                             && identity.numeric_fields_valid
                             && identity.typeflag_valid),
                 )?;
-                result.set_item("stored_checksum", identity.stored_checksum)?;
-                result.set_item("computed_checksum", identity.computed_checksum)?;
-                result.set_item("member_size", identity.member_size)?;
-                result.set_item("ustar_magic", identity.ustar_magic)?;
-                result.set_item("format", if identity.ustar_magic { "ustar" } else { "tar" })?;
-                result.set_item("fuzzy_name_nonempty", identity.name_nonempty)?;
-                result.set_item("fuzzy_numeric_fields_valid", identity.numeric_fields_valid)?;
-                result.set_item("fuzzy_typeflag_valid", identity.typeflag_valid)?;
-                result.set_item("fuzzy_payload_in_range", identity.payload_in_range)?;
+                result.put("stored_checksum", identity.stored_checksum)?;
+                result.put("computed_checksum", identity.computed_checksum)?;
+                result.put("member_size", identity.member_size)?;
+                result.put("ustar_magic", identity.ustar_magic)?;
+                result.put("format", if identity.ustar_magic { "ustar" } else { "tar" })?;
+                result.put("fuzzy_name_nonempty", identity.name_nonempty)?;
+                result.put("fuzzy_numeric_fields_valid", identity.numeric_fields_valid)?;
+                result.put("fuzzy_typeflag_valid", identity.typeflag_valid)?;
+                result.put("fuzzy_payload_in_range", identity.payload_in_range)?;
             }
             let member_size = first_identity.map_or_else(
                 || crate::formats::tar::header_size(&header),
@@ -751,8 +635,8 @@ impl AnalysisBinaryView {
             let member_size = match member_size {
                 Ok(size) => size,
                 Err(error) => {
-                    result.set_item("entries_checked", checked)?;
-                    result.set_item("error", error)?;
+                    result.put("entries_checked", checked)?;
+                    result.put("error", error)?;
                     let flag = match header[156] {
                         b'x' | b'g' => "pax_header_bad",
                         b'L' | b'K' => "gnu_longname_bad",
@@ -760,21 +644,18 @@ impl AnalysisBinaryView {
                         _ if error == "checksum_mismatch" => "tar_checksum_bad",
                         _ => "tar_metadata_bad",
                     };
-                    result.set_item("damage_flags", PyList::new(py, [flag])?)?;
+                    result.put("damage_flags", [flag])?;
                     if checked > 0 {
-                        result.set_item("plausible", true)?;
-                        result.set_item("entry_walk_ok", true)?;
-                        result.set_item("segment_end", py.None())?;
-                        result.set_item("boundary_confidence", "none")?;
-                        result.set_item(
-                            "evidence",
-                            PyList::new(py, ["tar:header_checksum", "tar:block_walk_prefix"])?,
-                        )?;
+                        result.put("plausible", true)?;
+                        result.put("entry_walk_ok", true)?;
+                        result.put("segment_end", Value::Null)?;
+                        result.put("boundary_confidence", "none")?;
+                        result.put("evidence", ["tar:header_checksum", "tar:block_walk_prefix"])?;
                     }
                     return Ok(result);
                 }
             };
-            let record = py.detach(|| {
+            let record = (|| {
                 tar_state.advance_validated(
                     &header,
                     member_size,
@@ -786,20 +667,20 @@ impl AnalysisBinaryView {
                             .map(|data| data.to_vec())
                     },
                 )
-            });
+            })();
             let next_cursor = match record {
                 Ok(record) => record.next,
                 Err(error) => {
-                    result.set_item("entries_checked", checked)?;
-                    result.set_item("plausible", checked > 0)?;
-                    result.set_item("entry_walk_ok", checked > 0)?;
+                    result.put("entries_checked", checked)?;
+                    result.put("plausible", checked > 0)?;
+                    result.put("entry_walk_ok", checked > 0)?;
                     if error.kind() == io::ErrorKind::OutOfMemory {
-                        result.set_item("plausible", true)?;
-                        result.set_item("entry_walk_ok", false)?;
-                        result.set_item("error", "analysis_resource_limit")?;
-                        result.set_item("structure_status", "incomplete")?;
-                        result.set_item("structure_validation_complete", false)?;
-                        result.set_item("evidence", PyList::new(py, ["tar:header_checksum"])?)?;
+                        result.put("plausible", true)?;
+                        result.put("entry_walk_ok", false)?;
+                        result.put("error", "analysis_resource_limit")?;
+                        result.put("structure_status", "incomplete")?;
+                        result.put("structure_validation_complete", false)?;
+                        result.put("evidence", ["tar:header_checksum"])?;
                     } else if error.kind() == io::ErrorKind::UnexpectedEof {
                         let payload_start = cursor.saturating_add(TAR_BLOCK_SIZE as u64);
                         let fault = ReadFault::short_read(
@@ -811,16 +692,16 @@ impl AnalysisBinaryView {
                             size,
                         )
                         .with_field("tar.member.payload", FieldLocation::Tail);
-                        set_view_read_fault(&result, &fault, "member_payload_out_of_range")?;
+                        set_view_read_fault(&mut result, &fault, "member_payload_out_of_range")?;
                     } else {
-                        result.set_item("error", error.to_string())?;
+                        result.put("error", error.to_string())?;
                         let flag = match header[156] {
                             b'x' | b'g' => "pax_header_bad",
                             b'L' | b'K' => "gnu_longname_bad",
                             b'S' => "sparse_header_bad",
                             _ => "tar_metadata_bad",
                         };
-                        result.set_item("damage_flags", PyList::new(py, [flag])?)?;
+                        result.put("damage_flags", [flag])?;
                     }
                     return Ok(result);
                 }
@@ -830,44 +711,38 @@ impl AnalysisBinaryView {
             let ustar = matches!(&header[257..263], b"ustar\x00" | b"ustar ");
             if last_ustar != Some(ustar) {
                 last_ustar = Some(ustar);
-                result.set_item(
+                result.put(
                     "evidence",
-                    PyList::new(
-                        py,
-                        [
-                            "tar:header_checksum",
-                            if ustar {
-                                "tar:ustar_magic"
-                            } else {
-                                "tar:v7_header"
-                            },
-                        ],
-                    )?,
+                    [
+                        "tar:header_checksum",
+                        if ustar {
+                            "tar:ustar_magic"
+                        } else {
+                            "tar:v7_header"
+                        },
+                    ],
                 )?;
             }
         }
         if checked > 0 && cursor == size {
-            result.set_item("plausible", true)?;
-            result.set_item("entries_checked", checked)?;
-            result.set_item("entry_walk_ok", true)?;
-            result.set_item("walk_complete", true)?;
-            result.set_item("segment_end", cursor)?;
-            result.set_item("boundary_confidence", "medium")?;
-            result.set_item("error", "tar_end_zero_blocks_missing_at_eof")?;
-            result.set_item("damage_flags", PyList::new(py, ["missing_end_block"])?)?;
-            result.set_item(
+            result.put("plausible", true)?;
+            result.put("entries_checked", checked)?;
+            result.put("entry_walk_ok", true)?;
+            result.put("walk_complete", true)?;
+            result.put("segment_end", cursor)?;
+            result.put("boundary_confidence", "medium")?;
+            result.put("error", "tar_end_zero_blocks_missing_at_eof")?;
+            result.put("damage_flags", ["missing_end_block"])?;
+            result.put(
                 "evidence",
-                PyList::new(
-                    py,
-                    ["tar:header_checksum", "tar:block_walk", "tar:eof_boundary"],
-                )?,
+                ["tar:header_checksum", "tar:block_walk", "tar:eof_boundary"],
             )?;
         } else if checked > 0 {
-            result.set_item("plausible", true)?;
-            result.set_item("entries_checked", checked)?;
-            result.set_item("entry_walk_ok", true)?;
-            result.set_item("segment_end", py.None())?;
-            result.set_item("boundary_confidence", "none")?;
+            result.put("plausible", true)?;
+            result.put("entries_checked", checked)?;
+            result.put("entry_walk_ok", true)?;
+            result.put("segment_end", Value::Null)?;
+            result.put("boundary_confidence", "none")?;
             let fault = ReadFault::short_read(
                 "read_record",
                 cursor,
@@ -876,154 +751,8 @@ impl AnalysisBinaryView {
                 size,
             )
             .with_field("tar.archive.end_zero_blocks", FieldLocation::Tail);
-            set_view_read_fault(&result, &fault, "tar_end_zero_blocks_not_found")?;
-            result.set_item(
-                "evidence",
-                PyList::new(py, ["tar:header_checksum", "tar:block_walk_prefix"])?,
-            )?;
-        }
-        Ok(result)
-    }
-
-    fn probe_compression<'py>(
-        &self,
-        py: Python<'py>,
-        format: &str,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let result = PyDict::new(py);
-        result.set_item("format", format)?;
-        result.set_item("magic_matched", false)?;
-        result.set_item("plausible", false)?;
-        result.set_item("error", "")?;
-
-        result.set_item("boundary_confidence", "medium")?;
-        result.set_item("integrity_confidence", "unknown")?;
-        result.set_item("evidence", PyList::empty(py))?;
-        result.set_item("damage_flags", PyList::empty(py))?;
-        let header = self.read_at_bytes_detached(py, 0, 64)?;
-        match format {
-            "lz4" => {
-                return py
-                    .detach(|| crate::formats::lz4::walk(&self.reader, 0, self.reader.len()))
-                    .to_dict(py, self.reader.len());
-            }
-            "gzip" => {
-                if !header.starts_with(GZIP) {
-                    result.set_item("error", "gzip_magic_not_found")?;
-                    return Ok(result);
-                }
-                result.set_item("magic_matched", true)?;
-                if let Err(error) = py.detach(|| {
-                    crate::scan::compression_stream::inspect_gzip_header(
-                        &self.reader,
-                        0,
-                        self.reader.len(),
-                    )
-                }) {
-                    result.set_item("error", error.code())?;
-                    result.set_item("damage_flags", PyList::new(py, [error.code()])?)?;
-                    return Ok(result);
-                }
-                result.set_item("plausible", true)?;
-
-                let evidence = PyList::new(
-                    py,
-                    ["gzip:magic", "gzip:method:deflate", "gzip:flags_valid"],
-                )?;
-                if self.reader.len() >= 18 {
-                    let tail = self.read_tail_bytes(py, 4)?;
-                    if tail.len() == 4 {
-                        result.set_item("isize", u32_le(&tail, 0))?;
-                        evidence.append("gzip:trailer")?;
-                    }
-                }
-                result.set_item("evidence", evidence)?;
-            }
-            "bzip2" => {
-                if !header.starts_with(BZIP2) {
-                    result.set_item("error", "bzip2_magic_not_found")?;
-                    return Ok(result);
-                }
-                result.set_item("magic_matched", true)?;
-                let ok = header.len() >= 10
-                    && b"123456789".contains(&header[3])
-                    && (&header[4..10] == b"\x31\x41\x59\x26\x53\x59"
-                        || &header[4..10] == b"\x17\x72\x45\x38\x50\x90");
-                if !ok {
-                    result.set_item("error", "bzip2_block_marker_not_found")?;
-                    let flag = if header.len() >= 4
-                        && header.starts_with(BZIP2)
-                        && !b"123456789".contains(&header[3])
-                    {
-                        "bzip2_block_size_bad"
-                    } else {
-                        "bzip2_block_bad"
-                    };
-                    result.set_item("damage_flags", PyList::new(py, [flag])?)?;
-                    return Ok(result);
-                }
-                result.set_item("plausible", true)?;
-
-                result.set_item(
-                    "evidence",
-                    PyList::new(py, ["bzip2:magic", "bzip2:block_marker"])?,
-                )?;
-            }
-            "xz" => {
-                if !header.starts_with(XZ) {
-                    result.set_item("error", "xz_magic_not_found")?;
-                    return Ok(result);
-                }
-                result.set_item("magic_matched", true)?;
-                if header.len() < 12 || u32_le(&header, 8) != crc32(&header[6..8]) {
-                    result.set_item("error", "xz_header_crc_mismatch")?;
-                    result.set_item("damage_flags", PyList::new(py, ["xz_header_crc_bad"])?)?;
-                    return Ok(result);
-                }
-                let footer = self.read_tail_bytes(py, 12)?;
-                if footer.len() == 12 && &footer[10..12] == b"YZ" {
-                    if u32_le(&footer, 0) != crc32(&footer[4..10]) || footer[8..10] != header[6..8]
-                    {
-                        result.set_item("error", "xz_footer_crc_mismatch")?;
-                        result.set_item("damage_flags", PyList::new(py, ["xz_footer_crc_bad"])?)?;
-                        return Ok(result);
-                    }
-                    result.set_item("plausible", true)?;
-
-                    result.set_item("boundary_confidence", "high")?;
-                    result.set_item(
-                        "evidence",
-                        PyList::new(py, ["xz:magic", "xz:footer_magic"])?,
-                    )?;
-                } else {
-                    result.set_item("plausible", true)?;
-
-                    result.set_item("error", "xz_footer_magic_not_found")?;
-                    result.set_item("damage_flags", PyList::new(py, ["xz_footer_crc_bad"])?)?;
-                    result.set_item("evidence", PyList::new(py, ["xz:magic"])?)?;
-                }
-            }
-            "zstd" => {
-                if !header.starts_with(ZSTD) {
-                    result.set_item("error", "zstd_magic_not_found")?;
-                    return Ok(result);
-                }
-                result.set_item("magic_matched", true)?;
-                if header.len() < 6 || header[4] & 0x08 != 0 {
-                    result.set_item("error", "zstd_reserved_bit_set")?;
-                    result.set_item("damage_flags", PyList::new(py, ["zstd_frame_bad"])?)?;
-                    return Ok(result);
-                }
-                result.set_item("plausible", true)?;
-
-                result.set_item(
-                    "evidence",
-                    PyList::new(py, ["zstd:magic", "zstd:frame_descriptor"])?,
-                )?;
-            }
-            _ => {
-                result.set_item("error", "unsupported_compression_format")?;
-            }
+            set_view_read_fault(&mut result, &fault, "tar_end_zero_blocks_not_found")?;
+            result.put("evidence", ["tar:header_checksum", "tar:block_walk_prefix"])?;
         }
         Ok(result)
     }
@@ -1034,11 +763,11 @@ fn zip_archive_start_kind(
     spanned: bool,
     empty: bool,
     zip64_eocd_offset: Option<u64>,
-) -> PyResult<&'static str> {
+) -> std::io::Result<&'static str> {
     // Keep this check on the same ManagedReader as the structural probe.  It
     // therefore shares the existing read accounting and request/global
-    // caches instead of reopening the source from Python.
-    let head = reader.read_cached_at(0, 8).map_err(reader_error_to_py)?;
+    // caches instead of reopening the source.
+    let head = reader.read_cached_at(0, 8).map_err(reader_error)?;
     if head.starts_with(ZIP_LOCAL) {
         Ok("local_header")
     } else if empty && head.starts_with(ZIP_EOCD) {
@@ -1053,11 +782,11 @@ fn zip_archive_start_kind(
 }
 
 fn set_zip_eocd_candidate(
-    result: &Bound<'_, PyDict>,
+    result: &mut DiagnosticFields,
     offset: u64,
     record: &[u8],
     available: i64,
-) -> PyResult<()> {
+) -> std::io::Result<()> {
     if record.len() < 22 || &record[..4] != ZIP_EOCD {
         return Ok(());
     }
@@ -1065,21 +794,21 @@ fn set_zip_eocd_candidate(
     let total_entries = u16_le(record, 10);
     let cd_offset = u32_le(record, 16);
     let cd_size = u32_le(record, 12);
-    result.set_item("eocd_candidate_found", true)?;
-    result.set_item("eocd_candidate_offset", offset)?;
-    result.set_item("eocd_candidate_comment_length", comment_length)?;
-    result.set_item(
+    result.put("eocd_candidate_found", true)?;
+    result.put("eocd_candidate_offset", offset)?;
+    result.put("eocd_candidate_comment_length", comment_length)?;
+    result.put(
         "eocd_candidate_comment_available_delta",
         available - i64::from(comment_length),
     )?;
-    result.set_item(
+    result.put(
         "eocd_candidate_declared_entry_count_present",
         total_entries > 0,
     )?;
-    result.set_item("eocd_candidate_declared_cd_offset_present", cd_offset > 0)?;
-    result.set_item("eocd_candidate_total_entries", total_entries)?;
-    result.set_item("eocd_candidate_cd_offset", cd_offset)?;
-    result.set_item("eocd_candidate_cd_size", cd_size)?;
+    result.put("eocd_candidate_declared_cd_offset_present", cd_offset > 0)?;
+    result.put("eocd_candidate_total_entries", total_entries)?;
+    result.put("eocd_candidate_cd_offset", cd_offset)?;
+    result.put("eocd_candidate_cd_size", cd_size)?;
     Ok(())
 }
 
@@ -1109,7 +838,7 @@ fn zip_window_read(
     reader: &mut std::io::BufReader<crate::io::reader::SourceCursor>,
     offset: u64,
     length: usize,
-) -> PyResult<Vec<u8>> {
+) -> std::io::Result<Vec<u8>> {
     use std::io::{Seek, SeekFrom};
     let current = reader.stream_position()?;
     if let Ok(delta) = i64::try_from(i128::from(offset) - i128::from(current)) {
@@ -1124,7 +853,7 @@ fn zip_window_read(
             Ok(0) => break,
             Ok(count) => used += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(reader_error_to_py(error)),
+            Err(error) => return Err(reader_error(error)),
         }
     }
     bytes.truncate(used);

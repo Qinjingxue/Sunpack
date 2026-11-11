@@ -1,1 +1,0 @@
-"""Internal relation grouping implementation."""

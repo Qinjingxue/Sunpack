@@ -1,5 +1,3 @@
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -161,23 +159,22 @@ impl ReadFault {
         io::Error::new(self.io_kind, self)
     }
 
-    pub(crate) fn write_python(&self, output: &Bound<'_, PyDict>) -> PyResult<()> {
-        let py = output.py();
-        let diagnostic = PyDict::new(py);
-        diagnostic.set_item("code", self.code)?;
-        diagnostic.set_item("operation", self.operation)?;
-        diagnostic.set_item("field", self.field)?;
-        diagnostic.set_item("location", self.location.as_str())?;
-        diagnostic.set_item("offset", self.offset)?;
-        diagnostic.set_item("requested", self.requested)?;
-        diagnostic.set_item("actual", self.actual)?;
-        diagnostic.set_item("source_len", self.source_len)?;
-        diagnostic.set_item("volume_number", self.volume_number)?;
-        diagnostic.set_item("io_kind", format!("{:?}", self.io_kind).to_lowercase())?;
-        diagnostic.set_item("os_error", self.os_error)?;
-        diagnostic.set_item("detail", &self.detail)?;
-        diagnostic.set_item("possible_missing_volume", self.possible_missing_volume())?;
-        output.set_item("read_error", diagnostic)
+    pub(crate) fn to_diagnostic(&self) -> serde_json::Value {
+        serde_json::json!({
+            "code": self.code,
+            "operation": self.operation,
+            "field": self.field,
+            "location": self.location.as_str(),
+            "offset": self.offset,
+            "requested": self.requested,
+            "actual": self.actual,
+            "source_len": self.source_len,
+            "volume_number": self.volume_number,
+            "io_kind": format!("{:?}", self.io_kind).to_lowercase(),
+            "os_error": self.os_error,
+            "detail": self.detail,
+            "possible_missing_volume": self.possible_missing_volume(),
+        })
     }
 }
 

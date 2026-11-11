@@ -1,6 +1,4 @@
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -46,7 +44,6 @@ pub(crate) const FILE_ROUTE_DETECTION: u8 = 2;
 pub(crate) const FILE_ROUTE_RESIDUAL: u8 = 3;
 const FORMAT_REJECT_TAR: u32 = 1 << 3;
 
-#[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeDirectorySnapshot {
     pub(crate) table: Arc<DirectorySnapshotTable>,
     pub(crate) rows: Arc<Vec<usize>>,
@@ -80,19 +77,7 @@ impl NativeDirectorySnapshot {
         )
     }
 
-    fn from_records(records: Vec<DirectoryEntryRecord>, errors: DirectoryReadErrors) -> Self {
-        let mut table = Self::build_table(records);
-        table.scan_errors = errors.into_messages();
-        let table = Arc::new(table);
-        let rows = (0..table.paths.len()).collect();
-        Self {
-            table,
-            rows: Arc::new(rows),
-            buckets: OnceLock::new(),
-        }
-    }
-
-    fn from_views(
+    pub(super) fn from_views(
         filtered_rows: Vec<usize>,
         raw: Vec<DirectoryEntryRecord>,
         errors: DirectoryReadErrors,
@@ -118,7 +103,7 @@ impl NativeDirectorySnapshot {
         )
     }
 
-    fn build_table(records: Vec<DirectoryEntryRecord>) -> DirectorySnapshotTable {
+    pub(crate) fn build_table(records: Vec<DirectoryEntryRecord>) -> DirectorySnapshotTable {
         let mut table = DirectorySnapshotTable {
             scan_errors: Vec::new(),
             paths: Vec::with_capacity(records.len()),
@@ -235,15 +220,6 @@ struct DirectoryScanRecords {
 }
 
 impl DirectoryScanRecords {
-    fn into_filtered(mut self) -> (Vec<DirectoryEntryRecord>, DirectoryReadErrors) {
-        let records = self
-            .filtered
-            .into_iter()
-            .map(|index| std::mem::take(&mut self.raw[index]))
-            .collect();
-        (records, self.errors)
-    }
-
     fn retain(&mut self, mut keep: impl FnMut(&DirectoryEntryRecord) -> bool) {
         let mut remap = Vec::with_capacity(self.raw.len());
         let mut next = 0;
@@ -280,7 +256,6 @@ pub(crate) struct OutputFileRecord {
     pub(crate) magic: Vec<u8>,
 }
 
-#[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWorkerManifest {
     files: Arc<Vec<OutputFileRecord>>,
     complete: bool,
@@ -292,12 +267,13 @@ pub(crate) struct NativeWorkerManifest {
 
 impl NativeWorkerManifest {
     /// Build from parsed rows and the five-column `inventory` summary.
-    pub(crate) fn from_parts(files: Vec<OutputFileRecord>, inventory: [u64; 5]) -> PyResult<Self> {
+    pub(crate) fn from_parts(
+        files: Vec<OutputFileRecord>,
+        inventory: [u64; 5],
+    ) -> std::io::Result<Self> {
         let count = |value: u64, what: &str| {
             usize::try_from(value).map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "worker manifest {what} is out of range"
-                ))
+                std::io::Error::other(format!("worker manifest {what} is out of range"))
             })
         };
         let file_count = count(inventory[1], "file count")?;
@@ -321,36 +297,26 @@ impl NativeWorkerManifest {
     }
 }
 
-#[pymethods]
 impl NativeWorkerManifest {
-    #[getter]
-    fn complete(&self) -> bool {
+    pub(crate) fn complete(&self) -> bool {
         self.complete
     }
-    #[getter]
-    fn file_count(&self) -> usize {
+    pub(crate) fn file_count(&self) -> usize {
         self.file_count
     }
-    #[getter]
-    fn dir_count(&self) -> usize {
+    pub(crate) fn dir_count(&self) -> usize {
         self.dir_count
     }
-    #[getter]
-    fn total_size(&self) -> u64 {
+    pub(crate) fn total_size(&self) -> u64 {
         self.total_size
     }
-    #[getter]
-    fn identity_paths(&self) -> bool {
+    pub(crate) fn identity_paths(&self) -> bool {
         self.identity_paths
     }
-    fn __len__(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.files.len()
     }
-    #[pyo3(signature = (offset=0, limit=128))]
-    fn file_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<Py<PyDict>>> {
-        output_file_page(py, &self.files, offset, limit)
-    }
-    fn to_output_inventory(&self, root: String) -> NativeOutputInventory {
+    pub(crate) fn to_output_inventory(&self, root: String) -> NativeOutputInventory {
         NativeOutputInventory {
             root,
             exists: true,
@@ -366,7 +332,6 @@ impl NativeWorkerManifest {
     }
 }
 
-#[pyclass(module = "sunpack_native", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct NativeOutputInventory {
     root: String,
@@ -385,13 +350,10 @@ impl NativeOutputInventory {
     pub(crate) fn records(&self) -> &Arc<Vec<OutputFileRecord>> {
         &self.files
     }
-
 }
 
-#[pymethods]
 impl NativeOutputInventory {
-    #[staticmethod]
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             root: String::new(),
             exists: false,
@@ -406,54 +368,45 @@ impl NativeOutputInventory {
         }
     }
 
-    #[getter]
-    fn root(&self) -> &str {
+    pub(crate) fn root(&self) -> &str {
         &self.root
     }
-    #[getter]
-    fn exists(&self) -> bool {
+    pub(crate) fn exists(&self) -> bool {
         self.exists
     }
-    #[getter]
-    fn is_dir(&self) -> bool {
+    pub(crate) fn is_dir(&self) -> bool {
         self.is_dir
     }
-    #[getter]
-    fn file_count(&self) -> usize {
+    pub(crate) fn file_count(&self) -> usize {
         self.file_count
     }
-    #[getter]
-    fn dir_count(&self) -> usize {
+    pub(crate) fn dir_count(&self) -> usize {
         self.dir_count
     }
-    #[getter]
-    fn total_size(&self) -> u64 {
+    pub(crate) fn total_size(&self) -> u64 {
         self.total_size
     }
-    #[getter]
-    fn unreadable_count(&self) -> usize {
+    pub(crate) fn unreadable_count(&self) -> usize {
         self.unreadable_count
     }
-    #[getter]
-    fn worker_inventory_complete(&self) -> bool {
+    pub(crate) fn worker_inventory_complete(&self) -> bool {
         self.worker_inventory_complete
     }
-    #[getter]
-    fn identity_paths(&self) -> bool {
+    pub(crate) fn identity_paths(&self) -> bool {
         self.identity_paths
     }
 
-    fn __len__(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.files.len()
     }
 
-    fn build_directory_snapshots(
+    pub(crate) fn build_directory_snapshots(
         &self,
-        py: Python<'_>,
-        options: PyRef<'_, NativeDirectoryScanOptions>,
-    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+
+        options: &NativeDirectoryScanOptions,
+    ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let options = &options.options;
-        let (filtered, raw) = py.detach(|| {
+        let (filtered, raw) = (|| {
             let mut records =
                 build_inventory_snapshot_views(&self.root, self.files.as_ref(), options);
             if self.unreadable_count != 0 {
@@ -470,71 +423,14 @@ impl NativeOutputInventory {
                 records.errors,
                 Vec::new(),
             )
-        });
-        Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
+        })();
+        Ok((filtered, raw))
     }
 }
 
-fn output_file_page(
-    py: Python<'_>,
-    files: &[OutputFileRecord],
-    offset: usize,
-    limit: usize,
-) -> PyResult<Vec<Py<PyDict>>> {
-    if limit == 0 || offset >= files.len() {
-        return Ok(Vec::new());
-    }
-    let end = offset.saturating_add(limit).min(files.len());
-    files[offset..end]
-        .iter()
-        .map(|item| output_file_dict(py, item))
-        .collect()
-}
-
-fn output_file_dict(py: Python<'_>, item: &OutputFileRecord) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("index", item.index)?;
-    dict.set_item("path", &item.path)?;
-    if let Some(abs_path) = &item.abs_path {
-        dict.set_item("abs_path", abs_path)?;
-    }
-    if let Some(output_path) = &item.output_path {
-        dict.set_item("output_path", output_path)?;
-    }
-    dict.set_item("size", item.size)?;
-    dict.set_item("bytes_written", item.bytes_written)?;
-    if let Some(crc32) = item.crc32 {
-        dict.set_item("crc32", crc32)?;
-        dict.set_item("has_crc", true)?;
-    }
-    if let Some(output_crc32) = item.output_crc32 {
-        dict.set_item("output_crc32", output_crc32)?;
-        dict.set_item("has_output_crc", true)?;
-    }
-    if let Some(crc_ok) = item.crc_ok {
-        dict.set_item("crc_ok", crc_ok)?;
-    }
-    if item.status != 0 {
-        dict.set_item(
-            "status",
-            match item.status {
-                1 => "complete",
-                2 => "failed",
-                _ => "unverified",
-            },
-        )?;
-    }
-    dict.set_item("magic", PyBytes::new(py, &item.magic))?;
-    if let Some(mtime_ns) = item.mtime_ns {
-        dict.set_item("mtime_ns", mtime_ns)?;
-    }
-    Ok(dict.unbind())
-}
-
-#[pymethods]
 impl NativeDirectorySnapshot {
     /// A lazy name index over this view; rows and existing Rust head facts stay shared.
-    fn relation_bucket(&self, seed: &str) -> Self {
+    pub(crate) fn relation_bucket(&self, seed: &str) -> Self {
         let stem = |path: &str| {
             crate::path_keys::case_key(crate::relations::first_dot_stem(
                 Path::new(path)
@@ -558,23 +454,25 @@ impl NativeDirectorySnapshot {
         self.view(buckets.get(&stem(seed)).cloned().unwrap_or_default())
     }
 
-    fn scan_errors(&self) -> Vec<DirectoryReadError> {
+    pub(crate) fn scan_errors(&self) -> Vec<DirectoryReadError> {
         self.table.scan_errors.clone()
     }
 
-    fn __len__(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.rows.len()
     }
 
-    fn __bool__(&self) -> bool {
-        !self.rows.is_empty()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 
-    fn has_files(&self) -> bool {
+    pub(crate) fn has_files(&self) -> bool {
         self.rows.iter().any(|&row| !self.table.is_dirs[row])
     }
 
-    fn materialize_columns(&self) -> (Vec<String>, Vec<bool>, Vec<Option<u64>>, Vec<Option<u64>>) {
+    pub(crate) fn materialize_columns(
+        &self,
+    ) -> (Vec<String>, Vec<bool>, Vec<Option<u64>>, Vec<Option<u64>>) {
         let mut paths = Vec::with_capacity(self.rows.len());
         let mut is_dirs = Vec::with_capacity(self.rows.len());
         let mut sizes = Vec::with_capacity(self.rows.len());
@@ -588,7 +486,7 @@ impl NativeDirectorySnapshot {
         (paths, is_dirs, sizes, mtimes_ns)
     }
 
-    fn file_columns(&self) -> (Vec<String>, Vec<Option<u64>>, Vec<Option<u64>>) {
+    pub(crate) fn file_columns(&self) -> (Vec<String>, Vec<Option<u64>>, Vec<Option<u64>>) {
         let mut paths = Vec::new();
         let mut sizes = Vec::new();
         let mut mtimes_ns = Vec::new();
@@ -603,10 +501,15 @@ impl NativeDirectorySnapshot {
         (paths, sizes, mtimes_ns)
     }
 
-    fn relation_anchor_rows(
+    pub(crate) fn relation_anchor_rows(
         &self,
-        py: Python<'_>,
-    ) -> PyResult<Vec<(String, Option<u64>, Py<PyDict>)>> {
+    ) -> impl Iterator<
+        Item = (
+            &str,
+            Option<u64>,
+            &crate::analysis_native::volume_anchor::VolumeAnchor,
+        ),
+    > {
         self.rows
             .iter()
             .filter_map(|&row| {
@@ -622,13 +525,12 @@ impl NativeDirectorySnapshot {
             })
             .filter_map(|(row, anchor)| anchor.map(|anchor| (row, anchor)))
             .map(|(row, anchor)| {
-                Ok((
-                    self.table.paths[row].clone(),
+                (
+                    self.table.paths[row].as_str(),
                     self.table.sizes[row],
-                    crate::relations::volume_anchor_to_dict(py, anchor)?,
-                ))
+                    anchor,
+                )
             })
-            .collect()
     }
 }
 
@@ -651,7 +553,7 @@ struct NativeNumericRange {
     eq: Option<u64>,
 }
 
-type NumericRangeTuple = (
+pub(crate) type NumericRangeTuple = (
     Option<u64>,
     Option<u64>,
     Option<u64>,
@@ -691,7 +593,6 @@ struct DirectoryScanProfile {
     path_matching: Duration,
     record_building: Duration,
     traversal_overhead: Duration,
-    file_probe_population: Duration,
     scan_total: Duration,
     directories_opened: usize,
     entries_seen: usize,
@@ -722,47 +623,6 @@ impl DirectoryScanProfile {
         }
     }
 
-    fn into_py_dict(
-        self,
-        py: Python<'_>,
-        options_compile: Duration,
-        snapshot_building: Duration,
-        profiled_call_total: Duration,
-    ) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        dict.set_item("options_compile_ns", duration_ns(options_compile))?;
-        dict.set_item("regex_compiled_bytes", self.regex_compiled_bytes)?;
-        dict.set_item("regex_cache_bytes", self.regex_cache_bytes)?;
-        dict.set_item(
-            "directory_enumeration_ns",
-            duration_ns(self.directory_enumeration),
-        )?;
-        dict.set_item("metadata_reads_ns", duration_ns(self.metadata_reads))?;
-        dict.set_item("path_matching_ns", duration_ns(self.path_matching))?;
-        dict.set_item("record_building_ns", duration_ns(self.record_building))?;
-        dict.set_item(
-            "traversal_overhead_ns",
-            duration_ns(self.traversal_overhead),
-        )?;
-        dict.set_item(
-            "file_probe_population_ns",
-            duration_ns(self.file_probe_population),
-        )?;
-        dict.set_item("scan_total_ns", duration_ns(self.scan_total))?;
-        dict.set_item("snapshot_building_ns", duration_ns(snapshot_building))?;
-        dict.set_item("profiled_call_total_ns", duration_ns(profiled_call_total))?;
-        dict.set_item("directories_opened", self.directories_opened)?;
-        dict.set_item("entries_seen", self.entries_seen)?;
-        dict.set_item("metadata_read_count", self.metadata_read_count)?;
-        dict.set_item("accepted_entries", self.accepted_entries)?;
-        dict.set_item("pruned_directories", self.pruned_directories)?;
-        dict.set_item("rejected_files", self.rejected_files)?;
-        Ok(dict.unbind())
-    }
-}
-
-fn duration_ns(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn measure<const ENABLED: bool, T>(
@@ -784,11 +644,11 @@ fn measure<const ENABLED: bool, T>(
 
 impl DirectoryScanOptions {
     fn new(
-        blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
+        blacklist_rules: Vec<NativePathRule>,
         size_ranges: Vec<NumericRangeTuple>,
         mtime_ranges: Vec<NumericRangeTuple>,
-        whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
-    ) -> PyResult<Self> {
+        whitelist_rules: Vec<NativePathRule>,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             scope: None,
             relation_stem: None,
@@ -812,20 +672,17 @@ impl DirectoryScanOptions {
     }
 }
 
-#[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeDirectoryScanOptions {
     options: DirectoryScanOptions,
 }
 
-#[pymethods]
 impl NativeDirectoryScanOptions {
-    #[new]
-    fn new(
-        blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
+    pub(crate) fn new(
+        blacklist_rules: Vec<NativePathRule>,
         size_ranges: Vec<NumericRangeTuple>,
         mtime_ranges: Vec<NumericRangeTuple>,
-        whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
-    ) -> PyResult<Self> {
+        whitelist_rules: Vec<NativePathRule>,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             options: DirectoryScanOptions::new(
                 blacklist_rules,
@@ -836,36 +693,34 @@ impl NativeDirectoryScanOptions {
         })
     }
 
-    #[pyo3(signature = (state, scope, changed=None))]
-    fn catalog_update(
+    pub(crate) fn catalog_update(
         &self,
-        py: Python<'_>,
+
         state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope,
         changed: Option<&str>,
-    ) -> PyResult<Vec<DirectoryReadError>> {
-        Ok(update_catalog(self, py, state, scope, changed, false)?.0)
+    ) -> std::io::Result<Vec<DirectoryReadError>> {
+        Ok(update_catalog(self, state, scope, changed, false)?.0)
     }
 
-    #[pyo3(signature = (state, scope, changed=None))]
-    fn catalog_refresh(
+    pub(crate) fn catalog_refresh(
         &self,
-        py: Python<'_>,
+
         state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope,
         changed: Option<&str>,
-    ) -> PyResult<(Vec<DirectoryReadError>, Vec<String>)> {
-        update_catalog(self, py, state, scope, changed, true)
+    ) -> std::io::Result<(Vec<DirectoryReadError>, Vec<String>)> {
+        update_catalog(self, state, scope, changed, true)
     }
 
-    fn catalog_snapshot(
+    pub(crate) fn catalog_snapshot(
         &self,
-        py: Python<'_>,
+
         state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope,
         seed: &str,
-    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        let (filtered, raw) = py.detach(|| {
+    ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
+        let (filtered, raw) = (|| {
             let root = Path::new(&scope.root);
             let mut filter_scratch = PathFilterScratch::new(&self.options);
             let mut directory_cache = HashMap::new();
@@ -932,23 +787,21 @@ impl NativeDirectoryScanOptions {
                 .collect();
             populate_relation_anchors_cached(&mut raw, &cells, Some(&scope.root));
             NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report(), cells)
-        });
-        Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
+        })();
+        Ok((filtered, raw))
     }
 
     /// Missing-volume recovery needs a live name inventory, even when Watch
     /// has not received the arrival event yet. Reuse unchanged native heads.
-    #[pyo3(signature = (scope, seed, previous, state=None))]
-    fn refresh_relation_bucket(
+    pub(crate) fn refresh_relation_bucket(
         &self,
-        py: Python<'_>,
+
         scope: &crate::scan::scope::NativeDiscoveryScope,
         seed: &str,
-        previous: PyRef<'_, NativeDirectorySnapshot>,
+        previous: &NativeDirectorySnapshot,
         state: Option<&NativeWatchCatalog>,
-    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        let previous = &*previous;
-        let (filtered, raw) = py.detach(|| {
+    ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
+        let (filtered, raw) = (|| {
             let mut scope = scope.clone();
             if let Some(state) = state {
                 scope.exclude_roots(state.output_roots(&scope.root).into_iter());
@@ -991,62 +844,49 @@ impl NativeDirectoryScanOptions {
                 }
             }
             populate_relation_anchors(&mut records.raw);
-            Ok::<_, PyErr>(NativeDirectorySnapshot::from_views(
+            Ok::<_, std::io::Error>(NativeDirectorySnapshot::from_views(
                 records.filtered,
                 records.raw,
                 records.errors,
                 Vec::new(),
             ))
-        })?;
-        Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
+        })()?;
+        Ok((filtered, raw))
     }
 
-    fn scan_scope(
+    pub(crate) fn scan_scope(
         &self,
-        py: Python<'_>,
+
         scope: &crate::scan::scope::NativeDiscoveryScope,
-    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+    ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let mut options = self.options.clone();
         options.scope = Some(scope.clone());
-        scan_snapshots_with_options(py, &scope.root, scope.max_depth, &options)
+        scan_snapshots_with_options(&scope.root, scope.max_depth, &options)
     }
 
-    fn scan(
-        &self,
-        py: Python<'_>,
-        root_path: &str,
-        max_depth: Option<usize>,
-    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        scan_snapshots_with_options(py, root_path, max_depth, &self.options)
-    }
 }
 
 fn scan_snapshots_with_options(
-    py: Python<'_>,
     root_path: &str,
     max_depth: Option<usize>,
     options: &DirectoryScanOptions,
-) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-    let (filtered, raw) = py.detach(|| {
+) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
+    let (filtered, raw) = (|| {
         let mut records = scan_directory_views(root_path, max_depth, options)?;
         populate_relation_anchors_cached(&mut records.raw, &[], Some(root_path));
-        Ok::<_, PyErr>(NativeDirectorySnapshot::from_views(
+        Ok::<_, std::io::Error>(NativeDirectorySnapshot::from_views(
             records.filtered,
             records.raw,
             records.errors,
             Vec::new(),
         ))
-    })?;
-    Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
+    })()?;
+    Ok((filtered, raw))
 }
 
 /// Filesystem target classification only; archive analysis remains in discovery.
-#[pyfunction]
-pub(crate) fn classify_scan_targets(
-    py: Python<'_>,
-    paths: Vec<String>,
-) -> (Vec<u8>, Vec<DirectoryReadError>) {
-    py.detach(|| {
+pub(crate) fn classify_scan_targets(paths: Vec<String>) -> (Vec<u8>, Vec<DirectoryReadError>) {
+    (|| {
         let mut kinds = Vec::with_capacity(paths.len());
         let mut errors = DirectoryReadErrors::report();
         for path in paths {
@@ -1065,101 +905,7 @@ pub(crate) fn classify_scan_targets(
             }
         }
         (kinds, errors.into_messages())
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, is_dirs, sizes, mtimes_ns, relation_member_eligible=None))]
-pub(crate) fn directory_snapshot_from_columns(
-    py: Python<'_>,
-    paths: Vec<String>,
-    is_dirs: Vec<bool>,
-    sizes: Vec<Option<u64>>,
-    mtimes_ns: Vec<Option<u64>>,
-    relation_member_eligible: Option<Vec<bool>>,
-) -> PyResult<Py<NativeDirectorySnapshot>> {
-    let length = paths.len();
-    if is_dirs.len() != length
-        || sizes.len() != length
-        || mtimes_ns.len() != length
-        || relation_member_eligible
-            .as_ref()
-            .is_some_and(|values| values.len() != length)
-    {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "directory snapshot columns must have equal lengths",
-        ));
-    }
-    let relation_member_eligible = relation_member_eligible.unwrap_or_else(|| vec![true; length]);
-    let mut records = paths
-        .into_iter()
-        .zip(is_dirs)
-        .zip(sizes)
-        .zip(mtimes_ns)
-        .zip(relation_member_eligible)
-        .map(
-            |((((path, is_dir), size), mtime_ns), relation_member_eligible)| DirectoryEntryRecord {
-                path,
-                is_dir,
-                size,
-                mtime_ns,
-                relation_member_eligible,
-                relation_anchor: None,
-            },
-        )
-        .collect::<Vec<_>>();
-    let snapshot = py.detach(move || {
-        populate_relation_anchors(&mut records);
-        NativeDirectorySnapshot::from_records(records, DirectoryReadErrors::default())
-    });
-    Py::new(py, snapshot)
-}
-
-#[pyfunction]
-#[pyo3(signature = (root_path, max_depth, blacklist_rules, size_ranges, mtime_ranges, whitelist_rules, include_relation_anchors=false))]
-pub(crate) fn profile_directory_scan(
-    py: Python<'_>,
-    root_path: &str,
-    max_depth: Option<usize>,
-    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
-    size_ranges: Vec<NumericRangeTuple>,
-    mtime_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
-    include_relation_anchors: bool,
-) -> PyResult<(Py<NativeDirectorySnapshot>, Py<PyDict>)> {
-    let call_started = Instant::now();
-    let options_started = Instant::now();
-    let options =
-        DirectoryScanOptions::new(blacklist_rules, size_ranges, mtime_ranges, whitelist_rules)?;
-    let options_compile = options_started.elapsed();
-
-    let (profile, snapshot, snapshot_building) = py.detach(|| {
-        let mut profile = DirectoryScanProfile::default();
-        let mut entries = scan_directory_impl::<true>(
-            root_path,
-            max_depth,
-            &options,
-            include_relation_anchors,
-            Some(&mut profile),
-            None,
-        )?;
-        if include_relation_anchors {
-            let started = Instant::now();
-            populate_relation_anchors_cached(&mut entries.raw, &[], Some(root_path));
-            profile.file_probe_population = started.elapsed();
-        }
-        let snapshot_started = Instant::now();
-        let (records, errors) = entries.into_filtered();
-        let snapshot = NativeDirectorySnapshot::from_records(records, errors);
-        Ok::<_, PyErr>((profile, snapshot, snapshot_started.elapsed()))
-    })?;
-    let python_started = Instant::now();
-    let snapshot = Py::new(py, snapshot)?;
-    let snapshot_building = snapshot_building + python_started.elapsed();
-    let profiled_call_total = call_started.elapsed();
-    let profile =
-        profile.into_py_dict(py, options_compile, snapshot_building, profiled_call_total)?;
-    Ok((snapshot, profile))
+    })()
 }
 
 fn build_inventory_snapshot_views(
@@ -1259,7 +1005,7 @@ fn build_inventory_snapshot_views(
         .collect();
 
     // Directory entries are derived before mtime filtering to preserve the ordered
-    // Python filter semantics: a directory can remain after its last file is rejected
+    // Directory filters preserve empty parents: a directory can remain after its last file is rejected
     // by the final mtime stage.
     let mut filtered: Vec<usize> = ancestor_directory_records(
         &root,
@@ -1372,11 +1118,6 @@ fn ancestor_directory_records<'a>(
             relation_anchor: None,
         })
         .collect()
-}
-
-#[pyfunction]
-pub(crate) fn scan_output_inventory(py: Python<'_>, output_dir: String) -> NativeOutputInventory {
-    py.detach(|| scan_output_inventory_impl(&output_dir))
 }
 
 pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {
@@ -1522,7 +1263,7 @@ fn scan_directory_views(
     root_path: &str,
     max_depth: Option<usize>,
     options: &DirectoryScanOptions,
-) -> PyResult<DirectoryScanRecords> {
+) -> std::io::Result<DirectoryScanRecords> {
     scan_directory_impl::<false>(root_path, max_depth, options, true, None, None)
 }
 
@@ -1533,8 +1274,8 @@ fn scan_directory_impl<const PROFILE: bool>(
     collect_raw: bool,
     mut profile: Option<&mut DirectoryScanProfile>,
     known_metadata: Option<fs::Metadata>,
-) -> PyResult<DirectoryScanRecords> {
-    let scan_started = Instant::now();
+) -> std::io::Result<DirectoryScanRecords> {
+    let scan_started = PROFILE.then(Instant::now);
     let root = PathBuf::from(root_path);
     let filter_root = options
         .scope
@@ -1555,7 +1296,7 @@ fn scan_directory_impl<const PROFILE: bool>(
     if metadata.is_none() {
         if PROFILE {
             if let Some(profile) = profile.as_deref_mut() {
-                profile.scan_total = scan_started.elapsed();
+                profile.scan_total = scan_started.map_or(Duration::ZERO, |start| start.elapsed());
             }
         }
         return Ok(DirectoryScanRecords {
@@ -1625,7 +1366,7 @@ fn scan_directory_impl<const PROFILE: bool>(
         };
         if PROFILE {
             if let Some(profile) = profile.as_deref_mut() {
-                profile.scan_total = scan_started.elapsed();
+                profile.scan_total = scan_started.map_or(Duration::ZERO, |start| start.elapsed());
                 filter_scratch.record_memory(options, profile);
             }
         }
@@ -1861,7 +1602,7 @@ fn scan_directory_impl<const PROFILE: bool>(
     }
     if PROFILE {
         if let Some(profile) = profile.as_deref_mut() {
-            profile.scan_total = scan_started.elapsed();
+            profile.scan_total = scan_started.map_or(Duration::ZERO, |start| start.elapsed());
             filter_scratch.record_memory(options, profile);
         }
     }
@@ -1999,7 +1740,7 @@ fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
 
 pub(crate) fn scope_file_paths(
     scope: &crate::scan::scope::NativeDiscoveryScope,
-) -> PyResult<(Vec<PathBuf>, Vec<DirectoryReadError>)> {
+) -> std::io::Result<(Vec<PathBuf>, Vec<DirectoryReadError>)> {
     let mut options = DirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
     options.scope = Some(scope.clone());
     let records = scan_directory_views(&scope.root, scope.max_depth, &options)?;
@@ -2015,7 +1756,6 @@ pub(crate) fn scope_file_paths(
 }
 
 /// One native path table with derived filename buckets and a disposable cache WAL.
-#[pyclass(module = "sunpack_native")]
 pub(crate) struct NativeWatchCatalog {
     catalogs: Mutex<HashMap<String, ScopeCatalog>>,
     outputs: Arc<Mutex<crate::watch_store::StateData>>,
@@ -2024,21 +1764,16 @@ pub(crate) struct NativeWatchCatalog {
     recovery_ids: Mutex<HashMap<String, crate::filesystem::DirectoryRecoveryCache>>,
 }
 
-#[pymethods]
 impl NativeWatchCatalog {
-    #[new]
-    #[pyo3(signature = (outputs, folder=None))]
-    fn new(
-        py: Python<'_>,
-        outputs: PyRef<'_, crate::watch_store::NativeWatchState>,
+    pub(crate) fn new(
+        outputs: &crate::watch_store::NativeWatchState,
         folder: Option<String>,
     ) -> Self {
         let mut catalogs = HashMap::new();
         let mut error = None;
         let store = folder.and_then(|folder| {
-            match py.detach(|| {
-                super::catalog_store::CatalogStore::open(Path::new(&folder), &mut catalogs)
-            }) {
+            match (|| super::catalog_store::CatalogStore::open(Path::new(&folder), &mut catalogs))()
+            {
                 Ok(store) => Some(store),
                 Err(e) => {
                     error = Some(e.to_string());
@@ -2054,19 +1789,17 @@ impl NativeWatchCatalog {
             recovery_ids: Mutex::new(HashMap::new()),
         }
     }
-    #[getter]
-    fn error(&self) -> Option<String> {
+    pub(crate) fn error(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
     }
 
-    #[pyo3(signature = (scope, under=None))]
-    fn candidate_paths(
+    pub(crate) fn candidate_paths(
         &self,
-        py: Python<'_>,
+
         scope: &crate::scan::scope::NativeDiscoveryScope,
         under: Option<&str>,
     ) -> Vec<String> {
-        py.detach(|| {
+        (|| {
             let mut target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
             target.truncate(target.trim_end_matches('\\').len());
             let mut paths: Vec<String> = self
@@ -2094,11 +1827,11 @@ impl NativeWatchCatalog {
             // paths only, without opening each file before the actual probe.
             paths.retain(|path| scope.contains(path) && !self.is_owned(path));
             paths
-        })
+        })()
     }
 
-    fn observation(&self, py: Python<'_>, path: &str) -> Option<NativeWatchObservation> {
-        py.detach(|| {
+    pub(crate) fn observation(&self, path: &str) -> Option<NativeWatchObservation> {
+        (|| {
             let key = crate::path_keys::path_key(path);
             self.catalogs.lock().unwrap().values().find_map(|table| {
                 table
@@ -2108,13 +1841,12 @@ impl NativeWatchCatalog {
                     .as_deref()
                     .cloned()
             })
-        })
+        })()
     }
 
-    #[pyo3(signature = (path, size, mtime, file_id, change_usn, phase_boundary=false))]
-    fn remember_observation(
+    pub(crate) fn remember_observation(
         &self,
-        py: Python<'_>,
+
         path: &str,
         size: u64,
         mtime: f64,
@@ -2122,7 +1854,7 @@ impl NativeWatchCatalog {
         change_usn: i64,
         phase_boundary: bool,
     ) {
-        py.detach(|| {
+        (|| {
             let key = crate::path_keys::path_key(path);
             let mut tables = self.catalogs.lock().unwrap();
             let scope = tables
@@ -2158,20 +1890,19 @@ impl NativeWatchCatalog {
                 .get_mut(key.as_str())
                 .unwrap()
                 .remember_observation(size, mtime, file_id, change_usn, phase_boundary);
-        })
+        })()
     }
 
-    #[pyo3(signature = (path, quiet_seconds=None, last_content_event_at=None, cadence_seconds=0.0, pending_interval_seconds=0.0))]
-    fn retire_observation(
+    pub(crate) fn retire_observation(
         &self,
-        py: Python<'_>,
+
         path: &str,
         quiet_seconds: Option<f64>,
         last_content_event_at: Option<f64>,
         cadence_seconds: f64,
         pending_interval_seconds: f64,
     ) {
-        py.detach(|| {
+        (|| {
             let key = crate::path_keys::path_key(path);
             let mut tables = self.catalogs.lock().unwrap();
             for table in tables.values_mut() {
@@ -2190,14 +1921,13 @@ impl NativeWatchCatalog {
                     }
                 }
             }
-        })
+        })()
     }
 
-    #[pyo3(signature = (path, recursive=false, missing_only=false))]
-    fn forget_observation(&self, py: Python<'_>, path: &str, recursive: bool, missing_only: bool) {
+    pub(crate) fn forget_observation(&self, path: &str, recursive: bool, missing_only: bool) {
         let mut key = crate::path_keys::path_key(path);
         key.truncate(key.trim_end_matches('\\').len());
-        py.detach(|| {
+        (|| {
             let mut tables = self.catalogs.lock().unwrap();
             for table in tables.values_mut() {
                 let keys: Vec<_> = table
@@ -2227,11 +1957,11 @@ impl NativeWatchCatalog {
                     }
                 }
             }
-        });
+        })();
     }
 
-    fn memory_stats(&self, py: Python<'_>) -> HashMap<&'static str, usize> {
-        py.detach(|| {
+    pub(crate) fn memory_stats(&self) -> HashMap<&'static str, usize> {
+        (|| {
             let tables = self.catalogs.lock().unwrap();
             let mut stats = HashMap::from([
                 ("rows", 0),
@@ -2271,15 +2001,15 @@ impl NativeWatchCatalog {
                     .and_modify(|count| *count += table.parent_count());
             }
             stats
-        })
+        })()
     }
 
-    fn cursor(
+    pub(crate) fn cursor(
         &self,
-        py: Python<'_>,
+
         scope: &crate::scan::scope::NativeDiscoveryScope,
     ) -> Option<(String, u64, i64)> {
-        py.detach(|| {
+        (|| {
             let stamp = self.stamp(scope)?;
             let store = self.store.lock().unwrap();
             let saved = store
@@ -2291,9 +2021,9 @@ impl NativeWatchCatalog {
                 && saved.excluded == stamp.excluded)
                 .then(|| saved.cursor.clone())
                 .flatten()
-        })
+        })()
     }
-    fn bucket_paths(
+    pub(crate) fn bucket_paths(
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
         seed: &str,
@@ -2313,7 +2043,7 @@ impl NativeWatchCatalog {
             .map(|row| row.path())
             .collect()
     }
-    fn retain_roots(&self, roots: Vec<String>) {
+    pub(crate) fn retain_roots(&self, roots: Vec<String>) {
         self.recovery_ids.lock().unwrap().clear();
         let keys: HashSet<_> = roots
             .iter()
@@ -2333,20 +2063,16 @@ impl NativeWatchCatalog {
             }
         }
     }
-    fn recover_changes(
+    pub(crate) fn recover_changes(
         &self,
-        py: Python<'_>,
-        scopes: Vec<Py<crate::scan::scope::NativeDiscoveryScope>>,
+
+        scopes: &[crate::scan::scope::NativeDiscoveryScope],
         volume: &str,
         journal: u64,
         start_usn: i64,
         end_usn: i64,
-    ) -> PyResult<Vec<String>> {
-        let scopes: Vec<_> = scopes
-            .iter()
-            .map(|scope| scope.borrow(py).clone())
-            .collect();
-        py.detach(|| {
+    ) -> std::io::Result<Vec<String>> {
+        (|| {
             if start_usn == end_usn || scopes.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2376,18 +2102,18 @@ impl NativeWatchCatalog {
                 end_usn,
                 caches.entry(volume.to_owned()).or_default(),
             )
-            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
-        })
+            .map_err(|error| std::io::Error::other(error.to_string()))
+        })()
     }
-    fn set_cursor(
+    pub(crate) fn set_cursor(
         &self,
-        py: Python<'_>,
+
         scope: &crate::scan::scope::NativeDiscoveryScope,
         volume: String,
         journal: u64,
         next_usn: i64,
     ) {
-        py.detach(|| {
+        (|| {
             let Some(mut stamp) = self.stamp(scope) else {
                 return;
             };
@@ -2403,11 +2129,10 @@ impl NativeWatchCatalog {
                 },
                 false,
             );
-        });
+        })();
     }
-    #[pyo3(signature = (idle=false))]
-    fn commit(&self, py: Python<'_>, idle: bool) {
-        py.detach(|| {
+    pub(crate) fn commit(&self, idle: bool) {
+        (|| {
             if idle {
                 self.recovery_ids.lock().unwrap().clear();
             }
@@ -2430,10 +2155,10 @@ impl NativeWatchCatalog {
                     *slot = None;
                 }
             }
-        });
+        })();
     }
-    fn close(&self, py: Python<'_>) {
-        py.detach(|| {
+    pub(crate) fn close(&self) {
+        (|| {
             self.recovery_ids.lock().unwrap().clear();
             let tables = self.catalogs.lock().unwrap();
             let mut slot = self.store.lock().unwrap();
@@ -2442,12 +2167,15 @@ impl NativeWatchCatalog {
                     *self.error.lock().unwrap() = Some(error.to_string());
                 }
             }
-        });
+        })();
     }
 }
 
 impl NativeWatchCatalog {
-    fn directory_paths(&self, scope: &crate::scan::scope::NativeDiscoveryScope) -> Vec<String> {
+    pub(crate) fn directory_paths(
+        &self,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+    ) -> Vec<String> {
         let tables = self.catalogs.lock().unwrap();
         let mut directories = vec![scope.root.clone()];
         if scope.max_depth != Some(0) {
@@ -2464,7 +2192,7 @@ impl NativeWatchCatalog {
         }
         directories
     }
-    fn output_roots(&self, under: &str) -> Vec<String> {
+    pub(crate) fn output_roots(&self, under: &str) -> Vec<String> {
         let key = format!(
             "owned|{}",
             crate::path_keys::path_key(under).trim_end_matches('\\')
@@ -2499,7 +2227,7 @@ impl NativeWatchCatalog {
             .map(|(path, _)| path)
             .collect()
     }
-    fn is_owned(&self, path: &str) -> bool {
+    pub(crate) fn is_owned(&self, path: &str) -> bool {
         let key = crate::path_keys::path_key(path);
         let mut current = key.trim_end_matches('\\');
         let data = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
@@ -2520,7 +2248,7 @@ impl NativeWatchCatalog {
 }
 
 impl NativeWatchCatalog {
-    fn stamp(
+    pub(crate) fn stamp(
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
     ) -> Option<super::catalog_store::Stamp> {
@@ -2534,7 +2262,7 @@ impl NativeWatchCatalog {
             cursor: None,
         })
     }
-    fn persist(
+    pub(crate) fn persist(
         &self,
         tables: &HashMap<String, ScopeCatalog>,
         delta: super::catalog_store::DeltaView<'_>,
@@ -2565,13 +2293,13 @@ impl NativeWatchCatalog {
 
 fn update_catalog(
     options: &NativeDirectoryScanOptions,
-    py: Python<'_>,
+
     state: &NativeWatchCatalog,
     scope: &crate::scan::scope::NativeDiscoveryScope,
     changed: Option<&str>,
     report_changes: bool,
-) -> PyResult<(Vec<DirectoryReadError>, Vec<String>)> {
-    py.detach(|| {
+) -> std::io::Result<(Vec<DirectoryReadError>, Vec<String>)> {
+    (|| {
         // Enumeration and publication share the existing index write lock:
         // a startup rebuild cannot overwrite a newer file-event update.
         let mut catalogs = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
@@ -2730,5 +2458,5 @@ fn update_catalog(
             );
         }
         Ok((errors, changed_paths))
-    })
+    })()
 }

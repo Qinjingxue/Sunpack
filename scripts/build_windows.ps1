@@ -3,13 +3,10 @@ param(
     [switch]$SkipTests,
     [switch]$Clean,
     [switch]$NoPause,
-    # Manual build verification only; tagged releases keep Nuitka LTO enabled.
+    # Manual build verification only; tagged releases keep Cargo LTO enabled.
     [switch]$FastBuild,
     [ValidateRange(1, 64)]
     [int]$BuildJobs = 4,
-    # Nuitka currently warns that C-level PGO is unsupported for standalone builds.
-    # Keep it opt-in for local experiments only; release builds use LTO by default.
-    [switch]$ExperimentalCProfileGuidedOptimization,
     [string]$Version,
     [string]$InnoCompilerPath,
     [ValidateSet("x64", "arm64")]
@@ -38,22 +35,6 @@ function Wait-BeforeBuildExit {
     } catch {
         # Never let the pause path hide the original build failure.
     }
-}
-
-function Get-UvBootstrapPythonCommand {
-    foreach ($candidate in @("python", "py")) {
-        try {
-            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
-                if ($resolvedPython) {
-                    return ([string]$resolvedPython).Trim()
-                }
-            }
-        } catch {
-        }
-    }
-    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
 }
 
 function Remove-IfExists {
@@ -185,31 +166,6 @@ function Assert-PathMissing {
 }
 
 
-function Remove-PreviousNativeExtension {
-    param(
-        [Parameter(Mandatory = $true)][string]$PythonPath,
-        [Parameter(Mandatory = $true)][string]$VenvPath
-    )
-
-    $sitePackages = Join-Path $VenvPath "Lib\site-packages"
-    if (-not (Test-Path -LiteralPath $sitePackages)) {
-        return
-    }
-
-    # Keep exactly one extension: remove the registered distribution and every
-    # stale module/dist-info residue before installing this build's wheel.
-    Invoke-Native -FilePath "uv" -Arguments @("pip", "uninstall", "--python", $PythonPath, "sunpack-native")
-    $leftovers = Get-ChildItem -LiteralPath $sitePackages -Force |
-        Where-Object {
-            $_.Name -eq "sunpack_native" -or
-            $_.Name -match "^sunpack_native-.*\.dist-info$" -or
-            $_.Name -match "^[~].*npack_native$"
-        }
-    foreach ($leftover in $leftovers) {
-        Remove-Item -LiteralPath $leftover.FullName -Recurse -Force
-    }
-}
-
 function Assert-CommandExists {
     param(
         [string]$Command,
@@ -327,33 +283,6 @@ function Invoke-Native {
     }
 }
 
-function Get-LatestWheel {
-    param([string]$WheelRoot)
-    $wheel = Get-ChildItem -LiteralPath $WheelRoot -Filter "*.whl" -File |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First 1
-    if ($null -eq $wheel) {
-        throw "Native wheel was not produced under: $WheelRoot"
-    }
-    return $wheel.FullName
-}
-
-function Get-MaturinCommand {
-    param([string]$VenvScripts)
-
-    $venvMaturin = Join-Path $VenvScripts "maturin.exe"
-    if (Test-Path -LiteralPath $venvMaturin) {
-        return $venvMaturin
-    }
-
-    $globalMaturin = Get-Command "maturin" -ErrorAction SilentlyContinue
-    if ($globalMaturin) {
-        return $globalMaturin.Source
-    }
-
-    throw "maturin executable not found. Install the project build extra or make maturin available in PATH."
-}
-
 function Test-CommandRuns {
     param(
         [Parameter(Mandatory = $true)]
@@ -408,29 +337,6 @@ function Get-CTestCommand {
     }
 
     throw "ctest executable not found. Install CMake or make CTest available in PATH."
-}
-
-function Test-NativeImport {
-    param([string]$PythonPath)
-
-    $code = @"
-import sunpack_native as n
-required = [
-    'NativeDirectoryScanOptions', 'NativeCandidateTable',
-    'directory_snapshot_from_columns',
-    'authorize_nested_candidates',
-    'scan_embedded_archives',
-    'analyze_zip_filename_encoding', 'AnalysisBinaryView',
-    'watch_broker_acquire', 'watch_broker_release',
-    'watch_broker_is_connected', 'watch_broker_ping_seconds'
-]
-missing = [name for name in required if not callable(getattr(n, name, None))]
-assert not missing, missing
-"@
-    Invoke-Native -FilePath $PythonPath -Arguments @(
-        "-c",
-        $code
-    )
 }
 
 function Get-PeSubsystem {
@@ -490,57 +396,6 @@ function Get-InnoSetupCompiler {
     throw "Inno Setup 6 compiler (ISCC.exe) was not found. Install JRSoftware.InnoSetup or pass -InnoCompilerPath."
 }
 
-
-function Test-SevenZipWorker {
-    param([string]$PythonPath, [string]$RepoRoot)
-
-    # The 7-Zip backend is compiled into the worker, so the old
-    # "assert tools\7z.dll exists" probe is gone. What still has to hold is that
-    # the worker binary is present AND that the embedded backend can open a real
-    # archive end to end.
-    $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sunpack-embedded-backend-" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
-    try {
-        $probe = Join-Path $fixtureRoot "probe.py"
-        $fixture = Join-Path $fixtureRoot "probe.zip"
-        @'
-import os
-import sys
-import zipfile
-
-from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
-
-worker = get_sevenzip_bridge_worker_path()
-assert os.path.exists(worker), worker
-
-target = sys.argv[1]
-with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-    archive.writestr("probe.txt", "sunpack embedded backend\n" * 8)
-assert os.path.getsize(target) > 0
-'@ | Set-Content -LiteralPath $probe -Encoding UTF8
-        Invoke-Native -FilePath $PythonPath -Arguments @($probe, $fixture)
-        Push-Location $RepoRoot
-        try {
-            Invoke-Native -FilePath $PythonPath -Arguments @(
-                "sunpack.py", "scan", "--no-pause", $fixture
-            )
-        } finally {
-            try {
-                # The source CLI uses the persistent server for non-help
-                # commands. Do not leave the venv Python alive while the build
-                # later mutates or packages files from the same environment.
-                Invoke-Native -FilePath $PythonPath -Arguments @(
-                    "sunpack.py", "--persistent-shutdown"
-                )
-                Wait-ExecutableExit -ExecutablePath $PythonPath
-            } finally {
-                Pop-Location
-            }
-        }
-    } finally {
-        Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
 
 function Build-SevenZipWorker {
     param(
@@ -612,40 +467,6 @@ function Build-ToastLibrary {
     Assert-PathExists -LiteralPath $toastDll -Description "Built toast DLL"
     Assert-PeMachine -LiteralPath $toastDll -BuildArch $BuildArch -Description "Built toast DLL"
     Copy-Item -LiteralPath $toastDll -Destination (Join-Path $ToolsRoot "sunpack_toast.dll") -Force
-}
-
-function Assert-PackagedNativeExtension {
-    param(
-        [string]$PackageRoot,
-        [string]$BuildArch
-    )
-
-    $nativeExtension = Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -like "sunpack_native*.pyd" -or
-            $_.Name -like "sunpack_native*.dll"
-        } |
-        Select-Object -First 1
-
-    if ($null -eq $nativeExtension) {
-        throw "Packaged sunpack_native extension not found under: $PackageRoot"
-    }
-
-    Write-Host ("Packaged native extension: {0}" -f $nativeExtension.FullName) -ForegroundColor Green
-    Assert-PeMachine -LiteralPath $nativeExtension.FullName -BuildArch $BuildArch -Description "Packaged sunpack_native extension"
-}
-
-function Test-PythonImports {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PythonPath,
-        [Parameter(Mandatory = $true)]
-        [string[]]$Modules
-    )
-
-    $importList = ($Modules | ForEach-Object { "'$_'" }) -join ", "
-    & $PythonPath -c "import importlib.util, sys; modules = [$importList]; missing = [name for name in modules if importlib.util.find_spec(name) is None]; sys.exit(0 if not missing else 1)"
-    return ($LASTEXITCODE -eq 0)
 }
 
 function Invoke-WithRetry {
@@ -724,108 +545,6 @@ function Confirm-AcceptanceTests {
 }
 
 
-function New-NuitkaEntrypoint {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $content = @(
-        "from sunpack.runtime.entrypoint import main",
-        "raise SystemExit(main())",
-        ""
-    )
-    [System.IO.File]::WriteAllText($Path, ($content -join [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
-}
-
-function Embed-WindowsApplicationManifest {
-    param(
-        [Parameter(Mandatory = $true)][string]$PythonPath,
-        [Parameter(Mandatory = $true)][string]$EmbeddingScriptPath,
-        [Parameter(Mandatory = $true)][string]$ManifestPath,
-        [Parameter(Mandatory = $true)][string[]]$ExecutablePaths
-    )
-
-    Assert-PathExists -LiteralPath $EmbeddingScriptPath -Description "Manifest resource embedding script"
-    Assert-PathExists -LiteralPath $ManifestPath -Description "Windows application manifest"
-    $arguments = @($EmbeddingScriptPath, "--manifest", $ManifestPath)
-    foreach ($executablePath in $ExecutablePaths) {
-        Assert-PathExists -LiteralPath $executablePath -Description "Nuitka executable for manifest embedding"
-        $arguments += @("--executable", $executablePath)
-    }
-    Invoke-Native -FilePath $PythonPath -Arguments $arguments
-}
-
-function Invoke-NuitkaStandaloneBuild {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PythonPath,
-        [Parameter(Mandatory = $true)]
-        [string]$EntryPath,
-        [Parameter(Mandatory = $true)]
-        [string]$OutputRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$ExecutableName,
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("force", "disable")]
-        [string]$ConsoleMode,
-        [Parameter(Mandatory = $true)]
-        [string]$IconPath,
-        [Parameter(Mandatory = $true)]
-        [string[]]$DynamicPackages,
-        [string]$PgoArgs,
-        [switch]$EnableExperimentalCProfileGuidedOptimization,
-        [Parameter(Mandatory = $true)]
-        [string]$ReportPath
-    )
-
-    $arguments = @(
-        "-m", "nuitka",
-        "--standalone",
-        "--assume-yes-for-downloads",
-        "--lto=$(if ($FastBuild) { 'no' } else { 'yes' })",
-        "--jobs=$BuildJobs",
-        "--output-dir=$OutputRoot",
-        "--output-filename=$ExecutableName",
-        "--windows-console-mode=$ConsoleMode",
-        "--windows-icon-from-ico=$IconPath",
-        "--include-module=sunpack_native",
-        "--report=$ReportPath"
-    )
-    if ($EnableExperimentalCProfileGuidedOptimization) {
-        Write-Warning "C-level PGO is experimental and unsupported by Nuitka for standalone builds; do not publish this output without independent validation"
-        $arguments += "--pgo-c"
-        if ($PgoArgs) {
-            $arguments += "--pgo-args=$PgoArgs"
-        }
-    }
-    foreach ($package in $DynamicPackages) {
-        $arguments += "--include-package=$package"
-    }
-
-    foreach ($module in @("ssl", "_ssl")) {
-        $arguments += "--nofollow-import-to=$module"
-    }
-
-    $arguments += $EntryPath
-    Invoke-Native -FilePath $PythonPath -Arguments $arguments
-}
-
-function Copy-NuitkaDistContents {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Source,
-        [Parameter(Mandatory = $true)]
-        [string]$Destination
-    )
-
-    Assert-PathExists -LiteralPath $Source -Description "Nuitka standalone output"
-    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
-        Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force
-    }
-}
-
 function Copy-IfExists {
     param(
         [string]$Source,
@@ -886,21 +605,12 @@ if ($env:OS -ne "Windows_NT") {
     throw "This build script only supports Windows."
 }
 Write-Host "Requested architecture: $buildArch"
-Write-Host "Build system: Nuitka"
-Write-Host "Build Python/process architecture: $processArch"
-if ($processArch -ne $buildArch) {
-    throw "Windows Nuitka/PyO3 final executable builds must run under a target-architecture Python. This machine/process is '$processArch', so it cannot produce a real '$buildArch' sunpack.exe. Use an ARM64 Windows Python environment for -Arch arm64; use static PE validation on the resulting package."
-}
-
+Write-Host "Build system: Cargo and CMake"
 $venvPath = Join-Path $repoRoot ".venv"
-$venvPython = Join-Path $venvPath "Scripts\python.exe"
 $venvScripts = Join-Path $venvPath "Scripts"
-$sunpackEntryPath = Join-Path $repoRoot "sunpack.py"
 $installerScriptPath = Join-Path $repoRoot "installer\SunPack.iss"
-$projectPath = Join-Path $repoRoot "pyproject.toml"
 $iconPath = Join-Path $repoRoot "sunpack.ico"
 $applicationManifestPath = Join-Path $repoRoot "sunpack.manifest"
-$manifestEmbeddingScriptPath = Join-Path $repoRoot "scripts\embed_windows_manifest.py"
 $nativeCrateRoot = Join-Path $repoRoot "native\sunpack_native"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "native\Cargo.lock"
@@ -931,7 +641,6 @@ $rc6LicensePath = Join-Path $repoRoot "licenses\rc6-license.txt"
 $thirdPartyNoticesPath = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $distRoot = Join-Path $repoRoot "dist"
 $buildRoot = Join-Path $repoRoot "build"
-$nativeWheelRoot = Join-Path $buildRoot ("native-wheels-" + $buildArch)
 $releaseRoot = Join-Path $repoRoot "release"
 $distFolderName = "sunpack-" + $buildArch
 $appExeName = "sunpack.exe"
@@ -939,7 +648,6 @@ $runtimeExeName = "sunpack-runtime.exe"
 $distAppRoot = Join-Path $distRoot $distFolderName
 $distExePath = Join-Path $distAppRoot $appExeName
 $distRuntimeExePath = Join-Path $distAppRoot $runtimeExeName
-$nuitkaBuildRoot = Join-Path $buildRoot ("nuitka-" + $distFolderName)
 $distToolsRoot = Join-Path $distAppRoot "tools"
 $distServiceRoot = Join-Path $distAppRoot "service"
 $distWatchBrokerPath = Join-Path $distServiceRoot "sunpack-watch-broker.exe"
@@ -954,13 +662,10 @@ if ($promptForAcceptanceTests) {
     $runAcceptanceTests = Confirm-AcceptanceTests
 }
 
-Assert-PathExists -LiteralPath $projectPath -Description "pyproject.toml"
-Assert-PathExists -LiteralPath $sunpackEntryPath -Description "SunPack entry point"
 Assert-PathExists -LiteralPath $installerScriptPath -Description "Inno Setup installer script"
 $innoCompiler = Get-InnoSetupCompiler -PreferredPath $InnoCompilerPath
 Assert-PathExists -LiteralPath $iconPath -Description "SunPack icon"
 Assert-PathExists -LiteralPath $applicationManifestPath -Description "Windows application manifest"
-Assert-PathExists -LiteralPath $manifestEmbeddingScriptPath -Description "Manifest resource embedding script"
 Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_native Cargo manifest"
 Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust workspace lockfile"
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
@@ -981,7 +686,6 @@ Assert-PathExists -LiteralPath $blowfishLicensePath -Description "RustCrypto Blo
 Assert-PathExists -LiteralPath $rc6LicensePath -Description "RustCrypto RC6 license file"
 Assert-PathExists -LiteralPath $thirdPartyNoticesPath -Description "Third-party notices file"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
-Assert-CommandExists -Command "uv" -Description "uv dependency manager"
 Assert-PeMachine -LiteralPath $sevenZipPath -BuildArch $buildArch -Description "Bundled 7-Zip executable"
 
 if ($Clean) {
@@ -995,66 +699,33 @@ if ($Clean) {
     }
 }
 
-Write-Step "Preparing build virtual environment"
-if (Test-Path -LiteralPath (Join-Path $venvPath "pyvenv.cfg")) {
-    $venvConfig = Get-Content -LiteralPath (Join-Path $venvPath "pyvenv.cfg") -Raw
-    if ($venvConfig -match "include-system-site-packages\s*=\s*true") {
-        Write-Host "Disabling global site-packages in the existing virtual environment" -ForegroundColor Yellow
-        [IO.File]::WriteAllText((Join-Path $venvPath "pyvenv.cfg"), ($venvConfig -replace "include-system-site-packages\s*=\s*true", "include-system-site-packages = false"), [Text.UTF8Encoding]::new($false))
-    }
-}
-$syncArguments = @("sync", "--locked", "--extra", "dev")
-if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    $syncArguments += @("--python", (Get-UvBootstrapPythonCommand))
-}
-Invoke-Native -FilePath "uv" -Arguments $syncArguments
-Assert-PathExists -LiteralPath $venvPython -Description "Project virtual environment Python"
-Invoke-Native -FilePath "uv" -Arguments @("pip", "check", "--python", $venvPython)
-$maturinCommand = Get-MaturinCommand -VenvScripts $venvScripts
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
 
-$env:Path = "$venvScripts;$env:Path"
-$env:PYTHONPATH = if ($env:PYTHONPATH) { "$repoRoot;$env:PYTHONPATH" } else { $repoRoot }
-
 Write-Step "Cleaning previous build outputs"
-Remove-IfExists -LiteralPath $buildRoot
-Remove-IfExists -LiteralPath $distRoot
-Remove-IfExists -LiteralPath $releaseRoot
+$resolvedDistApp = [IO.Path]::GetFullPath($distAppRoot)
+$resolvedDistRoot = [IO.Path]::GetFullPath($distRoot) + "\"
+if (-not $resolvedDistApp.StartsWith($resolvedDistRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Package output is outside its distribution directory: $resolvedDistApp"
+}
+Remove-IfExists -LiteralPath $resolvedDistApp
+New-Item -ItemType Directory -Path $distAppRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 
-Write-Step "Building and installing Rust native extension"
-Remove-PreviousNativeExtension -PythonPath $venvPython -VenvPath $venvPath
-New-Item -ItemType Directory -Path $nativeWheelRoot -Force | Out-Null
-Invoke-Native -FilePath "cargo" -Arguments @("--version")
-Invoke-Native -FilePath $maturinCommand -Arguments @(
-    "build",
-    "--locked",
-    "--manifest-path", $nativeCargoToml,
-    "--interpreter", $venvPython,
-    "--release",
-    "--target", $rustTarget,
-    "--target-dir", $rustTargetDir,
-    "--out", $nativeWheelRoot
+Write-Step "Building Rust runtime and Windows Watch Broker"
+$rustFlags = 'target.' + $rustTarget + '.rustflags=[''-C'', ''target-feature=+crt-static'']'
+$cargoArgs = @(
+    "build", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
+    "--release", "--target", $rustTarget, "--target-dir", $rustTargetDir,
+    "--jobs", [string]$BuildJobs, "--config", $rustFlags,
+    "-p", "sunpack-native", "-p", "sunpack-watch-broker"
 )
-$nativeWheelPath = Get-LatestWheel -WheelRoot $nativeWheelRoot
-Invoke-Native -FilePath "uv" -Arguments @("pip", "install", "--python", $venvPython, "--reinstall", $nativeWheelPath)
-Test-NativeImport -PythonPath $venvPython
-
-Write-Step "Building minimal Windows Watch Broker service"
-Invoke-Native -FilePath "cargo" -Arguments @(
-    "build",
-    # The service lives outside the Python DLL directory and must start on a
-    # clean machine. Scope static CRT flags to this build, not the PyO3 wheel.
-    # TOML literal strings keep their quotes through Windows PowerShell's
-    # native argument marshalling, which strips embedded double quotes.
-    "--config", ('target.' + $rustTarget + '.rustflags=[''-C'', ''target-feature=+crt-static'']'),
-    "--locked",
-    "--manifest-path", $watchBrokerCargoToml,
-    "--release",
-    "--target", $rustTarget,
-    "--target-dir", $rustTargetDir
-)
+if ($FastBuild) {
+    $cargoArgs += @("--config", "profile.release.lto=false", "--config", "profile.release.codegen-units=16")
+}
+Invoke-Native -FilePath "cargo" -Arguments $cargoArgs
+$runtimeBuildPath = Join-Path $rustTargetDir "$rustTarget\release\sunpack-runtime.exe"
+Assert-PathExists -LiteralPath $runtimeBuildPath -Description "SunPack runtime executable"
 Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch Broker executable"
 Assert-PeMachine -LiteralPath $watchBrokerBuildPath -BuildArch $buildArch -Description "SunPack Watch Broker executable"
 
@@ -1065,59 +736,21 @@ if ($nativeLinkerEntry.Count -ne 1) {
     throw "Cannot locate the native linker for the Watch Broker CRT dependency check."
 }
 $nativeLinker = $nativeLinkerEntry[0].Substring("CMAKE_LINKER:FILEPATH=".Length)
-Invoke-Native -FilePath $cmakeCommand -Arguments @(
-    "-DLINKER=$nativeLinker", "-DBINARY=$watchBrokerBuildPath",
-    "-P", (Join-Path $sevenZipWrapperRoot "tests\static_runtime.cmake")
-)
+foreach ($executable in @($runtimeBuildPath, $watchBrokerBuildPath)) {
+    Invoke-Native -FilePath $cmakeCommand -Arguments @(
+        "-DLINKER=$nativeLinker", "-DBINARY=$executable",
+        "-P", (Join-Path $sevenZipWrapperRoot "tests\static_runtime.cmake")
+    )
+}
 Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Assert-PathExists -LiteralPath $sevenZipWorkerPath -Description "Bundled 7z worker executable"
 Assert-PathExists -LiteralPath $toastHostPath -Description "Bundled toast DLL"
-Test-SevenZipWorker -PythonPath $venvPython -RepoRoot $repoRoot
-Invoke-Native -FilePath $venvPython -Arguments @(
-    "-c",
-    "from sunpack.core.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"
-)
-
-if ($runAcceptanceTests) {
-    Write-Step "Running acceptance tests"
-    Invoke-Native -FilePath "powershell" -Arguments @(
-        "-ExecutionPolicy", "Bypass",
-        "-File", (Join-Path $repoRoot "run_acceptance_tests.ps1"),
-        "-NoWait",
-        "-SkipEnvironmentRefresh",
-        "-Arch", $buildArch,
-        "-BuildProfile", "release"
-    )
-} else {
-    Write-Host "Skipping acceptance tests by request" -ForegroundColor Yellow
-}
-
 Write-Step "Building Core UI management panel"
 $guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
 & (Join-Path $repoRoot "scripts\build_gui.ps1") -Arch $buildArch -CMakeCommand $cmakeCommand -BuildDir $guiBuildDir -Jobs $BuildJobs -SkipTests:$SkipTests -ApplicationOnly:$SkipTests
 
-Write-Step "Building Windows release with Nuitka"
-    $nuitkaEntryRoot = Join-Path $nuitkaBuildRoot "entries"
-    $nuitkaRuntimeEntryPath = Join-Path $nuitkaEntryRoot "sunpack-runtime.py"
-    $nuitkaRuntimeDist = Join-Path $nuitkaBuildRoot ([System.IO.Path]::GetFileNameWithoutExtension($runtimeExeName) + ".dist")
-    $nuitkaDynamicPackages = @(
-    "watchdog",
-        "sunpack.runtime.cli.commands",
-        "sunpack.core.config.fields",
-    "sunpack.pipeline.discovery.embedded",
-    "sunpack.core.passwords.candidates",
-        "sunpack.pipeline.extraction.internal",
-        "sunpack.pipeline.discovery.relations.internal",
-        "sunpack.pipeline.postprocess.internal"
-    )
-
-    New-Item -ItemType Directory -Path $nuitkaEntryRoot -Force | Out-Null
-    New-NuitkaEntrypoint -Path $nuitkaRuntimeEntryPath
-    Invoke-NuitkaStandaloneBuild -PythonPath $venvPython -EntryPath $nuitkaRuntimeEntryPath -OutputRoot $nuitkaBuildRoot -ExecutableName $runtimeExeName -ConsoleMode "disable" -IconPath $iconPath -DynamicPackages $nuitkaDynamicPackages -PgoArgs "--help" -EnableExperimentalCProfileGuidedOptimization:$ExperimentalCProfileGuidedOptimization -ReportPath (Join-Path $nuitkaBuildRoot "sunpack-runtime-report.xml")
-    Embed-WindowsApplicationManifest -PythonPath $venvPython -EmbeddingScriptPath $manifestEmbeddingScriptPath -ManifestPath $applicationManifestPath -ExecutablePaths @(
-        (Join-Path $nuitkaRuntimeDist $runtimeExeName)
-    )
-    Copy-NuitkaDistContents -Source $nuitkaRuntimeDist -Destination $distAppRoot
+Write-Step "Staging native executables"
+Copy-Item -LiteralPath $runtimeBuildPath -Destination $distRuntimeExePath -Force
 Copy-Item -LiteralPath (Join-Path $guiBuildDir "Release\SunPackGUI.exe") -Destination (Join-Path $distAppRoot "SunPackGUI.exe") -Force
 Assert-PeMachine -LiteralPath (Join-Path $distAppRoot "SunPackGUI.exe") -BuildArch $buildArch -Description "Packaged GUI manager"
 Assert-PeSubsystem -LiteralPath (Join-Path $distAppRoot "SunPackGUI.exe") -Expected 2 -Description "Packaged GUI manager"
@@ -1135,7 +768,6 @@ Assert-PeMachine -LiteralPath $distWatchBrokerPath -BuildArch $buildArch -Descri
 Assert-PeSubsystem -LiteralPath $distExePath -Expected 3 -Description "Packaged sunpack executable"
 Assert-PeSubsystem -LiteralPath $distRuntimeExePath -Expected 2 -Description "Packaged shared SunPack runtime executable"
 Assert-PathMissing -LiteralPath (Join-Path $distAppRoot "sunpack-watch.exe") -Description "Retired duplicate watch executable"
-Assert-PackagedNativeExtension -PackageRoot $distAppRoot -BuildArch $buildArch
 
 Write-Step "Adding release metadata and helper scripts"
 $distPasswordPath = Join-Path $distAppRoot "builtin_passwords.json"
@@ -1197,13 +829,13 @@ Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip_worker
 
 $versionFilePath = Join-Path $distAppRoot "VERSION.txt"
 $gitCommit = Get-GitCommit -RepoRoot $repoRoot
-$pythonVersion = (& $venvPython --version).Trim()
+$rustVersion = (& rustc --version).Trim()
 $metadata = @(
     "product=SunPack"
     "version=$versionValue"
     "arch=$buildArch"
     "git_commit=$gitCommit"
-    "python=$pythonVersion"
+    "rustc=$rustVersion"
     "built_at_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
 )
 [System.IO.File]::WriteAllLines($versionFilePath, $metadata)
@@ -1214,8 +846,10 @@ if ($processArch -eq $buildArch) {
     # legitimately contain schema fields removed by the current build and must
     # not turn a valid package into a false build failure.
     $originalProgramData = $env:ProgramData
+    $originalConfigOverrides = $env:SUNPACK_CONFIG_OVERRIDES
     $smokeProgramDataRoot = Join-Path $buildRoot ("smoke-program-data-" + [guid]::NewGuid().ToString("N"))
     $env:ProgramData = $smokeProgramDataRoot
+    $env:SUNPACK_CONFIG_OVERRIDES = '{"passwords":{"clipboard_passwords_enabled":false}}'
     try {
         $packagedDataRoot = Join-Path $env:ProgramData "SunPack"
         New-Item -ItemType Directory -Path $packagedDataRoot -Force | Out-Null
@@ -1226,9 +860,16 @@ if ($processArch -eq $buildArch) {
 
         Write-Step "Running packaged smoke tests"
         try {
+            $smokeInput = Join-Path $smokeProgramDataRoot "probe.txt"
+            $smokeArchive = Join-Path $smokeProgramDataRoot "probe.zip"
+            $smokeOutput = Join-Path $smokeProgramDataRoot "output"
+            [IO.File]::WriteAllText($smokeInput, "SunPack archive smoke test")
+            Compress-Archive -LiteralPath $smokeInput -DestinationPath $smokeArchive
             Invoke-Native -FilePath $distExePath -Arguments @("--help")
-            Invoke-Native -FilePath $distExePath -Arguments @("passwords", "--json")
-            Invoke-Native -FilePath $distExePath -Arguments @("scan", (Join-Path $repoRoot "tests"), "--json")
+            Invoke-Native -FilePath $distExePath -Arguments @("passwords", "--json") | Out-Null
+            Invoke-Native -FilePath $distExePath -Arguments @("scan", $smokeArchive, "--json") | Out-Null
+            Invoke-Native -FilePath $distExePath -Arguments @("extract", $smokeArchive, "--cleanup", "k", "--out-dir", $smokeOutput, "--json") | Out-Null
+            Assert-PathExists -LiteralPath (Join-Path $smokeOutput "probe\probe.txt") -Description "Extracted smoke fixture"
             Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "--json")
         } finally {
             # Every launcher request may start the packaged persistent runtime.
@@ -1238,11 +879,21 @@ if ($processArch -eq $buildArch) {
         }
     } finally {
         $env:ProgramData = $originalProgramData
+        $env:SUNPACK_CONFIG_OVERRIDES = $originalConfigOverrides
         Remove-Item -LiteralPath $smokeProgramDataRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 } else {
     Write-Step "Skipping packaged smoke tests"
     Write-Host "Packaged executable is $buildArch and cannot run under the current $processArch process" -ForegroundColor Yellow
+}
+
+if ($runAcceptanceTests -and $processArch -eq $buildArch) {
+    Write-Step "Running acceptance tests"
+    Invoke-Native -FilePath "powershell" -Arguments @(
+        "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $repoRoot "run_acceptance_tests.ps1"),
+        "-NoWait", "-Arch", $buildArch, "-BuildProfile", "release"
+    )
 }
 
 Write-Step "Creating Windows installer"

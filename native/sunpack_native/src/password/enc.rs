@@ -2,14 +2,16 @@
 //! to extraction. Reuse the existing generation-aware prepared-context cache.
 use super::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use super::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
+use super::PasswordVerification;
+use crate::io::archive_state::InputExtent;
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, FieldLocation};
 use crate::io::reader::ManagedReader;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use crate::io::reader::NativeArchiveSession;
 use rayon::prelude::*;
 use std::io::{Read, Seek};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use sunpack_enc::{Error, PasswordProbe, Workspace};
 
 // Argon2 is memory-hard: bound aggregate scratch space for one batch, rather
@@ -29,45 +31,23 @@ impl Drop for ActiveBatch {
     }
 }
 
-#[pyfunction]
-pub(crate) fn enc_fast_verify_passwords(
-    py: Python<'_>,
-    archive_path: String,
-    passwords: &Bound<'_, PyList>,
-) -> PyResult<Py<PyAny>> {
-    let reader = py.detach(|| ManagedReader::open(&archive_path))?;
-    enc_fast_verify_passwords_with_reader(py, &reader, passwords)
-}
-
 pub(crate) fn enc_fast_verify_passwords_with_reader(
-    py: Python<'_>,
     reader: &ManagedReader,
-    passwords: &Bound<'_, PyList>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|p| p.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
-    verify_prepared(py, InputKey::file("enc", reader)?, &candidates, || {
+    candidates: &[Arc<str>],
+) -> std::io::Result<PasswordVerification> {
+    verify_prepared(InputKey::file("enc", reader)?, candidates, || {
         prepare(reader.cursor(), reader.len()).map(PasswordContext::Enc)
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (ranges, passwords, *, sessions=None))]
 pub(crate) fn enc_fast_verify_passwords_from_ranges(
-    py: Python<'_>,
-    ranges: &Bound<'_, PyList>,
-    passwords: &Bound<'_, PyList>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|p| p.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
+    ranges: &[&InputExtent],
+    candidates: &[Arc<str>],
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges, sessions)?;
     let length = ranges_total_len(&parsed);
-    verify_prepared(py, ranges_key("enc", &parsed)?, &candidates, || {
+    verify_prepared(ranges_key("enc", &parsed)?, candidates, || {
         prepare(VirtualRangeReader::new(parsed.into()), length).map(PasswordContext::Enc)
     })
 }
@@ -95,42 +75,38 @@ impl EncPasswordContext {
     pub(crate) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
     }
-    pub(crate) fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
-        let found = py.detach(|| self.find_first(candidates));
+    pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
+        let found = self.find_first(candidates);
         let (index, attempts) = match found {
             Some((index, Ok(()))) => (index as i32, index + 1),
             Some((_, Err(Error::Memory))) => {
-                return Err(pyo3::exceptions::PyMemoryError::new_err(
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
                     "ENC Argon2 workspace allocation failed",
                 ))
             }
             Some((_, Err(error))) => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                return Err(std::io::Error::other(format!(
                     "ENC password proof: {error:?}"
                 )))
             }
             None => (-1, candidates.len()),
         };
-        let result = PyDict::new(py);
-        result.set_item("status", if index >= 0 { "match" } else { "no_match" })?;
-        result.set_item("matched_index", index)?;
-        result.set_item("attempts", attempts)?;
-        // The 32-byte [a-z0-9] proof has about 90 bits of rejection strength.
-        // This selects one password; the normal extraction still checks BLAKE3.
-        result.set_item("final_confirmation_required", false)?;
-        result.set_item("match_evidence", "enc_v4_quick_block")?;
-        result.set_item(
-            "message",
-            if index >= 0 {
-                "ENC v4 quick block matched"
+        // The quick-block proof selects a password. Extraction verifies BLAKE3.
+        Ok(PasswordVerification {
+            matched_index: usize::try_from(index).ok(),
+            attempts,
+            final_confirmation_required: Some(false),
+            match_evidence: Some("enc_v4_quick_block"),
+            ..if index >= 0 {
+                PasswordVerification::status("match", "ENC v4 quick block matched")
             } else {
-                "ENC v4 quick block rejected candidates"
-            },
-        )?;
-        Ok(result.into())
+                PasswordVerification::status("no_match", "ENC v4 quick block rejected candidates")
+            }
+        })
     }
 
-    fn find_first(&self, candidates: &[String]) -> Option<(usize, Result<(), Error>)> {
+    fn find_first(&self, candidates: &[Arc<str>]) -> Option<(usize, Result<(), Error>)> {
         if candidates.is_empty() {
             return None;
         }
@@ -152,7 +128,7 @@ impl EncPasswordContext {
         let chunk_size = candidates.len().div_ceil(workers);
         let earliest = AtomicUsize::new(candidates.len());
         let cancellation = Cancellation::current();
-        let search = |(chunk_index, chunk): (usize, &[String])| {
+        let search = |(chunk_index, chunk): (usize, &[Arc<str>])| {
             let mut workspace = Workspace::default();
             workspace.set_cancellation(cancellation.flag());
             let mut utf16 = Vec::new();

@@ -50,19 +50,12 @@ jobs:
         with:
           arch: x64
           profile: ci
-          python-version: "3.11"
-          source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest') }}
-
-      - name: Cache acceptance fixture generators
-        uses: actions/cache@v4
-        with:
-          path: .sunpack_test_tools
-          key: acceptance-tools-v1-${{ runner.os }}-x64-${{ hashFiles('scripts/setup_windows_dev.ps1') }}
+          source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
 
       - name: Prepare acceptance environment
         shell: pwsh
         run: |
-          .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4
+          .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4 -SkipAcceptanceTestTools
 
       - name: Save native build cache after successful compilation
         if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
@@ -77,22 +70,15 @@ jobs:
             native/toast_host/build-x64-ci
           key: ${{ steps.native-cache.outputs.cache-key }}
 
-      - name: Upload native wheel for GUI cross-language contracts
+      - name: Upload native runtime for GUI contracts
         uses: actions/upload-artifact@v7
         with:
-          name: sunpack-native-wheel-ci-x64
-          path: build/native-wheels-dev-x64-ci/sunpack_native-*.whl
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload GUI integration runtime
-        uses: actions/upload-artifact@v7
-        with:
-          name: sunpack-gui-runtime-ci-x64
+          name: sunpack-runtime-ci-x64
+          include-hidden-files: true
           path: |
-            tools/7z.exe
-            tools/7z.dll
-            tools/sunpack_sevenzip_worker.exe
+            .cache/rust-target/x64/x86_64-pc-windows-msvc/ci/sunpack-runtime.exe
+            native/sevenzip_bridge/build-x64-ci/Release/sunpack_launcher.exe
+            native/sevenzip_bridge/build-x64-ci/Release/sunpack_sevenzip_worker.exe
           if-no-files-found: error
           retention-days: 1
 
@@ -206,11 +192,11 @@ jobs:
         shell: pwsh
         run: uv sync --locked --extra dev
 
-      - name: Download native Python wheel
+      - name: Download Rust runtime
         uses: actions/download-artifact@v8
         with:
-          name: sunpack-native-wheel-ci-x64
-          path: build/gui-contract-wheel
+          name: sunpack-runtime-ci-x64
+          path: .
 
       - name: Download GUI native test binary
         uses: actions/download-artifact@v8
@@ -218,27 +204,9 @@ jobs:
           name: sunpack-gui-test-ci-x64
           path: .cache/gui-x64/Release
 
-      - name: Download GUI integration runtime
-        uses: actions/download-artifact@v8
-        with:
-          name: sunpack-gui-runtime-ci-x64
-          path: tools
-
-      - name: Verify GUI integration runtime
+      - name: Run GUI and runtime boundary tests
         shell: pwsh
         run: |
-          foreach ($file in @('tools/7z.exe', 'tools/7z.dll', 'tools/sunpack_sevenzip_worker.exe')) {
-            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-              throw "Missing GUI integration runtime: $file"
-            }
-          }
-
-      - name: Run cross-language GUI integration tests
-        shell: pwsh
-        run: |
-          $wheel = Get-ChildItem -LiteralPath build/gui-contract-wheel -Filter 'sunpack_native-*.whl' -File | Select-Object -First 1
-          if (-not $wheel) { throw 'Native Python wheel artifact missing' }
-          uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel.FullName
-          if ($LASTEXITCODE -ne 0) { throw 'Installing native Python wheel failed' }
-          & .\.venv\Scripts\python.exe -m pytest tests/gui/test_integration.py -q
-          if ($LASTEXITCODE -ne 0) { throw 'GUI cross-language contracts failed' }
+          $env:SUNPACK_GUI_TEST_BINARY = (Resolve-Path .cache/gui-x64/Release/sunpack_gui_tests.exe).Path
+          & .\.venv\Scripts\python.exe -m pytest -q tests/blackbox/test_runtime_commands.py::test_gui_password_edits_are_visible_to_running_runtime tests/gui/test_integration.py::test_gui_template_texts_exist_in_both_languages
+          if ($LASTEXITCODE -ne 0) { throw 'GUI and runtime boundary tests failed' }

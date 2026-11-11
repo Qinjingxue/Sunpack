@@ -1,11 +1,10 @@
 //! Immutable password material for the logical input selected by Rust analysis.
 //! Physical generations and logical boundaries are part of the identity; no
 //! archive detection or member discovery is performed by this cache.
+use super::PasswordVerification;
 use crate::io::cancellation::CancellableOnce;
 use crate::io::read_fault::ReadFault;
 use crate::io::reader::{FileIdentity, ManagedReader};
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,12 +79,12 @@ impl PasswordContext {
         }
     }
 
-    fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
+    fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         match self {
-            Self::Enc(context) => context.verify(py, candidates),
-            Self::Zip(context) => context.verify(py, candidates),
-            Self::Rar(context) => context.verify(py, candidates),
-            Self::SevenZip(context) => context.verify(py, candidates),
+            Self::Enc(context) => context.verify(candidates),
+            Self::Zip(context) => context.verify(candidates),
+            Self::Rar(context) => context.verify(candidates),
+            Self::SevenZip(context) => context.verify(candidates),
         }
     }
 }
@@ -100,17 +99,10 @@ impl PreparedStatus {
         Self::Status(status, message.into())
     }
 
-    fn to_python(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn verification(&self) -> PasswordVerification {
         match self {
-            Self::ReadFault(fault) => super::password_read_fault_status(py, fault),
-            Self::Status(status, message) => {
-                let result = PyDict::new(py);
-                result.set_item("status", status)?;
-                result.set_item("matched_index", -1)?;
-                result.set_item("attempts", 0)?;
-                result.set_item("message", message)?;
-                Ok(result.into())
-            }
+            Self::ReadFault(fault) => super::password_read_fault_status(fault),
+            Self::Status(status, message) => PasswordVerification::status(status, message.as_str()),
         }
     }
 }
@@ -137,11 +129,10 @@ fn cache() -> &'static Mutex<VecDeque<Entry>> {
 /// Initialize once per input, outside the cache lock and without the GIL.
 /// Unrelated archives and all candidate calculations remain concurrent.
 pub(crate) fn verify_prepared(
-    py: Python<'_>,
     key: InputKey,
-    candidates: &[String],
+    candidates: &[Arc<str>],
     prepare: impl FnOnce() -> Prepared + Send,
-) -> PyResult<Py<PyAny>> {
+) -> std::io::Result<PasswordVerification> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check()?;
     // The key comes from the already opened physical readers. Their generation
@@ -179,15 +170,14 @@ pub(crate) fn verify_prepared(
             entries.push_back(entry);
             slot
         };
-        let ready = py
-            .detach(|| {
-                slot.value.get_or_init(&cancellation, || {
-                    prepare
-                        .take()
-                        .expect("only the initializer consumes prepare")()
-                })
+        let ready = (|| {
+            slot.value.get_or_init(&cancellation, || {
+                prepare
+                    .take()
+                    .expect("only the initializer consumes prepare")()
             })
-            .is_some();
+        })()
+        .is_some();
         if ready {
             break slot;
         }
@@ -205,8 +195,8 @@ pub(crate) fn verify_prepared(
         return Err(input_changed());
     }
     let result = cancellation.check().and_then(|()| match prepared {
-        Ok(context) => context.verify(py, candidates),
-        Err(status) => status.to_python(py),
+        Ok(context) => context.verify(candidates),
+        Err(status) => Ok(status.verification()),
     });
     let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
     let retired = slot.retired.load(Ordering::Acquire);
@@ -253,8 +243,8 @@ pub(crate) fn verify_prepared(
     result
 }
 
-fn input_changed() -> PyErr {
-    pyo3::exceptions::PyOSError::new_err(
+fn input_changed() -> std::io::Error {
+    std::io::Error::other(
         "password verification input changed; Rust archive analysis must be refreshed",
     )
 }
@@ -296,11 +286,66 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn cancelled_initializer_does_not_publish_damage_to_shared_password_input() {
+        use crate::io::cancellation::Cancellation;
+        let path = crate::test_support::temp_file("cancel_prepare", b"physical generation");
+        let reader = ManagedReader::open(&path).unwrap();
+        let key = InputKey::file("rar", &reader).unwrap();
+        let owner_key = key.clone();
+        let borrower_key = key.clone();
+        let signal = Cancellation::new();
+        let owner_signal = signal.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            owner_signal.run(|| {
+                verify_prepared(owner_key, &[], move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err(PreparedStatus::new("damaged", "abandoned initializer"))
+                })
+                .unwrap_err()
+                .to_string()
+            })
+        });
+        entered_rx.recv().unwrap();
+        // Acquire the owner's exact slot before revoking it. A waiter on
+        // this generation must see an abandoned initialization even if
+        // the slot is already removed from the map when it resumes.
+        let borrowed = {
+            let entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+            Arc::clone(&entries.iter().find(|(entry, _)| *entry == key).unwrap().1)
+        };
+        let borrower = std::thread::spawn(move || {
+            assert!(borrowed
+                .value
+                .get_or_init(&Cancellation::default(), || {
+                    panic!("the owner must settle its slot")
+                })
+                .is_none());
+            verify_prepared(borrower_key, &[], || {
+                Err(PreparedStatus::new("not_required", "surviving initializer"))
+            })
+            .unwrap()
+            .status
+        });
+        signal.cancel();
+        release_tx.send(()).unwrap();
+        assert_eq!(owner.join().unwrap(), "native operation cancelled");
+        assert_eq!(borrower.join().unwrap(), "not_required");
+        let reused =
+            verify_prepared(key, &[], || panic!("successful facts must be reused")).unwrap();
+        assert_eq!(reused.status, "not_required");
+        release_under_roots(std::slice::from_ref(&path));
+        drop(reader);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn concurrent_volume_snapshots_preserve_independent_password_facts() {
         // Arrival tests hit this overlap only by chance; cancellation tests use
         // one identical key. Block one initializer while a larger snapshot
         // completes, then check both cached verdicts without KDF/payload work.
-        Python::initialize();
         let root = std::env::temp_dir().join(format!(
             "sunpack_password_snapshots_{}_{}",
             std::process::id(),
@@ -328,34 +373,28 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let owner = std::thread::spawn(move || {
-            Python::attach(|py| {
-                verify_prepared(py, owner_key, &[], move || {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    Err(PreparedStatus::new("missing_volume", "partial snapshot"))
-                })
-                .and_then(|value| value.bind(py).get_item("status")?.extract::<String>())
+            verify_prepared(owner_key, &[], move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(PreparedStatus::new("missing_volume", "partial snapshot"))
             })
+            .map(|value| value.status)
         });
         entered_rx.recv().unwrap();
-        let newer = Python::attach(|py| {
-            verify_prepared(py, complete.clone(), &[], || {
-                Err(PreparedStatus::new("not_required", "complete snapshot"))
-            })
-            .and_then(|value| value.bind(py).get_item("status")?.extract::<String>())
-        });
+        let newer = verify_prepared(complete.clone(), &[], || {
+            Err(PreparedStatus::new("not_required", "complete snapshot"))
+        })
+        .map(|value| value.status);
         release_tx.send(()).unwrap();
         let older = owner.join().unwrap();
-        let reused = Python::attach(|py| {
-            [partial, complete].map(|key| {
-                verify_prepared(py, key, &[], || {
-                    Err(PreparedStatus::new(
-                        "damaged",
-                        "unexpected reinitialization",
-                    ))
-                })
-                .and_then(|value| value.bind(py).get_item("status")?.extract::<String>())
+        let reused = [partial, complete].map(|key| {
+            verify_prepared(key, &[], || {
+                Err(PreparedStatus::new(
+                    "damaged",
+                    "unexpected reinitialization",
+                ))
             })
+            .map(|value| value.status)
         });
         release_under_roots(std::slice::from_ref(&root));
         drop(readers);

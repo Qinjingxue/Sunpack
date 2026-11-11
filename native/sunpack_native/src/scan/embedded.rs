@@ -13,8 +13,6 @@ use crate::scan::compression_stream::{
 use aho_corasick::{packed, AhoCorasick};
 use crc32fast::hash as crc32;
 use memchr::memmem;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
@@ -119,18 +117,21 @@ const DEFAULT_IOCP_WORKERS: usize = 4;
 #[cfg(test)]
 const TEST_IOCP_CHUNK_SIZE: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq)]
-struct EmbeddedCandidate {
-    format: &'static str,
-    offset: u64,
-    end_offset: Option<u64>,
-    validation: &'static str,
-    candidate_kind: &'static str,
-    boundary_kind: &'static str,
-    extractable: bool,
-    lz4_index: Option<Box<crate::formats::lz4::Index>>,
-    zip_eocd_offset: Option<u64>,
-    volume_anchor: Option<Box<VolumeAnchor>>,
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct EmbeddedCandidate {
+    pub(crate) format: &'static str,
+    pub(crate) offset: u64,
+    pub(crate) end_offset: Option<u64>,
+    pub(crate) validation: &'static str,
+    pub(crate) candidate_kind: &'static str,
+    pub(crate) boundary_kind: &'static str,
+    pub(crate) extractable: bool,
+    #[serde(skip)]
+    pub(crate) lz4_index: Option<Box<crate::formats::lz4::Index>>,
+    #[serde(rename = "eocd_offset", skip_serializing_if = "Option::is_none")]
+    pub(crate) zip_eocd_offset: Option<u64>,
+    #[serde(skip)]
+    pub(crate) volume_anchor: Option<Box<VolumeAnchor>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,10 +218,15 @@ pub(crate) struct NativeScanResult {
     zip_eocd_absent: bool,
 }
 
-pub(crate) struct RarInputResolution<'a> {
+pub(crate) struct RarInputResolution {
     pub end_offset: Option<u64>,
-    pub password: Option<&'a str>,
+    pub password: Option<std::sync::Arc<str>>,
     pub failure_reason: Option<&'static str>,
+}
+
+pub(crate) struct ResolvedEmbeddedScan {
+    pub(crate) scan: std::sync::Arc<NativeScanResult>,
+    pub(crate) resolutions: HashMap<u64, RarInputResolution>,
 }
 
 impl NativeScanResult {
@@ -308,124 +314,37 @@ impl NativeScanResult {
                     || self.candidates[0].boundary_kind != "exact"))
     }
 
-    pub(crate) fn primary_analysis(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        let Some(index) = self
-            .candidates
-            .first()
-            .and_then(|item| item.lz4_index.as_ref())
-        else {
-            return Ok(None);
-        };
-        let result = PyDict::new(py);
-        result.set_item("structure_complete", index.complete)?;
-        Ok(Some(result.unbind()))
+    pub(crate) fn primary_analysis(&self) -> Option<crate::io::archive_state::AnalysisFacts> {
+        let index = self.candidates.first()?.lz4_index.as_ref()?;
+        Some(crate::io::archive_state::AnalysisFacts {
+            structure_complete: index.complete,
+            ..Default::default()
+        })
     }
 
-    pub(crate) fn to_py_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        self.to_py_dict_with_rar_resolutions(py, &HashMap::new())
+    pub(crate) fn candidates(&self) -> &[EmbeddedCandidate] {
+        &self.candidates
     }
 
-    // Project already verified facts once; never read Python rows back into
-    // Rust or clone the scan's potentially large hit/candidate collections.
-    pub(crate) fn to_py_dict_with_rar_resolutions(
-        &self,
-        py: Python<'_>,
-        resolutions: &HashMap<u64, RarInputResolution<'_>>,
-    ) -> PyResult<Py<PyDict>> {
-        let result = PyDict::new(py);
-        result.set_item("complete", !self.budget_exhausted)?;
-        result.set_item("signature_scan_complete", !self.budget_exhausted)?;
-        result.set_item(
-            "logical_resolution_complete",
-            self.logical_resolution_complete
-                || (!resolutions.is_empty()
-                    && self.candidates.iter().all(|candidate| {
-                        candidate.candidate_kind != "logical_archive"
-                            || candidate.boundary_kind == "exact"
-                            || resolutions
-                                .get(&candidate.offset)
-                                .is_some_and(|r| r.end_offset.is_some())
-                    })),
-        )?;
-        result.set_item("file_size", self.file_size)?;
-        result.set_item("read_bytes", self.file_size)?;
-        result.set_item("scan_read_bytes", self.scan_read_bytes)?;
-        result.set_item("scan_read_operations", self.scan_read_operations)?;
-        result.set_item("raw_hit_count", self.raw_hit_count)?;
-        result.set_item("budget_exhausted", self.budget_exhausted)?;
-        let hit_rows = PyList::empty(py);
-        for hit in &self.raw_hits {
-            let row = PyDict::new(py);
-            row.set_item("name", hit.hit_name())?;
-            row.set_item(
-                "offset",
-                if hit.kind() == "tar" {
-                    hit.offset() + 257
-                } else {
-                    hit.offset()
-                },
-            )?;
-            row.set_item("source", "detection_embedded_scan")?;
-            hit_rows.append(row)?;
-        }
-        result.set_item("hits", hit_rows)?;
-        let rows = PyList::empty(py);
-        let mut passwords = Vec::new();
-        for candidate in &self.candidates {
-            let resolution = resolutions.get(&candidate.offset);
-            let resolved_end = resolution.and_then(|r| r.end_offset);
-            let row = PyDict::new(py);
-            row.set_item("format", candidate.format)?;
-            row.set_item("offset", candidate.offset)?;
-            row.set_item("end_offset", resolved_end.or(candidate.end_offset))?;
-            if resolved_end.is_some() {
-                row.set_item(
-                    "validation",
-                    format!("{}_decrypted_end", candidate.validation),
-                )?;
-            } else {
-                row.set_item("validation", candidate.validation)?;
-            }
-            row.set_item("candidate_kind", candidate.candidate_kind)?;
-            row.set_item(
-                "volume_candidate",
-                resolution.is_none()
-                    && (candidate.volume_anchor.is_some()
-                        || (candidate.format == "zip" && candidate.end_offset.is_none())),
-            )?;
-            row.set_item(
-                "boundary_kind",
-                if resolved_end.is_some() {
-                    "exact"
-                } else {
-                    candidate.boundary_kind
-                },
-            )?;
-            row.set_item(
-                "extractable",
-                resolved_end.is_some() || candidate.extractable,
-            )?;
-            if let Some(resolution) = resolution {
-                if let Some(reason) = resolution.failure_reason {
-                    row.set_item("discovery_failure_reason", reason)?;
-                }
-                if let Some(password) = resolution.password {
-                    passwords.push((candidate.offset, password));
-                }
-            }
-            if let Some(offset) = candidate.zip_eocd_offset {
-                row.set_item("eocd_offset", offset)?;
-            }
-            if let Some(index) = &candidate.lz4_index {
-                row.set_item("error", index.error)?;
-            }
-            rows.append(row)?;
-        }
-        result.set_item("candidates", rows)?;
-        if !passwords.is_empty() {
-            result.set_item("resolved_passwords", passwords)?;
-        }
-        Ok(result.unbind())
+    pub(crate) fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    pub(crate) fn signature_scan_complete(&self) -> bool {
+        !self.budget_exhausted
+    }
+
+    pub(crate) fn logical_resolution_complete(&self) -> bool {
+        self.logical_resolution_complete
+    }
+
+    pub(crate) fn signature_hits(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        self.raw_hits.iter().map(|hit| {
+            (
+                hit.hit_name(),
+                hit.offset() + if hit.kind() == "tar" { 257 } else { 0 },
+            )
+        })
     }
 }
 
@@ -474,12 +393,10 @@ pub(crate) fn scan_detected_lz4(path: &str, parallel_files: usize) -> io::Result
 /// Raw signatures are never returned directly: each hit must pass the format's
 /// structural header checks. The scan deliberately has no hit or byte budget;
 /// callers select which files receive this reliable pass before invoking it.
-#[pyfunction]
-pub(crate) fn scan_embedded_archives(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
-    let owned_path = path.to_owned();
-    let reader = py.detach(move || ManagedReader::open(&owned_path))?;
+#[cfg(test)]
+fn scan_embedded_archives(path: &str) -> io::Result<NativeScanResult> {
+    let reader = ManagedReader::open(path)?;
     scan_embedded_archives_with_reader(
-        py,
         &reader,
         DEFAULT_IOCP_CHUNK_SIZE,
         DEFAULT_IOCP_BUFFERS,
@@ -487,28 +404,26 @@ pub(crate) fn scan_embedded_archives(py: Python<'_>, path: &str) -> PyResult<Py<
     )
 }
 
-pub(crate) fn scan_embedded_archives_with_reader(
-    py: Python<'_>,
+#[cfg(test)]
+fn scan_embedded_archives_with_reader(
     reader: &ManagedReader,
     iocp_chunk_bytes: usize,
     iocp_buffers: usize,
     iocp_workers: usize,
-) -> PyResult<Py<PyDict>> {
+) -> io::Result<NativeScanResult> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check()?;
     let reader = reader.clone();
-    let scan = py.detach(move || {
+    let scan = (move || {
         scan_embedded_archives_native_with_iocp(
             reader,
             iocp_chunk_bytes,
             iocp_buffers,
             iocp_workers,
         )
-    });
+    })();
     cancellation.check()?;
-    let scan = scan?;
-
-    scan.to_py_dict(py)
+    scan
 }
 
 fn embedded_matcher() -> &'static AhoCorasick {
@@ -3159,36 +3074,11 @@ mod tests {
         gzip.write_all(b"payload").unwrap();
         data.extend_from_slice(&gzip.finish().unwrap());
         let path = temp_file("embedded_multi", &data);
-        Python::initialize();
-        Python::attach(|py| {
-            let result = scan_embedded_archives(py, path.to_str().unwrap()).unwrap();
-            let bound = result.bind(py);
-            let rows = bound
-                .get_item("candidates")
-                .unwrap()
-                .unwrap()
-                .cast_into::<PyList>()
-                .unwrap();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(
-                rows.get_item(0)
-                    .unwrap()
-                    .get_item("offset")
-                    .unwrap()
-                    .extract::<u64>()
-                    .unwrap(),
-                zip_offset
-            );
-            assert_eq!(
-                rows.get_item(1)
-                    .unwrap()
-                    .get_item("offset")
-                    .unwrap()
-                    .extract::<u64>()
-                    .unwrap(),
-                gzip_offset
-            );
-        });
+        let result = scan_embedded_archives(path.to_str().unwrap()).unwrap();
+        let rows = result.candidates();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].offset, zip_offset);
+        assert_eq!(rows[1].offset, gzip_offset);
         let _ = fs::remove_file(path);
     }
 
@@ -3249,22 +3139,8 @@ mod tests {
         .unwrap();
         assert!(scan.raw_hit_count > 2000);
         assert!(scan.raw_hits.len() <= scan.candidates.len());
-        Python::initialize();
-        Python::attach(|py| {
-            let result = scan.to_py_dict(py).unwrap();
-            let bound = result.bind(py);
-            let rows = bound
-                .get_item("candidates")
-                .unwrap()
-                .unwrap()
-                .cast_into::<PyList>()
-                .unwrap();
-            let formats: Vec<String> = rows
-                .iter()
-                .map(|row| row.get_item("format").unwrap().extract::<String>().unwrap())
-                .collect();
-            assert_eq!(formats, ["bzip2", "xz", "zstd"]);
-        });
+        let formats: Vec<_> = scan.candidates().iter().map(|row| row.format).collect();
+        assert_eq!(formats, ["bzip2", "xz", "zstd"]);
         let _ = fs::remove_file(path);
     }
 
@@ -3356,27 +3232,9 @@ mod tests {
         let mut data = vec![b'x'; gzip_offset];
         data.extend_from_slice(&gzip_bytes);
         let path = temp_file("embedded_cross_boundary", &data);
-        Python::initialize();
-        Python::attach(|py| {
-            let result = scan_embedded_archives(py, path.to_str().unwrap()).unwrap();
-            let bound = result.bind(py);
-            let rows = bound
-                .get_item("candidates")
-                .unwrap()
-                .unwrap()
-                .cast_into::<PyList>()
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows.get_item(0)
-                    .unwrap()
-                    .get_item("offset")
-                    .unwrap()
-                    .extract::<u64>()
-                    .unwrap(),
-                gzip_offset as u64
-            );
-        });
+        let result = scan_embedded_archives(path.to_str().unwrap()).unwrap();
+        assert_eq!(result.candidates().len(), 1);
+        assert_eq!(result.candidates()[0].offset, gzip_offset as u64);
         let _ = fs::remove_file(path);
     }
 

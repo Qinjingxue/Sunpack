@@ -1,456 +1,379 @@
-//! Parse one sevenzip worker binary frame straight into Python objects.
-//!
-//! Per-item manifest and trace chunks are decoded directly into Rust-owned
-//! tables. A job accumulator moves them into the final native_rows/native_items
-//! objects while only event envelopes and result summaries become Python dicts.
-
+//! Binary worker envelopes and typed manifest and trace chunks.
+use super::worker_wire::{frame_payload, protocol_error, Decoder};
 use crate::scan::directory::{NativeWorkerManifest, OutputFileRecord};
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
-use pyo3::IntoPyObjectExt;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
-use std::fmt;
-use std::sync::Arc;
+use serde_json::{json, Map, Value};
+use std::{fmt, io};
 
-/// One item from a worker trace chunk.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OutputTraceItem {
-    pub(crate) index: u32,
-    pub(crate) path: String,
-    pub(crate) output_path: String,
-    pub(crate) is_dir: bool,
-    pub(crate) encrypted: bool,
-    pub(crate) bytes_written: u64,
-    pub(crate) expected_size: u64,
-    pub(crate) has_expected_size: bool,
-    pub(crate) source_crc32: u32,
-    pub(crate) has_source_crc32: bool,
-    pub(crate) output_crc32: u32,
-    pub(crate) has_output_crc32: bool,
-    pub(crate) crc_verified: bool,
-    pub(crate) operation_result: i64,
-    pub(crate) operation_result_name: String,
-    pub(crate) hresult: i64,
-    pub(crate) win32_error: i64,
-    pub(crate) done: bool,
-    pub(crate) failed: bool,
+/// The scheduler only needs verified file counts for partial recovery.
+#[derive(Default)]
+struct TraceCounts {
+    items: usize,
+    complete_files: usize,
 }
 
-/// Rust-owned output trace table of one worker result.
-#[pyclass(module = "sunpack_native", frozen)]
-pub(crate) struct NativeOutputTrace {
-    items: Arc<Vec<OutputTraceItem>>,
-}
-
-impl NativeOutputTrace {
-    pub(crate) fn items(&self) -> &Arc<Vec<OutputTraceItem>> {
-        &self.items
-    }
-}
-
-#[pymethods]
-impl NativeOutputTrace {
-    fn __len__(&self) -> usize {
-        self.items.len()
-    }
-
-    /// True when any traced item wrote bytes or reached an unfailed path.
-    fn has_progress(&self) -> bool {
-        self.items
-            .iter()
-            .any(|item| item.bytes_written > 0 || (!item.path.is_empty() && !item.failed))
-    }
-
-    #[pyo3(signature = (offset=0, limit=128))]
-    fn item_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<Py<PyDict>>> {
-        if limit == 0 || offset >= self.items.len() {
-            return Ok(Vec::new());
+impl<'de> Deserialize<'de> for TraceCounts {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Item<'a> {
+            #[serde(rename = "index")]
+            _index: u32,
+            #[serde(rename = "path")]
+            _path: &'a str,
+            #[serde(rename = "output_path")]
+            _output_path: &'a str,
+            is_dir: bool,
+            #[serde(rename = "encrypted")]
+            _encrypted: bool,
+            #[serde(rename = "bytes_written")]
+            _bytes_written: u64,
+            #[serde(rename = "expected_size")]
+            _expected_size: u64,
+            #[serde(rename = "has_expected_size")]
+            _has_expected_size: bool,
+            #[serde(rename = "source_crc32")]
+            _source_crc32: u32,
+            #[serde(rename = "has_source_crc32")]
+            _has_source_crc32: bool,
+            #[serde(rename = "output_crc32")]
+            _output_crc32: u32,
+            #[serde(rename = "has_output_crc32")]
+            _has_output_crc32: bool,
+            #[serde(rename = "crc_verified")]
+            _crc_verified: bool,
+            operation_result: i64,
+            #[serde(rename = "operation_result_name")]
+            _operation_result_name: &'a str,
+            #[serde(rename = "hresult")]
+            _hresult: i64,
+            #[serde(rename = "win32_error")]
+            _win32_error: i64,
+            done: bool,
+            failed: bool,
         }
-        let end = offset.saturating_add(limit).min(self.items.len());
-        self.items[offset..end]
-            .iter()
-            .map(|item| {
-                let row = PyDict::new(py);
-                row.set_item("index", item.index)?;
-                row.set_item("path", &item.path)?;
-                row.set_item("output_path", &item.output_path)?;
-                row.set_item("is_dir", item.is_dir)?;
-                row.set_item("encrypted", item.encrypted)?;
-                row.set_item("bytes_written", item.bytes_written)?;
-                row.set_item("expected_size", item.expected_size)?;
-                row.set_item("has_expected_size", item.has_expected_size)?;
-                row.set_item("source_crc32", item.source_crc32)?;
-                row.set_item("has_source_crc32", item.has_source_crc32)?;
-                row.set_item("output_crc32", item.output_crc32)?;
-                row.set_item("has_output_crc32", item.has_output_crc32)?;
-                row.set_item("crc_verified", item.crc_verified)?;
-                row.set_item("operation_result", item.operation_result)?;
-                row.set_item("operation_result_name", &item.operation_result_name)?;
-                row.set_item("hresult", item.hresult)?;
-                row.set_item("win32_error", item.win32_error)?;
-                row.set_item("done", item.done)?;
-                row.set_item("failed", item.failed)?;
-                Ok(row.unbind())
-            })
-            .collect()
-    }
-}
 
-/// Decode a complete binary frame directly into native tables and a small envelope.
-#[pyfunction]
-pub(crate) fn parse_worker_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<PyDict>> {
-    parse_worker_payload(py, super::worker_wire::frame_payload(frame)?)
-}
+        struct TraceVisitor;
+        impl<'de> Visitor<'de> for TraceVisitor {
+            type Value = TraceCounts;
 
-fn parse_worker_payload(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyDict>> {
-    let mut decoder = super::worker_wire::Decoder::new(data);
-    let value = PySeed {
-        py,
-        scope: Scope::Root,
-    }
-    .deserialize(&mut decoder)?;
-    if !decoder.data.is_empty() {
-        return Err(PyValueError::new_err("trailing worker value"));
-    }
-    Ok(value.into_bound(py).cast_into::<PyDict>()?.unbind())
-}
-
-/// A valid frame boundary permits a bad job body to be isolated. A broken
-/// header/length cannot be routed safely and aborts the shared transport.
-#[pyfunction]
-pub(crate) fn parse_worker_transport_event(py: Python<'_>, frame: &[u8]) -> PyResult<Py<PyDict>> {
-    let data = super::worker_wire::frame_payload(frame)?;
-    match parse_worker_payload(py, data) {
-        Ok(event) => Ok(event),
-        Err(error) => {
-            let job_id = super::worker_wire::Decoder::new(data)
-                .routing_job_id()
-                .ok()
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    PyValueError::new_err(format!("unattributable worker protocol error: {error}"))
-                })?;
-            let event = PyDict::new(py);
-            event.set_item("type", "protocol_error")?;
-            event.set_item("job_id", job_id)?;
-            event.set_item("message", format!("malformed worker event: {error}"))?;
-            Ok(event.unbind())
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    Root,
-    Manifest,
-    Diagnostics,
-    OutputTrace,
-    Plain,
-}
-
-struct PySeed<'py> {
-    py: Python<'py>,
-    scope: Scope,
-}
-
-fn py_error<E: de::Error>(error: PyErr) -> E {
-    E::custom(error.to_string())
-}
-
-impl<'de, 'py> DeserializeSeed<'de> for PySeed<'py> {
-    type Value = Py<PyAny>;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_any(self)
-    }
-}
-
-impl<'de, 'py> Visitor<'de> for PySeed<'py> {
-    type Value = Py<PyAny>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a binary worker value")
-    }
-
-    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-        value.into_py_any(self.py).map_err(py_error)
-    }
-
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-        value.into_py_any(self.py).map_err(py_error)
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-        value.into_py_any(self.py).map_err(py_error)
-    }
-
-    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-        value.into_py_any(self.py).map_err(py_error)
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(PyString::new(self.py, value).into_any().unbind())
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(self.py.None())
-    }
-
-    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(self.py.None())
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let list = PyList::empty(self.py);
-        while let Some(value) = seq.next_element_seed(PySeed {
-            py: self.py,
-            scope: Scope::Plain,
-        })? {
-            list.append(value).map_err(py_error)?;
-        }
-        Ok(list.into_any().unbind())
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let py = self.py;
-        let dict = PyDict::new(py);
-        while let Some(key) = map.next_key::<&str>()? {
-            match (self.scope, key) {
-                (Scope::Manifest, "rows") | (Scope::OutputTrace, "items") => {
-                    return Err(de::Error::custom(
-                        "worker result details must arrive in chunks",
-                    ));
-                }
-                (Scope::Manifest, "inventory") => {
-                    let [complete, files, dirs, size, identity_paths] =
-                        map.next_value::<[u64; 5]>()?;
-                    let summary = PyDict::new(py);
-                    summary
-                        .set_item("complete", complete != 0)
-                        .map_err(py_error)?;
-                    summary.set_item("file_count", files).map_err(py_error)?;
-                    summary.set_item("dir_count", dirs).map_err(py_error)?;
-                    summary.set_item("total_size", size).map_err(py_error)?;
-                    summary
-                        .set_item("identity_paths", identity_paths != 0)
-                        .map_err(py_error)?;
-                    dict.set_item("inventory", summary).map_err(py_error)?;
-                    continue;
-                }
-                (Scope::Root, "rows") => {
-                    let chunk = WorkerChunk {
-                        data: Some(ChunkData::Manifest(map.next_value::<WorkerRows>()?.0)),
-                    };
-                    dict.set_item("native_chunk", Py::new(py, chunk).map_err(py_error)?)
-                        .map_err(py_error)?;
-                    continue;
-                }
-                (Scope::Root, "items") => {
-                    let chunk = WorkerChunk {
-                        data: Some(ChunkData::Trace(map.next_value::<Vec<OutputTraceItem>>()?)),
-                    };
-                    dict.set_item("native_chunk", Py::new(py, chunk).map_err(py_error)?)
-                        .map_err(py_error)?;
-                    continue;
-                }
-                _ => {}
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("worker output trace items")
             }
-            let child = match (self.scope, key) {
-                (Scope::Root, "verified_manifest") => Scope::Manifest,
-                (Scope::Root, "diagnostics") => Scope::Diagnostics,
-                (Scope::Diagnostics, "output_trace") => Scope::OutputTrace,
-                _ => Scope::Plain,
-            };
-            let value = map.next_value_seed(PySeed { py, scope: child })?;
-            dict.set_item(key, value).map_err(py_error)?;
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<TraceCounts, A::Error> {
+                let mut trace = TraceCounts::default();
+                while let Some(item) = seq.next_element::<Item>()? {
+                    trace.items += 1;
+                    trace.complete_files += usize::from(
+                        !item.is_dir && item.done && !item.failed && item.operation_result == 0,
+                    );
+                }
+                Ok(trace)
+            }
         }
-        Ok(dict.into_any().unbind())
+
+        deserializer.deserialize_seq(TraceVisitor)
     }
 }
 
 enum ChunkData {
     Manifest(Vec<OutputFileRecord>),
-    Trace(Vec<OutputTraceItem>),
+    Trace(TraceCounts),
 }
 
-#[pyclass]
-struct WorkerChunk {
-    data: Option<ChunkData>,
+pub(crate) struct WorkerFrame {
+    pub(crate) summary: Value,
+    pub(crate) manifest: Option<NativeWorkerManifest>,
+    pub(crate) traced_complete_files: Option<usize>,
+    chunk: Option<ChunkData>,
+    manifest_inventory: Option<[u64; 5]>,
 }
 
-/// Transport-only storage. Chunk vectors are moved into the job's tables;
-/// finalization moves those tables into the existing immutable native objects.
-#[pyclass(module = "sunpack_native")]
+impl WorkerFrame {
+    fn envelope(summary: Value) -> Self {
+        Self {
+            summary,
+            manifest: None,
+            traced_complete_files: None,
+            chunk: None,
+            manifest_inventory: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerFrame {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EnvelopeVisitor;
+        impl<'de> Visitor<'de> for EnvelopeVisitor {
+            type Value = WorkerFrame;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("worker event object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<WorkerFrame, A::Error> {
+                let mut fields = Map::new();
+                let mut chunk = None;
+                let mut manifest_inventory = None;
+                while let Some(key) = map.next_key::<&str>()? {
+                    let decoded = match key {
+                        "rows" => ChunkData::Manifest(map.next_value::<WorkerRows>()?.0),
+                        "items" => ChunkData::Trace(map.next_value()?),
+                        "verified_manifest" => {
+                            let section = map.next_value_seed(SummarySection::Manifest)?;
+                            manifest_inventory = section.inventory;
+                            fields.insert(key.to_owned(), Value::Object(section.fields));
+                            continue;
+                        }
+                        "diagnostics" => {
+                            let section = map.next_value_seed(SummarySection::Diagnostics)?;
+                            fields.insert(key.to_owned(), Value::Object(section.fields));
+                            continue;
+                        }
+                        _ => {
+                            fields.insert(key.to_owned(), map.next_value::<Value>()?);
+                            continue;
+                        }
+                    };
+                    if chunk.replace(decoded).is_some() {
+                        return Err(de::Error::custom("worker event contains multiple chunks"));
+                    }
+                }
+
+                let mut frame = WorkerFrame::envelope(Value::Object(fields));
+                frame.chunk = chunk;
+                frame.manifest_inventory = manifest_inventory;
+                Ok(frame)
+            }
+        }
+
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SummarySection {
+    Manifest,
+    Diagnostics,
+    Trace,
+}
+
+struct Summary {
+    fields: Map<String, Value>,
+    inventory: Option<[u64; 5]>,
+}
+
+impl<'de> DeserializeSeed<'de> for SummarySection {
+    type Value = Summary;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Summary, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SummarySection {
+    type Value = Summary;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("worker result summary")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Summary, A::Error> {
+        let mut fields = Map::new();
+        let mut inventory = None;
+        while let Some(key) = map.next_key::<&str>()? {
+            let value = match (self, key) {
+                (Self::Manifest, "rows") | (Self::Trace, "items") => {
+                    return Err(de::Error::custom(
+                        "worker result details must arrive in chunks",
+                    ));
+                }
+                (Self::Manifest, "inventory") => {
+                    let columns = map.next_value::<[u64; 5]>()?;
+                    let [complete, files, dirs, size, identity_paths] = columns;
+                    inventory = Some(columns);
+                    json!({
+                        "complete": complete != 0,
+                        "file_count": files,
+                        "dir_count": dirs,
+                        "total_size": size,
+                        "identity_paths": identity_paths != 0,
+                    })
+                }
+                (Self::Diagnostics, "output_trace") => {
+                    Value::Object(map.next_value_seed(Self::Trace)?.fields)
+                }
+                _ => map.next_value::<Value>()?,
+            };
+            fields.insert(key.to_owned(), value);
+        }
+        Ok(Summary { fields, inventory })
+    }
+}
+
+/// A valid frame boundary lets a bad job body fail only the affected job.
+pub(crate) fn parse_worker_transport_event(frame: &[u8]) -> io::Result<WorkerFrame> {
+    let data = frame_payload(frame)?;
+    let mut decoder = Decoder::new(data);
+    let event = WorkerFrame::deserialize(&mut decoder)
+        .map_err(io::Error::from)
+        .and_then(|event| {
+            if !decoder.data.is_empty() {
+                return Err(protocol_error("trailing worker value"));
+            }
+            Ok(event)
+        });
+    match event {
+        Ok(event) => Ok(event),
+        Err(error) => {
+            let job_id = Decoder::new(data)
+                .routing_job_id()
+                .ok()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    protocol_error(format!("unattributable worker protocol error: {error}"))
+                })?;
+            Ok(WorkerFrame::envelope(json!({
+                "type": "protocol_error",
+                "job_id": job_id,
+                "message": format!("malformed worker event: {error}"),
+            })))
+        }
+    }
+}
+
 pub(crate) struct NativeWorkerResultAccumulator {
     job_id: String,
     manifest_seq: usize,
     trace_seq: usize,
     files: Vec<OutputFileRecord>,
-    items: Vec<OutputTraceItem>,
+    trace: TraceCounts,
     finished: bool,
 }
 
-#[pymethods]
 impl NativeWorkerResultAccumulator {
-    #[new]
-    fn new(job_id: String) -> Self {
+    pub(crate) fn new(job_id: String) -> Self {
         Self {
             job_id,
             manifest_seq: 0,
             trace_seq: 0,
             files: Vec::new(),
-            items: Vec::new(),
+            trace: TraceCounts::default(),
             finished: false,
         }
     }
 
-    /// True for a consumed chunk; result events are finalized in place.
-    fn accept(&mut self, py: Python<'_>, payload: &Bound<'_, PyDict>) -> PyResult<bool> {
-        let kind_value = payload
-            .get_item("type")?
-            .ok_or_else(|| PyValueError::new_err("worker event type missing"))?;
-        let kind = kind_value.cast::<PyString>()?.to_str()?;
+    /// Chunks are consumed. A result moves the accumulated tables into its envelope.
+    pub(crate) fn accept(&mut self, mut frame: WorkerFrame) -> io::Result<Option<WorkerFrame>> {
+        let payload = &mut frame.summary;
+        let kind = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| protocol_error("worker event type missing"))?;
         if !matches!(kind, "manifest_chunk" | "trace_chunk" | "result") {
-            return Ok(false);
+            return Ok(Some(frame));
         }
         if self.finished {
-            return Err(PyValueError::new_err("worker data received after result"));
+            return Err(protocol_error("worker data received after result"));
         }
-        let job_id_value = payload
-            .get_item("job_id")?
-            .ok_or_else(|| PyValueError::new_err("worker job_id missing"))?;
-        let job_id = job_id_value.cast::<PyString>()?.to_str()?;
-        if job_id != self.job_id {
-            return Err(PyValueError::new_err("worker chunk belongs to another job"));
+        if payload.get("job_id").and_then(Value::as_str) != Some(self.job_id.as_str()) {
+            return Err(protocol_error("worker chunk belongs to another job"));
         }
         if kind != "result" {
-            let seq = payload
-                .get_item("seq")?
-                .ok_or_else(|| PyValueError::new_err("worker chunk sequence missing"))?
-                .extract::<usize>()?;
+            let seq = count(payload, "seq")?;
             let expected = if kind == "manifest_chunk" {
                 self.manifest_seq
             } else {
                 self.trace_seq
             };
             if seq != expected {
-                return Err(PyValueError::new_err(format!(
+                return Err(protocol_error(format!(
                     "{kind} sequence {seq}, expected {expected}"
                 )));
             }
-            let chunk = payload
-                .get_item("native_chunk")?
-                .ok_or_else(|| PyValueError::new_err("worker chunk data missing"))?;
-            let mut chunk = chunk.extract::<PyRefMut<'_, WorkerChunk>>()?;
-            match chunk.data.take() {
-                Some(ChunkData::Manifest(mut files)) if kind == "manifest_chunk" => {
-                    if self.files.is_empty() {
-                        self.files = files;
-                    } else {
-                        self.files.append(&mut files);
-                    }
+            match frame.chunk {
+                Some(ChunkData::Manifest(files)) if kind == "manifest_chunk" => {
+                    append_chunk(&mut self.files, files);
                     self.manifest_seq += 1;
                 }
-                Some(ChunkData::Trace(mut items)) if kind == "trace_chunk" => {
-                    if self.items.is_empty() {
-                        self.items = items;
-                    } else {
-                        self.items.append(&mut items);
-                    }
+                Some(ChunkData::Trace(trace)) if kind == "trace_chunk" => {
+                    self.trace.items += trace.items;
+                    self.trace.complete_files += trace.complete_files;
                     self.trace_seq += 1;
                 }
-                _ => return Err(PyValueError::new_err("worker chunk data type mismatch")),
+                _ => return Err(protocol_error("worker chunk data type mismatch")),
             }
-            return Ok(true);
+            return Ok(None);
         }
 
-        let manifest = payload.get_item("verified_manifest")?;
+        let manifest = payload.get("verified_manifest");
         let trace = payload
-            .get_item("diagnostics")?
-            .map(|value| value.cast_into::<PyDict>())
-            .transpose()?
-            .map(|dict| dict.get_item("output_trace"))
-            .transpose()?
-            .flatten();
-        if let Some(manifest) = &manifest {
-            let manifest = manifest.cast::<PyDict>()?;
-            check_chunk_summary(manifest, self.manifest_seq, self.files.len(), "file_count")?;
-        } else if self.manifest_seq != 0 {
-            return Err(PyValueError::new_err(
-                "manifest chunks have no result summary",
-            ));
+            .get("diagnostics")
+            .and_then(|d| d.get("output_trace"));
+        check_chunk_summary(manifest, self.manifest_seq, self.files.len(), "file_count")?;
+        check_chunk_summary(trace, self.trace_seq, self.trace.items, "item_count")?;
+        if let Some(manifest) = payload
+            .get_mut("verified_manifest")
+            .and_then(Value::as_object_mut)
+        {
+            let columns = frame
+                .manifest_inventory
+                .ok_or_else(|| protocol_error("manifest inventory missing"))?;
+            frame.manifest = Some(NativeWorkerManifest::from_parts(
+                std::mem::take(&mut self.files),
+                columns,
+            )?);
+            manifest.remove("chunk_count");
         }
-        if let Some(trace) = &trace {
-            check_chunk_summary(
-                trace.cast::<PyDict>()?,
-                self.trace_seq,
-                self.items.len(),
-                "item_count",
-            )?;
-        } else if self.trace_seq != 0 {
-            return Err(PyValueError::new_err("trace chunks have no result summary"));
-        }
-
-        if let Some(manifest) = manifest {
-            let manifest = manifest.cast::<PyDict>()?;
-            let inventory = manifest
-                .get_item("inventory")?
-                .ok_or_else(|| PyValueError::new_err("manifest inventory missing"))?;
-            let inventory = inventory.cast::<PyDict>()?;
-            let field = |key: &str| {
-                inventory.get_item(key)?.ok_or_else(|| {
-                    PyValueError::new_err(format!("manifest inventory {key} missing"))
-                })
-            };
-            let columns = [
-                u64::from(field("complete")?.is_truthy()?),
-                field("file_count")?.extract::<u64>()?,
-                field("dir_count")?.extract::<u64>()?,
-                field("total_size")?.extract::<u64>()?,
-                u64::from(field("identity_paths")?.is_truthy()?),
-            ];
-            let native =
-                NativeWorkerManifest::from_parts(std::mem::take(&mut self.files), columns)?;
-            manifest.set_item("native_rows", Py::new(py, native)?)?;
-            manifest.del_item("chunk_count")?;
-        }
-        if let Some(trace) = trace {
-            let trace = trace.cast::<PyDict>()?;
-            trace.set_item(
-                "native_items",
-                Py::new(
-                    py,
-                    NativeOutputTrace {
-                        items: Arc::new(std::mem::take(&mut self.items)),
-                    },
-                )?,
-            )?;
-            trace.del_item("chunk_count")?;
-            trace.del_item("item_count")?;
+        if let Some(trace) = payload
+            .get_mut("diagnostics")
+            .and_then(|d| d.get_mut("output_trace"))
+            .and_then(Value::as_object_mut)
+        {
+            if self.trace.items != 0 {
+                frame.traced_complete_files = Some(self.trace.complete_files);
+            }
+            trace.remove("chunk_count");
+            trace.remove("item_count");
         }
         self.finished = true;
-        Ok(false)
+        Ok(Some(frame))
     }
 }
 
+fn append_chunk<T>(table: &mut Vec<T>, mut chunk: Vec<T>) {
+    if table.is_empty() {
+        *table = chunk;
+    } else {
+        table.append(&mut chunk);
+    }
+}
+
+fn count(value: &Value, key: &str) -> io::Result<usize> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| protocol_error(format!("missing or invalid worker field {key}")))
+}
+
 fn check_chunk_summary(
-    dict: &Bound<'_, PyDict>,
+    summary: Option<&Value>,
     chunks: usize,
     rows: usize,
     count_key: &str,
-) -> PyResult<()> {
-    let count = |key: &str| -> PyResult<usize> {
-        dict.get_item(key)?
-            .ok_or_else(|| PyValueError::new_err(format!("worker summary {key} missing")))?
-            .extract()
-    };
-    if count("chunk_count")? != chunks || count(count_key)? != rows {
-        return Err(PyValueError::new_err("worker chunk summary count mismatch"));
+) -> io::Result<()> {
+    match summary {
+        Some(summary)
+            if count(summary, "chunk_count")? == chunks && count(summary, count_key)? == rows =>
+        {
+            Ok(())
+        }
+        None if chunks == 0 => Ok(()),
+        _ => Err(protocol_error("worker chunk summary count mismatch")),
     }
-    Ok(())
 }
 
 /// One fixed 14-column array per regular file in the worker manifest.
@@ -541,5 +464,88 @@ impl<'de> Deserialize<'de> for MagicBytes {
             }
         }
         deserializer.deserialize_bytes(BytesVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::worker_wire::encode_worker_frame;
+
+    fn manifest_frame(job: &str) -> WorkerFrame {
+        let sentinel = "__binary_magic__";
+        let mut bytes = encode_worker_frame(&json!({
+            "type": "manifest_chunk", "job_id": job, "seq": 0,
+            "rows": [[0, job, "renamed.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, sentinel]],
+        }))
+        .unwrap();
+        let body = bytes
+            .windows(sentinel.len())
+            .position(|part| part == sentinel.as_bytes())
+            .unwrap();
+        bytes.splice(
+            body - 5..body + sentinel.len(),
+            [8, 3, 0, 0, 0, b'a', b'b', b'c'],
+        );
+        let size = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&size.to_le_bytes());
+        parse_worker_transport_event(&bytes).unwrap()
+    }
+
+    fn result_frame(job: &str, files: u64) -> WorkerFrame {
+        parse_worker_transport_event(
+            &encode_worker_frame(&json!({
+                "type": "result", "job_id": job,
+                "verified_manifest": {
+                    "file_count": files, "inventory": [1, files, 0, 3, 0],
+                    "chunk_count": 1,
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn worker_chunks_move_into_their_own_result_only() {
+        let mut first = NativeWorkerResultAccumulator::new("first".into());
+        let mut second = NativeWorkerResultAccumulator::new("second".into());
+        assert!(second.accept(manifest_frame("second")).unwrap().is_none());
+        assert!(first.accept(manifest_frame("first")).unwrap().is_none());
+        let Err(duplicate) = first.accept(manifest_frame("first")) else {
+            panic!("duplicate chunk")
+        };
+        assert!(duplicate.to_string().contains("sequence"));
+        let Err(mismatch) = first.accept(result_frame("first", 2)) else {
+            panic!("bad count")
+        };
+        assert!(mismatch.to_string().contains("count mismatch"));
+        for (job, accumulator) in [("first", first), ("second", second)] {
+            let manifest = { accumulator }
+                .accept(result_frame(job, 1))
+                .unwrap()
+                .unwrap()
+                .manifest
+                .unwrap();
+            assert!(manifest.complete());
+            let row = &manifest.records()[0];
+            assert_eq!(row.path, job);
+            assert_eq!(row.output_path.as_deref(), Some("renamed.txt"));
+            assert_eq!(row.magic, b"abc");
+            assert_eq!(row.mtime_ns, Some(123));
+        }
+    }
+
+    #[test]
+    fn malformed_job_body_does_not_break_frame_routing() {
+        let malformed = encode_worker_frame(&json!({
+            "type": "result", "job_id": "malformed",
+            "diagnostics": {"output_trace": {"items": []}},
+        }))
+        .unwrap();
+        let event = parse_worker_transport_event(&malformed).unwrap();
+        assert_eq!(event.summary["type"], "protocol_error");
+        assert_eq!(event.summary["job_id"], "malformed");
+        assert!(parse_worker_transport_event(b"broken stream").is_err());
     }
 }

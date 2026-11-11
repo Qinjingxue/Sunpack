@@ -2,14 +2,6 @@
 
 [English](../cli_parameters.md) | **简体中文**
 
-入口脚本：
-
-```powershell
-python sunpack.py <command> [options] [paths...]
-```
-
-打包后的 Windows 程序通常可直接使用：
-
 ```powershell
 sunpack.exe <command> [options] [paths...]
 ```
@@ -65,7 +57,7 @@ JSON 的 `summary.scan_error_count` 统计文件系统扫描错误，包括省�
 用法：
 
 ```powershell
-python sunpack.py extract [options] <paths...>
+sunpack.exe extract [options] <paths...>
 ```
 
 `paths` 可以是一个或多个文件、目录。目录按配置扫描并生成解压任务。
@@ -97,12 +89,12 @@ python sunpack.py extract [options] <paths...>
 示例：
 
 ```powershell
-python sunpack.py extract D:\Downloads
-python sunpack.py extract D:\A.7z -p 123456 -p secret
-python sunpack.py extract D:\Archives --pw-file .\passwords.txt --cleanup r
-python sunpack.py extract D:\Nested --recur * --no-flatten
-python sunpack.py extract --direct-file D:\MaybeArchive.bin
-python sunpack.py extract D:\Archives -o E:\Unpacked
+sunpack.exe extract D:\Downloads
+sunpack.exe extract D:\A.7z -p 123456 -p secret
+sunpack.exe extract D:\Archives --pw-file .\passwords.txt --cleanup r
+sunpack.exe extract D:\Nested --recur * --no-flatten
+sunpack.exe extract --direct-file D:\MaybeArchive.bin
+sunpack.exe extract D:\Archives -o E:\Unpacked
 ```
 
 退出码：
@@ -120,7 +112,7 @@ python sunpack.py extract D:\Archives -o E:\Unpacked
 用法：
 
 ```powershell
-python sunpack.py scan [options] <paths...>
+sunpack.exe scan [options] <paths...>
 ```
 
 `scan` 复用 extract 的发现、输入规划和密码确认流程，按物理文件和逻辑段列出本次取得的格式、范围、分卷、密码及错误。普通压缩包省略范围；载体标注 `[起点, 终点)`，未知终点用 `?`，多段以树形展示。未取得的信息省略；已知加密但未找到密码时显示“密码：未在密码表中”，不重复输出密码报错，确认的密码直接显示。
@@ -134,9 +126,9 @@ python sunpack.py scan [options] <paths...>
 示例：
 
 ```powershell
-python sunpack.py scan D:\Downloads
-python sunpack.py scan D:\Downloads --deep-detect --json
-python sunpack.py scan D:\Downloads -v
+sunpack.exe scan D:\Downloads
+sunpack.exe scan D:\Downloads --deep-detect --json
+sunpack.exe scan D:\Downloads -v
 ```
 
 ## watch
@@ -144,7 +136,7 @@ python sunpack.py scan D:\Downloads -v
 用法：
 
 ```powershell
-python sunpack.py watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
+sunpack.exe watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
 ```
 
 监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned | recursive`，后四列可省略：
@@ -197,7 +189,7 @@ sunpack.exe watch add D:\Downloads --deep-detect --start
 用法：
 
 ```powershell
-python sunpack.py passwords [options]
+sunpack.exe passwords [options]
 ```
 
 参数：
@@ -215,9 +207,9 @@ python sunpack.py passwords [options]
 示例：
 
 ```powershell
-python sunpack.py passwords
-python sunpack.py passwords -p 123456 --no-builtin-pw
-python sunpack.py passwords --pw-file .\passwords.txt --json
+sunpack.exe passwords
+sunpack.exe passwords -p 123456 --no-builtin-pw
+sunpack.exe passwords --pw-file .\passwords.txt --json
 ```
 
 ## config
@@ -225,7 +217,7 @@ python sunpack.py passwords --pw-file .\passwords.txt --json
 用法：
 
 ```powershell
-python sunpack.py config [options] <show|validate>
+sunpack.exe config [options] <show|validate>
 ```
 
 | 子命令 | 说明 |
@@ -242,9 +234,9 @@ python sunpack.py config [options] <show|validate>
 示例：
 
 ```powershell
-python sunpack.py config show
-python sunpack.py config validate
-python sunpack.py config validate --json
+sunpack.exe config show
+sunpack.exe config validate
+sunpack.exe config validate --json
 ```
 
 ## doctor
@@ -252,8 +244,8 @@ python sunpack.py config validate --json
 用法：
 
 ```powershell
-python sunpack.py doctor [--json]
-python sunpack.py d [-j]
+sunpack.exe doctor [--json]
+sunpack.exe d [-j]
 ```
 
 `doctor` 只读检查配置、原生扩展、`7z.dll`、SevenZip worker、Windows 通知能力以及已配置的监控根。不存在的监控根报告为警告；命令不会启动持续监控或真实解压，也不会修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码为 `0`。
@@ -263,7 +255,7 @@ python sunpack.py d [-j]
 用法：
 
 ```powershell
-python sunpack.py version
+sunpack.exe version
 ```
 
 `version` 读取当前运行的 SunPack 可执行文件同目录下的 `VERSION.txt`，并输出 `version=` 后的版本号。打包后的程序也可直接使用 `sunpack.exe version`。
@@ -277,7 +269,7 @@ python sunpack.py version
 .\scripts\unregister_context_menu.ps1
 ```
 
-发行包内的注册脚本使用脚本父目录中的 `sunpack.exe`。从源码树运行时，脚本会识别唯一的 `dist/sunpack-*/sunpack.exe`；存在多个构建产物时使用 `-AppPath` 明确指定。找不到打包程序时使用 `python sunpack.py`。
+发行包内的注册脚本使用脚本父目录中的 `sunpack.exe`。从源码树运行时，脚本会识别唯一的 `dist/sunpack-*/sunpack.exe`；存在多个构建产物时使用 `-AppPath` 明确指定。
 
 文件夹对象菜单提供“解压该目录下文件”“输入密码解压该目录下文件”，目录空白处菜单提供“解压目录下文件”“输入密码解压目录下文件”；两者还提供监控和取消监控动作。任意文件的菜单提供“解压该文件”“输入密码解压该文件”，对应命令分别相当于：
 

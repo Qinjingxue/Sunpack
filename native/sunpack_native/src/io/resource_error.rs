@@ -35,10 +35,10 @@ pub(crate) fn zeroed_bytes(len: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(crate) fn to_py_error(error: io::Error) -> pyo3::PyErr {
-    if is_memory_error(&error) {
-        pyo3::exceptions::PyMemoryError::new_err(error.to_string())
+pub(crate) fn to_io_error(error: io::Error) -> io::Error {
+    if error.kind() != io::ErrorKind::OutOfMemory && is_memory_error(&error) {
+        io::Error::new(io::ErrorKind::OutOfMemory, error)
     } else {
-        error.into()
+        error
     }
 }

@@ -1,15 +1,16 @@
 // Canonical archive analysis report.
 //
 // This is the only place that turns format probes into evidence,
-// segment boundaries, selection, and the extraction segment plan. Python only
-// projects the returned report into its task contracts.
+// segment boundaries, selection, and the extraction segment plan.
 
 use crate::analysis_native::structure::{
     has_compression_stream_header, inspect_compression_stream_reader,
 };
+use crate::io::archive_state::{AnalysisFacts, ArchiveInput, OpenMode, VolumeCompleteness};
 use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::reader::FileIdentity;
-use pyo3::types::PyTuple;
+use crate::io::reader::ReaderStats;
+use crate::scan::embedded::{EmbeddedCandidate, NativeScanResult};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -79,54 +80,50 @@ struct ModuleConfig {
 }
 
 /// Parsed analysis configuration, built once per engine and shared by calls.
-#[pyclass(frozen)]
 pub(crate) struct NativeAnalysisConfig {
     modules: Vec<ModuleConfig>,
 }
 
-#[pymethods]
 impl NativeAnalysisConfig {
-    #[new]
-    fn new(config: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let mut modules: Vec<ModuleConfig> = Vec::new();
-        if let Some(items) = config.get_item("modules")? {
-            if let Ok(items) = items.cast::<PyList>() {
-                for item in items.iter() {
-                    let Ok(item) = item.cast::<PyDict>() else {
-                        continue;
-                    };
-                    let enabled = match item.get_item("enabled")? {
-                        Some(value) => value.is_truthy()?,
-                        None => false,
-                    };
-                    let name = str_of(item, "name")?.trim().to_string();
-                    if !enabled || name.is_empty() {
-                        continue;
-                    }
-                    let Some(kind) = ModuleKind::from_name(&name) else {
-                        continue;
-                    };
-                    let module = ModuleConfig { name, kind };
-                    // A repeated name keeps its first position and last settings.
-                    match modules
-                        .iter_mut()
-                        .find(|existing| existing.name == module.name)
-                    {
-                        Some(existing) => *existing = module,
-                        None => modules.push(module),
-                    }
-                }
+    pub(crate) fn new<T: AsRef<str>>(modules: impl IntoIterator<Item = (T, bool)>) -> Self {
+        let mut ordered: Vec<ModuleConfig> = Vec::new();
+        for (name, enabled) in modules {
+            let name = name.as_ref().trim();
+            let Some(kind) = enabled.then(|| ModuleKind::from_name(name)).flatten() else {
+                continue;
+            };
+            if !ordered.iter().any(|module| module.name == name) {
+                ordered.push(ModuleConfig {
+                    name: name.to_owned(),
+                    kind,
+                });
             }
         }
-        Ok(Self { modules })
+        Self { modules: ordered }
     }
 
-    #[getter]
-    fn module_names(&self) -> Vec<String> {
-        self.modules
-            .iter()
-            .map(|module| module.name.clone())
-            .collect()
+    pub(crate) fn module_names(&self) -> impl Iterator<Item = &str> {
+        self.modules.iter().map(|module| module.name.as_str())
+    }
+}
+
+impl Default for NativeAnalysisConfig {
+    fn default() -> Self {
+        Self::new(
+            [
+                "zip",
+                "rar",
+                "seven_zip",
+                "tar",
+                "gzip",
+                "bzip2",
+                "xz",
+                "zstd",
+                "lz4",
+            ]
+            .into_iter()
+            .map(|name| (name.to_owned(), true)),
+        )
     }
 }
 
@@ -139,6 +136,7 @@ struct Segment {
     end: Option<u64>,
     extractable: bool,
     password_required: Option<bool>,
+    zip_eocd_offset: Option<u64>,
     damage_flags: Vec<String>,
     evidence: Vec<String>,
 }
@@ -150,49 +148,74 @@ impl Segment {
             end,
             extractable: false,
             password_required: None,
+            zip_eocd_offset: None,
             damage_flags,
             evidence,
         }
     }
 }
 
-// Keep typed observations native until the report is exported. External
-// embedded facts already arrive as Python mappings and stay borrowed.
-enum EvidenceDetails<'py> {
+// Structural facts stay typed until a caller asks for diagnostic output.
+enum EvidenceDetails {
     Empty,
-    Python(Bound<'py, PyDict>),
+    Fields(DiagnosticFields),
     Rar(Box<RarReportDetails>),
     SevenZip(Box<SevenZipReportDetails>),
+    Combined(Box<CombinedEvidence>),
 }
 
-impl<'py> From<Bound<'py, PyDict>> for EvidenceDetails<'py> {
-    fn from(value: Bound<'py, PyDict>) -> Self {
-        Self::Python(value)
+struct CombinedEvidence {
+    primary: usize,
+    details: Vec<EvidenceDetails>,
+}
+
+impl From<DiagnosticFields> for EvidenceDetails {
+    fn from(value: DiagnosticFields) -> Self {
+        Self::Fields(value)
     }
 }
 
-impl<'py> EvidenceDetails<'py> {
-    fn to_python(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+impl EvidenceDetails {
+    fn primary(&self) -> &Self {
         match self {
-            Self::Empty => Ok(PyDict::new(py)),
-            Self::Python(value) => Ok(value.clone()),
-            Self::Rar(value) => value.to_python(py),
-            Self::SevenZip(value) => value.to_python(py),
+            Self::Combined(combined) => combined.details[combined.primary].primary(),
+            primary => primary,
         }
     }
 
-    fn password_required(&self) -> PyResult<bool> {
+    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
+        match self {
+            Self::Empty => Ok(DiagnosticFields::new()),
+            Self::Fields(value) => Ok(value.clone()),
+            Self::Rar(value) => value.to_diagnostic(),
+            Self::SevenZip(value) => value.to_diagnostic(),
+            Self::Combined(combined) => {
+                let candidates: Vec<_> = combined
+                    .details
+                    .iter()
+                    .map(Self::to_diagnostic)
+                    .collect::<io::Result<_>>()?;
+                let mut primary = candidates[combined.primary].clone();
+                primary.put("candidate_count", candidates.len())?;
+                primary.put("candidate_details", candidates)?;
+                Ok(primary)
+            }
+        }
+    }
+
+    fn password_required(&self) -> std::io::Result<bool> {
         match self {
             Self::Rar(value) => Ok(value.raw.password_required.unwrap_or(false)),
             Self::SevenZip(value) => Ok(value.raw.password_required),
-            Self::Python(value) => truthy(value, "password_required"),
+            Self::Fields(value) => truthy(value, "password_required"),
             Self::Empty => Ok(false),
+            Self::Combined(combined) => combined.details[combined.primary].password_required(),
         }
     }
 
-    fn embedded_anchor(&self) -> PyResult<bool> {
-        match self {
-            Self::Python(value) if str_of(value, "source")? == "embedded_scan" => {
+    fn embedded_anchor(&self) -> std::io::Result<bool> {
+        match self.primary() {
+            Self::Fields(value) if str_of(value, "source")? == "embedded_scan" => {
                 let kind = str_of(value, "candidate_kind")?;
                 Ok(!kind.is_empty() && kind != "logical_archive")
             }
@@ -201,20 +224,20 @@ impl<'py> EvidenceDetails<'py> {
     }
 }
 
-struct Evidence<'py> {
-    format: String,
-    status: &'static str,
+pub(crate) struct Evidence {
+    pub(crate) format: String,
+    pub(crate) status: &'static str,
     segments: Vec<Segment>,
-    warnings: Vec<String>,
-    details: EvidenceDetails<'py>,
+    pub(crate) warnings: Vec<String>,
+    details: EvidenceDetails,
 }
 
-impl<'py> Evidence<'py> {
+impl Evidence {
     fn new(
         format: &str,
         status: &'static str,
         mut segments: Vec<Segment>,
-        details: impl Into<EvidenceDetails<'py>>,
+        details: impl Into<EvidenceDetails>,
     ) -> Self {
         for segment in &mut segments {
             segment.extractable |= status == "extractable";
@@ -243,7 +266,7 @@ impl<'py> Evidence<'py> {
             .unwrap_or((u64::MAX, std::cmp::Reverse(0)))
     }
 
-    fn not_found(_py: Python<'py>, format: &str) -> Self {
+    fn not_found(format: &str) -> Self {
         Self::new(format, "not_found", Vec::new(), EvidenceDetails::Empty)
     }
 
@@ -283,72 +306,108 @@ struct ReportSignatureHit {
     offset: u64,
 }
 
-fn prepass_dicts<'py>(
-    prepass: &Bound<'py, PyDict>,
-    key: &str,
-) -> PyResult<Vec<Bound<'py, PyDict>>> {
-    let Some(value) = prepass.get_item(key)? else {
-        return Ok(Vec::new());
-    };
-    if value.is_none() {
-        return Ok(Vec::new());
-    }
-    value
-        .try_iter()?
-        .map(|item| item?.cast_into::<PyDict>().map_err(Into::into))
-        .collect()
-}
-
 /// Probe access shared by single-file and multi-volume analysis.
-struct ReportContext<'a, 'py> {
-    py: Python<'py>,
+struct ReportContext<'a> {
     view: &'a AnalysisBinaryView,
     disk_starts: Option<&'a [u64]>,
-    prepass: Bound<'py, PyDict>,
     hits: Arc<[SignatureHit]>,
-    embedded: HashMap<String, Vec<Bound<'py, PyDict>>>,
-    stream_structure: Option<Option<Bound<'py, PyDict>>>,
+    embedded_scan: Option<&'a NativeScanResult>,
+    stream_structure: Option<Option<Arc<DiagnosticFields>>>,
+}
+
+pub(crate) struct AnalysisSegment {
+    pub(crate) format_hint: String,
+    pub(crate) start: u64,
+    pub(crate) end: Option<u64>,
+    pub(crate) zip_eocd_offset: Option<u64>,
+    pub(crate) password_required: bool,
+    pub(crate) damage_flags: Option<Arc<Vec<String>>>,
+}
+
+pub(crate) struct AnalysisReport {
+    pub(crate) format_hint: String,
+    pub(crate) facts: AnalysisFacts,
+    pub(crate) status: &'static str,
+    pub(crate) extractable_segments: Vec<AnalysisSegment>,
+    pub(crate) password_segment: Option<AnalysisSegment>,
+    pub(crate) size: u64,
+    pub(crate) stats: ReaderStats,
+    pub(crate) evidences: Vec<Evidence>,
+}
+
+pub(crate) fn analyze_input(
+    input: &ArchiveInput,
+    config: &NativeAnalysisConfig,
+    initial_prepass: Option<&NativeScanResult>,
+    format_structure: bool,
+) -> io::Result<AnalysisReport> {
+    let cache_bytes = 64 * 1024 * 1024;
+    if input.mode == OpenMode::File || (input.parts.is_empty() && input.ranges.is_empty()) {
+        return AnalysisBinaryView::new(&input.entry_path, cache_bytes)?.analyze(
+            config,
+            initial_prepass,
+            format_structure,
+        );
+    }
+    let extents = if input.mode.structured() {
+        let mut parts: Vec<_> = input.parts.iter().collect();
+        parts.sort_by_key(|part| part.volume_number);
+        parts.into_iter().map(|part| &part.extent).collect()
+    } else {
+        input.physical_extents().collect::<Vec<_>>()
+    };
+    if extents.len() == 1 && extents[0].start == 0 && extents[0].end.is_none() {
+        return AnalysisBinaryView::new(&extents[0].path, cache_bytes)?.analyze(
+            config,
+            initial_prepass,
+            format_structure,
+        );
+    }
+    let (reader, starts) = ManagedReader::open_extents(
+        extents.iter().map(|e| (e.path.as_str(), e.start, e.end)),
+        ReaderConfig { cache_bytes },
+    )?;
+    let view = AnalysisBinaryView { reader };
+    view.analyze_report(
+        config,
+        initial_prepass,
+        format_structure,
+        input.mode.structured().then_some(&starts),
+    )
 }
 
 impl AnalysisBinaryView {
-    pub(crate) fn analyze_report<'py>(
+    pub(crate) fn analyze_report(
         &self,
-        py: Python<'py>,
         config: &NativeAnalysisConfig,
-        initial_prepass: Option<&Bound<'py, PyDict>>,
+        initial_prepass: Option<&NativeScanResult>,
         format_structure: bool,
         disk_starts: Option<&[u64]>,
-    ) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
+    ) -> io::Result<AnalysisReport> {
         let cancellation = Cancellation::current();
         cancellation.check()?;
-        let (prepass, hits) = match initial_prepass {
-            Some(prepass) if !prepass.is_empty() => {
-                let hits = signature_hits_from_prepass(prepass)?;
-                (prepass.copy()?, hits)
-            }
-            _ => {
-                let data = py
-                    .detach(|| signature_prepass_native(&self.reader))
-                    .map_err(reader_error_to_py)?;
-                let hits = Arc::clone(&data.hits);
-                (signature_prepass_to_python(py, data)?.into_bound(py), hits)
-            }
+        let hits = match initial_prepass {
+            Some(scan) => scan
+                .signature_hits()
+                .filter_map(|(name, offset)| {
+                    let pattern = ANALYSIS_SIGNATURES
+                        .iter()
+                        .position(|(item, _)| *item == name)
+                        .or_else(|| {
+                            name.starts_with("zip_")
+                                .then_some(ANALYSIS_SIGNATURES.len() - 1)
+                        })?;
+                    Some(SignatureHit::new(pattern, offset))
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            None => signature_prepass_native(&self.reader).map_err(reader_error)?,
         };
-        let mut embedded: HashMap<String, Vec<Bound<'py, PyDict>>> = HashMap::new();
-        for item in prepass_dicts(&prepass, "embedded_candidates")? {
-            embedded
-                .entry(str_of(&item, "format")?)
-                .or_default()
-                .push(item);
-        }
         let mut context = ReportContext {
-            py,
             view: self,
             disk_starts,
-            prepass,
             hits,
-            embedded,
+            embedded_scan: initial_prepass,
             stream_structure: None,
         };
         let mut evidences = Vec::new();
@@ -358,12 +417,12 @@ impl AnalysisBinaryView {
                 evidences.push(match context.run_module(module) {
                     Ok(evidence) => evidence,
                     Err(error) => {
-                        let message = error.value(py).str()?.to_string();
-                        let details = PyDict::new(py);
-                        details.set_item("message", &message)?;
-                        if error.is_instance_of::<pyo3::exceptions::PyMemoryError>(py) {
-                            details.set_item("error", "out_of_memory")?;
-                            details.set_item("failure_kind", "resource_unavailable")?;
+                        let message = error.to_string();
+                        let mut details = DiagnosticFields::new();
+                        details.put("message", &message)?;
+                        if crate::io::resource_error::is_memory_error(&error) {
+                            details.put("error", "out_of_memory")?;
+                            details.put("failure_kind", "resource_unavailable")?;
                         }
                         Evidence::new(module.kind.format(), "error", Vec::new(), details)
                             .with_warnings(vec![message])
@@ -386,31 +445,60 @@ impl AnalysisBinaryView {
             .iter()
             .copied()
             .min_by_key(|index| evidences[*index].range_key());
-        let sorted = evidences;
-
-        let plan = SegmentPlan::build(&sorted, &selected, size)?;
-        let stats = self.reader.stats()?;
-        let report = PyDict::new(py);
-        report.set_item("size", size)?;
-        report.set_item("prepass", &context.prepass)?;
-        report.set_item("read_bytes", stats.read_bytes)?;
-        report.set_item("cache_hits", stats.cache_hits)?;
-        let py_evidences = PyList::empty(py);
-        for evidence in &sorted {
-            py_evidences.append(evidence_to_python(py, evidence)?)?;
+        let best = best_selected.or_else(|| {
+            evidences
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| status_rank(e.status) != 0)
+                .max_by_key(|(index, e)| (status_rank(e.status), std::cmp::Reverse(*index)))
+                .map(|(i, _)| i)
+        });
+        let plan = SegmentPlan::build(&evidences, &selected, size)?;
+        let to_segment = |(evidence, index): (usize, usize)| -> io::Result<AnalysisSegment> {
+            let evidence = &evidences[evidence];
+            let segment = &evidence.segments[index];
+            Ok(AnalysisSegment {
+                format_hint: evidence.format.clone(),
+                start: segment.start,
+                end: segment.end,
+                zip_eocd_offset: segment.zip_eocd_offset,
+                password_required: segment
+                    .password_required
+                    .unwrap_or(evidence.details.password_required()?),
+                damage_flags: (!segment.damage_flags.is_empty())
+                    .then(|| Arc::new(segment.damage_flags.clone())),
+            })
+        };
+        let extractable_segments = plan
+            .extractable
+            .into_iter()
+            .map(to_segment)
+            .collect::<io::Result<_>>()?;
+        let password_segment = plan.password_segment.map(to_segment).transpose()?;
+        let primary = best.map(|index| &evidences[index]);
+        let mut facts = primary
+            .map(Evidence::analysis_facts)
+            .transpose()?
+            .unwrap_or_default();
+        if !plan.missing_volume_evidence.is_empty() {
+            facts.volume_completeness = Some(VolumeCompleteness::Missing);
+            facts.missing_volume_evidence = Some(plan.missing_volume_evidence.to_owned());
         }
-        report.set_item("evidences", py_evidences)?;
-        report.set_item("selected", selected)?;
-        report.set_item("best_selected", best_selected)?;
-        report.set_item("extractable_segments", plan.extractable)?;
-        report.set_item("password_segment", plan.password_segment)?;
-        report.set_item("missing_volume_evidence", plan.missing_volume_evidence)?;
-        Ok(report.unbind())
+        Ok(AnalysisReport {
+            format_hint: primary.map_or_else(String::new, |e| e.format.clone()),
+            facts,
+            status: primary.map_or("not_found", |e| e.status),
+            extractable_segments,
+            password_segment,
+            size,
+            stats: self.reader.stats()?,
+            evidences,
+        })
     }
 }
 
-impl<'a, 'py> ReportContext<'a, 'py> {
-    fn run_module(&mut self, module: &ModuleConfig) -> PyResult<Evidence<'py>> {
+impl<'a> ReportContext<'a> {
+    fn run_module(&mut self, module: &ModuleConfig) -> std::io::Result<Evidence> {
         match module.kind {
             ModuleKind::Zip => self.zip_module(),
             ModuleKind::Rar => self.rar_module(),
@@ -434,47 +522,46 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             .collect()
     }
 
-    fn embedded(&self, format: &str, logical_only: bool) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let mut items = Vec::new();
-        for item in self.embedded.get(format).into_iter().flatten() {
-            if !logical_only || str_of(item, "candidate_kind")? == "logical_archive" {
-                items.push(item.clone());
-            }
-        }
-        Ok(items)
+    fn embedded(&self, format: &str, logical_only: bool) -> Vec<&'a EmbeddedCandidate> {
+        self.embedded_scan
+            .into_iter()
+            .flat_map(NativeScanResult::candidates)
+            .filter(|item| {
+                item.format == format && (!logical_only || item.candidate_kind == "logical_archive")
+            })
+            .collect()
     }
 
-    fn preserve_multiple(&self) -> PyResult<bool> {
-        Ok(str_of(&self.prepass, "source")? == "embedded_scan")
+    fn preserve_multiple(&self) -> bool {
+        self.embedded_scan.is_some()
     }
 
     // ---- RAR ------------------------------------------------------------
 
-    fn rar_module(&mut self) -> PyResult<Evidence<'py>> {
-        let py = self.py;
+    fn rar_module(&mut self) -> std::io::Result<Evidence> {
         let hits = self.hits(|kind| kind == ReportHitKind::Rar);
-        let embedded = self.embedded("rar", true)?;
+        let embedded = self.embedded("rar", true);
         if hits.is_empty() && embedded.is_empty() {
-            return Ok(Evidence::not_found(py, "rar"));
+            return Ok(Evidence::not_found("rar"));
         }
         let mut candidates = Vec::new();
         let mut exact_starts = HashSet::new();
         for item in &embedded {
-            let start = u64_of(item, "offset")?;
-            let end = opt_u64_of(item, "end_offset")?;
+            let start = item.offset;
+            let end = item.end_offset;
             let Some(end) = end else { continue };
-            if str_of(item, "boundary_kind")? != "exact" || !truthy(item, "extractable")? {
+            if item.boundary_kind != "exact" || !item.extractable {
                 continue;
             }
             exact_starts.insert(start);
 
-            let validation = str_or(item, "validation", "complete_header_walk")?;
-            let details = PyDict::new(py);
-            details.set_item("source", "embedded_scan")?;
-            details.set_item("candidate", item)?;
-            details.set_item("boundary_kind", "exact")?;
-            details.set_item("boundary_confidence", "high")?;
-            details.set_item("integrity_confidence", "deferred")?;
+            let validation = item.validation;
+            let mut details = DiagnosticFields::new();
+            details.put("source", "embedded_scan")?;
+            details.put("candidate", item)?;
+            details.put("boundary_kind", "exact")?;
+            details.put("boundary_confidence", "high")?;
+            details.put("integrity_confidence", "deferred")?;
             candidates.push(Evidence::new(
                 "rar",
                 "extractable",
@@ -487,10 +574,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 details,
             ));
         }
-        let mut starts = embedded
-            .iter()
-            .map(|item| u64_of(item, "offset"))
-            .collect::<PyResult<Vec<_>>>()?;
+        let mut starts = embedded.iter().map(|item| item.offset).collect::<Vec<_>>();
         if starts.is_empty() {
             starts = hits.iter().map(|hit| hit.offset).collect::<Vec<_>>();
         }
@@ -500,68 +584,61 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             .into_iter()
             .filter(|start| !exact_starts.contains(start))
         {
-            let native = py.detach(|| self.view.probe_rar_native(start))?;
+            let native = (self.view.probe_rar_native(start))?;
             candidates.push(rar_from_native(native, start)?);
         }
-        combine_candidates(py, "rar", candidates, self.preserve_multiple()?)
+        combine_candidates("rar", candidates, self.preserve_multiple())
     }
 
     // ---- 7z -------------------------------------------------------------
 
-    fn seven_zip_module(&mut self) -> PyResult<Evidence<'py>> {
-        let py = self.py;
-        let embedded = self.embedded("7z", true)?;
+    fn seven_zip_module(&mut self) -> std::io::Result<Evidence> {
+        let embedded = self.embedded("7z", true);
         let mut exact = Vec::new();
         for item in embedded {
-            if str_of(&item, "boundary_kind")? == "exact"
-                && opt_u64_of(&item, "end_offset")?.is_some()
-                && truthy(&item, "extractable")?
-            {
+            if item.boundary_kind == "exact" && item.end_offset.is_some() && item.extractable {
                 exact.push(item);
             }
         }
         if !exact.is_empty() {
             let candidates = exact
                 .iter()
-                .map(|item| seven_zip_from_embedded(py, item))
-                .collect::<PyResult<Vec<_>>>()?;
-            return combine_candidates(py, "7z", candidates, true);
+                .map(|item| seven_zip_from_embedded(item))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            return combine_candidates("7z", candidates, true);
         }
         let hits = self.hits(|kind| kind == ReportHitKind::SevenZip);
         if hits.is_empty() {
-            return Ok(Evidence::not_found(py, "7z"));
+            return Ok(Evidence::not_found("7z"));
         }
         let mut starts = hits.iter().map(|hit| hit.offset).collect::<Vec<_>>();
         starts.sort_unstable();
         starts.dedup();
         let mut candidates = Vec::new();
         for start in starts {
-            let native = py.detach(|| self.view.probe_seven_zip_native(start))?;
+            let native = (self.view.probe_seven_zip_native(start))?;
             candidates.push(seven_zip_from_native(native, start)?);
         }
-        combine_candidates(py, "7z", candidates, self.preserve_multiple()?)
+        combine_candidates("7z", candidates, self.preserve_multiple())
     }
 
     // ---- TAR ------------------------------------------------------------
 
-    fn tar_module(&mut self) -> PyResult<Evidence<'py>> {
-        let py = self.py;
-        let embedded = self.embedded("tar", true)?;
+    fn tar_module(&mut self) -> std::io::Result<Evidence> {
+        let embedded = self.embedded("tar", true);
         if !embedded.is_empty() {
             let mut candidates = Vec::new();
             for item in &embedded {
-                let start = u64_of(item, "offset")?;
-                let end = opt_u64_of(item, "end_offset")?;
-                let boundary_kind = required_item(item, "boundary_kind")?;
-                let exact = end.is_some()
-                    && boundary_kind.str()?.to_string() == "exact"
-                    && required_item(item, "extractable")?.is_truthy()?;
+                let start = item.offset;
+                let end = item.end_offset;
+                let boundary_kind = item.boundary_kind;
+                let exact = end.is_some() && boundary_kind == "exact" && item.extractable;
 
-                let validation = str_or(item, "validation", "validated_structure")?;
-                let details = PyDict::new(py);
-                details.set_item("source", "embedded_scan")?;
-                details.set_item("candidate", item)?;
-                details.set_item("boundary_kind", boundary_kind)?;
+                let validation = item.validation;
+                let mut details = DiagnosticFields::new();
+                details.put("source", "embedded_scan")?;
+                details.put("candidate", item)?;
+                details.put("boundary_kind", boundary_kind)?;
                 candidates.push(Evidence::new(
                     "tar",
                     if exact { "extractable" } else { "damaged" },
@@ -578,43 +655,43 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                     details,
                 ));
             }
-            return combine_candidates(py, "tar", candidates, true);
+            return combine_candidates("tar", candidates, true);
         }
         // Ordinary analysis owns only a TAR starting at the logical input start.
         // Nonzero TAR candidates belong to the canonical embedded scanner;
         // raw ustar hits can also be bytes inside a compression stream.
         Ok(self
             .tar_candidate(0)?
-            .unwrap_or_else(|| Evidence::not_found(py, "tar")))
+            .unwrap_or_else(|| Evidence::not_found("tar")))
     }
 
-    fn tar_observation(&self, start: u64) -> PyResult<Bound<'py, PyDict>> {
-        let raw = self.view.walk_tar(self.py, start)?;
-        set_default(&raw, "archive_offset", start)?;
+    fn tar_observation(&self, start: u64) -> std::io::Result<DiagnosticFields> {
+        let mut raw = self.view.walk_tar(start)?;
+        set_default(&mut raw, "archive_offset", start)?;
         let detected = if truthy(&raw, "plausible")? {
             ".tar"
         } else {
             ""
         };
-        set_default(&raw, "detected_ext", detected)?;
+        set_default(&mut raw, "detected_ext", detected)?;
         let error = str_of(&raw, "error")?;
         let mut damage_flags = str_list(&raw, "damage_flags")?;
         if !error.is_empty() && !TAR_BENIGN_ERRORS.contains(&error.as_str()) {
             damage_flags.push(error);
         }
-        let integrity = match raw.get_item("stored_checksum")? {
-            Some(stored) if stored.is_truthy()? => match raw.get_item("computed_checksum")? {
-                Some(computed) if stored.eq(&computed)? => "high",
+        let integrity = match raw.get("stored_checksum") {
+            Some(stored) if value_truthy(stored) => match raw.get("computed_checksum") {
+                Some(computed) if stored == computed => "high",
                 _ => "low",
             },
             _ => "unknown",
         };
-        raw.set_item("integrity_confidence", integrity)?;
-        raw.set_item("damage_flags", sorted_unique(damage_flags))?;
+        raw.put("integrity_confidence", integrity)?;
+        raw.put("damage_flags", sorted_unique(damage_flags))?;
         Ok(raw)
     }
 
-    fn tar_candidate(&self, start: u64) -> PyResult<Option<Evidence<'py>>> {
+    fn tar_candidate(&self, start: u64) -> std::io::Result<Option<Evidence>> {
         let result = self.tar_observation(start)?;
         if truthy(&result, "plausible")? {
             let segment = Segment::new(
@@ -627,7 +704,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 "tar",
                 "extractable",
                 vec![segment],
-                result.copy()?,
+                result.clone(),
             )));
         }
         if truthy(&result, "magic_matched")? {
@@ -636,8 +713,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 damage_flags.push("tar_metadata_bad".to_string());
             }
             let evidence = non_empty_or(str_list(&result, "evidence")?, "tar:header");
-            let details = result.copy()?;
-            details.set_item("route_evidence_flags", damage_flags.clone())?;
+            let mut details = result;
+            details.put("route_evidence_flags", damage_flags.clone())?;
             return Ok(Some(Evidence::new(
                 "tar",
                 "damaged",
@@ -650,26 +727,25 @@ impl<'a, 'py> ReportContext<'a, 'py> {
 
     // ---- ZIP ------------------------------------------------------------
 
-    fn zip_module(&mut self) -> PyResult<Evidence<'py>> {
-        let py = self.py;
+    fn zip_module(&mut self) -> std::io::Result<Evidence> {
         let hits = self.hits(|kind| {
             matches!(
                 kind,
                 ReportHitKind::ZipLocal | ReportHitKind::ZipEocd | ReportHitKind::ZipOther
             )
         });
-        let embedded = self.embedded("zip", false)?;
+        let embedded = self.embedded("zip", false);
         if hits.is_empty() && embedded.is_empty() {
-            return Ok(Evidence::not_found(py, "zip"));
+            return Ok(Evidence::not_found("zip"));
         }
         let mut logical = Vec::new();
         for item in &embedded {
-            if required_item(item, "candidate_kind")?.str()?.to_string() == "logical_archive" {
-                logical.push(zip_from_embedded(py, item)?);
+            if item.candidate_kind == "logical_archive" {
+                logical.push(zip_from_embedded(item)?);
             }
         }
         if !logical.is_empty() {
-            return combine_candidates(py, "zip", logical, true);
+            return combine_candidates("zip", logical, true);
         }
         // Resolve only on recovery, once per analysis, including an absent local header.
         let mut earliest_local = None::<Option<u64>>;
@@ -711,15 +787,15 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             .flat_map(|evidence| evidence.segments.iter().map(|segment| segment.start))
             .collect::<HashSet<_>>();
         for item in &embedded {
-            if !str_of(item, "validation")?.contains("local_header") {
+            if !item.validation.contains("local_header") {
                 continue;
             }
-            let start = u64_of(item, "offset")?;
+            let start = item.offset;
             if known_starts.contains(&start) {
                 continue;
             }
-            let details = PyDict::new(py);
-            details.set_item("boundary_confidence", "low")?;
+            let mut details = DiagnosticFields::new();
+            details.put("boundary_confidence", "low")?;
             evidences.push(Evidence::new(
                 "zip",
                 "damaged",
@@ -732,109 +808,96 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 details,
             ));
         }
-        combine_candidates(py, "zip", evidences, self.preserve_multiple()?)
+        combine_candidates("zip", evidences, self.preserve_multiple())
     }
 
-    fn zip_eocd_observation(&self, requested: u64) -> PyResult<Bound<'py, PyDict>> {
-        let py = self.py;
-        let candidate = self
-            .view
-            .locate_zip_eocd_native(py, Some(requested))?
-            .into_bound(py);
+    fn zip_eocd_observation(&self, requested: u64) -> std::io::Result<DiagnosticFields> {
+        let candidate = self.view.locate_zip_eocd_native(Some(requested))?;
         if !truthy(&candidate, "eocd_candidate_found")? {
-            let raw = PyDict::new(py);
-            raw.set_item("plausible", false)?;
-            raw.set_item("magic_matched", false)?;
-            raw.set_item("error", "eocd_not_found")?;
-            raw.update(candidate.as_mapping())?;
-            zip_observation(&raw)?;
+            let mut raw = DiagnosticFields::new();
+            raw.put("plausible", false)?;
+            raw.put("magic_matched", false)?;
+            raw.put("error", "eocd_not_found")?;
+            raw.extend(candidate.clone());
+            zip_observation(&mut raw)?;
             return Ok(raw);
         }
         let eocd_offset = u64_of(&candidate, "eocd_candidate_offset")?;
-        let raw = self
+        let mut raw = self
             .view
-            .probe_zip_with_disk_starts(py, eocd_offset, self.disk_starts)?
-            .into_bound(py);
-        raw.update(candidate.as_mapping())?;
+            .probe_zip_with_disk_starts(eocd_offset, self.disk_starts)?;
+        raw.extend(candidate.clone());
         set_default(
-            &raw,
+            &mut raw,
             "comment_length",
             i64_of(&candidate, "eocd_candidate_comment_length")?,
         )?;
         set_default(
-            &raw,
+            &mut raw,
             "declared_central_directory_offset",
             i64_of(&candidate, "eocd_candidate_cd_offset")?,
         )?;
         set_default(
-            &raw,
+            &mut raw,
             "declared_central_directory_size",
             i64_of(&candidate, "eocd_candidate_cd_size")?,
         )?;
-        set_default(
-            &raw,
-            "declared_total_entries",
-            i64_of(&raw, "total_entries")?,
-        )?;
+        let total_entries = i64_of(&raw, "total_entries")?;
+        set_default(&mut raw, "declared_total_entries", total_entries)?;
         let size = self.view.reader.len() as i64;
         let segment_end = match i64_of(&raw, "segment_end")? {
             0 => size,
             value => value,
         };
         set_default(
-            &raw,
+            &mut raw,
             "trailing_bytes_after_eocd",
             (size - segment_end).max(0),
         )?;
         let physical_cd = i64_of(&raw, "central_directory_offset")?;
         let declared_cd = i64_of(&raw, "declared_central_directory_offset")?;
-        set_default(&raw, "physical_central_directory_offset", physical_cd)?;
-        set_default(&raw, "inferred_central_directory_offset", physical_cd)?;
+        set_default(&mut raw, "physical_central_directory_offset", physical_cd)?;
+        set_default(&mut raw, "inferred_central_directory_offset", physical_cd)?;
+        let directory_size = i64_of(&raw, "central_directory_size")?;
+        set_default(&mut raw, "inferred_central_directory_size", directory_size)?;
         set_default(
-            &raw,
-            "inferred_central_directory_size",
-            i64_of(&raw, "central_directory_size")?,
-        )?;
-        set_default(
-            &raw,
+            &mut raw,
             "central_directory_offset_delta",
             physical_cd - declared_cd,
         )?;
-        set_default(&raw, "central_directory_size_delta", 0)?;
-        set_default(&raw, "entry_count_delta", 0)?;
+        set_default(&mut raw, "central_directory_size_delta", 0)?;
+        set_default(&mut raw, "entry_count_delta", 0)?;
         let links = i64_of(&raw, "local_header_links_checked")?;
         let links_ok = truthy(&raw, "local_header_links_ok")?;
         set_default(
-            &raw,
+            &mut raw,
             "local_header_links_ok_count",
             if links_ok { links } else { 0 },
         )?;
         set_default(
-            &raw,
+            &mut raw,
             "local_header_links_error_count",
             if links_ok { 0 } else { 1 },
         )?;
-        zip_observation(&raw)?;
+        zip_observation(&mut raw)?;
         Ok(raw)
     }
 
     // ---- Compression streams -------------------------------------------
 
-    fn stream_module(&mut self, format: &'static str) -> PyResult<Evidence<'py>> {
-        let py = self.py;
-        let embedded = self.embedded(format, true)?;
+    fn stream_module(&mut self, format: &'static str) -> std::io::Result<Evidence> {
+        let embedded = self.embedded(format, true);
         if !embedded.is_empty() {
             let mut complete = true;
             let mut segments = Vec::new();
             for item in &embedded {
-                let end = opt_u64_of(item, "end_offset")?;
-                let extractable = end.is_some()
-                    && required_item(item, "boundary_kind")?.str()?.to_string() == "exact"
-                    && required_item(item, "extractable")?.is_truthy()?;
+                let end = item.end_offset;
+                let extractable =
+                    end.is_some() && item.boundary_kind == "exact" && item.extractable;
                 complete &= extractable;
-                let validation = str_or(item, "validation", "validated_header")?;
+                let validation = item.validation;
                 let mut segment = Segment::new(
-                    u64_of(item, "offset")?,
+                    item.offset,
                     end,
                     if end.is_some() {
                         Vec::new()
@@ -846,10 +909,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 segment.extractable = extractable;
                 segments.push(segment);
             }
-            let details = PyDict::new(py);
-            details.set_item("source", "embedded_scan")?;
-            details.set_item("candidates", PyList::new(py, &embedded)?)?;
-            details.set_item("boundary_confidence", if complete { "high" } else { "low" })?;
+            let mut details = DiagnosticFields::new();
+            details.put("source", "embedded_scan")?;
+            details.put("candidates", &embedded)?;
+            details.put("boundary_confidence", if complete { "high" } else { "low" })?;
             return Ok(Evidence::new(
                 format,
                 if complete { "extractable" } else { "damaged" },
@@ -896,8 +959,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             }
 
             let end = opt_u64_of(&result, "segment_end")?;
-            let details = result.copy()?;
-            details.set_item("route_evidence_flags", damage_flags.clone())?;
+            let mut details = result;
+            details.put("route_evidence_flags", damage_flags.clone())?;
             return Ok(Evidence::new(
                 format,
                 "damaged",
@@ -908,8 +971,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         if damage_flags.is_empty() {
             damage_flags.push("stream_unverified".to_string());
         }
-        let details = result.copy()?;
-        details.set_item("route_evidence_flags", damage_flags.clone())?;
+        let mut details = result;
+        details.put("route_evidence_flags", damage_flags.clone())?;
         Ok(Evidence::new(
             format,
             if damage_flags.iter().any(|flag| flag != "stream_unverified") {
@@ -922,29 +985,33 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         ))
     }
 
-    fn stream_observation(&mut self, format: &str) -> PyResult<Bound<'py, PyDict>> {
-        let py = self.py;
+    fn stream_observation(&mut self, format: &str) -> std::io::Result<DiagnosticFields> {
         let raw = match self.full_stream_structure()? {
-            Some(structure) => structure.copy()?,
-            None => PyDict::new(py),
+            Some(structure) if structure.get("format").and_then(Value::as_str) == Some(format) => {
+                (*structure).clone()
+            }
+            Some(structure) => structure
+                .get("format")
+                .map(|actual| DiagnosticFields::from_iter([("format".to_owned(), actual.clone())]))
+                .unwrap_or_default(),
+            None => DiagnosticFields::new(),
         };
-        stream_observation(py, raw, format)
+        stream_observation(raw, format)
     }
 
     /// Full-stream validation walks the complete structure, so it runs at most once
     /// per analysis and once per physical file generation across analyses.
-    fn full_stream_structure(&mut self) -> PyResult<Option<Bound<'py, PyDict>>> {
+    fn full_stream_structure(&mut self) -> io::Result<Option<Arc<DiagnosticFields>>> {
         if let Some(structure) = &self.stream_structure {
             return Ok(structure.clone());
         }
         let reader = &self.view.reader;
-        let header = self.py.detach(|| reader.read_cached_at(0, 32)).ok();
+        let header = (reader.read_cached_at(0, 32)).ok();
         let structure =
             if let Some(header) = header.filter(|head| has_compression_stream_header(head)) {
                 Some(match reader.file_identity().ok() {
-                    Some(identity) => stream_structure_cached(self.py, identity, reader, &header)?,
-                    None => inspect_compression_stream_reader(self.py, reader, &header)?
-                        .into_bound(self.py),
+                    Some(identity) => stream_structure_cached(identity, reader, &header)?,
+                    None => Arc::new(inspect_compression_stream_reader(reader, &header)?),
                 })
             } else {
                 // No compression family can match; the requested-format mismatch
@@ -984,27 +1051,27 @@ struct RarReportDetails {
 }
 
 impl RarReportDetails {
-    fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
         let raw = &self.raw;
-        let result = raw.to_python(py)?.into_bound(py);
-        result.set_item("format", if raw.magic_matched { "rar" } else { "" })?;
-        result.set_item("detected_ext", if raw.magic_matched { ".rar" } else { "" })?;
-        result.set_item(
+        let mut result = raw.to_diagnostic()?;
+        result.put("format", if raw.magic_matched { "rar" } else { "" })?;
+        result.put("detected_ext", if raw.magic_matched { ".rar" } else { "" })?;
+        result.put(
             "validated_prefix",
             raw.second_block_checked && raw.second_block_ok,
         )?;
-        result.set_item(
+        result.put(
             "confidence",
             if raw.header_crc_ok { "strong" } else { "none" },
         )?;
-        result.set_item("boundary_confidence", self.boundary)?;
-        result.set_item("integrity_confidence", self.integrity)?;
-        result.set_item("damage_flags", &self.damage_flags)?;
+        result.put("boundary_confidence", self.boundary)?;
+        result.put("integrity_confidence", self.integrity)?;
+        result.put("damage_flags", &self.damage_flags)?;
         Ok(result)
     }
 }
 
-fn rar_from_native<'py>(mut raw: RarObservation, start: u64) -> PyResult<Evidence<'py>> {
+fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evidence> {
     let mut damage_flags = raw
         .damage_flags
         .iter()
@@ -1125,21 +1192,20 @@ fn rar_from_native<'py>(mut raw: RarObservation, start: u64) -> PyResult<Evidenc
     .with_warnings(warnings))
 }
 
-fn seven_zip_from_embedded<'py>(
-    py: Python<'py>,
-    item: &Bound<'py, PyDict>,
-) -> PyResult<Evidence<'py>> {
-    let start = u64_of(item, "offset")?;
-    let end = required_item(item, "end_offset")?.extract::<u64>()?;
+fn seven_zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence> {
+    let start = item.offset;
+    let end = item
+        .end_offset
+        .ok_or_else(|| io::Error::other("validated 7z has no end"))?;
 
-    let validation = str_or(item, "validation", "start_header_crc_and_declared_end")?;
-    let details = PyDict::new(py);
-    details.set_item("source", "embedded_scan")?;
-    details.set_item("validation", &validation)?;
-    details.set_item("candidate_kind", "logical_archive")?;
-    details.set_item("boundary_kind", "exact")?;
-    details.set_item("boundary_confidence", "high")?;
-    details.set_item("integrity_confidence", "deferred")?;
+    let validation = item.validation;
+    let mut details = DiagnosticFields::new();
+    details.put("source", "embedded_scan")?;
+    details.put("validation", &validation)?;
+    details.put("candidate_kind", "logical_archive")?;
+    details.put("boundary_kind", "exact")?;
+    details.put("boundary_confidence", "high")?;
+    details.put("integrity_confidence", "deferred")?;
     Ok(Evidence::new(
         "7z",
         "extractable",
@@ -1164,23 +1230,23 @@ struct SevenZipReportDetails {
 }
 
 impl SevenZipReportDetails {
-    fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
         let raw = &self.raw;
-        let result = raw.to_python(py)?.into_bound(py);
-        result.set_item("detected_ext", if raw.magic_matched { ".7z" } else { "" })?;
-        result.set_item(
+        let mut result = raw.to_diagnostic()?;
+        result.put("detected_ext", if raw.magic_matched { ".7z" } else { "" })?;
+        result.put(
             "next_header_semantic_ok",
             raw.next_header_crc_ok && raw.next_header_nid_valid,
         )?;
-        result.set_item("confidence", if raw.plausible { "strong" } else { "none" })?;
-        result.set_item("boundary_confidence", self.boundary)?;
-        result.set_item("integrity_confidence", self.integrity)?;
-        result.set_item("damage_flags", &self.damage_flags)?;
+        result.put("confidence", if raw.plausible { "strong" } else { "none" })?;
+        result.put("boundary_confidence", self.boundary)?;
+        result.put("integrity_confidence", self.integrity)?;
+        result.put("damage_flags", &self.damage_flags)?;
         Ok(result)
     }
 }
 
-fn seven_zip_from_native<'py>(mut raw: SevenZipObservation, start: u64) -> PyResult<Evidence<'py>> {
+fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> std::io::Result<Evidence> {
     let mut damage_flags = Vec::new();
     if let Some((fault, legacy)) = &raw.read_fault {
         raw.error = legacy;
@@ -1275,7 +1341,7 @@ fn seven_zip_from_native<'py>(mut raw: SevenZipObservation, start: u64) -> PyRes
     .with_warnings(warnings))
 }
 
-fn zip_observation(raw: &Bound<'_, PyDict>) -> PyResult<()> {
+fn zip_observation(raw: &mut DiagnosticFields) -> std::io::Result<()> {
     let error = str_of(raw, "error")?;
     let damage_flags = sorted_unique(str_list(raw, "damage_flags")?);
     let plausible = truthy(raw, "plausible")?;
@@ -1299,34 +1365,44 @@ fn zip_observation(raw: &Bound<'_, PyDict>) -> PyResult<()> {
     Ok(())
 }
 
-fn zip_from_embedded<'py>(py: Python<'py>, item: &Bound<'py, PyDict>) -> PyResult<Evidence<'py>> {
-    let start = u64_of(item, "offset")?;
-    let end = opt_u64_of(item, "end_offset")?;
+fn zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence> {
+    let start = item.offset;
+    let end = item.end_offset;
 
-    let validation = str_or(item, "validation", "validated_structure")?;
-    let boundary_kind = required_item(item, "boundary_kind")?.str()?.to_string();
+    let validation = item.validation;
+    let boundary_kind = item.boundary_kind;
     let bounded_end = end.filter(|end| *end > start);
-    let extractable = boundary_kind == "exact"
-        && required_item(item, "extractable")?.is_truthy()?
-        && bounded_end.is_some();
+    let extractable = boundary_kind == "exact" && item.extractable && bounded_end.is_some();
     let exact = boundary_kind == "exact";
-    let details = PyDict::new(py);
-    details.set_item("source", "embedded_scan")?;
-    details.set_item("validation", &validation)?;
-    details.set_item("archive_offset", start)?;
-    if let Some(offset) = item.get_item("eocd_offset")? {
-        details.set_item("eocd_offset", offset)?;
+    let mut details = DiagnosticFields::new();
+    details.put("source", "embedded_scan")?;
+    details.put("validation", &validation)?;
+    details.put("archive_offset", start)?;
+    if let Some(offset) = item.zip_eocd_offset {
+        details.put("eocd_offset", offset)?;
     }
-    details.set_item("candidate_kind", str_of(item, "candidate_kind")?)?;
-    details.set_item("boundary_kind", &boundary_kind)?;
-    details.set_item(
+    details.put("candidate_kind", item.candidate_kind)?;
+    details.put("boundary_kind", &boundary_kind)?;
+    details.put(
         "boundary_confidence",
         if exact { "high" } else { "unresolved" },
     )?;
-    details.set_item(
+    details.put(
         "integrity_confidence",
         if exact { "deferred" } else { "unknown" },
     )?;
+    let mut segment = Segment::new(
+        start,
+        bounded_end,
+        Vec::new(),
+        vec![
+            format!("zip:{validation}"),
+            "embedded_scan:validated_candidate".to_string(),
+        ],
+    );
+    segment.zip_eocd_offset = item
+        .zip_eocd_offset
+        .and_then(|offset| offset.checked_sub(start));
     Ok(Evidence::new(
         "zip",
         if extractable {
@@ -1334,24 +1410,16 @@ fn zip_from_embedded<'py>(py: Python<'py>, item: &Bound<'py, PyDict>) -> PyResul
         } else {
             "damaged"
         },
-        vec![Segment::new(
-            start,
-            bounded_end,
-            Vec::new(),
-            vec![
-                format!("zip:{validation}"),
-                "embedded_scan:validated_candidate".to_string(),
-            ],
-        )],
+        vec![segment],
         details,
     ))
 }
 
-fn zip_from_native<'py>(
-    native: Bound<'py, PyDict>,
+fn zip_from_native(
+    mut native: DiagnosticFields,
     hits: &[ReportSignatureHit],
     view_size: u64,
-) -> PyResult<Evidence<'py>> {
+) -> std::io::Result<Evidence> {
     let magic_matched = truthy(&native, "magic_matched")?;
     if !magic_matched && hits.is_empty() {
         return Ok(Evidence::new("zip", "not_found", Vec::new(), native));
@@ -1388,17 +1456,17 @@ fn zip_from_native<'py>(
     let crc_warning = str_of(&native, "content_integrity_warning")?;
     if !crc_warning.is_empty() {
         damage_flags.push("content_integrity_bad_or_unknown".to_string());
-        native.set_item("integrity_confidence", "low")?;
-        native.set_item("content_damage_reason", &crc_warning)?;
+        native.put("integrity_confidence", "low")?;
+        native.put("content_damage_reason", &crc_warning)?;
     } else {
         set_default(
-            &native,
+            &mut native,
             "integrity_confidence",
             if plausible { "medium" } else { "unknown" },
         )?;
     }
     set_default(
-        &native,
+        &mut native,
         "boundary_confidence",
         if plausible && walk_ok { "high" } else { "low" },
     )?;
@@ -1413,23 +1481,26 @@ fn zip_from_native<'py>(
                 .to_string(),
             );
         }
-        vec![Segment::new(
+        let mut segment = Segment::new(
             archive_offset,
             end_offset.map(|end| end.min(view_size)),
             damage_flags,
             evidence,
-        )]
+        );
+        segment.zip_eocd_offset = opt_u64_of(&native, "eocd_offset")?
+            .and_then(|offset| offset.checked_sub(archive_offset));
+        vec![segment]
     } else {
         Vec::new()
     };
     Ok(Evidence::new("zip", status, segments, native))
 }
 
-fn zip_local_header_recovery<'py>(
-    native: &Bound<'py, PyDict>,
+fn zip_local_header_recovery(
+    native: &DiagnosticFields,
     hits: &[ReportSignatureHit],
     earliest_local: &mut Option<Option<u64>>,
-) -> PyResult<Option<Evidence<'py>>> {
+) -> std::io::Result<Option<Evidence>> {
     if !ZIP_LOCAL_RECOVERY_ERRORS.contains(&str_of(native, "error")?.as_str()) {
         return Ok(None);
     }
@@ -1446,10 +1517,10 @@ fn zip_local_header_recovery<'py>(
     let Some(start) = (*earliest_local).flatten() else {
         return Ok(None);
     };
-    let details = native.copy()?;
-    details.set_item("boundary_confidence", "low")?;
-    details.set_item("integrity_confidence", "unknown")?;
-    details.set_item("directory_confidence", "low")?;
+    let mut details = native.clone();
+    details.put("boundary_confidence", "low")?;
+    details.put("integrity_confidence", "unknown")?;
+    details.put("directory_confidence", "low")?;
     Ok(Some(
         Evidence::new(
             "zip",
@@ -1471,26 +1542,22 @@ fn zip_local_header_recovery<'py>(
     ))
 }
 
-fn stream_observation<'py>(
-    py: Python<'py>,
-    raw: Bound<'py, PyDict>,
-    requested: &str,
-) -> PyResult<Bound<'py, PyDict>> {
+fn stream_observation(raw: DiagnosticFields, requested: &str) -> std::io::Result<DiagnosticFields> {
     let actual = str_of(&raw, "format")?;
-    let raw = if !requested.is_empty() && actual != requested {
-        let replaced = PyDict::new(py);
-        replaced.set_item("format", requested)?;
-        replaced.set_item("actual_format", actual)?;
-        replaced.set_item("magic_matched", false)?;
-        replaced.set_item("plausible", false)?;
-        replaced.set_item("structure_status", "invalid")?;
-        replaced.set_item("structure_validation_complete", false)?;
-        replaced.set_item("integrity_status", "failed")?;
-        replaced.set_item("integrity_validation_complete", true)?;
-        replaced.set_item("boundary_exact", false)?;
-        replaced.set_item("error", format!("{requested}_magic_not_found"))?;
-        replaced.set_item("damage_flags", PyList::empty(py))?;
-        replaced.set_item("evidence", PyList::empty(py))?;
+    let mut raw = if !requested.is_empty() && actual != requested {
+        let mut replaced = DiagnosticFields::new();
+        replaced.put("format", requested)?;
+        replaced.put("actual_format", actual)?;
+        replaced.put("magic_matched", false)?;
+        replaced.put("plausible", false)?;
+        replaced.put("structure_status", "invalid")?;
+        replaced.put("structure_validation_complete", false)?;
+        replaced.put("integrity_status", "failed")?;
+        replaced.put("integrity_validation_complete", true)?;
+        replaced.put("boundary_exact", false)?;
+        replaced.put("error", format!("{requested}_magic_not_found"))?;
+        replaced.put("damage_flags", Vec::<&str>::new())?;
+        replaced.put("evidence", Vec::<&str>::new())?;
         replaced
     } else {
         raw
@@ -1498,7 +1565,7 @@ fn stream_observation<'py>(
     let structure_complete = truthy(&raw, "structure_validation_complete")?;
     let integrity_status = str_or(&raw, "integrity_status", "deferred")?;
     set_default(
-        &raw,
+        &mut raw,
         "structure_status",
         if structure_complete {
             "complete"
@@ -1506,11 +1573,15 @@ fn stream_observation<'py>(
             "incomplete"
         },
     )?;
-    set_default(&raw, "structure_validation_complete", structure_complete)?;
-    set_default(&raw, "boundary_exact", structure_complete)?;
-    set_default(&raw, "integrity_status", &integrity_status)?;
     set_default(
-        &raw,
+        &mut raw,
+        "structure_validation_complete",
+        structure_complete,
+    )?;
+    set_default(&mut raw, "boundary_exact", structure_complete)?;
+    set_default(&mut raw, "integrity_status", &integrity_status)?;
+    set_default(
+        &mut raw,
         "integrity_validation_complete",
         integrity_status == "verified" || integrity_status == "failed",
     )?;
@@ -1538,32 +1609,31 @@ fn stream_observation<'py>(
         ("none", "unknown")
     };
     let file_size = i64_of(&raw, "file_size")?;
-    if !raw.contains("segment_end")? {
+    if !raw.contains_key("segment_end") {
         match trailing {
             Some(trailing) if structure_complete && file_size >= trailing => {
-                raw.set_item("segment_end", file_size - trailing)?
+                raw.put("segment_end", file_size - trailing)?
             }
-            _ => raw.set_item("segment_end", py.None())?,
+            _ => raw.put("segment_end", Value::Null)?,
         }
     }
-    raw.set_item("boundary_confidence", boundary)?;
-    raw.set_item("integrity_confidence", integrity)?;
-    set_default(&raw, "damage_flags", damage_flags)?;
+    raw.put("boundary_confidence", boundary)?;
+    raw.put("integrity_confidence", integrity)?;
+    set_default(&mut raw, "damage_flags", damage_flags)?;
     Ok(raw)
 }
 
-fn combine_candidates<'py>(
-    py: Python<'py>,
+fn combine_candidates(
     format: &str,
-    candidates: Vec<Evidence<'py>>,
+    candidates: Vec<Evidence>,
     preserve_multiple: bool,
-) -> PyResult<Evidence<'py>> {
+) -> std::io::Result<Evidence> {
     let mut usable = candidates
         .into_iter()
         .filter(|item| !item.segments.is_empty())
         .collect::<Vec<_>>();
     if usable.is_empty() {
-        return Ok(Evidence::not_found(py, format));
+        return Ok(Evidence::not_found(format));
     }
     if usable
         .iter()
@@ -1587,28 +1657,16 @@ fn combine_candidates<'py>(
     let mut seen = HashMap::new();
     let mut segments: Vec<Segment> = Vec::new();
     let mut warnings = Vec::new();
-    let candidate_details = PyList::empty(py);
-    let mut best_details = None;
-    for (index, item) in usable.iter().enumerate() {
-        let projected = item.details.to_python(py)?;
-        if index == best {
-            best_details = Some(projected.clone());
-        }
-        candidate_details.append(projected)?;
-        for warning in &item.warnings {
-            if !warnings.contains(warning) {
-                warnings.push(warning.clone());
-            }
-        }
-    }
-    let details = best_details
-        .expect("best candidate was projected once")
-        .copy()?;
-    details.set_item("candidate_count", usable.len())?;
-    details.set_item("candidate_details", candidate_details)?;
+    let mut candidate_details = Vec::with_capacity(usable.len());
     let status = usable[best].status;
     for item in usable {
         let password_required = item.details.password_required()?;
+        candidate_details.push(item.details);
+        for warning in item.warnings {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
         for mut segment in item.segments {
             // Merging evidence must not promote a damaged peer or lose an
             // encrypted peer's password requirement with the primary details.
@@ -1641,7 +1699,10 @@ fn combine_candidates<'py>(
         status,
         segments,
         warnings,
-        details: details.into(),
+        details: EvidenceDetails::Combined(Box::new(CombinedEvidence {
+            primary: best,
+            details: candidate_details,
+        })),
     })
 }
 
@@ -1663,7 +1724,7 @@ struct SegmentPlan {
 
 impl SegmentPlan {
     /// Order the canonical extractable carved segments by physical position.
-    fn build(evidences: &[Evidence<'_>], selected: &[usize], size: u64) -> PyResult<Self> {
+    fn build(evidences: &[Evidence], selected: &[usize], size: u64) -> std::io::Result<Self> {
         let mut candidates = Vec::new();
         for &evidence_index in selected {
             let evidence = &evidences[evidence_index];
@@ -1721,7 +1782,7 @@ impl SegmentPlan {
             if !evidence.format.eq_ignore_ascii_case("7z") {
                 continue;
             }
-            let expected_end = match &evidence.details {
+            let expected_end = match evidence.details.primary() {
                 EvidenceDetails::SevenZip(details) if details.raw.start_header_crc_ok => {
                     let raw = &details.raw;
                     raw.archive_offset
@@ -1729,7 +1790,7 @@ impl SegmentPlan {
                         .saturating_add(raw.next_header_offset)
                         .saturating_add(raw.next_header_size)
                 }
-                EvidenceDetails::Python(details) if truthy(details, "start_header_crc_ok")? => {
+                EvidenceDetails::Fields(details) if truthy(details, "start_header_crc_ok")? => {
                     u64_of(details, "archive_offset")?
                         .saturating_add(32)
                         .saturating_add(u64_of(details, "next_header_offset")?)
@@ -1751,91 +1812,117 @@ impl SegmentPlan {
     }
 }
 
-fn evidence_to_python<'py>(
-    py: Python<'py>,
-    evidence: &Evidence<'py>,
-) -> PyResult<Bound<'py, PyTuple>> {
-    let segments = PyList::empty(py);
-    for segment in &evidence.segments {
-        segments.append((
-            segment.start,
-            segment.end,
-            segment.damage_flags.clone(),
-            segment.evidence.clone(),
-        ))?;
+impl Evidence {
+    fn structure_complete(&self, details: &DiagnosticFields) -> io::Result<bool> {
+        Ok(match self.details.primary() {
+            EvidenceDetails::Rar(value) => {
+                value.raw.end_block_found
+                    && value.raw.error.is_empty()
+                    && value.raw.read_fault.is_none()
+            }
+            EvidenceDetails::SevenZip(value) => {
+                value.raw.next_header_crc_ok
+                    && value.raw.next_header_nid_valid
+                    && value.raw.error.is_empty()
+            }
+            _ if self.format == "zip" => {
+                truthy(&details, "central_directory_walk_ok")?
+                    && truthy(&details, "local_header_links_ok")?
+            }
+            _ if self.format == "tar" => {
+                truthy(&details, "walk_complete")? && str_of(&details, "error")?.is_empty()
+            }
+            _ => truthy(&details, "structure_validation_complete")?,
+        })
     }
-    let details = evidence.details.to_python(py)?;
-    // Completion is independent of extraction feasibility and content CRC.
-    // Encrypted headers can authorize extraction with only partial structure.
-    let resource_unavailable = evidence.status == "error"
-        || str_of(&details, "error")? == "analysis_resource_limit"
-        || dict_item(&details, "read_error")?
-            .is_some_and(|fault| str_of(&fault, "code").is_ok_and(|code| code == "io_error"));
-    let complete = match &evidence.details {
-        EvidenceDetails::Rar(value) => {
-            value.raw.end_block_found
-                && value.raw.error.is_empty()
-                && value.raw.read_fault.is_none()
-        }
-        EvidenceDetails::SevenZip(value) => {
-            value.raw.next_header_crc_ok
-                && value.raw.next_header_nid_valid
-                && value.raw.error.is_empty()
-        }
-        _ if evidence.format == "zip" => {
-            truthy(&details, "central_directory_walk_ok")?
-                && truthy(&details, "local_header_links_ok")?
-        }
-        _ if evidence.format == "tar" => {
-            truthy(&details, "walk_complete")? && str_of(&details, "error")?.is_empty()
-        }
-        _ => truthy(&details, "structure_validation_complete")?,
-    };
-    let invalid = !str_of(&details, "error")?.is_empty()
-        && !resource_unavailable
-        && !truthy(&details, "encrypted_header")?
-        && !truthy(&details, "header_encrypted")?
-        && evidence.status != "not_found";
-    details.set_item(
-        "analysis_state",
-        if resource_unavailable {
-            "resource_unavailable"
-        } else if invalid {
-            "invalid"
-        } else if complete {
-            "complete"
+
+    fn analysis_facts(&self) -> io::Result<AnalysisFacts> {
+        let fields = match self.details.primary() {
+            EvidenceDetails::Fields(fields) => Some(fields),
+            _ => None,
+        };
+        let structure_complete = match self.details.primary() {
+            EvidenceDetails::Rar(value) => {
+                value.raw.end_block_found
+                    && value.raw.error.is_empty()
+                    && value.raw.read_fault.is_none()
+            }
+            EvidenceDetails::SevenZip(value) => {
+                value.raw.next_header_crc_ok
+                    && value.raw.next_header_nid_valid
+                    && value.raw.error.is_empty()
+            }
+            _ => match fields {
+                Some(fields) => self.structure_complete(fields)?,
+                None => false,
+            },
+        };
+        let zip_eocd_offset = if self.format == "zip" {
+            fields
+                .and_then(|fields| fields.get("eocd_offset"))
+                .and_then(Value::as_u64)
         } else {
-            "partial"
-        },
-    )?;
-    PyTuple::new(
-        py,
-        [
-            evidence.format.clone().into_pyobject(py)?.into_any(),
-            evidence.status.into_pyobject(py)?.into_any(),
-            segments.into_any(),
-            evidence.warnings.clone().into_pyobject(py)?.into_any(),
-            details.into_any(),
-        ],
-    )
+            None
+        };
+        Ok(AnalysisFacts {
+            zip_eocd_offset,
+            zip_spanned: fields
+                .and_then(|fields| fields.get("is_multi_disk"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            password_required: self.details.password_required()?,
+            structure_complete,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn diagnostics(&self) -> io::Result<serde_json::Map<String, Value>> {
+        let evidence = self;
+        let mut details = self.details.to_diagnostic()?;
+        // Completion is independent of extraction feasibility and content CRC.
+        // Encrypted headers can authorize extraction with only partial structure.
+        let resource_unavailable = evidence.status == "error"
+            || str_of(&details, "error")? == "analysis_resource_limit"
+            || dict_item(&details, "read_error")?
+                .is_some_and(|fault| str_of(&fault, "code").is_ok_and(|code| code == "io_error"));
+        let complete = evidence.structure_complete(&details)?;
+        let invalid = !str_of(&details, "error")?.is_empty()
+            && !resource_unavailable
+            && !truthy(&details, "encrypted_header")?
+            && !truthy(&details, "header_encrypted")?
+            && evidence.status != "not_found";
+        details.put(
+            "analysis_state",
+            if resource_unavailable {
+                "resource_unavailable"
+            } else if invalid {
+                "invalid"
+            } else if complete {
+                "complete"
+            } else {
+                "partial"
+            },
+        )?;
+        Ok(details)
+    }
 }
 
 /// Trailing bytes after the last stream member. A truncated stream reports the
 /// field as unavailable, which leaves the boundary unproven.
-fn trailing_bytes(dict: &Bound<'_, PyDict>) -> PyResult<Option<i64>> {
-    match dict.get_item("archive.trailing_data")? {
+fn trailing_bytes(dict: &DiagnosticFields) -> std::io::Result<Option<i64>> {
+    match dict.get("archive.trailing_data") {
         None => Ok(Some(0)),
-        Some(value) if value.is_none() => Ok(Some(0)),
-        Some(value) => Ok(value.extract::<i64>().ok()),
+        Some(value) if value.is_null() => Ok(Some(0)),
+        Some(value) => Ok(value.as_i64()),
     }
 }
 
-fn read_fault_damage_flags(native: &Bound<'_, PyDict>) -> PyResult<Vec<String>> {
+fn read_fault_damage_flags(native: &DiagnosticFields) -> std::io::Result<Vec<String>> {
     let flags = str_list(native, "damage_flags")?;
-    let Some(fault) = native.get_item("read_error")? else {
+    let Some(fault) = native.get("read_error") else {
         return Ok(flags);
     };
-    let Ok(fault) = fault.cast::<PyDict>() else {
+    let Some(fault) = fault.as_object() else {
         return Ok(flags);
     };
     let mut flags = flags;
@@ -1863,11 +1950,6 @@ fn read_fault_damage_flags(native: &Bound<'_, PyDict>) -> PyResult<Vec<String>> 
 // ---- Format identity confirmation ----------------------------------------
 
 /// Confirm a routed single-file TAR or compression stream by format identity.
-#[pyfunction]
-pub(crate) fn confirm_format_identity(py: Python<'_>, path: &str, format: &str) -> PyResult<bool> {
-    Ok(py.detach(|| confirm_format_identity_native(path, format)))
-}
-
 pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
     match format {
         "enc" => {
@@ -1909,7 +1991,7 @@ pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
 
 // ---- Full-stream structure cache -----------------------------------------
 
-type StreamStructureSlot = CancellableOnce<PyResult<Py<PyDict>>>;
+type StreamStructureSlot = CancellableOnce<Result<Arc<DiagnosticFields>, Arc<io::Error>>>;
 type StreamStructureEntry = (FileIdentity, Arc<StreamStructureSlot>);
 
 fn stream_structure_cache() -> &'static Mutex<VecDeque<StreamStructureEntry>> {
@@ -1917,12 +1999,11 @@ fn stream_structure_cache() -> &'static Mutex<VecDeque<StreamStructureEntry>> {
     CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn stream_structure_cached<'py>(
-    py: Python<'py>,
+fn stream_structure_cached(
     identity: FileIdentity,
     reader: &ManagedReader,
     header: &[u8],
-) -> PyResult<Bound<'py, PyDict>> {
+) -> io::Result<Arc<DiagnosticFields>> {
     let cancellation = Cancellation::current();
     cancellation.check()?;
     let slot = loop {
@@ -1940,18 +2021,12 @@ fn stream_structure_cached<'py>(
             entries.push_back(entry);
             slot
         };
-        // Waiting for another initializer must release the GIL: its final Python
-        // result cannot be published until the initializer reacquires it.
-        let ready = py
-            .detach(|| {
-                slot.get_or_init(&cancellation, || {
-                    Python::attach(|py| {
-                        // Keep the original physical source without holding
-                        // transient stream windows in the view's request cache.
-                        let reader = reader.with_config(ReaderConfig::default());
-                        inspect_compression_stream_reader(py, &reader, header)
-                    })
-                })
+        let ready = slot
+            .get_or_init(&cancellation, || {
+                let reader = reader.with_config(ReaderConfig::default());
+                inspect_compression_stream_reader(&reader, header)
+                    .map(Arc::new)
+                    .map_err(Arc::new)
             })
             .is_some();
         if ready {
@@ -1969,8 +2044,8 @@ fn stream_structure_cached<'py>(
     let result = slot.get().expect("completed stream structure");
     let invalid = result.is_err();
     let result = cancellation.check().and_then(|()| match result {
-        Ok(value) => Ok(value.clone_ref(py).into_bound(py)),
-        Err(error) => Err(error.clone_ref(py)),
+        Ok(value) => Ok(Arc::clone(value)),
+        Err(error) => Err(io::Error::new(error.kind(), Arc::clone(error))),
     });
     let mut entries = stream_structure_cache()
         .lock()
@@ -1995,7 +2070,7 @@ fn stream_structure_cached<'py>(
 }
 
 pub(crate) fn clear_stream_structure_cache() -> usize {
-    // Retire the whole allocation and drop Python results outside the cache lock.
+    // Retire the whole allocation and drop results outside the cache lock.
     let retired = std::mem::take(
         &mut *stream_structure_cache()
             .lock()
@@ -2014,85 +2089,81 @@ pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) -> u
     before - entries.len()
 }
 
-// ---- PyDict helpers --------------------------------------------------------
+// ---- Diagnostic field access ----------------------------------------------
 
-fn dict_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
-    Ok(dict
-        .get_item(key)?
-        .and_then(|value| value.cast_into::<PyDict>().ok()))
-}
-
-fn required_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
-    dict.get_item(key)?
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(key.to_string()))
-}
-
-fn truthy(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
-    match dict.get_item(key)? {
-        Some(value) => value.is_truthy(),
-        None => Ok(false),
-    }
-}
-
-fn present<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
-    Ok(match dict.get_item(key)? {
-        Some(value) if value.is_truthy()? => Some(value),
-        _ => None,
-    })
-}
-
-fn i64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<i64> {
-    match present(dict, key)? {
-        Some(value) => value.extract::<i64>(),
-        None => Ok(0),
-    }
-}
-
-fn u64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<u64> {
-    Ok(i64_of(dict, key)?.max(0) as u64)
-}
-
-fn opt_u64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
-    match dict.get_item(key)? {
-        Some(value) if !value.is_none() => Ok(Some(value.extract::<i64>()?.max(0) as u64)),
-        _ => Ok(None),
-    }
-}
-
-fn str_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
-    match present(dict, key)? {
-        Some(value) => Ok(value.str()?.to_string()),
-        None => Ok(String::new()),
-    }
-}
-
-fn str_or(dict: &Bound<'_, PyDict>, key: &str, default: &str) -> PyResult<String> {
-    let value = str_of(dict, key)?;
-    Ok(if value.is_empty() {
-        default.to_string()
-    } else {
-        value
-    })
-}
-
-fn str_list(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<String>> {
-    let Some(value) = present(dict, key)? else {
-        return Ok(Vec::new());
-    };
-    let mut items = Vec::new();
-    for item in value.try_iter()? {
-        items.push(item?.str()?.to_string());
-    }
-    Ok(items)
-}
-
-fn set_default<'py, V: IntoPyObject<'py>>(
-    dict: &Bound<'py, PyDict>,
+fn dict_item<'a>(
+    fields: &'a DiagnosticFields,
     key: &str,
-    value: V,
-) -> PyResult<()> {
-    if !dict.contains(key)? {
-        dict.set_item(key, value)?;
+) -> io::Result<Option<&'a DiagnosticFields>> {
+    Ok(fields.get(key).and_then(Value::as_object))
+}
+
+fn value_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|number| number != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn truthy(fields: &DiagnosticFields, key: &str) -> io::Result<bool> {
+    Ok(fields.get(key).is_some_and(value_truthy))
+}
+
+fn i64_of(fields: &DiagnosticFields, key: &str) -> io::Result<i64> {
+    Ok(fields.get(key).and_then(Value::as_i64).unwrap_or_default())
+}
+
+fn u64_of(fields: &DiagnosticFields, key: &str) -> io::Result<u64> {
+    Ok(opt_u64_of(fields, key)?.unwrap_or_default())
+}
+
+fn opt_u64_of(fields: &DiagnosticFields, key: &str) -> io::Result<Option<u64>> {
+    Ok(fields.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().map(|value| value.max(0) as u64))
+    }))
+}
+
+fn str_of(fields: &DiagnosticFields, key: &str) -> io::Result<String> {
+    Ok(fields
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned())
+}
+
+fn str_or(fields: &DiagnosticFields, key: &str, default: &str) -> io::Result<String> {
+    Ok(fields
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .to_owned())
+}
+
+fn str_list(fields: &DiagnosticFields, key: &str) -> io::Result<Vec<String>> {
+    Ok(fields
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect())
+}
+
+fn set_default(
+    fields: &mut DiagnosticFields,
+    key: &str,
+    value: impl serde::Serialize,
+) -> io::Result<()> {
+    if !fields.contains_key(key) {
+        fields.put(key, value)?;
     }
     Ok(())
 }
@@ -2116,16 +2187,15 @@ fn non_empty_or(values: Vec<String>, default: &str) -> Vec<String> {
 mod report_tests {
     use super::*;
 
-    fn evidence<'py>(
-        py: Python<'py>,
+    fn evidence(
         format: &str,
         status: &'static str,
         segments: &[(u64, Option<u64>)],
         details: &[(&str, &str)],
-    ) -> Evidence<'py> {
-        let dict = PyDict::new(py);
+    ) -> Evidence {
+        let mut dict = DiagnosticFields::new();
         for (key, value) in details {
-            dict.set_item(*key, *value).unwrap();
+            dict.put(*key, *value).unwrap();
         }
         Evidence::new(
             format,
@@ -2138,7 +2208,7 @@ mod report_tests {
         )
     }
 
-    fn planned(evidences: &[Evidence<'_>], plan: &SegmentPlan) -> Vec<(String, u64)> {
+    fn planned(evidences: &[Evidence], plan: &SegmentPlan) -> Vec<(String, u64)> {
         plan.extractable
             .iter()
             .map(|(evidence, segment)| {
@@ -2174,150 +2244,108 @@ mod report_tests {
 
     #[test]
     fn plan_orders_carved_segments_including_prefix_and_skips_anchor_fragments() {
-        Python::initialize();
-        Python::attach(|py| {
-            let evidences = vec![
-                evidence(py, "rar", "extractable", &[(40, Some(60))], &[]),
-                evidence(
-                    py,
-                    "7z",
-                    "extractable",
-                    &[(4, Some(32)), (0, Some(14))],
-                    &[],
-                ),
-                evidence(
-                    py,
-                    "zip",
-                    "extractable",
-                    &[(13, Some(81))],
-                    &[("source", "embedded_scan"), ("candidate_kind", "anchor")],
-                ),
-                evidence(py, "tar", "extractable", &[(90, None)], &[]),
-            ];
-            let plan = SegmentPlan::build(&evidences, &[0, 1, 2, 3], 100).unwrap();
-            assert_eq!(
-                planned(&evidences, &plan),
-                vec![("7z".into(), 0), ("rar".into(), 40)]
-            );
-        });
+        let evidences = vec![
+            evidence("rar", "extractable", &[(40, Some(60))], &[]),
+            evidence("7z", "extractable", &[(4, Some(32)), (0, Some(14))], &[]),
+            evidence(
+                "zip",
+                "extractable",
+                &[(13, Some(81))],
+                &[("source", "embedded_scan"), ("candidate_kind", "anchor")],
+            ),
+            evidence("tar", "extractable", &[(90, None)], &[]),
+        ];
+        let plan = SegmentPlan::build(&evidences, &[0, 1, 2, 3], 100).unwrap();
+        assert_eq!(
+            planned(&evidences, &plan),
+            vec![("7z".into(), 0), ("rar".into(), 40)]
+        );
     }
 
     #[test]
     fn plan_picks_first_carved_password_segment() {
-        Python::initialize();
-        Python::attach(|py| {
-            let evidences = vec![
-                evidence(
-                    py,
-                    "7z",
-                    "damaged",
-                    &[(0, None)],
-                    &[("password_required", "yes")],
-                ),
-                evidence(
-                    py,
-                    "rar",
-                    "damaged",
-                    &[(90, None), (64, None)],
-                    &[("password_required", "yes")],
-                ),
-                evidence(
-                    py,
-                    "zip",
-                    "damaged",
-                    &[(10, None)],
-                    &[("password_required", "yes")],
-                ),
-            ];
-            let plan = SegmentPlan::build(&evidences, &[], 200).unwrap();
-            assert_eq!(plan.password_segment, Some((2, 0)));
-            assert!(plan.extractable.is_empty());
-        });
+        let evidences = vec![
+            evidence(
+                "7z",
+                "damaged",
+                &[(0, None)],
+                &[("password_required", "yes")],
+            ),
+            evidence(
+                "rar",
+                "damaged",
+                &[(90, None), (64, None)],
+                &[("password_required", "yes")],
+            ),
+            evidence(
+                "zip",
+                "damaged",
+                &[(10, None)],
+                &[("password_required", "yes")],
+            ),
+        ];
+        let plan = SegmentPlan::build(&evidences, &[], 200).unwrap();
+        assert_eq!(plan.password_segment, Some((2, 0)));
+        assert!(plan.extractable.is_empty());
     }
 
     #[test]
     fn plan_proves_missing_volume_from_seven_zip_declared_end() {
-        Python::initialize();
-        Python::attach(|py| {
-            let seven = evidence(py, "7z", "damaged", &[(0, None)], &[]);
-            seven
-                .details
-                .to_python(py)
+        let mut seven = evidence("7z", "damaged", &[(0, None)], &[]);
+        let EvidenceDetails::Fields(details) = &mut seven.details else {
+            unreachable!()
+        };
+        details.put("start_header_crc_ok", true).unwrap();
+        details.put("archive_offset", 0).unwrap();
+        details.put("next_header_offset", 100).unwrap();
+        details.put("next_header_size", 10).unwrap();
+        let evidences = vec![seven];
+        assert_eq!(
+            SegmentPlan::build(&evidences, &[], 50)
                 .unwrap()
-                .set_item("start_header_crc_ok", true)
-                .unwrap();
-            seven
-                .details
-                .to_python(py)
+                .missing_volume_evidence,
+            "seven_zip_start_header_length"
+        );
+        assert_eq!(
+            SegmentPlan::build(&evidences, &[], 142)
                 .unwrap()
-                .set_item("archive_offset", 0)
-                .unwrap();
-            seven
-                .details
-                .to_python(py)
-                .unwrap()
-                .set_item("next_header_offset", 100)
-                .unwrap();
-            seven
-                .details
-                .to_python(py)
-                .unwrap()
-                .set_item("next_header_size", 10)
-                .unwrap();
-            let evidences = vec![seven];
-            assert_eq!(
-                SegmentPlan::build(&evidences, &[], 50)
-                    .unwrap()
-                    .missing_volume_evidence,
-                "seven_zip_start_header_length"
-            );
-            assert_eq!(
-                SegmentPlan::build(&evidences, &[], 142)
-                    .unwrap()
-                    .missing_volume_evidence,
-                ""
-            );
-        });
+                .missing_volume_evidence,
+            ""
+        );
     }
 
     #[test]
     fn combine_prefers_first_outer_range_and_deduplicates_segments() {
-        Python::initialize();
-        Python::attach(|py| {
-            let candidates = vec![
-                evidence(py, "rar", "weak", &[(9, None)], &[("id", "weak")]),
-                evidence(
-                    py,
-                    "rar",
-                    "extractable",
-                    &[(30, Some(50))],
-                    &[("id", "first")],
-                ),
-                evidence(
-                    py,
-                    "rar",
-                    "extractable",
-                    &[(4, Some(20)), (30, Some(50))],
-                    &[("id", "second")],
-                ),
-            ];
-            let combined = combine_candidates(py, "rar", candidates, true).unwrap();
-            assert_eq!(combined.status, "extractable");
-            assert_eq!(
-                str_of(&combined.details.to_python(py).unwrap(), "id").unwrap(),
-                "second"
-            );
-            assert_eq!(
-                i64_of(&combined.details.to_python(py).unwrap(), "candidate_count").unwrap(),
-                2
-            );
-            let spans = combined
-                .segments
-                .iter()
-                .map(|segment| (segment.start, segment.end))
-                .collect::<Vec<_>>();
-            assert_eq!(spans, vec![(4, Some(20)), (30, Some(50))]);
-        });
+        let candidates = vec![
+            evidence("rar", "weak", &[(9, None)], &[("id", "weak")]),
+            evidence("rar", "extractable", &[(30, Some(50))], &[("id", "first")]),
+            evidence(
+                "rar",
+                "extractable",
+                &[(4, Some(20)), (30, Some(50))],
+                &[("id", "second")],
+            ),
+        ];
+        let combined = combine_candidates("rar", candidates, true).unwrap();
+        assert_eq!(combined.status, "extractable");
+        assert_eq!(
+            str_of(&combined.details.to_diagnostic().unwrap(), "id").unwrap(),
+            "second"
+        );
+        assert_eq!(
+            i64_of(
+                &combined.details.to_diagnostic().unwrap(),
+                "candidate_count"
+            )
+            .unwrap(),
+            2
+        );
+        let spans = combined
+            .segments
+            .iter()
+            .map(|segment| (segment.start, segment.end))
+            .collect::<Vec<_>>();
+        assert_eq!(spans, vec![(4, Some(20)), (30, Some(50))]);
     }
 
     #[test]
@@ -2325,90 +2353,78 @@ mod report_tests {
         // Existing isolated-format tests cannot expose promotion of bounded
         // damaged peers, lost password facts, or a duplicate hiding a valid
         // segment. One in-memory plan covers those independent merge effects.
-        Python::initialize();
-        Python::attach(|py| {
-            let candidates = vec![
-                evidence(py, "zip", "damaged", &[(40, Some(60)), (80, Some(90))], &[]),
-                evidence(py, "zip", "extractable", &[(40, Some(60))], &[]),
-                evidence(
-                    py,
-                    "zip",
-                    "damaged",
-                    &[(10, Some(20))],
-                    &[("password_required", "yes")],
-                ),
-            ];
-            let combined = combine_candidates(py, "zip", candidates, true).unwrap();
-            let evidences = vec![combined];
-            let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
-            assert_eq!(planned(&evidences, &plan), vec![("zip".into(), 40)]);
-            assert_eq!(plan.password_segment, Some((0, 0)));
-            assert_eq!(evidences[0].range_key().0, 40);
+        let candidates = vec![
+            evidence("zip", "damaged", &[(40, Some(60)), (80, Some(90))], &[]),
+            evidence("zip", "extractable", &[(40, Some(60))], &[]),
+            evidence(
+                "zip",
+                "damaged",
+                &[(10, Some(20))],
+                &[("password_required", "yes")],
+            ),
+        ];
+        let combined = combine_candidates("zip", candidates, true).unwrap();
+        let evidences = vec![combined];
+        let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
+        assert_eq!(planned(&evidences, &plan), vec![("zip".into(), 40)]);
+        assert_eq!(plan.password_segment, Some((0, 0)));
+        assert_eq!(evidences[0].range_key().0, 40);
 
-            // An encrypted primary must likewise not transfer its password
-            // requirement to an earlier, unencrypted damaged peer.
-            let candidates = vec![
-                evidence(
-                    py,
-                    "rar",
-                    "extractable",
-                    &[(40, Some(60))],
-                    &[("password_required", "yes")],
-                ),
-                evidence(py, "rar", "damaged", &[(10, Some(20))], &[]),
-            ];
-            let evidences = vec![combine_candidates(py, "rar", candidates, true).unwrap()];
-            let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
-            assert_eq!(plan.password_segment, Some((0, 1)));
-        });
+        // An encrypted primary must likewise not transfer its password
+        // requirement to an earlier, unencrypted damaged peer.
+        let candidates = vec![
+            evidence(
+                "rar",
+                "extractable",
+                &[(40, Some(60))],
+                &[("password_required", "yes")],
+            ),
+            evidence("rar", "damaged", &[(10, Some(20))], &[]),
+        ];
+        let evidences = vec![combine_candidates("rar", candidates, true).unwrap()];
+        let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
+        assert_eq!(plan.password_segment, Some((0, 1)));
     }
 
     #[test]
     fn read_fault_projects_field_truncation_and_missing_volume_flags() {
-        Python::initialize();
-        Python::attach(|py| {
-            let native = PyDict::new(py);
-            native
-                .set_item("damage_flags", vec!["read_error", "probably_truncated"])
-                .unwrap();
-            let fault = PyDict::new(py);
-            fault.set_item("code", "unexpected_eof").unwrap();
-            fault.set_item("field", " zip.eocd ").unwrap();
-            fault.set_item("possible_missing_volume", true).unwrap();
-            native.set_item("read_error", fault).unwrap();
-            assert_eq!(
-                read_fault_damage_flags(&native).unwrap(),
-                vec![
-                    "read_error",
-                    "probably_truncated",
-                    "input_truncated",
-                    "field_read_error:zip.eocd",
-                    "missing_volume",
-                ]
-            );
-            native.del_item("read_error").unwrap();
-            assert_eq!(
-                read_fault_damage_flags(&native).unwrap(),
-                vec!["read_error", "probably_truncated"]
-            );
-        });
+        let mut native = DiagnosticFields::new();
+        native
+            .put("damage_flags", vec!["read_error", "probably_truncated"])
+            .unwrap();
+        let mut fault = DiagnosticFields::new();
+        fault.put("code", "unexpected_eof").unwrap();
+        fault.put("field", " zip.eocd ").unwrap();
+        fault.put("possible_missing_volume", true).unwrap();
+        native.put("read_error", fault).unwrap();
+        assert_eq!(
+            read_fault_damage_flags(&native).unwrap(),
+            vec![
+                "read_error",
+                "probably_truncated",
+                "input_truncated",
+                "field_read_error:zip.eocd",
+                "missing_volume",
+            ]
+        );
+        native.remove("read_error").unwrap();
+        assert_eq!(
+            read_fault_damage_flags(&native).unwrap(),
+            vec!["read_error", "probably_truncated"]
+        );
     }
 
     #[test]
     fn truncated_stream_trailing_size_is_unknown_not_an_error() {
-        Python::initialize();
-        Python::attach(|py| {
-            let raw = PyDict::new(py);
-            raw.set_item("format", "gzip").unwrap();
-            raw.set_item("magic_matched", true).unwrap();
-            raw.set_item("plausible", false).unwrap();
-            raw.set_item("structure_validation_complete", true).unwrap();
-            raw.set_item("archive.trailing_data", "unavailable")
-                .unwrap();
-            raw.set_item("file_size", 100).unwrap();
-            let observed = stream_observation(py, raw, "gzip").unwrap();
-            assert!(observed.get_item("segment_end").unwrap().unwrap().is_none());
-            assert_eq!(str_of(&observed, "boundary_confidence").unwrap(), "none");
-        });
+        let mut raw = DiagnosticFields::new();
+        raw.put("format", "gzip").unwrap();
+        raw.put("magic_matched", true).unwrap();
+        raw.put("plausible", false).unwrap();
+        raw.put("structure_validation_complete", true).unwrap();
+        raw.put("archive.trailing_data", "unavailable").unwrap();
+        raw.put("file_size", 100).unwrap();
+        let observed = stream_observation(raw, "gzip").unwrap();
+        assert!(observed.get("segment_end").unwrap().is_null());
+        assert_eq!(str_of(&observed, "boundary_confidence").unwrap(), "none");
     }
 }

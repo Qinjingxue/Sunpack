@@ -1,8 +1,6 @@
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::resource_lifecycle::TrackedFile;
-use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -356,6 +354,15 @@ impl ManagedReader {
         Ok(Self::new(Arc::new(source), config))
     }
 
+    pub(crate) fn open_extents<'a>(
+        extents: impl IntoIterator<Item = (&'a str, u64, Option<u64>)>,
+        config: ReaderConfig,
+    ) -> io::Result<(Self, Vec<u64>)> {
+        let source = MultiVolumeSource::open_extents(extents)?;
+        let disk_starts = source.volumes.iter().map(|volume| volume.start).collect();
+        Ok((Self::new(Arc::new(source), config), disk_starts))
+    }
+
     pub(crate) fn from_bytes(data: Vec<u8>, config: ReaderConfig) -> Self {
         let data: Arc<[u8]> = Arc::from(data);
         Self::new(Arc::new(BytesSource { data }), config)
@@ -701,183 +708,23 @@ impl ManagedReader {
     }
 }
 
-#[pyclass]
 pub(crate) struct NativeArchiveSession {
     path: String,
     reader: ManagedReader,
-    closed: bool,
 }
 
 impl NativeArchiveSession {
-    pub(crate) fn borrowed_reader(&self) -> PyResult<(&str, ManagedReader)> {
-        self.ensure_open()?;
-        Ok((&self.path, self.reader.clone()))
+    pub(crate) fn new(path: String) -> io::Result<Self> {
+        let reader = ManagedReader::open(&path)?;
+        Ok(Self { path, reader })
     }
 
-    fn ensure_open(&self) -> PyResult<()> {
-        if self.closed {
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "native archive session is closed",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[pymethods]
-impl NativeArchiveSession {
-    #[new]
-    fn new(py: Python<'_>, path: String) -> PyResult<Self> {
-        let reader = py.detach(|| ManagedReader::open(&path)).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                // Watch must identify the vanished physical member, which can
-                // differ from the candidate that triggered a volume request.
-                pyo3::exceptions::PyFileNotFoundError::new_err((
-                    error.raw_os_error().unwrap_or(2),
-                    error.to_string(),
-                    path.clone(),
-                ))
-            } else {
-                error.into()
-            }
-        })?;
-        Ok(Self {
-            path,
-            reader,
-            closed: false,
-        })
+    pub(crate) fn borrowed_reader(&self) -> (&str, ManagedReader) {
+        (&self.path, self.reader.clone())
     }
 
-    #[getter]
-    fn path(&self) -> &str {
-        &self.path
-    }
-
-    #[getter]
-    fn size(&self) -> PyResult<u64> {
-        self.ensure_open()?;
-        Ok(self.reader.len())
-    }
-
-    #[getter]
-    fn generation_token(&self) -> PyResult<String> {
-        self.ensure_open()?;
-        Ok(self.reader.file_identity()?.source_id.to_string())
-    }
-
-    #[getter]
-    fn closed(&self) -> bool {
-        self.closed
-    }
-
-    fn close(&mut self) {
-        if !self.closed {
-            self.reader = ManagedReader::closed();
-            self.closed = true;
-        }
-    }
-
-    fn read_at<'py>(
-        &self,
-        py: Python<'py>,
-        offset: u64,
-        len: usize,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        self.ensure_open()?;
-        let data = self.reader.read_cached_at(offset, len)?;
-        Ok(PyBytes::new(py, data.as_slice()))
-    }
-
-    #[pyo3(signature = (cache_bytes=67108864))]
-    fn analysis_view(
-        &self,
-        cache_bytes: usize,
-    ) -> PyResult<crate::analysis_native::AnalysisBinaryView> {
-        if self.closed {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "native archive session is closed",
-            ));
-        }
-        Ok(crate::analysis_native::AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.with_config(ReaderConfig { cache_bytes }),
-            closed: false,
-        })
-    }
-
-    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        let stats = self.reader.stats()?;
-        let dict = PyDict::new(py);
-        dict.set_item("read_bytes", stats.read_bytes)?;
-        dict.set_item("cache_hits", stats.cache_hits)?;
-        Ok(dict.unbind())
-    }
-
-    fn enc_fast_verify_passwords(
-        &self,
-        py: Python<'_>,
-        passwords: &Bound<'_, PyList>,
-    ) -> PyResult<Py<PyAny>> {
-        self.ensure_open()?;
-        crate::password::enc::enc_fast_verify_passwords_with_reader(py, &self.reader, passwords)
-    }
-
-    #[pyo3(signature = (passwords, eocd_offset=None))]
-    fn zip_fast_verify_passwords(
-        &self,
-        py: Python<'_>,
-        passwords: &Bound<'_, PyList>,
-        eocd_offset: Option<u64>,
-    ) -> PyResult<Py<PyAny>> {
-        self.ensure_open()?;
-        crate::password::zip::zip_fast_verify_passwords_with_reader(
-            py,
-            &self.reader,
-            passwords,
-            eocd_offset,
-        )
-    }
-
-    fn seven_zip_fast_verify_passwords(
-        &self,
-        py: Python<'_>,
-        passwords: &Bound<'_, PyList>,
-    ) -> PyResult<Py<PyAny>> {
-        self.ensure_open()?;
-        crate::password::seven_zip::seven_zip_fast_verify_passwords_with_reader(
-            py,
-            &self.reader,
-            passwords,
-        )
-    }
-
-    fn rar_fast_verify_passwords(
-        &self,
-        py: Python<'_>,
-        passwords: &Bound<'_, PyList>,
-    ) -> PyResult<Py<PyAny>> {
-        self.ensure_open()?;
-        crate::password::rar::rar_fast_verify_passwords_with_reader(py, &self.reader, passwords)
-    }
-
-    #[pyo3(signature = (iocp_chunk_bytes=2097152, iocp_buffers=2, iocp_workers=4))]
-    fn scan_embedded_archives(
-        &self,
-        py: Python<'_>,
-        iocp_chunk_bytes: usize,
-        iocp_buffers: usize,
-        iocp_workers: usize,
-    ) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        crate::scan::embedded::scan_embedded_archives_with_reader(
-            py,
-            &self.reader,
-            iocp_chunk_bytes,
-            iocp_buffers,
-            iocp_workers,
-        )
+    pub(crate) fn generation(&self) -> io::Result<(&str, u64)> {
+        Ok((&self.path, self.reader.file_identity()?.source_id))
     }
 }
 
@@ -1007,13 +854,82 @@ pub(crate) struct FileIdentity {
     source_id: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct PhysicalFileGeneration {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PhysicalFileGeneration {
     len: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
     #[cfg(windows)]
     windows: WindowsFileGeneration,
+}
+
+/// Durable receipt values. The signed tuple also represents file times before
+/// the Unix epoch, which can be present in archives and Windows metadata.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedFileGeneration {
+    len: u64,
+    modified: Option<(bool, u64, u32)>,
+    created: Option<(bool, u64, u32)>,
+    #[cfg(windows)]
+    windows: WindowsFileGeneration,
+}
+
+impl PhysicalFileGeneration {
+    pub(crate) fn object_id(&self) -> Option<(u64, [u8; 16])> {
+        #[cfg(windows)]
+        { Some((self.windows.volume, self.windows.file_id)) }
+        #[cfg(not(windows))]
+        { None }
+    }
+    pub(crate) fn persisted(&self) -> PersistedFileGeneration {
+        PersistedFileGeneration {
+            len: self.len,
+            modified: self.modified.map(persisted_file_time),
+            created: self.created.map(persisted_file_time),
+            #[cfg(windows)]
+            windows: self.windows.clone(),
+        }
+    }
+}
+
+fn persisted_file_time(time: SystemTime) -> (bool, u64, u32) {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => (false, duration.as_secs(), duration.subsec_nanos()),
+        Err(error) => (true, error.duration().as_secs(), error.duration().subsec_nanos()),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DirectoryIdentity {
+    volume: u64,
+    file_id: [u8; 16],
+    created: Option<(bool, u64, u32)>,
+}
+
+impl DirectoryIdentity {
+    pub(crate) fn object_id(&self) -> (u64, [u8; 16]) { (self.volume, self.file_id) }
+}
+
+#[cfg(windows)]
+pub(crate) fn capture_directory_identity(path: &Path) -> io::Result<DirectoryIdentity> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x0080) // FILE_READ_ATTRIBUTES
+        .share_mode(0x0007) // read, write, delete
+        .custom_flags(0x02200000) // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & 0x0400 != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "checkpoint output is not a regular directory"));
+    }
+    let generation = windows_file_generation(&file)?;
+    Ok(DirectoryIdentity { volume: generation.volume, file_id: generation.file_id,
+        created: metadata.created().ok().map(persisted_file_time) })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn capture_directory_identity(_path: &Path) -> io::Result<DirectoryIdentity> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "directory identity requires Windows"))
 }
 
 struct FileSource {
@@ -1283,6 +1199,7 @@ impl ByteSource for FileSource {
 struct Volume {
     start: u64,
     end: u64,
+    physical_start: u64,
     source: Arc<FileSource>,
 }
 
@@ -1305,13 +1222,15 @@ impl MultiVolumeSource {
             let chunk_len = (logical_end - logical_start) as usize;
             let target = &mut buffer[written..written + chunk_len];
             let count = if direct {
-                volume
-                    .source
-                    .read_direct_into_at(logical_start - volume.start, target)?
+                volume.source.read_direct_into_at(
+                    volume.physical_start + (logical_start - volume.start),
+                    target,
+                )?
             } else {
-                volume
-                    .source
-                    .read_into_at(logical_start - volume.start, target)?
+                volume.source.read_into_at(
+                    volume.physical_start + (logical_start - volume.start),
+                    target,
+                )?
             };
             written += count;
             if count != chunk_len {
@@ -1333,25 +1252,40 @@ impl MultiVolumeSource {
     }
 
     fn open(paths: &[String]) -> io::Result<Self> {
-        if paths.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "multi-volume reader requires at least one volume",
-            ));
-        }
+        Self::open_extents(paths.iter().map(|path| (path.as_str(), 0, None)))
+    }
+
+    fn open_extents<'a>(
+        extents: impl IntoIterator<Item = (&'a str, u64, Option<u64>)>,
+    ) -> io::Result<Self> {
+        let extents = extents.into_iter();
         let mut cursor = 0u64;
-        let mut volumes = Vec::with_capacity(paths.len());
-        for path in paths {
+        let mut volumes = Vec::with_capacity(extents.size_hint().0);
+        for (path, physical_start, physical_end) in extents {
             let source = manager().open_file(path.as_ref())?;
-            let end = cursor.checked_add(source.len()).ok_or_else(|| {
+            let length = physical_end
+                .unwrap_or(source.len())
+                .min(source.len())
+                .checked_sub(physical_start)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid archive extent")
+                })?;
+            let end = cursor.checked_add(length).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "multi-volume size overflow")
             })?;
             volumes.push(Volume {
                 start: cursor,
                 end,
+                physical_start,
                 source,
             });
             cursor = end;
+        }
+        if volumes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-volume reader requires at least one volume",
+            ));
         }
         Ok(Self {
             len: cursor,
@@ -1398,9 +1332,10 @@ impl ByteSource for MultiVolumeSource {
             let logical_start = offset.max(volume.start);
             let logical_end = end.min(volume.end);
             let chunk_len = (logical_end - logical_start) as usize;
-            let volume_slices = volume
-                .source
-                .read_slices_at(logical_start - volume.start, chunk_len)?;
+            let volume_slices = volume.source.read_slices_at(
+                volume.physical_start + (logical_start - volume.start),
+                chunk_len,
+            )?;
             let produced = volume_slices.iter().map(|slice| slice.len()).sum::<usize>();
             slices.extend(volume_slices);
             if produced != chunk_len {
@@ -1988,8 +1923,7 @@ fn cache_tier(source: &FileSource, index: u64) -> CacheTier {
     }
 }
 
-#[pyfunction]
-pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
+pub(crate) fn reader_cache_stats() -> io::Result<HashMap<&'static str, u64>> {
     let manager = manager();
     let (entries, hot_bytes, general_bytes, mut capacity) = manager.cache_totals()?;
     let handles = {
@@ -2000,89 +1934,89 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
         capacity += handles.entries.capacity() + handles.order.capacity();
         handles.entries.len()
     };
-    let dict = PyDict::new(py);
-    dict.set_item(
+    let mut metrics = HashMap::new();
+    metrics.insert(
         "logical_bytes",
-        manager.metrics.logical_bytes.load(Ordering::Relaxed),
-    )?;
-    dict.set_item(
+        (manager.metrics.logical_bytes.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
         "physical_bytes",
-        manager.metrics.physical_bytes.load(Ordering::Relaxed),
-    )?;
-    dict.set_item(
+        (manager.metrics.physical_bytes.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
         "physical_reads",
-        manager.metrics.physical_reads.load(Ordering::Relaxed),
-    )?;
-    dict.set_item(
+        (manager.metrics.physical_reads.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
         "cache_hits",
-        manager.metrics.cache_hits.load(Ordering::Relaxed),
-    )?;
-    dict.set_item(
+        (manager.metrics.cache_hits.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
         "hot_cache_hits",
-        manager.metrics.hot_cache_hits.load(Ordering::Relaxed),
-    )?;
-    dict.set_item(
+        (manager.metrics.hot_cache_hits.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
         "cache_misses",
-        manager.metrics.cache_misses.load(Ordering::Relaxed),
-    )?;
-    dict.set_item(
+        (manager.metrics.cache_misses.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
         "handle_hits",
-        manager.metrics.handle_hits.load(Ordering::Relaxed),
-    )?;
-    dict.set_item("opens", manager.metrics.opens.load(Ordering::Relaxed))?;
-    dict.set_item(
+        (manager.metrics.handle_hits.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
+        "opens",
+        (manager.metrics.opens.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert(
         "evictions",
-        manager.metrics.evictions.load(Ordering::Relaxed),
-    )?;
-    dict.set_item("cache_entries", entries)?;
-    dict.set_item("hot_cache_bytes", hot_bytes)?;
-    dict.set_item("general_cache_bytes", general_bytes)?;
-    dict.set_item("open_handles", handles)?;
-    dict.set_item("cache_shards", CACHE_SHARDS)?;
-    dict.set_item("container_capacity", capacity)?;
-    dict.set_item(
+        (manager.metrics.evictions.load(Ordering::Relaxed)) as u64,
+    );
+    metrics.insert("cache_entries", (entries) as u64);
+    metrics.insert("hot_cache_bytes", (hot_bytes) as u64);
+    metrics.insert("general_cache_bytes", (general_bytes) as u64);
+    metrics.insert("open_handles", (handles) as u64);
+    metrics.insert("cache_shards", (CACHE_SHARDS) as u64);
+    metrics.insert("container_capacity", (capacity) as u64);
+    metrics.insert(
         "relation_regex_cache_entries",
-        crate::relations::regex_cache_entries(),
-    )?;
-    dict.set_item(
+        (crate::relations::regex_cache_entries()) as u64,
+    );
+    metrics.insert(
         "seven_zip_kdf_cache_entries",
-        crate::formats::seven_zip::seven_zip_kdf_cache_entries(),
-    )?;
-    Ok(dict.unbind())
+        (crate::formats::seven_zip::seven_zip_kdf_cache_entries()) as u64,
+    );
+    Ok(metrics)
 }
 
-#[pyfunction]
-pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
+pub(crate) fn clear_reader_resources() -> io::Result<HashMap<&'static str, u64>> {
     let relation_regexes = crate::relations::clear_regex_caches();
     crate::password::context::clear();
     crate::analysis_native::clear_stream_structure_cache();
     let seven_zip_kdf_entries = crate::formats::seven_zip::clear_seven_zip_kdf_cache();
     let (handles, cache_entries, cache_bytes) = manager().clear_resources()?;
-    let dict = PyDict::new(py);
-    dict.set_item("handles", handles)?;
-    dict.set_item("cache_entries", cache_entries)?;
-    dict.set_item("cache_bytes", cache_bytes)?;
-    dict.set_item("relation_regexes", relation_regexes)?;
-    dict.set_item("seven_zip_kdf_entries", seven_zip_kdf_entries)?;
-    Ok(dict.unbind())
+    let mut metrics = HashMap::new();
+    metrics.insert("handles", (handles) as u64);
+    metrics.insert("cache_entries", (cache_entries) as u64);
+    metrics.insert("cache_bytes", (cache_bytes) as u64);
+    metrics.insert("relation_regexes", (relation_regexes) as u64);
+    metrics.insert("seven_zip_kdf_entries", (seven_zip_kdf_entries) as u64);
+    Ok(metrics)
 }
 
-#[pyfunction]
 pub(crate) fn release_reader_resources_under_roots(
-    py: Python<'_>,
     paths: Vec<String>,
-) -> PyResult<Py<PyDict>> {
-    let (handles, cache_entries, cache_bytes) = py.detach(|| {
+) -> io::Result<HashMap<&'static str, u64>> {
+    let (handles, cache_entries, cache_bytes) = (|| {
         let roots = canonical_release_roots(&paths);
         crate::password::context::release_under_roots(&roots);
         crate::analysis_native::release_stream_structure_cache_under_roots(&roots);
         manager().release_resources_under_roots(&roots)
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item("handles", handles)?;
-    dict.set_item("cache_entries", cache_entries)?;
-    dict.set_item("cache_bytes", cache_bytes)?;
-    Ok(dict.unbind())
+    })()?;
+    let mut metrics = HashMap::new();
+    metrics.insert("handles", (handles) as u64);
+    metrics.insert("cache_entries", (cache_entries) as u64);
+    metrics.insert("cache_bytes", (cache_bytes) as u64);
+    Ok(metrics)
 }
 
 static MANAGER: OnceLock<ReaderManager> = OnceLock::new();
@@ -2122,6 +2056,12 @@ fn manager() -> &'static ReaderManager {
     })
 }
 
+/// Capture the stable physical generation independently of the reader cache.
+pub(crate) fn capture_file_generation(path: &Path) -> io::Result<PhysicalFileGeneration> {
+    let file = TrackedFile::open_reader(path, "source_generation")?;
+    physical_file_generation(&file)
+}
+
 fn physical_file_generation(file: &File) -> io::Result<PhysicalFileGeneration> {
     let metadata = file.metadata()?;
     Ok(PhysicalFileGeneration {
@@ -2134,7 +2074,7 @@ fn physical_file_generation(file: &File) -> io::Result<PhysicalFileGeneration> {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct WindowsFileGeneration {
     volume: u64,
     file_id: [u8; 16],
@@ -2975,19 +2915,22 @@ mod tests {
 
     #[test]
     fn multi_volume_reads_across_boundary() {
-        let first = temp_file("managed_reader_part1", b"abc");
-        let second = temp_file("managed_reader_part2", b"def");
+        let first = temp_file("managed_reader_part1", b"..abc!");
+        let second = temp_file("managed_reader_part2", b".def!!");
         let empty = temp_file("managed_reader_empty_part", b"");
-        let paths = vec![
-            empty.to_string_lossy().into_owned(),
-            first.to_string_lossy().into_owned(),
-            empty.to_string_lossy().into_owned(),
-            second.to_string_lossy().into_owned(),
-            empty.to_string_lossy().into_owned(),
+        let first_path = first.to_string_lossy();
+        let second_path = second.to_string_lossy();
+        let empty_path = empty.to_string_lossy();
+        let extents = [
+            (empty_path.as_ref(), 0, None),
+            (first_path.as_ref(), 2, Some(5)),
+            (empty_path.as_ref(), 0, None),
+            (second_path.as_ref(), 1, Some(4)),
+            (empty_path.as_ref(), 0, None),
         ];
-        // One coarse matrix covers all read modes, zero-length volumes
-        // and clipped EOF. Two nonempty volumes alone miss these.
-        let source = MultiVolumeSource::open(&paths).unwrap();
+        // One matrix covers all read modes, bounded carrier ranges,
+        // zero-length volumes, and clipped EOF.
+        let source = MultiVolumeSource::open_extents(extents).unwrap();
         for offset in 0..=7u64 {
             for length in 0..=8usize {
                 let start = (offset as usize).min(6);
@@ -3008,7 +2951,9 @@ mod tests {
                 );
             }
         }
-        let reader = ManagedReader::open_volumes(&paths, ReaderConfig::default()).unwrap();
+        let (reader, starts) =
+            ManagedReader::open_extents(extents, ReaderConfig::default()).unwrap();
+        assert_eq!(starts, [0, 0, 3, 3, 6]);
         assert_eq!(reader.read_at(2, 3).unwrap(), b"cde");
         let mut cursor = reader.cursor();
         cursor.seek(SeekFrom::Start(2)).unwrap();
@@ -3090,10 +3035,7 @@ mod tests {
         pool.insert(Arc::clone(&third));
         for _ in 0..2000 {
             assert_eq!(
-                Arc::as_ptr(
-                    &pool.touch(&second.identity.path, &second.physical)
-                        .unwrap()
-                ),
+                Arc::as_ptr(&pool.touch(&second.identity.path, &second.physical).unwrap()),
                 first_ptr
             );
         }

@@ -1,16 +1,11 @@
 //! Resident Watch state records owned by Rust.
 //!
-//! `WatchStateStore` (Python) keeps sequencing, WAL submission and checkpoint
-//! orchestration. The record maps, their snapshot/journal decoding, operation
-//! application and snapshot encoding live here, so the long-running Watch
-//! process never keeps every pending item and retry entry as Python objects.
+//! Typed record maps, operation application, and the snapshot and journal codecs
+//! share one durable representation with the Watch scheduler.
 
 use crate::collections::trim_map;
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::wal::{self, Kind};
-use pyo3::exceptions::{PyTypeError, PyValueError};
-use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -36,7 +31,7 @@ fn recorded_file_presence(path: &str) -> Option<bool> {
 // Serialize the existing path list schema; index canonical keys only in memory.
 // Ancestor lookup and subtree retirement do not scan unrelated sibling outputs.
 #[derive(Debug, Clone, Default)]
-struct PathSet(BTreeMap<String, String>);
+pub(crate) struct PathSet(BTreeMap<String, String>);
 impl Serialize for PathSet {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.0.values())
@@ -49,13 +44,13 @@ impl<'de> Deserialize<'de> for PathSet {
     }
 }
 impl PathSet {
-    fn iter(&self) -> impl Iterator<Item = &String> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
         self.0.values()
     }
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    fn contains(&self, path: &str) -> bool {
+    pub(crate) fn contains(&self, path: &str) -> bool {
         self.0.contains_key(&path_key(path))
     }
     fn covers(&self, path: &str) -> bool {
@@ -262,40 +257,40 @@ impl PendingRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PendingRecord {
-    path: String,
-    size: i64,
-    mtime: f64,
-    file_id: String,
-    change_usn: i64,
-    force: bool,
-    password_scope_dir: String,
-    source_input_root: String,
-    internal_recovery: bool,
-    discovery_scope: Map<String, Value>,
-    durable_owner: bool,
-    active_outputs: BTreeMap<String, String>,
-    committed_roots: PathSet,
-    completed_sources: PathSet,
-    output_identities: BTreeMap<String, String>,
-    promoted_destinations: PathSet,
+pub(crate) struct PendingRecord {
+    pub(crate) path: String,
+    pub(crate) size: i64,
+    pub(crate) mtime: f64,
+    pub(crate) file_id: String,
+    pub(crate) change_usn: i64,
+    pub(crate) force: bool,
+    pub(crate) password_scope_dir: String,
+    pub(crate) source_input_root: String,
+    pub(crate) internal_recovery: bool,
+    pub(crate) discovery_scope: Map<String, Value>,
+    pub(crate) durable_owner: bool,
+    pub(crate) active_outputs: BTreeMap<String, String>,
+    pub(crate) committed_roots: PathSet,
+    pub(crate) completed_sources: PathSet,
+    pub(crate) output_identities: BTreeMap<String, String>,
+    pub(crate) promoted_destinations: PathSet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EntryRecord {
-    path: String,
-    size: i64,
-    mtime: f64,
-    file_id: String,
-    change_usn: i64,
-    status: String,
-    last_error: String,
-    attempt_count: i64,
-    failure_kind: String,
-    failure_stage: String,
-    failure_payload: Map<String, Value>,
-    last_attempt_at: f64,
+pub(crate) struct EntryRecord {
+    pub(crate) path: String,
+    pub(crate) size: i64,
+    pub(crate) mtime: f64,
+    pub(crate) file_id: String,
+    pub(crate) change_usn: i64,
+    pub(crate) status: String,
+    pub(crate) last_error: String,
+    pub(crate) attempt_count: i64,
+    pub(crate) failure_kind: String,
+    pub(crate) failure_stage: String,
+    pub(crate) failure_payload: Map<String, Value>,
+    pub(crate) last_attempt_at: f64,
 }
 
 impl EntryRecord {
@@ -307,18 +302,16 @@ impl EntryRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, FromPyObject)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[pyo3(from_item_all)]
-struct Cursor {
-    journal_id: i128,
-    next_usn: i128,
+pub(crate) struct Cursor {
+    pub(crate) journal_id: i128,
+    pub(crate) next_usn: i128,
 }
 
-#[derive(FromPyObject)]
-struct PendingObservation(String, i64, f64, String, i64);
+pub(crate) struct PendingObservation(pub String, pub i64, pub f64, pub String, pub i64);
 
-type PendingUpdate<'py> = (PendingObservation, String, Option<Bound<'py, PyDict>>);
+pub(crate) type PendingUpdate = (PendingObservation, String, Option<Map<String, Value>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Collection {
@@ -407,7 +400,10 @@ impl<'de> Deserialize<'de> for Operation {
                     5 => Operation::SetCursors(field(&mut seq)?),
                     6 => {
                         let key: String = field(&mut seq)?;
-                        if !key.starts_with("owned|") && !key.starts_with("flatten|") {
+                        if !key.starts_with("owned|")
+                            && !key.starts_with("flatten|")
+                            && !key.starts_with("checkpoint|")
+                        {
                             return Err(A::Error::custom("unknown runtime record"));
                         }
                         Operation::Runtime(key, field(&mut seq)?)
@@ -485,9 +481,15 @@ impl StateData {
             }
             Operation::Delete(Collection::Pending, key) => {
                 self.pending.remove(key);
+                if !self.entries.contains_key(key) {
+                    self.retire_checkpoints(key);
+                }
             }
             Operation::Delete(Collection::Entries, key) => {
                 self.entries.remove(key);
+                if !self.pending.contains_key(key) {
+                    self.retire_checkpoints(key);
+                }
             }
             Operation::SetMetadata(generation, signature) => {
                 self.password_generation = *generation;
@@ -496,27 +498,88 @@ impl StateData {
             Operation::SetCursors(cursors) => self.cursors = cursors.clone(),
         }
     }
+
+    fn retire_checkpoints(&mut self, owner: &str) {
+        let prefix = format!("checkpoint|{owner}\0");
+        let keys: Vec<_> = self
+            .runtime
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            self.runtime.remove(&key);
+        }
+    }
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, Clone)]
 #[serde(transparent)]
 pub(crate) struct Operations(Vec<Operation>);
 
 /// Decoded journal operations, validated before their WAL record is submitted.
-#[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchOperations {
     pub(crate) operations: Arc<Operations>,
 }
 
-#[pymethods]
 impl NativeWatchOperations {
-    fn __len__(&self) -> usize {
+    pub(crate) fn empty() -> Self {
+        Self {
+            operations: Arc::new(Operations::default()),
+        }
+    }
+
+    pub(crate) fn finish_pending(path: &str, entry: Option<Arc<EntryRecord>>) -> Self {
+        let key = path_key(path);
+        let retry = match entry {
+            Some(entry) => Operation::PutEntry(key.clone(), entry),
+            None => Operation::Delete(Collection::Entries, key.clone()),
+        };
+        Self {
+            operations: Arc::new(Operations(vec![
+                retry,
+                Operation::Delete(Collection::Pending, key),
+            ])),
+        }
+    }
+
+    pub(crate) fn checkpoint(owner: &str, output: &str, value: Option<Value>) -> Self {
+        Self {
+            operations: Arc::new(Operations(vec![Operation::Runtime(
+                format!("checkpoint|{}\0{}", path_key(owner), path_key(output)),
+                value,
+            )])),
+        }
+    }
+
+    pub(crate) fn cursors(cursors: BTreeMap<String, Cursor>) -> Self {
+        Self {
+            operations: Arc::new(Operations(vec![Operation::SetCursors(cursors)])),
+        }
+    }
+
+    pub(crate) fn password_generation(generation: i64, signature: String) -> Self {
+        Self {
+            operations: Arc::new(Operations(vec![Operation::SetMetadata(
+                generation, signature,
+            )])),
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        Arc::make_mut(&mut self.operations)
+            .0
+            .extend(Arc::unwrap_or_clone(other.operations).0);
+    }
+}
+
+impl NativeWatchOperations {
+    pub(crate) fn __len__(&self) -> usize {
         self.operations.0.len()
     }
 }
 
 /// Frozen checkpoint view; writing it never touches the live maps.
-#[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchSnapshot {
     checkpoint_seq: u64,
     data: StateData,
@@ -601,16 +664,14 @@ struct SnapshotInput {
     runtime: BTreeMap<String, Value>,
 }
 
-#[pymethods]
 impl NativeWatchSnapshot {
-    #[getter]
-    fn checkpoint_seq(&self) -> u64 {
+    pub(crate) fn checkpoint_seq(&self) -> u64 {
         self.checkpoint_seq
     }
 
     /// Encode, write and fsync the snapshot to an existing temporary file.
-    fn write(&self, py: Python<'_>, path: String) -> PyResult<u64> {
-        py.detach(|| -> PyResult<u64> {
+    pub(crate) fn write(&self, path: String) -> std::io::Result<u64> {
+        (|| -> std::io::Result<u64> {
             let document = SnapshotDocument {
                 password_generation: self.data.password_generation,
                 password_source_signature: &self.data.password_source_signature,
@@ -636,23 +697,17 @@ impl NativeWatchSnapshot {
             )?;
             file.sync_all()?;
             Ok(bytes)
-        })
+        })()
     }
 }
 
 /// Records applied from one journal segment.
-#[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchReplay {
-    #[pyo3(get)]
-    applied_seq: u64,
-    #[pyo3(get)]
-    expected_seq: u64,
-    #[pyo3(get)]
-    records: u64,
-    #[pyo3(get)]
-    bytes: u64,
-    #[pyo3(get)]
-    valid_bytes: u64,
+    pub(crate) applied_seq: u64,
+    pub(crate) expected_seq: u64,
+    pub(crate) records: u64,
+    pub(crate) bytes: u64,
+    pub(crate) valid_bytes: u64,
 }
 
 fn entry_event(record: &EntryRecord) -> Value {
@@ -660,7 +715,6 @@ fn entry_event(record: &EntryRecord) -> Value {
         "error":crate::event_log::diagnostic_text(&record.last_error)})
 }
 
-#[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchState {
     pub(crate) data: Arc<Mutex<StateData>>,
     events: Mutex<Option<std::sync::Weak<crate::event_log::Shared>>>,
@@ -777,26 +831,22 @@ impl NativeWatchState {
     }
 }
 
-#[pymethods]
 impl NativeWatchState {
     /// Preserve output ownership while updating the input observation. The same
     /// operations back in-memory queues, admissions and durable USN checkpoints.
-    #[pyo3(signature = (updates, *, force=false, password_scope_dir="", internal_recovery=false, durable_owner=false, cursors=None))]
-    fn pending_operations(
+    pub(crate) fn pending_operations(
         &self,
-        updates: &Bound<'_, PyAny>,
+        updates: impl IntoIterator<Item = PendingUpdate>,
         force: bool,
         password_scope_dir: &str,
         internal_recovery: bool,
         durable_owner: bool,
         cursors: Option<BTreeMap<String, Cursor>>,
-    ) -> PyResult<(NativeWatchOperations, bool)> {
+    ) -> std::io::Result<(NativeWatchOperations, bool)> {
         let recovery_batch = cursors.is_some();
         let mut operations = Vec::with_capacity(1);
         let mut persist_attempt = false;
-        for update in updates.try_iter()? {
-            let (PendingObservation(path, size, mtime, file_id, change_usn), root, scope) =
-                update?.extract::<PendingUpdate<'_>>()?;
+        for (PendingObservation(path, size, mtime, file_id, change_usn), root, scope) in updates {
             let key = crate::path_keys::path_key(&path);
             let previous = {
                 let data = self.lock();
@@ -831,9 +881,6 @@ impl NativeWatchState {
                 record.source_input_root = root;
             }
             if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
-                let Value::Object(scope) = py_to_json(scope.as_any())? else {
-                    return Err(invalid("expected a discovery scope object"));
-                };
                 record.discovery_scope = scope;
             }
             record.path = path;
@@ -859,7 +906,7 @@ impl NativeWatchState {
         ))
     }
 
-    fn promotion_operation(
+    pub(crate) fn promotion_operation(
         &self,
         owner: &str,
         destinations: Vec<String>,
@@ -880,16 +927,15 @@ impl NativeWatchState {
             })
     }
     /// Build a bounded WAL delta without exporting a growing pending record.
-    #[pyo3(signature = (owner, task, output, keep=None, *, owned_paths=Vec::new()))]
-    fn output_operation(
+    pub(crate) fn output_operation(
         &self,
-        py: Python<'_>,
+
         owner: &str,
         task: String,
         output: String,
         keep: Option<bool>,
         owned_paths: Vec<String>,
-    ) -> PyResult<Option<NativeWatchOperations>> {
+    ) -> std::io::Result<Option<NativeWatchOperations>> {
         let register = !owned_paths.is_empty();
         if register && keep.is_some() {
             return Err(invalid("output registration requires a start"));
@@ -919,7 +965,7 @@ impl NativeWatchState {
                 true
             }
         };
-        let identity = py.detach(|| -> PyResult<Option<String>> {
+        let identity = (|| -> std::io::Result<Option<String>> {
             let path = Path::new(&output);
             if register {
                 crate::scan::scope::create_output_root_exclusive(path)?;
@@ -932,7 +978,7 @@ impl NativeWatchState {
             } else {
                 Ok(None)
             }
-        })?;
+        })()?;
         let mut operations = Vec::with_capacity(1 + owned_paths.len());
         let change = if let Some(keep) = keep {
             OutputChange::Finish {
@@ -973,15 +1019,11 @@ impl NativeWatchState {
         }))
     }
 
-    fn runtime_record(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyDict>>> {
-        self.lock()
-            .runtime
-            .get(key)
-            .map(|v| to_py_dict(py, v))
-            .transpose()
+    pub(crate) fn runtime_record(&self, key: &str) -> Option<Value> {
+        self.lock().runtime.get(key).cloned()
     }
 
-    fn runtime_keys(&self, prefix: &str) -> Vec<String> {
+    pub(crate) fn runtime_keys(&self, prefix: &str) -> Vec<String> {
         self.lock()
             .runtime
             .range(prefix.to_owned()..)
@@ -990,7 +1032,7 @@ impl NativeWatchState {
             .collect()
     }
 
-    fn output_root_in_use(&self, path: &str) -> bool {
+    pub(crate) fn output_root_in_use(&self, path: &str) -> bool {
         let root = path_key(path);
         let intersects = |path: &str| {
             let key = path_key(path);
@@ -1014,7 +1056,7 @@ impl NativeWatchState {
             })
     }
 
-    fn owned_root(&self, path: &str) -> Option<String> {
+    pub(crate) fn owned_root(&self, path: &str) -> Option<String> {
         let key = crate::path_keys::path_key(path);
         let mut current = key.trim_end_matches('\\');
         let data = self.lock();
@@ -1033,71 +1075,63 @@ impl NativeWatchState {
         }
     }
 
-    #[new]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             data: Arc::new(Mutex::new(StateData::default())),
             events: Mutex::new(None),
         }
     }
 
-    fn attach_events(&self, log: PyRef<'_, crate::event_log::NativeEventLog>) -> PyResult<()> {
+    pub(crate) fn attach_events(
+        &self,
+        log: &crate::event_log::NativeEventLog,
+    ) -> std::io::Result<()> {
         *self.events.lock().unwrap() = Some(Arc::downgrade(log.shared()?));
         Ok(())
     }
 
-    fn reset(&self) {
+    pub(crate) fn reset(&self) {
         *self.lock() = StateData::default();
     }
 
     /// Capacity-only maintenance: never changes records or checkpoint views.
-    fn trim_idle_storage(&self) {
+    pub(crate) fn trim_idle_storage(&self) {
         let mut data = self.lock();
         trim_map(&mut data.pending);
         trim_map(&mut data.entries);
     }
 
-    fn storage_capacities(&self) -> (usize, usize) {
+    pub(crate) fn storage_capacities(&self) -> (usize, usize) {
         let data = self.lock();
         (data.pending.capacity(), data.entries.capacity())
     }
 
-    #[getter]
-    fn password_generation(&self) -> i64 {
+    pub(crate) fn password_generation(&self) -> i64 {
         self.lock().password_generation
     }
 
-    #[getter]
-    fn password_source_signature(&self) -> String {
+    pub(crate) fn password_source_signature(&self) -> String {
         self.lock().password_source_signature.clone()
     }
 
-    #[getter]
-    fn pending_count(&self) -> usize {
+    pub(crate) fn pending_count(&self) -> usize {
         self.lock().pending.len()
     }
 
-    #[getter]
-    fn entry_count(&self) -> usize {
+    pub(crate) fn entry_count(&self) -> usize {
         self.lock().entries.len()
     }
 
-    fn pending(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<PyDict>>> {
-        let record = self.lock().pending.get(&path_key(path)).cloned();
-        record
-            .map(|value| to_py_dict(py, value.as_ref()))
-            .transpose()
+    pub(crate) fn pending(&self, path: &str) -> Option<Arc<PendingRecord>> {
+        self.lock().pending.get(&path_key(path)).cloned()
     }
 
-    fn entry(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<PyDict>>> {
-        let record = self.lock().entries.get(&path_key(path)).cloned();
-        record
-            .map(|value| to_py_dict(py, value.as_ref()))
-            .transpose()
+    pub(crate) fn entry(&self, path: &str) -> Option<Arc<EntryRecord>> {
+        self.lock().entries.get(&path_key(path)).cloned()
     }
 
     /// Project provenance without converting complete failure/group payloads.
-    fn promoted_nested_input_paths(&self, paths: Vec<String>) -> Vec<String> {
+    pub(crate) fn promoted_nested_input_paths(&self, paths: Vec<String>) -> Vec<String> {
         let data = self.lock();
         paths
             .into_iter()
@@ -1120,56 +1154,41 @@ impl NativeWatchState {
             .collect()
     }
 
-    fn pending_items(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
-        let records: Vec<_> = self.lock().pending.values().cloned().collect();
-        records
-            .iter()
-            .map(|value| to_py_dict(py, value.as_ref()))
-            .collect()
+    pub(crate) fn pending_items(&self) -> Vec<Arc<PendingRecord>> {
+        self.lock().pending.values().cloned().collect()
     }
 
-    /// Entries, optionally only those waiting on one blocker.
-    #[pyo3(signature = (*, blocker=None))]
-    fn entry_items(&self, py: Python<'_>, blocker: Option<&str>) -> PyResult<Vec<Py<PyDict>>> {
-        let records: Vec<_> = self
-            .lock()
+    pub(crate) fn entry_items(&self, blocker: Option<&str>) -> Vec<Arc<EntryRecord>> {
+        self.lock()
             .entries
             .values()
             .filter(|value| blocker.is_none_or(|blocker| value.blocks(blocker)))
             .cloned()
-            .collect();
-        records
-            .iter()
-            .map(|value| to_py_dict(py, value.as_ref()))
             .collect()
     }
 
-    fn has_entry_blocker(&self, blocker: &str) -> bool {
+    pub(crate) fn has_entry_blocker(&self, blocker: &str) -> bool {
         self.lock()
             .entries
             .values()
             .any(|value| value.blocks(blocker))
     }
 
-    fn has_pending(&self, path: &str) -> bool {
+    pub(crate) fn has_pending(&self, path: &str) -> bool {
         self.lock().pending.contains_key(&path_key(path))
     }
 
-    fn has_entry(&self, path: &str) -> bool {
+    pub(crate) fn has_entry(&self, path: &str) -> bool {
         self.lock().entries.contains_key(&path_key(path))
     }
 
     /// Configuration retirement only visits resident state, never file-index rows.
-    fn scope_retirement_operations(
+    pub(crate) fn scope_retirement_operations(
         &self,
-        py: Python<'_>,
-        scopes: Vec<Py<crate::scan::scope::NativeDiscoveryScope>>,
+
+        scopes: &[crate::scan::scope::NativeDiscoveryScope],
     ) -> NativeWatchOperations {
-        let scopes: Vec<_> = scopes
-            .iter()
-            .map(|scope| scope.borrow(py).clone())
-            .collect();
-        let operations = py.detach(|| {
+        let operations = (|| {
             let data = self.lock();
             let recovery_paths: Vec<_> = data
                 .pending
@@ -1231,17 +1250,16 @@ impl NativeWatchState {
                 operations.push(Operation::SetCursors(cursors));
             }
             operations
-        });
+        })();
         NativeWatchOperations {
             operations: Arc::new(Operations(operations)),
         }
     }
 
     /// Missing-only retirement keeps durable output recovery, even under a removed directory.
-    #[pyo3(signature = (path, recursive, *, missing_only=false))]
-    fn keys_matching(
+    pub(crate) fn keys_matching(
         &self,
-        py: Python<'_>,
+
         path: &str,
         recursive: bool,
         missing_only: bool,
@@ -1279,7 +1297,7 @@ impl NativeWatchState {
                 )
             }
         };
-        py.detach(move || {
+        (move || {
             let mut pending: Vec<_> = pending
                 .into_iter()
                 .filter(|(_, record)| {
@@ -1301,12 +1319,11 @@ impl NativeWatchState {
             pending.sort();
             entries.sort();
             (pending, entries)
-        })
+        })()
     }
 
     /// ``(key, recorded path)`` in the requested retry-entry scope.
-    #[pyo3(signature = (path=None, recursive=false))]
-    fn entry_paths(&self, path: Option<&str>, recursive: bool) -> Vec<(String, String)> {
+    pub(crate) fn entry_paths(&self, path: Option<&str>, recursive: bool) -> Vec<(String, String)> {
         let expected = path.map(path_key);
         let data = self.lock();
         let mut paths: Vec<_> = if let Some(key) = expected.as_ref().filter(|_| !recursive) {
@@ -1330,46 +1347,37 @@ impl NativeWatchState {
         paths
     }
 
-    #[staticmethod]
-    fn file_presence(py: Python<'_>, path: &str) -> Option<bool> {
-        py.detach(|| recorded_file_presence(path))
+    pub(crate) fn file_presence(path: &str) -> Option<bool> {
+        recorded_file_presence(path)
     }
 
-    fn watch_cursors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let cursors = self.lock().cursors.clone();
-        let result = PyDict::new(py);
-        for (key, cursor) in cursors {
-            result.set_item(key, cursor_dict(py, cursor)?)?;
-        }
-        Ok(result)
+    pub(crate) fn watch_cursors(&self) -> BTreeMap<String, Cursor> {
+        self.lock().cursors.clone()
     }
 
-    fn watch_cursor<'py>(
+    pub(crate) fn watch_cursor(&self, volume_key: &str) -> Option<Cursor> {
+        self.lock().cursors.get(&volume_key.to_lowercase()).copied()
+    }
+
+    /// Validate external journal operation inputs with the replay schema.
+    pub(crate) fn decode_operations(
         &self,
-        py: Python<'py>,
-        volume_key: &str,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let cursor = self.lock().cursors.get(&volume_key.to_lowercase()).copied();
-        cursor.map(|cursor| cursor_dict(py, cursor)).transpose()
-    }
-
-    /// Validate journal operations; raises ``ValueError``/``TypeError`` like the WAL replay.
-    fn decode_operations(&self, operations: &Bound<'_, PyAny>) -> PyResult<NativeWatchOperations> {
-        let mut decoded = Vec::new();
-        for operation in operations.try_iter()? {
-            let operation = decode_operation(&py_to_json(&operation?)?)?;
-            decoded.push(operation);
-        }
+        operations: &[Value],
+    ) -> std::io::Result<NativeWatchOperations> {
+        let decoded = operations
+            .iter()
+            .map(decode_operation)
+            .collect::<std::io::Result<_>>()?;
         Ok(NativeWatchOperations {
             operations: Arc::new(Operations(decoded)),
         })
     }
 
-    fn apply(&self, operations: PyRef<'_, NativeWatchOperations>) {
+    pub(crate) fn apply(&self, operations: &NativeWatchOperations) {
         self.apply_operations(&operations.operations);
     }
 
-    fn capture(&self, checkpoint_seq: u64) -> NativeWatchSnapshot {
+    pub(crate) fn capture(&self, checkpoint_seq: u64) -> NativeWatchSnapshot {
         NativeWatchSnapshot {
             checkpoint_seq,
             data: self.lock().clone(),
@@ -1377,16 +1385,15 @@ impl NativeWatchState {
     }
 
     /// Replace the maps with the snapshot at ``path``.
-    fn load_snapshot(&self, py: Python<'_>, path: String) -> PyResult<u64> {
-        let (checkpoint_seq, data) = py.detach(|| load_snapshot_file(&path))?;
+    pub(crate) fn load_snapshot(&self, path: String) -> std::io::Result<u64> {
+        let (checkpoint_seq, data) = (load_snapshot_file(&path))?;
         *self.lock() = data;
         Ok(checkpoint_seq)
     }
 
     /// Replay already established this boundary while holding the path gate.
-    #[staticmethod]
-    fn truncate_journal_tail(py: Python<'_>, path: String, valid_bytes: u64) -> PyResult<()> {
-        py.detach(|| -> PyResult<()> {
+    pub(crate) fn truncate_journal_tail(path: String, valid_bytes: u64) -> std::io::Result<()> {
+        (|| -> std::io::Result<()> {
             let file = TrackedFile::open_with(&path, "watch_journal_repair", |options| {
                 options.read(true).write(true);
             })?;
@@ -1395,27 +1402,22 @@ impl NativeWatchState {
                 file.sync_all()?;
             }
             Ok(())
-        })
+        })()
     }
 
     /// Apply one journal segment after ``checkpoint_seq``; errors carry the WAL diagnosis.
-    fn replay_segment(
+    pub(crate) fn replay_segment(
         &self,
-        py: Python<'_>,
+
         path: String,
         checkpoint_seq: u64,
         expected_seq: u64,
-    ) -> PyResult<NativeWatchReplay> {
-        let mut data = std::mem::take(&mut *self.lock());
-        let replay =
-            py.detach(|| replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq));
-        *self.lock() = data;
-        replay
+    ) -> std::io::Result<NativeWatchReplay> {
+        replay_segment_file(&mut self.lock(), &path, checkpoint_seq, expected_seq)
     }
 }
 
-/// Absolute Windows filesystem key shared with discovery and Python.
-#[pyfunction]
+/// Absolute Windows filesystem key shared with discovery.
 pub(crate) fn watch_path_key(path: &str) -> String {
     path_key(path)
 }
@@ -1434,18 +1436,11 @@ pub(crate) fn is_path_under(path: &str, root: &str) -> bool {
     path.len() > root.len() && path.starts_with(root) && path.as_bytes()[root.len()] == b'\\'
 }
 
-fn cursor_dict<'py>(py: Python<'py>, cursor: Cursor) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("journal_id", cursor.journal_id)?;
-    dict.set_item("next_usn", cursor.next_usn)?;
-    Ok(dict)
+fn invalid(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(message.into())
 }
 
-fn invalid(message: impl Into<String>) -> PyErr {
-    PyValueError::new_err(message.into())
-}
-
-fn require_fields(object: &Map<String, Value>, required: &[&str]) -> PyResult<()> {
+fn require_fields(object: &Map<String, Value>, required: &[&str]) -> std::io::Result<()> {
     if required.iter().any(|name| !object.contains_key(*name))
         || object.keys().any(|name| !required.contains(&name.as_str()))
     {
@@ -1454,21 +1449,23 @@ fn require_fields(object: &Map<String, Value>, required: &[&str]) -> PyResult<()
     Ok(())
 }
 
-fn decode_record<T: for<'de> Deserialize<'de>>(value: &Value) -> PyResult<T> {
+fn decode_record<T: for<'de> Deserialize<'de>>(value: &Value) -> std::io::Result<T> {
     if !value.is_object() {
-        return Err(PyTypeError::new_err("state record value must be an object"));
+        return Err(std::io::Error::other(
+            "state record value must be an object",
+        ));
     }
-    T::deserialize(value).map_err(|error| PyTypeError::new_err(error.to_string()))
+    T::deserialize(value).map_err(|error| std::io::Error::other(error.to_string()))
 }
 
-fn decode_operation(operation: &Value) -> PyResult<Operation> {
+fn decode_operation(operation: &Value) -> std::io::Result<Operation> {
     let Some(object) = operation.as_object() else {
-        return Err(PyTypeError::new_err("journal operation must be an object"));
+        return Err(std::io::Error::other("journal operation must be an object"));
     };
     let action = object
         .get("op")
         .and_then(Value::as_str)
-        .ok_or_else(|| PyTypeError::new_err("journal operation op must be a string"))?;
+        .ok_or_else(|| std::io::Error::other("journal operation op must be a string"))?;
     match action {
         "runtime" => {
             require_fields(
@@ -1483,7 +1480,10 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
                 .get("key")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("runtime key missing"))?;
-            if !key.starts_with("owned|") && !key.starts_with("flatten|") {
+            if !key.starts_with("owned|")
+                && !key.starts_with("flatten|")
+                && !key.starts_with("checkpoint|")
+            {
                 return Err(invalid("unknown runtime record"));
             }
             return Ok(Operation::Runtime(
@@ -1534,7 +1534,7 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
             let value = object
                 .get("value")
                 .and_then(Value::as_object)
-                .ok_or_else(|| PyTypeError::new_err("metadata value must be an object"))?;
+                .ok_or_else(|| std::io::Error::other("metadata value must be an object"))?;
             require_fields(value, &["password_generation", "password_source_signature"])?;
             let generation = value
                 .get("password_generation")
@@ -1554,7 +1554,7 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
     let collection_name = object
         .get("collection")
         .and_then(Value::as_str)
-        .ok_or_else(|| PyTypeError::new_err("journal operation collection must be a string"))?;
+        .ok_or_else(|| std::io::Error::other("journal operation collection must be a string"))?;
     let collection = match collection_name {
         "pending_work" => Collection::Pending,
         "entries" => Collection::Entries,
@@ -1568,7 +1568,7 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
     let key = object
         .get("key")
         .and_then(Value::as_str)
-        .ok_or_else(|| PyTypeError::new_err("journal operation key must be a string"))?
+        .ok_or_else(|| std::io::Error::other("journal operation key must be a string"))?
         .to_owned();
     if key.is_empty() {
         return Err(invalid("state operation key must not be empty"));
@@ -1578,7 +1578,7 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
         "put" => {
             let value = object
                 .get("value")
-                .ok_or_else(|| PyTypeError::new_err("journal put operation requires value"))?;
+                .ok_or_else(|| std::io::Error::other("journal put operation requires value"))?;
             Ok(match collection {
                 Collection::Pending => {
                     let record: PendingRecord = decode_record(value)?;
@@ -1594,7 +1594,7 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
     }
 }
 
-fn load_snapshot_file(path: &str) -> PyResult<(u64, StateData)> {
+fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
     let file = TrackedFile::open(path, "watch_state_snapshot_input")?;
     let (checkpoint_seq, snapshot): (_, SnapshotInput) =
         wal::read_snapshot(file, Kind::TaskSnapshot)
@@ -1625,7 +1625,7 @@ fn replay_segment_file(
     path: &str,
     checkpoint_seq: u64,
     mut expected_seq: u64,
-) -> PyResult<NativeWatchReplay> {
+) -> std::io::Result<NativeWatchReplay> {
     let diagnose = |error| invalid(format!("corrupt watch state journal at {path}: {error}"));
     let file = TrackedFile::open(path, "watch_state_journal_input")?;
     let mut reader = wal::Reader::new(file, Kind::TaskWal).map_err(diagnose)?;
@@ -1664,92 +1664,6 @@ fn replay_segment_file(
     replay.valid_bytes = reader.valid_end;
     replay.expected_seq = expected_seq;
     Ok(replay)
-}
-
-fn to_py_dict<T: Serialize>(py: Python<'_>, record: &T) -> PyResult<Py<PyDict>> {
-    let value = serde_json::to_value(record).map_err(|error| invalid(error.to_string()))?;
-    json_to_py(py, &value)?
-        .bind(py)
-        .cast::<PyDict>()
-        .map(|dict| dict.clone().unbind())
-        .map_err(|_| invalid("Watch record did not encode as an object"))
-}
-
-fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
-    use pyo3::IntoPyObjectExt;
-    Ok(match value {
-        Value::Null => py.None(),
-        Value::Bool(flag) => flag.into_py_any(py)?,
-        Value::Number(number) => {
-            if let Some(value) = number.as_i64() {
-                value.into_py_any(py)?
-            } else if let Some(value) = number.as_u64() {
-                value.into_py_any(py)?
-            } else {
-                number.as_f64().unwrap_or(0.0).into_py_any(py)?
-            }
-        }
-        Value::String(text) => text.into_py_any(py)?,
-        Value::Array(items) => {
-            let list = PyList::empty(py);
-            for item in items {
-                list.append(json_to_py(py, item)?)?;
-            }
-            list.into_any().unbind()
-        }
-        Value::Object(items) => {
-            let dict = PyDict::new(py);
-            for (key, item) in items {
-                dict.set_item(key, json_to_py(py, item)?)?;
-            }
-            dict.into_any().unbind()
-        }
-    })
-}
-
-pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
-    if value.is_none() {
-        return Ok(Value::Null);
-    }
-    if value.is_instance_of::<PyBool>() {
-        return Ok(Value::Bool(value.extract::<bool>()?));
-    }
-    if value.is_instance_of::<PyInt>() {
-        if let Ok(number) = value.extract::<i64>() {
-            return Ok(Value::from(number));
-        }
-        return Ok(Value::from(value.extract::<u64>()?));
-    }
-    if value.is_instance_of::<PyFloat>() {
-        return serde_json::Number::from_f64(value.extract::<f64>()?)
-            .map(Value::Number)
-            .ok_or_else(|| PyTypeError::new_err("Watch state floats must be finite"));
-    }
-    if value.is_instance_of::<PyString>() {
-        return Ok(Value::String(value.extract::<String>()?));
-    }
-    if let Ok(dict) = value.cast::<PyDict>() {
-        let mut object = Map::with_capacity(dict.len());
-        for (key, item) in dict.iter() {
-            let key = if key.is_instance_of::<PyString>() {
-                key.extract::<String>()?
-            } else {
-                key.str()?.to_string_lossy().into_owned()
-            };
-            object.insert(key, py_to_json(&item)?);
-        }
-        return Ok(Value::Object(object));
-    }
-    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
-        let mut items = Vec::new();
-        for item in value.try_iter()? {
-            items.push(py_to_json(&item?)?);
-        }
-        return Ok(Value::Array(items));
-    }
-    Err(PyTypeError::new_err(
-        "Watch state contains a value that is not JSON serializable",
-    ))
 }
 
 #[cfg(test)]

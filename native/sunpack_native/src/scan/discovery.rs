@@ -1,8 +1,9 @@
 use crate::analysis_native::volume_anchor::CheapAnchor;
+use crate::io::archive_state::AnalysisFacts;
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
     build_native_candidate_groups_from_snapshot, collect_relation_cache, resolve_embedded_volumes,
-    NativeRelationGroup, RelationCache,
+    NativeRelationGroup, RelationCache, RelationProjection,
 };
 use crate::scan::directory::{
     filesystem_logical_name, filesystem_route_name, DirectorySnapshotTable,
@@ -10,17 +11,46 @@ use crate::scan::directory::{
 };
 use crate::scan::embedded::{
     scan_detected_lz4, scan_embedded_path, NativeScanResult, RarInputResolution,
+    ResolvedEmbeddedScan,
 };
 use crate::scan::pe_overlay::{inspect_pe_image_native, PeProbe, PeState};
-use pyo3::exceptions::PyIndexError;
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use rayon::prelude::*;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+pub(crate) enum CandidateProjection<'a> {
+    File {
+        path: &'a str,
+        size: Option<u64>,
+        route: &'static str,
+        format_hint: &'a str,
+        reject_mask: u32,
+        logical_name: String,
+    },
+    Relation {
+        relation: RelationProjection,
+        needs_password: bool,
+        failure_reason: Option<&'a str>,
+    },
+}
+
+pub(crate) struct EmbeddedPageRow {
+    pub(crate) index: usize,
+    pub(crate) status: u8,
+    pub(crate) reason: &'static str,
+    pub(crate) scan: Option<Arc<NativeScanResult>>,
+    pub(crate) error: Option<Arc<io::Error>>,
+}
+
+pub(crate) struct EmbeddedVolumeOutcome {
+    pub(crate) index: usize,
+    pub(crate) status: u8,
+    pub(crate) scan: Option<ResolvedEmbeddedScan>,
+    pub(crate) password: Option<Arc<str>>,
+}
 
 enum Candidate {
     File(Arc<DirectorySnapshotTable>, usize),
@@ -42,7 +72,6 @@ impl Candidate {
     }
 }
 
-#[pyclass(module = "sunpack_native")]
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
@@ -129,7 +158,7 @@ impl FileTargets {
 }
 
 impl NativeCandidateTable {
-    fn append_speculative_files(&mut self, snapshot: &NativeDirectorySnapshot) {
+    pub(crate) fn append_speculative_files(&mut self, snapshot: &NativeDirectorySnapshot) {
         // The relations-only API projects every row as a group. File routing
         // belongs only to the shared discovery table, including password retry.
         if !self.filesystem_routed {
@@ -174,14 +203,14 @@ impl NativeCandidateTable {
         }
     }
 
-    fn relation_cache(&self) -> RelationCache {
+    pub(crate) fn relation_cache(&self) -> RelationCache {
         collect_relation_cache(self.rows.iter().filter_map(|row| match row {
             Candidate::Relation(group) => Some(group.as_ref()),
             Candidate::File(..) => None,
         }))
     }
 
-    fn relation_groups(
+    pub(crate) fn relation_groups(
         &self,
         raw: &NativeDirectorySnapshot,
         filtered: &NativeDirectorySnapshot,
@@ -212,26 +241,23 @@ impl NativeCandidateTable {
         groups
     }
 
-    fn retain_targets(&mut self) {
+    pub(crate) fn retain_targets(&mut self) {
         if let Some(targets) = &self.targets {
             targets.retain(&mut self.rows);
         }
     }
 }
 
-#[pyclass(module = "sunpack_native")]
 #[derive(Default)]
 pub(crate) struct NativeDiscoveryRoutes {
     scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<io::Error>>>,
-    #[pyo3(get)]
     pub(crate) relation_events: Vec<(usize, u8)>,
-    #[pyo3(get)]
     pub(crate) detection_events: Vec<(usize, u8)>,
     embedded: Vec<usize>,
 }
 
 impl NativeDiscoveryRoutes {
-    fn resolved_relations(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn resolved_relations(&self) -> impl Iterator<Item = usize> + '_ {
         self.relation_events
             .iter()
             .filter_map(|&(index, status)| (status == 1).then_some(index))
@@ -244,7 +270,6 @@ enum EmbeddedOutcome {
     Scan(Arc<NativeScanResult>),
 }
 
-#[pyclass(module = "sunpack_native")]
 #[derive(Default)]
 pub(crate) struct NativeEmbeddedBatch {
     relation_cache: RelationCache,
@@ -263,7 +288,7 @@ struct PendingEmbeddedVolume {
 }
 
 impl NativeEmbeddedBatch {
-    fn claims_offset(&self, key: &str, offset: u64) -> bool {
+    pub(crate) fn claims_offset(&self, key: &str, offset: u64) -> bool {
         self.claimed_ranges.get(key).is_some_and(|ranges| {
             ranges
                 .iter()
@@ -273,21 +298,17 @@ impl NativeEmbeddedBatch {
 
     fn project_outcomes(
         &mut self,
-        py: Python<'_>,
+
         table: &NativeCandidateTable,
         outcomes: impl Iterator<Item = (usize, EmbeddedOutcome)>,
-    ) -> PyResult<Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>> {
+    ) -> io::Result<Vec<EmbeddedPageRow>> {
         let mut projected = Vec::new();
         for (index, outcome) in outcomes {
-            let row: PyResult<_> = match outcome {
+            let (status, reason, scan, error) = match outcome {
                 EmbeddedOutcome::Residual => {
                     unreachable!("residuals are filtered before projection")
                 }
-                EmbeddedOutcome::Failed(error) => {
-                    let detail = PyDict::new(py);
-                    detail.set_item("error", error.to_string())?;
-                    Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
-                }
+                EmbeddedOutcome::Failed(error) => (2, "embedded_scan_io_error", None, Some(error)),
                 EmbeddedOutcome::Scan(scan) => {
                     let path = table.rows[index].embedded_source().0;
                     let key = path_key(path);
@@ -317,28 +338,33 @@ impl NativeEmbeddedBatch {
                                 scan: retain_scan.then(|| Arc::clone(&scan)),
                             });
                         }
-                        Ok((index, 3, "embedded_volume_candidate", None))
+                        (3, "embedded_volume_candidate", None, None)
                     } else {
                         // A complete peer archive keeps its original ownership.
                         self.excluded.extend(table.path_keys(index)?);
-                        Ok((index, 1, "", Some(scan.to_py_dict(py)?)))
+                        (1, "", Some(scan), None)
                     }
                 }
             };
-            projected.push(row?);
+            projected.push(EmbeddedPageRow {
+                index,
+                status,
+                reason,
+                scan,
+                error,
+            });
         }
         Ok(projected)
     }
 }
 
 fn scan_embedded_jobs(
-    py: Python<'_>,
     groups: &[(&NativeCandidateTable, &NativeEmbeddedBatch)],
     jobs: &[(usize, usize)],
-) -> PyResult<Vec<(usize, usize, EmbeddedOutcome)>> {
+) -> std::io::Result<Vec<(usize, usize, EmbeddedOutcome)>> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check()?;
-    let outcomes = py.detach(|| {
+    let outcomes = (|| {
         // File producers also own per-file validation state. Matching jobs
         // continue to share the existing eight-thread IOCP scan pool.
         let parallel_jobs = jobs.len().min(rayon::current_num_threads()).clamp(1, 2);
@@ -395,7 +421,7 @@ fn scan_embedded_jobs(
             .into_iter()
             .map(|(_, group, index, outcome)| (group, index, outcome))
             .collect()
-    });
+    })();
     cancellation.check()?;
     Ok(outcomes)
 }
@@ -419,35 +445,24 @@ impl EmbeddedOutcome {
     }
 }
 
-#[pymethods]
 impl NativeDiscoveryRoutes {
-    fn primary_analysis(&self, py: Python<'_>, index: usize) -> PyResult<Option<Py<PyDict>>> {
-        self.scans
-            .get(&index)
-            .and_then(|scan| scan.as_ref().ok())
-            .map_or(Ok(None), |scan| scan.primary_analysis(py))
+    pub(crate) fn primary_analysis(&self, index: usize) -> Option<AnalysisFacts> {
+        self.scans.get(&index)?.as_ref().ok()?.primary_analysis()
     }
 }
 
-#[pymethods]
 impl NativeEmbeddedBatch {
-    fn __len__(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.ids.len()
     }
 
     /// Process selected jobs across roots and consume their cached scan evidence.
     /// Root-local policy, relation ownership and password evidence stay in each batch.
-    #[staticmethod]
-    #[pyo3(signature = (groups, offset=0, limit=256))]
-    fn scan_pages(
-        py: Python<'_>,
-        mut groups: Vec<(
-            PyRef<'_, NativeCandidateTable>,
-            PyRefMut<'_, NativeEmbeddedBatch>,
-        )>,
+    pub(crate) fn scan_pages(
+        mut groups: Vec<(&NativeCandidateTable, &mut NativeEmbeddedBatch)>,
         offset: usize,
         limit: usize,
-    ) -> PyResult<Vec<(usize, Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>)>> {
+    ) -> io::Result<Vec<(usize, Vec<EmbeddedPageRow>)>> {
         let mut jobs = Vec::new();
         let mut skip = offset;
         for (group, (_, batch)) in groups.iter().enumerate() {
@@ -468,9 +483,9 @@ impl NativeEmbeddedBatch {
         }
         let borrowed: Vec<_> = groups
             .iter()
-            .map(|(table, batch)| (&**table, &**batch))
+            .map(|(table, batch)| (*table, &**batch))
             .collect();
-        let outcomes = scan_embedded_jobs(py, &borrowed, &jobs)?;
+        let outcomes = scan_embedded_jobs(&borrowed, &jobs)?;
         for (group, index) in jobs {
             let (_, batch) = &mut groups[group];
             if !batch.scans.is_empty()
@@ -488,15 +503,12 @@ impl NativeEmbeddedBatch {
             .into_iter()
             .map(|(group, outcomes)| {
                 let (table, batch) = &mut groups[group];
-                Ok((
-                    group,
-                    batch.project_outcomes(py, table, outcomes.into_iter())?,
-                ))
+                Ok((group, batch.project_outcomes(table, outcomes.into_iter())?))
             })
             .collect()
     }
 
-    fn encrypted_volume_paths(&self, table: PyRef<'_, NativeCandidateTable>) -> Vec<String> {
+    pub(crate) fn encrypted_volume_paths(&self, table: &NativeCandidateTable) -> Vec<String> {
         let mut requests: HashSet<_> = self
             .pending_volumes
             .iter()
@@ -559,13 +571,12 @@ impl NativeEmbeddedBatch {
 
     /// One directed Relations call per source scope, using native scan facts.
     /// Status 0 returns standalone/sibling scan facts to Embedded.
-    #[pyo3(signature = (table, password_candidates=None))]
-    fn resolve_volumes(
+    pub(crate) fn resolve_volumes(
         &mut self,
-        py: Python<'_>,
-        mut table: PyRefMut<'_, NativeCandidateTable>,
-        password_candidates: Option<Vec<(String, Vec<String>)>>,
-    ) -> PyResult<Vec<(usize, u8, Option<Py<PyDict>>, Option<String>)>> {
+
+        table: &mut NativeCandidateTable,
+        password_candidates: Option<Vec<(String, Vec<Arc<str>>)>>,
+    ) -> io::Result<Vec<EmbeddedVolumeOutcome>> {
         use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
         let mut batch = std::mem::take(self);
         if batch.pending_volumes.is_empty() {
@@ -620,7 +631,7 @@ impl NativeEmbeddedBatch {
             .collect();
         let cancellation = crate::io::cancellation::Cancellation::current();
         cancellation.check()?;
-        let matched = py.detach(|| {
+        let matched = (|| {
             // Independent headers share the existing Rayon pool. Preserve the
             // request's cancellation on each worker, including expensive KDFs.
             encrypted
@@ -642,7 +653,7 @@ impl NativeEmbeddedBatch {
                 })
                 .collect::<io::Result<Vec<_>>>()
                 .map(|rows| rows.into_iter().flatten().collect::<HashMap<_, _>>())
-        })?;
+        })()?;
         cancellation.check()?;
         // Own one scan reference and one sparse resolution table per physical
         // carrier. Project its hits/candidates only after every head is resolved.
@@ -682,7 +693,7 @@ impl NativeEmbeddedBatch {
                         anchor.structure_offset.unwrap_or(0),
                         RarInputResolution {
                             end_offset: anchor.expected_logical_size,
-                            password: matched.get(&match_key).map(String::as_str),
+                            password: matched.get(&match_key).cloned(),
                             failure_reason,
                         },
                     );
@@ -697,7 +708,7 @@ impl NativeEmbeddedBatch {
                 anchor.evidence.push("embedded:volume_candidate");
                 anchors.push(anchor);
             }
-            // Project once after Relations; Python combines logical inputs
+            // Project once after Relations; the planner combines logical inputs
             // sharing this carrier under the existing multi-segment task.
             if let Some(scan) = item
                 .scan
@@ -708,17 +719,15 @@ impl NativeEmbeddedBatch {
                     .or_insert_with(|| (scan, HashMap::new()));
             }
         }
-        let mut fallback = fallback_scans
+        let mut fallback: Vec<_> = fallback_scans
             .into_iter()
-            .map(|(index, (scan, resolutions))| {
-                Ok((
-                    index,
-                    0,
-                    Some(scan.to_py_dict_with_rar_resolutions(py, &resolutions)?),
-                    None,
-                ))
+            .map(|(index, (scan, resolutions))| EmbeddedVolumeOutcome {
+                index,
+                status: 0,
+                scan: Some(ResolvedEmbeddedScan { scan, resolutions }),
+                password: None,
             })
-            .collect::<PyResult<Vec<_>>>()?;
+            .collect();
         if anchors.is_empty() {
             return Ok(fallback);
         }
@@ -728,7 +737,7 @@ impl NativeEmbeddedBatch {
         let anchor_paths: HashSet<_> = anchors.iter().map(|a| path_key(&a.path)).collect();
         batch.excluded.retain(|key| !anchor_paths.contains(key));
         let excluded = &batch.excluded;
-        let mut groups = py.detach(|| resolve_embedded_volumes(sources, anchors, excluded, cache));
+        let mut groups = resolve_embedded_volumes(sources, anchors, excluded, cache);
         // A failed NextHeader inside a carrier can also be damaged standalone
         // data. Require actual peers for this speculative split identity.
         // Index only nominated stems once, rather than rescan scopes per head.
@@ -789,42 +798,42 @@ impl NativeEmbeddedBatch {
                 .cloned();
             let index = table.rows.len();
             table.rows.push(Candidate::Relation(Box::new(group)));
-            fallback.push((index, 1, None, password));
+            fallback.push(EmbeddedVolumeOutcome {
+                index,
+                status: 1,
+                scan: None,
+                password,
+            });
         }
         Ok(fallback)
     }
 }
 
-#[pymethods]
 impl NativeCandidateTable {
-    #[new]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn __len__(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.rows.len()
     }
 
-    /// Keep relation facts native while Python discovers directory passwords.
-    #[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords=None))]
-    fn append_relations(
+    /// Keep relation facts native while the caller discovers directory passwords.
+    pub(crate) fn append_relations(
         &mut self,
-        py: Python<'_>,
-        raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
-        filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
+
+        raw_snapshot: &NativeDirectorySnapshot,
+        filtered_snapshot: &NativeDirectorySnapshot,
         path_passwords: Option<Vec<(String, String)>>,
-    ) -> PyResult<()> {
-        let raw_snapshot = &*raw_snapshot;
-        let filtered_snapshot = &*filtered_snapshot;
-        let groups = py.detach(|| {
+    ) -> std::io::Result<()> {
+        let groups = (|| {
             build_native_candidate_groups_from_snapshot(
                 raw_snapshot,
                 filtered_snapshot,
                 path_passwords.as_deref(),
                 None,
             )
-        });
+        })();
         self.rows.extend(
             groups
                 .into_iter()
@@ -834,17 +843,14 @@ impl NativeCandidateTable {
         Ok(())
     }
 
-    #[pyo3(signature = (raw_snapshot, filtered_snapshot, targets=None))]
-    fn append_directory(
+    pub(crate) fn append_directory(
         &mut self,
-        py: Python<'_>,
-        raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
-        filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
+
+        raw_snapshot: &NativeDirectorySnapshot,
+        filtered_snapshot: &NativeDirectorySnapshot,
         targets: Option<Vec<(String, String)>>,
-    ) -> PyResult<()> {
-        let raw_snapshot = &*raw_snapshot;
-        let filtered_snapshot = &*filtered_snapshot;
-        py.detach(|| {
+    ) -> std::io::Result<()> {
+        (|| {
             self.filesystem_routed = true;
             self.targets = targets.map(FileTargets::new);
             let selected = self
@@ -877,25 +883,25 @@ impl NativeCandidateTable {
             self.retain_targets();
             self.append_speculative_files(raw_snapshot);
             self.relation_sources.push(raw_snapshot.share_rows());
-        });
+        })();
         Ok(())
     }
 
     /// Only password-blocked relation proposals leave Rust for policy probing.
-    fn encrypted_rar_groups(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+    pub(crate) fn encrypted_rar_groups(&self) -> Vec<RelationProjection> {
         let mut output = Vec::new();
         for row in &self.rows {
             if let Candidate::Relation(group) = row {
                 let data = group.candidate_data();
                 if data.format_hint == "rar" && data.needs_password {
-                    output.push(group.to_dict(py)?);
+                    output.push(group.project());
                 }
             }
         }
-        Ok(output)
+        output
     }
 
-    fn record_relation_failures(&mut self, failures: Vec<(String, String)>) {
+    pub(crate) fn record_relation_failures(&mut self, failures: Vec<(String, String)>) {
         self.relation_failures.extend(
             failures
                 .into_iter()
@@ -904,18 +910,15 @@ impl NativeCandidateTable {
     }
 
     /// Replace the relation evidence for one table after a password is found.
-    #[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords, refresh_paths=None))]
-    fn retry_relations(
+    pub(crate) fn retry_relations(
         &mut self,
-        py: Python<'_>,
-        raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
-        filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
+
+        raw_snapshot: &NativeDirectorySnapshot,
+        filtered_snapshot: &NativeDirectorySnapshot,
         path_passwords: Vec<(String, String)>,
         refresh_paths: Option<Vec<String>>,
-    ) -> PyResult<()> {
-        let raw_snapshot = &*raw_snapshot;
-        let filtered_snapshot = &*filtered_snapshot;
-        py.detach(|| {
+    ) -> std::io::Result<()> {
+        (|| {
             let cached = self.relation_cache();
             // A short password probe may start after another request consumed its
             // inputs. Drop only proven departures from that proposal, sharing the
@@ -965,18 +968,18 @@ impl NativeCandidateTable {
             self.rows = replacement;
             self.retain_targets();
             self.append_speculative_files(raw);
-        });
+        })();
         Ok(())
     }
 
-    fn extend(&mut self, other: &mut NativeCandidateTable) {
+    pub(crate) fn extend(&mut self, other: &mut NativeCandidateTable) {
         self.rows.append(&mut other.rows);
         self.relation_sources.append(&mut other.relation_sources);
         self.relation_failures
             .extend(other.relation_failures.drain());
     }
 
-    fn dedupe(&mut self) {
+    pub(crate) fn dedupe(&mut self) {
         let mut positions: HashMap<String, usize> = HashMap::new();
         let mut unique_len = 0;
         for index in 0..self.rows.len() {
@@ -1023,58 +1026,49 @@ impl NativeCandidateTable {
         self.rows.truncate(unique_len);
     }
 
-    fn project(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
+    pub(crate) fn project(&self, index: usize) -> io::Result<CandidateProjection<'_>> {
         let row = self
             .rows
             .get(index)
-            .ok_or_else(|| PyIndexError::new_err(index.to_string()))?;
-        match row {
+            .ok_or_else(|| io::Error::other(index.to_string()))?;
+        Ok(match row {
             Candidate::File(table, index) => {
                 let path = &table.paths[*index];
-                let anchor = table.relation_anchors[*index]
-                    .as_ref()
-                    .and_then(CheapAnchor::anchor);
-                let route = table.file_routes[*index];
-                Ok((
-                    "file",
-                    (
-                        path,
-                        table.sizes[*index],
-                        filesystem_route_name(route),
-                        anchor.map(|a| a.format.as_str()).unwrap_or(""),
-                        table.relation_anchors[*index]
-                            .as_ref()
-                            .map(CheapAnchor::reject_mask)
-                            .unwrap_or(0),
-                        filesystem_logical_name(path),
-                    ),
-                )
-                    .into_pyobject(py)?
-                    .into_any()
-                    .unbind())
+                let fact = table.relation_anchors[*index].as_ref();
+                CandidateProjection::File {
+                    path,
+                    size: table.sizes[*index],
+                    route: filesystem_route_name(table.file_routes[*index]),
+                    format_hint: fact
+                        .and_then(CheapAnchor::anchor)
+                        .map_or("", |anchor| anchor.format.as_str()),
+                    reject_mask: fact.map_or(0, CheapAnchor::reject_mask),
+                    logical_name: filesystem_logical_name(path),
+                }
             }
             Candidate::Relation(group) => {
-                let dict = group.to_dict(py)?;
                 let data = group.candidate_data();
-                if data.needs_password {
-                    if let Some(reason) = self.relation_failures.get(&path_key(data.entry_path)) {
-                        if let Some(metadata) = dict.bind(py).get_item("head_metadata")? {
-                            metadata
-                                .cast::<PyDict>()?
-                                .set_item("relation_failure_reason", reason)?;
-                        }
-                    }
+                CandidateProjection::Relation {
+                    relation: group.project(),
+                    needs_password: data.needs_password,
+                    failure_reason: data
+                        .needs_password
+                        .then(|| {
+                            self.relation_failures
+                                .get(&path_key(data.entry_path))
+                                .map(String::as_str)
+                        })
+                        .flatten(),
                 }
-                Ok(("relation", dict).into_pyobject(py)?.into_any().unbind())
             }
-        }
+        })
     }
 
-    fn summary(&self, index: usize) -> PyResult<(String, String)> {
+    pub(crate) fn summary(&self, index: usize) -> std::io::Result<(String, String)> {
         let row = self
             .rows
             .get(index)
-            .ok_or_else(|| PyIndexError::new_err(index.to_string()))?;
+            .ok_or_else(|| std::io::Error::other(index.to_string()))?;
         Ok(match row {
             Candidate::File(table, index) => (
                 table.paths[*index].clone(),
@@ -1091,11 +1085,11 @@ impl NativeCandidateTable {
         })
     }
 
-    fn path_keys(&self, index: usize) -> PyResult<Vec<String>> {
+    pub(crate) fn path_keys(&self, index: usize) -> std::io::Result<Vec<String>> {
         let row = self
             .rows
             .get(index)
-            .ok_or_else(|| PyIndexError::new_err(index.to_string()))?;
+            .ok_or_else(|| std::io::Error::other(index.to_string()))?;
         Ok(match row {
             Candidate::File(table, index) => vec![path_key(&table.paths[*index])],
             Candidate::Relation(group) => {
@@ -1112,7 +1106,7 @@ impl NativeCandidateTable {
         })
     }
 
-    fn resolve(&self, py: Python<'_>) -> PyResult<NativeDiscoveryRoutes> {
+    pub(crate) fn resolve(&self) -> std::io::Result<NativeDiscoveryRoutes> {
         let cancellation = crate::io::cancellation::Cancellation::current();
         cancellation.check()?;
         let mut routes = NativeDiscoveryRoutes::default();
@@ -1167,7 +1161,7 @@ impl NativeCandidateTable {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        py.detach(|| {
+        (|| {
             for batch in detection_indices.chunks(1024) {
                 if cancellation.cancelled() {
                     break;
@@ -1233,7 +1227,7 @@ impl NativeCandidateTable {
                     }
                 }
             }
-        });
+        })();
         cancellation.check()?;
         // Preserve the former stage order: filesystem residuals, Relations
         // residuals, then Detection residuals.
@@ -1289,10 +1283,9 @@ impl NativeCandidateTable {
     }
 
     /// Finish primary projection before calling: only embedded/relation rows survive.
-    #[pyo3(signature = (routes, recursive=false, force_scan=false, enabled=true, recursive_ratio=0.3))]
-    fn prepare_embedded(
+    pub(crate) fn prepare_embedded(
         &mut self,
-        mut routes: PyRefMut<'_, NativeDiscoveryRoutes>,
+        routes: &mut NativeDiscoveryRoutes,
         recursive: bool,
         force_scan: bool,
         enabled: bool,
@@ -1336,7 +1329,7 @@ impl NativeCandidateTable {
         }
         if ids.is_empty() {
             // This root has no remaining I/O or cached errors. Its primary
-            // decisions are already owned by Python; no recovery can use it.
+            // decisions are already owned by the caller; no recovery can use it.
             *self = Self::default();
             routes.scans = HashMap::new();
             return NativeEmbeddedBatch::default();

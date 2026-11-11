@@ -1,6 +1,5 @@
 param(
     [string]$AppPath,
-    [string]$PythonPath,
     [string]$MenuText,
     [string]$IconPath,
     [switch]$DryRun
@@ -12,8 +11,7 @@ $ErrorActionPreference = "Stop"
 function Resolve-Launcher {
     param(
         [string]$RepoRoot,
-        [string]$PreferredAppPath,
-        [string]$PreferredPythonPath
+        [string]$PreferredAppPath
     )
 
     if ($PreferredAppPath) {
@@ -67,38 +65,7 @@ function Resolve-Launcher {
         }
     }
 
-    $defaultScript = Join-Path $RepoRoot "sunpack.py"
-    if (-not (Test-Path -LiteralPath $defaultScript)) {
-        throw "No usable script entry was found. Expected sunpack.py at the repository root."
-    }
-    $resolvedScript = (Resolve-Path -LiteralPath $defaultScript).Path
-
-    $pythonCandidates = @()
-    if ($PreferredPythonPath) {
-        $pythonCandidates += $PreferredPythonPath
-    }
-    foreach ($commandName in @("python", "py")) {
-        $command = Get-Command $commandName -ErrorAction SilentlyContinue
-        if ($command) {
-            $pythonCandidates += $command.Source
-        }
-    }
-    $pythonCandidates = $pythonCandidates | Select-Object -Unique
-
-    foreach ($candidate in $pythonCandidates) {
-        if (Test-Path -LiteralPath $candidate) {
-            $resolvedPython = (Resolve-Path -LiteralPath $candidate).Path
-            $appIcon = Resolve-SunPackIcon -RepoRoot $RepoRoot -FallbackPath $resolvedPython
-            return @{
-                Mode = "python"
-                AppPath = $resolvedPython
-                ScriptPath = $resolvedScript
-                IconPath = $appIcon
-            }
-        }
-    }
-
-    throw "No usable Python interpreter was found. Please pass -PythonPath explicitly."
+    throw "No SunPack executable was found. Build the Windows package or pass -AppPath."
 }
 
 function Resolve-SunPackIcon {
@@ -125,11 +92,7 @@ function New-CommandString {
 
     $extractArgs = if ($PromptPasswords) { " --ask-pw" } else { "" }
     if ($Recursive) { $extractArgs += " --recursive" }
-    if ($Launcher.Mode -eq "app") {
-        return ('"{0}" extract "{1}" --out-dir "{2}"{3} --pause' -f $Launcher.AppPath, $TargetToken, $OutDirToken, $extractArgs)
-    }
-
-    return ('"{0}" "{1}" extract "{2}" --out-dir "{3}"{4} --pause' -f $Launcher.AppPath, $Launcher.ScriptPath, $TargetToken, $OutDirToken, $extractArgs)
+    return ('"{0}" extract "{1}" --out-dir "{2}"{3} --pause' -f $Launcher.AppPath, $TargetToken, $OutDirToken, $extractArgs)
 }
 
 function New-FileCommandString {
@@ -140,11 +103,7 @@ function New-FileCommandString {
     )
 
     $passwordArg = if ($PromptPasswords) { " --ask-pw --deep-detect" } else { " --deep-detect" }
-    if ($Launcher.Mode -eq "app") {
-        return ('"{0}" extract "{1}"{2} --pause' -f $Launcher.AppPath, $TargetToken, $passwordArg)
-    }
-
-    return ('"{0}" "{1}" extract "{2}"{3} --pause' -f $Launcher.AppPath, $Launcher.ScriptPath, $TargetToken, $passwordArg)
+    return ('"{0}" extract "{1}"{2} --pause' -f $Launcher.AppPath, $TargetToken, $passwordArg)
 }
 
 function New-WatchCommandString {
@@ -180,9 +139,6 @@ function New-HiddenStartProcessCommand {
     # command line, splitting folder names that contain spaces.
     $helperPath = Join-Path $PSScriptRoot "context_menu_watch.ps1"
     $command = ('"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AppPath "{1}" -WatchAction {2} -TargetPath "{3}"' -f $helperPath, $Launcher.AppPath, $WatchAction, $TargetToken)
-    if ($Launcher.Mode -ne "app") {
-        $command += (' -ScriptPath "{0}"' -f $Launcher.ScriptPath)
-    }
     if ($Recursive) {
         $command += " -Recursive"
     }
@@ -311,7 +267,7 @@ function Get-SubMenuTexts {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptDir
-$launcher = Resolve-Launcher -RepoRoot $repoRoot -PreferredAppPath $AppPath -PreferredPythonPath $PythonPath
+$launcher = Resolve-Launcher -RepoRoot $repoRoot -PreferredAppPath $AppPath
 $resolvedIconPath = if ($IconPath) { (Resolve-Path -LiteralPath $IconPath).Path } else { $launcher.IconPath }
 $menuLanguage = Get-MenuLanguage -RepoRoot $repoRoot
 $resolvedMenuText = if ($MenuText) { $MenuText } else { "sunpack" }
@@ -403,12 +359,6 @@ Write-Host "Folder menu key:" $folderKey
 Write-Host "Directory background key:" $backgroundKey
 Write-Host "Folder submenu key:" $folderSubCommandsKey
 Write-Host "Directory background submenu key:" $backgroundSubCommandsKey
-Write-Host "Launch mode:" $launcher.Mode
-if ($launcher.Mode -eq "app") {
-    Write-Host "App path:" $launcher.AppPath
-} else {
-    Write-Host "Python path:" $launcher.AppPath
-    Write-Host "Script path:" $launcher.ScriptPath
-}
+Write-Host "App path:" $launcher.AppPath
 Write-Host ""
 Write-Host ('You can now right-click a file, folder or directory background and choose the "{0}" submenu' -f $resolvedMenuText)

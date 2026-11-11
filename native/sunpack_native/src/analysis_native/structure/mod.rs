@@ -1,7 +1,6 @@
+use super::diagnostic::{lz4_diagnostic, DiagnosticFields, DiagnosticFieldsExt};
 use crate::io::reader::ManagedReader;
 use crc32fast::hash as crc32;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::io::Read;
 
 include!("constants.rs");

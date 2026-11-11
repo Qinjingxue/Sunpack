@@ -4,7 +4,6 @@ import ntpath
 import os
 import shutil
 import subprocess
-import sys
 from ctypes import wintypes
 from pathlib import Path
 
@@ -183,8 +182,7 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert "-Recursive" not in argv
 
 
-@pytest.mark.parametrize("launcher_mode", ["app", "python"])
-def test_context_menu_registration_survives_rebuild_and_uninstalls(tmp_path, launcher_mode):
+def test_context_menu_registration_survives_rebuild_and_uninstalls(tmp_path):
     # Dry-run tests cannot detect commands erased by a later parent rebuild, or
     # leftover registry entries after reinstall/uninstall. This one isolated
     # lifecycle check covers those failures for both launch modes without admin.
@@ -193,11 +191,10 @@ def test_context_menu_registration_survives_rebuild_and_uninstalls(tmp_path, lau
     scripts.mkdir()
     for name in ("register_context_menu.ps1", "unregister_context_menu.ps1"):
         shutil.copyfile(repo / "scripts" / name, scripts / name)
-    (tmp_path / "sunpack.py").touch()
     (tmp_path / "sunpack_config.json").write_text('{"cli":{"language":"zh"}}', encoding="utf-8")
     harness = tmp_path / "registry_lifecycle.ps1"
     harness.write_text(r'''
-param([string]$Scripts, [string]$LauncherMode, [string]$PythonPath)
+param([string]$Scripts)
 $ErrorActionPreference = "Stop"
 $testRootName = "SunPack.ContextMenuTest_" + [guid]::NewGuid().ToString("N")
 $testRoot = "Registry::HKEY_CURRENT_USER\Software\$testRootName"
@@ -209,7 +206,7 @@ try {
     $null = New-PSDrive -Name HKLM -PSProvider Registry -Root "HKEY_CURRENT_USER\Software\$testRootName\Machine"
     $legacyKey = "HKLM:\Software\Classes\Directory\shell\SunPack"
     $null = New-Item -Path $legacyKey -Force
-    $registrationArgs = if ($LauncherMode -eq "app") { @{ AppPath = $env:COMSPEC } } else { @{ PythonPath = $PythonPath } }
+    $registrationArgs = @{ AppPath = $env:COMSPEC }
     $snapshots = @()
     foreach ($pass in 1..2) {
         $null = New-Item -Path "HKCU:\Software\Classes\SunPack.BackgroundContextMenu\shell\Obsolete" -Force
@@ -252,7 +249,7 @@ try {
 ''', encoding="ascii")
     completed = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness),
-         "-Scripts", str(scripts), "-LauncherMode", launcher_mode, "-PythonPath", sys.executable],
+         "-Scripts", str(scripts)],
         check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
     )
     result = json.loads(completed.stdout.strip().splitlines()[-1])
@@ -270,7 +267,7 @@ try {
         assert entries["WatchFolderRecursive"]["label"] == "递归监控此目录"
         command = entries["RecursiveExtract"]["command"].replace(token, "D:\\")
         argv = _windows_argv(command)
-        offset = 1 if launcher_mode == "app" else 2
+        offset = 1
         assert argv[offset] == "extract"
         assert ntpath.normpath(argv[offset + 1]) == "D:\\"
         assert ntpath.normpath(argv[argv.index("--out-dir") + 1]) == "D:\\"
@@ -316,27 +313,21 @@ def test_context_menu_directory_token_is_stable_for_normal_paths():
         ("background_unwatch", ["watch", "remove"]),
     ],
 )
-def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu_key, expected_args):
-    # Exercise the real PowerShell -File -> Python argv boundary, not merely
+def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu_key, expected_args, native_argument_recorder):
+    # Exercise the real PowerShell -File -> native argv boundary, not merely
     # the registry command text. No admin rights or live Watch service needed.
     scripts_dir = tmp_path / "menu scripts"
     scripts_dir.mkdir()
     for name in ("register_context_menu.ps1", "context_menu_watch.ps1"):
         shutil.copyfile(Path(__file__).resolve().parents[2] / "scripts" / name, scripts_dir / name)
-    stub = tmp_path / "sunpack.py"
-    stub.write_text(
-        'import json, sys\n'
-        'from pathlib import Path\n'
-        'Path(__file__).with_name("context_watch_args.json").write_text('
-        'json.dumps(sys.argv[1:]), encoding="ascii")\n',
-        encoding="ascii",
-    )
+    stub = tmp_path / "arguments.exe"
+    shutil.copyfile(native_argument_recorder, stub)
     folder = tmp_path / "WeChat's 中文 Files & (2026)"
     folder.mkdir()
     completed = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
          "-File", str(scripts_dir / "register_context_menu.ps1"),
-         "-PythonPath", sys.executable, "-DryRun"],
+         "-AppPath", str(stub), "-DryRun"],
         check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
     )
     commands = json.loads(completed.stdout.strip().splitlines()[-1])
@@ -345,7 +336,7 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu
         _windows_argv(command), capture_output=True, text=True, timeout=30,
     )
     assert launched.returncode == 0, launched.stderr
-    actual = json.loads((tmp_path / "context_watch_args.json").read_text(encoding="ascii"))
+    actual = stub.with_suffix(".args").read_text(encoding="utf-8-sig").splitlines()
     assert actual[:2] == expected_args[:2]
     assert ntpath.normpath(actual[2]) == ntpath.normpath(str(folder))
     assert actual[3:] == expected_args[2:]
@@ -361,3 +352,34 @@ def _windows_argv(command: str) -> list[str]:
         return [argv[index] for index in range(argc.value)]
     finally:
         ctypes.windll.kernel32.LocalFree(argv)
+
+
+@pytest.fixture(scope="session")
+def native_argument_recorder(tmp_path_factory):
+    workspace = tmp_path_factory.mktemp("native-arguments")
+    framework = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET"
+    compiler = next((path for path in (
+        framework / "Framework64/v4.0.30319/csc.exe",
+        framework / "Framework/v4.0.30319/csc.exe",
+    ) if path.is_file()), None)
+    if compiler is None:
+        pytest.skip("Windows .NET Framework C# compiler is required for the native argv fixture")
+    source = workspace / "Arguments.cs"
+    source.write_text("""
+using System.IO;
+using System.Reflection;
+using System.Text;
+class Arguments {
+    static void Main(string[] args) {
+        string path = Path.ChangeExtension(Assembly.GetExecutingAssembly().Location, "args");
+        File.WriteAllLines(path, args, new UTF8Encoding(false));
+    }
+}
+""", encoding="ascii")
+    executable = workspace / "Arguments.exe"
+    completed = subprocess.run(
+        [str(compiler), "/nologo", "/target:exe", "/out:" + str(executable), str(source)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    return executable

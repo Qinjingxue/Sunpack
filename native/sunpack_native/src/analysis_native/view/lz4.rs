@@ -1,75 +1,74 @@
-// LZ4 report projection reuses the canonical structural index and existing segment policy.
-impl<'a, 'py> ReportContext<'a, 'py> {
-    fn lz4_module(&mut self) -> PyResult<Evidence<'py>> {
-        let py = self.py;
-        let format = "lz4";
-        let mut rows = self.embedded("lz4", true)?;
-        if rows.is_empty() {
+impl<'a> ReportContext<'a> {
+    fn lz4_module(&mut self) -> io::Result<Evidence> {
+        let rows = self.embedded("lz4", true);
+        if !rows.is_empty() {
+            let mut details = DiagnosticFields::new();
+            details.put("source", "embedded_scan")?;
+            details.put("candidate_kind", "logical_archive")?;
+            details.put("candidates", &rows)?;
+            let mut blocked = false;
+            let segments = rows
+                .into_iter()
+                .map(|row| {
+                    let error = row.lz4_index.as_ref().map_or("", |index| index.error);
+                    let mut segment =
+                        lz4_segment(row.offset, row.end_offset, row.extractable, error);
+                    blocked |= !row.extractable;
+                    segment.password_required = Some(false);
+                    segment
+                })
+                .collect();
+            return Ok(Evidence::new(
+                "lz4",
+                if blocked { "damaged" } else { "extractable" },
+                segments,
+                details,
+            ));
+        }
+
+        if self.stream_structure.is_none() {
             let Ok(prefix) = self.view.reader.read_cached_at(0, 4) else {
-                return Ok(Evidence::not_found(py, format));
+                return Ok(Evidence::not_found("lz4"));
             };
             if !crate::formats::lz4::leading(prefix.as_slice()) {
-                return Ok(Evidence::not_found(py, format));
+                return Ok(Evidence::not_found("lz4"));
             }
-            let facts = match &self.stream_structure {
-                Some(Some(facts)) => facts.clone(),
-                _ => {
-                    let reader = self.view.reader.clone();
-                    let index = py.detach(|| crate::formats::lz4::walk(&reader, 0, reader.len()));
-                    let facts = index.to_dict(py, reader.len())?;
-                    self.stream_structure = Some(Some(facts.clone()));
-                    facts
-                }
-            };
-            if str_of(&facts, "format")? != "lz4" {
-                return Ok(Evidence::not_found(py, format));
-            }
-            if u64_of(&facts, "structure.stream_count")? == 0
+        }
+        let Some(facts) = self.full_stream_structure()? else {
+            return Ok(Evidence::not_found("lz4"));
+        };
+        if str_of(&facts, "format")? != "lz4"
+            || (u64_of(&facts, "structure.stream_count")? == 0
                 && matches!(
                     str_of(&facts, "error")?.as_str(),
                     "" | "lz4_magic_not_found"
-                )
-            {
-                return Ok(Evidence::not_found(py, format));
-            }
-            let row = facts.copy()?;
-            row.set_item("offset", 0)?;
-            row.set_item("end_offset", facts.get_item("segment_end")?)?;
-            row.set_item(
-                "extractable",
-                truthy(&facts, "structure_validation_complete")?,
-            )?;
-            rows.push(row);
+                ))
+        {
+            return Ok(Evidence::not_found("lz4"));
         }
-        let details = PyDict::new(py);
-        details.set_item("source", "embedded_scan")?;
-        details.set_item("candidate_kind", "logical_archive")?;
-        let mut segments = Vec::new();
-        let mut blocked = false;
-        for row in &rows {
-            let offset = u64_of(row, "offset")?;
-            let end = opt_u64_of(row, "end_offset")?;
-            let complete = truthy(row, "extractable")?;
-            let mut flags = Vec::new();
-            let error = str_of(row, "error")?;
-            if !error.is_empty() {
-                flags.push(error);
-            }
-            let mut segment =
-                Segment::new(offset, end, flags, vec!["lz4:frame_structure".to_string()]);
-            segment.extractable = complete;
-            segments.push(segment);
-            blocked |= !complete;
-        }
-        if segments.is_empty() {
-            return Ok(Evidence::not_found(py, format));
-        }
-        details.set_item("candidates", pyo3::types::PyList::new(py, &rows)?)?;
+        let complete = truthy(&facts, "structure_validation_complete")?;
+        let segment = lz4_segment(
+            0,
+            opt_u64_of(&facts, "segment_end")?,
+            complete,
+            &str_of(&facts, "error")?,
+        );
         Ok(Evidence::new(
-            format,
-            if blocked { "damaged" } else { "extractable" },
-            segments,
-            details,
+            "lz4",
+            if complete { "extractable" } else { "damaged" },
+            vec![segment],
+            (*facts).clone(),
         ))
     }
+}
+
+fn lz4_segment(offset: u64, end: Option<u64>, complete: bool, error: &str) -> Segment {
+    let flags = if error.is_empty() {
+        Vec::new()
+    } else {
+        vec![error.to_owned()]
+    };
+    let mut segment = Segment::new(offset, end, flags, vec!["lz4:frame_structure".to_owned()]);
+    segment.extractable = complete;
+    segment
 }

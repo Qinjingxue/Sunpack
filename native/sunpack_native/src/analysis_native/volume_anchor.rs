@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crc32fast::hash as crc32;
 use memchr::memmem;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 
 use crate::analysis_native::structure::unified_prefilter_mask_from_head;
@@ -124,48 +122,6 @@ impl VolumeAnchor {
         self.extent_end()
             .saturating_sub(self.structure_offset.unwrap_or(0))
     }
-
-    fn into_dict(self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let out = PyDict::new(py);
-        out.set_item("path", self.path)?;
-        out.set_item("size", self.size)?;
-        out.set_item("format", self.format)?;
-        out.set_item("confidence", self.confidence)?;
-        out.set_item("standalone", self.standalone)?;
-        out.set_item("multivolume", self.multivolume)?;
-        out.set_item("encrypted", self.encrypted)?;
-        out.set_item("needs_password", self.needs_password)?;
-        out.set_item("wrong_password", self.wrong_password)?;
-        out.set_item("anchor_roles", PyList::new(py, self.anchor_roles)?)?;
-        out.set_item("internal_volume_number", self.internal_volume_number)?;
-        out.set_item("structure_offset", self.structure_offset)?;
-        out.set_item("expected_logical_size", self.expected_logical_size)?;
-        out.set_item("zip_eocd_offset", self.zip_eocd_offset)?;
-        out.set_item(
-            "continuation_from_previous",
-            self.continuation_from_previous,
-        )?;
-        out.set_item("continuation_to_next", self.continuation_to_next)?;
-        out.set_item("sfx", self.sfx)?;
-        out.set_item("pe_structure", self.pe_state == PeState::Confirmed)?;
-        out.set_item("evidence", PyList::new(py, self.evidence)?)?;
-        out.set_item("error", self.error)?;
-        out.set_item("bytes_read", self.bytes_read)?;
-        Ok(out.unbind())
-    }
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, path_passwords=None))]
-pub(crate) fn probe_volume_anchors(
-    py: Python<'_>,
-    paths: Vec<String>,
-    path_passwords: Option<Vec<(String, String)>>,
-) -> PyResult<Vec<Py<PyDict>>> {
-    py.detach(|| probe_volume_anchor_paths(&paths, path_passwords.as_deref()))
-        .into_iter()
-        .map(|anchor| anchor.into_dict(py))
-        .collect()
 }
 
 pub(crate) fn probe_volume_anchor_paths(
@@ -1153,7 +1109,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
 pub(crate) fn resolve_encrypted_relation_anchor(
     anchor: &VolumeAnchor,
     reader: &ManagedReader,
-    passwords: &[String],
+    passwords: &[std::sync::Arc<str>],
 ) -> std::io::Result<(VolumeAnchor, Option<usize>)> {
     let rar5 = anchor.evidence.contains(&"rar5:encryption_header");
     for (index, password) in passwords.iter().enumerate() {

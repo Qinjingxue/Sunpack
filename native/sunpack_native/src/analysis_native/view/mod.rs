@@ -1,15 +1,14 @@
+use super::diagnostic::{DiagnosticFields, DiagnosticFieldsExt};
 use crate::formats::rar::read_vint;
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, ReaderConfig};
 use crc32fast::hash as crc32;
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use serde_json::Value;
 use std::io::{self, Read};
 
 include!("constants.rs");
 include!("types.rs");
 include!("binary.rs");
-include!("multivolume.rs");
 include!("impls.rs");
 include!("rar.rs");
 include!("seven_zip.rs");
@@ -18,33 +17,32 @@ include!("tar.rs");
 include!("report.rs");
 include!("lz4.rs");
 
-fn reader_error_to_py(error: std::io::Error) -> PyErr {
-    crate::io::resource_error::to_py_error(error)
+fn reader_error(error: io::Error) -> io::Error {
+    crate::io::resource_error::to_io_error(error)
 }
 
 fn set_view_read_fault(
-    result: &Bound<'_, PyDict>,
+    result: &mut DiagnosticFields,
     fault: &ReadFault,
     legacy_error: &str,
-) -> PyResult<()> {
-    result.set_item("error", legacy_error)?;
-    fault.write_python(result)?;
-    let mut flags = result
-        .get_item("damage_flags")?
-        .and_then(|value| value.extract::<Vec<String>>().ok())
-        .unwrap_or_default();
-    let mut push_flag = |flag: &str| {
-        if !flags.iter().any(|existing| existing == flag) {
+) -> io::Result<()> {
+    result.put("error", legacy_error)?;
+    result.insert("read_error".into(), fault.to_diagnostic());
+    let mut flags = str_list(result, "damage_flags")?;
+    for flag in [
+        "read_error",
+        "input_truncated",
+        "probably_truncated",
+        "missing_volume",
+    ] {
+        let applies = match flag {
+            "input_truncated" | "probably_truncated" => fault.code == "unexpected_eof",
+            "missing_volume" => fault.possible_missing_volume(),
+            _ => true,
+        };
+        if applies && !flags.iter().any(|existing| existing == flag) {
             flags.push(flag.to_string());
         }
-    };
-    push_flag("read_error");
-    if fault.code == "unexpected_eof" {
-        push_flag("input_truncated");
-        push_flag("probably_truncated");
     }
-    if fault.possible_missing_volume() {
-        push_flag("missing_volume");
-    }
-    result.set_item("damage_flags", PyList::new(result.py(), flags)?)
+    result.put("damage_flags", flags)
 }

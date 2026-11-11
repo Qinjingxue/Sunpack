@@ -24,7 +24,8 @@ $inputs = if ($Scope -eq "gui") {
       "scripts/restore_native_cache_times.ps1", "sunpack.manifest",
       "sunpack_advanced_config.json", "native/third_party/lz4")
 } else {
-    @("native", "scripts", ":(exclude)scripts/build_gui.ps1", "sunpack.manifest")
+    @("native", "scripts", ":(exclude)scripts/build_gui.ps1", "sunpack.manifest",
+      "sunpack.ico", "sunpack_advanced_config.json")
 }
 $tracked = @(& git -C $repoRoot -c core.quotepath=false ls-files --stage -- $inputs)
 if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate $Scope build inputs" }

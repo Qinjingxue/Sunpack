@@ -1,6 +1,4 @@
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -8,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
-type PromotionResult = (
+pub(crate) type PromotionResult = (
     Vec<(String, String)>,
     Vec<String>,
     Vec<String>,
@@ -16,62 +14,28 @@ type PromotionResult = (
     bool,
 );
 
-#[pyclass(frozen)]
 pub(crate) struct NativeBlockedInputPromotion {
     moves: Vec<(PathBuf, PathBuf)>,
     destination: PathBuf,
-    // Shared with Python leases/WAL and the result; convert paths only once.
-    #[pyo3(get)]
-    path_map: Py<PyDict>,
 }
 
-#[pymethods]
 impl NativeBlockedInputPromotion {
-    #[new]
-    fn new(py: Python<'_>, paths: Vec<String>, destination_dir: String) -> PyResult<Self> {
-        let destination = PathBuf::from(destination_dir);
-        let moves = py.detach(|| plan_promotion_moves(paths, &destination))?;
-        let path_map = PyDict::new(py);
-        for (source, target) in &moves {
-            path_map.set_item(normalize_path(source), normalize_path(target))?;
-        }
-        Ok(Self {
-            moves,
-            destination,
-            path_map: path_map.unbind(),
-        })
+    pub(crate) fn new(paths: Vec<String>, destination: PathBuf) -> io::Result<Self> {
+        let moves = plan_promotion_moves(paths, &destination)?;
+        Ok(Self { moves, destination })
     }
 
-    #[pyo3(signature = (before_move=None))]
-    fn execute(
-        &self,
-        py: Python<'_>,
-        before_move: Option<Py<PyAny>>,
-    ) -> PyResult<(Py<PyDict>, Vec<String>, Vec<String>, String, bool)> {
-        let (residual, removed, touched, error, collision) = py.detach(|| {
-            promote_input_files_with_move(
-                &self.moves,
-                &self.destination,
-                || {
-                    if let Some(callback) = before_move {
-                        Python::attach(|py| callback.call0(py))
-                            .map_err(|error| io::Error::other(error.to_string()))?;
-                    }
-                    Ok(())
-                },
-                move_input_no_replace,
-            )
-        });
-        let path_map = if error.is_empty() {
-            self.path_map.clone_ref(py)
-        } else {
-            let partial = PyDict::new(py);
-            for (source, target) in residual {
-                partial.set_item(source, target)?;
-            }
-            partial.unbind()
-        };
-        Ok((path_map, removed, touched, error, collision))
+    pub(crate) fn moves(&self) -> &[(PathBuf, PathBuf)] {
+        &self.moves
+    }
+
+    pub(crate) fn execute(&self, before_move: impl FnOnce() -> io::Result<()>) -> PromotionResult {
+        promote_input_files_with_move(
+            &self.moves,
+            &self.destination,
+            before_move,
+            move_input_no_replace,
+        )
     }
 }
 
@@ -157,7 +121,7 @@ fn promote_input_files_with_move(
         if let Err(error) = move_file(source, target) {
             let mut message = error.to_string();
             // Only this prefix moved. Build a residual map only on failed rollback;
-            // successful execution reuses the already published Python map.
+            // successful execution reuses the already published move plan.
             for (old, new) in moves[..index].iter().rev() {
                 if let Err(rollback) = move_file(new, old) {
                     residual.push((normalize_path(old), normalize_path(new)));
@@ -204,11 +168,11 @@ fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 
 use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
 
-struct WatchCandidateRow {
-    path: String,
-    size: u64,
-    mtime: f64,
-    observation: WatchFileObservation,
+pub(crate) struct WatchCandidateRow {
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) mtime: f64,
+    pub(crate) observation: WatchFileObservation,
 }
 
 #[cfg(windows)]
@@ -217,25 +181,10 @@ extern "system" {
     fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
 }
 
-#[pyfunction]
-#[pyo3(signature = (roots, recursive=true))]
 pub(crate) fn scan_watch_candidates(
-    py: Python<'_>,
     roots: Vec<String>,
     recursive: bool,
-) -> PyResult<(Py<PyList>, Vec<DirectoryReadError>)> {
-    let (candidates, messages) = py.detach(|| scan_watch_candidate_rows(roots, recursive))?;
-    let values = PyList::empty(py);
-    for row in candidates {
-        values.append(watch_candidate_to_python(py, row)?)?;
-    }
-    Ok((values.unbind(), messages))
-}
-
-fn scan_watch_candidate_rows(
-    roots: Vec<String>,
-    recursive: bool,
-) -> PyResult<(Vec<WatchCandidateRow>, Vec<DirectoryReadError>)> {
+) -> io::Result<(Vec<WatchCandidateRow>, Vec<DirectoryReadError>)> {
     let mut candidates = Vec::new();
     let mut messages = DirectoryReadErrors::report();
     for root in roots {
@@ -247,7 +196,7 @@ fn scan_watch_candidate_rows(
         let (paths, errors) = crate::scan::directory::scope_file_paths(&scope)?;
         messages.extend(errors);
         for path in paths {
-            if let Some(candidate) = watch_candidate_row(&path, None)? {
+            if let Some(candidate) = watch_candidate_for_path(&path, None)? {
                 candidates.push(candidate);
             }
         }
@@ -256,93 +205,25 @@ fn scan_watch_candidate_rows(
     Ok((candidates, messages.into_messages()))
 }
 
-#[pyfunction]
-#[pyo3(signature = (path, since_usn=None))]
-pub(crate) fn watch_candidate_for_path(
-    py: Python<'_>,
-    path: &str,
-    since_usn: Option<i64>,
-) -> PyResult<Option<Py<PyDict>>> {
-    py.detach(|| watch_candidate_row(Path::new(path), since_usn))?
-        .map(|row| watch_candidate_to_python(py, row))
-        .transpose()
-}
-
-#[pyfunction]
-#[pyo3(signature = (base, work_path=None, before_move=None, resume_leaf=None))]
 pub(crate) fn flatten_single_branch_directories(
-    py: Python<'_>,
-    base: &str,
-    work_path: Option<&str>,
-    before_move: Option<Py<PyAny>>,
-    resume_leaf: Option<&str>,
-) -> PyResult<Py<PyDict>> {
-    let base_path = PathBuf::from(base);
-    let result = PyDict::new(py);
-    result.set_item("moved", 0usize)?;
-    result.set_item("removed_dirs", 0usize)?;
-    result.set_item("errors", PyList::empty(py))?;
-    result.set_item("output_dir", normalize_path(&base_path))?;
-    result.set_item("source_dir", "")?;
-    if !base_path.is_dir() && resume_leaf.is_none() {
-        return Ok(result.unbind());
-    }
-
+    base: &Path,
+    work_path: Option<&Path>,
+    before_move: impl FnOnce(&Path, &Path, &Path) -> io::Result<()>,
+    resume_leaf: Option<&Path>,
+) -> FlattenStats {
     let mut stats = FlattenStats::default();
-    // The rename chain is pure filesystem work, and every rename publishes a
-    // directory change the watch scheduler has to consume.  Release the GIL for
-    // the loop (as delete_files_batch already does) so those two can overlap
-    // instead of serializing on the interpreter lock.
-    py.detach(|| {
-        flatten_single_branch_chain_with_publisher(
-            &base_path,
-            &mut stats,
-            work_path.map(Path::new),
-            rename_no_replace,
-            |root, work, leaf| {
-                if let Some(callback) = before_move {
-                    Python::attach(|py| {
-                        callback.call1(
-                            py,
-                            (
-                                normalize_path(root),
-                                normalize_path(work),
-                                normalize_path(leaf),
-                            ),
-                        )
-                    })
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                }
-                Ok(())
-            },
-            resume_leaf.map(Path::new),
-        )
-    });
-    result.set_item("moved", stats.moved)?;
-    result.set_item("removed_dirs", stats.removed_dirs)?;
-    result.set_item("errors", PyList::new(py, stats.errors)?)?;
-    if let Some(output) = stats.output_dir {
-        result.set_item("output_dir", normalize_path(&output))?;
-    }
-    if let Some(source) = stats.source_dir {
-        result.set_item("source_dir", normalize_path(&source))?;
-    }
-    Ok(result.unbind())
+    flatten_single_branch_chain_with_publisher(
+        base,
+        &mut stats,
+        work_path,
+        rename_no_replace,
+        before_move,
+        resume_leaf,
+    );
+    stats
 }
 
-#[pyfunction]
-pub(crate) fn remove_output_path(py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
-    py.detach(|| {
-        if recursive {
-            remove_owned_tree(Path::new(&path))
-        } else {
-            remove_owned_file(Path::new(&path))
-        }
-    })?;
-    Ok(())
-}
-
-fn remove_owned_file(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_owned_file(path: &Path) -> io::Result<()> {
     remove_with_readonly(path, |path| fs::remove_file(path))
 }
 
@@ -371,7 +252,7 @@ fn remove_with_readonly(path: &Path, remove: impl Fn(&Path) -> io::Result<()>) -
     }
 }
 
-fn remove_owned_tree(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_owned_tree(path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -404,41 +285,10 @@ fn remove_owned_tree(path: &Path) -> io::Result<()> {
     }
 }
 
-#[pyfunction]
-pub(crate) fn delete_files_batch(py: Python<'_>, paths: Vec<String>) -> PyResult<Py<PyList>> {
-    let rows = py.detach(|| {
-        paths
-            .into_iter()
-            .map(|raw| {
-                let result = remove_owned_file(Path::new(&raw));
-                let (status, error, error_code) = match result {
-                    Ok(()) => ("deleted", String::new(), 0),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        ("missing", String::new(), 0)
-                    }
-                    Err(error) => (
-                        "error",
-                        error.to_string(),
-                        error.raw_os_error().unwrap_or(0),
-                    ),
-                };
-                (raw, status, error, error_code)
-            })
-            .collect::<Vec<_>>()
-    });
-    let results = PyList::empty(py);
-    for (raw, status, error, error_code) in rows {
-        let item = PyDict::new(py);
-        item.set_item("path", normalize_path(Path::new(&raw)))?;
-        item.set_item("status", status)?;
-        item.set_item("error", error)?;
-        item.set_item("error_code", error_code)?;
-        results.append(item)?;
-    }
-    Ok(results.unbind())
-}
-
-fn watch_candidate_row(path: &Path, since_usn: Option<i64>) -> PyResult<Option<WatchCandidateRow>> {
+pub(crate) fn watch_candidate_for_path(
+    path: &Path,
+    since_usn: Option<i64>,
+) -> io::Result<Option<WatchCandidateRow>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(None),
@@ -453,7 +303,7 @@ fn watch_candidate_from_metadata(
     path: &Path,
     metadata: &fs::Metadata,
     since_usn: Option<i64>,
-) -> PyResult<Option<WatchCandidateRow>> {
+) -> io::Result<Option<WatchCandidateRow>> {
     if metadata.len() == 0 {
         return Ok(None);
     }
@@ -466,31 +316,13 @@ fn watch_candidate_from_metadata(
     }))
 }
 
-fn watch_candidate_to_python(py: Python<'_>, row: WatchCandidateRow) -> PyResult<Py<PyDict>> {
-    let observation = row.observation;
-    let dict = PyDict::new(py);
-    dict.set_item("path", row.path)?;
-    dict.set_item("size", row.size)?;
-    dict.set_item("mtime", row.mtime)?;
-    dict.set_item("file_id", observation.file_id)?;
-    dict.set_item("change_usn", observation.change_usn)?;
-    dict.set_item("change_reasons", observation.change_reasons)?;
-    dict.set_item(
-        "change_reasons_without_close",
-        observation.change_reasons_without_close,
-    )?;
-    dict.set_item("change_reasons_known", observation.change_reasons_known)?;
-    dict.set_item("change_reason_error", observation.change_reason_error)?;
-    Ok(dict.unbind())
-}
-
 #[derive(Default)]
-struct FlattenStats {
-    moved: usize,
-    removed_dirs: usize,
-    errors: Vec<String>,
-    output_dir: Option<PathBuf>,
-    source_dir: Option<PathBuf>,
+pub(crate) struct FlattenStats {
+    pub(crate) moved: usize,
+    pub(crate) removed_dirs: usize,
+    pub(crate) errors: Vec<String>,
+    pub(crate) output_dir: Option<PathBuf>,
+    pub(crate) source_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]

@@ -1,15 +1,10 @@
 use crate::fast_hash_core::{hash_reader, Xxh64};
 use crate::io::resource_lifecycle::TrackedFile;
-use pyo3::exceptions::PyOSError;
-use pyo3::prelude::*;
 use std::io;
 use std::path::Path;
 
-#[pyfunction]
-pub(crate) fn runtime_binary_build_id(py: Python<'_>, path: String) -> PyResult<String> {
-    py.detach(move || hash_runtime_binary(Path::new(&path)))
-        .map(|hash| format!("{hash:016x}"))
-        .map_err(|error| PyOSError::new_err(error.to_string()))
+pub(crate) fn runtime_binary_build_id(path: &Path) -> io::Result<String> {
+    hash_runtime_binary(path).map(|hash| format!("{hash:016x}"))
 }
 
 fn hash_runtime_binary(path: &Path) -> io::Result<u64> {

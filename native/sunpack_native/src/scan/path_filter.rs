@@ -1,18 +1,18 @@
 //! One compiled rule model. Mutable search state belongs to a batch, never a rule.
-use pyo3::prelude::*;
 use regex_automata::{
     meta::{Cache, Regex},
     Input,
 };
 use regex_syntax::hir::{literal::Extractor, Hir, HirKind, Look};
 use serde::Deserialize;
+use std::io;
 use std::{borrow::Cow, cell::OnceCell, collections::HashSet, path::Path, sync::Arc};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuleEntry {
-    value: String,
-    regex: bool,
+pub(crate) struct RuleEntry {
+    pub(crate) value: String,
+    pub(crate) regex: bool,
 }
 
 fn wildcard_pattern(value: &str) -> String {
@@ -40,7 +40,7 @@ fn wildcard_pattern(value: &str) -> String {
     pattern
 }
 
-fn compile_patterns(patterns: &[String]) -> PyResult<Option<Regex>> {
+fn compile_patterns(patterns: &[String]) -> io::Result<Option<Regex>> {
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -59,7 +59,7 @@ fn compile_patterns(patterns: &[String]) -> PyResult<Option<Regex>> {
                 message.push_str(&cause.to_string());
                 source = cause.source();
             }
-            pyo3::exceptions::PyValueError::new_err(message)
+            invalid_rule(message)
         })
 }
 
@@ -74,7 +74,7 @@ impl TextMatcher {
     fn regex_memory_usage(&self) -> usize {
         self.patterns.as_ref().map_or(0, Regex::memory_usage)
     }
-    fn compile(values: Vec<String>, mut patterns: Vec<String>) -> PyResult<Self> {
+    fn compile(values: Vec<String>, mut patterns: Vec<String>) -> io::Result<Self> {
         let mut exact = HashSet::new();
         for value in values {
             if value.contains(['*', '?']) {
@@ -88,14 +88,14 @@ impl TextMatcher {
             patterns: compile_patterns(&patterns)?,
         })
     }
-    fn from_entries(entries: Vec<RuleEntry>, field: &str) -> PyResult<Self> {
+    fn from_entries(entries: Vec<RuleEntry>, field: &str) -> io::Result<Self> {
         let (mut values, mut patterns) = (Vec::new(), Vec::new());
         for entry in entries {
             if entry.regex {
                 patterns.push(entry.value);
             } else {
                 if entry.value.contains(['/', '\\']) {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    return Err(invalid_rule(format!(
                         "{field} must not contain a path separator"
                     )));
                 }
@@ -170,7 +170,7 @@ fn regex_routes(pattern: &str) -> Option<Vec<String>> {
 }
 
 impl PathMatcher {
-    fn compile(entries: Vec<RuleEntry>) -> PyResult<Self> {
+    fn compile(entries: Vec<RuleEntry>) -> io::Result<Self> {
         let (mut names, mut paths, mut patterns) = (Vec::new(), Vec::new(), Vec::new());
         let mut routes = Some(Vec::new());
         for entry in entries {
@@ -186,9 +186,7 @@ impl PathMatcher {
             } else {
                 let value = entry.value.replace('\\', "/").trim_matches('/').to_owned();
                 if value.is_empty() {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "Path must not be empty",
-                    ));
+                    return Err(invalid_rule("Path must not be empty"));
                 }
                 if value.contains('/') {
                     if let Some(combined) = routes.as_mut() {
@@ -374,7 +372,7 @@ impl PathRule {
         files: Vec<RuleEntry>,
         extensions: Vec<RuleEntry>,
         full_names: Vec<RuleEntry>,
-    ) -> PyResult<Self> {
+    ) -> io::Result<Self> {
         Ok(Self {
             paths: PathMatcher::compile(paths)?,
             files: [
@@ -433,42 +431,39 @@ impl PathRule {
     }
 }
 
-fn entries(value: &Bound<'_, PyAny>, field: &str) -> PyResult<Vec<RuleEntry>> {
-    let entries: Vec<RuleEntry> = serde_json::from_value(crate::watch_store::py_to_json(value)?)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{field}: {e}")))?;
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.value.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{field}[{index}].value must not be empty"
-            )));
-        }
-    }
-    Ok(entries)
+fn invalid_rule(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-#[pyclass(module = "sunpack_native", frozen)]
+#[derive(Clone)]
 pub(crate) struct NativePathRule {
     pub(super) rule: Arc<PathRule>,
 }
-#[pymethods]
+
 impl NativePathRule {
-    #[new]
-    fn new(
-        paths: &Bound<'_, PyAny>,
-        files: &Bound<'_, PyAny>,
-        extensions: &Bound<'_, PyAny>,
-        full_names: &Bound<'_, PyAny>,
-    ) -> PyResult<Self> {
+    pub(crate) fn compile(
+        paths: Vec<RuleEntry>,
+        files: Vec<RuleEntry>,
+        extensions: Vec<RuleEntry>,
+        full_names: Vec<RuleEntry>,
+    ) -> io::Result<Self> {
+        for (field, entries) in [
+            ("paths", &paths),
+            ("files", &files),
+            ("extensions", &extensions),
+            ("full_names", &full_names),
+        ] {
+            if let Some(index) = entries.iter().position(|entry| entry.value.is_empty()) {
+                return Err(invalid_rule(format!(
+                    "{field}[{index}].value must not be empty"
+                )));
+            }
+        }
         Ok(Self {
-            rule: Arc::new(PathRule::compile(
-                entries(paths, "paths")?,
-                entries(files, "files")?,
-                entries(extensions, "extensions")?,
-                entries(full_names, "full_names")?,
-            )?),
+            rule: Arc::new(PathRule::compile(paths, files, extensions, full_names)?),
         })
     }
-    fn rejects(&self, path: &str, root: &str, is_dir: bool, whitelist: bool) -> bool {
+    pub(crate) fn rejects(&self, path: &str, root: &str, is_dir: bool, whitelist: bool) -> bool {
         let mut scratch = PathRuleScratch::default();
         // Scalar events cannot reuse ancestor state; use the same matcher
         // without allocating an immediately discarded path/prefix cache.

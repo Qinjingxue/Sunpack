@@ -1,8 +1,6 @@
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::wal::{self, Kind};
 use crate::watch_store::{NativeWatchOperations, Operations};
-use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
@@ -26,7 +24,6 @@ enum TicketGoal {
     Sealed,
 }
 
-#[pyclass(module = "sunpack_native")]
 pub(crate) struct NativeJournalTicket {
     shared: Arc<Shared>,
     stream: String,
@@ -117,19 +114,16 @@ struct StreamFrontier {
 }
 
 /// A store owns a stream until drain/checkpoint completion. Dropping a store
-/// also submits release through the existing writer, without blocking GC.
-#[pyclass(module = "sunpack_native")]
+/// also submits release through the existing writer, without blocking the caller.
 pub(crate) struct NativeJournalStream {
     runtime: Arc<JournalRuntime>,
     stream: Option<String>,
 }
 
-#[pymethods]
 impl NativeJournalStream {
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn close(&mut self) -> std::io::Result<()> {
         if let Some(stream) = self.stream.take() {
-            py.detach(|| self.runtime.release(stream))
-                .map_err(PyRuntimeError::new_err)?;
+            (self.runtime.release(stream)).map_err(std::io::Error::other)?;
         }
         Ok(())
     }
@@ -146,20 +140,16 @@ impl Drop for NativeJournalStream {
     }
 }
 
-#[pymethods]
 impl NativeJournalTicket {
-    fn wait(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.wait_for(self.goal))
-            .map_err(PyRuntimeError::new_err)
+    pub(crate) fn wait(&self) -> std::io::Result<()> {
+        (self.wait_for(self.goal)).map_err(std::io::Error::other)
     }
 
-    fn wait_written(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.wait_for(TicketGoal::Written))
-            .map_err(PyRuntimeError::new_err)
+    pub(crate) fn wait_written(&self) -> std::io::Result<()> {
+        (self.wait_for(TicketGoal::Written)).map_err(std::io::Error::other)
     }
 
-    #[getter]
-    fn bytes_written(&self) -> u64 {
+    pub(crate) fn bytes_written(&self) -> u64 {
         self.bytes_written
             .as_ref()
             .map_or(0, |bytes| bytes.load(Ordering::Acquire))
@@ -966,21 +956,18 @@ fn flusher_loop(shared: Arc<Shared>) {
     }
 }
 
-#[pyfunction]
-pub(crate) fn watch_journal_open(py: Python<'_>, stream: String) -> PyResult<NativeJournalStream> {
-    py.detach(|| runtime().open(stream))
-        .map_err(PyRuntimeError::new_err)
+pub(crate) fn watch_journal_open(stream: String) -> std::io::Result<NativeJournalStream> {
+    (runtime().open(stream)).map_err(std::io::Error::other)
 }
 
-#[pyfunction]
 pub(crate) fn watch_journal_submit_append(
     stream: String,
     path: String,
     segment_start: u64,
     seq: u64,
-    operations: PyRef<'_, NativeWatchOperations>,
+    operations: &NativeWatchOperations,
     durable: bool,
-) -> PyResult<NativeJournalTicket> {
+) -> std::io::Result<NativeJournalTicket> {
     let operations = JournalPayload::Task(Arc::clone(&operations.operations));
     runtime()
         .submit_append(
@@ -991,40 +978,35 @@ pub(crate) fn watch_journal_submit_append(
             operations,
             durable,
         )
-        .map_err(PyRuntimeError::new_err)
+        .map_err(std::io::Error::other)
 }
 
-#[pyfunction]
 pub(crate) fn watch_journal_submit_seal(
     stream: String,
     old_path: String,
     old_start: u64,
     boundary: u64,
-) -> PyResult<NativeJournalTicket> {
+) -> std::io::Result<NativeJournalTicket> {
     runtime()
         .submit_seal(stream, PathBuf::from(old_path), old_start, boundary)
-        .map_err(PyRuntimeError::new_err)
+        .map_err(std::io::Error::other)
 }
 
-#[pyfunction]
 pub(crate) fn watch_journal_request_flush(
     stream: String,
     target_seq: u64,
-) -> PyResult<NativeJournalTicket> {
+) -> std::io::Result<NativeJournalTicket> {
     runtime()
         .request_flush(stream, target_seq)
-        .map_err(PyRuntimeError::new_err)
+        .map_err(std::io::Error::other)
 }
 
-#[pyfunction]
-pub(crate) fn watch_journal_seed(stream: &str, seq: u64) -> PyResult<()> {
-    runtime().seed(stream, seq).map_err(PyRuntimeError::new_err)
+pub(crate) fn watch_journal_seed(stream: &str, seq: u64) -> std::io::Result<()> {
+    runtime().seed(stream, seq).map_err(std::io::Error::other)
 }
 
-#[pyfunction]
-pub(crate) fn watch_journal_flush_all(py: Python<'_>) -> PyResult<()> {
-    py.detach(|| runtime().flush_all())
-        .map_err(PyRuntimeError::new_err)
+pub(crate) fn watch_journal_flush_all() -> std::io::Result<()> {
+    (runtime().flush_all()).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]

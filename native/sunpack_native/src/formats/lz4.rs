@@ -1,8 +1,6 @@
 //! One structural LZ4 parser shared by routing, reports and embedded scanning.
 //! Walk block lengths; do not decode or hash payload during archive analysis.
 use crate::io::reader::{CachedBytes, ManagedReader};
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::ffi::c_void;
 use std::io::Read;
 
@@ -279,62 +277,13 @@ fn walk_inner(
     }
 }
 impl Index {
-    pub(crate) fn to_dict<'py>(
-        &self,
-        py: Python<'py>,
-        file_size: u64,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let result = PyDict::new(py);
-        result.set_item("format", "lz4")?;
-        result.set_item("ext", ".lz4")?;
-        result.set_item("file_size", file_size)?;
-        result.set_item(
-            "magic_matched",
-            self.frames > 0
-                || self.error.starts_with("lz4_") && self.error != "lz4_magic_not_found",
-        )?;
-        result.set_item("plausible", self.frames > 0)?;
-        result.set_item("error", self.error)?;
-        result.set_item(
-            "damage_flags",
-            if self.error.is_empty() {
-                vec![]
-            } else {
-                vec![self.error]
-            },
-        )?;
-        result.set_item("evidence", vec!["lz4:frame_structure"])?;
-        result.set_item(
-            "structure_status",
-            if self.complete {
-                "complete"
-            } else {
-                "incomplete"
-            },
-        )?;
-        result.set_item("structure_validation_complete", self.complete)?;
-        result.set_item("boundary_exact", self.complete)?;
-        result.set_item("segment_end", self.complete.then_some(self.end))?;
-        result.set_item("archive.trailing_data", file_size.saturating_sub(self.end))?;
-        result.set_item(
-            "integrity_status",
-            if self.content_checksums + self.block_checksums > 0 {
-                "deferred"
-            } else {
-                "not_present"
-            },
-        )?;
-        result.set_item("integrity_validation_complete", false)?;
-        result.set_item(
-            "checksum_present",
-            self.content_checksums + self.block_checksums > 0,
-        )?;
-        result.set_item("structure.stream_count", self.frames)?;
-        result.set_item("structure.block_count", self.blocks)?;
-        result.set_item("structure.decoded_size", self.decoded_size)?;
-        Ok(result)
+    pub(crate) fn magic_matched(&self) -> bool {
+        self.frames > 0 || self.error.starts_with("lz4_") && self.error != "lz4_magic_not_found"
     }
 
+    pub(crate) fn checksum_present(&self) -> bool {
+        self.content_checksums != 0 || self.block_checksums != 0
+    }
 }
 
 #[repr(C)]

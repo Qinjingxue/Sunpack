@@ -152,25 +152,21 @@ function Assert-PeMachine {
 }
 
 $root = (Resolve-Path -LiteralPath $PackageRoot).Path
-$nativeExtension = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.Name -like "sunpack_native*.pyd" -or
-        $_.Name -like "sunpack_native*.dll"
-    } |
-    Select-Object -First 1
-
-if ($null -eq $nativeExtension) {
-    throw "sunpack_native extension not found under: $root"
+$pythonFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object {
+    $_.Extension -eq ".pyd" -or $_.Name -match '^python(?:3\d*)?\.dll$' -or $_.Name -match '^sunpack_native.*\.dll$'
+})
+if ($pythonFiles.Count -ne 0) {
+    throw "Unexpected Python runtime files: $($pythonFiles.FullName -join ', ')"
 }
 
 Assert-PeMachine -LiteralPath (Join-Path $root "sunpack.exe") -BuildArch $Arch -Description "sunpack.exe"
 Assert-PeMachine -LiteralPath (Join-Path $root "sunpack-runtime.exe") -BuildArch $Arch -Description "sunpack-runtime.exe"
 Assert-PeMachine -LiteralPath (Join-Path $root "SunPackGUI.exe") -BuildArch $Arch -Description "SunPackGUI.exe"
+Assert-PeMachine -LiteralPath (Join-Path $root "service\sunpack-watch-broker.exe") -BuildArch $Arch -Description "service/sunpack-watch-broker.exe"
 Assert-PeSubsystem -LiteralPath (Join-Path $root "SunPackGUI.exe") -Expected 2 -Description "SunPackGUI.exe"
 Assert-PeSubsystem -LiteralPath (Join-Path $root "sunpack.exe") -Expected 3 -Description "sunpack.exe"
 Assert-PeSubsystem -LiteralPath (Join-Path $root "sunpack-runtime.exe") -Expected 2 -Description "sunpack-runtime.exe"
 Assert-PathMissing -LiteralPath (Join-Path $root "sunpack-watch.exe") -Description "retired duplicate watch executable"
-Assert-PeMachine -LiteralPath $nativeExtension.FullName -BuildArch $Arch -Description "sunpack_native extension"
 Assert-PackagedRuntimeTools -PackageRoot $root
 # The 7-Zip backend is compiled into sunpack_sevenzip_worker.exe. A leftover
 # standalone 7z.dll would silently re-introduce the external backend dependency.

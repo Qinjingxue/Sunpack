@@ -9,18 +9,16 @@ from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
 
-from sunpack_native import fast_hash128_file
 
 
 SERVICE_ENV = "SUNPACK_WATCH_BROKER_SERVICE_NAME"
 PIPE_ENV = "SUNPACK_WATCH_BROKER_PIPE_NAME"
 BINARY_ENV = "SUNPACK_WATCH_BROKER_BINARY_PATH"
-HASH_ENV = "SUNPACK_WATCH_BROKER_BINARY_XXH128"
 TEST_SERVICE_PREFIX = "SunPackWatchBrokerTest_"
 TEST_PIPE_PREFIX = r"\\.\pipe\SunPack.WatchBroker.Test."
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVICE_MANAGER = REPO_ROOT / "scripts" / "manage_test_watch_service.ps1"
-MANAGED_ENVIRONMENT = (SERVICE_ENV, PIPE_ENV, BINARY_ENV, HASH_ENV)
+MANAGED_ENVIRONMENT = (SERVICE_ENV, PIPE_ENV, BINARY_ENV)
 
 
 def isolated_broker_environment() -> bool:
@@ -111,7 +109,6 @@ def temporary_watch_broker_service() -> Iterator[None]:
         os.environ[SERVICE_ENV] = service_name
         os.environ[PIPE_ENV] = pipe_name
         os.environ[BINARY_ENV] = str(binary)
-        os.environ[HASH_ENV] = fast_hash128_file(binary)
         print(f"==> Installing temporary Watch Broker service: {service_name}", flush=True)
         _run_service_manager("Install", service_name, pipe_name, binary)
         installed = True
@@ -127,34 +124,3 @@ def temporary_watch_broker_service() -> Iterator[None]:
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = value
-
-
-@contextmanager
-def watch_broker_lease() -> Iterator[dict[str, object]]:
-    if not isolated_broker_environment():
-        raise RuntimeError(
-            "watch benchmarks require the isolated Broker launcher; "
-            "run them with `python -m benchmarks watch <scenario>`"
-        )
-    from sunpack_native import (
-        watch_broker_acquire,
-        watch_broker_is_connected,
-        watch_broker_release,
-    )
-
-    watch_broker_acquire()
-    try:
-        connected = bool(watch_broker_is_connected())
-        if not connected:
-            raise RuntimeError("isolated Watch Broker did not connect")
-        binary_path = os.environ.get(BINARY_ENV, "")
-        yield {
-            "service_name": os.environ[SERVICE_ENV],
-            "pipe_name": os.environ[PIPE_ENV],
-            "binary_path": binary_path,
-            "binary_xxh128": os.environ.get(HASH_ENV, "").strip().lower()
-            or (fast_hash128_file(binary_path) if binary_path else ""),
-            "connected": connected,
-        }
-    finally:
-        watch_broker_release()

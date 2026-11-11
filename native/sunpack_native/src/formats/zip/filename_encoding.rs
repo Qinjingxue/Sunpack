@@ -1,9 +1,7 @@
-use crate::io::archive_state::{build_segments, Segment};
+use crate::io::archive_state::{build_segments, ArchiveInput, Segment};
 use crate::io::reader::ManagedReader;
 use crate::io::scratch::SpillSet;
 use encoding_rs::{BIG5, GBK, SHIFT_JIS};
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::OnceLock;
@@ -161,21 +159,14 @@ impl ZipLogicalReader {
     }
 }
 
-#[pyfunction]
 pub(crate) fn analyze_zip_filename_encoding(
-    py: Python<'_>,
-    archive_input: &Bound<'_, PyDict>,
-) -> PyResult<Option<&'static str>> {
-    let segments = build_segments(archive_input)?;
-    let disk_aware = archive_input
-        .get_item("volume_style")?
-        .map(|value| value.extract::<String>())
-        .transpose()?
-        .is_some_and(|style| style == "zip_spanned");
-    Ok(py.detach(move || {
-        let reader = ZipLogicalReader::open(segments, disk_aware)?;
-        scan_zip_names(&reader)
-    })?)
+    archive_input: &ArchiveInput,
+) -> io::Result<Option<&'static str>> {
+    let reader = ZipLogicalReader::open(
+        build_segments(archive_input)?,
+        archive_input.analysis.zip_spanned,
+    )?;
+    scan_zip_names(&reader)
 }
 
 fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<Option<&'static str>> {

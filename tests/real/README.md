@@ -1,88 +1,13 @@
-# Real archive regression coverage
+# 真实归档结构语料
 
-Use `.venv/Scripts/python.exe -m pytest tests/real`. Watch tests additionally
-require the isolated Broker environment established by `run_acceptance_tests.ps1`.
+此目录保留独立生成的真实归档语料，用于发现、解压和兼容性回归。Python 实现的 Plan 1–7 测试已退役。当前功能验收通过 [原生黑盒入口](../blackbox/) 和 Rust/C++ 测试执行。
 
-The new regression cases cover:
-
-* `test_split_zip_failure_classification.py` covers actual PKZIP `.z01/.zip`
-  disks (ZipCrypto and AES256), in addition to Plan 4's generic `.zip.001`
-  streams. Complete sets pass an independent `7z t` and a successful SunPack
-  extraction before testing all-wrong passwords and six missing-disk layouts.
-  Missing sets with a correct password must report only `MISSING_VOLUME`;
-  complete sets with all-wrong passwords must report only `WRONG_PASSWORD`.
-  When both faults exist, either can surface first. A real watch lifecycle
-  for PKZIP (both ciphers), generic ZIP, 7z and RAR resolves the reported
-  blocker, checks suspension on the other, then resolves it and verifies a
-  successful extraction. RAR covers both middle and tail loss. No error
-  priority is required.
-  Headless fragments which the scanner does not recognize are asserted
-  separately. The real CLI and watch scheduler also process a junk-wrapped
-  outer ZIP containing concurrent healthy, wrong-password and missing-volume
-  disguised split groups. The scheduler test uses real files, engine, worker
-  and persistent blockers; only the installed Broker admission preflight is
-  bypassed, so this regression runs without a test service.
-  Plan 3/4/5 share strict recursive failure assertions, and recognized
-  incomplete inputs may no longer pass by disappearing during scanning.
-* LZ4 and TAR/LZ4 participate in Plan 1's ordinary/disguised/mixed directory
-  matrices and concatenated streams. The nested CLI and Plan 7 restart/password
-  fixtures contain a valid TAR/LZ4 carrier segment alongside encrypted 7z;
-  expected sizes/CRC32 verify that this healthy segment survives sibling
-  failures and is extracted exactly once. Plan 7 also covers LZ4 ordinary,
-  disguised, embedded, chunked downloads and writes to the final path.
-  `plan7_watch_downloads/test_plan7_lz4_wrapped_rar_volumes.py` delivers four
-  independently LZ4-wrapped, header-encrypted RAR volumes with the password
-  supplied before arrival. Both interleaved rename-commit and final-path writes
-  start the real directory monitor, promote the volume group to the input root,
-  and automatically extract each member
-  exactly once; Rust inventories verify volume/member sizes and CRC32.
-
-* Plan 5 constructs carriers once with a declared seed. Rust streams source
-  files into the carrier and records byte offsets/lengths independently of the
-  scanner. Scanner failures cannot cause fixture regeneration. Fixed fake
-  signatures, adjacent equal-format archives and signatures crossing 64 KiB /
-  1 MiB boundaries have separate tests.
-* `test_combined_nested_lifecycle.py` sends encrypted, disguised split 7z/ZIP/RAR
-  through the real CLI. Inside are a carrier, a differently encrypted 7z and
-  healthy / separately encrypted ZIP branches. A mixed-group Pipeline case
-  covers concurrent failures, output hashes, deletion and flattening.
-* Plan 7 adds late-tail delivery, a restart with incomplete volumes, a second
-  restart with a retained inner password failure, and a scoped JSON password
-  update. Blocked inner inputs are promoted to the original input directory;
-  the test asserts their ordinary password scope before triggering the update.
-* `test_external_structure_corpus.py` generates self-authored samples using
-  Windows bsdtar/libarchive and WinRAR, independently of SunPack/7-Zip's usual
-  fixture writer. It checks USTAR, PAX long Unicode paths, GNU longname,
-  duplicate TAR/ZIP members, empty ZIP, legacy CP437 ZIP and solid RAR5 under
-  plain names, disguised names and junk-prefixed/suffixed carriers. Expected
-  output paths, sizes and CRC32 come from source files, not extraction output.
-* Plan 2, Plan 3 and Plan 7 exercise the official ENC v4 compatibility vector
-  through foreground decryption, wrong-password reporting and watch downloads.
-  Plan 2 gives the ENC vector a `.mov` name to verify signature-based discovery;
-  the fixture is copied by the Rust test helper from
-  `native/sunpack_enc/tests/data/algorithm_0.mov`.
-
-Samples are generated once per structure per test module and reused for all
-three container variants. The ignored `tests/real/corpus/` directory is optional;
-a clean checkout can collect and run these tests without it. To generate an
-inspectable corpus with tool/command/artifact provenance:
+可在干净工作区用真实系统工具生成一组带来源记录的结构样本：
 
 ```powershell
 .venv/Scripts/python.exe -m scripts.generate_real_structure_corpus
 ```
 
-Binary assembly and hashing use the test-only Cargo example `real_fixture`,
-with bounded buffers (64 KiB for assembly/hashing, 256 KiB input for LZ4).
-LZ4 frames use the pinned upstream encoder with block/content checksums,
-declared content size and linked 64 KiB blocks; multiple sources produce
-concatenated frames without querying the product parser. Before running pytest,
-`scripts/setup_windows_dev.ps1` builds it with the workspace's existing locked
-dependencies and installs it as `tools/real_fixture.exe` (`tools-arm64` on ARM64).
-The helper fails explicitly if it is missing and never invokes Cargo during tests.
-This does not add production APIs or dependencies. Python reads
-only text manifests and orchestrates existing fixture/tool paths.
+语料覆盖 USTAR、PAX Unicode 长路径、GNU longname、重复 TAR/ZIP 成员、空 ZIP、CP437 ZIP 和 solid RAR5 等结构。样本可用原名、伪装名和带前后杂项字节的载体三种方式运行。期望输出的路径、大小和 CRC32 来源于原始文件。
 
-The legacy CP437 case asserts exact names and contents in all three containers.
-Rust passes CP437 explicitly when it wins the filename analysis, so the native
-handler cannot substitute its Unix UTF-8 heuristic or the machine's codepage.
-UTF-8 flags and valid Unicode path fields retain precedence in the handler.
+脚本使用 bsdtar、WinRAR 和 `tools/real_fixture.exe`（ARM64 对应 `tools-arm64`）等独立工具。后者由 `scripts/setup_windows_dev.ps1` 从工作区预先构建。它以有界缓冲组装载体、生成 LZ4 帧并清点文件，不调用应用的扫描逻辑。可选输出位于忽略的 `tests/real/corpus/structure/`；pytest 收集不依赖它。

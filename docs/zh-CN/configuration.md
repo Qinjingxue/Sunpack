@@ -2,7 +2,7 @@
 
 [English](../configuration.md) | **简体中文**
 
-日常设置请修改 `sunpack_config.json`。源码运行时使用项目根目录中的文件；安装版使用 `%ProgramData%\SunPack\sunpack_config.json`。`sunpack_advanced_config.json` 提供其余默认值。
+日常设置请修改 `sunpack_config.json`。开发构建使用项目根目录中的文件；安装版使用 `%ProgramData%\SunPack\sunpack_config.json`。`sunpack_advanced_config.json` 提供其余默认值。
 
 普通配置的同名值优先于高级配置；`SUNPACK_CONFIG_OVERRIDES` 仍是最后一层显式覆盖。对象按字段合并，`filesystem.scan_filters` 按 `name` 合并，其余数组整体覆盖。Watch 会自动重新加载配置变更。
 
@@ -10,11 +10,9 @@
 修改后校验并查看最终配置：
 
 ```powershell
-python sunpack.py config validate
-python sunpack.py config show
+sunpack.exe config validate
+sunpack.exe config show
 ```
-
-安装版请将 `python sunpack.py` 换成 `sunpack.exe`。
 
 ## 常用设置
 
@@ -118,7 +116,7 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 分析只识别当前层格式。GZIP、BZIP2、XZ、Zstandard、LZ4 先解开外层流，产出的 TAR 再由正常递归流程识别和解压；不提前识别复合格式。原 `tar_*` 分析模块及全部 `max_probe_bytes` 配置已删除。普通 TAR 分析仅从偏移 0 开始，其他位置的 TAR 候选只来自统一的 embedded 扫描器。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
 
-使用 `python sunpack.py watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；留空时解压到各归档所在文件夹。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
+使用 `sunpack.exe watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；留空时解压到各归档所在文件夹。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
 
 ## 自动运行参数
 

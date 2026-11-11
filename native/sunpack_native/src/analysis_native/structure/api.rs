@@ -46,57 +46,46 @@ pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u
     rejected
 }
 
-#[pyfunction]
-pub(crate) fn inspect_compression_stream_identity(
-    py: Python<'_>,
-    path: &str,
-) -> PyResult<Py<PyDict>> {
-    py.detach(|| inspect_compression_stream_identity_impl(path))
-        .to_py_dict(py)
-}
-
 pub(crate) fn confirm_compression_format_identity_native(path: &str, format: &str) -> bool {
     let result = inspect_compression_stream_identity_impl(path);
     result.format == format && result.plausible && result.error.is_empty()
 }
 
-#[pyfunction]
-pub(crate) fn inspect_compression_stream_structure(
-    py: Python<'_>,
+#[cfg(test)]
+fn inspect_compression_stream_structure(
     path: &str,
-) -> PyResult<Py<PyDict>> {
-    let Ok(reader) = py.detach(|| ManagedReader::open(path)) else {
-        return compression_empty(py, "os_error", "", "", false);
+) -> std::io::Result<DiagnosticFields> {
+    let Ok(reader) = ManagedReader::open(path) else {
+        return compression_empty("os_error", "", "", false);
     };
-    let header = py.detach(|| reader.read_cached_at(0, 32))?;
-    inspect_compression_stream_reader(py, &reader, &header)
+    let header = (reader.read_cached_at(0, 32))?;
+    inspect_compression_stream_reader(&reader, &header)
 }
 
 pub(crate) fn inspect_compression_stream_reader(
-    py: Python<'_>,
     reader: &ManagedReader,
     header: &[u8],
-) -> PyResult<Py<PyDict>> {
+) -> std::io::Result<DiagnosticFields> {
     if let Some(kind) = StructuralStreamKind::from_header(header) {
         if reader.len() > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-            return inspect_structural_stream(py, reader, kind);
+            return inspect_structural_stream(reader, kind);
         }
         return match kind {
-            StructuralStreamKind::Gzip => inspect_gzip(py, reader),
-            StructuralStreamKind::Bzip2 => inspect_bzip2(py, reader),
-            StructuralStreamKind::Xz => inspect_xz(py, reader),
-            StructuralStreamKind::Zstd => inspect_zstd(py, reader),
+            StructuralStreamKind::Gzip => inspect_gzip(reader),
+            StructuralStreamKind::Bzip2 => inspect_bzip2(reader),
+            StructuralStreamKind::Xz => inspect_xz(reader),
+            StructuralStreamKind::Zstd => inspect_zstd(reader),
         };
     }
     if crate::formats::lz4::leading(header) {
         let file_size = reader.len();
-        let index = py.detach(|| crate::formats::lz4::walk(reader, 0, file_size));
+        let index = crate::formats::lz4::walk(reader, 0, file_size);
         if index.frames == 0 && matches!(index.error, "" | "lz4_magic_not_found") {
-            return compression_empty(py, "ambiguous_skippable_stream", "", "", false);
+            return compression_empty("ambiguous_skippable_stream", "", "", false);
         }
-        return Ok(index.to_dict(py, file_size)?.unbind());
+        return Ok(lz4_diagnostic(&index, file_size));
     }
-    compression_empty(py, "compression_stream_magic_not_found", "", "", false)
+    compression_empty("compression_stream_magic_not_found", "", "", false)
 }
 
 pub(crate) fn has_compression_stream_header(header: &[u8]) -> bool {

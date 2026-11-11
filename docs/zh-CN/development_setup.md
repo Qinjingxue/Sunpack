@@ -2,13 +2,13 @@
 
 [English](../development_setup.md) | **简体中文**
 
-SunPack 是 Windows-only 项目。Python 依赖统一声明在根目录 `pyproject.toml`，由 `uv.lock` 锁定；Rust、C++ 和 Windows 服务使用同一条构建链路。
+SunPack 是 Windows-only 项目。Cargo 构建 Rust 运行时和 Watch Broker，CMake 构建原生 worker、启动器、GUI 与通知 DLL。Python 测试依赖由 `uv.lock` 锁定。
 
 ## 环境要求
 
 - Windows 10/11
 - PowerShell 5.1 或更新版本
-- Python 3.10 或更新版本，架构必须与目标发行包一致
+- Python 3.10 或更新版本，用于黑盒测试和辅助脚本
 - `uv` 0.12 或更新版本
 - Rust MSVC toolchain，提供 `cargo`
 - Visual Studio Build Tools 2022，包含 C++17 编译器
@@ -18,8 +18,7 @@ SunPack 是 Windows-only 项目。Python 依赖统一声明在根目录 `pyproje
 项目主要目录：
 
 ```text
-sunpack/                    产品运行时代码
-native/sunpack_native/      Rust/PyO3 扩展
+native/sunpack_native/      Rust 调度与计算核心、CLI 和 Watch
 native/sunpack_usn_core/    NTFS/USN 共用 Rust 核心
 native/sunpack_watch_broker/Windows Watch Broker 服务
 native/sevenzip_bridge/     Windows 7z.dll bridge 与 worker
@@ -34,9 +33,8 @@ tools-arm64/                ARM64 外部工具和原生构建产物
 
 | Extra | 用途 |
 | --- | --- |
-| 默认 | SunPack 运行依赖 |
 | `test` | pytest 与测试数据生成依赖 |
-| `build` | Nuitka、maturin、CMake |
+| `build` | CMake |
 | `dev` | build 与 test 的并集 |
 
 常用安装方式：
@@ -47,7 +45,7 @@ uv sync --locked --extra test
 uv sync --locked --extra dev
 ```
 
-开发环境目录为 `.venv`。如果该环境启用了全局 site-packages，准备脚本会重建它，避免全局包影响依赖解析。
+开发环境目录为 `.venv`。如果该环境启用了全局 site-packages，准备脚本会关闭该选项，避免全局包影响依赖解析。
 
 ## 一键准备开发环境
 
@@ -58,12 +56,12 @@ uv sync --locked --extra dev
 脚本会：
 
 1. 用 `uv sync --locked --extra dev` 准备隔离的 `.venv`
-2. 构建并安装当前架构的 Rust/PyO3 wheel
+2. 构建 Rust 运行时和测试数据生成器
 3. 构建 `sunpack-watch-broker.exe`
 4. 准备对应架构的 `7z.exe`、`7z.dll` 和 license
 5. 构建 `sunpack_sevenzip_worker.exe` 和 `sunpack_toast.dll`
 6. 把原生产物复制到工具目录
-7. 运行 Python、Rust、C++ 和 CLI smoke checks
+7. 运行 worker 与 toast 的 CTest 用例
 
 选项：
 
@@ -73,13 +71,11 @@ uv sync --locked --extra dev
 .\scripts\setup_windows_dev.ps1 -SkipAcceptanceTestTools
 ```
 
-目标架构必须与当前 Python 进程架构一致。
-
 x64 环境还会在 `.sunpack_test_tools/` 下准备验收测试的压缩包生成器：WinRAR 6.22、zstd 1.5.7 和 [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4)。LZ4 生成器安装在 `7zip-zstd/7z.exe`，同时保留配套的 `7z.dll`；脚本检查工具能够运行并提供 LZ4 编码器。这些工具不进入发行包。`-SkipAcceptanceTestTools` 会跳过它们的准备。
 
 ## USN Watch Broker
 
-watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `native/sunpack_usn_core` 和 `native/sunpack_watch_broker`，Python 只消费文件观察结果和 watch 状态。
+watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `native/sunpack_usn_core` 和 `native/sunpack_watch_broker`，Watch 直接消费 Rust 文件观察结果和状态。
 
 ### 组件和生命周期
 
@@ -145,16 +141,10 @@ Pipe:    \\.\pipe\SunPack.WatchBroker.Test.<id>
 
 ## 手动构建原生组件
 
-### Rust/PyO3
+### Rust 运行时
 
 ```powershell
-uv sync --locked --extra build
-.\.venv\Scripts\maturin.exe build --manifest-path native\sunpack_native\Cargo.toml --release --target-dir .cache\rust-target\x64 --out build\native-wheels-dev
-$wheel = Get-ChildItem build\native-wheels-dev\sunpack_native-*.whl |
-    Sort-Object LastWriteTimeUtc -Descending |
-    Select-Object -First 1 -ExpandProperty FullName
-uv pip uninstall --python .\.venv\Scripts\python.exe sunpack-native
-uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
+cargo build --locked --manifest-path native\Cargo.toml -p sunpack-native --bin sunpack-runtime --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
 ```
 
 ### C++ 内嵌 7-Zip worker
@@ -179,25 +169,21 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 
 持续运行的 watch 按 `watch.toast_enabled` 创建 Windows 通知能力，并按配置发送进度、完成和失败通知。普通 CLI 请求以及 `watch start --once` 不创建通知能力。通知失败报告写入可写数据目录下的 `.sunpack_watch/failures`。
 
-## Smoke Checks
+## 验证
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import sunpack_native as n; assert callable(n.NativeDirectoryScanOptions)"
-.\.venv\Scripts\python.exe -c "from sunpack.core.support.resources import get_sevenzip_bridge_worker_path; print(get_sevenzip_bridge_worker_path())"
-.\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
+cargo test --locked --manifest-path native\Cargo.toml --workspace --profile ci
 ```
-
-前两个命令分别验证 Rust 扩展和 C++ worker 路径；第三个命令验证配置加载。
 
 ## 测试
 
-普通 pytest：
+完成开发环境构建后可直接运行 CLI 黑盒测试：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q tests\blackbox
 ```
 
-直接运行 pytest 时，需要 Windows NTFS Watch Broker 的用例会被跳过。完整验收通过 `run_acceptance_tests.ps1` 准备隔离测试服务，运行单元、功能、集成、真实场景、磁盘空间和 CLI smoke tests，结束后自动卸载测试服务：
+直接运行 pytest 时，需要 Windows NTFS Watch Broker 的用例会被跳过。完整验收通过 `run_acceptance_tests.ps1` 准备隔离测试服务，运行 Rust 正确性测试和 CLI、Watch 黑盒测试，结束后自动卸载测试服务：
 
 ```powershell
 .\run_acceptance_tests.ps1 -NoWait
@@ -232,52 +218,8 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 
 构建过程：
 
-1. 创建或复用 `.venv`（`-Clean` 时清理重建）
-2. 安装项目 `dev` extra
-3. 构建并安装 Rust wheel
-4. 构建 Watch Broker
-5. 构建和测试 C++ bridge/worker 与 toast DLL
-6. 可选运行 acceptance tests
-7. 构建无控制台 runtime 和 CLI launcher
-8. 复制配置、密码表、工具、Watch Broker、第三方许可证文件和声明
-9. 校验关键 PE 文件架构
-10. 运行 packaged CLI、bridge 和 worker smoke checks
-11. 用 Inno Setup 创建 Windows 安装器
-
-输出：
-
-```text
-dist\sunpack-<arch>\
-dist\sunpack-<arch>\service\sunpack-watch-broker.exe
-dist\sunpack-<arch>\licenses\SunPack-MIT.txt
-dist\sunpack-<arch>\licenses\7zip-license.txt
-dist\sunpack-<arch>\licenses\7zip-source-license.txt
-dist\sunpack-<arch>\licenses\LGPL-2.1.txt
-dist\sunpack-<arch>\THIRD_PARTY_NOTICES.md
-release\sunpack-windows-<arch>-<version>-setup.exe
-```
-
-ARM64 必须在 ARM64 Windows 和 ARM64 Python 环境中构建。已有目录可独立校验：
-
-```powershell
-.\scripts\verify_windows_package_arch.ps1 -PackageRoot dist\sunpack-x64 -Arch x64
-```
-
-## 运行时原生文件
-
-x64 开发环境默认使用：
-
-```text
-tools\7z.exe
-tools\7z.dll
-tools\sunpack_sevenzip_worker.exe
-tools\sunpack_toast.dll
-```
-
-安装包还包含：
-
-```text
-service\sunpack-watch-broker.exe
-```
-
-`sunpack_sevenzip_worker.exe` 读取二进制任务帧，通过内嵌 7-Zip 后端解压文件、分卷和虚拟输入。`7z.exe` 及其开发环境中的相邻 `7z.dll` 用于 fixture、手工诊断、文件来源和发布资源准备，不属于产品解压运行时依赖。
+1. 用 Cargo 构建 Rust 运行时和 Watch Broker
+2. 用 CMake 构建 CLI 启动器、worker、GUI 与 toast DLL
+3. 放入配置、密码表、辅助脚本、许可证及其他发行文件
+4. 检查 PE 架构，运行打包后的 CLI smoke tests
+5. 按构建参数运行验收测试，用 Inno Setup 创建安装器

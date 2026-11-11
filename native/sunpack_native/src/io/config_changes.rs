@@ -1,7 +1,6 @@
 //! Arm configuration notifications before publishing a directory subscription.
 use super::iocp::{CancelIoEx, Overlapped};
 use super::resource_lifecycle::TrackedFile;
-use pyo3::prelude::*;
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
@@ -59,6 +58,7 @@ struct Request {
     overlapped: Box<Overlapped>,
     buffer: Box<[u32]>,
     pending: bool,
+    recursive: bool,
 }
 
 // The boxed OS buffers stay fixed; access and cancellation are serialized by
@@ -72,7 +72,7 @@ impl Request {
                 self.file.as_raw_handle(),
                 self.buffer.as_mut_ptr().cast(),
                 (self.buffer.len() * 4) as u32,
-                0,
+                i32::from(self.recursive),
                 0x01 | 0x02 | 0x08 | 0x10,
                 std::ptr::null_mut(),
                 &mut *self.overlapped,
@@ -137,16 +137,17 @@ impl Drop for Request {
     }
 }
 
-#[pyclass(frozen)]
 pub(crate) struct NativeConfigChanges {
     request: Mutex<Option<Request>>,
     stopped: OwnedHandle,
 }
 
-#[pymethods]
 impl NativeConfigChanges {
-    #[new]
-    fn new(path: PathBuf) -> io::Result<Self> {
+    pub(crate) fn new(path: PathBuf) -> io::Result<Self> {
+        Self::observe(path, false)
+    }
+
+    pub(crate) fn observe(path: PathBuf, recursive: bool) -> io::Result<Self> {
         let stopped = event(false)?;
         let file = TrackedFile::open_passive_with(path, "config_directory", |options| {
             options
@@ -165,6 +166,7 @@ impl NativeConfigChanges {
             _event: event,
             buffer: vec![0u32; 1024].into_boxed_slice(),
             pending: false,
+            recursive,
         };
         request.arm()?;
         Ok(Self {
@@ -174,57 +176,53 @@ impl NativeConfigChanges {
     }
 
     // None denotes overflow: invalidate all subscribed files in this directory.
-    fn read(&self, py: Python<'_>) -> io::Result<Option<Vec<String>>> {
-        py.detach(|| {
-            let mut guard = self.request.lock().unwrap();
-            let Some(request) = guard.as_mut() else {
+    pub(crate) fn read(&self) -> io::Result<Option<Vec<String>>> {
+        let mut guard = self.request.lock().unwrap();
+        let Some(request) = guard.as_mut() else {
+            return Ok(Some(Vec::new()));
+        };
+        let handles = [self.stopped.as_raw_handle(), request._event.as_raw_handle()];
+        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, u32::MAX) } {
+            0 => {
+                guard.take();
                 return Ok(Some(Vec::new()));
-            };
-            let handles = [self.stopped.as_raw_handle(), request._event.as_raw_handle()];
-            match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, u32::MAX) } {
-                0 => {
-                    guard.take();
-                    return Ok(Some(Vec::new()));
-                }
-                1 => {}
-                _ => return Err(io::Error::last_os_error()),
             }
-            let mut size = 0;
-            if unsafe {
-                GetOverlappedResult(
-                    request.file.as_raw_handle(),
-                    &mut *request.overlapped,
-                    &mut size,
-                    0,
-                )
-            } == 0
-            {
-                let error = io::Error::last_os_error();
-                request.pending = false;
-                if error.raw_os_error() == Some(1022) {
-                    request.arm()?;
-                    return Ok(None);
-                }
-                return Err(error);
-            }
+            1 => {}
+            _ => return Err(io::Error::last_os_error()),
+        }
+        let mut size = 0;
+        if unsafe {
+            GetOverlappedResult(
+                request.file.as_raw_handle(),
+                &mut *request.overlapped,
+                &mut size,
+                0,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
             request.pending = false;
-            let names = if size == 0 {
-                None
-            } else {
-                Some(request.names(size as usize)?)
-            };
-            request.arm()?;
-            Ok(names)
-        })
+            if error.raw_os_error() == Some(1022) {
+                request.arm()?;
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        request.pending = false;
+        let names = if size == 0 {
+            None
+        } else {
+            Some(request.names(size as usize)?)
+        };
+        request.arm()?;
+        Ok(names)
     }
 
-    fn close(&self, py: Python<'_>) {
-        py.detach(|| {
-            unsafe {
-                SetEvent(self.stopped.as_raw_handle());
-            }
-            self.request.lock().unwrap().take();
-        });
+    pub(crate) fn close(&self) {
+        unsafe {
+            SetEvent(self.stopped.as_raw_handle());
+        }
+        self.request.lock().unwrap().take();
     }
 }
 

@@ -1,5 +1,3 @@
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -9,14 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[derive(Clone)]
-struct NativeResourceRecord {
-    kind: &'static str,
-    paths: Vec<PathBuf>,
-    promotion_blocking: bool,
+pub(crate) struct NativeResourceRecord {
+    pub(crate) kind: &'static str,
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) promotion_blocking: bool,
     // Keep diagnostics cheap while the registry lock is held. Formatting is
     // only needed when a resource snapshot is requested.
-    thread: std::thread::ThreadId,
-    created_from: &'static std::panic::Location<'static>,
+    pub(crate) thread: std::thread::ThreadId,
+    pub(crate) created_from: &'static std::panic::Location<'static>,
 }
 
 #[derive(Default)]
@@ -295,30 +293,8 @@ fn shared_utf8_text(path: PathBuf) -> io::Result<String> {
 }
 
 /// Read one UTF-8 snapshot without blocking an atomic replacement of its path.
-#[pyfunction]
-pub(crate) fn read_shared_utf8_text(py: Python<'_>, path: PathBuf) -> PyResult<String> {
-    Ok(py.detach(move || shared_utf8_text(path))?)
-}
-
-/// Hash the same read used for parsing, without another file pass or Python copy.
-/// Duplicate notifications do not transfer or parse the unchanged document again.
-#[pyfunction]
-#[pyo3(signature = (path, previous_signature))]
-pub(crate) fn read_changed_shared_utf8_text(
-    py: Python<'_>,
-    path: PathBuf,
-    previous_signature: Option<String>,
-) -> PyResult<Option<(String, String)>> {
-    Ok(py.detach(move || -> io::Result<Option<(String, String)>> {
-        let text = shared_utf8_text(path)?;
-        let data = text.as_bytes();
-        let signature = format!(
-            "{:016x}{:016x}",
-            crate::fast_hash_core::xxh64(data, 0),
-            crate::fast_hash_core::xxh64(data, 1),
-        );
-        Ok((previous_signature.as_ref() != Some(&signature)).then_some((signature, text)))
-    })?)
+pub(crate) fn read_shared_utf8_text(path: PathBuf) -> std::io::Result<String> {
+    Ok((shared_utf8_text(path))?)
 }
 
 impl NativeResourceGuard {
@@ -441,23 +417,23 @@ fn overlaps(record: &NativeResourceRecord, roots: &[PathBuf]) -> bool {
     paths_overlap(&record.paths, roots)
 }
 
-#[pyfunction]
-pub(crate) fn native_begin_promotion(roots: Vec<String>) -> PyResult<u64> {
+pub(crate) fn native_begin_promotion(roots: Vec<String>) -> std::io::Result<u64> {
     static NEXT_PROMOTION_ID: AtomicU64 = AtomicU64::new(1);
     let roots = roots
         .into_iter()
         .map(PathBuf::from)
         .map(normalized_path)
         .collect::<Vec<_>>();
-    let mut registry = registry().registry.lock().map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err("native resource registry poisoned")
-    })?;
+    let mut registry = registry()
+        .registry
+        .lock()
+        .map_err(|_| std::io::Error::other("native resource registry poisoned"))?;
     if registry
         .promotions
         .values()
         .any(|existing| paths_overlap(&roots, existing))
     {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+        return Err(std::io::Error::other(
             "overlapping native promotion already active",
         ));
     }
@@ -466,15 +442,13 @@ pub(crate) fn native_begin_promotion(roots: Vec<String>) -> PyResult<u64> {
     Ok(id)
 }
 
-#[pyfunction]
-pub(crate) fn native_end_promotion(token: u64) -> PyResult<()> {
-    let mut registry = registry().registry.lock().map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err("native resource registry poisoned")
-    })?;
+pub(crate) fn native_end_promotion(token: u64) -> std::io::Result<()> {
+    let mut registry = registry()
+        .registry
+        .lock()
+        .map_err(|_| std::io::Error::other("native resource registry poisoned"))?;
     if registry.promotions.remove(&token).is_none() {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "unknown native promotion token",
-        ));
+        return Err(std::io::Error::other("unknown native promotion token"));
     }
     if registry.promotions.capacity() > 256 {
         crate::collections::trim_map(&mut registry.promotions);
@@ -482,55 +456,54 @@ pub(crate) fn native_end_promotion(token: u64) -> PyResult<()> {
     Ok(())
 }
 
-#[pyfunction]
-pub(crate) fn native_resource_snapshot(py: Python<'_>, roots: Vec<String>) -> PyResult<Py<PyList>> {
+pub(crate) fn native_resource_snapshot(
+    roots: Vec<String>,
+) -> io::Result<Vec<(u64, NativeResourceRecord)>> {
     let roots = roots
         .into_iter()
         .map(PathBuf::from)
         .map(normalized_path)
         .collect::<Vec<_>>();
     let records = {
-        let registry = registry().registry.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err("native resource registry poisoned")
-        })?;
+        let registry = registry()
+            .registry
+            .lock()
+            .map_err(|_| std::io::Error::other("native resource registry poisoned"))?;
         matching_resources(&registry, &roots, false)
     };
-    resource_snapshot_to_python(py, records)
+    Ok(records)
 }
 
-#[pyfunction]
 pub(crate) fn native_wait_for_resources(
-    py: Python<'_>,
     roots: Vec<String>,
     nonblocking: bool,
-) -> PyResult<Py<PyList>> {
+) -> io::Result<Vec<(u64, NativeResourceRecord)>> {
     let roots = roots
         .into_iter()
         .map(PathBuf::from)
         .map(normalized_path)
         .collect::<Vec<_>>();
-    let records = py
-        .detach(move || {
-            let state = registry();
-            let registry = state
-                .registry
-                .lock()
-                .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-            if nonblocking {
-                return Ok::<_, io::Error>(matching_resources(&registry, &roots, true));
-            }
-            let _registry = state
-                .changed
-                .wait_while(registry, |registry| {
-                    registry.resources.values().any(|record| {
-                        record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots))
-                    })
+    let records = (move || {
+        let state = registry();
+        let registry = state
+            .registry
+            .lock()
+            .map_err(|_| io::Error::other("native resource registry poisoned"))?;
+        if nonblocking {
+            return Ok::<_, io::Error>(matching_resources(&registry, &roots, true));
+        }
+        let _registry = state
+            .changed
+            .wait_while(registry, |registry| {
+                registry.resources.values().any(|record| {
+                    record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots))
                 })
-                .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-            Ok::<_, io::Error>(Vec::new())
-        })
-        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
-    resource_snapshot_to_python(py, records)
+            })
+            .map_err(|_| io::Error::other("native resource registry poisoned"))?;
+        Ok::<_, io::Error>(Vec::new())
+    })()
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(records)
 }
 
 fn matching_resources(
@@ -547,38 +520,6 @@ fn matching_resources(
         })
         .map(|(id, record)| (*id, record.clone()))
         .collect()
-}
-
-fn resource_snapshot_to_python(
-    py: Python<'_>,
-    records: Vec<(u64, NativeResourceRecord)>,
-) -> PyResult<Py<PyList>> {
-    let output = PyList::empty(py);
-    for (id, record) in records {
-        let item = PyDict::new(py);
-        item.set_item("resource_id", id)?;
-        item.set_item("kind", record.kind)?;
-        item.set_item("promotion_blocking", record.promotion_blocking)?;
-        item.set_item(
-            "paths",
-            record
-                .paths
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-        )?;
-        item.set_item("thread", format!("{:?}", record.thread))?;
-        item.set_item(
-            "created_from",
-            format!(
-                "{}:{}",
-                record.created_from.file(),
-                record.created_from.line()
-            ),
-        )?;
-        output.append(item)?;
-    }
-    Ok(output.unbind())
 }
 
 #[cfg(test)]

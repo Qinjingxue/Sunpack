@@ -62,12 +62,12 @@ function Get-CiEnvironmentRefreshReasons {
         return
     }
     try {
-        & $VenvPython -c "import pytest, xdist, psutil, send2trash, watchdog, zstandard; import sunpack_native as n; assert callable(n.NativeDirectoryScanOptions) and callable(n.NativeAnalysisConfig)" *> $null
-        if ($LASTEXITCODE -ne 0) { "Runtime, test dependencies or native smoke check failed" }
+        & $VenvPython -c "import pytest, xdist, psutil" *> $null
+        if ($LASTEXITCODE -ne 0) { "Python test dependencies could not be imported" }
     } catch {
-        "Runtime, test dependencies or native smoke check failed"
+        "Python test dependencies could not be imported"
     }
-    Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension (Get-NativeExtensionPath -PythonPath $VenvPython) -BuildProfile $BuildProfile
+    Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile
 }
 
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
@@ -100,23 +100,17 @@ foreach ($name in $testEnvironmentNames) {
 try {
     $env:SUNPACK_TEST_ARCH = $Arch.ToLowerInvariant()
     $env:SUNPACK_TEST_BUILD_PROFILE = $BuildProfile.ToLowerInvariant()
+    $target = if ($Arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
     Write-Host "Native test build: $Arch/$BuildProfile"
-    Invoke-TestStep -Label "Native extension smoke test" -Command @(
-        $python,
-        "-c",
-        "import sunpack_native as n; assert callable(n.NativeDirectoryScanOptions) and callable(n.NativeAnalysisConfig)"
+    Invoke-TestStep -Label "Rust correctness tests" -Command @(
+        "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
+        "--workspace", "--profile", $BuildProfile, "--target", $target,
+        "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
     )
-    Invoke-TestStep -Label "Parallel unit, functional, and CLI tests" -Command @(
-        $python,
-        "-m", "pytest", "-q",
-        "-n", [string]$ParallelWorkers,
-        "--dist", "worksteal",
-        "tests/unit", "tests/functional", "tests/cli"
+    Invoke-TestStep -Label "CLI and script boundary tests" -Command @(
+        $python, "-m", "pytest", "-q", "-n", [string]$ParallelWorkers,
+        "--dist", "worksteal", "tests/blackbox", "tests/unit", "-m", "not requires_watch_broker"
     )
-    Invoke-TestStep -Label "CLI help smoke test" -Command @($python, "sunpack.py", "--help")
-    Invoke-TestStep -Label "CLI passwords smoke test" -Command @($python, "sunpack.py", "passwords", "--json")
-    Invoke-TestStep -Label "CLI scan smoke test" -Command @($python, "sunpack.py", "scan", (Join-Path $repoRoot "tests"), "--json")
-    Invoke-TestStep -Label "CLI config smoke test" -Command @($python, "sunpack.py", "config", "--json", "show")
 } finally {
     foreach ($name in $testEnvironmentNames) {
         [Environment]::SetEnvironmentVariable($name, $testEnvironmentBackup[$name], "Process")

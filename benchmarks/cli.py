@@ -16,11 +16,9 @@ BENCHMARK_CACHE_ROOT = BENCHMARKS_ROOT / ".cache"
 BENCHMARK_WORK_ROOT = BENCHMARKS_ROOT / ".work"
 BENCHMARK_RUN_ID_ENV = "SUNPACK_BENCH_RUN_ID"
 
-# A scenario that makes a stale API call must fail loudly instead of hanging the
-# whole benchmark run.  Every scenario therefore runs in a child process under
-# a hard wall-clock deadline; on expiry the child is killed and the run reports
-# exit code 124 (the conventional "timeout" status).
-DEFAULT_TIMEOUT_SECONDS = float(os.environ.get("SUNPACK_BENCH_TIMEOUT", "3600"))
+# Optional operator budget; valid large archives have no implicit deadline.
+_timeout = os.environ.get("SUNPACK_BENCH_TIMEOUT")
+DEFAULT_TIMEOUT_SECONDS = float(_timeout) if _timeout else None
 TIMEOUT_EXIT_CODE = 124
 
 
@@ -33,7 +31,7 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIMEOUT_SECONDS,
         help=(
             "Hard wall-clock limit in seconds for the whole scenario "
-            f"(default: {DEFAULT_TIMEOUT_SECONDS:g}; env SUNPACK_BENCH_TIMEOUT). "
+            "(default: no deadline; env SUNPACK_BENCH_TIMEOUT). "
             "On expiry the scenario process is killed and the run exits with "
             f"{TIMEOUT_EXIT_CODE}."
         ),
@@ -44,7 +42,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cleanup_benchmark_run_workdir(run_id: str) -> None:
+def _cleanup_benchmark_run_workdir(run_id: str, *, keep_workdir: bool = False) -> None:
     """Remove only workspaces tagged with one benchmark parent run ID."""
     if not BENCHMARK_WORK_ROOT.is_dir():
         return
@@ -55,17 +53,20 @@ def _cleanup_benchmark_run_workdir(run_id: str) -> None:
         return
     for candidate in candidates:
         if candidate.is_dir() and marker in candidate.name:
-            shutil.rmtree(candidate, ignore_errors=True)
+            if BENCHMARK_WORK_ROOT.resolve() not in candidate.resolve().parents:
+                raise ValueError(f"work cleanup escaped root: {candidate}")
+            launcher = candidate / "work/installation/sunpack.exe"
+            if launcher.is_file():
+                environment = {**os.environ, "PROGRAMDATA": str(candidate / "work/ProgramData")}
+                environment.pop("SUNPACK_CONFIG_OVERRIDES", None)
+                subprocess.run([str(launcher), "--persistent-shutdown"], env=environment,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if not keep_workdir:
+                shutil.rmtree(candidate, ignore_errors=True)
 
 
-def _run_scenario_in_subprocess(module: str, scenario_args: list[str], timeout: float) -> int:
-    """Run one scenario module in a child process with a hard timeout.
-
-    The child inherits stdout/stderr so real-time progress stays visible, and
-    its exit code becomes the benchmark's exit code.  A stale scenario that
-    blocks forever is killed by ``subprocess.run``'s timeout and reported as
-    ``TIMEOUT_EXIT_CODE`` instead of hanging the parent.
-    """
+def _run_scenario_in_subprocess(module: str, scenario_args: list[str], timeout: float | None) -> int:
+    """Run a scenario in isolation with an optional operator time budget."""
     command = [sys.executable, "-m", module, *scenario_args]
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     environment = os.environ.copy()
@@ -89,8 +90,7 @@ def _run_scenario_in_subprocess(module: str, scenario_args: list[str], timeout: 
             return TIMEOUT_EXIT_CODE
         return int(completed.returncode)
     finally:
-        if not keep_workdir:
-            _cleanup_benchmark_run_workdir(run_id)
+        _cleanup_benchmark_run_workdir(run_id, keep_workdir=keep_workdir)
 
 
 def _clean_benchmark_artifacts(args: list[str]) -> int:
@@ -111,6 +111,8 @@ def _clean_benchmark_artifacts(args: list[str]) -> int:
         if selected.dry_run:
             print(f"would remove benchmark {label}: {path}")
         elif path.exists():
+            if path.resolve().parent != BENCHMARKS_ROOT.resolve():
+                raise ValueError(f"artifact cleanup escaped benchmark root: {path}")
             shutil.rmtree(path)
             print(f"removed benchmark {label}: {path}")
         else:
@@ -134,11 +136,11 @@ def main(argv: list[str] | None = None) -> int:
     if selected is None:
         names = ", ".join(name for group, name in SCENARIOS if group == args.group)
         _parser().error(f"unknown {args.group} scenario {args.scenario!r}; choose one of: {names}")
-    if args.timeout <= 0:
+    if args.timeout is not None and args.timeout <= 0:
         _parser().error("--timeout must be positive")
     if args.group == "watch":
         from .watch_broker import temporary_watch_broker_service
 
         with temporary_watch_broker_service():
-            return _run_scenario_in_subprocess(selected.module, list(args.scenario_args), args.timeout)
-    return _run_scenario_in_subprocess(selected.module, list(args.scenario_args), args.timeout)
+            return _run_scenario_in_subprocess(selected.module, [*selected.arguments, *args.scenario_args], args.timeout)
+    return _run_scenario_in_subprocess(selected.module, [*selected.arguments, *args.scenario_args], args.timeout)

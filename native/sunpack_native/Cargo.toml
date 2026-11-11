@@ -5,7 +5,7 @@ license = "MIT"
 
 [lib]
 name = "sunpack_native"
-crate-type = ["cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 sunpack-enc = { path = "../sunpack_enc" }
@@ -21,13 +21,12 @@ hmac = "0.12"
 lzma-rust2 = "0.16"
 memchr = "2.7"
 pbkdf2 = "0.12"
-pyo3 = { version = "0.29", features = ["extension-module"] }
 regex = "1.11"
 regex-automata = "0.4"
 regex-syntax = "0.8"
 rayon = "1.10"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "compress"] }
 sha1 = "0.10"
 sha2 = "0.10"
@@ -37,6 +36,16 @@ xz2 = "0.1"
 zstd = "0.13"
 unicode-normalization = "0.1"
 rmp-serde = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authorization",
+    "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory",
+    "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Threading",
+    "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 cc = "1"

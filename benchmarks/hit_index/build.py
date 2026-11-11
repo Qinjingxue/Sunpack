@@ -34,7 +34,6 @@ def environment() -> dict[str, str]:
                 env[key.upper()] = value
     llvm = Path(env.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
     env["PATH"] = os.pathsep.join([str(llvm), sys.base_prefix, str(Path(sys.base_prefix) / "DLLs"), env.get("PATH", "")])
-    env["PYO3_PYTHON"] = sys.executable
     return env
 
 
@@ -81,14 +80,14 @@ def bridge(*, source_root: Path = ROOT, meter: bool = False, destination: Path |
     embedded = (native / "scan/embedded.rs").read_text(encoding="utf-8")
     begin = embedded.index("#[derive(Debug, Clone, PartialEq, Eq)]\n#[repr(C)]\nstruct RawHit")
     end = embedded.index("pub(crate) struct NativeScanResult", begin)
-    original_types = embedded[begin:end]
+    original_types = embedded[begin:end].removesuffix("#[derive(Default)]\n")
     patterns = embedded[embedded.index("const PATTERNS:"):embedded.index("#[cfg(target_arch", embedded.index("const PATTERNS:"))]
     names = re.findall(r'\([^,\n]+,\s*"([^"]+)",\s*"([^"]+)"\)', patterns)
     if len(names) != 13:
         raise RuntimeError("Signature schema changed; update protocol/adapter explicitly")
     declarations = 'const PATTERNS:[(&[u8],&str,&str);13]=[' + ','.join('(b"",'+json.dumps(name)+','+json.dumps(kind)+')' for name,kind in names) + '];\n'
     root = root.replace("// BENCHMARK_PRODUCTION_TYPES", declarations + original_types)
-    for key, path in [("PATH_KEYS", native / "path_keys.rs"), ("FAST_HASH_CORE", native / "fast_hash_core.rs"), ("RESOURCE_LIFECYCLE", native / "io/resource_lifecycle.rs"), ("SCRATCH", native / "io/scratch.rs")]:
+    for key, path in [("COLLECTIONS", native / "collections.rs"), ("PATH_KEYS", native / "path_keys.rs"), ("FAST_HASH_CORE", native / "fast_hash_core.rs"), ("RESOURCE_LIFECYCLE", native / "io/resource_lifecycle.rs"), ("SCRATCH", native / "io/scratch.rs")]:
         root = root.replace(key, path.as_posix())
     write_generated(dest / "src/lib.rs", root)
     source = (native / "scan/hit_storage.rs").read_text(encoding="utf-8")
@@ -104,7 +103,6 @@ allocation-meter = []
 rayon = "1.10"
 serde = { version = "1", features = ["derive", "rc"] }
 rmp-serde = "1"
-pyo3 = { version = "0.29", features = ["extension-module"] }
 [profile.release]
 opt-level = 3
 lto = "fat"

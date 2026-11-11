@@ -1,16 +1,18 @@
+use super::PasswordVerification;
 use crate::formats::seven_zip::{
     seven_zip_encryption_facts_from_next_header, SevenZipPasswordProbe,
 };
+use crate::io::archive_state::InputExtent;
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
+use crate::io::reader::NativeArchiveSession;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use crate::password::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
 use rayon::prelude::*;
 use sevenz_rust2::{Archive, Error as SevenZipError, Password};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 const SEVEN_Z_SIGNATURE: &[u8] = b"7z\xbc\xaf\x27\x1c";
@@ -36,48 +38,23 @@ fn seven_zip_password_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-#[pyfunction]
-pub(crate) fn seven_zip_fast_verify_passwords(
-    py: Python<'_>,
-    archive_path: String,
-    passwords: &Bound<'_, PyList>,
-) -> PyResult<Py<PyAny>> {
-    let reader = match py.detach(|| ManagedReader::open(&archive_path)) {
-        Ok(reader) => reader,
-        Err(_) => return status(py, "damaged", -1, 0, "7z archive could not be opened"),
-    };
-    seven_zip_fast_verify_passwords_with_reader(py, &reader, passwords)
-}
-
 pub(crate) fn seven_zip_fast_verify_passwords_with_reader(
-    py: Python<'_>,
     reader: &ManagedReader,
-    passwords: &Bound<'_, PyList>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
-    verify_prepared(py, InputKey::file("7z", reader)?, &candidates, || {
+    candidates: &[Arc<str>],
+) -> std::io::Result<PasswordVerification> {
+    verify_prepared(InputKey::file("7z", reader)?, candidates, || {
         prepare_seven_zip(reader.cursor(), reader.len()).map(PasswordContext::SevenZip)
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (ranges, passwords, *, sessions=None))]
 pub(crate) fn seven_zip_fast_verify_passwords_from_ranges(
-    py: Python<'_>,
-    ranges: &Bound<'_, PyList>,
-    passwords: &Bound<'_, PyList>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
+    ranges: &[&InputExtent],
+    candidates: &[Arc<str>],
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<PasswordVerification> {
     let parsed = parse_ranges(ranges, sessions)?;
     let total_len = ranges_total_len(&parsed);
-    verify_prepared(py, ranges_key("7z", &parsed)?, &candidates, || {
+    verify_prepared(ranges_key("7z", &parsed)?, candidates, || {
         prepare_seven_zip(VirtualRangeReader::new(parsed.into()), total_len)
             .map(PasswordContext::SevenZip)
     })
@@ -92,14 +69,13 @@ impl SevenZipPasswordContext {
         self.probe.retained_bytes()
     }
 
-    pub(crate) fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
+    pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         if let Some((index, outcome)) =
-            py.detach(|| find_first_conclusive_header_with_probe(candidates, &self.probe))
+            find_first_conclusive_header_with_probe(candidates, &self.probe)
         {
-            return conclusive_status(py, index, outcome);
+            return conclusive_status(index, outcome);
         }
         status(
-            py,
             "no_match",
             -1,
             candidates.len() as i32,
@@ -226,14 +202,14 @@ fn seven_zip_tail_requirement<R: Read + Seek>(mut reader: R) -> Result<[u8; 32],
 }
 
 fn find_first_conclusive_header_with_probe(
-    candidates: &[String],
+    candidates: &[Arc<str>],
     probe: &SevenZipPasswordProbe,
 ) -> Option<(usize, HeaderRead)> {
     let cancellation = Cancellation::current();
     if cancellation.cancelled() {
         return None;
     }
-    let test = |(index, password): (usize, &String)| {
+    let test = |(index, password): (usize, &Arc<str>)| {
         cancellation.run(
             || match probe.decoded_header_if_password_matches(password) {
                 Ok(Some(decoded)) => Some((index, Ok(decoded))),
@@ -280,10 +256,9 @@ fn read_predecoded_header(decoded_header: &[u8]) -> HeaderRead {
     }
 }
 
-fn conclusive_status(py: Python<'_>, index: usize, outcome: HeaderRead) -> PyResult<Py<PyAny>> {
+fn conclusive_status(index: usize, outcome: HeaderRead) -> std::io::Result<PasswordVerification> {
     match outcome {
         HeaderRead::Ok { .. } => status_with_details(
-            py,
             "match",
             index as i32,
             (index + 1) as i32,
@@ -291,14 +266,10 @@ fn conclusive_status(py: Python<'_>, index: usize, outcome: HeaderRead) -> PyRes
             Some(false),
             Some("7z_encrypted_header"),
         ),
-        HeaderRead::Unsupported(message) => status(
-            py,
-            "unknown_needs_final_verifier",
-            -1,
-            index as i32,
-            &message,
-        ),
-        HeaderRead::Damaged(message) => status(py, "damaged", -1, index as i32, &message),
+        HeaderRead::Unsupported(message) => {
+            status("unknown_needs_final_verifier", -1, index as i32, &message)
+        }
+        HeaderRead::Damaged(message) => status("damaged", -1, index as i32, &message),
         HeaderRead::WrongPasswordOrPasswordRequired => unreachable!("filtered outcome"),
     }
 }
@@ -335,36 +306,29 @@ fn read_archive_header_from_reader<R: Read + Seek>(mut reader: R, password: &str
 }
 
 fn status(
-    py: Python<'_>,
-    status: &str,
+    status: &'static str,
     matched_index: i32,
     attempts: i32,
     message: &str,
-) -> PyResult<Py<PyAny>> {
-    status_with_details(py, status, matched_index, attempts, message, None, None)
+) -> std::io::Result<PasswordVerification> {
+    status_with_details(status, matched_index, attempts, message, None, None)
 }
 
 fn status_with_details(
-    py: Python<'_>,
-    status: &str,
+    status: &'static str,
     matched_index: i32,
     attempts: i32,
     message: &str,
     final_confirmation_required: Option<bool>,
-    match_evidence: Option<&str>,
-) -> PyResult<Py<PyAny>> {
-    let result = PyDict::new(py);
-    result.set_item("status", status)?;
-    result.set_item("matched_index", matched_index)?;
-    result.set_item("attempts", attempts)?;
-    result.set_item("message", message)?;
-    if let Some(value) = final_confirmation_required {
-        result.set_item("final_confirmation_required", value)?;
-    }
-    if let Some(value) = match_evidence {
-        result.set_item("match_evidence", value)?;
-    }
-    Ok(result.into())
+    match_evidence: Option<&'static str>,
+) -> std::io::Result<PasswordVerification> {
+    Ok(PasswordVerification {
+        matched_index: usize::try_from(matched_index).ok(),
+        attempts: attempts as usize,
+        final_confirmation_required,
+        match_evidence,
+        ..PasswordVerification::status(status, message)
+    })
 }
 
 #[cfg(test)]

@@ -2,7 +2,6 @@
 use super::directory::DirectoryEntryRecord;
 use crate::analysis_native::volume_anchor::CheapAnchorCell;
 use crate::path_keys::path_key;
-use pyo3::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -61,33 +60,23 @@ impl FileId {
     }
 }
 
-/// A value snapshot for Python; the catalog retains only the Rust struct.
-#[pyclass(module = "sunpack_native", frozen, skip_from_py_object)]
+/// Accepted-event metadata, independent of a newer directory scan.
 #[derive(Clone)]
 pub(crate) struct NativeWatchObservation {
     // Accepted-event metadata must survive a newer scan until admission. It is
     // a different version from the directory view, not a second directory row.
-    #[pyo3(get)]
     pub size: u64,
-    #[pyo3(get)]
     pub mtime: f64,
     file_id: FileId,
-    #[pyo3(get)]
     pub change_usn: i64,
-    #[pyo3(get)]
     pub quiet_seconds: f64,
-    #[pyo3(get)]
     pub cadence_seconds: f64,
-    #[pyo3(get)]
     pub pending_interval_seconds: f64,
-    #[pyo3(get)]
     pub last_content_event_at: Option<f64>,
 }
 
-#[pymethods]
 impl NativeWatchObservation {
-    #[getter]
-    fn file_id(&self) -> String {
+    pub(crate) fn file_id(&self) -> String {
         self.file_id.text()
     }
 }
@@ -248,7 +237,7 @@ pub(super) struct ScopeCatalog {
     pub persistent_len: usize,
 }
 
-pub(super) fn catalog_stem(path: &str) -> String {
+pub(crate) fn catalog_stem(path: &str) -> String {
     crate::path_keys::case_key(crate::relations::first_dot_stem(
         std::path::Path::new(path)
             .file_name()

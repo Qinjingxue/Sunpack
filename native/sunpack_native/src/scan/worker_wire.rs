@@ -1,11 +1,8 @@
 //! Binary worker frames. The matching C++ codec is internal/worker_wire.hpp.
-//! Rust owns encoding, framing and decoding; Python only forwards pipe bytes.
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
-use std::fmt;
+use serde_json::Value;
+use std::{fmt, io};
 
 #[derive(Debug)]
 pub(super) struct Error(String);
@@ -20,10 +17,13 @@ impl de::Error for Error {
         Self(message.to_string())
     }
 }
-impl From<Error> for PyErr {
+impl From<Error> for io::Error {
     fn from(error: Error) -> Self {
-        PyValueError::new_err(error.0)
+        io::Error::new(io::ErrorKind::InvalidData, error)
     }
+}
+pub(super) fn protocol_error(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 fn invalid(message: &str) -> Error {
     Error(message.into())
@@ -145,114 +145,113 @@ impl<'de> MapAccess<'de> for &mut Decoder<'de> {
     }
 }
 
-fn sized(out: &mut Vec<u8>, tag: u8, data: &[u8]) -> PyResult<()> {
+fn sized(out: &mut Vec<u8>, tag: u8, data: &[u8]) -> io::Result<()> {
     let size = u32::try_from(data.len())
-        .map_err(|_| PyValueError::new_err("worker string exceeds u32 length"))?;
+        .map_err(|_| protocol_error("worker string exceeds u32 length"))?;
     out.push(tag);
     out.extend_from_slice(&size.to_le_bytes());
     out.extend_from_slice(data);
     Ok(())
 }
-fn encode(out: &mut Vec<u8>, value: &Bound<'_, PyAny>, depth: usize) -> PyResult<()> {
+
+fn encode(out: &mut Vec<u8>, value: &Value, depth: usize) -> io::Result<()> {
     if depth > 64 {
-        return Err(PyValueError::new_err("worker value nesting exceeds schema"));
+        return Err(protocol_error("worker value nesting exceeds schema"));
     }
-    if value.is_none() {
-        out.push(1);
-    } else if value.is_instance_of::<PyBool>() {
-        out.push(if value.is_truthy()? { 3 } else { 2 });
-    } else if value.is_instance_of::<PyInt>() {
-        if let Ok(n) = value.extract::<u64>() {
-            if n <= u8::MAX as u64 {
-                out.extend_from_slice(&[11, n as u8]);
-            } else if n <= u32::MAX as u64 {
-                out.push(12);
-                out.extend_from_slice(&(n as u32).to_le_bytes());
-            } else {
-                out.push(4);
+    match value {
+        Value::Null => out.push(1),
+        Value::Bool(value) => out.push(if *value { 3 } else { 2 }),
+        Value::Number(value) => {
+            if let Some(n) = value.as_u64() {
+                if n <= u8::MAX as u64 {
+                    out.extend_from_slice(&[11, n as u8]);
+                } else if n <= u32::MAX as u64 {
+                    out.push(12);
+                    out.extend_from_slice(&(n as u32).to_le_bytes());
+                } else {
+                    out.push(4);
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            } else if let Some(n) = value.as_i64() {
+                out.push(5);
                 out.extend_from_slice(&n.to_le_bytes());
+            } else if let Some(n) = value.as_f64() {
+                out.push(6);
+                out.extend_from_slice(&n.to_le_bytes());
+            } else {
+                return Err(protocol_error("unsupported worker number"));
             }
-        } else {
-            out.push(5);
-            out.extend_from_slice(&value.extract::<i64>()?.to_le_bytes());
         }
-    } else if value.is_instance_of::<PyFloat>() {
-        out.push(6);
-        out.extend_from_slice(&value.extract::<f64>()?.to_le_bytes());
-    } else if let Ok(text) = value.cast::<PyString>() {
-        sized(out, 7, text.to_str()?.as_bytes())?;
-    } else if let Ok(bytes) = value.cast::<PyBytes>() {
-        sized(out, 8, bytes.as_bytes())?;
-    } else if let Ok(dict) = value.cast::<PyDict>() {
-        out.push(10);
-        for (key, value) in dict.iter() {
-            sized(out, 7, key.cast::<PyString>()?.to_str()?.as_bytes())?;
-            encode(out, &value, depth + 1)?;
+        Value::String(text) => sized(out, 7, text.as_bytes())?,
+        Value::Array(items) => {
+            out.push(9);
+            for item in items {
+                encode(out, item, depth + 1)?;
+            }
+            out.push(0);
         }
-        out.push(0);
-    } else if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
-        out.push(9);
-        for item in value.try_iter()? {
-            encode(out, &item?, depth + 1)?;
+        Value::Object(fields) => {
+            out.push(10);
+            for (key, value) in fields {
+                sized(out, 7, key.as_bytes())?;
+                encode(out, value, depth + 1)?;
+            }
+            out.push(0);
         }
-        out.push(0);
-    } else {
-        return Err(PyValueError::new_err("unsupported worker field type"));
     }
     Ok(())
 }
-#[pyfunction]
-pub(crate) fn encode_worker_frame<'py>(
-    py: Python<'py>,
-    value: &Bound<'_, PyDict>,
-) -> PyResult<Bound<'py, PyBytes>> {
+
+pub(crate) fn encode_worker_frame(value: &Value) -> io::Result<Vec<u8>> {
+    if !value.is_object() {
+        return Err(protocol_error("worker object expected"));
+    }
     let mut out = Vec::with_capacity(1024);
     out.extend_from_slice(b"SPBF\0\0\0\0");
-    encode(&mut out, value.as_any(), 0)?;
+    encode(&mut out, value, 0)?;
     let size = u32::try_from(out.len() - 8)
-        .map_err(|_| PyValueError::new_err("worker frame exceeds u32 length"))?;
+        .map_err(|_| protocol_error("worker frame exceeds u32 length"))?;
     out[4..8].copy_from_slice(&size.to_le_bytes());
-    Ok(PyBytes::new(py, &out))
+    Ok(out)
 }
 
-pub(super) fn frame_payload(frame: &[u8]) -> PyResult<&[u8]> {
+pub(super) fn frame_payload(frame: &[u8]) -> io::Result<&[u8]> {
     let size = frame_size(frame)?;
     if size != frame.len() {
-        return Err(PyValueError::new_err("truncated or trailing worker frame"));
+        return Err(protocol_error("truncated or trailing worker frame"));
     }
     Ok(&frame[8..])
 }
-fn frame_size(header: &[u8]) -> PyResult<usize> {
+fn frame_size(header: &[u8]) -> io::Result<usize> {
     if header.len() < 8 || &header[..4] != b"SPBF" {
-        return Err(PyValueError::new_err("invalid worker frame header"));
+        return Err(protocol_error("invalid worker frame header"));
     }
     Ok(u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize + 8)
 }
 
 /// Holds only an incomplete frame. Complete frames in the incoming read are
-/// decoded in place; no Python per-item tables or full-stream copies.
-#[pyclass(module = "sunpack_native")]
+/// decoded in place without full-stream copies.
 #[derive(Default)]
 pub(crate) struct NativeWorkerFrameDecoder {
     pending: Vec<u8>,
     failure: Option<String>,
 }
-#[pymethods]
 impl NativeWorkerFrameDecoder {
-    #[new]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
-    fn feed(&mut self, py: Python<'_>, mut data: &[u8]) -> PyResult<Vec<Py<PyDict>>> {
+    pub(crate) fn feed(
+        &mut self,
+        mut data: &[u8],
+    ) -> io::Result<Vec<super::worker_event::WorkerFrame>> {
         self.check()?;
         let mut events = Vec::new();
-        let decoded = (|| -> PyResult<()> {
+        let decoded = (|| -> io::Result<()> {
             while !data.is_empty() {
                 if self.pending.is_empty() && data.len() >= 8 {
                     let size = frame_size(data)?;
                     if data.len() >= size {
                         events.push(super::worker_event::parse_worker_transport_event(
-                            py,
                             &data[..size],
                         )?);
                         data = &data[size..];
@@ -269,7 +268,6 @@ impl NativeWorkerFrameDecoder {
                 data = &data[count..];
                 if self.pending.len() >= 8 && self.pending.len() == frame_size(&self.pending)? {
                     events.push(super::worker_event::parse_worker_transport_event(
-                        py,
                         &self.pending,
                     )?);
                     // Drop the backing allocation before an idle pipe wait.
@@ -289,18 +287,58 @@ impl NativeWorkerFrameDecoder {
     }
     /// Deliver complete preceding frames before reporting a damaged suffix.
     /// Call after dispatching each batch, before waiting for more pipe input.
-    fn check(&self) -> PyResult<()> {
+    pub(crate) fn check(&self) -> io::Result<()> {
         if let Some(error) = &self.failure {
-            return Err(PyValueError::new_err(error.clone()));
+            return Err(protocol_error(error.clone()));
         }
         Ok(())
     }
-    fn finish(&mut self) -> PyResult<()> {
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
         self.check()?;
         if !self.pending.is_empty() {
             self.pending = Vec::new();
-            return Err(PyValueError::new_err("truncated worker frame at EOF"));
+            return Err(protocol_error("truncated worker frame at EOF"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_worker_frame, NativeWorkerFrameDecoder};
+    use serde_json::json;
+
+    #[test]
+    fn framing_keeps_complete_events_across_fragmentation_and_errors() {
+        let expected = json!({
+            "type": "progress", "job_id": "目录😀\u{0}\r\n\\\"",
+            "values": [null, true, false, 0, 255, 256, u64::MAX, i64::MIN, 0.125]
+        });
+        let frame = encode_worker_frame(&expected).unwrap();
+        for offset in 0..=frame.len() {
+            let mut decoder = NativeWorkerFrameDecoder::new();
+            let mut events = decoder.feed(&frame[..offset]).unwrap();
+            let tail = [&frame[offset..], &frame].concat();
+            events.extend(decoder.feed(&tail).unwrap());
+            decoder.finish().unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(events.into_iter().all(|event| event.summary == expected));
+            if offset > 0 && offset < frame.len() {
+                decoder.feed(&frame[..offset]).unwrap();
+                assert!(decoder
+                    .finish()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("truncated"));
+            }
+        }
+        let mut decoder = NativeWorkerFrameDecoder::new();
+        let tail = [frame.as_slice(), b"broken frame"].concat();
+        assert_eq!(decoder.feed(&tail).unwrap()[0].summary, expected);
+        assert!(decoder
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("frame header"));
     }
 }

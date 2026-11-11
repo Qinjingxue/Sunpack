@@ -1,10 +1,8 @@
 项目为windows-only项目，使用.venv作为开发环境，使用uv管理依赖
 
-主程序代码在sunpack文件夹下
+主程序代码在 native\sunpack_native，core 负责配置、密码和系统资源，pipeline 负责归档调度，runtime 负责 CLI、Watch 和 Windows 集成
 
 native的7z.dll worker和C++ CLI启动器代码在native\sevenzip_bridge
-
-Rust扩展代码在native\sunpack_native
 
 USN和watch监控服务代码在：native\sunpack_usn_core和native\sunpack_watch_broker
 
@@ -14,7 +12,7 @@ scripts下是构建脚本，开发环境安装脚本，注册右键菜单脚本
 
 项目正确性测试在tests文件夹下，性能测试在benchmarks文件夹下
 
-禁止主程序的Python直接碰文件二进制和高计算IO路径，Rust负责底层、IO、计算
+Python 仅用于黑盒测试、基准和辅助脚本。主程序的底层、IO 和计算由 Rust 负责
 
 不用管Rustfmt造成的代码风格变化而刻意回退代码
 

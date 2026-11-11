@@ -5,7 +5,7 @@ function Set-DevelopmentArtifactBuildTime {
     param([Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][datetime]$BuildStartedUtc)
     # Incremental builds may succeed without relinking. Record when the build
-    # verified its inputs, rather than preserving an old link/wheel timestamp.
+    # verified its inputs, rather than preserving an old link timestamp.
     # Advance an old timestamp only to the START time, not completion time.
     # Never backdate a newly linked output: Cargo needs its original timestamp
     # relative to dependencies for subsequent incremental builds.
@@ -22,25 +22,10 @@ function Get-WatchBrokerBuildPath {
     return Join-Path $RepoRoot (".cache\rust-target\{0}\{1}\{2}\sunpack-watch-broker.exe" -f $Arch, $target, $BuildProfile)
 }
 
-function Get-NativeExtensionPath {
-    param([Parameter(Mandatory = $true)][string]$PythonPath)
-    # Resolve the actual extension rather than picking the newest .pyd beside
-    # a package wrapper (which might not be the binary Python loads).
-    $code = @'
-import importlib.util
-from importlib.machinery import EXTENSION_SUFFIXES
-spec = importlib.util.find_spec('sunpack_native')
-if spec and spec.submodule_search_locations is not None:
-    spec = importlib.util.find_spec('sunpack_native.sunpack_native')
-origin = spec.origin if spec else ''
-print(origin if origin and any(origin.endswith(s) for s in EXTENSION_SUFFIXES) else '')
-'@
-    try {
-        $origin = & $PythonPath -c $code 2>$null
-        if ($LASTEXITCODE -eq 0) { return (($origin | Out-String).Trim()) }
-    } catch {
-    }
-    return ""
+function Get-SunPackRuntimeBuildPath {
+    param([string]$RepoRoot, [ValidateSet("x64", "arm64")][string]$Arch,
+        [ValidateSet("release", "ci")][string]$BuildProfile = "ci")
+    return Join-Path (Split-Path -Parent (Get-WatchBrokerBuildPath -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile)) "sunpack-runtime.exe"
 }
 
 function Get-NewestSourceWriteTime {
@@ -77,7 +62,6 @@ function Get-NativeArtifactRefreshReasons {
     param(
         [Parameter(Mandatory = $true)][string]$RepoRoot,
         [ValidateSet("x64", "arm64")][string]$Arch = "x64",
-        [AllowEmptyString()][string]$NativeExtension = "",
         [ValidateSet("release", "ci")][string]$BuildProfile = "ci"
     )
     $nativeRoot = Join-Path $RepoRoot "native"
@@ -91,8 +75,13 @@ function Get-NativeArtifactRefreshReasons {
         (Join-Path $nativeRoot "lz4_stream"), (Join-Path $nativeRoot "third_party\lz4")
     )
     $components = @(
-        @{ Name = "sunpack_native"; Artifact = $NativeExtension; InputTime = @(
+        @{ Name = "SunPack runtime"; Artifact = (Get-SunPackRuntimeBuildPath -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile); InputTime = @(
             $sharedRustTime, $lz4Time,
+            (Get-NewestSourceWriteTime -Paths @(
+                (Join-Path $RepoRoot "sunpack_advanced_config.json"),
+                (Join-Path $RepoRoot "sunpack.manifest"),
+                (Join-Path $RepoRoot "sunpack.ico")
+            )),
             (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_native")),
             (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_enc"))
         ) },
@@ -122,13 +111,6 @@ function Get-NativeArtifactRefreshReasons {
         if (-not $artifact -or -not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
             "$($component.Name) build artifact is missing: $artifact"
             continue
-        }
-        if ($component.Name -eq "sunpack_native") {
-            $sitePackages = [IO.Path]::GetFullPath((Join-Path $RepoRoot ".venv\Lib\site-packages")) + '\'
-            if (-not ([IO.Path]::GetFullPath($artifact)).StartsWith($sitePackages, [StringComparison]::OrdinalIgnoreCase)) {
-                "sunpack_native is loaded outside the project .venv: $artifact"
-                continue
-            }
         }
         $artifactTime = (Get-Item -LiteralPath $artifact).LastWriteTimeUtc
         foreach ($inputTime in $component.InputTime) {

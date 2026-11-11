@@ -26,43 +26,39 @@ struct SevenZipObservation {
 }
 
 impl SevenZipObservation {
-    fn to_python(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let result = PyDict::new(py);
-        result.set_item("format", "7z")?;
-        result.set_item("plausible", &self.plausible)?;
-        result.set_item("magic_matched", &self.magic_matched)?;
-        result.set_item("strong_accept", &self.strong_accept)?;
-        result.set_item("error", &self.error)?;
-        result.set_item("archive_offset", &self.archive_offset)?;
-        result.set_item("segment_end", &self.segment_end)?;
-        result.set_item("next_header_offset", &self.next_header_offset)?;
-        result.set_item("next_header_size", &self.next_header_size)?;
-        result.set_item("start_header_crc_ok", &self.start_header_crc_ok)?;
-        result.set_item("next_header_crc_checked", &self.next_header_crc_checked)?;
-        result.set_item("next_header_crc_ok", &self.next_header_crc_ok)?;
-        result.set_item("next_header_nid", &self.next_header_nid)?;
-        result.set_item("next_header_nid_valid", &self.next_header_nid_valid)?;
-        result.set_item("version_major", &self.version_major)?;
-        result.set_item("version_minor", &self.version_minor)?;
-        result.set_item("password_required", &self.password_required)?;
-        result.set_item("encrypted_header", &self.encrypted_header)?;
-        result.set_item("encrypted_payload", &self.encrypted_payload)?;
-        result.set_item("password_state", &self.password_state)?;
-        result.set_item("encryption_scan_complete", &self.encryption_scan_complete)?;
-        result.set_item("evidence", &self.evidence)?;
+    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
+        let mut result = DiagnosticFields::new();
+        result.put("format", "7z")?;
+        result.put("plausible", &self.plausible)?;
+        result.put("magic_matched", &self.magic_matched)?;
+        result.put("strong_accept", &self.strong_accept)?;
+        result.put("error", &self.error)?;
+        result.put("archive_offset", &self.archive_offset)?;
+        result.put("segment_end", &self.segment_end)?;
+        result.put("next_header_offset", &self.next_header_offset)?;
+        result.put("next_header_size", &self.next_header_size)?;
+        result.put("start_header_crc_ok", &self.start_header_crc_ok)?;
+        result.put("next_header_crc_checked", &self.next_header_crc_checked)?;
+        result.put("next_header_crc_ok", &self.next_header_crc_ok)?;
+        result.put("next_header_nid", &self.next_header_nid)?;
+        result.put("next_header_nid_valid", &self.next_header_nid_valid)?;
+        result.put("version_major", &self.version_major)?;
+        result.put("version_minor", &self.version_minor)?;
+        result.put("password_required", &self.password_required)?;
+        result.put("encrypted_header", &self.encrypted_header)?;
+        result.put("encrypted_payload", &self.encrypted_payload)?;
+        result.put("password_state", &self.password_state)?;
+        result.put("encryption_scan_complete", &self.encryption_scan_complete)?;
+        result.put("evidence", &self.evidence)?;
         if let Some((fault, legacy)) = &self.read_fault {
-            set_view_read_fault(&result, fault, legacy)?;
+            set_view_read_fault(&mut result, fault, legacy)?;
         }
-        Ok(result.unbind())
+        Ok(result)
     }
 }
 
 impl AnalysisBinaryView {
-    fn probe_seven_zip_native(
-        &self,
-        start_offset: u64,
-    ) -> PyResult<SevenZipObservation> {
-        self.ensure_open()?;
+    fn probe_seven_zip_native(&self, start_offset: u64) -> std::io::Result<SevenZipObservation> {
         let mut result = SevenZipObservation {
             archive_offset: start_offset,
             password_state: "unknown",
@@ -149,7 +145,10 @@ impl AnalysisBinaryView {
             while offset < segment_end {
                 let length = (segment_end - offset).min(64 * 1024) as usize;
                 let bytes = match self.read_field_at_bytes(
-                    offset, length, "7z.next_header", FieldLocation::Tail,
+                    offset,
+                    length,
+                    "7z.next_header",
+                    FieldLocation::Tail,
                 ) {
                     Ok(bytes) => bytes,
                     Err(fault) => {

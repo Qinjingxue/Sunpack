@@ -1,7 +1,10 @@
+use super::PasswordVerification;
 use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
+use crate::io::archive_state::{InputExtent, InputPart};
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
+use crate::io::reader::NativeArchiveSession;
 use crate::io::scratch::{Blob, Spool};
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use crate::password::input::{
@@ -14,14 +17,13 @@ use aes::{Aes128, Aes256};
 use cbc::Decryptor;
 use crc32fast::hash as crc32_hash;
 use hmac::{Hmac, Mac};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
 use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use std::borrow::Cow;
 use std::io;
 use std::io::Write;
+use std::sync::Arc;
 
 const RAR4_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
 const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
@@ -47,7 +49,7 @@ type Aes128CbcDecryptor = Decryptor<Aes128>;
 
 /// The result of walking a header-encrypted RAR stream far enough to prove
 /// whether its ENDARC record is present.  This deliberately contains no
-/// member data or Python observation fields: relation validation only needs
+/// member data or diagnostic fields: relation validation only needs
 /// the terminal proof after the password has already been confirmed.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RarTerminalProof {
@@ -85,26 +87,11 @@ where
         .collect()
 }
 
-#[pyfunction]
-pub(crate) fn rar_fast_verify_passwords(
-    py: Python<'_>,
-    archive_path: String,
-    passwords: &Bound<'_, PyList>,
-) -> PyResult<Py<PyAny>> {
-    let reader = py.detach(|| ManagedReader::open(&archive_path))?;
-    rar_fast_verify_passwords_with_reader(py, &reader, passwords)
-}
-
 pub(crate) fn rar_fast_verify_passwords_with_reader(
-    py: Python<'_>,
     reader: &ManagedReader,
-    passwords: &Bound<'_, PyList>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
-    verify_prepared(py, InputKey::file("rar", reader)?, &candidates, || {
+    candidates: &[Arc<str>],
+) -> std::io::Result<PasswordVerification> {
+    verify_prepared(InputKey::file("rar", reader)?, candidates, || {
         prepare_rar(|offset, len, field| {
             reader.read_at(offset, len).map_err(|error| {
                 ReadFault::from_io(error, "read_at", offset, len, 0, reader.len())
@@ -115,39 +102,25 @@ pub(crate) fn rar_fast_verify_passwords_with_reader(
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (ranges, passwords, *, sessions=None))]
 pub(crate) fn rar_fast_verify_passwords_from_ranges(
-    py: Python<'_>,
-    ranges: &Bound<'_, PyList>,
-    passwords: &Bound<'_, PyList>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
+    ranges: &[&InputExtent],
+    candidates: &[Arc<str>],
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<PasswordVerification> {
     let parsed: std::sync::Arc<[_]> = parse_ranges(ranges, sessions)?.into();
-    verify_prepared(py, ranges_key("rar", &parsed)?, &candidates, || {
+    verify_prepared(ranges_key("rar", &parsed)?, candidates, || {
         prepare_rar(|offset, len, field| read_ranges_at_field(&parsed, offset, len, field))
             .map(PasswordContext::Rar)
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (parts, passwords, *, sessions=None))]
 pub(crate) fn rar_fast_verify_passwords_from_volumes(
-    py: Python<'_>,
-    parts: &Bound<'_, PyList>,
-    passwords: &Bound<'_, PyList>,
-    sessions: Option<&Bound<'_, PyTuple>>,
-) -> PyResult<Py<PyAny>> {
-    let candidates = passwords
-        .iter()
-        .map(|item| item.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
+    parts: &[InputPart],
+    candidates: &[Arc<str>],
+    sessions: &[NativeArchiveSession],
+) -> std::io::Result<PasswordVerification> {
     let volumes = VolumeSet::new(parse_volumes(parts, sessions)?);
-    verify_prepared(py, volumes.key("rar")?, &candidates, || {
+    verify_prepared(volumes.key("rar")?, candidates, || {
         volumes.require_contiguous()?;
         prepare_rar(|offset, len, field| volumes.first_volume_read_at_field(offset, len, field))
             .map(PasswordContext::Rar)
@@ -475,16 +448,16 @@ impl RarPasswordContext {
         }
     }
 
-    pub(crate) fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
+    pub(crate) fn verify(&self, candidates: &[Arc<str>]) -> std::io::Result<PasswordVerification> {
         match &self.material {
-            RarPasswordMaterial::Rar5(header) => verify_rar5_material(py, header, candidates),
+            RarPasswordMaterial::Rar5(header) => verify_rar5_material(header, candidates),
             RarPasswordMaterial::Stored { encrypted, probe } => {
-                verify_rar4_stored_data(py, encrypted, candidates, probe)
+                verify_rar4_stored_data(encrypted, candidates, probe)
             }
             RarPasswordMaterial::Header { salt, encrypted } => {
                 let cancellation = Cancellation::current();
-                let matched = py.detach(|| {
-                    let matches = |password: &String| {
+                let matched = (|| {
+                    let matches = |password: &Arc<str>| {
                         !cancellation.cancelled()
                             && cancellation
                                 .run(|| decrypt_rar4_header(encrypted, password, salt).is_some())
@@ -494,10 +467,9 @@ impl RarPasswordContext {
                     } else {
                         candidates.iter().position(matches)
                     }
-                });
+                })();
                 if let Some(index) = matched {
                     status_with_details(
-                        py,
                         "match",
                         index as i32,
                         (index + 1) as i32,
@@ -507,7 +479,6 @@ impl RarPasswordContext {
                     )
                 } else {
                     status(
-                        py,
                         "no_match",
                         -1,
                         candidates.len() as i32,
@@ -758,17 +729,16 @@ fn parse_rar4_file_probe(data: &[u8], offset: usize, block: Rar4Block) -> Option
 }
 
 fn verify_rar4_stored_data(
-    py: Python<'_>,
     encrypted: &[u8],
-    candidates: &[String],
+    candidates: &[Arc<str>],
     probe: &Rar4DataProbe,
-) -> PyResult<Py<PyAny>> {
+) -> std::io::Result<PasswordVerification> {
     let salt = probe.salt.as_ref();
     let expected_crc = probe.file_crc;
     let unpacked_size = probe.unpacked_size;
     let cancellation = Cancellation::current();
-    let matched_index = py.detach(|| {
-        let matches = |password: &String| {
+    let matched_index = (|| {
+        let matches = |password: &Arc<str>| {
             !cancellation.cancelled()
                 && cancellation.run(|| {
                     rar4_stored_password_matches(
@@ -785,10 +755,9 @@ fn verify_rar4_stored_data(
         } else {
             candidates.iter().position(matches)
         }
-    });
+    })();
     if let Some(index) = matched_index {
         return status_with_details(
-            py,
             "match",
             index as i32,
             (index + 1) as i32,
@@ -798,7 +767,6 @@ fn verify_rar4_stored_data(
         );
     }
     status_with_details(
-        py,
         "no_match",
         -1,
         candidates.len() as i32,
@@ -947,14 +915,12 @@ fn derive_rar3_long_key_iv(mut raw: Vec<u8>) -> Option<([u8; 16], [u8; 16])> {
 }
 
 fn verify_rar5_material(
-    py: Python<'_>,
     header: &Rar5EncryptionHeader,
-    candidates: &[String],
-) -> PyResult<Py<PyAny>> {
-    let matched_index = py.detach(|| find_rar5_password_match(candidates, header));
+    candidates: &[Arc<str>],
+) -> std::io::Result<PasswordVerification> {
+    let matched_index = find_rar5_password_match(candidates, header);
     if let Some(index) = matched_index {
         return status_with_details(
-            py,
             "match",
             index as i32,
             (index + 1) as i32,
@@ -964,7 +930,6 @@ fn verify_rar5_material(
         );
     }
     status(
-        py,
         "no_match",
         -1,
         candidates.len() as i32,
@@ -972,9 +937,12 @@ fn verify_rar5_material(
     )
 }
 
-fn find_rar5_password_match(candidates: &[String], header: &Rar5EncryptionHeader) -> Option<usize> {
+fn find_rar5_password_match(
+    candidates: &[Arc<str>],
+    header: &Rar5EncryptionHeader,
+) -> Option<usize> {
     let cancellation = Cancellation::current();
-    let matches = |password: &String| {
+    let matches = |password: &Arc<str>| {
         !cancellation.cancelled()
             && cancellation.run(|| rar5_checked_aes_key(password, header).is_some())
     };
@@ -1269,16 +1237,22 @@ pub(crate) fn probe_header_encrypted_terminal(
     Ok(None)
 }
 
-#[pyfunction]
+pub(crate) struct RarBoundaryResolution {
+    pub(crate) offset: u64,
+    pub(crate) status: &'static str,
+    pub(crate) end_offset: Option<u64>,
+    pub(crate) password: Option<Arc<str>>,
+    pub(crate) error: Option<String>,
+}
+
 pub(crate) fn resolve_embedded_rar_boundaries(
-    py: Python<'_>,
     archive_path: String,
     offsets: Vec<u64>,
-    passwords: Vec<String>,
-) -> PyResult<Py<PyList>> {
+    passwords: &[Arc<str>],
+) -> io::Result<Vec<RarBoundaryResolution>> {
     // One reader and one pass over each logical input. A failed segment must
     // not discard earlier facts or classify the unvisited remainder.
-    let outcomes = py.detach(move || -> io::Result<_> {
+    let outcomes = (move || -> io::Result<_> {
         let reader = ManagedReader::open(&archive_path)?;
         let mut outcomes = Vec::with_capacity(offsets.len());
         for offset in offsets {
@@ -1286,7 +1260,7 @@ pub(crate) fn resolve_embedded_rar_boundaries(
                 if passwords.is_empty() {
                     return Ok(("password_required", None, None));
                 }
-                for password in &passwords {
+                for password in passwords {
                     let Some(proof) = probe_header_encrypted_terminal(
                         &reader,
                         offset,
@@ -1316,24 +1290,19 @@ pub(crate) fn resolve_embedded_rar_boundaries(
             }
         }
         Ok(outcomes)
-    })?;
-    let rows = PyList::empty(py);
-    for (offset, status, end, password, error) in outcomes {
-        let row = PyDict::new(py);
-        row.set_item("offset", offset)?;
-        row.set_item("status", status)?;
-        if let Some(end) = end {
-            row.set_item("end_offset", end)?;
-        }
-        if let Some(password) = password {
-            row.set_item("password", password)?;
-        }
-        if let Some(error) = error {
-            row.set_item("error", error)?;
-        }
-        rows.append(row)?;
-    }
-    Ok(rows.unbind())
+    })()?;
+    Ok(outcomes
+        .into_iter()
+        .map(
+            |(offset, status, end_offset, password, error)| RarBoundaryResolution {
+                offset,
+                status,
+                end_offset,
+                password,
+                error,
+            },
+        )
+        .collect())
 }
 
 fn probe_rar5_encrypted_terminal(
@@ -1646,36 +1615,29 @@ fn walk_rar4_encrypted_headers(
 }
 
 fn status(
-    py: Python<'_>,
-    status: &str,
+    status: &'static str,
     matched_index: i32,
     attempts: i32,
     message: &str,
-) -> PyResult<Py<PyAny>> {
-    status_with_details(py, status, matched_index, attempts, message, None, None)
+) -> std::io::Result<PasswordVerification> {
+    status_with_details(status, matched_index, attempts, message, None, None)
 }
 
 fn status_with_details(
-    py: Python<'_>,
-    status: &str,
+    status: &'static str,
     matched_index: i32,
     attempts: i32,
     message: &str,
     final_confirmation_required: Option<bool>,
-    match_evidence: Option<&str>,
-) -> PyResult<Py<PyAny>> {
-    let result = PyDict::new(py);
-    result.set_item("status", status)?;
-    result.set_item("matched_index", matched_index)?;
-    result.set_item("attempts", attempts)?;
-    result.set_item("message", message)?;
-    if let Some(value) = final_confirmation_required {
-        result.set_item("final_confirmation_required", value)?;
-    }
-    if let Some(value) = match_evidence {
-        result.set_item("match_evidence", value)?;
-    }
-    Ok(result.into())
+    match_evidence: Option<&'static str>,
+) -> std::io::Result<PasswordVerification> {
+    Ok(PasswordVerification {
+        matched_index: usize::try_from(matched_index).ok(),
+        attempts: attempts as usize,
+        final_confirmation_required,
+        match_evidence,
+        ..PasswordVerification::status(status, message)
+    })
 }
 
 fn read_vint_bounded(data: &[u8], offset: usize, end: usize) -> Option<(u64, usize)> {

@@ -3,6 +3,9 @@
 use super::assignment::{materialize, proposal_facts, BucketView, VolumeAssignment};
 use super::filename::NameProfile;
 use super::*;
+use crate::io::archive_state::{
+    TailTotal, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -835,60 +838,69 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
     output
 }
 
-pub(super) fn to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResult<Py<PyDict>> {
-    let attempts = validation.attempts.as_ref().unwrap();
-    let result = PyDict::new(py);
-    if let Some(total) = attempts.head_size_from_total {
-        result.set_item("head_size_from_total", total)?;
-    }
-    if let Some(size) = attempts.minimum_size {
-        result.set_item("minimum_size", size)?;
-    }
-    if !attempts.tail_totals.is_empty() {
-        result.set_item("tail_totals", &attempts.tail_totals)?;
-    }
-    let sources = PyList::empty(py);
-    for extent in &attempts.sources {
-        let source = PyDict::new(py);
-        source.set_item("path", &extent.path)?;
-        source.set_item("start", extent.start)?;
-        source.set_item("end", extent.end)?;
-        sources.append(source)?;
-    }
-    let layouts = PyList::empty(py);
-    let domains = PyList::empty(py);
-    let mut domain_indexes = HashMap::new();
-    for layout in &attempts.layouts {
-        let slots = PyList::empty(py);
-        for (number, choices) in layout {
-            let slot = PyDict::new(py);
-            slot.set_item("number", number)?;
-            let (domain, terminal) = match domain_indexes.get(&Arc::as_ptr(choices)) {
-                Some(index) => *index,
-                None => {
-                    let index = domains.len();
-                    domains.append(choices.as_ref())?;
-                    let info = (index, choices.iter().all(|i| attempts.sources[*i].terminal));
-                    domain_indexes.insert(Arc::as_ptr(choices), info);
-                    info
+impl VolumeAttempts {
+    pub(super) fn project(&self, proposal: &RelationProposal, style: &str) -> VolumeAttemptPlan {
+        let mut domains = Vec::new();
+        let mut domain_indexes = HashMap::new();
+        let layouts = self
+            .layouts
+            .iter()
+            .zip(&self.minimum_slots)
+            .map(|(layout, &minimum_slots)| {
+                let slots = layout
+                    .iter()
+                    .map(|&(number, ref choices)| {
+                        let (domain, terminal) = *domain_indexes
+                            .entry(Arc::as_ptr(choices))
+                            .or_insert_with(|| {
+                                let index = domains.len();
+                                domains.push(VolumeDomain {
+                                    choices: Arc::clone(choices),
+                                });
+                                (index, choices.iter().all(|&i| self.sources[i].terminal))
+                            });
+                        VolumeSlot {
+                            number,
+                            canonical_name: canonical_volume_name(
+                                &proposal.logical_name,
+                                number,
+                                style,
+                                proposal.width,
+                                proposal.style == "zip_spanned" && terminal,
+                            ),
+                            domain,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                VolumeLayout {
+                    slots,
+                    minimum_slots,
                 }
-            };
-            slot.set_item("domain", domain)?;
-            slot.set_item(
-                "role",
-                if validation.proposal.style == "zip_spanned" && terminal {
-                    "terminal"
-                } else {
-                    "member"
-                },
-            )?;
-            slots.append(slot)?;
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        VolumeAttemptPlan {
+            sources: self
+                .sources
+                .iter()
+                .map(|extent| InputExtent {
+                    path: extent.path.clone(),
+                    start: extent.start,
+                    end: Some(extent.end),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            domains: domains.into_boxed_slice(),
+            layouts,
+            head_size_from_total: self.head_size_from_total,
+            minimum_size: self.minimum_size,
+            tail_totals: self
+                .tail_totals
+                .iter()
+                .map(|&(source, total)| TailTotal { source, total })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
-        layouts.append(slots)?;
     }
-    result.set_item("sources", sources)?;
-    result.set_item("domains", domains)?;
-    result.set_item("layouts", layouts)?;
-    result.set_item("minimum_slots", &attempts.minimum_slots)?;
-    Ok(result.unbind())
 }

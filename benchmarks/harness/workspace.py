@@ -132,6 +132,8 @@ class BenchmarkWorkspace:
             )
         finally:
             if not self.keep_workdir:
+                if self.temp_root.resolve() not in self.root.resolve().parents:
+                    raise ValueError(f"workspace cleanup escaped temporary root: {self.root}")
                 shutil.rmtree(self.root, ignore_errors=True)
 
     def _require_paths(self) -> WorkspacePaths:

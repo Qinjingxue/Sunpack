@@ -163,7 +163,7 @@ Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，�
 配置校验命令：
 
 ```powershell
-python sunpack.py config validate
+sunpack config validate
 ```
 
 常用设置和示例见 [配置指南](docs/zh-CN/configuration.md)。

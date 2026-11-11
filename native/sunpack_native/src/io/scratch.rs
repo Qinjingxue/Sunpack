@@ -264,14 +264,11 @@ impl DiskSet {
             )?,
             capacity,
             count: 0,
-            data: BufReader::with_capacity(
-                RECORD_READ_BUFFER_BYTES,
-                Spool::default(),
-            ),
+            data: BufReader::with_capacity(RECORD_READ_BUFFER_BYTES, Spool::default()),
         })
     }
     fn hash(key: &str) -> u64 {
-        crate::fast_hash::xxh64(key.as_bytes(), 0)
+        crate::fast_hash_core::xxh64(key.as_bytes(), 0)
     }
     fn matches(&mut self, offset: u64, key: &str) -> io::Result<bool> {
         let data = &mut self.data;
@@ -481,13 +478,21 @@ mod tests {
             assert!(!map.insert(&format!("{index}-{suffix}")).unwrap());
         }
         let disk = map.disk.as_mut().unwrap();
-        assert!(!disk.find("different-full-key", DiskSet::hash(&format!("0-{suffix}")))
-            .unwrap().1);
+        assert!(
+            !disk
+                .find("different-full-key", DiskSet::hash(&format!("0-{suffix}")))
+                .unwrap()
+                .1
+        );
         let mut collision = format!("0-{suffix}");
         collision.pop();
         collision.push('y');
-        assert!(!disk.find(&collision, DiskSet::hash(&format!("0-{suffix}")))
-            .unwrap().1);
+        assert!(
+            !disk
+                .find(&collision, DiskSet::hash(&format!("0-{suffix}")))
+                .unwrap()
+                .1
+        );
         assert!(map.insert("").unwrap());
         assert!(!map.insert("").unwrap());
     }

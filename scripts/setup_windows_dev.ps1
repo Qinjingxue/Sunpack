@@ -51,33 +51,6 @@ function ConvertTo-NormalizedFullPath {
     return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') -replace '/', '\').ToLowerInvariant()
 }
 
-function Wait-ExecutableExit {
-    param(
-        [Parameter(Mandatory = $true)][string]$ExecutablePath,
-        [int]$TimeoutSeconds = 15
-    )
-
-    $expectedPath = ConvertTo-NormalizedFullPath -Path $ExecutablePath
-    $executableName = [System.IO.Path]::GetFileName($ExecutablePath).Replace("'", "''")
-    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
-    do {
-        $matching = @(
-            Get-CimInstance Win32_Process -Filter "Name='$executableName'" -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.ExecutablePath -and
-                    (ConvertTo-NormalizedFullPath -Path $_.ExecutablePath) -eq $expectedPath
-                }
-        )
-        if ($matching.Count -eq 0) {
-            return
-        }
-        Start-Sleep -Milliseconds 100
-    } while ((Get-Date) -lt $deadline)
-
-    $processIds = ($matching | ForEach-Object ProcessId) -join ", "
-    throw "Executable did not exit within $TimeoutSeconds seconds: $ExecutablePath (PID: $processIds)"
-}
-
 function Reset-StaleCMakeBuildDir {
     param(
         [Parameter(Mandatory = $true)]
@@ -339,31 +312,6 @@ function Ensure-Bundled7ZipAssets {
     }
 }
 
-function Remove-PreviousNativeExtension {
-    param(
-        [Parameter(Mandatory = $true)][string]$PythonPath,
-        [Parameter(Mandatory = $true)][string]$VenvPath
-    )
-
-    $sitePackages = Join-Path $VenvPath "Lib\site-packages"
-    if (-not (Test-Path -LiteralPath $sitePackages)) {
-        return
-    }
-
-    # Keep exactly one extension: remove the registered distribution and every
-    # stale module/dist-info residue before installing this build's wheel.
-    Invoke-Native -FilePath "uv" -Arguments @("pip", "uninstall", "--python", $PythonPath, "sunpack-native")
-    $leftovers = Get-ChildItem -LiteralPath $sitePackages -Force |
-        Where-Object {
-            $_.Name -eq "sunpack_native" -or
-            $_.Name -match "^sunpack_native-.*\.dist-info$" -or
-            $_.Name -match "^[~].*npack_native$"
-        }
-    foreach ($leftover in $leftovers) {
-        Remove-Item -LiteralPath $leftover.FullName -Recurse -Force
-    }
-}
-
 function Invoke-VerifiedFileDownload {
     param(
         [Parameter(Mandatory = $true)]
@@ -570,33 +518,6 @@ function Invoke-Native {
     }
 }
 
-function Get-LatestWheel {
-    param([string]$WheelRoot)
-    $wheel = Get-ChildItem -LiteralPath $WheelRoot -Filter "*.whl" -File |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First 1
-    if ($null -eq $wheel) {
-        throw "Native wheel was not produced under: $WheelRoot"
-    }
-    return $wheel.FullName
-}
-
-function Get-MaturinCommand {
-    param([string]$VenvScripts)
-
-    $venvMaturin = Join-Path $VenvScripts "maturin.exe"
-    if (Test-Path -LiteralPath $venvMaturin) {
-        return $venvMaturin
-    }
-
-    $globalMaturin = Get-Command "maturin" -ErrorAction SilentlyContinue
-    if ($globalMaturin) {
-        return $globalMaturin.Source
-    }
-
-    throw "maturin executable not found. Install maturin or make it available in PATH."
-}
-
 function Test-CommandRuns {
     param(
         [Parameter(Mandatory = $true)]
@@ -757,85 +678,9 @@ function Build-ToastLibrary {
     Set-DevelopmentArtifactBuildTime -Path (Join-Path $ToolsRoot "sunpack_toast.dll") -BuildStartedUtc $buildStartedUtc
 }
 
-function Test-NativeImport {
-    param([string]$PythonPath)
-
-    $code = @"
-import sunpack_native as n
-required = [
-    'NativeDirectoryScanOptions', 'NativeCandidateTable',
-    'directory_snapshot_from_columns',
-    'authorize_nested_candidates',
-    'scan_embedded_archives',
-    'analyze_zip_filename_encoding', 'AnalysisBinaryView',
-    'watch_broker_acquire', 'watch_broker_release',
-    'watch_broker_is_connected', 'watch_broker_ping_seconds',
-]
-missing = [name for name in required if not callable(getattr(n, name, None))]
-assert not missing, missing
-"@
-    Invoke-Native -FilePath $PythonPath -Arguments @(
-        "-c",
-        $code
-    )
-}
-
-function Test-SevenZipWorker {
-    param([string]$PythonPath, [string]$RepoRoot)
-
-    # The 7-Zip backend is compiled into the worker, so the old
-    # "assert tools\7z.dll exists" probe is gone. What still has to hold is that
-    # the worker binary is present AND that the embedded backend can open a real
-    # archive end to end.
-    $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sunpack-embedded-backend-" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
-    try {
-        $probe = Join-Path $fixtureRoot "probe.py"
-        $fixture = Join-Path $fixtureRoot "probe.zip"
-        $probeSource = @'
-import os
-import sys
-import zipfile
-
-from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
-
-worker = get_sevenzip_bridge_worker_path()
-assert os.path.exists(worker), worker
-
-target = sys.argv[1]
-with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-    archive.writestr("probe.txt", "sunpack embedded backend\n" * 8)
-assert os.path.getsize(target) > 0
-'@
-        Set-Content -LiteralPath $probe -Value $probeSource -Encoding UTF8
-        Invoke-Native -FilePath $PythonPath -Arguments @($probe, $fixture)
-        Push-Location $RepoRoot
-        try {
-            Invoke-Native -FilePath $PythonPath -Arguments @(
-                "sunpack.py", "scan", "--no-pause", $fixture
-            )
-        } finally {
-            try {
-                # Any real source CLI request starts the persistent runtime. Stop
-                # the exact venv-backed server before a later uv sync tries to
-                # replace .venv\Scripts on Windows.
-                Invoke-Native -FilePath $PythonPath -Arguments @(
-                    "sunpack.py", "--persistent-shutdown"
-                )
-                Wait-ExecutableExit -ExecutablePath $PythonPath
-            } finally {
-                Pop-Location
-            }
-        }
-    } finally {
-        Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
-$processArch = Get-ProcessBuildArch
 $rustTarget = Get-RustTarget -BuildArch $buildArch
 
 Write-Step "Environment preflight"
@@ -843,10 +688,6 @@ if ($env:OS -ne "Windows_NT") {
     throw "This setup script only supports Windows."
 }
 Write-Host "Requested architecture: $buildArch"
-Write-Host "Python/process architecture: $processArch"
-if ($processArch -ne $buildArch) {
-    throw "Development setup for native Python extensions must run under a target-architecture Python. This process is '$processArch', so it cannot prepare a real '$buildArch' environment."
-}
 
 $venvPath = Join-Path $repoRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
@@ -864,8 +705,6 @@ $lto = if ($BuildProfile -eq "ci") { "OFF" } else { "ON" }
 $sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch + $buildSuffix)
 $toastHostRoot = Join-Path $repoRoot "native\toast_host"
 $toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch + $buildSuffix)
-$buildRoot = Join-Path $repoRoot "build"
-$nativeWheelRoot = Join-Path $buildRoot ("native-wheels-dev-" + $buildArch + $buildSuffix)
 $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
 
@@ -877,7 +716,7 @@ Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 Assert-CommandExists -Command "uv" -Description "uv dependency manager"
 if ($Clean) {
     Write-Step "Cleaning native build outputs"
-    foreach ($output in @($rustTargetDir, $sevenZipWrapperBuildDir, $toastHostBuildDir, $nativeWheelRoot)) {
+    foreach ($output in @($rustTargetDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
         $fullOutput = [IO.Path]::GetFullPath($output)
         if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Build output is outside the repository: $output"
@@ -915,59 +754,21 @@ if ($BootstrapOnly) {
     return
 }
 
-Write-Step "Building and installing Rust native extension"
+Write-Step "Building Rust runtime and native fixture tool"
 $nativeBuildStartedUtc = [datetime]::UtcNow
-$maturinCommand = Get-MaturinCommand -VenvScripts $venvScripts
-Remove-PreviousNativeExtension -PythonPath $venvPython -VenvPath $venvPath
-New-Item -ItemType Directory -Path $nativeWheelRoot -Force | Out-Null
-Invoke-Native -FilePath "cargo" -Arguments @("--version")
-Invoke-Native -FilePath $maturinCommand -Arguments @(
-    "build",
-    "--locked",
-    "--manifest-path", $nativeCargoToml,
-    "--interpreter", $venvPython,
-    "--profile", $BuildProfile,
-    "--target", $rustTarget,
-    "--target-dir", $rustTargetDir,
-    "--out", $nativeWheelRoot
+Invoke-Native -FilePath "cargo" -Arguments @(
+    "build", "--locked", "--manifest-path", $nativeCargoToml, "--profile", $BuildProfile,
+    "--target", $rustTarget, "--target-dir", $rustTargetDir, "--jobs", [string]$BuildJobs,
+    "--bin", "sunpack-runtime", "--example", "real_fixture"
 )
-$nativeWheelPath = Get-LatestWheel -WheelRoot $nativeWheelRoot
-Invoke-Native -FilePath "uv" -Arguments @("pip", "install", "--python", $venvPython, "--reinstall", $nativeWheelPath)
-Test-NativeImport -PythonPath $venvPython
-Set-DevelopmentArtifactBuildTime -Path (Get-NativeExtensionPath -PythonPath $venvPython) -BuildStartedUtc $nativeBuildStartedUtc
-
-Write-Step "Building native test fixture tool"
-$fixtureBuildStartedUtc = [datetime]::UtcNow
-# Match maturin's runnable-interpreter environment: otherwise the example build
-# invalidates PyO3's build script and the next wheel recompiles the extension.
-# Signature format: PyO3/maturin src/python_interpreter/mod.rs environment_signature.
-$pythonSignature = & $venvPython -c "import sys, struct; print('{}-{}.{}-{}bit'.format(sys.implementation.name, sys.version_info.major, sys.version_info.minor, struct.calcsize('P') * 8))"
-if ($LASTEXITCODE -ne 0) { throw "Cannot identify the fixture Python interpreter" }
-$fixtureEnvironmentBackup = @{}
-foreach ($name in @("PYO3_PYTHON", "PYO3_ENVIRONMENT_SIGNATURE", "PYTHON_SYS_EXECUTABLE", "PYO3_BUILD_EXTENSION_MODULE")) {
-    $fixtureEnvironmentBackup[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
-}
-try {
-    $env:PYO3_PYTHON = $venvPython
-    $env:PYTHON_SYS_EXECUTABLE = $venvPython
-    $env:PYO3_ENVIRONMENT_SIGNATURE = ([string]$pythonSignature).Trim()
-    $env:PYO3_BUILD_EXTENSION_MODULE = "1"
-    Invoke-Native -FilePath "cargo" -Arguments @(
-        "build", "--locked", "--manifest-path", $nativeCargoToml,
-        "--profile", $BuildProfile, "--target", $rustTarget, "--target-dir", $rustTargetDir,
-        "--example", "real_fixture"
-    )
-} finally {
-    foreach ($name in $fixtureEnvironmentBackup.Keys) {
-        [Environment]::SetEnvironmentVariable($name, $fixtureEnvironmentBackup[$name], "Process")
-    }
-}
+$runtimePath = Get-SunPackRuntimeBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
+Set-DevelopmentArtifactBuildTime -Path $runtimePath -BuildStartedUtc $nativeBuildStartedUtc
 $fixtureBuildPath = Join-Path $rustTargetDir "$rustTarget\$BuildProfile\examples\real_fixture.exe"
 Assert-PathExists -LiteralPath $fixtureBuildPath -Description "Native test fixture executable"
 New-Item -ItemType Directory -Path $toolsRoot -Force | Out-Null
 $fixtureToolPath = Join-Path $toolsRoot "real_fixture.exe"
 Copy-Item -LiteralPath $fixtureBuildPath -Destination $fixtureToolPath -Force
-Set-DevelopmentArtifactBuildTime -Path $fixtureToolPath -BuildStartedUtc $fixtureBuildStartedUtc
+Set-DevelopmentArtifactBuildTime -Path $fixtureToolPath -BuildStartedUtc $nativeBuildStartedUtc
 
 Write-Step "Building minimal Windows Watch Broker service"
 $brokerBuildStartedUtc = [datetime]::UtcNow
@@ -986,17 +787,8 @@ $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
 Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
-Test-SevenZipWorker -PythonPath $venvPython -RepoRoot $repoRoot
-Invoke-Native -FilePath $venvPython -Arguments @(
-    "-c",
-    "from sunpack.core.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"
-)
-
-Write-Step "Verifying local source execution"
-Invoke-Native -FilePath $venvPython -Arguments @("sunpack.py", "--help")
-Invoke-Native -FilePath $venvPython -Arguments @("-m", "pytest", "--version")
-
 Write-Host ""
 Write-Host "Local development environment is ready" -ForegroundColor Green
-Write-Host "Virtual env: $venvPath"
+Write-Host "Runtime: $runtimePath"
+Write-Host "Test virtual env: $venvPath"
 Write-Host "Activate: $venvPath\\Scripts\\Activate.ps1"

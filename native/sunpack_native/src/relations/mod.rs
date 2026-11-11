@@ -2,12 +2,13 @@ use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap,
     probe_volume_anchor_reader_at_offset, CheapAnchorCell, VolumeAnchor,
 };
+use crate::io::archive_state::{
+    ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
+};
 use crate::path_keys::{case_key, path_key};
 use crate::scan::directory::NativeDirectorySnapshot;
 use crate::scan::executable_carrier::executable_sfx_stub_profile;
 use crate::scan::pe_overlay::{inspect_pe_image_reader, inspect_pe_overlay_reader, PeState};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -225,42 +226,61 @@ impl NativeRelationGroup {
         }
     }
 
-    pub(crate) fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = match self {
-            Self::Ordinary(row, confirmed) => ordinary_file_group_to_dict(py, row, *confirmed),
-            Self::Proposal(validation) => proposal_to_dict(py, validation),
-        }?;
+    pub(crate) fn project(&self) -> RelationProjection {
         let data = self.candidate_data();
-        let reason = if data.needs_password {
-            Some(
-                if self
-                    .entry_anchor()
-                    .is_some_and(|anchor| anchor.wrong_password)
+        let anchor = self.entry_anchor();
+        let mut input = ArchiveInput::file(
+            data.entry_path.to_owned(),
+            data.format_hint.to_owned(),
+            data.logical_name().into_owned(),
+        );
+        input.analysis.password_required = data.needs_password;
+        let failure_reason = match self {
+            Self::Proposal(validation) => project_proposal(validation, &mut input),
+            Self::Ordinary(..) => {
+                if let Some(anchor) = anchor {
+                    let start = anchor.structure_offset.unwrap_or(0);
+                    if start > 0 && (anchor.sfx || data.needs_password) {
+                        input.mode = OpenMode::FileRange;
+                        input.parts = Box::new([InputPart::range(InputExtent {
+                            path: data.entry_path.to_owned(),
+                            start,
+                            end: anchor.expected_logical_size.filter(|end| *end > start),
+                        })]);
+                    }
+                    if data.format_hint == "zip" {
+                        input.analysis.zip_eocd_offset = anchor
+                            .zip_eocd_offset
+                            .and_then(|end| end.checked_sub(start));
+                    }
+                }
+                if data.needs_password {
+                    Some(if anchor.is_some_and(|a| a.wrong_password) {
+                        "wrong_password"
+                    } else {
+                        "needs_password"
+                    })
+                } else if !data.relation_confirmed
+                    && ((data.multivolume && (data.is_split || data.structural_non_head))
+                        || anchor
+                            .is_some_and(|a| a.evidence.contains(&"embedded:volume_candidate")))
                 {
-                    "wrong_password"
+                    Some("missing_volume")
                 } else {
-                    "needs_password"
-                },
-            )
-        } else if !data.relation_confirmed
-            && ((data.multivolume && (data.is_split || data.structural_non_head))
-                || self
-                    .entry_anchor()
-                    .is_some_and(|a| a.evidence.contains(&"embedded:volume_candidate")))
-        {
-            Some("missing_volume")
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            if let Some(metadata) = dict.bind(py).get_item("head_metadata")? {
-                let metadata = metadata.cast::<PyDict>()?;
-                if !metadata.contains("relation_failure_reason")? {
-                    metadata.set_item("relation_failure_reason", reason)?;
+                    None
                 }
             }
+        };
+        RelationProjection {
+            input,
+            carrier_path: data.carrier_path.to_owned(),
+            owned_paths: data
+                .parts()
+                .chain(data.companions.iter().map(String::as_str))
+                .map(str::to_owned)
+                .collect(),
+            failure_reason,
         }
-        Ok(dict)
     }
 
     pub(crate) fn speculative_paths(&self) -> impl Iterator<Item = &str> {
@@ -371,23 +391,11 @@ impl NativeRelationGroup {
     }
 }
 
-#[derive(Debug, Clone)]
-struct FileRelationNative {
-    filename: String,
-    logical_name: String,
-    split_role: Option<String>,
-    is_split_member: bool,
-    has_generic_001_head: bool,
-    is_plain_numeric_member: bool,
-    has_split_companions: bool,
-    is_split_exe_companion: bool,
-    is_disguised_split_exe_companion: bool,
-    is_split_related: bool,
-    match_rar_disguised: bool,
-    match_rar_head: bool,
-    match_001_head: bool,
-    split_family: String,
-    split_index: u32,
+pub(crate) struct RelationProjection {
+    pub input: ArchiveInput,
+    pub carrier_path: String,
+    pub owned_paths: Vec<String>,
+    pub failure_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -400,25 +408,8 @@ struct ParsedVolume {
     decorated: bool,
 }
 
-#[pyfunction]
-pub(crate) fn relations_detect_split_role(filename: &str) -> Option<String> {
-    detect_split_role(filename).map(str::to_string)
-}
-
-#[pyfunction]
-#[pyo3(signature = (filename, is_archive=false))]
 pub(crate) fn relations_logical_name(filename: &str, is_archive: bool) -> String {
     get_logical_name(filename, is_archive)
-}
-
-#[pyfunction]
-pub(crate) fn relations_parse_numbered_volume(
-    py: Python<'_>,
-    path: &str,
-) -> PyResult<Option<Py<PyDict>>> {
-    Ok(parse_relation_numbered_volume(path)
-        .map(|parsed| parsed_volume_to_dict(py, &parsed))
-        .transpose()?)
 }
 
 pub(crate) fn build_native_candidate_groups_from_snapshot(
@@ -1024,105 +1015,6 @@ fn anchor_has_split_identity(anchor: &VolumeAnchor) -> bool {
         && (anchor.multivolume || anchor.continuation_from_previous || anchor.continuation_to_next)
 }
 
-fn ordinary_file_group_to_dict(
-    py: Python<'_>,
-    row: &RelationInput,
-    relation_confirmed: bool,
-) -> PyResult<Py<PyDict>> {
-    let parsed = parse_relation_numbered_volume(&row.name);
-    let archive_numbered_hypothesis = !relation_confirmed
-        && parsed
-            .as_ref()
-            .is_some_and(|_| row.anchor.as_ref().is_some_and(anchor_has_split_identity));
-    let relation_format = row
-        .anchor
-        .as_ref()
-        .map(|anchor| anchor.format.as_str())
-        .filter(|format| !format.is_empty())
-        .or_else(|| parsed.as_ref().map(|value| value.family))
-        .unwrap_or("");
-    let split_family = if archive_numbered_hypothesis {
-        parsed
-            .as_ref()
-            .map(|value| split_family_for_proposal(relation_format, value.style))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let split_index = parsed
-        .as_ref()
-        .filter(|_| archive_numbered_hypothesis)
-        .map(|value| value.number)
-        .unwrap_or(0);
-    let relation = FileRelationNative {
-        filename: row.name.clone(),
-        logical_name: parsed
-            .as_ref()
-            .filter(|_| archive_numbered_hypothesis)
-            .map(logical_name_from_parsed)
-            // The logical name names the output directory; a (possibly
-            // disguised) extension would collide with the archive itself.
-            .unwrap_or_else(|| get_logical_name(&row.name, true)),
-        split_role: archive_numbered_hypothesis.then(|| {
-            if split_index == 1 {
-                "first".to_string()
-            } else {
-                "member".to_string()
-            }
-        }),
-        is_split_member: archive_numbered_hypothesis,
-        has_generic_001_head: archive_numbered_hypothesis
-            && split_index == 1
-            && parsed
-                .as_ref()
-                .is_some_and(|value| value.family == "generic"),
-        is_plain_numeric_member: archive_numbered_hypothesis
-            && parsed
-                .as_ref()
-                .is_some_and(|value| value.style == "plain_numeric_suffix"),
-        has_split_companions: false,
-        is_split_exe_companion: false,
-        is_disguised_split_exe_companion: false,
-        is_split_related: archive_numbered_hypothesis,
-        match_rar_disguised: false,
-        match_rar_head: false,
-        match_001_head: archive_numbered_hypothesis && split_index == 1,
-        split_family,
-        split_index,
-    };
-    let dict = PyDict::new(py);
-    dict.set_item("head_path", &row.path)?;
-    dict.set_item("head_name", &row.name)?;
-    dict.set_item("logical_name", &relation.logical_name)?;
-    dict.set_item("relation", relation_to_dict(py, &relation)?)?;
-    dict.set_item("all_parts", PyList::new(py, [&row.path])?)?;
-    dict.set_item("is_split_candidate", false)?;
-    dict.set_item("head_size", row.size)?;
-    dict.set_item("logical_size", row.size)?;
-    dict.set_item("split_volumes", PyList::empty(py))?;
-    let head_metadata = row
-        .anchor
-        .as_ref()
-        .filter(|anchor| anchor_has_relation_evidence(anchor))
-        .map(|anchor| {
-            if relation_confirmed {
-                relation_confirmed_anchor_to_dict(py, anchor)
-            } else {
-                volume_anchor_to_dict(py, anchor)
-            }
-        })
-        .transpose()?;
-    dict.set_item("head_metadata", head_metadata)?;
-    dict.set_item(
-        "format_reject_mask",
-        row.anchor
-            .as_ref()
-            .map(|anchor| anchor.format_reject_mask)
-            .unwrap_or(0),
-    )?;
-    Ok(dict.unbind())
-}
-
 fn validation_relation_confirmed(validation: &ProposalValidation) -> bool {
     validation.attempts.is_some()
         || (validation.unresolved.is_empty()
@@ -1136,133 +1028,123 @@ fn validation_relation_confirmed(validation: &ProposalValidation) -> bool {
             }))
 }
 
-fn proposal_to_dict(py: Python<'_>, validation: &ProposalValidation) -> PyResult<Py<PyDict>> {
+fn project_proposal(
+    validation: &ProposalValidation,
+    input: &mut ArchiveInput,
+) -> Option<&'static str> {
     let proposal = &validation.proposal;
-    let head_path = proposal.entry_path();
-    let head_anchor = validation.facts.anchors.get(&path_key(head_path));
-    let split_family = proposal_split_family(proposal, &validation.facts.anchors);
-    let relation = FileRelationNative {
-        filename: basename(head_path).to_string(),
-        logical_name: proposal.logical_name.clone(),
-        split_role: Some("first".to_string()),
-        is_split_member: true,
-        has_generic_001_head: false,
-        is_plain_numeric_member: false,
-        has_split_companions: !proposal.companions.is_empty(),
-        is_split_exe_companion: false,
-        is_disguised_split_exe_companion: false,
-        is_split_related: true,
-        match_rar_disguised: proposal.format == "rar",
-        match_rar_head: proposal.format == "rar",
-        match_001_head: true,
-        split_family: split_family.clone(),
-        split_index: 1,
-    };
-    let volume_dicts =
-        proposal_volume_dicts(py, proposal, &split_family, &validation.facts.anchors)?;
-    let all_parts = PyList::empty(py);
-    for path in validation.part_paths() {
-        all_parts.append(path)?;
-    }
-    let carrier = proposal.companions.first().cloned().unwrap_or_default();
-    let carrier_size = (!carrier.is_empty())
-        .then(|| {
-            validation
-                .facts
-                .anchors
-                .get(&path_key(&carrier))
-                .map(|anchor| anchor.size)
-        })
-        .flatten();
-    let dict = PyDict::new(py);
-    dict.set_item("head_path", head_path)?;
-    if validation.attempts.is_some() {
-        dict.set_item("volume_attempts", attempts::to_dict(py, validation)?)?;
-    }
-    dict.set_item("head_name", basename(head_path))?;
-    dict.set_item("logical_name", &proposal.logical_name)?;
-    dict.set_item("relation", relation_to_dict(py, &relation)?)?;
-    dict.set_item("all_parts", all_parts)?;
-    dict.set_item("is_split_candidate", true)?;
-    dict.set_item("head_size", head_anchor.map(|anchor| anchor.size))?;
-    dict.set_item(
-        "logical_size",
-        proposal_logical_size(proposal, &validation.facts.anchors),
-    )?;
-    dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
-    let metadata = if let Some(anchor) = head_anchor {
-        relation_confirmed_anchor_to_dict(py, anchor)?
+    let anchors = &validation.facts.anchors;
+    let style = proposal_split_family(proposal, anchors);
+    input.analysis.zip_spanned = style == "zip_spanned";
+    input.mode = if matches!(style.as_str(), "rar_sfx_part" | "sfx_numeric_suffix") {
+        OpenMode::SfxWithVolumes
     } else {
-        let metadata = PyDict::new(py);
-        metadata.set_item("format", &proposal.format)?;
-        metadata.set_item("confidence", "strong")?;
-        metadata.set_item("relation_confirmed", true)?;
-        metadata.unbind()
+        OpenMode::NativeVolumes
     };
-    if proposal.format == "zip" {
+    input.volume_attempts = validation
+        .attempts
+        .as_ref()
+        .map(|attempts| Box::new(attempts.project(proposal, &style)));
+    // Keep the fixed composition for the Rust password probe. Ordered attempts
+    // replace it in the worker request and are materialized only on success.
+    input.parts = proposal
+        .volumes
+        .iter()
+        .filter(|(_, number)| *number > 0)
+        .map(|(path, number)| {
+            let anchor = anchors.get(&path_key(path));
+            let terminal = proposal.style == "zip_spanned"
+                && anchor.is_some_and(|anchor| anchor.anchor_roles.contains(&"terminal"));
+            InputPart {
+                extent: InputExtent {
+                    path: path.clone(),
+                    start: anchor.and_then(|a| a.structure_offset).unwrap_or(0),
+                    end: anchor.and_then(|a| {
+                        let end = a.extent_end();
+                        (end < a.size).then_some(end)
+                    }),
+                },
+                volume_number: Some(*number),
+                canonical_name: canonical_volume_name(
+                    &proposal.logical_name,
+                    *number,
+                    &style,
+                    proposal.width,
+                    terminal,
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    input.parts.sort_unstable_by_key(|part| part.volume_number);
+    if proposal.format == "zip" && input.volume_attempts.is_none() {
         let mut logical_start = 0u64;
         for (path, _) in &proposal.volumes {
-            let Some(anchor) = validation.facts.anchors.get(&path_key(path)) else {
+            let Some(anchor) = anchors.get(&path_key(path)) else {
                 break;
             };
             let start = anchor.structure_offset.unwrap_or(0);
-            if let Some(eocd) = anchor.zip_eocd_offset.filter(|eocd| *eocd >= start) {
-                metadata
-                    .bind(py)
-                    .set_item("zip_eocd_offset", logical_start + eocd - start)?;
+            if let Some(eocd) = anchor
+                .zip_eocd_offset
+                .and_then(|eocd| eocd.checked_sub(start))
+            {
+                input.analysis.zip_eocd_offset = logical_start.checked_add(eocd);
                 break;
             }
             logical_start = logical_start.saturating_add(anchor.payload_size());
         }
     }
-    let metadata_dict = metadata.bind(py);
-    match validation.status {
-        ProposalStatus::Valid => {}
-        ProposalStatus::NeedsPassword => {
-            metadata_dict.set_item("needs_password", true)?;
-            metadata_dict.set_item("proposal_paths", validation_owned_paths(validation))?;
-            metadata_dict.set_item("password_scope", &proposal.logical_name)?;
-            metadata_dict.set_item(
-                "relation_failure_reason",
-                RelationFailureReason::NeedsPassword.as_str(),
-            )?;
-        }
-        ProposalStatus::Inconclusive => {
-            metadata_dict.set_item(
-                "relation_failure_reason",
-                validation.reason.map(RelationFailureReason::as_str),
-            )?;
-        }
-        ProposalStatus::Reject | ProposalStatus::Unsupported => {
-            unreachable!("only admitted proposals become relation groups");
-        }
-    }
-    if validation.status != ProposalStatus::Valid {
-        metadata_dict.set_item(
-            "relation_confirmed",
-            validation_relation_confirmed(validation),
-        )?;
-    }
-    if validation.status == ProposalStatus::Inconclusive
-        || validation
-            .facts
-            .anchors
+    let incomplete = validation.status == ProposalStatus::Inconclusive
+        || anchors
             .values()
-            .any(|anchor| anchor.evidence.contains(&"embedded:unresolved_volume"))
-    {
-        metadata_dict.set_item("volume_set_incomplete", true)?;
+            .any(|anchor| anchor.evidence.contains(&"embedded:unresolved_volume"));
+    input.analysis.volume_completeness = Some(
+        if input.volume_attempts.is_some() || validation.status == ProposalStatus::NeedsPassword {
+            VolumeCompleteness::Unknown
+        } else if incomplete {
+            VolumeCompleteness::Missing
+        } else {
+            VolumeCompleteness::Complete
+        },
+    );
+    let reason = match validation.status {
+        ProposalStatus::Valid => None,
+        ProposalStatus::NeedsPassword => Some(RelationFailureReason::NeedsPassword.as_str()),
+        ProposalStatus::Inconclusive => validation.reason.map(RelationFailureReason::as_str),
+        ProposalStatus::Reject | ProposalStatus::Unsupported => {
+            unreachable!("only admitted proposals become relation groups")
+        }
+    };
+    if incomplete && reason == Some("missing_volume") {
+        input.analysis.missing_volume_evidence = Some("relation_missing_volume".to_owned());
     }
-    dict.set_item("head_metadata", metadata)?;
-    dict.set_item("companion_paths", &proposal.companions)?;
-    dict.set_item("carrier_path", &carrier)?;
-    dict.set_item("carrier_size", carrier_size)?;
-    dict.set_item(
-        "format_reject_mask",
-        head_anchor
-            .map(|anchor| anchor.format_reject_mask)
-            .unwrap_or(0),
-    )?;
-    Ok(dict.unbind())
+    reason
+}
+
+fn canonical_volume_name(
+    prefix: &str,
+    number: u32,
+    style: &str,
+    width: usize,
+    terminal: bool,
+) -> String {
+    let base = basename(prefix);
+    let width = if width == 0 { 3 } else { width };
+    match style {
+        "rar_part" => format!("{base}.part{number:0width$}.rar"),
+        "rar_sfx_part" => {
+            let extension = if number == 1 { "exe" } else { "rar" };
+            format!("{base}.part{number:0width$}.{extension}")
+        }
+        "rar_oldstyle" if number == 1 => format!("{base}.rar"),
+        "rar_oldstyle" => format!("{base}.r{:02}", number - 2),
+        "zip_spanned" if terminal => format!("{base}.zip"),
+        "zip_spanned" => format!("{base}.z{number:02}"),
+        "zip_zero_numbered" => format!("{base}.{:04}", number - 1),
+        "sfx_numeric_suffix" if number == 1 => format!("{}.exe", split_ext(base).0),
+        "sfx_numeric_suffix" => format!("{base}.{:0width$}", number - 1),
+        _ => format!("{base}.{number:03}"),
+    }
 }
 
 fn proposal_logical_size(
@@ -1274,56 +1156,6 @@ fn proposal_logical_size(
             .get(&path_key(path))
             .map(|anchor| total.saturating_add(anchor.payload_size()))
     })
-}
-
-fn proposal_volume_dicts(
-    py: Python<'_>,
-    proposal: &RelationProposal,
-    split_family: &str,
-    anchors: &HashMap<String, VolumeAnchor>,
-) -> PyResult<Vec<Py<PyDict>>> {
-    proposal
-        .volumes
-        .iter()
-        .filter(|part| part.1 > 0)
-        .map(|(path, number)| {
-            let anchor = anchors.get(&path_key(path));
-            let dict = PyDict::new(py);
-            let role = if proposal.style == "zip_spanned"
-                && anchor.is_some_and(|anchor| anchor.anchor_roles.contains(&"terminal"))
-            {
-                "terminal"
-            } else if *number == 1 {
-                "first"
-            } else {
-                "member"
-            };
-            dict.set_item("path", path)?;
-            dict.set_item("number", number)?;
-            dict.set_item("role", role)?;
-            // A proposal is emitted only after the format validator has
-            // accepted its path union.  The filename interpretation selects
-            // the candidate, but it is the structural validation that makes
-            // this volume part of the relation contract.
-            dict.set_item("source", "structure")?;
-            dict.set_item("style", split_family)?;
-            dict.set_item("prefix", &proposal.logical_name)?;
-            dict.set_item("width", proposal.width)?;
-            if let Some(start) = anchor
-                .and_then(|anchor| anchor.structure_offset)
-                .filter(|offset| *offset > 0)
-            {
-                dict.set_item("start", start)?;
-            }
-            if let Some(end) = anchor.and_then(|a| {
-                let end = a.extent_end();
-                (end < a.size).then_some(end)
-            }) {
-                dict.set_item("end", end)?;
-            }
-            Ok(dict.unbind())
-        })
-        .collect()
 }
 
 /// Split family used for canonical volume names.  RAR volume names are
@@ -1368,191 +1200,6 @@ fn split_family_for_proposal(format: &str, style: &str) -> String {
         return format!("{format}_part");
     }
     format!("{format}_numbered")
-}
-
-fn anchor_has_relation_evidence(anchor: &VolumeAnchor) -> bool {
-    !anchor.format.is_empty()
-        || !anchor.confidence.is_empty()
-        || anchor.multivolume
-        || anchor.encrypted
-        || anchor.needs_password
-        || anchor.wrong_password
-        || !anchor.anchor_roles.is_empty()
-        || anchor.internal_volume_number.is_some()
-        || anchor.structure_offset.is_some()
-        || anchor.expected_logical_size.is_some()
-        || anchor.continuation_from_previous
-        || anchor.continuation_to_next
-        || anchor.sfx
-        || !anchor.evidence.is_empty()
-        || !anchor.error.is_empty()
-}
-
-#[pyfunction]
-#[pyo3(signature = (current_paths, candidate_paths, format_hint="", path_passwords=None))]
-pub(crate) fn relations_resolve_volume_once(
-    py: Python<'_>,
-    current_paths: Vec<String>,
-    candidate_paths: Vec<String>,
-    format_hint: &str,
-    path_passwords: Option<Vec<(String, String)>>,
-) -> PyResult<Option<Py<PyDict>>> {
-    if current_paths.is_empty() || candidate_paths.is_empty() {
-        return Ok(None);
-    }
-    let group = py.detach(|| {
-        let mut visible_paths = current_paths.clone();
-        visible_paths.extend(candidate_paths);
-        let visible_paths = sorted_unique_paths(visible_paths);
-        let anchors = probe_volume_anchor_paths_cheap(&visible_paths, None);
-        // The indexed parallel probe returns one result per input in the
-        // original order, including failed reads.
-        let rows: Vec<_> = visible_paths
-            .into_iter()
-            .zip(anchors)
-            .map(|(path, anchor)| RelationInput {
-                path_key: path_key(&path),
-                name: basename(&path).to_string(),
-                path,
-                size: Some(anchor.size),
-                relation_member_eligible: true,
-                anchor: Some(anchor),
-                anchor_cell: None,
-            })
-            .collect();
-        let filtered_keys: HashSet<String> =
-            current_paths.iter().map(|path| path_key(path)).collect();
-        let groups = build_candidate_groups_from_source(
-            RelationSource::Physical(&rows),
-            &filtered_keys,
-            path_passwords.as_deref(),
-            None,
-            None,
-        );
-        let format_hint = normalize_retry_format(format_hint);
-        for group in groups {
-            let data = group.candidate_data();
-            if !data.is_split || !data.relation_confirmed {
-                continue;
-            }
-            if !format_hint.is_empty() && data.format_hint != format_hint {
-                continue;
-            }
-            if filtered_keys.iter().all(|current| {
-                data.parts()
-                    .chain(data.companions.iter().map(String::as_str))
-                    .any(|part| path_key(part) == *current)
-            }) {
-                return Some(group);
-            }
-        }
-        None
-    });
-    group.map(|group| group.to_dict(py)).transpose()
-}
-
-fn sorted_unique_paths(mut paths: Vec<String>) -> Vec<String> {
-    paths.sort_by_cached_key(|path| path_key(path));
-    paths.dedup_by(|left, right| path_key(left) == path_key(right));
-    paths
-}
-
-fn normalize_retry_format(format_hint: &str) -> &str {
-    match format_hint
-        .trim()
-        .trim_start_matches('.')
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "7z" => "7z",
-        "zip" | "zipx" => "zip",
-        "rar" => "rar",
-        _ => "",
-    }
-}
-
-pub(crate) fn volume_anchor_to_dict(py: Python<'_>, anchor: &VolumeAnchor) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("path", &anchor.path)?;
-    dict.set_item("size", anchor.size)?;
-    dict.set_item("format", &anchor.format)?;
-    dict.set_item("confidence", &anchor.confidence)?;
-    dict.set_item("standalone", anchor.standalone)?;
-    dict.set_item("multivolume", anchor.multivolume)?;
-    dict.set_item("encrypted", anchor.encrypted)?;
-    dict.set_item("needs_password", anchor.needs_password)?;
-    dict.set_item("wrong_password", anchor.wrong_password)?;
-    dict.set_item("anchor_roles", PyList::new(py, &anchor.anchor_roles)?)?;
-    dict.set_item("internal_volume_number", anchor.internal_volume_number)?;
-    dict.set_item("structure_offset", anchor.structure_offset)?;
-    dict.set_item("expected_logical_size", anchor.expected_logical_size)?;
-    dict.set_item("zip_eocd_offset", anchor.zip_eocd_offset)?;
-    dict.set_item(
-        "continuation_from_previous",
-        anchor.continuation_from_previous,
-    )?;
-    dict.set_item("continuation_to_next", anchor.continuation_to_next)?;
-    dict.set_item("sfx", anchor.sfx)?;
-    dict.set_item("pe_structure", anchor.pe_state == PeState::Confirmed)?;
-    dict.set_item("evidence", PyList::new(py, &anchor.evidence)?)?;
-    dict.set_item("error", &anchor.error)?;
-    dict.set_item("bytes_read", anchor.bytes_read)?;
-    Ok(dict.unbind())
-}
-
-fn relation_confirmed_anchor_to_dict(
-    py: Python<'_>,
-    anchor: &VolumeAnchor,
-) -> PyResult<Py<PyDict>> {
-    let dict = volume_anchor_to_dict(py, anchor)?;
-    dict.bind(py).set_item("relation_confirmed", true)?;
-    Ok(dict)
-}
-
-fn relation_to_dict(py: Python<'_>, relation: &FileRelationNative) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("filename", &relation.filename)?;
-    dict.set_item("logical_name", &relation.logical_name)?;
-    dict.set_item("split_role", &relation.split_role)?;
-    dict.set_item("is_split_member", relation.is_split_member)?;
-    dict.set_item("has_generic_001_head", relation.has_generic_001_head)?;
-    dict.set_item("is_plain_numeric_member", relation.is_plain_numeric_member)?;
-    dict.set_item("has_split_companions", relation.has_split_companions)?;
-    dict.set_item("is_split_exe_companion", relation.is_split_exe_companion)?;
-    dict.set_item(
-        "is_disguised_split_exe_companion",
-        relation.is_disguised_split_exe_companion,
-    )?;
-    dict.set_item("is_split_related", relation.is_split_related)?;
-    dict.set_item("match_rar_disguised", relation.match_rar_disguised)?;
-    dict.set_item("match_rar_head", relation.match_rar_head)?;
-    dict.set_item("match_001_head", relation.match_001_head)?;
-    dict.set_item("split_family", &relation.split_family)?;
-    dict.set_item("split_index", relation.split_index)?;
-    Ok(dict.unbind())
-}
-
-fn parsed_volume_to_dict(py: Python<'_>, parsed: &ParsedVolume) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("prefix", &parsed.prefix)?;
-    dict.set_item("number", parsed.number)?;
-    dict.set_item("style", parsed.style)?;
-    dict.set_item("width", parsed.width)?;
-    if parsed.decorated {
-        dict.set_item("decorated", true)?;
-    }
-    Ok(dict.unbind())
-}
-
-fn detect_split_role(filename: &str) -> Option<&'static str> {
-    if let Some(parsed) = parse_relation_numbered_volume(filename) {
-        return Some(if parsed.number == 1 {
-            "first"
-        } else {
-            "member"
-        });
-    }
-    None
 }
 
 fn get_logical_name(filename: &str, is_archive: bool) -> String {
@@ -2275,7 +1922,6 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(normalize_retry_format(".ZIPX"), "zip");
         assert_eq!(archive_family("ZIPX"), Some("zip"));
         for name in ["payload.zipx.part02.zipx", "payload.part02.zipx"] {
             let parsed = parse_relation_numbered_volume(name).unwrap();

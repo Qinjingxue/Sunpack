@@ -2,18 +2,16 @@
 
 **English** | [简体中文](zh-CN/configuration.md)
 
-Edit `sunpack_config.json` to change everyday settings. When running from source, use the file in the project root. For an installed copy, use `%ProgramData%\SunPack\sunpack_config.json`. `sunpack_advanced_config.json` supplies the remaining defaults.
+Edit `sunpack_config.json` to change everyday settings. For a development build, use the file in the project root. For an installed copy, use `%ProgramData%\SunPack\sunpack_config.json`. `sunpack_advanced_config.json` supplies the remaining defaults.
 
 Ordinary configuration values take precedence over the same fields in the advanced file; `SUNPACK_CONFIG_OVERRIDES` remains the final explicit override layer. Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
 
 Check your changes and view the resulting configuration:
 
 ```powershell
-python sunpack.py config validate
-python sunpack.py config show
+sunpack.exe config validate
+sunpack.exe config show
 ```
-
-For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 
 ## Common settings
 
@@ -159,7 +157,7 @@ Monitored input folders require NTFS. On startup or configuration reload, the ba
 
 Analysis recognizes only the current archive layer. GZIP, BZIP2, XZ, Zstandard and LZ4 streams are extracted first; a resulting TAR is discovered and extracted by the normal recursive pipeline. The former `tar_*` analysis modules and all `max_probe_bytes` settings have been removed. Ordinary TAR analysis starts at offset zero; only the canonical embedded scanner can supply TAR candidates at other offsets. `watch.event_log_retention_days` controls task history and event retention shared by CLI and Watch.
 
-Add a monitored directory with `python sunpack.py watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory; leaving it empty writes beside each archive. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
+Add a monitored directory with `sunpack.exe watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory; leaving it empty writes beside each archive. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
 
 ## Automatic runtime settings
 
