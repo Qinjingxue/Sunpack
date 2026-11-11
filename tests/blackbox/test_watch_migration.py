@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import subprocess
 import time
@@ -39,7 +40,7 @@ def _staged_worker(package, tmp_path):
     )
 
 
-def test_watch_resumes_missing_volumes_with_a_rebuilt_catalog(package, tmp_path):
+def test_watch_rebuild_preserves_completed_generations_and_recovers_offline_arrivals(package, tmp_path):
     watched = tmp_path / "watched"
     watched.mkdir()
     output = tmp_path / "out"
@@ -55,14 +56,24 @@ def test_watch_resumes_missing_volumes_with_a_rebuilt_catalog(package, tmp_path)
     assert len(parts) >= 3
     missing = tmp_path / parts[1].name
     parts[1].replace(missing)
+    retained = watched / "retained.zip"
+    changed = watched / "changed.zip"
+    _zip(retained, "retained.txt", b"already completed")
+    _zip(changed, "changed.txt", b"old generation")
 
     package.json("watch", "add", watched, "-o", output)
     blocked = package.run("watch", "start", "--once", "--no-tray", "--json")
     assert blocked.returncode == 1, (blocked.stdout, blocked.stderr)
     assert not list(output.rglob(payload.name))
+    retained_outputs = list(output.rglob("retained.txt"))
+    assert len(retained_outputs) == 1
+    assert [path.read_bytes() for path in output.rglob("changed.txt")] == [b"old generation"]
+    assert retained.is_file() and changed.is_file()
+    assert package.run("--persistent-shutdown").returncode == 0
 
-    # Only the disposable catalog is lost. The durable missing-volume blocker
-    # must retry even when startup has no catalog delta for the arriving peer.
+    # Lose only the disposable catalog. Kept successful sources must not replay,
+    # but a new offline file, a content edit with identical metadata, and a
+    # previously missing volume must all be admitted through the rebuilt view.
     state = package.data / ".sunpack_watch"
     roots = package.data / "sunpack_watch_roots.txt"
     assert roots.read_text(encoding="utf-8").split("|")[3].strip() == "true"
@@ -71,8 +82,25 @@ def test_watch_resumes_missing_volumes_with_a_rebuilt_catalog(package, tmp_path)
     for path in catalog:
         path.unlink()
     missing.replace(parts[1])
+    _zip(watched / "offline.zip", "offline.txt", b"arrived while stopped")
+    before = changed.stat()
+    _zip(changed, "changed.txt", b"new generation")
+    os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert changed.stat().st_size == before.st_size
     package.json("watch", "start", "--once", "--no-tray")
     assert [path.read_bytes() for path in output.rglob(payload.name)] == [content]
+    assert list(output.rglob("retained.txt")) == retained_outputs
+    assert retained_outputs[0].read_bytes() == b"already completed"
+    assert [path.read_bytes() for path in output.rglob("offline.txt")] == [b"arrived while stopped"]
+    assert sorted(path.read_bytes() for path in output.rglob("changed.txt")) == [
+        b"new generation", b"old generation",
+    ]
+    completed = sorted(path.relative_to(output) for path in output.rglob("*") if path.is_file())
+    assert package.run("--persistent-shutdown").returncode == 0
+    for path in state.glob("catalog.*.bin"):
+        path.unlink()
+    package.json("watch", "start", "--once", "--no-tray")
+    assert sorted(path.relative_to(output) for path in output.rglob("*") if path.is_file()) == completed
 
 
 def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(package, tmp_path):
@@ -156,7 +184,12 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
         with zipfile.ZipFile(incoming, "a") as archive:
             for part in parts:
                 archive.write(part, part.name)
-        incoming.write_bytes(b"carrier prefix" + incoming.read_bytes() + b"carrier suffix")
+        sibling = fixtures / "sibling.zip"
+        _zip(sibling, "sibling.txt", b"second carrier segment")
+        incoming.write_bytes(
+            b"carrier prefix" + incoming.read_bytes() + b"between segments" +
+            sibling.read_bytes() + b"carrier suffix"
+        )
         (package.data / "builtin_passwords.json").write_text(
             json.dumps({"passwords": [{"value": "crash-key"}]}), encoding="utf-8",
         )
@@ -170,7 +203,12 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
 
     def admitted():
         nonlocal batch
-        if not (output / "incoming").is_dir():
+        container = output / "incoming"
+        if not container.is_dir():
+            return False
+        if not cancel_before_crash and not any(path.is_dir() for path in container.iterdir()):
+            # Wait for the first logical segment's output reservation, which
+            # used to overwrite the carrier's durable ownership under one key.
             return False
         try:
             history = native_fixture("display_events", path=str(events))["history"]
@@ -214,6 +252,8 @@ def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(packa
     expected = [] if cancel_before_crash else [b"original generation"]
     assert [path.read_bytes() for path in output.rglob("payload.txt")] == expected
     if not cancel_before_crash:
+        assert [path.read_bytes() for path in output.rglob("sibling.txt")] == [b"second carrier segment"]
+        assert [path.name for path in output.iterdir()] == ["incoming"]
         nested_outputs = list(output.rglob("nested-payload.bin"))
         assert len(nested_outputs) == 1
         assert nested_outputs[0].read_bytes() == nested_content

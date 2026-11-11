@@ -392,11 +392,56 @@ impl Header {
 
 struct Connection<'a> {
     writer: Mutex<Writer<'a>>,
-    prompt: Mutex<Option<mpsc::SyncSender<Vec<u8>>>>,
+    prompt: Mutex<Option<Arc<mpsc::SyncSender<Vec<u8>>>>>,
     input: Mutex<PromptInput>,
     cancel: Cancellation,
     terminal_size: AtomicU32,
     flags: u32,
+}
+
+/// The cancellation wake targets this response channel, even after the control
+/// reader takes its sender and blocks receiving the rest of an input frame.
+struct PromptReply<'a> {
+    slot: &'a Mutex<Option<Arc<mpsc::SyncSender<Vec<u8>>>>>,
+    sender: Arc<mpsc::SyncSender<Vec<u8>>>,
+    receive: mpsc::Receiver<Vec<u8>>,
+    _cancellation: Option<crate::io::cancellation::Subscription>,
+}
+
+impl<'a> PromptReply<'a> {
+    fn new(
+        slot: &'a Mutex<Option<Arc<mpsc::SyncSender<Vec<u8>>>>>,
+        cancel: &Cancellation,
+    ) -> io::Result<Option<Self>> {
+        let (send, receive) = mpsc::sync_channel(1);
+        let sender = Arc::new(send);
+        {
+            let mut pending = slot.lock().unwrap();
+            if cancel.cancelled() {
+                return Ok(None);
+            }
+            if pending.is_some() {
+                return Err(io::Error::other("a prompt is already awaiting input"));
+            }
+            *pending = Some(Arc::clone(&sender));
+        }
+        let wake = Arc::clone(&sender);
+        let cancellation = cancel.subscribe(move || {
+            // Empty input is the existing EOF response. Never block a canceller
+            // if an answer already occupies the single response slot.
+            let _ = wake.try_send(Vec::new());
+        });
+        Ok(Some(Self { slot, sender, receive, _cancellation: cancellation }))
+    }
+}
+
+impl Drop for PromptReply<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap();
+        if slot.as_ref().is_some_and(|sender| Arc::ptr_eq(sender, &self.sender)) {
+            slot.take();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -521,16 +566,11 @@ impl Connection<'_> {
     }
 
     fn read_prompt_chunk(&self) -> io::Result<Option<Vec<u8>>> {
-        let (send, receive) = mpsc::sync_channel(1);
-        {
-            let mut pending = self.prompt.lock().unwrap();
-            if self.cancel.cancelled() {
-                return Ok(None);
-            }
-            *pending = Some(send);
-        }
+        let Some(reply) = PromptReply::new(&self.prompt, &self.cancel)? else {
+            return Ok(None);
+        };
         self.frame(3, &[])?;
-        Ok(receive.recv().ok())
+        Ok(reply.receive.recv().ok())
     }
 }
 
@@ -828,5 +868,38 @@ pub(super) fn submit_existing(
             1 | 2 => {}
             _ => return Err(io::ErrorKind::InvalidData.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_releases_only_its_prompt_even_during_a_partial_reply() {
+        // Client CANCEL coverage cannot catch internal cancellation while the
+        // control reader owns a response sender or a stale waiter is retiring.
+        let slot = Mutex::default();
+        let first_cancel = Cancellation::new();
+        let first = PromptReply::new(&slot, &first_cancel).unwrap().unwrap();
+        assert!(PromptReply::new(&slot, &Cancellation::new()).is_err());
+        let in_flight = slot.lock().unwrap().take().unwrap();
+        let second_cancel = Cancellation::new();
+        let second = PromptReply::new(&slot, &second_cancel).unwrap().unwrap();
+        first_cancel.cancel();
+        assert!(first.receive.recv().unwrap().is_empty());
+        drop(first);
+        assert!(slot.lock().unwrap().as_ref().is_some_and(|sender| {
+            Arc::ptr_eq(sender, &second.sender)
+        }));
+        assert!(matches!(second.receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(in_flight.send(b"late answer".to_vec()).is_err());
+        second.sender.send(b"yes".to_vec()).unwrap();
+        // A full response channel must not block cancellation.
+        second_cancel.cancel();
+        assert_eq!(second.receive.recv().unwrap(), b"yes");
+        drop(second);
+        assert!(slot.lock().unwrap().is_none());
+        assert!(PromptReply::new(&slot, &second_cancel).unwrap().is_none());
     }
 }

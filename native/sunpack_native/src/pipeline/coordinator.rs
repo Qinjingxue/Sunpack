@@ -14,6 +14,7 @@ use crate::core::config::{CleanupMode, ContentRequirement, ProcessMode, Recursio
 use crate::io::archive_state::{
     archive_input_slices, ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
 };
+use crate::io::cancellation::is_cancellation;
 use crate::io::directory_errors::{directory_error_count, DirectoryReadErrors};
 use crate::io::reader::{
     capture_directory_identity, capture_file_generation, release_reader_resources_under_roots,
@@ -38,7 +39,7 @@ use std::future::poll_fn;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::task::{Poll, Waker};
 
 pub struct Engine {
@@ -179,7 +180,7 @@ impl Engine {
             deep_options,
             analysis,
             observer,
-            recursion: Mutex::new(HashMap::new()),
+            recursion: RecursivePrompts::default(),
             output_names: OutputReservationGuard { registry: &self.output_names, owner: request_id },
             created_outputs: Mutex::default(),
             output_base,
@@ -212,10 +213,22 @@ impl Engine {
                 &request.cancel,
             )?;
         }
-        let mut executed =
+        let execute = || {
             scheduler.run(request_id, request.origin, &request.cancel, |spawner| {
                 Box::pin(run.execute_batch(discovered, 1, None, None, spawner))
-            });
+            })
+        };
+        let mut executed = if request.mode == Mode::Extract
+            && request.config.recursive_extract == Recursion::Prompt
+        {
+            run.recursion.serve(
+                &request.cancel,
+                |depth, pending| observer.allow_recursive(depth, pending),
+                execute,
+            )
+        } else {
+            execute()
+        };
         // Scheduler completion joins every writer, even on cancellation. Never
         // roll back a tree while a native job or recursive branch can write it.
         if request.cancel.cancelled() {
@@ -288,13 +301,143 @@ struct Run<'a, O> {
     deep_options: Option<NativeDirectoryScanOptions>,
     analysis: NativeAnalysisConfig,
     observer: &'a O,
-    recursion: Mutex<HashMap<usize, bool>>,
+    recursion: RecursivePrompts,
     output_names: OutputReservationGuard<'a>,
     created_outputs: Mutex<CreatedOutputs>,
     output_base: Option<PathBuf>,
     checkpoints: HashMap<CheckpointKey, Vec<usize>>,
     promoted_sources: HashMap<String, &'a PromotedSource>,
     scan_errors: Mutex<DirectoryReadErrors>,
+}
+
+/// One shared decision per depth, like main's prompt gates. Only the blocking
+/// Observer interaction runs outside Rayon; all archive waiters use the existing
+/// scheduler's Pending/Waker path and return their host admission slots.
+#[derive(Default)]
+struct RecursivePrompts {
+    decisions: Arc<Mutex<HashMap<usize, Arc<RecursiveDecision>>>>,
+    requests: OnceLock<mpsc::Sender<Option<RecursivePrompt>>>,
+}
+
+type RecursivePrompt = (usize, usize, Arc<RecursiveDecision>);
+
+#[derive(Default)]
+struct RecursiveDecision(Mutex<RecursiveDecisionState>);
+
+#[derive(Default)]
+struct RecursiveDecisionState {
+    value: Option<bool>,
+    next_waiter: u64,
+    waiters: HashMap<u64, Waker>,
+}
+
+impl RecursiveDecision {
+    fn complete(&self, value: bool) {
+        let mut state = self.0.lock().unwrap();
+        // Cancellation can settle a gate before a late input answer arrives.
+        state.value.get_or_insert(value);
+        let waiters = std::mem::take(&mut state.waiters);
+        drop(state);
+        for waker in waiters.into_values() {
+            waker.wake();
+        }
+    }
+}
+
+impl RecursivePrompts {
+    fn serve<T>(
+        &self,
+        cancel: &Cancellation,
+        prompt: impl Fn(usize, usize) -> bool + Sync,
+        execute: impl FnOnce() -> T,
+    ) -> T {
+        let (send, receive) = mpsc::channel();
+        assert!(self.requests.set(send.clone()).is_ok());
+        let decisions = Arc::clone(&self.decisions);
+        let _cancellation = cancel.subscribe(move || {
+            let decisions: Vec<_> = decisions.lock().unwrap().values().cloned().collect();
+            for decision in decisions {
+                decision.complete(false);
+            }
+        });
+        std::thread::scope(|scope| {
+            // This thread belongs to the request, not to each recursive branch.
+            // Its scoped join keeps the borrowed Observer alive until it stops.
+            let prompt = &prompt;
+            scope.spawn(move || {
+                let _panic = CancelPromptPanic(cancel);
+                while let Ok(Some((depth, pending, decision))) = receive.recv() {
+                    let allowed = !cancel.cancelled() && cancel.run(|| prompt(depth, pending));
+                    decision.complete(allowed);
+                }
+            });
+            let _close = ClosePrompts { send, cancel };
+            execute()
+        })
+    }
+
+    async fn allow(&self, depth: usize, pending: usize, cancel: &Cancellation) -> bool {
+        if cancel.cancelled() {
+            return false;
+        }
+        let (decision, first) = {
+            let mut decisions = self.decisions.lock().unwrap();
+            match decisions.entry(depth) {
+                std::collections::hash_map::Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    (Arc::clone(entry.insert(Arc::default())), true)
+                }
+            }
+        };
+        if first {
+            let request = Some((depth, pending, Arc::clone(&decision)));
+            if self.requests.get().expect("prompt service is running").send(request).is_err() {
+                decision.complete(false);
+            }
+        }
+        let mut waiter = None;
+        poll_fn(|cx| {
+            let mut state = decision.0.lock().unwrap();
+            if cancel.cancelled() {
+                return Poll::Ready(false);
+            }
+            if let Some(value) = state.value {
+                return Poll::Ready(value);
+            }
+            let id = *waiter.get_or_insert_with(|| {
+                state.next_waiter += 1;
+                state.next_waiter
+            });
+            state.waiters.insert(id, cx.waker().clone());
+            Poll::Pending
+        }).await
+    }
+}
+
+struct ClosePrompts<'a> {
+    send: mpsc::Sender<Option<RecursivePrompt>>,
+    cancel: &'a Cancellation,
+}
+
+impl Drop for ClosePrompts<'_> {
+    fn drop(&mut self) {
+        // Also release the receiver if execution unwinds before its result.
+        if std::thread::panicking() {
+            self.cancel.cancel();
+        }
+        let _ = self.send.send(None);
+    }
+}
+
+struct CancelPromptPanic<'a>(&'a Cancellation);
+
+impl Drop for CancelPromptPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // A panicking Observer must not leave the scheduler's gates parked.
+            self.0.cancel();
+        }
+    }
 }
 
 /// Shared across requests, with the same ownership rule as main's
@@ -664,7 +807,7 @@ impl<'run, O: Observer> Run<'run, O> {
         for (id, mut cancelled, branch) in executed {
             let mut branch = match branch {
                 Ok(branch) => branch,
-                Err(error) if is_cancellation(&error, &self.request.cancel) => {
+                Err(error) if is_cancellation(&error) => {
                     cancelled.failure = Some(Failure::new(
                         FailureKind::Cancelled, "Operation interrupted",
                     ));
@@ -986,7 +1129,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             self.request,
                         ) {
                             Ok(nested) => nested,
-                            Err(error) if is_cancellation(&error, cancel) => Discovered {
+                            Err(error) if is_cancellation(&error) => Discovered {
                                 tasks: Vec::new(),
                                 errors: Vec::new(),
                                 scan_errors: DirectoryReadErrors::report(),
@@ -995,7 +1138,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         };
                         drop(inventory);
                         if !nested.tasks.is_empty()
-                            && self.allow_recursive(depth + 1, nested.tasks.len())
+                            && self.allow_recursive(depth + 1, nested.tasks.len()).await
                         {
                             ran_recursive_children = true;
                             descendants = self
@@ -1827,7 +1970,7 @@ impl<'run, O: Observer> Run<'run, O> {
     fn process_or_file_failure(&self, error: io::Error, worker: bool) -> Failure {
         if crate::io::resource_error::is_memory_error(&error) {
             Failure::new(FailureKind::ResourceUnavailable, error.to_string())
-        } else if self.request.cancel.cancelled() {
+        } else if is_cancellation(&error) {
             Failure::new(FailureKind::Cancelled, "Operation interrupted")
         } else if worker {
             Failure::new(FailureKind::ProcessError, error.to_string())
@@ -1836,16 +1979,11 @@ impl<'run, O: Observer> Run<'run, O> {
         }
     }
 
-    fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
+    async fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
         if self.request.config.recursive_extract != Recursion::Prompt {
             return true;
         }
-        *self
-            .recursion
-            .lock()
-            .unwrap()
-            .entry(depth)
-            .or_insert_with(|| self.observer.allow_recursive(depth, pending))
+        self.recursion.allow(depth, pending, &self.request.cancel).await
     }
 
     fn preferred_output(&self, input: &ArchiveInput, depth: usize) -> PathBuf {
@@ -1987,7 +2125,9 @@ fn flatten_result(
     };
     let stats = match attempt() {
         Ok(stats) => stats,
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+        Err(error) if is_cancellation(&error) || error.kind() == io::ErrorKind::Interrupted => {
+            return Err(error);
+        }
         Err(error) => {
             record_cleanup(children, output, "flatten", Err(io::Error::other(error)));
             return Ok(());
@@ -2306,10 +2446,6 @@ fn remove_empty_or_promoted(output: &Path, promoted_dirs: &[String]) -> bool {
         }
         Err(_) => false,
     }
-}
-
-fn is_cancellation(error: &io::Error, cancel: &Cancellation) -> bool {
-    error.kind() == io::ErrorKind::Interrupted && cancel.cancelled()
 }
 
 fn subtree_complete(outcome: &Outcome) -> bool {
@@ -2845,6 +2981,204 @@ impl Drop for Lease<'_> {
 mod tests {
     use super::*;
 
+    fn test_run<'a, O: Observer>(
+        engine: &'a Engine,
+        request: &'a Request,
+        observer: &'a O,
+    ) -> Run<'a, O> {
+        Run {
+            engine,
+            request,
+            resolve_aliases: false,
+            candidates: CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None),
+            options: discovery::scan_options(&request.config).unwrap(),
+            deep_options: None,
+            analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
+            observer,
+            recursion: RecursivePrompts::default(),
+            output_names: OutputReservationGuard { registry: &engine.output_names, owner: 1 },
+            created_outputs: Mutex::default(),
+            output_base: None,
+            checkpoints: HashMap::new(),
+            promoted_sources: HashMap::new(),
+            scan_errors: Mutex::new(DirectoryReadErrors::report()),
+        }
+    }
+
+    #[test]
+    fn recursive_prompt_parks_siblings_and_shares_each_depth_decision() {
+        use std::time::Duration;
+
+        struct Prompt {
+            entered: mpsc::Sender<usize>,
+            answer: Mutex<mpsc::Receiver<bool>>,
+        }
+        impl Observer for Prompt {
+            fn notify(&self, _: Event) {}
+            fn allow_recursive(&self, depth: usize, _: usize) -> bool {
+                self.entered.send(depth).unwrap();
+                self.answer.lock().unwrap().recv().unwrap()
+            }
+        }
+        // The generic parked-task test does not exercise the blocking Observer
+        // callback or same-depth prompt sharing. Withhold input until unrelated
+        // work actually runs on the only host slot, for both yes and no answers.
+        for answer in [true, false] {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let mut request = Request::new(Vec::new(), Mode::Extract);
+            Arc::make_mut(&mut request.config).recursive_extract = Recursion::Prompt;
+            let (entered, prompts) = mpsc::channel();
+            let (respond, responses) = mpsc::channel();
+            let observer = Prompt { entered, answer: Mutex::new(responses) };
+            let run = test_run(&engine, &request, &observer);
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+            let scheduler = pool.install(Scheduler::new);
+            std::thread::scope(|scope| {
+                let prompted = scope.spawn(|| {
+                    run.recursion.serve(
+                        &request.cancel,
+                        |depth, pending| observer.allow_recursive(depth, pending),
+                        || scheduler.run(1, Origin::Foreground, &request.cancel, |spawner| {
+                            let run = &run;
+                            Box::pin(async move {
+                                let results = spawner.bounded_map(vec![(); 8], move |_| {
+                                    Box::pin(run.allow_recursive(2, 1))
+                                }).await;
+                                assert_eq!(run.allow_recursive(2, 1).await, answer);
+                                let next_depth = run.allow_recursive(3, 1).await;
+                                (results, next_depth)
+                            })
+                        }),
+                    )
+                });
+                assert_eq!(prompts.recv_timeout(Duration::from_secs(10)).unwrap(), 2);
+                let (finished, completed) = mpsc::channel();
+                let independent = scope.spawn(|| {
+                    scheduler.run(2, Origin::Watch, &Cancellation::new(), |_| {
+                        Box::pin(async move { finished.send(()).unwrap() })
+                    });
+                });
+                let admitted = completed.recv_timeout(Duration::from_secs(10));
+                // Release the prompt even on a scheduling regression so both
+                // requests can join before the assertion reports the failure.
+                respond.send(answer).unwrap();
+                assert_eq!(prompts.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
+                respond.send(!answer).unwrap();
+                let (results, next_depth) = prompted.join().unwrap();
+                independent.join().unwrap();
+                admitted.expect("recursive prompt held the shared host slot");
+                assert_eq!(results, vec![answer; 8]);
+                assert_eq!(next_depth, !answer);
+                assert!(prompts.try_recv().is_err(), "same depth asked more than once");
+            });
+        }
+    }
+
+    #[test]
+    fn cancelled_or_panicking_prompt_wakes_siblings_and_joins_its_callback() {
+        use std::time::Duration;
+
+        // Verify cancellation wakes every archive independently of a still
+        // returning input callback, and a callback panic cannot strand gates.
+        for panic in [false, true] {
+            let cancel = Cancellation::new();
+            let prompts = RecursivePrompts::default();
+            let scheduler = Scheduler::new();
+            let (entered, entering) = mpsc::channel();
+            let (respond, response) = mpsc::channel();
+            let response = Mutex::new(response);
+            let (finished, completed) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let request = scope.spawn(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        prompts.serve(&cancel, |_, _| {
+                            entered.send(()).unwrap();
+                            assert!(!panic, "observer prompt panic");
+                            response.lock().unwrap().recv().unwrap()
+                        }, || scheduler.run(1, Origin::Foreground, &cancel, |spawner| {
+                            let prompts = &prompts;
+                            let cancel = &cancel;
+                            let finished = &finished;
+                            Box::pin(async move {
+                                let results = spawner.bounded_map(vec![(); 8], move |_| {
+                                    Box::pin(prompts.allow(2, 1, cancel))
+                                }).await;
+                                finished.send(()).unwrap();
+                                results
+                            })
+                        }))
+                    }))
+                });
+                entering.recv_timeout(Duration::from_secs(10)).unwrap();
+                if !panic {
+                    cancel.cancel();
+                }
+                let woke = completed.recv_timeout(Duration::from_secs(10));
+                if !panic {
+                    // A late yes must not replace the cancellation decision.
+                    respond.send(true).unwrap();
+                }
+                let result = request.join().unwrap();
+                woke.expect("cancellation left recursive siblings parked");
+                assert!(cancel.cancelled());
+                if panic {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), vec![false; 8]);
+                }
+                for decision in prompts.decisions.lock().unwrap().values() {
+                    assert!(decision.0.lock().unwrap().waiters.is_empty());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn cancelled_batch_does_not_swallow_unrelated_journal_io_errors() {
+        struct JournalFailure(Cancellation, io::ErrorKind);
+        impl Observer for JournalFailure {
+            fn notify(&self, _: Event) {}
+            fn claim_sources(&self, _: &Path, _: &[String], _: usize) -> io::Result<()> {
+                self.0.cancel();
+                Err(io::Error::new(self.1, "journal failure"))
+            }
+        }
+        // The cancelled-child outcome regression alone would still pass if all
+        // IO errors were swallowed whenever the request token was cancelled.
+        for kind in [io::ErrorKind::Other, io::ErrorKind::Interrupted] {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(Vec::new(), Mode::Extract);
+            let observer = JournalFailure(request.cancel.clone(), kind);
+            let run = test_run(&engine, &request, &observer);
+            let batch = Discovered {
+                tasks: vec![Task {
+                    inputs: vec![LogicalInput {
+                        input: ArchiveInput::file("child.zip".into(), "zip".into(), "child".into()),
+                        password: None,
+                        failure: Some(Failure::new(FailureKind::Damaged, "preflight failure")),
+                    }],
+                    owned_paths: Vec::new(),
+                    source: DiscoverySource::Direct,
+                    retry: None,
+                }],
+                errors: Vec::new(),
+                scan_errors: DirectoryReadErrors::report(),
+            };
+            let error = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
+                Box::pin(run.execute_batch(batch, 2, None, None, spawner))
+            }).unwrap_err();
+            assert!(request.cancel.cancelled());
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "journal failure");
+            assert_eq!(run.process_or_file_failure(io::Error::new(kind, "filesystem failure"), false).kind,
+                FailureKind::FilesystemError);
+            assert_eq!(run.process_or_file_failure(io::Error::new(kind, "worker failure"), true).kind,
+                FailureKind::ProcessError);
+            assert_eq!(run.process_or_file_failure(request.cancel.check_io().unwrap_err(), false).kind,
+                FailureKind::Cancelled);
+        }
+    }
+
     #[test]
     fn conflicting_output_ancestor_preserves_alias_spelling() {
         for spelling in ["physical", "junction-alias"] {
@@ -3068,23 +3402,7 @@ mod tests {
         let engine = Engine::new(PathBuf::from("unused-worker"));
         let request = Request::new(Vec::new(), Mode::Extract);
         let observer = CancelOnQueue(request.cancel.clone());
-        let run = Run {
-            engine: &engine,
-            request: &request,
-            resolve_aliases: false,
-            candidates: CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None),
-            options: discovery::scan_options(&request.config).unwrap(),
-            deep_options: None,
-            analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
-            observer: &observer,
-            recursion: Mutex::default(),
-            output_names: OutputReservationGuard { registry: &engine.output_names, owner: 1 },
-            created_outputs: Mutex::default(),
-            output_base: None,
-            checkpoints: HashMap::new(),
-            promoted_sources: HashMap::new(),
-            scan_errors: Mutex::new(DirectoryReadErrors::report()),
-        };
+        let run = test_run(&engine, &request, &observer);
         let input = ArchiveInput::file("parent/child.zip".into(), "zip".into(), "child".into());
         let parent = receipt(&input, DiscoverySource::Direct, 1);
         let batch = Discovered {
@@ -3103,7 +3421,7 @@ mod tests {
         assert_eq!(outcome.archives.len(), 1);
         assert_eq!(outcome.archives[0].failure.as_ref().unwrap().kind, FailureKind::Cancelled);
         assert!(!subtree_complete(&outcome));
-        assert!(!is_cancellation(&io::Error::other("journal failure"), &request.cancel));
+        assert!(!is_cancellation(&io::Error::other("journal failure")));
     }
 
     #[test]

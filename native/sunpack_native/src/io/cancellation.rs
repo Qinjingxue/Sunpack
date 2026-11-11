@@ -121,9 +121,26 @@ impl Cancellation {
     }
 }
 
-fn cancelled_io() -> io::Error {
+pub(crate) fn cancelled_io() -> io::Error {
     // Interrupted is automatically retried by Read::read_exact/read_to_end.
-    io::Error::other("native operation cancelled")
+    io::Error::other(Cancelled)
+}
+
+/// Keep cancellation distinguishable from real IO failures with the same kind.
+/// In particular, Interrupted cannot be used because Read retries it internally.
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("native operation cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+pub(crate) fn is_cancellation(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|error| error.is::<Cancelled>())
 }
 
 pub(crate) struct Subscription {
@@ -190,6 +207,40 @@ mod tests {
     use super::*;
     use crate::io::{iocp, ScanBatch};
     use std::sync::mpsc;
+
+    #[test]
+    fn cancellation_marker_preserves_io_errors_and_stops_read_retry_helpers() {
+        use std::io::Read;
+
+        // A kind-only test misses both false-positive Interrupted errors and
+        // the standard Read helpers silently retrying genuine cancellation.
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        for error in [
+            cancel.check().unwrap_err(),
+            cancel.check_io().unwrap_err(),
+            cancel.run(Cancellation::check_current_io).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(is_cancellation(&error));
+        }
+        for kind in [io::ErrorKind::Other, io::ErrorKind::Interrupted] {
+            assert!(!is_cancellation(&io::Error::new(kind, "native operation cancelled")));
+        }
+        struct CancelledRead<'a>(&'a Cancellation, usize);
+        impl Read for CancelledRead<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.1 += 1;
+                assert_eq!(self.1, 1, "Read retried a cancelled operation");
+                self.0.check_io()?;
+                Ok(0)
+            }
+        }
+        let error = CancelledRead(&cancel, 0).read_exact(&mut [0; 1]).unwrap_err();
+        assert!(is_cancellation(&error));
+        let error = CancelledRead(&cancel, 0).read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(is_cancellation(&error));
+    }
 
     #[test]
     fn cancellation_drains_live_scan_and_preserves_other_requests() {

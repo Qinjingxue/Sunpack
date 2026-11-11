@@ -67,6 +67,24 @@ fn key(path: &Path) -> String {
     watch_path_key(&path.to_string_lossy())
 }
 
+fn resolve_output(root: &Path, value: &str) -> io::Result<PathBuf> {
+    // Resolve the current-user home prefix before making a relative output
+    // path absolute against its Watch input root.
+    if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
+        let home = std::env::var_os("USERPROFILE").or_else(|| {
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = std::env::var_os("HOMEDRIVE").unwrap_or_default();
+            home.push(path);
+            Some(home)
+        });
+        if let Some(home) = home {
+            let path = PathBuf::from(home).join(value[1..].trim_start_matches(['/', '\\']));
+            return cli::resolve(root, &path.to_string_lossy());
+        }
+    }
+    cli::resolve(root, value)
+}
+
 fn roots_path(cwd: &Path) -> io::Result<PathBuf> {
     Ok(resources::writable_data_dir(cwd)?.join(ROOTS_FILE))
 }
@@ -98,7 +116,7 @@ fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
         let output = fields
             .next()
             .filter(|output| !output.is_empty())
-            .map(|output| cli::resolve(&input, output))
+            .map(|output| resolve_output(&input, output))
             .transpose()?;
         let mut boolean = || match fields.next().unwrap_or("").to_ascii_lowercase().as_str() {
             "" | "false" => Ok(false),
@@ -421,7 +439,7 @@ impl Watch {
                 }
                 roots.push(Root {
                     path: root.clone(),
-                    output: output.map(|value| cli::resolve(root, value)).transpose()?,
+                    output: output.map(|value| resolve_output(root, value)).transpose()?,
                     deep,
                     recursive,
                     scanned: false,
@@ -774,6 +792,99 @@ impl Drop for FileObserver {
     }
 }
 
+struct RootObserver {
+    observer: FileObserver,
+    identity: String,
+}
+
+impl RootObserver {
+    fn matches(&self, path: &Path) -> bool {
+        key(path) == key(&self.observer.path)
+            && !self.observer.stopping.load(Ordering::Acquire)
+            && output_identity(&path.to_string_lossy()).is_ok_and(|identity| identity == self.identity)
+    }
+
+    fn start(
+        directory: &Path,
+        root: &Root,
+        scope: Option<NativeDiscoveryScope>,
+        hub: &Arc<Hub>,
+    ) -> io::Result<Self> {
+        let identity = output_identity(&directory.to_string_lossy())?;
+        let id = key(&root.path);
+        let watched_dir = directory.to_owned();
+        let recursive = scope.is_some() && root.recursive;
+        let hub = Arc::clone(hub);
+        let observer = FileObserver::start(directory, recursive, move |names| {
+            let paths = names.map(|names| {
+                names.into_iter().map(|name| watched_dir.join(name)).filter(|path| {
+                    scope.as_ref().map_or_else(
+                        // A parent sentinel only reacts to the root or a
+                        // missing ancestor, never unrelated sibling traffic.
+                        || { let path = key(path); path == id || is_path_under(&id, &path) },
+                        |scope| scope.contains(&path.to_string_lossy()),
+                    )
+                }).collect::<Vec<_>>()
+            });
+            if paths.as_ref().is_none_or(|paths| !paths.is_empty()) {
+                hub.update(|signals| {
+                    signals.changed_roots.entry(id.clone()).or_default()
+                        .extend(paths.into_iter().flatten());
+                });
+            }
+        })?;
+        Ok(Self { observer, identity })
+    }
+}
+
+#[derive(Default)]
+struct RootObservers {
+    root: Option<RootObserver>,
+    parent: Option<RootObserver>,
+}
+
+impl RootObservers {
+    fn rearm(
+        &mut self,
+        root: &Root,
+        scope: &NativeDiscoveryScope,
+        hub: &Arc<Hub>,
+    ) -> (bool, Vec<io::Error>) {
+        // Arm the parent first. A rename between the identity probe and the
+        // root subscription is then replayed through the existing Hub loop.
+        let mut errors = Vec::new();
+        let parent = root.path.parent().and_then(nearest_directory);
+        if self.parent.as_ref().is_some_and(|observer| {
+            parent.is_none_or(|path| !observer.matches(path))
+        }) {
+            self.parent.take();
+        }
+        if self.parent.is_none() {
+            if let Some(parent) = parent {
+                match RootObserver::start(parent, root, None, hub) {
+                    Ok(observer) => self.parent = Some(observer),
+                    Err(error) => errors.push(io::Error::new(error.kind(), format!(
+                        "Parent observer {}: {error}", parent.display(),
+                    ))),
+                }
+            }
+        }
+        // A root can grant access even when its parent only permits traversal.
+        // Failure of the extra sentinel must not disable the root subscription.
+        let replaced = self.root.as_ref().is_some_and(|observer| !observer.matches(&root.path));
+        if replaced {
+            self.root.take();
+        }
+        if self.root.is_none() && root.path.is_dir() {
+            match RootObserver::start(&root.path, root, Some(scope.clone()), hub) {
+                Ok(observer) => self.root = Some(observer),
+                Err(error) => errors.push(error),
+            }
+        }
+        (replaced, errors)
+    }
+}
+
 struct Pending {
     root: String,
     candidate: WatchCandidateRow,
@@ -838,7 +949,7 @@ struct ClaimedSources {
 impl ClaimedSources {
     fn capture(&mut self, members: &[String]) -> io::Result<()> {
         if self.cancelled {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "Watch batch cancelled"));
+            return Err(crate::io::cancellation::cancelled_io());
         }
         for member in members {
             let id = watch_path_key(member);
@@ -897,7 +1008,7 @@ struct Scheduler {
     deep_options: NativeDirectoryScanOptions,
     passwords: Arc<BuiltinStore>,
     hub: Arc<Hub>,
-    root_observers: HashMap<String, FileObserver>,
+    root_observers: HashMap<String, RootObservers>,
     config_observers: Vec<FileObserver>,
     pending: HashMap<String, Pending>,
     unpublished: HashSet<String>,
@@ -975,6 +1086,9 @@ impl Scheduler {
         scheduler.reconcile_shell();
         windows::configure_priority(&scheduler.engine, scheduler.settings.runtime.process_mode);
         scheduler.recover_pending(None)?;
+        if !scheduler.continuous && scheduler.settings.watch.clipboard_monitor_enabled {
+            scheduler.merge_clipboard(&crate::core::passwords::clipboard_passwords())?;
+        }
         scheduler.password_update()?;
         scheduler.checkpoint(&HashMap::new(), true, true)?;
         scheduler.retry_missing_volumes(None)?;
@@ -1233,57 +1347,22 @@ impl Scheduler {
         }
         self.available_roots.retain(|id| next.contains_key(id));
         self.roots = next;
-        self.rearm_root_observers();
+        self.rearm_root_observers(None);
         Ok(())
     }
 
-    fn rearm_root_observers(&mut self) {
-        self.root_observers.retain(|id, observer| {
-            self.roots
-                .get(id)
-                .and_then(|(root, _)| nearest_directory(&root.path))
-                .is_some_and(|path| {
-                    key(path) == key(&observer.path) && !observer.stopping.load(Ordering::Acquire)
-                })
-        });
-        for (id, (root, scope)) in &self.roots {
-            if self.root_observers.contains_key(id) {
-                continue;
+    fn rearm_root_observers(&mut self, changed: Option<&HashMap<String, HashSet<PathBuf>>>) {
+        self.root_observers.retain(|id, _| self.roots.contains_key(id));
+        for (id, (root, scope)) in self.roots.iter()
+            .filter(|(id, _)| changed.is_none_or(|changed| changed.contains_key(*id)))
+        {
+            let (replaced, errors) = self.root_observers.entry(id.clone()).or_default()
+                .rearm(root, scope, &self.hub);
+            if replaced {
+                self.available_roots.remove(id);
             }
-            let Some(directory) = nearest_directory(&root.path) else {
-                continue;
-            };
-            let recursive = root.recursive && directory == root.path;
-            let key = id.clone();
-            let filter = (directory == root.path).then(|| scope.clone());
-            let directory = directory.to_owned();
-            let watched_dir = directory.clone();
-            let hub = Arc::clone(&self.hub);
-            let observer = FileObserver::start(&directory, recursive, move |names| {
-                let paths = names.map(|names| {
-                    names
-                        .into_iter()
-                        .map(|name| watched_dir.join(name))
-                        .filter(|path| {
-                            filter
-                                .as_ref()
-                                .is_none_or(|scope| scope.contains(&path.to_string_lossy()))
-                        })
-                        .collect::<Vec<_>>()
-                });
-                if paths.as_ref().is_none_or(|paths| !paths.is_empty()) {
-                    hub.update(|signals| {
-                        signals
-                            .changed_roots
-                            .entry(key.clone())
-                            .or_default()
-                            .extend(paths.into_iter().flatten());
-                    });
-                }
-            });
-            match observer {
-                Ok(observer) => { self.root_observers.insert(id.clone(), observer); }
-                Err(error) => self.journal.log(json!({"event":"watch_root_unavailable","root":root.path,"error":error.to_string()})),
+            for error in errors {
+                self.journal.log(json!({"event":"watch_root_unavailable","root":root.path,"error":error.to_string()}));
             }
         }
     }
@@ -1378,16 +1457,7 @@ impl Scheduler {
                 let _ = waiter.send(self.journal.rebuild_log());
             }
             if let Some(clipboard) = signals.clipboard {
-                match self.passwords.merge_clipboard(
-                    &clipboard,
-                    self.settings.watch.clipboard_builtin_max_entries,
-                ) {
-                    Ok(true) => self.password_update()?,
-                    Ok(false) => {}
-                    Err(error) => self.journal.log(json!({
-                        "event":"watch_clipboard_password_save_failed", "error":error.to_string(),
-                    })),
-                }
+                self.merge_clipboard(&clipboard)?;
             }
             if signals.password_changed || !signals.reload_waiters.is_empty() {
                 self.password_update()?;
@@ -1419,8 +1489,8 @@ impl Scheduler {
                 || !signals.changed_roots.is_empty()
                 || !signals.once.is_empty()
             {
-                self.rearm_root_observers();
                 let all_roots = signals.volumes_changed || !signals.once.is_empty();
+                self.rearm_root_observers((!all_roots).then_some(&signals.changed_roots));
                 let result = self
                     .checkpoint(&signals.changed_roots, all_roots, false)
                     .and_then(|_| {
@@ -2160,6 +2230,20 @@ impl Scheduler {
         Ok(())
     }
 
+    fn merge_clipboard(&mut self, clipboard: &[String]) -> io::Result<()> {
+        match self.passwords.merge_clipboard(
+            clipboard,
+            self.settings.watch.clipboard_builtin_max_entries,
+        ) {
+            Ok(true) => self.password_update()?,
+            Ok(false) => {}
+            Err(error) => self.journal.log(json!({
+                "event":"watch_clipboard_password_save_failed", "error":error.to_string(),
+            })),
+        }
+        Ok(())
+    }
+
     fn password_update(&mut self) -> io::Result<()> {
         let snapshot = match self.passwords.reload() {
             Ok(snapshot) => snapshot,
@@ -2343,7 +2427,7 @@ impl Scheduler {
             });
             let mut revisit = BTreeMap::new();
             let mut cleanup_failed = false;
-            for (task, output) in &pending.active_outputs {
+            for (task, output) in pending.active_outputs.iter() {
                 if pending.committed_roots.contains(output) || borrowed == Some(output.as_str()) {
                     continue;
                 }
@@ -2780,10 +2864,11 @@ impl Scheduler {
             request.discovery_scope = Some(scope.clone());
             request.watch_catalog = Some(Arc::clone(&self.catalog));
         }
+        let mut outputs = BTreeMap::new();
         for candidate in &candidates {
-            request
-                .checkpoints
-                .extend(self.checkpoints_for(&candidate.path)?);
+            request.checkpoints.extend(restore_checkpoints(
+                self.journal.state(), &candidate.path, &mut outputs,
+            )?);
             if let Some(entry) = self.journal.state().entry(&candidate.path) {
                 if let Some(receipts) = entry.failure_payload.get("promoted_sources") {
                     let sources = Vec::<PromotedSource>::deserialize(receipts)?;
@@ -2827,7 +2912,7 @@ impl Scheduler {
                     journal,
                     owners,
                     scope,
-                    outputs: Mutex::default(),
+                    outputs: Mutex::new(outputs),
                     batch: worker_batch,
                     toast: worker_toast,
                     hub: Arc::clone(&hub),
@@ -2875,10 +2960,6 @@ impl Scheduler {
             },
         );
         Ok(())
-    }
-
-    fn checkpoints_for(&self, owner: &str) -> io::Result<Vec<crate::pipeline::InputCheckpoint>> {
-        input_checkpoints(self.journal.state(), owner).collect()
     }
 
     fn cancel_display_batch(&mut self, id: &str) -> bool {
@@ -3286,9 +3367,16 @@ impl Scheduler {
                     .log(json!({"event":event,"path":canonical,"owner":batch,
                     "error":error,"output_dirs":outputs,"retire_group":true}));
             }
+            let record = record.filter(|entry| entry.status != "failed_terminal").or_else(|| {
+                // The catalog is disposable. Retain the accepted generation of
+                // a finished source in the task WAL, not a fresh probe that could
+                // accidentally acknowledge a replacement written during cleanup.
+                (!completed.cancelled && !NativePresence::at(&candidate.path).is_absent())
+                    .then(|| Arc::new(observed_entry(&candidate, "processed", None)))
+            });
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
                 &candidate.path,
-                record.filter(|entry| entry.status != "failed_terminal"),
+                record,
             ));
         }
         self.journal.commit(true, |state| {
@@ -3870,6 +3958,27 @@ fn finish_flatten(journal: &journal::Journal, root: &str) -> io::Result<()> {
     })
 }
 
+fn restore_checkpoints(
+    state: &crate::watch_store::NativeWatchState,
+    owner: &str,
+    outputs: &mut BTreeMap<String, String>,
+) -> io::Result<Vec<crate::pipeline::InputCheckpoint>> {
+    let checkpoints = input_checkpoints(state, owner).collect::<io::Result<Vec<_>>>()?;
+    // Reusing a receipt deliberately skips register_output's exclusive create.
+    // Restore its routing separately, before the engine discovers children.
+    for checkpoint in &checkpoints {
+        outputs.insert(key(checkpoint.output()), owner.to_owned());
+    }
+    if let Some(pending) = state.pending(owner) {
+        // The enclosing output can differ from an individual logical input's
+        // output (carrier siblings and completed flatten operations).
+        for container in pending.committed_roots.iter() {
+            outputs.insert(watch_path_key(container), owner.to_owned());
+        }
+    }
+    Ok(checkpoints)
+}
+
 fn input_checkpoints<'a>(
     state: &'a crate::watch_store::NativeWatchState,
     owner: &str,
@@ -3996,7 +4105,7 @@ mod tests {
         assert!(claimed.candidates[&key(&late)].is_none());
         assert!(claimed.candidates[&watch_path_key(&unreadable)].is_none());
         claimed.cancelled = true;
-        assert_eq!(claimed.capture(&members).unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(crate::io::cancellation::is_cancellation(&claimed.capture(&members).unwrap_err()));
         fs::remove_file(head).unwrap();
         fs::remove_file(sibling).unwrap();
         fs::remove_file(late).unwrap();
@@ -4026,6 +4135,85 @@ mod tests {
         drop(observer);
         fs::remove_dir_all(directory).unwrap();
         fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
+        let source = crate::test_support::temp_file("watch_checkpoint_owner", b"outer archive");
+        let directory = source.with_extension("state");
+        let container = directory.join("output");
+        let output = container.join("logical-input");
+        fs::create_dir_all(&output).unwrap();
+        let owner = source.to_str().unwrap();
+        {
+            let journal = journal::Journal::open(&directory).unwrap();
+            journal.commit(true, |state| {
+                state.pending_operations(
+                    [(PendingObservation(owner.to_owned(), 13, 1.0, String::new(), 0),
+                        String::new(), None)],
+                    false, "", false, true, None,
+                ).map(|(operations, _)| operations)
+            }).unwrap();
+            journal.commit(true, |state| {
+                Ok(state.output_operation(owner, owner.to_owned(),
+                    container.to_str().unwrap().to_owned(), None, Vec::new())?.unwrap())
+            }).unwrap();
+            journal.commit(true, |state| {
+                let mut operations = state.output_operation(owner, owner.to_owned(),
+                    container.to_str().unwrap().to_owned(), Some(true), Vec::new())?.unwrap();
+                operations.extend(NativeWatchOperations::checkpoint(owner, output.to_str().unwrap(), Some(json!({
+                    "schema_version":1,"carrier":source,
+                    "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
+                    "sources":[{"path":source,"generation":capture_file_generation(&source)?.persisted()}],
+                    "output":{"path":output,"identity":capture_directory_identity(&output)?},
+                    "container":{"path":container,"identity":capture_directory_identity(&container)?},
+                    "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",
+                    "children_complete":false,"remaining_depth":2,
+                }))));
+                Ok(operations)
+            }).unwrap();
+            journal.flush().unwrap();
+        }
+        {
+            let journal = Arc::new(journal::Journal::open(&directory).unwrap());
+            let mut outputs = BTreeMap::new();
+            let checkpoints = restore_checkpoints(journal.state(), owner, &mut outputs).unwrap();
+            assert_eq!(checkpoints.len(), 1);
+            let observer = WatchObserver {
+                journal: Arc::clone(&journal),
+                owners: HashMap::from([(key(&source), owner.to_owned())]),
+                scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
+                outputs: Mutex::new(outputs),
+                batch: Arc::from("restored"),
+                toast: None,
+                hub: Arc::new(Hub::new()),
+                groups: Arc::default(),
+                claimed: Arc::default(),
+                promoted: Mutex::default(),
+            };
+            assert_eq!(observer.owner_for_path(&output.join("nested.zip")).as_deref(), Some(owner));
+            // A carrier's enclosing output need not be a logical receipt's
+            // output. Restoring it must not attempt an exclusive re-create.
+            let nested = container.join("nested.zip");
+            let nested_output = container.join("nested");
+            fs::write(&nested, b"nested archive").unwrap();
+            let archive = ArchiveResult {
+                path: nested.clone(), format: "zip".into(), output: None, failure: None,
+                files: 0, bytes: 0, encrypted: None, depth: 2, offset: 0,
+                end_offset: None, volume_completeness: None, volume_attempts: None,
+                source_paths: vec![nested.clone()], password: None,
+                discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
+                partial: false, retained: false, recovered_complete_files: 0,
+                promoted: false, promotion_original_path: None,
+            };
+            observer.register_output(&archive, &nested_output).unwrap();
+            assert!(nested_output.is_dir());
+            assert_eq!(observer.owner_for_path(&nested_output).as_deref(), Some(owner));
+            assert!(journal.state().pending(owner).unwrap().active_outputs
+                .values().any(|path| key(Path::new(path)) == key(&nested_output)));
+        }
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(source).unwrap();
     }
 
     #[test]

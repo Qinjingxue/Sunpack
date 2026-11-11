@@ -94,6 +94,75 @@ impl PathSet {
     }
 }
 
+// A carrier and its logical segments can have the same physical source.
+// Keep their output ownership independent without inventing synthetic paths.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
+pub(crate) struct ActiveOutputs(BTreeMap<String, Vec<String>>);
+
+impl<'de> Deserialize<'de> for ActiveOutputs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Outputs {
+            Single(String),
+            Multiple(Vec<String>),
+        }
+        let values = BTreeMap::<String, Outputs>::deserialize(deserializer)?;
+        Ok(Self(values.into_iter().map(|(task, outputs)| {
+            let outputs = match outputs {
+                Outputs::Single(output) => vec![output],
+                Outputs::Multiple(outputs) => outputs,
+            };
+            (task, outputs)
+        }).collect()))
+    }
+}
+
+impl ActiveOutputs {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &String> {
+        self.0.values().flatten()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter().flat_map(|(task, outputs)| outputs.iter().map(move |output| (task, output)))
+    }
+
+    fn contains(&self, task: &str, output: &str) -> bool {
+        self.0.get(task).is_some_and(|outputs| outputs.iter().any(|value| value == output))
+    }
+
+    fn insert(&mut self, task: String, output: String) {
+        let outputs = self.0.entry(task).or_default();
+        if !outputs.contains(&output) {
+            outputs.push(output);
+        }
+    }
+
+    fn remove(&mut self, task: &str, output: &str) {
+        if let Some(outputs) = self.0.get_mut(task) {
+            outputs.retain(|value| value != output);
+            if outputs.is_empty() {
+                self.0.remove(task);
+            }
+        }
+    }
+
+    fn relocate(&mut self, relocate: impl Fn(&str) -> String) {
+        self.0 = std::mem::take(&mut self.0).into_iter()
+            .map(|(task, outputs)| (relocate(&task), outputs.iter().map(|output| relocate(output)).collect()))
+            .collect();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum OutputChange {
     Start {
@@ -126,14 +195,7 @@ impl PendingRecord {
                 output,
                 identity,
             } => {
-                if let Some(old) = self.active_outputs.insert(task.clone(), output.clone()) {
-                    if old != *output
-                        && !self.committed_roots.contains(&old)
-                        && !self.active_outputs.values().any(|p| p == &old)
-                    {
-                        self.output_identities.remove(&old);
-                    }
-                }
+                self.active_outputs.insert(task.clone(), output.clone());
                 self.output_identities
                     .insert(output.clone(), identity.clone());
             }
@@ -143,12 +205,24 @@ impl PendingRecord {
                 keep,
                 identity,
             } => {
-                let old = self.active_outputs.remove(task);
+                self.active_outputs.remove(task, output);
                 let removed = if *keep {
-                    if path_key(task) != path_key(&self.path) {
+                    if path_key(task) != path_key(&self.path)
+                        && !self.active_outputs.keys().any(|active| active == task)
+                    {
                         self.completed_sources.insert(task.clone());
                     }
-                    self.committed_roots.retain_root(output)
+                    let output_key = path_key(output);
+                    let mut removed = self.committed_roots.retain_root(output);
+                    // Once a segment commits, its enclosing active carrier is
+                    // no longer disposable. Unfinished siblings remain active
+                    // and can still be removed individually on recovery.
+                    for (source, parent) in self.active_outputs.iter() {
+                        if source == task && is_path_under(&output_key, &path_key(parent)) {
+                            removed.extend(self.committed_roots.retain_root(parent));
+                        }
+                    }
+                    removed
                 } else {
                     self.completed_sources.remove_under(output);
                     self.committed_roots.remove_under(output)
@@ -159,7 +233,6 @@ impl PendingRecord {
                 }
                 for path in removed
                     .iter()
-                    .chain(old.iter())
                     .chain(std::iter::once(output))
                 {
                     if !self.committed_roots.contains(path)
@@ -194,10 +267,7 @@ impl PendingRecord {
                         path.to_owned()
                     }
                 };
-                self.active_outputs = std::mem::take(&mut self.active_outputs)
-                    .into_iter()
-                    .map(|(task, output)| (relocate(&task), relocate(&output)))
-                    .collect();
+                self.active_outputs.relocate(&relocate);
                 for path in self.committed_roots.remove_under(source) {
                     self.committed_roots.retain_root(&relocate(&path));
                 }
@@ -270,7 +340,7 @@ pub(crate) struct PendingRecord {
     pub(crate) internal_recovery: bool,
     pub(crate) discovery_scope: Map<String, Value>,
     pub(crate) durable_owner: bool,
-    pub(crate) active_outputs: BTreeMap<String, String>,
+    pub(crate) active_outputs: ActiveOutputs,
     pub(crate) committed_roots: PathSet,
     pub(crate) completed_sources: PathSet,
     pub(crate) output_identities: BTreeMap<String, String>,
@@ -493,7 +563,7 @@ impl StateData {
             }
             Operation::Delete(Collection::Pending, key) => {
                 self.pending.remove(key);
-                if !self.entries.contains_key(key) {
+                if self.entries.get(key).is_none_or(|entry| entry.status == "processed") {
                     self.retire_checkpoints(key);
                 }
             }
@@ -562,15 +632,18 @@ impl NativeWatchOperations {
 
     pub(crate) fn finish_pending(path: &str, entry: Option<Arc<EntryRecord>>) -> Self {
         let key = path_key(path);
-        let retry = match entry {
-            Some(entry) => Operation::PutEntry(key.clone(), entry),
-            None => Operation::Delete(Collection::Entries, key.clone()),
-        };
+        let mut operations = Vec::with_capacity(3);
+        // Clear the old blocker projection before publishing a compact terminal
+        // observation. Both changes and pending retirement share one WAL record.
+        if entry.as_ref().is_none_or(|entry| entry.status == "processed") {
+            operations.push(Operation::Delete(Collection::Entries, key.clone()));
+        }
+        if let Some(entry) = entry {
+            operations.push(Operation::PutEntry(key.clone(), entry));
+        }
+        operations.push(Operation::Delete(Collection::Pending, key));
         Self {
-            operations: Arc::new(Operations(vec![
-                retry,
-                Operation::Delete(Collection::Pending, key),
-            ])),
+            operations: Arc::new(Operations(operations)),
         }
     }
 
@@ -834,7 +907,7 @@ impl NativeWatchState {
                 let removed = if let (Some(_), Operation::Delete(Collection::Entries, path)) =
                     (&events, operation)
                 {
-                    data.entries.get(path).cloned()
+                    data.entries.get(path).filter(|record| record.status != "processed").cloned()
                 } else {
                     None
                 };
@@ -998,7 +1071,7 @@ impl NativeWatchState {
                 return Ok(None);
             };
             if let Some(keep) = keep {
-                if !record.active_outputs.contains_key(&task) {
+                if !record.active_outputs.contains(&task, &output) {
                     if !keep {
                         return Ok(None);
                     }
@@ -1010,7 +1083,7 @@ impl NativeWatchState {
                         }));
                     }
                 }
-                keep && (record.active_outputs.get(&task) != Some(&output)
+                keep && (!record.active_outputs.contains(&task, &output)
                     || !record.output_identities.contains_key(&output))
             } else {
                 true
@@ -1045,7 +1118,7 @@ impl NativeWatchState {
             // at the active path. A repeated start then has no state delta.
             if !register
                 && self.lock().pending.get(&key).is_some_and(|record| {
-                    record.active_outputs.get(&task) == Some(&output)
+                    record.active_outputs.contains(&task, &output)
                         && record.output_identities.get(&output) == Some(&identity)
                 })
             {
@@ -1753,6 +1826,122 @@ fn replay_segment_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carrier_outputs_survive_legacy_snapshot_and_incremental_replay() {
+        use std::fs::{self, OpenOptions};
+        use std::io::Write;
+
+        let snapshot = crate::test_support::temp_file("carrier_owner_snapshot", b"");
+        let journal = snapshot.with_extension("wal");
+        let base = snapshot.with_extension("outputs");
+        let owner = base.join("outer.zip").to_string_lossy().into_owned();
+        let task = base.join("nested.data").to_string_lossy().into_owned();
+        let container = base.join("carrier").to_string_lossy().into_owned();
+        let first = base.join("carrier").join("first").to_string_lossy().into_owned();
+        let second = base.join("carrier").join("second").to_string_lossy().into_owned();
+        let moved = base.join("relocated").to_string_lossy().into_owned();
+        let pending = PendingRecord { path: owner.clone(), ..Default::default() };
+        let mut legacy = serde_json::to_value(pending).unwrap();
+        legacy["active_outputs"] = serde_json::json!({ task.clone(): container.clone() });
+        legacy["output_identities"] = serde_json::json!({ container.clone(): "container-id" });
+        // This is the old scalar-value schema, not the new serializer feeding
+        // its own decoder. A saved main-branch owner must remain recoverable.
+        let old_snapshot = serde_json::json!({
+            "password_generation": 0, "password_source_signature": "",
+            "watch_cursors": {}, "pending_work": [legacy], "entries": [], "runtime": {},
+        });
+        wal::write_snapshot(&mut fs::File::create(&snapshot).unwrap(), Kind::TaskSnapshot, 1, &old_snapshot).unwrap();
+        let state = NativeWatchState::new();
+        assert_eq!(state.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap(), 1);
+        assert!(state.pending(&owner).unwrap().active_outputs.contains(&task, &container));
+        fs::write(&journal, wal::file_header(Kind::TaskWal)).unwrap();
+        let append = |seq, changes: Vec<OutputChange>| {
+            let operations = Operations(changes.into_iter()
+                .map(|change| Operation::Output(path_key(&owner), change)).collect());
+            let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+            wal::append_frame(&mut file, seq, |out| {
+                rmp_serde::encode::write(out, &operations).map_err(wal::invalid)
+            }).unwrap();
+            file.flush().unwrap();
+        };
+        append(2, vec![
+            OutputChange::Start { task: task.clone(), output: first.clone(), identity: "first-id".into() },
+            OutputChange::Start { task: task.clone(), output: second.clone(), identity: "second-id".into() },
+        ]);
+        state.replay_segment(journal.to_string_lossy().into_owned(), 1, 2).unwrap();
+        assert_eq!(state.pending(&owner).unwrap().active_outputs.values().count(), 3);
+        state.capture(2).write(snapshot.to_string_lossy().into_owned()).unwrap();
+        let resumed = NativeWatchState::new();
+        assert_eq!(resumed.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap(), 2);
+        assert_eq!(resumed.pending(&owner).unwrap().active_outputs.values().count(), 3);
+        append(3, vec![OutputChange::Finish {
+            task: task.clone(), output: first.clone(), keep: true, identity: None,
+        }]);
+        resumed.replay_segment(journal.to_string_lossy().into_owned(), 2, 3).unwrap();
+        let pending = resumed.pending(&owner).unwrap();
+        assert!(pending.active_outputs.contains(&task, &container));
+        assert!(pending.active_outputs.contains(&task, &second));
+        assert!(!pending.active_outputs.contains(&task, &first));
+        assert!(pending.committed_roots.contains(&container));
+        assert!(!pending.completed_sources.contains(&task));
+        assert_eq!(pending.output_identities[&container], "container-id");
+        // Recovery preserves the carrier holding the committed first segment,
+        // but the unfinished sibling remains an independently disposable root.
+        assert_eq!(pending.active_outputs.values()
+            .filter(|output| !pending.committed_roots.contains(output)).collect::<Vec<_>>(), vec![&second]);
+        assert!(resumed.output_operation(&owner, task.clone(), first.clone(), Some(false), Vec::new()).unwrap().is_none());
+        append(4, vec![OutputChange::Finish {
+            task: task.clone(), output: second.clone(), keep: false, identity: None,
+        }, OutputChange::Relocate {
+            source: container.clone(), destination: moved.clone(), identity: "moved-id".into(),
+        }]);
+        resumed.replay_segment(journal.to_string_lossy().into_owned(), 3, 4).unwrap();
+        let pending = resumed.pending(&owner).unwrap();
+        assert_eq!(pending.active_outputs.iter().collect::<Vec<_>>(), vec![(&task, &moved)]);
+        assert!(pending.committed_roots.contains(&moved));
+        assert_eq!(pending.output_identities[&moved], "moved-id");
+        assert!(!pending.output_identities.contains_key(&second));
+        fs::remove_file(snapshot).unwrap();
+        fs::remove_file(journal).unwrap();
+    }
+
+    #[test]
+    fn processed_observation_retires_recovery_but_survives_snapshot() {
+        let source = crate::test_support::temp_file("processed_source", b"kept input");
+        let snapshot = crate::test_support::temp_file("processed_snapshot", b"");
+        let path = source.to_string_lossy().into_owned();
+        let key = path_key(&path);
+        let record: EntryRecord = serde_json::from_value(serde_json::json!({
+            "path": path, "size": 10, "mtime": 1.0, "file_id": "retained-id", "change_usn": 42,
+            "status": "processed", "last_error": "", "attempt_count": 1, "failure_kind": "",
+            "failure_stage": "", "failure_payload": {}, "last_attempt_at": 1.0,
+        })).unwrap();
+        let state = NativeWatchState::new();
+        state.apply_operations(&Operations(vec![Operation::PutPending(key.clone(), Arc::new(PendingRecord {
+            path: path.clone(), ..Default::default()
+        }))]));
+        state.apply(&NativeWatchOperations::checkpoint(&path, "completed-output", Some(serde_json::json!({}))));
+        state.apply(&NativeWatchOperations::finish_pending(&path, Some(Arc::new(record))));
+        assert!(!state.has_pending(&path));
+        assert!(state.runtime_keys("checkpoint|").is_empty());
+        assert!(state.entry_items(Some("password")).is_empty());
+        assert!(NativeWatchState::event_projection(&state.data).is_empty());
+        state.capture(1).write(snapshot.to_string_lossy().into_owned()).unwrap();
+        let restored = NativeWatchState::new();
+        restored.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap();
+        let observed = restored.entry(&path).unwrap();
+        assert_eq!(observed.file_id, "retained-id");
+        assert_eq!(observed.change_usn, 42);
+        assert_eq!(observed.status, "processed");
+        // Completed observations use the existing departure/scope lifecycle,
+        // rather than growing a second ledger for files no longer watched.
+        assert_eq!(restored.entry_paths(None, true), vec![(key.clone(), path.clone())]);
+        restored.apply(&restored.scope_retirement_operations(&[]));
+        assert!(!restored.has_entry(&path));
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(snapshot).unwrap();
+    }
 
     #[test]
     fn recovery_publication_orders_concurrent_blocker_changes() {

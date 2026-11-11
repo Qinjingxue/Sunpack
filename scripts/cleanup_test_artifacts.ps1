@@ -46,7 +46,10 @@ function Remove-StaleTestVhds {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) {
             continue
         }
-        $vhdFiles = @(Get-ChildItem -LiteralPath $root -Filter "space-*.vhdx" -File -Recurse -ErrorAction SilentlyContinue)
+        # Keep the former space-* names recoverable as well as the current
+        # test's exact volume-label name. Do not sweep unrelated VHD images.
+        $vhdFiles = @(Get-ChildItem -LiteralPath $root -Filter "*.vhdx" -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "space-*.vhdx" -or $_.Name -match '^SP[0-9a-fA-F]{12}\.vhdx$' })
         foreach ($vhdFile in $vhdFiles) {
             try {
                 if (Get-Command Dismount-DiskImage -ErrorAction SilentlyContinue) {
