@@ -239,6 +239,7 @@ impl<'a> Peer<'a> {
     fn transfer(
         &self,
         event: &Event,
+        cancelled: Option<&Event>,
         operation: impl FnOnce(*mut c_void, &mut OVERLAPPED) -> i32,
     ) -> io::Result<usize> {
         let pipe = self.pipe.as_raw_handle();
@@ -252,13 +253,20 @@ impl<'a> Peer<'a> {
             if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
                 return Err(error);
             }
-            let handles = [event.raw(), self.stop.raw(), self.shutdown.raw()];
-            match unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) } {
+            let handles = [
+                event.raw(),
+                self.stop.raw(),
+                self.shutdown.raw(),
+                cancelled.unwrap_or(&self.stop).raw(),
+            ];
+            let count = if cancelled.is_some() { 4 } else { 3 };
+            // Completed I/O wins over cancellation; its bytes are already sent.
+            match unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, INFINITE) } {
                 WAIT_OBJECT_0 => {}
                 result => {
                     drain(pipe, &mut overlapped);
                     return Err(
-                        if result == WAIT_OBJECT_0 + 1 || result == WAIT_OBJECT_0 + 2 {
+                        if (WAIT_OBJECT_0 + 1..WAIT_OBJECT_0 + count).contains(&result) {
                             io::ErrorKind::ConnectionAborted.into()
                         } else {
                             io::Error::last_os_error()
@@ -281,7 +289,7 @@ impl Read for Reader<'_> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        self.peer.transfer(&self.event, |pipe, overlapped| unsafe {
+        self.peer.transfer(&self.event, None, |pipe, overlapped| unsafe {
             ReadFile(
                 pipe,
                 buffer.as_mut_ptr(),
@@ -296,22 +304,38 @@ impl Read for Reader<'_> {
 struct Writer<'a> {
     peer: &'a Peer<'a>,
     event: Event,
+    cancelled: &'a Event,
+    failed: bool,
 }
 
 impl Write for Writer<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
         if buffer.is_empty() {
             return Ok(0);
         }
-        self.peer.transfer(&self.event, |pipe, overlapped| unsafe {
-            WriteFile(
-                pipe,
-                buffer.as_ptr(),
-                buffer.len().min(u32::MAX as usize) as u32,
-                null_mut(),
-                overlapped,
-            )
-        })
+        let result = self.peer.transfer(
+            &self.event,
+            Some(self.cancelled),
+            |pipe, overlapped| unsafe {
+                WriteFile(
+                    pipe,
+                    buffer.as_ptr(),
+                    buffer.len().min(u32::MAX as usize) as u32,
+                    null_mut(),
+                    overlapped,
+                )
+            },
+        );
+        if result.is_err() {
+            // transfer has drained the operation. Its frame may be truncated:
+            // stop the reader and forbid any subsequent interrupt/exit frame.
+            self.failed = true;
+            self.peer.stop.signal();
+        }
+        result
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -514,19 +538,40 @@ impl PromptInput {
     }
 }
 
+// Console clients decode each output frame independently. Only inspect the
+// boundary (at most three continuation bytes), not the entire output buffer.
+fn frame_chunk_len(kind: u8, bytes: &[u8]) -> usize {
+    if bytes.len() <= MAX_FIELD || !matches!(kind, 1 | 2) {
+        return bytes.len().min(MAX_FIELD);
+    }
+    let mut end = MAX_FIELD;
+    while end > MAX_FIELD - 3 && bytes[end] & 0xc0 == 0x80 {
+        end -= 1;
+    }
+    if bytes[end] & 0xc0 == 0x80 {
+        // Arbitrary byte output must still make progress without losing data.
+        MAX_FIELD
+    } else {
+        end
+    }
+}
+
 impl Connection<'_> {
     fn frame(&self, kind: u8, bytes: &[u8]) -> io::Result<()> {
         let mut output = self.writer.lock().unwrap();
         let mut frame = Vec::with_capacity(5 + bytes.len().min(32 * 1024));
-        for chunk in bytes
-            .chunks(MAX_FIELD)
-            .chain(bytes.is_empty().then_some(bytes))
-        {
+        let mut remaining = bytes;
+        loop {
+            let (chunk, rest) = remaining.split_at(frame_chunk_len(kind, remaining));
             frame.clear();
             frame.push(kind);
             frame.extend((chunk.len() as u32).to_be_bytes());
             frame.extend(chunk);
             output.write_all(&frame)?;
+            if rest.is_empty() {
+                break;
+            }
+            remaining = rest;
         }
         Ok(())
     }
@@ -646,6 +691,10 @@ impl Server {
 
     fn request(&self, pipe: OwnedHandle) -> io::Result<()> {
         let peer = Peer::new(pipe, &self.stop)?;
+        let cancel = Cancellation::new();
+        let output_cancelled = Arc::new(Event::new(true)?);
+        let wake = Arc::clone(&output_cancelled);
+        let _output_cancellation = cancel.subscribe(move || wake.signal());
         let mut reader = Reader {
             peer: &peer,
             event: Event::new(true)?,
@@ -653,6 +702,8 @@ impl Server {
         let mut writer = Writer {
             peer: &peer,
             event: Event::new(true)?,
+            cancelled: &output_cancelled,
+            failed: false,
         };
         let header = Header::read(&mut reader, &self.build_id, &self.token)?;
         writer.write_all(&[b"SPS2".as_slice(), &self.build_id].concat())?;
@@ -660,7 +711,7 @@ impl Server {
             writer: Mutex::new(writer),
             prompt: Mutex::default(),
             input: Mutex::default(),
-            cancel: Cancellation::new(),
+            cancel,
             terminal_size: AtomicU32::new(header.terminal_size),
             flags: header.flags,
         };
@@ -901,5 +952,104 @@ mod prompt_tests {
         drop(second);
         assert!(slot.lock().unwrap().is_none());
         assert!(PromptReply::new(&slot, &second_cancel).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    #[test]
+    fn output_frames_keep_utf8_boundaries_and_binary_payloads() {
+        // Ordinary short-output tests never cross the protocol limit. Check
+        // every possible split inside a UTF-8 scalar with one reusable buffer.
+        let mut bytes = Vec::with_capacity(MAX_FIELD + 4);
+        for scalar in ["é", "中", "😀"] {
+            for split in 1..scalar.len() {
+                bytes.clear();
+                bytes.resize(MAX_FIELD - split, b'a');
+                bytes.extend_from_slice(scalar.as_bytes());
+                bytes.push(b'\n');
+                for kind in [1, 2] {
+                    let end = frame_chunk_len(kind, &bytes);
+                    assert_eq!(end, MAX_FIELD - split);
+                    let (first, rest) = bytes.split_at(end);
+                    assert!(std::str::from_utf8(first).is_ok());
+                    assert_eq!(std::str::from_utf8(rest).unwrap(), format!("{scalar}\n"));
+                    assert_eq!(frame_chunk_len(kind, rest), rest.len());
+                }
+                // Control payloads are binary, never interpreted as text.
+                assert_eq!(frame_chunk_len(0, &bytes), MAX_FIELD);
+            }
+        }
+        bytes.fill(0x80);
+        assert_eq!(frame_chunk_len(1, &bytes), MAX_FIELD);
+        assert_eq!(frame_chunk_len(2, &[]), 0);
+        assert_eq!(frame_chunk_len(0, &(-1_i32).to_be_bytes()), 4);
+        assert_eq!(frame_chunk_len(3, &[]), 0);
+    }
+}
+
+#[cfg(test)]
+mod output_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_output_drains_backpressure_and_rejects_later_frames() {
+        // A real overlapped pipe exercises the blocked WriteFile path that
+        // prompt-channel tests cannot cover. No client reads the large write.
+        let name = format!(
+            r"\\.\pipe\SunPack-output-cancel-test-{}-{}",
+            std::process::id(),
+            hex(&windows::random_bytes::<16>().unwrap()),
+        );
+        let security = windows::PipeSecurity::current_user().unwrap();
+        let accept = Accept::arm(&windows::wide(OsStr::new(&name)), &security.attributes(), true)
+            .unwrap();
+        let mut client = OpenOptions::new().read(true).write(true).open(name).unwrap();
+        let handles = [accept.event.raw()];
+        assert_eq!(
+            unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, INFINITE) },
+            WAIT_OBJECT_0,
+        );
+        let shutdown = Event::new(true).unwrap();
+        let peer = Peer::new(accept.finish().unwrap(), &shutdown).unwrap();
+        let cancel = Cancellation::new();
+        let cancelled = Arc::new(Event::new(true).unwrap());
+        let wake = Arc::clone(&cancelled);
+        let _subscription = cancel.subscribe(move || wake.signal());
+        let mut writer = Writer {
+            peer: &peer,
+            event: Event::new(true).unwrap(),
+            cancelled: &cancelled,
+            failed: false,
+        };
+        writer.write_all(b"ok").unwrap();
+        let mut output = [0; 2];
+        client.read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"ok");
+        cancel.cancel();
+        // Cancellation alone does not close the peer or interrupt its input.
+        let mut reader = Reader {
+            peer: &peer,
+            event: Event::new(true).unwrap(),
+        };
+        client.write_all(b"input").unwrap();
+        let mut input = [0; 5];
+        reader.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"input");
+
+        let error = writer.write_all(&vec![b'x'; 1024 * 1024]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(writer.failed);
+        let handles = [peer.stop.raw()];
+        assert_eq!(
+            unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, 0) },
+            WAIT_OBJECT_0,
+        );
+        assert_eq!(
+            writer.write_all(b"exit frame").unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted,
+        );
     }
 }

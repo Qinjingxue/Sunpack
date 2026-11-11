@@ -1,8 +1,8 @@
-//! Durable receipts hold physical layouts and counters, never archive file
-//! tables, analysis caches, password lists, or native reader handles.
+//! Durable receipts hold physical layouts, retry facts and counters, never
+//! archive file tables, analysis caches, password lists, or native reader handles.
 
 use super::{ArchiveResult, DiscoverySource, Failure, FailureKind};
-use crate::io::archive_state::{ArchiveInput, InputExtent, InputPart, OpenMode};
+use crate::io::archive_state::{AnalysisFacts, ArchiveInput, InputExtent, InputPart, OpenMode};
 use crate::io::reader::{
     capture_directory_identity, capture_file_generation, DirectoryIdentity,
     PersistedFileGeneration, PhysicalFileGeneration,
@@ -39,6 +39,17 @@ pub struct InputCheckpoint {
 struct PartialReceipt {
     failure: Failure,
     complete_files: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_facts: Option<RetryFacts>,
+}
+
+/// Fixed-layout retry evidence, not an analysis cache or an archive inventory.
+/// Unresolved volume plans cannot produce receipts; a successful selection
+/// drops its plan before checkpoint creation and needs no retry evidence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RetryFacts {
+    logical_name: String,
+    analysis: AnalysisFacts,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -177,6 +188,10 @@ impl InputCheckpoint {
             partial: result.failure.as_ref().map(|failure| PartialReceipt {
                 failure: failure.clone(),
                 complete_files: result.recovered_complete_files,
+                retry_facts: Some(RetryFacts {
+                    logical_name: input.logical_name.clone(),
+                    analysis: input.analysis.clone(),
+                }),
             }),
         }))
     }
@@ -187,6 +202,17 @@ impl InputCheckpoint {
         generations: &HashMap<String, PhysicalFileGeneration>,
     ) -> bool {
         self.schema_version == SCHEMA_VERSION
+            && self.partial.as_ref().is_none_or(|partial| {
+                // A plan that admits an old winner is enough for complete
+                // output, but new alternatives must wake a partial retry.
+                // Legacy partial receipts have no retry-fact proof and must
+                // run once more; legacy complete receipts remain reusable.
+                input.volume_attempts.is_none()
+                    && partial.retry_facts.as_ref().is_some_and(|facts| {
+                        facts.logical_name == input.logical_name
+                            && facts.analysis == input.analysis
+                    })
+            })
             && self.input.matches(input)
             && self.sources.iter().all(|source| {
                 generations
@@ -375,5 +401,103 @@ impl LogicalLayout {
             Some(plan) => plan.admits_parts(&self.parts),
             None => self.parts == input.parts,
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    use std::{fs, sync::Arc};
+
+    #[test]
+    fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternatives() {
+        let source = crate::test_support::temp_file("checkpoint_retry", b"archive");
+        let output = source.with_extension("output");
+        fs::create_dir(&output).unwrap();
+        let mut input = ArchiveInput::file(
+            source.to_string_lossy().into_owned(), "7z".into(), "archive".into(),
+        );
+        input.mode = OpenMode::NativeVolumes;
+        input.parts = vec![InputPart {
+            extent: InputExtent { path: input.entry_path.clone(), start: 0, end: Some(7) },
+            volume_number: Some(1),
+            canonical_name: "archive.7z.001".into(),
+        }].into_boxed_slice();
+        let key = path_key(&input.entry_path);
+        let mut generations = HashMap::from([
+            (key.clone(), capture_file_generation(&source).unwrap()),
+        ]);
+        let complete = InputCheckpoint {
+            schema_version: SCHEMA_VERSION,
+            carrier: source.clone(),
+            input: LogicalLayout {
+                entry: source.clone(), mode: input.mode, format: input.format_hint.clone(),
+                parts: input.parts.clone(), ranges: input.ranges.clone(),
+            },
+            sources: vec![SourceGeneration {
+                path: source.clone(), generation: generations[&key].persisted(),
+            }].into_boxed_slice(),
+            output: OwnedDirectory::capture(&output).unwrap(),
+            container: None, files: 1, bytes: 7, encrypted: None,
+            discovery_source: DiscoverySource::Direct, children_complete: true,
+            remaining_depth: 0, partial: None,
+        };
+        let mut result = complete.result(1);
+        result.failure = Some(Failure::new(FailureKind::MissingVolume, "missing volume"));
+        result.partial = true;
+        result.recovered_complete_files = 1;
+        let partial = InputCheckpoint::create(
+            &source, &input, &result, &generations, None, true, 0,
+        ).unwrap().unwrap();
+        // Exercise the persisted representation, not just in-memory equality.
+        let partial: InputCheckpoint = serde_json::from_slice(
+            &serde_json::to_vec(&partial).unwrap(),
+        ).unwrap();
+        assert!(partial.valid_for(&input, &generations));
+        let mut changed = input.clone();
+        changed.analysis.password_required = true;
+        assert!(!partial.valid_for(&changed, &generations));
+        changed = input.clone();
+        changed.logical_name.push_str("-new");
+        assert!(!partial.valid_for(&changed, &generations));
+
+        let mut alternatives = input.clone();
+        alternatives.volume_attempts = Some(Box::new(VolumeAttemptPlan {
+            sources: vec![input.parts[0].extent.clone(), InputExtent {
+                path: source.with_extension("alternative").to_string_lossy().into_owned(),
+                start: 0, end: Some(7),
+            }].into_boxed_slice(),
+            layouts: vec![VolumeLayout {
+                slots: vec![VolumeSlot {
+                    number: 1, canonical_name: input.parts[0].canonical_name.clone(), domain: 0,
+                }].into_boxed_slice(), minimum_slots: 0,
+            }].into_boxed_slice(),
+            domains: vec![VolumeDomain { choices: Arc::new(vec![0, 1]) }].into_boxed_slice(),
+            head_size_from_total: None, minimum_size: None, tail_totals: Box::new([]),
+        }));
+        assert!(complete.valid_for(&alternatives, &generations));
+        assert!(!partial.valid_for(&alternatives, &generations));
+        assert!(InputCheckpoint::create(
+            &source, &alternatives, &result, &generations, None, true, 0,
+        ).unwrap().is_none());
+
+        let mut legacy = serde_json::to_value(&partial).unwrap();
+        legacy["partial"].as_object_mut().unwrap().remove("retry_facts");
+        let legacy: InputCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.valid_for(&input, &generations));
+        assert!(!legacy.valid_for(&alternatives, &generations));
+        let legacy_complete: InputCheckpoint = serde_json::from_value(
+            serde_json::to_value(&complete).unwrap(),
+        ).unwrap();
+        assert!(legacy_complete.valid_for(&input, &generations));
+        assert!(legacy_complete.valid_for(&alternatives, &generations));
+        // Length changes make this deterministic even on coarse file clocks.
+        fs::write(&source, b"changed archive generation").unwrap();
+        generations.insert(key, capture_file_generation(&source).unwrap());
+        assert!(!partial.valid_for(&input, &generations));
+        assert!(!complete.valid_for(&alternatives, &generations));
+        fs::remove_dir(output).unwrap();
+        fs::remove_file(source).unwrap();
     }
 }

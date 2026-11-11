@@ -2503,8 +2503,10 @@ impl Scheduler {
             if unavailable {
                 continue;
             }
-            let has_checkpoint =
-                source.is_file() && !self.checkpoints_for(&pending.path)?.is_empty();
+            let has_checkpoint = source.is_file()
+                && !input_checkpoints(state, &pending.path)
+                    .collect::<io::Result<Vec<_>>>()?
+                    .is_empty();
             if (missing_output && !promoted_present) || has_checkpoint {
                 if !source.is_file() {
                     self.journal.log(

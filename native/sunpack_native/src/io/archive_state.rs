@@ -50,7 +50,7 @@ impl InputPart {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum VolumeCompleteness {
     Unknown,
     Missing,
@@ -67,7 +67,7 @@ impl VolumeCompleteness {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AnalysisFacts {
     pub zip_eocd_offset: Option<u64>,
     pub volume_completeness: Option<VolumeCompleteness>,

@@ -1,7 +1,7 @@
 use super::PasswordVerification;
 use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
 use crate::io::archive_state::{InputExtent, InputPart};
-use crate::io::cancellation::Cancellation;
+use crate::io::cancellation::{is_cancellation, Cancellation};
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::io::reader::NativeArchiveSession;
@@ -1253,22 +1253,36 @@ pub(crate) fn resolve_embedded_rar_boundaries(
     // One reader and one pass over each logical input. A failed segment must
     // not discard earlier facts or classify the unvisited remainder.
     let outcomes = (move || -> io::Result<_> {
-        let reader = ManagedReader::open(&archive_path)?;
+        Cancellation::check_current_io()?;
+        let reader = match ManagedReader::open(&archive_path) {
+            Ok(reader) => reader,
+            Err(error) if is_cancellation(&error) => return Err(error),
+            Err(error) => {
+                // A source can disappear between scanning and reopening. Keep
+                // this failure local to its unresolved segments, like read errors.
+                let message = error.to_string();
+                return Ok(offsets.into_iter().map(|offset| {
+                    (offset, "error", None, None, Some(message.clone()))
+                }).collect());
+            }
+        };
         let mut outcomes = Vec::with_capacity(offsets.len());
         for offset in offsets {
+            Cancellation::check_current_io()?;
             let outcome = (|| -> io::Result<_> {
                 if passwords.is_empty() {
                     return Ok(("password_required", None, None));
                 }
                 for password in passwords {
-                    let Some(proof) = probe_header_encrypted_terminal(
+                    let proof = probe_header_encrypted_terminal(
                         &reader,
                         offset,
                         password,
                         usize::try_from(reader.len().saturating_sub(offset) / 8)
                             .unwrap_or(usize::MAX),
-                    )?
-                    else {
+                    )?;
+                    Cancellation::check_current_io()?;
+                    let Some(proof) = proof else {
                         continue;
                     };
                     if !proof.password_matched {
@@ -1285,7 +1299,7 @@ pub(crate) fn resolve_embedded_rar_boundaries(
             })();
             match outcome {
                 Ok((status, end, password)) => outcomes.push((offset, status, end, password, None)),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                Err(error) if is_cancellation(&error) => return Err(error),
                 Err(error) => outcomes.push((offset, "error", None, None, Some(error.to_string()))),
             }
         }
@@ -1554,7 +1568,7 @@ fn walk_rar4_encrypted_headers(
         }
         let salt: [u8; 8] = salt.try_into().expect("RAR4 salt length checked");
         let (key, iv) = derive_rar3_key_iv(password, Some(&salt)).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, "password probe cancelled")
+            crate::io::cancellation::cancelled_io()
         })?;
         let cipher = Aes128::new_from_slice(&key)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid RAR4 AES key"))?;
@@ -1765,6 +1779,29 @@ mod rar5_header_decryption_tests {
             "single volume must not be multivolume"
         );
         assert_eq!(number, None);
+    }
+
+    #[test]
+    fn embedded_boundary_reopen_failure_is_local_but_cancellation_propagates() {
+        let missing = crate::test_support::temp_file("rar_boundary_missing", b"");
+        std::fs::remove_file(&missing).unwrap();
+        let path = missing.to_string_lossy().into_owned();
+        let rows = resolve_embedded_rar_boundaries(path.clone(), vec![7, 42], &[]).unwrap();
+        assert_eq!(rows.iter().map(|row| row.offset).collect::<Vec<_>>(), [7, 42]);
+        assert!(rows.iter().all(|row| row.status == "error" && row.error.is_some()));
+
+        let valid = crate::test_support::temp_file("rar_boundary_valid", &hex_bytes(SINGLE_HP_HEX));
+        let valid_path = valid.to_string_lossy().into_owned();
+        let passwords = [Arc::<str>::from("secret")];
+        let rows = resolve_embedded_rar_boundaries(valid_path.clone(), vec![0], &passwords).unwrap();
+        assert_eq!(rows[0].status, "ok");
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        for path in [path, valid_path] {
+            let result = cancel.run(|| resolve_embedded_rar_boundaries(path, vec![0], &passwords));
+            assert!(matches!(result, Err(error) if is_cancellation(&error)));
+        }
+        std::fs::remove_file(valid).unwrap();
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod live;
+mod reporting;
 
 pub(super) struct Host {
     engine: OnceLock<Arc<Engine>>,
@@ -763,6 +764,7 @@ struct Progress<'a> {
     cancel: &'a Cancellation,
     language: Language,
     display: Mutex<Display>,
+    reporting: reporting::Reports,
     branches: Mutex<HashMap<PathBuf, (PathBuf, u64, String)>>,
     prompt: bool,
     visible: bool,
@@ -777,6 +779,17 @@ struct Display {
 }
 
 impl Progress<'_> {
+    fn run<T>(&self, execute: impl FnOnce() -> T) -> T {
+        if !self.visible {
+            return execute();
+        }
+        self.reporting.serve(
+            |event| self.display_event(event),
+            |id, archives| self.finish_scope(id, archives),
+            execute,
+        )
+    }
+
     fn clear_panel(&self) -> io::Result<()> {
         let mut display = self.display.lock().unwrap();
         if let Some(mut panel) = display.panel.take() {
@@ -788,22 +801,9 @@ impl Progress<'_> {
         }
         Ok(())
     }
-}
 
-impl Observer for Progress<'_> {
-    fn worker_updates(&self) -> crate::pipeline::WorkerUpdates {
-        use crate::pipeline::WorkerUpdates;
-        if !self.visible {
-            WorkerUpdates::None
-        } else if self.session.interactive() {
-            WorkerUpdates::All
-        } else {
-            WorkerUpdates::Resources
-        }
-    }
-
-    fn notify(&self, event: Event) {
-        if !self.visible || self.cancel.cancelled() {
+    fn display_event(&self, event: Event) {
+        if self.cancel.cancelled() {
             return;
         }
         if self.session.interactive() {
@@ -833,19 +833,7 @@ impl Observer for Progress<'_> {
         }
     }
 
-    fn archive_branch(&self, parent: &ArchiveResult, child: &ArchiveResult) {
-        if self.visible {
-            self.branches.lock().unwrap().insert(
-                child.path.clone(),
-                (parent.path.clone(), parent.offset, parent.format.clone()),
-            );
-        }
-    }
-
-    fn scope_finished(&self, id: TaskId, archives: &[ArchiveResult]) -> io::Result<()> {
-        if !self.visible {
-            return Ok(());
-        }
+    fn finish_scope(&self, id: TaskId, archives: &[ArchiveResult]) -> io::Result<()> {
         let report = (!archives.is_empty()).then(|| ScopeReport::new(archives, self));
         let mut display = self.display.lock().unwrap();
         if self.cancel.cancelled() {
@@ -872,6 +860,46 @@ impl Observer for Progress<'_> {
             }
         }
         Ok(())
+    }
+}
+
+impl Observer for Progress<'_> {
+    fn worker_updates(&self) -> crate::pipeline::WorkerUpdates {
+        use crate::pipeline::WorkerUpdates;
+        if !self.visible {
+            WorkerUpdates::None
+        } else if self.session.interactive() {
+            WorkerUpdates::All
+        } else {
+            WorkerUpdates::Resources
+        }
+    }
+
+    fn notify(&self, event: Event) {
+        if self.visible && !self.cancel.cancelled() {
+            self.reporting.notify(event);
+        }
+    }
+
+    fn archive_branch(&self, parent: &ArchiveResult, child: &ArchiveResult) {
+        if self.visible {
+            self.branches.lock().unwrap().insert(
+                child.path.clone(),
+                (parent.path.clone(), parent.offset, parent.format.clone()),
+            );
+        }
+    }
+
+    async fn scope_finished(
+        &self,
+        id: TaskId,
+        archives: Vec<ArchiveResult>,
+    ) -> io::Result<Vec<ArchiveResult>> {
+        if self.visible {
+            self.reporting.finish(id, archives).await
+        } else {
+            Ok(archives)
+        }
     }
 
     fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
@@ -1233,6 +1261,7 @@ fn archives(
         cancel,
         language,
         display: Mutex::default(),
+        reporting: reporting::Reports::default(),
         branches: Mutex::default(),
         prompt: settings.recursive_extract == Recursion::Prompt,
         visible: !options.json && !scan,
@@ -1269,7 +1298,7 @@ fn archives(
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
         request.promoted_sources = std::mem::take(&mut promoted_sources);
-        let current = engine.run_reserved(request, &progress, &reservation);
+        let current = progress.run(|| engine.run_reserved(request, &progress, &reservation));
         let cleared = progress.clear_panel();
         let current = match current {
             Ok(outcome) => outcome,

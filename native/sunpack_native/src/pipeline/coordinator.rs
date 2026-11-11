@@ -728,18 +728,17 @@ impl CreatedOutputs {
     }
 
     fn rollback(&mut self, observer: &impl Observer, outcome: &mut Outcome) -> io::Result<()> {
+        let mut visited = HashSet::new();
         let mut roots = HashSet::new();
         for (key, (path, _)) in &self.0 {
-            if crate::path_keys::path_ancestors(key).any(|ancestor| roots.contains(ancestor)) {
+            if crate::path_keys::path_ancestors(key).any(|ancestor| visited.contains(ancestor)) {
                 continue;
             }
-            cleanup_owned_output(path).map_err(|error| {
-                io::Error::other(super::OutputCleanupError { path: path.clone(), error })
-            })?;
-            roots.insert(key.clone());
-        }
-        for (path, archive) in self.0.values() {
-            observer.discard_output(archive, path)?;
+            visited.insert(key.clone());
+            match cleanup_owned_output(path) {
+                Ok(()) => { roots.insert(key.clone()); }
+                Err(error) => record_cleanup(outcome, path, "rollback", Err(error)),
+            }
         }
         let discarded = |path: &Path| {
             let key = output_key(path);
@@ -756,8 +755,28 @@ impl CreatedOutputs {
             }
         }
         outcome.checkpoints.retain(|checkpoint| !discarded(checkpoint.output()));
-        self.0.clear();
-        Ok(())
+        // Only retire recovery/WAL ownership for trees actually removed. A
+        // journal failure is not a filesystem cleanup failure: propagate it,
+        // but still finish independent notifications and outcome accounting.
+        let mut observer_error = None;
+        self.0.retain(|_, (path, archive)| {
+            if !discarded(path) {
+                return true;
+            }
+            match observer.discard_output(archive, path) {
+                Ok(()) => false,
+                Err(error) => {
+                    if observer_error.is_none() {
+                        observer_error = Some(error);
+                    }
+                    true
+                }
+            }
+        });
+        match observer_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1410,7 +1429,10 @@ impl<'run, O: Observer> Run<'run, O> {
                 .append(&mut children.cleanup_results);
             drop(lease);
             if depth == 1 && self.request.mode == Mode::Extract && !cancel.cancelled() {
-                self.observer.scope_finished(task_id, &outcome.archives)?;
+                outcome.archives = self
+                    .observer
+                    .scope_finished(task_id, std::mem::take(&mut outcome.archives))
+                    .await?;
             }
             Ok(outcome)
         })
@@ -3268,6 +3290,79 @@ mod tests {
             fs::remove_dir_all(&root).unwrap();
           }
         }
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn rollback_isolates_cleanup_failures_and_preserves_journal_errors() {
+        struct Discards {
+            fail: bool,
+            paths: Mutex<Vec<PathBuf>>,
+        }
+        impl Observer for Discards {
+            fn notify(&self, _: Event) {}
+            fn discard_output(&self, _: &ArchiveResult, output: &Path) -> io::Result<()> {
+                self.paths.lock().unwrap().push(output.to_owned());
+                if self.fail { Err(io::Error::other("journal unavailable")) } else { Ok(()) }
+            }
+        }
+        let source = crate::test_support::temp_file("rollback_failure", b"source");
+        let root = source.with_extension("output");
+        let bad = root.join("a-failed");
+        let good = root.join("z-cleaned");
+        let nested = good.join("child");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        let generations = HashMap::from([
+            (path_key(&source.to_string_lossy()), capture_file_generation(&source).unwrap()),
+        ]);
+        for journal_fails in [false, true] {
+            fs::create_dir_all(&bad).unwrap();
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("payload"), b"partial data").unwrap();
+            let mut created = CreatedOutputs::default();
+            let mut outcome = Outcome::default();
+            for output in [&bad, &good, &nested] {
+                let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+                archive.output = Some(output.clone());
+                archive.files = 1;
+                archive.bytes = 12;
+                outcome.checkpoints.push(InputCheckpoint::create(
+                    &source, &input, &archive, &generations, None, true, 0,
+                ).unwrap().unwrap());
+                created.register(output, &archive);
+                outcome.archives.push(archive);
+            }
+            // Deterministic unsafe-root failure, independent of ACLs/admin rights.
+            fs::remove_dir(&bad).unwrap();
+            fs::write(&bad, b"replacement must survive").unwrap();
+            let observer = Discards { fail: journal_fails, paths: Mutex::default() };
+            let result = created.rollback(&observer, &mut outcome);
+            if journal_fails {
+                assert_eq!(result.unwrap_err().to_string(), "journal unavailable");
+                assert_eq!(created.0.len(), 3);
+            } else {
+                result.unwrap();
+                assert_eq!(created.0.len(), 1);
+            }
+            assert!(created.0.contains_key(&output_key(&bad)));
+            assert_eq!(fs::read(&bad).unwrap(), b"replacement must survive");
+            assert!(!good.exists());
+            assert_eq!(outcome.cleanup_results.len(), 1);
+            assert_eq!(outcome.errors[0].kind, InputErrorKind::Cleanup);
+            assert_eq!(outcome.errors[0].path, bad);
+            assert_eq!(outcome.checkpoints.len(), 1);
+            assert_eq!(outcome.checkpoints[0].output(), bad);
+            assert_eq!(outcome.archives[0].output.as_ref(), Some(&bad));
+            assert!(outcome.archives[1..].iter().all(|archive| {
+                archive.output.is_none() && archive.files == 0 && archive.bytes == 0
+                    && archive.failure.as_ref().unwrap().kind == FailureKind::Cancelled
+            }));
+            let paths = observer.paths.lock().unwrap();
+            assert_eq!(paths.len(), 2);
+            assert!(!paths.contains(&bad));
+            fs::remove_file(&bad).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
         fs::remove_file(source).unwrap();
     }
 
