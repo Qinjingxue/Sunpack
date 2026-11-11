@@ -50,6 +50,8 @@ sunpack w st
 
 JSON 的 `summary.scan_error_count` 统计文件系统扫描错误，包括省略了单独详情的错误。每份报告最多保留 100 条文件系统扫描诊断记录，另加 1 条总省略摘要；单个目录仍适用原有的 20 条详情上限。超出报告预算后只累计省略数量，不再保留每条错误的路径或身份。归档任务结果独立于这项诊断预算保留。
 
+如果原生 worker 提供了归档失败证据，`extract --json` 在 `summary.failure_details` 按逻辑归档列出，`scan --json` 在对应的 `items[].failure` 列出。`evidence` 可包含失败阶段、缺卷名、最后一次读取的位置，以及最多 50 个文件的恢复预览。`recovery.omitted_files` 统计未列出的文件；逐文件写入字节数是 worker 记录的尝试结果，最终保留的输出以 `summary.recovered_outputs` 为准。
+
 `extract` 的 `summary.failed_count` 和各轮处理的 `failed_count` 统计归档处理失败；`input_error_count` 单独统计无效输入，例如向 `--direct-file` 传入目录，文本中显示为 `[输入错误]`。各轮处理另有 `scan_error_count` 和 `input_error_count`。受预算限制的文件系统诊断详情集中保存在 `summary.scan_failures`，各轮的 `failures` 保存归档失败和输入错误。分类依据结构化错误类别和目标结果。所有错误类别均保留在 `errors` 中，并使退出码非零，即使其他归档处理成功也是如此。
 
 ## extract

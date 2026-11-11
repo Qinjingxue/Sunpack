@@ -175,8 +175,7 @@ pub(crate) fn inspect_pe_image_reader(reader: &ManagedReader) -> Result<PeProbe,
 
 pub(crate) fn inspect_pe_image_native(path: &str) -> std::io::Result<PeProbe> {
     let reader = ManagedReader::open(path)?;
-    inspect_pe_image_reader(&reader)
-        .map_err(|fault| std::io::Error::new(fault.io_kind, fault))
+    inspect_pe_image_reader(&reader).map_err(|fault| std::io::Error::new(fault.io_kind, fault))
 }
 
 pub(crate) struct ArchiveOverlay {

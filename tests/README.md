@@ -34,4 +34,6 @@ cargo test --manifest-path native/Cargo.toml --locked --workspace --profile ci
 .\run_acceptance_tests.ps1 -NoWait
 ```
 
+在管理员 PowerShell 中运行 `.\.venv\Scripts\python.exe -m pytest tests/integration/test_disk_full_pause_resume.py` 可单独验证真实满盘。用例只写自己创建并核对卷标的 32 MiB NTFS VHDX，不占满宿主卷；结束后卸载并删除镜像。可用 `SUNPACK_SPACE_TEST_VHD_DIR` 选择镜像所在目录。测试等待实际满盘事件后才释放空间、断开客户端或关闭常驻进程，覆盖双卷独立恢复和满盘时的输出回收。
+
 验收脚本可向 pytest 传入 `--diagnostics-dir` 保存各 worker 的测试进度。真实结构语料通过独立工具生成，pytest 不临时构建 Rust/C++ 工具。性能测量在 [benchmarks](../benchmarks/README.md)，不作为 pytest 的行为断言。

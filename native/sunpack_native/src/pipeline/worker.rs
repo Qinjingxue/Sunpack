@@ -1,18 +1,20 @@
 //! One multiplexed worker per engine. Each live job retains its result
 //! assembly and coalesces byte progress and resource state independently.
 
-use super::ResourceWait;
+use super::{ResourceWait, WorkerUpdates};
 use crate::core::config::{ProcessMode, WorkerConfig};
 use crate::io::cancellation::Cancellation;
 use crate::scan::worker_event::{NativeWorkerResultAccumulator, WorkerFrame};
 use crate::scan::worker_wire::{encode_worker_frame, NativeWorkerFrameDecoder};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 
 pub(super) struct Process {
@@ -96,9 +98,9 @@ impl Job {
             }
             _ => return false,
         }
-        if previous != self.resources {
-            self.mailbox.updates.lock().unwrap().resources = Some(self.resources);
-            self.mailbox.available.notify_one();
+        if previous != self.resources && self.mailbox.interest != WorkerUpdates::None {
+            self.mailbox
+                .update(|updates| updates.resources = Some(self.resources));
         }
         true
     }
@@ -125,18 +127,34 @@ impl Episode {
 #[derive(Default)]
 struct Mailbox {
     updates: Mutex<Updates>,
-    available: Condvar,
+    interest: WorkerUpdates,
+}
+
+impl Mailbox {
+    fn update(&self, change: impl FnOnce(&mut Updates)) {
+        let wake = {
+            let mut updates = self.updates.lock().unwrap();
+            change(&mut updates);
+            updates.waker.take()
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
 }
 
 #[derive(Default)]
 struct Updates {
+    started: bool,
     progress: Option<Progress>,
     resources: Option<ResourceWait>,
     result: Option<io::Result<WorkerFrame>>,
     retry_granted: bool,
+    waker: Option<Waker>,
 }
 
 pub(super) enum Update {
+    Started,
     Progress(Progress),
     ResourceWait(ResourceWait),
 }
@@ -290,34 +308,44 @@ impl Process {
         ))
     }
 
-    pub(super) fn submit(
+    pub(super) async fn submit(
         &self,
         job_id: &str,
-        request: &Value,
+        request: Value,
         cancellation: &Cancellation,
+        interest: WorkerUpdates,
         mut on_update: impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
-        let frame = encode_worker_frame(request)?;
-        let mailbox = Arc::new(Mailbox::default());
-        let wake_mailbox = Arc::clone(&mailbox);
-        let _subscription = cancellation.subscribe(move || {
-            let _guard = wake_mailbox.updates.lock().unwrap();
-            wake_mailbox.available.notify_one();
+        let frame = encode_worker_frame(&request)?;
+        drop(request);
+        let mailbox = Arc::new(Mailbox {
+            interest,
+            ..Mailbox::default()
         });
+        let wake_mailbox = Arc::clone(&mailbox);
+        let _subscription = cancellation.subscribe(move || wake_mailbox.update(|_| {}));
 
         cancellation.check_io()?;
         self.shared.register(job_id, Arc::clone(&mailbox))?;
-        loop {
-            self.send(&frame)?;
-            let result = self.wait(job_id, &mailbox, cancellation, &mut on_update)?;
-            if !rejected(&result) {
-                return Ok(result);
+        let mut active = ActiveSubmission(Some(self));
+        let result = async {
+            loop {
+                self.send(&frame)?;
+                let result = self
+                    .wait(job_id, &mailbox, cancellation, &mut on_update)
+                    .await?;
+                if !rejected(&result) {
+                    return Ok(result);
+                }
+                poll_fn(|cx| self.shared.poll_retry(job_id, &mailbox, cancellation, cx)).await?;
             }
-            self.shared.wait_for_retry(job_id, &mailbox, cancellation)?;
         }
+        .await;
+        active.0 = None;
+        result
     }
 
-    fn wait(
+    async fn wait(
         &self,
         job_id: &str,
         mailbox: &Mailbox,
@@ -325,21 +353,22 @@ impl Process {
         on_update: &mut impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
         let mut sent_cancel = false;
-        loop {
-            let updates = mailbox.updates.lock().unwrap();
-            let mut updates = mailbox
-                .available
-                .wait_while(updates, |state| {
-                    state.result.is_none()
-                        && state.progress.is_none()
-                        && state.resources.is_none()
-                        && (sent_cancel || !cancellation.cancelled())
-                })
-                .unwrap();
-            let progress = updates.progress.take();
-            let resources = updates.resources.take();
-            let result = updates.result.take();
-            drop(updates);
+        poll_fn(|cx| {
+            let (started, progress, resources, result) = {
+                let mut updates = mailbox.updates.lock().unwrap();
+                if updates.result.is_none() {
+                    updates.waker = Some(cx.waker().clone());
+                }
+                (
+                    std::mem::take(&mut updates.started),
+                    updates.progress.take(),
+                    updates.resources.take(),
+                    updates.result.take(),
+                )
+            };
+            if started {
+                on_update(Update::Started);
+            }
             if let Some(progress) = progress {
                 on_update(Update::Progress(progress));
             }
@@ -347,7 +376,7 @@ impl Process {
                 on_update(Update::ResourceWait(resources));
             }
             if let Some(result) = result {
-                return result;
+                return Poll::Ready(result);
             }
             if !sent_cancel && cancellation.cancelled() {
                 let cancel =
@@ -356,7 +385,11 @@ impl Process {
                 // Keep the path/output leases until native writers and callbacks stop.
                 sent_cancel = true;
             }
-        }
+            // Only one coalesced update per poll. Sustained progress from a
+            // large archive must leave room for other requests' stages.
+            Poll::Pending
+        })
+        .await
     }
 
     fn send(&self, frame: &[u8]) -> io::Result<()> {
@@ -380,6 +413,18 @@ impl Process {
         let _ = child.kill();
         let _ = child.wait();
         self.shared.fail(message, io::ErrorKind::BrokenPipe);
+    }
+}
+
+struct ActiveSubmission<'a>(Option<&'a Process>);
+
+impl Drop for ActiveSubmission<'_> {
+    fn drop(&mut self) {
+        if let Some(process) = self.0 {
+            // Unwinding a suspended task must stop the native writer before
+            // the task's output and source leases can be dropped.
+            process.abort("worker submission abandoned".into());
+        }
     }
 }
 
@@ -417,19 +462,14 @@ impl Shared {
         Ok(())
     }
 
-    fn wait_for_retry(
+    fn poll_retry(
         &self,
         job_id: &str,
         mailbox: &Mailbox,
         cancellation: &Cancellation,
-    ) -> io::Result<()> {
-        let updates = mailbox.updates.lock().unwrap();
-        let mut updates = mailbox
-            .available
-            .wait_while(updates, |updates| {
-                !updates.retry_granted && updates.result.is_none() && !cancellation.cancelled()
-            })
-            .unwrap();
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut updates = mailbox.updates.lock().unwrap();
         if let Err(error) = cancellation.check_io() {
             drop(updates);
             let mut state = self.state.lock().unwrap();
@@ -440,13 +480,17 @@ impl Shared {
             } else {
                 state.parked.retain(|(id, _)| id != job_id);
             }
-            return Err(error);
+            return Poll::Ready(Err(error));
         }
         if let Some(result) = updates.result.take() {
-            return result.map(|_| ());
+            return Poll::Ready(result.map(|_| ()));
         }
-        updates.retry_granted = false;
-        Ok(())
+        if std::mem::take(&mut updates.retry_granted) {
+            Poll::Ready(Ok(()))
+        } else {
+            updates.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 
     fn event(&self, frame: WorkerFrame) {
@@ -501,8 +545,7 @@ impl Shared {
                         state.claimed_epoch = state.completion_epoch;
                     }
                 }
-                job.mailbox.updates.lock().unwrap().result = Some(result);
-                job.mailbox.available.notify_one();
+                job.mailbox.update(|updates| updates.result = Some(result));
                 if state.jobs.capacity() > 256 {
                     crate::collections::trim_map(&mut state.jobs);
                 }
@@ -521,21 +564,26 @@ impl Shared {
             return;
         }
         match kind {
+            "native_event"
+                if event == "job_started" && job.mailbox.interest == WorkerUpdates::All =>
+            {
+                job.mailbox.update(|updates| updates.started = true);
+            }
             "protocol_error" => {
                 job.result = Some(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     string(&frame.summary, "message"),
                 )))
             }
-            "progress" => {
+            "progress" if job.mailbox.interest == WorkerUpdates::All => {
                 let update = Progress {
                     completed: number(&frame.summary, "completed_bytes"),
                     total: number(&frame.summary, "total_bytes"),
                 };
-                job.mailbox.updates.lock().unwrap().progress = Some(update);
-                job.mailbox.available.notify_one();
+                job.mailbox
+                    .update(|updates| updates.progress = Some(update));
             }
-            "native_memory" => {}
+            "progress" | "native_memory" => {}
             _ => match job.accumulator.accept(frame) {
                 Ok(Some(frame)) if string(&frame.summary, "type") == "result" => {
                     job.result = Some(Ok(frame))
@@ -553,12 +601,11 @@ impl Shared {
         }
         let exit = WorkerExit { message, kind };
         for (_, job) in state.jobs.drain() {
-            job.mailbox.updates.lock().unwrap().result = Some(Err(exit.error()));
-            job.mailbox.available.notify_one();
+            job.mailbox
+                .update(|updates| updates.result = Some(Err(exit.error())));
         }
         for (_, mailbox) in state.parked.drain(..) {
-            mailbox.updates.lock().unwrap().result = Some(Err(exit.error()));
-            mailbox.available.notify_one();
+            mailbox.update(|updates| updates.result = Some(Err(exit.error())));
         }
         state.closed = Some(exit);
         self.changed.notify_all();
@@ -573,8 +620,7 @@ impl State {
             }
             let job = Job::new(&id, Arc::clone(&mailbox), self.completion_epoch);
             self.jobs.insert(id, job);
-            mailbox.updates.lock().unwrap().retry_granted = true;
-            mailbox.available.notify_one();
+            mailbox.update(|updates| updates.retry_granted = true);
             true
         } else {
             false
@@ -672,6 +718,18 @@ mod tests {
         assert!(rejected(&result));
     }
 
+    fn take_retry(
+        shared: &Shared,
+        id: &str,
+        mailbox: &Mailbox,
+        cancel: &Cancellation,
+    ) -> io::Result<()> {
+        match shared.poll_retry(id, mailbox, cancel, &mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("retry should have settled"),
+        }
+    }
+
     #[test]
     fn each_completion_grants_one_retry_and_cancellation_passes_its_slot() {
         let shared = Shared::default();
@@ -693,8 +751,7 @@ mod tests {
         let cancelled = Cancellation::new();
         cancelled.cancel();
         assert_eq!(
-            shared
-                .wait_for_retry("first", &first, &cancelled)
+            take_retry(&shared, "first", &first, &cancelled)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Other,
@@ -705,8 +762,7 @@ mod tests {
         shared.fail("worker exited".into(), io::ErrorKind::BrokenPipe);
         for (id, mailbox) in [("second", &second), ("third", &third)] {
             assert_eq!(
-                shared
-                    .wait_for_retry(id, mailbox, &Cancellation::new())
+                take_retry(&shared, id, mailbox, &Cancellation::new())
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::BrokenPipe,
@@ -721,9 +777,7 @@ mod tests {
         finish(&shared, "retry", true);
         take_rejection(&mailbox);
         assert!(mailbox.updates.lock().unwrap().retry_granted);
-        shared
-            .wait_for_retry("retry", &mailbox, &Cancellation::new())
-            .unwrap();
+        take_retry(&shared, "retry", &mailbox, &Cancellation::new()).unwrap();
         finish(&shared, "retry", false);
         assert!(mailbox
             .updates

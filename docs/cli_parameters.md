@@ -50,6 +50,8 @@ For `extract` and `scan`, normal text goes to stdout and errors go to stderr. `[
 
 JSON `summary.scan_error_count` counts filesystem scan errors, including errors whose individual details were omitted. Filesystem scan diagnostics retain at most 100 records per report, plus one total omission summary; the existing 20-detail limit per directory also applies. Above the report budget, only the omitted count is accumulated, without retaining each path or error identity. Archive task results remain available independently of this diagnostic budget.
 
+When the native worker supplies archive failure evidence, `extract --json` lists it by logical archive in `summary.failure_details`; `scan --json` includes it in the corresponding `items[].failure`. The `evidence` can include the failure stage, missing volume name, last read location, and a recovery preview of up to 50 files. `recovery.omitted_files` counts files outside the preview. Per-file bytes describe the worker's write attempts; `summary.recovered_outputs` identifies the outputs retained by extraction.
+
 For `extract`, `summary.failed_count` and each attempt's `failed_count` count archive processing failures. `input_error_count` separately counts invalid inputs, such as a directory passed to `--direct-file`; these use `[Input error]` in text output. Attempts also include `scan_error_count` and `input_error_count`. Bounded filesystem diagnostic details are stored once in `summary.scan_failures`; each attempt's `failures` contains archive and input failures. Classification uses structured failure kinds and target results. All error categories remain in `errors` and cause a nonzero exit code, even when other archives succeed.
 
 ## extract

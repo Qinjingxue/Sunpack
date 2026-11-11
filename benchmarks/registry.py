@@ -18,5 +18,6 @@ _ROWS = [
     ("memory", "many-tasks", "Concurrent native directory workload, sampled peak and retained resources.", ("--mode", "memory", "--formats", "zip,7z", "--copies", "8", "--large-file-mib", "4")),
     ("memory", "password-store", "Scoped password-store request latency and resident memory.", ("--mode", "passwords")),
     ("watch", "state-persistence", "Native Watch bootstrap and completed-state restart cost.", ("--mode", "watch", "--formats", "zip", "--copies", "50", "--small-files", "64", "--large-files", "0")),
+    ("watch", "live-arrival", "Continuous Watch arrival latency and runtime plus Broker memory.", ("--mode", "watch", "--live-arrival", "--formats", "zip", "--small-files", "64", "--large-files", "0")),
 ]
 SCENARIOS = {(group, name): Scenario(group, name, description, arguments) for group, name, description, arguments in _ROWS}

@@ -398,10 +398,7 @@ impl<'a> CandidateSet<'a> {
                     } else {
                         FailureKind::Damaged
                     };
-                    return Ok(Err(Failure {
-                        kind,
-                        message: result.message,
-                    }));
+                    return Ok(Err(Failure::new(kind, result.message)));
                 }
                 _ => pending.extend(batch.iter().cloned()),
             }
@@ -518,17 +515,17 @@ impl PasswordPlan {
 
 impl Failure {
     pub(super) fn password() -> Self {
-        Self {
-            kind: FailureKind::WrongPassword,
-            message: "Password not found in the password list".to_owned(),
-        }
+        Self::new(
+            FailureKind::WrongPassword,
+            "Password not found in the password list",
+        )
     }
 
     pub(super) fn password_required() -> Self {
-        Self {
-            kind: FailureKind::PasswordRequired,
-            message: "Password not found in the password list".to_owned(),
-        }
+        Self::new(
+            FailureKind::PasswordRequired,
+            "Password not found in the password list",
+        )
     }
 }
 

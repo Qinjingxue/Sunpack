@@ -257,12 +257,30 @@ impl Drop for ConsoleControl {
     }
 }
 
-pub(super) fn console_columns() -> usize {
+pub(super) fn enable_console_updates() -> bool {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    };
+    let mut mode = 0;
+    unsafe {
+        let output = GetStdHandle(STD_OUTPUT_HANDLE);
+        GetConsoleMode(output, &mut mode) != 0
+            && (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+                || SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0)
+    }
+}
+
+pub(super) fn console_size() -> (usize, usize) {
     let mut screen = CONSOLE_SCREEN_BUFFER_INFO::default();
     if unsafe { GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut screen) } == 0 {
-        80
+        (80, 24)
     } else {
-        (i32::from(screen.srWindow.Right) - i32::from(screen.srWindow.Left) + 1).max(1) as usize
+        (
+            (i32::from(screen.srWindow.Right) - i32::from(screen.srWindow.Left) + 1).max(1)
+                as usize,
+            (i32::from(screen.srWindow.Bottom) - i32::from(screen.srWindow.Top) + 1).max(1)
+                as usize,
+        )
     }
 }
 

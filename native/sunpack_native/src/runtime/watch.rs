@@ -7,7 +7,7 @@ use crate::io::config_changes::NativeConfigChanges;
 use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
-    PromotedSource, Request, ResourceWait,
+    OutputCleanupError, PromotedSource, Request,
 };
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
@@ -828,6 +828,7 @@ struct Active {
     touched: HashSet<String>,
     cancel: Cancellation,
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
+    toast: Option<super::toast::Activity>,
     thread: JoinHandle<Completed>,
 }
 
@@ -835,6 +836,10 @@ struct Completed {
     cancelled: bool,
     result: io::Result<Outcome>,
     promoted: HashMap<String, Option<WatchCandidateRow>>,
+}
+
+fn output_cleanup_error(result: &io::Result<Outcome>) -> Option<&OutputCleanupError> {
+    result.as_ref().err()?.get_ref()?.downcast_ref()
 }
 
 #[derive(serde::Serialize)]
@@ -1333,7 +1338,7 @@ impl Scheduler {
             };
             let signals = self.hub.wait(deadline);
             for (batch, waiter) in signals.cancel {
-                let _ = waiter.send(self.cancel_batch(&batch));
+                let _ = waiter.send(self.cancel_display_batch(&batch));
             }
             for completed in signals.completed {
                 self.complete(&completed)?;
@@ -2708,7 +2713,10 @@ impl Scheduler {
         let Some((root, scope)) = self.roots.get(&id) else {
             return Ok(());
         };
-        let batch = windows::random_bytes::<16>()?
+        let mut token = windows::random_bytes::<16>()?;
+        // The other half of the token space is reserved for Toast groups.
+        token[0] &= 0x7f;
+        let batch = token
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
@@ -2763,8 +2771,15 @@ impl Scheduler {
             .map(|input| (watch_path_key(&input.path), input.path.clone()))
             .collect();
         let scope = scope.clone();
-        let toast = self.toast.as_ref().map(|toast| toast.publisher());
-        let language = self.settings.cli.language;
+        let toast = self
+            .toast
+            .as_ref()
+            .map(|toast| toast.register(Arc::clone(&batch_id), self.settings.cli.language));
+        let worker_toast = toast.clone();
+        let report_path = toast
+            .as_ref()
+            .and_then(|_| candidates.first())
+            .map(|candidate| PathBuf::from(&candidate.path));
         let groups = Arc::new(Mutex::new(HashMap::new()));
         let worker_groups = Arc::clone(&groups);
         let worker_cancel = cancel.clone();
@@ -2781,17 +2796,21 @@ impl Scheduler {
                     scope,
                     outputs: Mutex::default(),
                     batch: worker_batch,
-                    toast,
-                    toast_progress: Mutex::default(),
-                    language,
-                    began: Instant::now(),
+                    toast: worker_toast,
                     hub: Arc::clone(&hub),
                     groups: worker_groups,
                     promoted: Mutex::default(),
                 };
                 let result = engine.run_with(request, &observer);
                 let cancelled = worker_cancel.cancelled();
-                observer.finished(result.as_ref().ok(), cancelled);
+                if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
+                    let cleanup = output_cleanup_error(&result);
+                    toast.record(
+                        cleanup.map_or(path.as_path(), |error| error.path.as_path()),
+                        &result,
+                        cancelled && cleanup.is_none(),
+                    );
+                }
                 let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
                 hub.update(|signals| signals.completed.push(send_batch));
                 Completed {
@@ -2816,6 +2835,7 @@ impl Scheduler {
                 touched: HashSet::new(),
                 cancel,
                 groups,
+                toast,
                 thread,
             },
         );
@@ -2824,6 +2844,25 @@ impl Scheduler {
 
     fn checkpoints_for(&self, owner: &str) -> io::Result<Vec<crate::pipeline::InputCheckpoint>> {
         input_checkpoints(self.journal.state(), owner).collect()
+    }
+
+    fn cancel_display_batch(&mut self, id: &str) -> bool {
+        if matches!(id.as_bytes().first(), Some(b'8'..=b'9' | b'a'..=b'f')) {
+            let requests = self
+                .toast
+                .as_ref()
+                .map(|toast| toast.stop_group(id))
+                .unwrap_or_default();
+            // Keep each request's existing durable boundary. An arbitrarily
+            // large display group must not become a single WAL record.
+            let mut stopped = false;
+            for request in requests {
+                stopped |= self.cancel_batch(&request);
+            }
+            stopped
+        } else {
+            self.cancel_batch(id)
+        }
     }
 
     fn cancel_batch(&mut self, batch: &str) -> bool {
@@ -2894,6 +2933,31 @@ impl Scheduler {
             .join()
             .map_err(|_| io::Error::other("Watch extraction thread failed"))?;
         completed.cancelled |= active.cancel.cancelled();
+        let mut unfinished = HashSet::new();
+        if completed.cancelled {
+            let state = self.journal.state();
+            for input in &active.inputs {
+                let Some(record) = state.pending(&input.path) else {
+                    continue;
+                };
+                if let Some(output) = record.active_outputs.values().find(|output| {
+                    !record.committed_roots.contains(output)
+                        && !NativePresence::at(output).is_absent()
+                }) {
+                    unfinished.insert(watch_path_key(&input.path));
+                    self.journal
+                        .log(json!({"event":"watch_cancel_output_pending","owner":batch,
+                        "path":input.path,"output_dir":output}));
+                }
+            }
+        }
+        if let Some(toast) = &active.toast {
+            toast.finish(
+                &completed.result,
+                completed.cancelled,
+                !unfinished.is_empty() || output_cleanup_error(&completed.result).is_some(),
+            );
+        }
         let groups = std::mem::take(&mut *active.groups.lock().unwrap());
         {
             let mut claims = self.hub.claims.lock().unwrap();
@@ -2949,10 +3013,32 @@ impl Scheduler {
         };
         let mut by_path: HashMap<String, Vec<&ArchiveResult>> = HashMap::new();
         for archive in &outcome.archives {
+            if let Some(failure) = archive
+                .failure
+                .as_ref()
+                .filter(|failure| failure.evidence.is_some())
+            {
+                // Emit once per logical archive, including carrier segments and
+                // recursive children, rather than repeating it for every volume.
+                self.journal.log(
+                    json!({"event":"archive_failure_evidence","path":archive.path,
+                    "owner":batch,"depth":archive.depth,"offset":archive.offset,"failure":failure}),
+                );
+            }
             for input in &archive.source_paths {
                 by_path.entry(key(input)).or_default().push(archive);
             }
             by_path.entry(key(&archive.path)).or_default().push(archive);
+        }
+        for cleanup in outcome
+            .cleanup_results
+            .iter()
+            .filter(|cleanup| cleanup.status == crate::pipeline::CleanupStatus::Failed)
+        {
+            self.journal.log(
+                json!({"event":"pipeline_cleanup_failed","path":cleanup.path,
+                "owner":batch,"cleanup":cleanup}),
+            );
         }
         let error_paths = outcome
             .errors
@@ -3060,7 +3146,10 @@ impl Scheduler {
         }
         for candidate in active.inputs {
             let id = watch_path_key(&candidate.path);
-            if self.pending.contains_key(&id) || active.touched.contains(&id) {
+            if self.pending.contains_key(&id)
+                || active.touched.contains(&id)
+                || unfinished.contains(&id)
+            {
                 continue;
             }
             let group = groups.get(&id);
@@ -3313,19 +3402,10 @@ struct WatchObserver {
     scope: NativeDiscoveryScope,
     outputs: Mutex<BTreeMap<String, String>>,
     batch: Arc<str>,
-    toast: Option<super::toast::Publisher>,
-    toast_progress: Mutex<ToastProgress>,
-    language: crate::core::i18n::Language,
-    began: Instant,
+    toast: Option<super::toast::Activity>,
     hub: Arc<Hub>,
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
     promoted: Mutex<HashMap<String, Option<WatchCandidateRow>>>,
-}
-
-#[derive(Default)]
-struct ToastProgress {
-    latest: Option<(PathBuf, u64, u64)>,
-    waiting: HashMap<PathBuf, ResourceWait>,
 }
 
 impl WatchObserver {
@@ -3348,25 +3428,17 @@ impl WatchObserver {
             .max_by_key(|(path, _)| path.len())
             .map(|(_, owner)| owner.clone())
     }
-
-    fn finished(&self, outcome: Option<&Outcome>, cancelled: bool) {
-        let Some(toast) = &self.toast else {
-            return;
-        };
-        if cancelled {
-            toast.publish(super::toast::Snapshot::cancelled(
-                &self.batch,
-                self.language,
-            ));
-        } else if let Some(outcome) = outcome {
-            if !outcome.archives.is_empty() || !outcome.errors.is_empty() {
-                toast.publish_completed(&self.batch, self.language, outcome, self.began.elapsed());
-            }
-        }
-    }
 }
 
 impl Observer for WatchObserver {
+    fn worker_updates(&self) -> crate::pipeline::WorkerUpdates {
+        if self.toast.is_some() {
+            crate::pipeline::WorkerUpdates::All
+        } else {
+            crate::pipeline::WorkerUpdates::None
+        }
+    }
+
     fn promoted_source(&self, path: &str) -> Option<PromotedSource> {
         self.journal
             .state()
@@ -3547,61 +3619,8 @@ impl Observer for WatchObserver {
     }
 
     fn notify(&self, event: Event) {
-        let Some(toast) = &self.toast else {
-            return;
-        };
-        let mut progress = self.toast_progress.lock().unwrap();
-        match event {
-            Event::Progress {
-                path,
-                completed_bytes,
-                total_bytes,
-            } => {
-                progress.latest = Some((path, completed_bytes, total_bytes));
-                if !progress.waiting.is_empty() {
-                    return;
-                }
-            }
-            Event::ResourceWait { path, state } => {
-                if state.disk || state.memory {
-                    progress.waiting.insert(path, state);
-                } else {
-                    progress.waiting.remove(&path);
-                    if progress.latest.is_none() {
-                        progress.latest = Some((path, 0, 0));
-                    }
-                }
-            }
-            Event::Finished { path, .. } => {
-                if progress.waiting.remove(&path).is_none() {
-                    return;
-                }
-            }
-            _ => return,
-        }
-        if let Some((path, _)) = progress.waiting.iter().next() {
-            let state = progress
-                .waiting
-                .values()
-                .fold(ResourceWait::default(), |left, right| ResourceWait {
-                    disk: left.disk || right.disk,
-                    memory: left.memory || right.memory,
-                    volume_error: left.volume_error.or(right.volume_error),
-                });
-            toast.publish(super::toast::Snapshot::resource_wait(
-                &self.batch,
-                self.language,
-                path,
-                state,
-            ));
-        } else if let Some((path, completed, total)) = &progress.latest {
-            toast.publish(super::toast::Snapshot::progress(
-                &self.batch,
-                self.language,
-                path.clone(),
-                *completed,
-                *total,
-            ));
+        if let Some(toast) = &self.toast {
+            toast.event(event);
         }
     }
 

@@ -660,10 +660,10 @@ impl Discovered {
                                 DiscoverySource::Embedded,
                                 verified,
                             );
-                            task.inputs[0].failure = Some(Failure {
-                                kind: FailureKind::FilesystemError,
-                                message: error.to_string(),
-                            });
+                            task.inputs[0].failure = Some(Failure::new(
+                                FailureKind::FilesystemError,
+                                error.to_string(),
+                            ));
                             embedded_tasks.push(task);
                         }
                     } else if let Some(scan) = row.scan {
@@ -904,10 +904,7 @@ pub(super) fn discovery_failure(reason: &str) -> Option<Failure> {
         "embedded_scan_io_error" => (FailureKind::FilesystemError, "Unable to read archive input"),
         _ => return None,
     };
-    Some(Failure {
-        kind,
-        message: message.to_owned(),
-    })
+    Some(Failure::new(kind, message))
 }
 
 fn merge_shared_inputs(tasks: &mut Vec<Task>) {

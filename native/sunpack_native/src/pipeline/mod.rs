@@ -5,6 +5,8 @@ mod cleanup;
 mod coordinator;
 mod discovery;
 mod passwords;
+mod scheduling;
+mod shell_updates;
 mod worker;
 
 use crate::core::{config::Config, passwords::PasswordSnapshot};
@@ -129,6 +131,76 @@ pub enum FailureKind {
 pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Box<FailureEvidence>>,
+}
+
+impl Failure {
+    pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            evidence: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FailureEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_volume_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_volume_evidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read: Option<FailureRead>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryPreview>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureRead {
+    pub source_path: String,
+    pub source_offset: u64,
+    pub virtual_offset: u64,
+    pub requested: u64,
+    pub returned: u64,
+    pub win32_error: i64,
+    pub read_error: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecoveryPreview {
+    pub complete_files: usize,
+    pub partial_files: usize,
+    pub failed_files: usize,
+    pub incomplete_files: usize,
+    pub omitted_files: usize,
+    pub files: Vec<RecoveryFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryFile {
+    pub index: u32,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+    pub status: RecoveryStatus,
+    pub bytes_written: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryStatus {
+    Complete,
+    Partial,
+    Failed,
+    Incomplete,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +235,24 @@ pub struct CleanupResult {
     pub status: CleanupStatus,
     pub error_code: i32,
     pub message: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct OutputCleanupError {
+    pub path: PathBuf,
+    pub error: io::Error,
+}
+
+impl std::fmt::Display for OutputCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.error)
+    }
+}
+
+impl std::error::Error for OutputCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -243,25 +333,58 @@ pub struct ResourceWait {
     pub volume_error: Option<u64>,
 }
 
+pub type TaskId = u64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Segment {
+    pub index: usize,
+    pub count: usize,
+    pub offset: u64,
+    pub end_offset: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum Event {
+    Queued {
+        id: TaskId,
+        parent: Option<TaskId>,
+        path: PathBuf,
+        depth: usize,
+        segment: Option<Segment>,
+    },
     Started {
+        id: TaskId,
         path: PathBuf,
         depth: usize,
     },
+    Waiting {
+        id: TaskId,
+    },
+    Working {
+        id: TaskId,
+    },
+    Finalizing {
+        id: TaskId,
+    },
     Progress {
+        id: TaskId,
         path: PathBuf,
         completed_bytes: u64,
         total_bytes: u64,
     },
     ResourceWait {
+        id: TaskId,
         path: PathBuf,
         state: ResourceWait,
     },
     Finished {
+        id: TaskId,
         path: PathBuf,
         depth: usize,
         success: bool,
+    },
+    Skipped {
+        id: TaskId,
     },
 }
 
@@ -270,9 +393,13 @@ pub enum Event {
 pub(crate) trait Observer: Sync {
     fn notify(&self, event: Event);
 
+    fn worker_updates(&self) -> WorkerUpdates {
+        WorkerUpdates::All
+    }
+
     fn archive_branch(&self, _parent: &ArchiveResult, _child: &ArchiveResult) {}
 
-    fn scope_finished(&self, _archives: &[ArchiveResult]) -> io::Result<()> {
+    fn scope_finished(&self, _id: TaskId, _archives: &[ArchiveResult]) -> io::Result<()> {
         Ok(())
     }
 
@@ -363,6 +490,14 @@ pub(crate) trait Observer: Sync {
     fn allow_recursive(&self, _depth: usize, _pending: usize) -> bool {
         true
     }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WorkerUpdates {
+    #[default]
+    All,
+    Resources,
+    None,
 }
 
 impl<F: Fn(Event) + Sync> Observer for F {

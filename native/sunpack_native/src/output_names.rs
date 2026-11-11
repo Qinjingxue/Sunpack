@@ -63,4 +63,3 @@ pub(crate) fn output_name_component(value: &str) -> String {
         part.to_owned()
     }
 }
-

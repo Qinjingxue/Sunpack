@@ -10,7 +10,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
@@ -323,7 +323,11 @@ struct Header {
     flags: u32,
     cwd: PathBuf,
     argv: Vec<String>,
-    columns: usize,
+    terminal_size: u32,
+}
+
+fn encode_terminal_size(columns: u32, rows: u32) -> Option<u32> {
+    ((1..=32767).contains(&columns) && (1..=32767).contains(&rows)).then_some(columns | rows << 16)
 }
 
 fn read_u32(input: &mut impl Read) -> io::Result<u32> {
@@ -363,15 +367,16 @@ impl Header {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let mut argv = Vec::new();
-        let mut columns = 80;
+        let mut terminal_size = 80 | 24 << 16;
         for _ in 0..argc {
             let size = read_u32(input)? as usize;
             let arg = read_text(input, size)?;
             if let Some(value) = arg.strip_prefix("--_sunpack-terminal-size=") {
-                columns = value
-                    .split_once('x')
-                    .and_then(|(width, _)| width.parse().ok())
-                    .unwrap_or(80);
+                if let Some(size) = value.split_once('x').and_then(|(width, height)| {
+                    encode_terminal_size(width.parse().ok()?, height.parse().ok()?)
+                }) {
+                    terminal_size = size;
+                }
             } else {
                 argv.push(arg);
             }
@@ -380,7 +385,7 @@ impl Header {
             flags,
             cwd,
             argv,
-            columns,
+            terminal_size,
         })
     }
 }
@@ -390,7 +395,7 @@ struct Connection<'a> {
     prompt: Mutex<Option<mpsc::SyncSender<Vec<u8>>>>,
     input: Mutex<PromptInput>,
     cancel: Cancellation,
-    columns: AtomicUsize,
+    terminal_size: AtomicU32,
     flags: u32,
 }
 
@@ -485,12 +490,9 @@ impl Connection<'_> {
         loop {
             match read_u32(reader)? {
                 RESIZE if self.flags & 10 == 10 => {
-                    let columns = read_u32(reader)? as usize;
-                    let lines = read_u32(reader)? as usize;
-                    if !(1..=32767).contains(&columns) || !(1..=32767).contains(&lines) {
-                        return Err(io::ErrorKind::InvalidData.into());
-                    }
-                    self.columns.store(columns, Ordering::Relaxed);
+                    let size = encode_terminal_size(read_u32(reader)?, read_u32(reader)?)
+                        .ok_or(io::ErrorKind::InvalidData)?;
+                    self.terminal_size.store(size, Ordering::Relaxed);
                 }
                 CANCEL => {
                     if !self.cancel.cancelled() {
@@ -567,8 +569,9 @@ impl Session for Connection<'_> {
         self.flags & 16 != 0
     }
 
-    fn columns(&self) -> usize {
-        self.columns.load(Ordering::Relaxed)
+    fn terminal_size(&self) -> (usize, usize) {
+        let size = self.terminal_size.load(Ordering::Relaxed);
+        ((size & 0xffff) as usize, (size >> 16) as usize)
     }
 }
 
@@ -618,7 +621,7 @@ impl Server {
             prompt: Mutex::default(),
             input: Mutex::default(),
             cancel: Cancellation::new(),
-            columns: AtomicUsize::new(header.columns),
+            terminal_size: AtomicU32::new(header.terminal_size),
             flags: header.flags,
         };
         if header.flags & 1 != 0 {

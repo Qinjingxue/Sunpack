@@ -877,9 +877,13 @@ pub(crate) struct PersistedFileGeneration {
 impl PhysicalFileGeneration {
     pub(crate) fn object_id(&self) -> Option<(u64, [u8; 16])> {
         #[cfg(windows)]
-        { Some((self.windows.volume, self.windows.file_id)) }
+        {
+            Some((self.windows.volume, self.windows.file_id))
+        }
         #[cfg(not(windows))]
-        { None }
+        {
+            None
+        }
     }
     pub(crate) fn persisted(&self) -> PersistedFileGeneration {
         PersistedFileGeneration {
@@ -895,7 +899,11 @@ impl PhysicalFileGeneration {
 fn persisted_file_time(time: SystemTime) -> (bool, u64, u32) {
     match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => (false, duration.as_secs(), duration.subsec_nanos()),
-        Err(error) => (true, error.duration().as_secs(), error.duration().subsec_nanos()),
+        Err(error) => (
+            true,
+            error.duration().as_secs(),
+            error.duration().subsec_nanos(),
+        ),
     }
 }
 
@@ -907,7 +915,9 @@ pub(crate) struct DirectoryIdentity {
 }
 
 impl DirectoryIdentity {
-    pub(crate) fn object_id(&self) -> (u64, [u8; 16]) { (self.volume, self.file_id) }
+    pub(crate) fn object_id(&self) -> (u64, [u8; 16]) {
+        (self.volume, self.file_id)
+    }
 }
 
 #[cfg(windows)]
@@ -920,16 +930,25 @@ pub(crate) fn capture_directory_identity(path: &Path) -> io::Result<DirectoryIde
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_dir() || metadata.file_attributes() & 0x0400 != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "checkpoint output is not a regular directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint output is not a regular directory",
+        ));
     }
     let generation = windows_file_generation(&file)?;
-    Ok(DirectoryIdentity { volume: generation.volume, file_id: generation.file_id,
-        created: metadata.created().ok().map(persisted_file_time) })
+    Ok(DirectoryIdentity {
+        volume: generation.volume,
+        file_id: generation.file_id,
+        created: metadata.created().ok().map(persisted_file_time),
+    })
 }
 
 #[cfg(not(windows))]
 pub(crate) fn capture_directory_identity(_path: &Path) -> io::Result<DirectoryIdentity> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "directory identity requires Windows"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory identity requires Windows",
+    ))
 }
 
 struct FileSource {

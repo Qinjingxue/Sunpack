@@ -4,7 +4,7 @@ use crate::core::i18n::Language;
 use crate::core::{passwords, resources};
 use crate::pipeline::{
     ArchiveResult, Cancellation, CleanupStatus, Engine, Event, FailureKind, InputError,
-    InputErrorKind, Mode, Observer, Outcome, Request,
+    InputErrorKind, Mode, Observer, Outcome, Request, TaskId,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -14,6 +14,8 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+mod live;
 
 pub(super) struct Host {
     engine: OnceLock<Arc<Engine>>,
@@ -719,7 +721,7 @@ impl ArchiveSummary {
                     .filter_map(|entry| entry.failure.as_ref())
                     .find(|failure| failure.kind == FailureKind::MissingVolume)
                 {
-                    recovery["warning"] = json!(warning);
+                    recovery["warning"] = json!({"kind": warning.kind, "message": warning.message});
                 }
                 summary.recovered.push(recovery);
             } else {
@@ -758,98 +760,76 @@ fn input_error_message(error: &InputError, language: Language, json: bool) -> St
 struct Progress<'a> {
     session: &'a dyn Session,
     watch: &'a watch::Watch,
+    cancel: &'a Cancellation,
     language: Language,
-    last: Mutex<Option<Instant>>,
+    display: Mutex<Display>,
     branches: Mutex<HashMap<PathBuf, (PathBuf, u64, String)>>,
     prompt: bool,
     visible: bool,
     verbose: bool,
 }
 
+#[derive(Default)]
+struct Display {
+    panel: Option<live::Panel>,
+    prompting: bool,
+    deferred: Vec<u8>,
+}
+
+impl Progress<'_> {
+    fn clear_panel(&self) -> io::Result<()> {
+        let mut display = self.display.lock().unwrap();
+        if let Some(mut panel) = display.panel.take() {
+            // The launcher can already have printed its interrupt message.
+            // In that case the old cursor position no longer belongs to us.
+            if !self.cancel.cancelled() {
+                panel.clear(self.session)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Observer for Progress<'_> {
-    fn notify(&self, event: Event) {
+    fn worker_updates(&self) -> crate::pipeline::WorkerUpdates {
+        use crate::pipeline::WorkerUpdates;
         if !self.visible {
+            WorkerUpdates::None
+        } else if self.session.interactive() {
+            WorkerUpdates::All
+        } else {
+            WorkerUpdates::Resources
+        }
+    }
+
+    fn notify(&self, event: Event) {
+        if !self.visible || self.cancel.cancelled() {
             return;
         }
-        let interactive = self.session.interactive();
-        match event {
-            Event::ResourceWait { path, state } if interactive || state.disk => {
-                let _display = self.last.lock().unwrap();
-                let (status, hint) = match (state.disk, state.memory) {
-                    (true, true) => (
-                        "report.status.resources_paused",
-                        "report.status.resources_resume_hint",
-                    ),
-                    (true, false) => (
-                        "report.status.disk_paused",
-                        "report.status.disk_resume_hint",
-                    ),
-                    (false, true) => (
-                        "report.status.memory_paused",
-                        "report.status.memory_resume_hint",
-                    ),
-                    (false, false) => ("report.status.extracting", ""),
-                };
-                let hint = match state.volume_error {
-                    Some(error) => self.language.translate(
-                        "report.status.disk_unavailable",
-                        &[("error", &error.to_string())],
-                    ),
-                    None if !hint.is_empty() => self.language.text(hint).into(),
-                    None => String::new(),
-                };
-                if interactive {
-                    let _ = self.session.write(Stream::Out, b"\r\x1b[2K");
-                }
-                let filename = path
-                    .file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy();
-                let mut message = format!("{filename}: {}", self.language.text(status));
-                if !hint.is_empty() {
-                    message.push_str(" — ");
-                    message.push_str(&hint);
-                }
-                let _ = line(
-                    self.session,
-                    if interactive {
-                        Stream::Out
-                    } else {
-                        Stream::Err
-                    },
-                    &message,
-                );
+        if self.session.interactive() {
+            let mut display = self.display.lock().unwrap();
+            if self.cancel.cancelled() {
+                return;
             }
-            Event::Progress {
-                path,
-                completed_bytes,
-                total_bytes,
-            } if interactive && total_bytes != 0 => {
-                let mut last = self.last.lock().unwrap();
-                let now = Instant::now();
-                if last.is_some_and(|last| now.duration_since(last) < Duration::from_millis(100)) {
-                    return;
-                }
-                *last = Some(now);
-                let width = self.session.columns().saturating_sub(35).clamp(6, 40);
-                let filled = ((completed_bytes as u128 * width as u128 / total_bytes as u128)
-                    as usize)
-                    .min(width);
-                let filename = path
-                    .file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy();
-                let available = self.session.columns().saturating_sub(width + 10);
-                let filename: String = filename.chars().take(available).collect();
-                let percent = (completed_bytes as u128 * 100 / total_bytes as u128).min(100);
-                let bar = format!(
-                    "\r\x1b[2K{filename} [{}{}] {percent:3}%",
-                    "=".repeat(filled),
-                    " ".repeat(width - filled)
-                );
-                let _ = self.session.write(Stream::Out, bar.as_bytes());
+            let prompting = display.prompting;
+            display
+                .panel
+                .get_or_insert_with(live::Panel::default)
+                .update(self.session, self.language, event, prompting);
+        } else if let Event::ResourceWait { path, state, .. } = event {
+            if !state.disk {
+                return;
             }
-            _ => {}
+            let (status, hint) = live::wait_status(state, self.language);
+            let filename = path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy();
+            let _ = line(
+                self.session,
+                Stream::Err,
+                &format!("{filename}: {status} — {hint}"),
+            );
         }
     }
 
@@ -862,16 +842,36 @@ impl Observer for Progress<'_> {
         }
     }
 
-    fn scope_finished(&self, archives: &[ArchiveResult]) -> io::Result<()> {
-        if !self.visible || archives.is_empty() {
+    fn scope_finished(&self, id: TaskId, archives: &[ArchiveResult]) -> io::Result<()> {
+        if !self.visible {
             return Ok(());
         }
-        let report = ScopeReport::new(archives, self);
-        let mut last = self.last.lock().unwrap();
-        if last.take().is_some() {
-            self.session.write(Stream::Out, b"\r\x1b[2K")?;
+        let report = (!archives.is_empty()).then(|| ScopeReport::new(archives, self));
+        let mut display = self.display.lock().unwrap();
+        if self.cancel.cancelled() {
+            return Ok(());
         }
-        report.write()
+        if let Some(panel) = &mut display.panel {
+            panel.remove(id);
+        }
+        if display.prompting {
+            if let Some(report) = report {
+                report.write(&mut display.deferred)?;
+            }
+        } else {
+            if let Some(panel) = &mut display.panel {
+                panel.clear(self.session)?;
+            }
+            if let Some(report) = report {
+                let mut writer = BufWriter::new(SessionWriter(self.session));
+                report.write(&mut writer)?;
+                writer.flush()?;
+            }
+            if let Some(panel) = &mut display.panel {
+                panel.redraw(self.session, self.language, true);
+            }
+        }
+        Ok(())
     }
 
     fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
@@ -888,7 +888,26 @@ impl Observer for Progress<'_> {
                 ("round", &depth.saturating_sub(1).to_string()),
             ],
         );
-        confirm(self.session, self.language, &prompt).unwrap_or(false)
+        {
+            let mut display = self.display.lock().unwrap();
+            if let Some(panel) = &mut display.panel {
+                let _ = panel.clear(self.session);
+            }
+            display.prompting = true;
+        }
+        let confirmed = confirm(self.session, self.language, &prompt).unwrap_or(false);
+        let mut display = self.display.lock().unwrap();
+        display.prompting = false;
+        if !display.deferred.is_empty() {
+            let deferred = std::mem::take(&mut display.deferred);
+            let _ = self.session.write(Stream::Out, &deferred);
+        }
+        if !self.cancel.cancelled() {
+            if let Some(panel) = &mut display.panel {
+                panel.redraw(self.session, self.language, true);
+            }
+        }
+        confirmed
     }
 
     fn register_output(&self, _archive: &ArchiveResult, output: &Path) -> io::Result<()> {
@@ -918,7 +937,7 @@ fn tree_edge(unicode: bool, last: bool) -> (&'static str, &'static str) {
 
 struct ScopeReport<'a> {
     archives: &'a [ArchiveResult],
-    session: &'a dyn Session,
+    unicode: bool,
     language: Language,
     verbose: bool,
     groups: Vec<std::ops::Range<usize>>,
@@ -930,7 +949,7 @@ impl<'a> ScopeReport<'a> {
     fn new(archives: &'a [ArchiveResult], progress: &Progress<'a>) -> Self {
         let mut report = Self {
             archives,
-            session: progress.session,
+            unicode: progress.session.unicode(),
             language: progress.language,
             verbose: progress.verbose,
             groups: Vec::new(),
@@ -981,14 +1000,14 @@ impl<'a> ScopeReport<'a> {
         report
     }
 
-    fn write(&self) -> io::Result<()> {
+    fn write(&self, writer: &mut impl Write) -> io::Result<()> {
         let mut prefix = String::new();
         if self.archives.len() == 1 {
-            self.title("", "", &Self::name(&self.archives[0]))?;
-            return self.status_and_children(0, &mut prefix);
+            Self::title(writer, "", "", &Self::name(&self.archives[0]))?;
+            return self.status_and_children(writer, 0, &mut prefix);
         }
         for &root in &self.roots {
-            self.group(root, &mut prefix, None)?;
+            self.group(writer, root, &mut prefix, None)?;
         }
         Ok(())
     }
@@ -1001,16 +1020,21 @@ impl<'a> ScopeReport<'a> {
             .to_string_lossy()
     }
 
-    fn group(&self, group: usize, prefix: &mut String, last: Option<bool>) -> io::Result<()> {
+    fn group(
+        &self,
+        writer: &mut impl Write,
+        group: usize,
+        prefix: &mut String,
+        last: Option<bool>,
+    ) -> io::Result<()> {
         let range = self.groups[group].clone();
-        let (edge, continuation) =
-            last.map_or(("", ""), |last| tree_edge(self.session.unicode(), last));
+        let (edge, continuation) = last.map_or(("", ""), |last| tree_edge(self.unicode, last));
         let name = Self::name(&self.archives[range.start]);
         let len = prefix.len();
-        self.title(prefix, edge, &name)?;
+        Self::title(writer, prefix, edge, &name)?;
         prefix.push_str(continuation);
         if range.len() == 1 {
-            self.status_and_children(range.start, prefix)?;
+            self.status_and_children(writer, range.start, prefix)?;
         } else {
             let end = range.end;
             for (number, position) in range.enumerate() {
@@ -1024,11 +1048,11 @@ impl<'a> ScopeReport<'a> {
                     item.offset,
                     end_offset(item)
                 );
-                let (edge, continuation) = tree_edge(self.session.unicode(), position + 1 == end);
+                let (edge, continuation) = tree_edge(self.unicode, position + 1 == end);
                 let segment_prefix = prefix.len();
-                self.title(prefix, edge, &label)?;
+                Self::title(writer, prefix, edge, &label)?;
                 prefix.push_str(continuation);
-                self.status_and_children(position, prefix)?;
+                self.status_and_children(writer, position, prefix)?;
                 prefix.truncate(segment_prefix);
             }
         }
@@ -1036,16 +1060,21 @@ impl<'a> ScopeReport<'a> {
         Ok(())
     }
 
-    fn title(&self, prefix: &str, edge: &str, label: &str) -> io::Result<()> {
+    fn title(writer: &mut impl Write, prefix: &str, edge: &str, label: &str) -> io::Result<()> {
         let label = if label.contains(['\r', '\n']) {
             Cow::Owned(label.replace(['\r', '\n'], " "))
         } else {
             Cow::Borrowed(label)
         };
-        line(self.session, Stream::Out, &format!("{prefix}{edge}{label}"))
+        writeln!(writer, "{prefix}{edge}{label}")
     }
 
-    fn status_and_children(&self, position: usize, prefix: &mut String) -> io::Result<()> {
+    fn status_and_children(
+        &self,
+        writer: &mut impl Write,
+        position: usize,
+        prefix: &mut String,
+    ) -> io::Result<()> {
         let item = &self.archives[position];
         let (status, progress) = if item.partial {
             ("report.status.partial", "")
@@ -1054,10 +1083,10 @@ impl<'a> ScopeReport<'a> {
         } else {
             ("report.status.complete", " [####################] 100%")
         };
-        line(
-            self.session,
-            Stream::Out,
-            &format!("{prefix}  [{}]{progress}", self.language.text(status)),
+        writeln!(
+            writer,
+            "{prefix}  [{}]{progress}",
+            self.language.text(status)
         )?;
         if let Some(failure) = item
             .failure
@@ -1065,7 +1094,12 @@ impl<'a> ScopeReport<'a> {
             .filter(|_| !item.partial || self.verbose)
         {
             if !is_password_failure(failure.kind) {
-                self.title(prefix, "  ", failure_message(failure, self.language))?;
+                Self::title(
+                    writer,
+                    prefix,
+                    "  ",
+                    failure_message(failure, self.language),
+                )?;
             }
         }
         if let Some(output) = item.output.as_ref().filter(|_| self.verbose) {
@@ -1073,11 +1107,11 @@ impl<'a> ScopeReport<'a> {
                 "report.detail.output",
                 &[("output", &output.to_string_lossy())],
             );
-            self.title(prefix, "  ", &detail)?;
+            Self::title(writer, prefix, "  ", &detail)?;
         }
         if let Some(children) = self.children.get(position) {
             for (i, &child) in children.iter().enumerate() {
-                self.group(child, prefix, Some(i + 1 == children.len()))?;
+                self.group(writer, child, prefix, Some(i + 1 == children.len()))?;
             }
         }
         Ok(())
@@ -1196,11 +1230,12 @@ fn archives(
     let progress = Progress {
         session,
         watch: &host.watch,
+        cancel,
         language,
-        last: Mutex::new(None),
+        display: Mutex::default(),
         branches: Mutex::default(),
         prompt: settings.recursive_extract == Recursion::Prompt,
-        visible: !options.json,
+        visible: !options.json && !scan,
         verbose: options.verbose,
     };
     let max_depth = depth(settings.recursive_extract);
@@ -1234,10 +1269,13 @@ fn archives(
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
         request.promoted_sources = std::mem::take(&mut promoted_sources);
-        let current = match engine.run_reserved(request, &progress, &reservation) {
+        let current = engine.run_reserved(request, &progress, &reservation);
+        let cleared = progress.clear_panel();
+        let current = match current {
             Ok(outcome) => outcome,
             Err(error) => return archive_request_error(error, &inputs, options.command, language),
         };
+        cleared?;
         if cancel.cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -1398,6 +1436,20 @@ fn archives(
             "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
             "password_retry_count": retries, "cleanup_results": cleanup.values().collect::<Vec<_>>(),
         });
+        let failure_details: Vec<_> = all_archives
+            .values()
+            .filter_map(|entry| {
+                let failure = entry.failure.as_ref()?;
+                failure.evidence.as_ref()?;
+                Some(
+                    json!({"path": entry.path, "depth": entry.depth, "offset": entry.offset,
+                "end_offset": entry.end_offset, "partial": entry.partial, "failure": failure}),
+                )
+            })
+            .collect();
+        if !failure_details.is_empty() {
+            result.summary["failure_details"] = Value::Array(failure_details);
+        }
         result.items.push(password_item(
             &user,
             &clipboard,
@@ -1624,6 +1676,13 @@ fn report_scan(
                 let mut item =
                     json!({"main_path": entry.path, "format": entry.format, "input_id": input_id});
                 let obj = item.as_object_mut().unwrap();
+                if let Some(failure) = entry
+                    .failure
+                    .as_ref()
+                    .filter(|failure| failure.evidence.is_some())
+                {
+                    obj.insert("failure".into(), json!(failure));
+                }
                 if embedded {
                     obj.insert("offset".into(), json!(entry.offset));
                     obj.insert("end_offset".into(), json!(entry.end_offset));

@@ -1,5 +1,6 @@
 //! Request cancellation shared by native IO, analysis and password work.
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -8,12 +9,18 @@ thread_local! {
     static SCOPES: RefCell<Vec<Cancellation>> = const { RefCell::new(Vec::new()) };
 }
 
-type Wake = Arc<dyn Fn() + Send + Sync>;
+type Wake = Box<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct Wakes {
+    next: u64,
+    callbacks: HashMap<u64, Wake>,
+}
 
 #[derive(Default)]
 struct State {
     flag: Arc<AtomicBool>,
-    wakes: Mutex<Vec<Wake>>,
+    wakes: Mutex<Wakes>,
 }
 
 impl State {
@@ -21,9 +28,14 @@ impl State {
         if self.flag.swap(true, Ordering::Relaxed) {
             return;
         }
-        let wakes =
-            std::mem::take(&mut *self.wakes.lock().unwrap_or_else(|error| error.into_inner()));
-        for wake in wakes {
+        let wakes = std::mem::take(
+            &mut self
+                .wakes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .callbacks,
+        );
+        for wake in wakes.into_values() {
             wake();
         }
     }
@@ -90,7 +102,6 @@ impl Cancellation {
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Option<Subscription> {
         let state = self.0.as_ref()?;
-        let wake: Wake = Arc::new(wake);
         let mut wakes = state
             .wakes
             .lock()
@@ -98,12 +109,14 @@ impl Cancellation {
         if self.cancelled() {
             drop(wakes);
             wake();
-        } else {
-            wakes.push(Arc::clone(&wake));
+            return None;
         }
+        let id = wakes.next;
+        wakes.next += 1;
+        wakes.callbacks.insert(id, Box::new(wake));
         Some(Subscription {
             state: Arc::clone(state),
-            wake,
+            id,
         })
     }
 }
@@ -115,16 +128,22 @@ fn cancelled_io() -> io::Error {
 
 pub(crate) struct Subscription {
     state: Arc<State>,
-    wake: Wake,
+    id: u64,
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.state
+        let mut wakes = self
+            .state
             .wakes
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|wake| !Arc::ptr_eq(wake, &self.wake));
+            .unwrap_or_else(|error| error.into_inner());
+        let removed = wakes.callbacks.remove(&self.id);
+        if wakes.callbacks.capacity() > 256 {
+            crate::collections::trim_map(&mut wakes.callbacks);
+        }
+        drop(wakes);
+        drop(removed);
     }
 }
 
@@ -226,7 +245,7 @@ mod tests {
         canceller.join().unwrap();
         assert!(result.is_err());
         assert!(matched < size);
-        assert!(state.wakes.lock().unwrap().is_empty());
+        assert!(state.wakes.lock().unwrap().callbacks.is_empty());
         assert!(!Cancellation::current().cancelled());
         let mut surviving = 0;
         iocp::scan_file(

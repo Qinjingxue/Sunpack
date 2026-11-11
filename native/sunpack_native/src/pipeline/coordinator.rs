@@ -1,11 +1,13 @@
 use super::checkpoint::{CheckpointKey, InputCheckpoint, PromotedSource};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{AttemptCache, CandidateSet};
+use super::scheduling::{Scheduler, Spawner};
+use super::shell_updates::{ShellNotifier, ShellUpdates};
 use super::worker::{self, Process};
 use super::{
     ArchiveResult, BusyConflict, Cancellation, CleanupResult, CleanupStatus, DiscoverySource,
-    Event, Failure, FailureKind, InputError, InputErrorKind, Mode, Observer, Origin, Outcome,
-    Request,
+    Event, Failure, FailureEvidence, FailureKind, FailureRead, InputError, InputErrorKind, Mode,
+    Observer, Origin, Outcome, Request, Segment, TaskId,
 };
 use crate::analysis_native::{analyze_input, NativeAnalysisConfig};
 use crate::core::config::{CleanupMode, ContentRequirement, ProcessMode, Recursion, WorkerConfig};
@@ -29,14 +31,15 @@ use crate::scan::directory::{
     scan_output_inventory_impl, NativeDirectoryScanOptions, NativeOutputInventory,
 };
 use crate::scan::worker_event::WorkerFrame;
-use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::poll_fn;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::task::{Poll, Waker};
 
 pub struct Engine {
     worker_path: PathBuf,
@@ -44,6 +47,8 @@ pub struct Engine {
     leases: Arc<Leases>,
     next_job: AtomicU64,
     password_attempts: AttemptCache,
+    scheduler: OnceLock<Arc<Scheduler>>,
+    shell: ShellNotifier,
 }
 
 struct WorkerOwner {
@@ -62,6 +67,8 @@ impl Engine {
             leases: Arc::new(Leases::default()),
             next_job: AtomicU64::new(1),
             password_attempts: AttemptCache::default(),
+            scheduler: OnceLock::new(),
+            shell: ShellNotifier::default(),
         }
     }
 
@@ -164,7 +171,6 @@ impl Engine {
         let run = Run {
             engine: self,
             request: &request,
-            request_id,
             resolve_aliases,
             candidates,
             options,
@@ -178,11 +184,35 @@ impl Engine {
             promoted_sources,
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
         };
-        let mut outcome = request.cancel.run(|| {
-            request.cancel.check_io()?;
-            let discovered = discovery::discover(&request, run.options_at(1), &run.candidates)?;
-            run.execute_batch(discovered, 1, None, None)
+        let scheduler = self.scheduler.get_or_init(Scheduler::new);
+        let discovered = scheduler.run(request_id, request.origin, &request.cancel, |_| {
+            Box::pin(async {
+                request.cancel.check_io()?;
+                let mut discovered =
+                    discovery::discover(&request, run.options_at(1), &run.candidates)?;
+                if run.resolve_aliases {
+                    dedup_resolved_plans(&mut discovered.tasks);
+                }
+                Ok::<_, io::Error>(discovered)
+            })
         })?;
+        // Watch can wait for a different request's ownership here. The caller
+        // owns that wait, so the other request retains access to host slots.
+        if request.mode == Mode::Extract {
+            self.leases.extend_request(
+                request_id,
+                request.origin,
+                discovered
+                    .tasks
+                    .iter()
+                    .flat_map(|task| task.owned_paths.iter().map(String::as_str)),
+                &request.cancel,
+            )?;
+        }
+        let mut outcome =
+            scheduler.run(request_id, request.origin, &request.cancel, |spawner| {
+                Box::pin(run.execute_batch(discovered, 1, None, None, spawner))
+            })?;
         outcome.errors.extend(
             run.scan_errors
                 .into_inner()
@@ -240,7 +270,6 @@ impl Engine {
 struct Run<'a, O> {
     engine: &'a Engine,
     request: &'a Request,
-    request_id: u64,
     resolve_aliases: bool,
     candidates: CandidateSet<'a>,
     options: NativeDirectoryScanOptions,
@@ -261,7 +290,7 @@ struct Executed {
     input: ArchiveInput,
 }
 
-impl<O: Observer> Run<'_, O> {
+impl<'run, O: Observer> Run<'run, O> {
     fn options_at(&self, depth: usize) -> &NativeDirectoryScanOptions {
         if depth == 1 {
             self.deep_options.as_ref().unwrap_or(&self.options)
@@ -270,27 +299,14 @@ impl<O: Observer> Run<'_, O> {
         }
     }
 
-    fn execute_batch(
-        &self,
-        mut batch: Discovered,
+    async fn execute_batch<'a>(
+        &'a self,
+        batch: Discovered,
         depth: usize,
-        inherited_scope: Option<&Path>,
-        parent_archive: Option<&ArchiveResult>,
+        inherited_scope: Option<Arc<Path>>,
+        parent: Option<(TaskId, &ArchiveResult)>,
+        spawner: Spawner<'a>,
     ) -> io::Result<Outcome> {
-        if depth == 1 && self.resolve_aliases {
-            dedup_resolved_plans(&mut batch.tasks);
-        }
-        if depth == 1 && self.request.mode == Mode::Extract {
-            self.engine.leases.extend_request(
-                self.request_id,
-                self.request.origin,
-                batch
-                    .tasks
-                    .iter()
-                    .flat_map(|task| task.owned_paths.iter().map(String::as_str)),
-                &self.request.cancel,
-            )?;
-        }
         let mut outcome = Outcome {
             errors: batch.errors,
             scan_incomplete: self.record_scan_errors(batch.scan_errors),
@@ -298,16 +314,28 @@ impl<O: Observer> Run<'_, O> {
         };
         let executed: Vec<_> = batch
             .tasks
-            .into_par_iter()
+            .into_iter()
             .map(|task| {
-                self.request
-                    .cancel
-                    .run(|| self.execute_task(task, depth, inherited_scope))
+                let id = self.queue_task(task.entry(), depth, parent.map(|(id, _)| id), None);
+                spawner.spawn(self.execute_task(
+                    task,
+                    id,
+                    depth,
+                    inherited_scope.clone(),
+                    spawner.clone(),
+                ))
             })
             .collect();
+        let mut first_error = None;
         for branch in executed {
-            let mut branch = branch?;
-            if let Some((parent, child)) = parent_archive.zip(branch.archives.first()) {
+            let mut branch = match branch.wait().await {
+                Ok(branch) => branch,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            if let Some(((_, parent), child)) = parent.zip(branch.archives.first()) {
                 self.observer.archive_branch(parent, child);
             }
             outcome.archives.append(&mut branch.archives);
@@ -322,7 +350,25 @@ impl<O: Observer> Run<'_, O> {
                 .removed_promotion_dirs
                 .append(&mut branch.removed_promotion_dirs);
         }
-        Ok(outcome)
+        first_error.map_or(Ok(outcome), Err)
+    }
+
+    fn queue_task(
+        &self,
+        input: &ArchiveInput,
+        depth: usize,
+        parent: Option<TaskId>,
+        segment: Option<Segment>,
+    ) -> TaskId {
+        let id = self.engine.next_job.fetch_add(1, Ordering::Relaxed);
+        self.observer.notify(Event::Queued {
+            id,
+            parent,
+            path: PathBuf::from(&input.entry_path),
+            depth,
+            segment,
+        });
+        id
     }
 
     fn record_scan_errors(&self, errors: DirectoryReadErrors) -> bool {
@@ -333,406 +379,520 @@ impl<O: Observer> Run<'_, O> {
         true
     }
 
-    fn execute_task(
-        &self,
+    fn execute_task<'a>(
+        &'a self,
         mut task: Task,
+        task_id: TaskId,
         depth: usize,
-        inherited_scope: Option<&Path>,
-    ) -> io::Result<Outcome> {
-        let cancel = &self.request.cancel;
-        cancel.check_io()?;
-        let mut lease = self.claim_task(&task)?;
-        let mut outcome = Outcome::default();
-        let mut generations = self.capture_generations(&task);
-        let watch_root = depth == 1
-            && self.request.origin == Origin::Watch
-            && self.request.mode == Mode::Extract;
-        if watch_root && !self.should_process_watch(&task, &generations)? {
-            return Ok(outcome);
-        }
-        self.plan_inputs(&mut task)?;
-        self.observer.claim_sources(
-            Path::new(&task.entry().entry_path),
-            &task.owned_paths,
-            depth,
-        )?;
-        let owner_path = PathBuf::from(&task.entry().entry_path);
-        let root_scope = owner_path.parent();
-        let source_scope = inherited_scope.or(root_scope);
-        let candidates = self.candidates.with_scope(source_scope);
-        let preferred_carrier = self.preferred_output(task.entry(), depth);
-        let mut retained: Vec<_> = task
-            .inputs
-            .iter()
-            .map(|logical| {
-                self.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth)
-            })
-            .collect();
-        let multi = task.inputs.len() > 1;
-        let carrier = if self.request.mode == Mode::Extract && multi {
-            let existing = retained
+        inherited_scope: Option<Arc<Path>>,
+        spawner: Spawner<'a>,
+    ) -> super::scheduling::Task<'a, io::Result<Outcome>> {
+        Box::pin(async move {
+            let cancel = &self.request.cancel;
+            cancel.check_io()?;
+            let mut lease = self.claim_task(&task).await?;
+            let mut outcome = Outcome::default();
+            let mut shell = self.engine.shell.branch();
+            let mut generations = self.capture_generations(&task);
+            let watch_root = depth == 1
+                && self.request.origin == Origin::Watch
+                && self.request.mode == Mode::Extract;
+            if watch_root && !self.should_process_watch(&task, &generations)? {
+                self.observer.notify(Event::Skipped { id: task_id });
+                return Ok(outcome);
+            }
+            self.observer.notify(Event::Started {
+                id: task_id,
+                path: PathBuf::from(&task.entry().entry_path),
+                depth,
+            });
+            self.plan_inputs(&mut task)?;
+            self.observer.claim_sources(
+                Path::new(&task.entry().entry_path),
+                &task.owned_paths,
+                depth,
+            )?;
+            let owner_path = PathBuf::from(&task.entry().entry_path);
+            let root_scope = owner_path.parent();
+            let source_scope = inherited_scope.as_deref().or(root_scope);
+            let candidates = self.candidates.with_scope(source_scope);
+            let preferred_carrier = self.preferred_output(task.entry(), depth);
+            let mut retained: Vec<_> = task
+                .inputs
                 .iter()
-                .flatten()
-                .find_map(|checkpoint| checkpoint.container())
-                .map(Path::to_path_buf);
-            match existing {
-                Some(path) => Some(path),
-                None if task.inputs.iter().any(|input| input.failure.is_none()) => {
-                    let receipt = receipt(&task.inputs[0].input, task.source, depth);
-                    match self.reserve_output(preferred_carrier, &receipt)? {
-                        Ok(path) => Some(path),
-                        Err(failure) => {
-                            for logical in &mut task.inputs {
-                                logical.failure.get_or_insert_with(|| failure.clone());
+                .map(|logical| {
+                    self.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth)
+                })
+                .collect();
+            let multi = task.inputs.len() > 1;
+            let count = task.inputs.len();
+            let ids: Vec<_> = task
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, logical)| {
+                    if multi {
+                        let extent = logical.input.physical_extents().next();
+                        self.queue_task(
+                            &logical.input,
+                            depth,
+                            Some(task_id),
+                            Some(Segment {
+                                index: index + 1,
+                                count,
+                                offset: extent.map_or(0, |extent| extent.start),
+                                end_offset: extent.and_then(|extent| extent.end),
+                            }),
+                        )
+                    } else {
+                        task_id
+                    }
+                })
+                .collect();
+            let carrier = if self.request.mode == Mode::Extract && multi {
+                let existing = retained
+                    .iter()
+                    .flatten()
+                    .find_map(|checkpoint| checkpoint.container())
+                    .map(Path::to_path_buf);
+                match existing {
+                    Some(path) => Some(path),
+                    None if task.inputs.iter().any(|input| input.failure.is_none()) => {
+                        let receipt = receipt(&task.inputs[0].input, task.source, depth);
+                        match self.reserve_output(preferred_carrier, &receipt)? {
+                            Ok(path) => {
+                                shell.output(&path);
+                                Some(path)
                             }
-                            None
+                            Err(failure) => {
+                                for logical in &mut task.inputs {
+                                    logical.failure.get_or_insert_with(|| failure.clone());
+                                }
+                                None
+                            }
                         }
                     }
+                    None => None,
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
-        let mut completed = Vec::with_capacity(task.inputs.len());
-        let mut children = Outcome::default();
-        let retry = task.retry.filter(|_| task.inputs.len() == 1);
-        let mut promotion_sources = task.owned_paths;
-        let mut superseded_candidates = HashSet::new();
-        for (logical, checkpoint) in task.inputs.into_iter().zip(retained.drain(..)) {
-            let before_worker = logical.failure.is_some();
-            let mut attempted = logical.input.volume_attempts.as_ref().map(|_| {
-                logical
-                    .input
-                    .physical_paths()
-                    .map(path_key)
-                    .collect::<Vec<_>>()
-            });
-            let remaining_depth = self
-                .request
-                .max_depth
-                .saturating_sub(depth.saturating_sub(1));
-            let children_already_complete =
-                checkpoint.is_some_and(|checkpoint| checkpoint.children_complete(remaining_depth));
-            let mut executed = if let Some(checkpoint) = checkpoint {
-                let mut input = logical.input;
-                checkpoint.restore_input(&mut input);
-                let mut result = checkpoint.result(depth);
-                if result.partial
-                    && self.request.config.extraction.content_requirement
-                        == ContentRequirement::Complete
-                {
-                    let output = checkpoint.output();
-                    cleanup_owned_output(output)?;
-                    self.observer.discard_output(&result, output)?;
-                    result.output = None;
-                    result.partial = false;
-                    result.files = 0;
-                    result.bytes = 0;
-                    result.recovered_complete_files = 0;
-                }
-                let inventory = if children_already_complete {
-                    None
-                } else {
-                    result
-                        .output
-                        .as_ref()
-                        .map(|path| scan_output_inventory_impl(&path.to_string_lossy()))
-                };
-                Executed {
-                    input,
-                    result,
-                    inventory,
-                }
-            } else {
-                self.execute_input(logical, task.source, depth, carrier.as_deref(), &candidates)?
-            };
-            if let Some(context) = retry.as_deref().filter(|_| {
-                !cancel.cancelled()
-                    && executed.result.output.is_none()
-                    && (before_worker || self.request.mode == Mode::Extract)
-                    && executed
-                        .result
-                        .failure
-                        .as_ref()
-                        .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
-            }) {
-                if let Some(mut replacement) = discovery::retry_volume(
-                    &executed.result,
-                    context,
-                    self.options_at(depth),
-                    &candidates,
-                    self.request,
-                )? {
-                    self.observer.after_output(&executed.result)?;
-                    drop(lease);
-                    lease = self.claim_task(&replacement)?;
-                    generations = self.capture_generations(&replacement);
-                    if watch_root && !self.should_process_watch(&replacement, &generations)? {
-                        return Ok(outcome);
-                    }
-                    self.observer.claim_sources(
-                        Path::new(&replacement.entry().entry_path),
-                        &replacement.owned_paths,
-                        depth,
-                    )?;
-                    attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
-                        replacement
-                            .entry()
-                            .physical_paths()
-                            .map(path_key)
-                            .collect::<Vec<_>>()
-                    });
-                    promotion_sources = std::mem::take(&mut replacement.owned_paths);
-                    let logical = replacement
-                        .inputs
-                        .into_iter()
-                        .next()
-                        .expect("volume retry has one logical input");
-                    executed =
-                        self.execute_input(logical, replacement.source, depth, None, &candidates)?;
-                }
-            }
-            let Executed {
-                mut result,
-                inventory,
-                mut input,
-            } = executed;
-            if self.request.mode == Mode::Scan {
-                result.volume_attempts = input.volume_attempts.take();
-                if result
-                    .failure
-                    .as_ref()
-                    .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
-                {
-                    result.volume_completeness =
-                        Some(VolumeCompleteness::Missing.as_str().to_owned());
-                }
-            }
-            if result.failure.is_none() {
-                superseded_candidates.extend(attempted.into_iter().flatten());
-            }
-            let mut descendants = Outcome::default();
-            let mut ran_recursive_children = false;
-            if let Some(inventory) = inventory
-                .filter(|inventory| inventory.file_count() > 0 || inventory.unreadable_count() > 0)
-            {
-                if depth <= self.request.max_depth && !cancel.cancelled() {
-                    let nested = discovery::discover_output(
-                        &inventory,
-                        &self.options,
-                        &candidates,
-                        self.request,
-                    )?;
-                    drop(inventory);
-                    if !nested.tasks.is_empty()
-                        && self.allow_recursive(depth + 1, nested.tasks.len())
-                    {
-                        ran_recursive_children = true;
-                        descendants =
-                            self.execute_batch(nested, depth + 1, source_scope, Some(&result))?;
-                    } else {
-                        descendants.errors.extend(nested.errors);
-                        descendants.scan_incomplete = self.record_scan_errors(nested.scan_errors);
-                    }
-                }
-            }
-            let children_complete = children_already_complete || subtree_complete(&descendants);
-            if ran_recursive_children
-                && result.failure.is_none()
-                && children_complete
-                && !cancel.cancelled()
-            {
-                if let Some(output) = result.output.as_deref() {
-                    if remove_empty_or_promoted(output, &descendants.removed_promotion_dirs) {
-                        self.observer.discard_output(&result, output)?;
-                        result.output = None;
-                    }
-                }
-            }
-            if !result.retained
-                && result.failure.is_none()
-                && self.request.config.post_extract.flatten_single_directory
-                && children_complete
-                && !cancel.cancelled()
-            {
-                flatten_result(self.observer, &mut result, &mut descendants)?;
-            }
-            let checkpoint = if self.request.mode == Mode::Extract {
-                InputCheckpoint::create(
-                    &owner_path,
-                    &input,
-                    &result,
-                    &generations,
-                    carrier.as_deref(),
-                    children_complete,
-                    remaining_depth,
-                )?
             } else {
                 None
             };
-            self.observer.commit_output(&result, checkpoint.as_ref())?;
-            if let Some(checkpoint) = checkpoint {
-                outcome.checkpoints.push(checkpoint);
-            }
-            outcome.checkpoints.append(&mut descendants.checkpoints);
-            outcome
-                .promoted_sources
-                .append(&mut descendants.promoted_sources);
-            outcome
-                .removed_promotion_dirs
-                .append(&mut descendants.removed_promotion_dirs);
-            children.archives.append(&mut descendants.archives);
-            children.errors.append(&mut descendants.errors);
-            children.scan_incomplete |= descendants.scan_incomplete;
-            children
-                .cleanup_results
-                .append(&mut descendants.cleanup_results);
-            completed.push(result);
-        }
-        if !superseded_candidates.is_empty() {
-            let retained: HashSet<_> = completed
-                .iter()
-                .flat_map(|result| {
-                    result
-                        .source_paths
-                        .iter()
-                        .map(|path| path_key(&path.to_string_lossy()))
-                })
-                .collect();
-            promotion_sources.retain(|path| {
-                !superseded_candidates.contains(&path_key(path))
-                    || retained.contains(&path_key(path))
-            });
-        }
-        if let Some(root) = &carrier {
-            if completed.iter().all(|entry| entry.output.is_none()) {
-                if remove_empty_or_promoted(root, &outcome.removed_promotion_dirs) {
-                    if let Some(result) = completed.first() {
-                        self.observer.discard_output(result, root)?;
+            let mut completed = Vec::with_capacity(task.inputs.len());
+            let mut children = Outcome::default();
+            let retry = task.retry.filter(|_| task.inputs.len() == 1);
+            let mut promotion_sources = task.owned_paths;
+            let mut superseded_candidates = HashSet::new();
+            for ((logical, checkpoint), &id) in
+                task.inputs.into_iter().zip(retained.drain(..)).zip(&ids)
+            {
+                if multi {
+                    self.observer.notify(Event::Started {
+                        id,
+                        path: PathBuf::from(&logical.input.entry_path),
+                        depth,
+                    });
+                }
+                let before_worker = logical.failure.is_some();
+                let mut attempted = logical.input.volume_attempts.as_ref().map(|_| {
+                    logical
+                        .input
+                        .physical_paths()
+                        .map(path_key)
+                        .collect::<Vec<_>>()
+                });
+                let remaining_depth = self
+                    .request
+                    .max_depth
+                    .saturating_sub(depth.saturating_sub(1));
+                let children_already_complete = checkpoint
+                    .is_some_and(|checkpoint| checkpoint.children_complete(remaining_depth));
+                let mut executed = if let Some(checkpoint) = checkpoint {
+                    let mut input = logical.input;
+                    checkpoint.restore_input(&mut input);
+                    let mut result = checkpoint.result(depth);
+                    if result.partial
+                        && self.request.config.extraction.content_requirement
+                            == ContentRequirement::Complete
+                    {
+                        let output = checkpoint.output();
+                        shell.parent(output);
+                        cleanup_owned_output(output).map_err(|error| {
+                            io::Error::other(super::OutputCleanupError {
+                                path: output.to_owned(),
+                                error,
+                            })
+                        })?;
+                        self.observer.discard_output(&result, output)?;
+                        result.output = None;
+                        result.partial = false;
+                        result.files = 0;
+                        result.bytes = 0;
+                        result.recovered_complete_files = 0;
                     }
-                }
-            }
-        }
-        if depth > 1
-            && !cancel.cancelled()
-            && !completed.iter().any(|result| result.partial)
-            && completed.iter().any(|result| {
-                result.failure.as_ref().is_some_and(|failure| {
-                    matches!(
-                        failure.kind,
-                        FailureKind::PasswordRequired
-                            | FailureKind::WrongPassword
-                            | FailureKind::PasswordInconclusive
-                            | FailureKind::MissingVolume
-                    )
-                })
-            })
-        {
-            let destination = self.promotion_directory(source_scope.unwrap_or(Path::new(".")));
-            self.promote_blocked(
-                &promotion_sources,
-                &destination,
-                &generations,
-                &mut completed,
-                &mut outcome,
-            )?;
-        }
-        let complete = completed
-            .iter()
-            .all(|result| result.failure.is_none() && !result.partial)
-            && subtree_complete(&children)
-            && !cancel.cancelled();
-        // A Watch request may have been admitted before another batch moved
-        // these members. The source leases now cover the actual resolved family.
-        let admitted_promoted: Vec<_> = promotion_sources
-            .iter()
-            .filter_map(|path| {
-                if !watch_root && self.promoted_sources.is_empty() {
-                    return None;
-                }
-                let key = path_key(path);
-                let generation = generations.get(&key)?;
-                self.promoted_sources
-                    .get(&key)
-                    .filter(|source| source.matches(generation))
-                    .map(|source| (*source).clone())
-                    .or_else(|| {
-                        watch_root
-                            .then(|| self.observer.promoted_source(path))
-                            .flatten()
-                            .filter(|source| source.matches(generation))
-                    })
-                    .map(|source| (path, source))
-            })
-            .collect();
-        if complete && self.request.mode == Mode::Extract {
-            if watch_root {
-                self.observer.sources_processed(&completed, &generations)?;
-            }
-            let mode = if depth > 1 {
-                CleanupMode::Delete
-            } else {
-                self.request.config.post_extract.archive_cleanup_mode
-            };
-            if let Some(first) = completed.first_mut() {
-                if admitted_promoted.is_empty() || mode == CleanupMode::Delete {
-                    if mode != CleanupMode::Keep {
-                        let mut selected: Vec<_> =
-                            promotion_sources.iter().map(PathBuf::from).collect();
-                        dedup_paths(&mut selected);
-                        self.cleanup_sources(first, &selected, &generations, mode, &mut outcome)?;
+                    let inventory = if children_already_complete {
+                        None
+                    } else {
+                        result
+                            .output
+                            .as_ref()
+                            .map(|path| scan_output_inventory_impl(&path.to_string_lossy()))
+                    };
+                    Executed {
+                        input,
+                        result,
+                        inventory,
                     }
                 } else {
-                    let mut generated: Vec<_> = admitted_promoted
-                        .iter()
-                        .map(|(path, _)| PathBuf::from(path))
-                        .collect();
-                    dedup_paths(&mut generated);
-                    if mode != CleanupMode::Keep {
-                        let generated_keys: HashSet<_> =
-                            admitted_promoted.iter().map(|(path, _)| *path).collect();
-                        let mut originals: Vec<_> = promotion_sources
-                            .iter()
-                            .filter(|path| !generated_keys.contains(path))
-                            .map(PathBuf::from)
-                            .collect();
-                        dedup_paths(&mut originals);
-                        self.cleanup_sources(first, &originals, &generations, mode, &mut outcome)?;
+                    self.execute_input(
+                        logical,
+                        id,
+                        task.source,
+                        depth,
+                        carrier.as_deref(),
+                        &candidates,
+                        &mut shell,
+                    )
+                    .await?
+                };
+                if let Some(context) = retry.as_deref().filter(|_| {
+                    !cancel.cancelled()
+                        && executed.result.output.is_none()
+                        && (before_worker || self.request.mode == Mode::Extract)
+                        && executed
+                            .result
+                            .failure
+                            .as_ref()
+                            .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
+                }) {
+                    if let Some(mut replacement) = discovery::retry_volume(
+                        &executed.result,
+                        context,
+                        self.options_at(depth),
+                        &candidates,
+                        self.request,
+                    )? {
+                        self.observer.after_output(&executed.result)?;
+                        drop(lease);
+                        lease = self.claim_task(&replacement).await?;
+                        generations = self.capture_generations(&replacement);
+                        if watch_root && !self.should_process_watch(&replacement, &generations)? {
+                            self.observer.notify(Event::Skipped { id: task_id });
+                            return Ok(outcome);
+                        }
+                        self.observer.claim_sources(
+                            Path::new(&replacement.entry().entry_path),
+                            &replacement.owned_paths,
+                            depth,
+                        )?;
+                        attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
+                            replacement
+                                .entry()
+                                .physical_paths()
+                                .map(path_key)
+                                .collect::<Vec<_>>()
+                        });
+                        promotion_sources = std::mem::take(&mut replacement.owned_paths);
+                        let logical = replacement
+                            .inputs
+                            .into_iter()
+                            .next()
+                            .expect("volume retry has one logical input");
+                        executed = self
+                            .execute_input(
+                                logical,
+                                id,
+                                replacement.source,
+                                depth,
+                                None,
+                                &candidates,
+                                &mut shell,
+                            )
+                            .await?;
                     }
-                    self.cleanup_sources(
-                        first,
-                        &generated,
+                }
+                let Executed {
+                    mut result,
+                    inventory,
+                    mut input,
+                } = executed;
+                if self.request.mode == Mode::Scan {
+                    result.volume_attempts = input.volume_attempts.take();
+                    if result
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
+                    {
+                        result.volume_completeness =
+                            Some(VolumeCompleteness::Missing.as_str().to_owned());
+                    }
+                }
+                if result.failure.is_none() {
+                    superseded_candidates.extend(attempted.into_iter().flatten());
+                }
+                let mut descendants = Outcome::default();
+                let mut ran_recursive_children = false;
+                if let Some(inventory) = inventory.filter(|inventory| {
+                    inventory.file_count() > 0 || inventory.unreadable_count() > 0
+                }) {
+                    if depth <= self.request.max_depth && !cancel.cancelled() {
+                        let nested = discovery::discover_output(
+                            &inventory,
+                            &self.options,
+                            &candidates,
+                            self.request,
+                        )?;
+                        drop(inventory);
+                        if !nested.tasks.is_empty()
+                            && self.allow_recursive(depth + 1, nested.tasks.len())
+                        {
+                            ran_recursive_children = true;
+                            descendants = self
+                                .execute_batch(
+                                    nested,
+                                    depth + 1,
+                                    source_scope.map(Arc::from),
+                                    Some((id, &result)),
+                                    spawner.clone(),
+                                )
+                                .await?;
+                        } else {
+                            descendants.errors.extend(nested.errors);
+                            descendants.scan_incomplete =
+                                self.record_scan_errors(nested.scan_errors);
+                        }
+                    }
+                }
+                let children_complete = children_already_complete || subtree_complete(&descendants);
+                if ran_recursive_children
+                    && result.failure.is_none()
+                    && children_complete
+                    && !cancel.cancelled()
+                {
+                    if let Some(output) = result.output.as_deref() {
+                        if remove_empty_or_promoted(output, &descendants.removed_promotion_dirs) {
+                            self.observer.discard_output(&result, output)?;
+                            result.output = None;
+                        }
+                    }
+                }
+                if !result.retained
+                    && result.failure.is_none()
+                    && self.request.config.post_extract.flatten_single_directory
+                    && children_complete
+                    && !cancel.cancelled()
+                {
+                    flatten_result(self.observer, &mut result, &mut descendants)?;
+                }
+                let checkpoint = if self.request.mode == Mode::Extract {
+                    InputCheckpoint::create(
+                        &owner_path,
+                        &input,
+                        &result,
                         &generations,
-                        CleanupMode::Delete,
-                        &mut outcome,
-                    )?;
+                        carrier.as_deref(),
+                        children_complete,
+                        remaining_depth,
+                    )?
+                } else {
+                    None
+                };
+                self.observer.commit_output(&result, checkpoint.as_ref())?;
+                if let Some(checkpoint) = checkpoint {
+                    outcome.checkpoints.push(checkpoint);
+                }
+                outcome.checkpoints.append(&mut descendants.checkpoints);
+                outcome
+                    .promoted_sources
+                    .append(&mut descendants.promoted_sources);
+                outcome
+                    .removed_promotion_dirs
+                    .append(&mut descendants.removed_promotion_dirs);
+                children.archives.append(&mut descendants.archives);
+                children.errors.append(&mut descendants.errors);
+                children.scan_incomplete |= descendants.scan_incomplete;
+                children
+                    .cleanup_results
+                    .append(&mut descendants.cleanup_results);
+                if multi {
+                    self.observer.notify(Event::Finished {
+                        id,
+                        path: result.path.clone(),
+                        depth,
+                        success: result.failure.is_none() || result.partial,
+                    });
+                }
+                completed.push(result);
+            }
+            if !superseded_candidates.is_empty() {
+                let retained: HashSet<_> = completed
+                    .iter()
+                    .flat_map(|result| {
+                        result
+                            .source_paths
+                            .iter()
+                            .map(|path| path_key(&path.to_string_lossy()))
+                    })
+                    .collect();
+                promotion_sources.retain(|path| {
+                    !superseded_candidates.contains(&path_key(path))
+                        || retained.contains(&path_key(path))
+                });
+            }
+            if let Some(root) = &carrier {
+                if completed.iter().all(|entry| entry.output.is_none()) {
+                    if remove_empty_or_promoted(root, &outcome.removed_promotion_dirs) {
+                        if let Some(result) = completed.first() {
+                            self.observer.discard_output(result, root)?;
+                        }
+                    }
                 }
             }
-        } else {
+            if depth > 1
+                && !cancel.cancelled()
+                && !completed.iter().any(|result| result.partial)
+                && completed.iter().any(|result| {
+                    result.failure.as_ref().is_some_and(|failure| {
+                        matches!(
+                            failure.kind,
+                            FailureKind::PasswordRequired
+                                | FailureKind::WrongPassword
+                                | FailureKind::PasswordInconclusive
+                                | FailureKind::MissingVolume
+                        )
+                    })
+                })
+            {
+                let destination = self.promotion_directory(source_scope.unwrap_or(Path::new(".")));
+                self.promote_blocked(
+                    &promotion_sources,
+                    &destination,
+                    &generations,
+                    &mut completed,
+                    &mut outcome,
+                    &mut shell,
+                )
+                .await?;
+            }
+            let complete = completed
+                .iter()
+                .all(|result| result.failure.is_none() && !result.partial)
+                && subtree_complete(&children)
+                && !cancel.cancelled();
+            // A Watch request may have been admitted before another batch moved
+            // these members. The source leases now cover the actual resolved family.
+            let admitted_promoted: Vec<_> = promotion_sources
+                .iter()
+                .filter_map(|path| {
+                    if !watch_root && self.promoted_sources.is_empty() {
+                        return None;
+                    }
+                    let key = path_key(path);
+                    let generation = generations.get(&key)?;
+                    self.promoted_sources
+                        .get(&key)
+                        .filter(|source| source.matches(generation))
+                        .map(|source| (*source).clone())
+                        .or_else(|| {
+                            watch_root
+                                .then(|| self.observer.promoted_source(path))
+                                .flatten()
+                                .filter(|source| source.matches(generation))
+                        })
+                        .map(|source| (path, source))
+                })
+                .collect();
+            if complete && self.request.mode == Mode::Extract {
+                if watch_root {
+                    self.observer.sources_processed(&completed, &generations)?;
+                }
+                let mode = if depth > 1 {
+                    CleanupMode::Delete
+                } else {
+                    self.request.config.post_extract.archive_cleanup_mode
+                };
+                if let Some(first) = completed.first_mut() {
+                    if admitted_promoted.is_empty() || mode == CleanupMode::Delete {
+                        if mode != CleanupMode::Keep {
+                            let mut selected: Vec<_> =
+                                promotion_sources.iter().map(PathBuf::from).collect();
+                            dedup_paths(&mut selected);
+                            self.cleanup_sources(
+                                first,
+                                &selected,
+                                &generations,
+                                mode,
+                                &mut outcome,
+                                &mut shell,
+                            )?;
+                        }
+                    } else {
+                        let mut generated: Vec<_> = admitted_promoted
+                            .iter()
+                            .map(|(path, _)| PathBuf::from(path))
+                            .collect();
+                        dedup_paths(&mut generated);
+                        if mode != CleanupMode::Keep {
+                            let generated_keys: HashSet<_> =
+                                admitted_promoted.iter().map(|(path, _)| *path).collect();
+                            let mut originals: Vec<_> = promotion_sources
+                                .iter()
+                                .filter(|path| !generated_keys.contains(path))
+                                .map(PathBuf::from)
+                                .collect();
+                            dedup_paths(&mut originals);
+                            self.cleanup_sources(
+                                first,
+                                &originals,
+                                &generations,
+                                mode,
+                                &mut outcome,
+                                &mut shell,
+                            )?;
+                        }
+                        self.cleanup_sources(
+                            first,
+                            &generated,
+                            &generations,
+                            CleanupMode::Delete,
+                            &mut outcome,
+                            &mut shell,
+                        )?;
+                    }
+                }
+            } else {
+                outcome
+                    .promoted_sources
+                    .extend(admitted_promoted.into_iter().map(|(_, source)| source));
+            }
+            if let Some(result) = completed.first() {
+                self.observer.notify(Event::Finished {
+                    id: task_id,
+                    path: if multi {
+                        owner_path
+                    } else {
+                        result.path.clone()
+                    },
+                    depth,
+                    success: if multi {
+                        complete
+                    } else {
+                        result.failure.is_none() || result.partial
+                    },
+                });
+            }
+            outcome.archives.extend(completed);
+            outcome.archives.append(&mut children.archives);
+            outcome.errors.append(&mut children.errors);
+            outcome.scan_incomplete |= children.scan_incomplete;
             outcome
-                .promoted_sources
-                .extend(admitted_promoted.into_iter().map(|(_, source)| source));
-        }
-        for result in &completed {
-            self.observer.notify(Event::Finished {
-                path: result.path.clone(),
-                depth,
-                success: result.failure.is_none() || result.partial,
-            });
-        }
-        outcome.archives.extend(completed);
-        outcome.archives.append(&mut children.archives);
-        outcome.errors.append(&mut children.errors);
-        outcome.scan_incomplete |= children.scan_incomplete;
-        outcome
-            .cleanup_results
-            .append(&mut children.cleanup_results);
-        drop(lease);
-        if depth == 1 && self.request.mode == Mode::Extract && !cancel.cancelled() {
-            self.observer.scope_finished(&outcome.archives)?;
-        }
-        Ok(outcome)
+                .cleanup_results
+                .append(&mut children.cleanup_results);
+            drop(lease);
+            if depth == 1 && self.request.mode == Mode::Extract && !cancel.cancelled() {
+                self.observer.scope_finished(task_id, &outcome.archives)?;
+            }
+            Ok(outcome)
+        })
     }
 
     fn promotion_directory(&self, original_directory: &Path) -> PathBuf {
@@ -745,19 +905,25 @@ impl<O: Observer> Run<'_, O> {
             .unwrap_or_else(|| original_directory.to_path_buf())
     }
 
-    fn promote_blocked(
+    async fn promote_blocked(
         &self,
         sources: &[String],
         destination: &Path,
         generations: &HashMap<String, PhysicalFileGeneration>,
         results: &mut [ArchiveResult],
         outcome: &mut Outcome,
+        shell: &mut ShellUpdates<'_>,
     ) -> io::Result<()> {
         let representative = results
             .iter()
             .position(|result| result.failure.is_some())
             .expect("blocked task has a failure");
-        let promoted = (|| -> io::Result<(Vec<(PathBuf, PathBuf)>, Vec<PromotedSource>, bool, Option<String>)> {
+        let promoted: io::Result<(
+            Vec<(PathBuf, PathBuf)>,
+            Vec<PromotedSource>,
+            bool,
+            Option<String>,
+        )> = async {
             for source in sources {
                 let before = generations.get(&path_key(source)).ok_or_else(|| {
                     io::Error::other("promotion source has no admitted generation")
@@ -775,7 +941,11 @@ impl<O: Observer> Run<'_, O> {
                     .iter()
                     .map(|(_, target)| resolved_key(target))
                     .collect();
-                let _destinations = self.engine.leases.acquire(keys, &self.request.cancel)?;
+                let _destinations = self
+                    .engine
+                    .leases
+                    .acquire(keys, &self.request.cancel)
+                    .await?;
                 let _promotion = Promotion::begin(sources.to_vec())?;
                 let (residual, removed, _, error, collision) = plan.execute(|| {
                     self.observer
@@ -793,16 +963,32 @@ impl<O: Observer> Run<'_, O> {
                         .map(|(source, target)| (PathBuf::from(source), PathBuf::from(target)))
                         .collect()
                 };
-                let receipts: Vec<_> = moves.iter()
+                for (source, target) in &moves {
+                    shell.parent(source);
+                    shell.parent(target);
+                }
+                let receipts: Vec<_> = moves
+                    .iter()
                     .filter_map(|(_, target)| PromotedSource::capture(target).ok())
                     .collect();
-                self.observer.after_promotion(&results[representative], &moves, success, &receipts)?;
+                self.observer.after_promotion(
+                    &results[representative],
+                    &moves,
+                    success,
+                    &receipts,
+                )?;
                 outcome
                     .removed_promotion_dirs
                     .extend(removed.iter().map(|path| path_key(path)));
-                return Ok((moves, receipts, success, (!error.is_empty()).then_some(error)));
+                return Ok((
+                    moves,
+                    receipts,
+                    success,
+                    (!error.is_empty()).then_some(error),
+                ));
             }
-        })();
+        }
+        .await;
         match promoted {
             Ok((moves, receipts, success, error)) => {
                 outcome.promoted_sources.extend(receipts);
@@ -816,13 +1002,13 @@ impl<O: Observer> Run<'_, O> {
                     }
                     result.promoted = success;
                     if !success {
-                        result.failure = Some(Failure {
-                            kind: FailureKind::FilesystemError,
-                            message: format!(
+                        result.failure = Some(Failure::new(
+                            FailureKind::FilesystemError,
+                            format!(
                                 "Unable to promote blocked nested input: {}",
                                 error.as_deref().unwrap_or("unknown move failure")
                             ),
-                        });
+                        ));
                     }
                 }
                 for checkpoint in &mut outcome.checkpoints {
@@ -838,10 +1024,10 @@ impl<O: Observer> Run<'_, O> {
             }
             Err(error) if self.request.cancel.cancelled() => return Err(error),
             Err(error) => {
-                results[representative].failure = Some(Failure {
-                    kind: FailureKind::FilesystemError,
-                    message: format!("Unable to promote blocked nested input: {error}"),
-                });
+                results[representative].failure = Some(Failure::new(
+                    FailureKind::FilesystemError,
+                    format!("Unable to promote blocked nested input: {error}"),
+                ));
             }
         }
         Ok(())
@@ -872,13 +1058,13 @@ impl<O: Observer> Run<'_, O> {
             })
     }
 
-    fn claim_task(&self, task: &Task) -> io::Result<Lease<'_>> {
+    async fn claim_task(&self, task: &Task) -> io::Result<Lease<'_>> {
         let keys = task
             .owned_paths
             .iter()
             .map(|path| resolved_key(Path::new(path)))
             .collect();
-        self.engine.leases.acquire(keys, &self.request.cancel)
+        self.engine.leases.acquire(keys, &self.request.cancel).await
     }
 
     fn capture_generations(&self, task: &Task) -> HashMap<String, PhysicalFileGeneration> {
@@ -981,13 +1167,15 @@ impl<O: Observer> Run<'_, O> {
         Ok(())
     }
 
-    fn execute_input(
+    async fn execute_input(
         &self,
         logical: LogicalInput,
+        id: TaskId,
         source: DiscoverySource,
         depth: usize,
         carrier: Option<&Path>,
         candidates: &CandidateSet<'_>,
+        shell: &mut ShellUpdates<'_>,
     ) -> io::Result<Executed> {
         let LogicalInput {
             mut input,
@@ -995,10 +1183,6 @@ impl<O: Observer> Run<'_, O> {
             failure,
         } = logical;
         let mut result = receipt(&input, source, depth);
-        self.observer.notify(Event::Started {
-            path: result.path.clone(),
-            depth,
-        });
         if let Some(failure) = failure {
             result.failure = Some(failure);
             return Ok(Executed {
@@ -1021,10 +1205,7 @@ impl<O: Observer> Run<'_, O> {
             Err(error) => {
                 result.failure = Some(
                     if input.mode.structured() && error.kind() == io::ErrorKind::NotFound {
-                        Failure {
-                            kind: FailureKind::MissingVolume,
-                            message: error.to_string(),
-                        }
+                        Failure::new(FailureKind::MissingVolume, error.to_string())
                     } else {
                         self.process_or_file_failure(error, false)
                     },
@@ -1052,7 +1233,10 @@ impl<O: Observer> Run<'_, O> {
                 |root| root.join(archive_name(&input)),
             );
             match self.reserve_output(preferred, &result)? {
-                Ok(path) => Some(path),
+                Ok(path) => {
+                    shell.output(&path);
+                    Some(path)
+                }
                 Err(failure) => {
                     result.failure = Some(failure);
                     return Ok(Executed {
@@ -1092,29 +1276,41 @@ impl<O: Observer> Run<'_, O> {
         if let Some(codepage) = codepage {
             request["codepage"] = Value::from(codepage);
         }
-        let native = self
-            .engine
-            .worker(&self.request.config.performance.worker)
-            .and_then(|worker| {
-                worker.submit(&job_id, &request, &self.request.cancel, |update| {
-                    let event = match update {
-                        worker::Update::Progress(progress) => Event::Progress {
-                            path: result.path.clone(),
-                            completed_bytes: progress.completed,
-                            total_bytes: progress.total,
+        self.observer.notify(Event::Waiting { id });
+        let native = match self.engine.worker(&self.request.config.performance.worker) {
+            Ok(worker) => {
+                worker
+                    .submit(
+                        &job_id,
+                        request,
+                        &self.request.cancel,
+                        self.observer.worker_updates(),
+                        |update| {
+                            let event = match update {
+                                worker::Update::Started => Event::Working { id },
+                                worker::Update::Progress(progress) => Event::Progress {
+                                    id,
+                                    path: result.path.clone(),
+                                    completed_bytes: progress.completed,
+                                    total_bytes: progress.total,
+                                },
+                                worker::Update::ResourceWait(state) => Event::ResourceWait {
+                                    id,
+                                    path: result.path.clone(),
+                                    state,
+                                },
+                            };
+                            self.observer.notify(event);
                         },
-                        worker::Update::ResourceWait(state) => Event::ResourceWait {
-                            path: result.path.clone(),
-                            state,
-                        },
-                    };
-                    self.observer.notify(event);
-                })
-            });
-        drop(request);
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        self.observer.notify(Event::Finalizing { id });
         let mut inventory = None;
         match native {
-            Ok(frame) => {
+            Ok(mut frame) => {
                 let value = &frame.summary;
                 let format = worker::string(value, "archive_type");
                 if !format.is_empty()
@@ -1152,10 +1348,8 @@ impl<O: Observer> Run<'_, O> {
                             result.volume_completeness = Some("complete".to_owned());
                         }
                         Err(error) => {
-                            result.failure = Some(Failure {
-                                kind: FailureKind::ProcessError,
-                                message: error.to_string(),
-                            })
+                            result.failure =
+                                Some(Failure::new(FailureKind::ProcessError, error.to_string()));
                         }
                     }
                 }
@@ -1212,6 +1406,7 @@ impl<O: Observer> Run<'_, O> {
                             }
                         }
                     }
+                    failure.evidence = worker_evidence(value, frame.recovery.take());
                     result.failure = Some(failure);
                 }
             }
@@ -1222,7 +1417,7 @@ impl<O: Observer> Run<'_, O> {
                 if let Err(error) = cleanup_owned_output(&path) {
                     // Keep the durable guard on a failed deletion so Watch
                     // can finish recovery rather than forgetting the directory.
-                    return Err(io::Error::other(format!("{}: {error}", path.display())));
+                    return Err(io::Error::other(super::OutputCleanupError { path, error }));
                 }
                 self.observer.discard_output(&result, &path)?;
             }
@@ -1236,20 +1431,11 @@ impl<O: Observer> Run<'_, O> {
 
     fn process_or_file_failure(&self, error: io::Error, worker: bool) -> Failure {
         if crate::io::resource_error::is_memory_error(&error) {
-            Failure {
-                kind: FailureKind::ResourceUnavailable,
-                message: error.to_string(),
-            }
+            Failure::new(FailureKind::ResourceUnavailable, error.to_string())
         } else if self.request.cancel.cancelled() {
-            Failure {
-                kind: FailureKind::Cancelled,
-                message: "Operation interrupted".to_owned(),
-            }
+            Failure::new(FailureKind::Cancelled, "Operation interrupted")
         } else if worker {
-            Failure {
-                kind: FailureKind::ProcessError,
-                message: error.to_string(),
-            }
+            Failure::new(FailureKind::ProcessError, error.to_string())
         } else {
             file_failure(error)
         }
@@ -1352,6 +1538,7 @@ impl<O: Observer> Run<'_, O> {
         generations: &HashMap<String, PhysicalFileGeneration>,
         cleanup: CleanupMode,
         outcome: &mut Outcome,
+        shell: &mut ShellUpdates<'_>,
     ) -> io::Result<()> {
         let mode = match cleanup {
             CleanupMode::Keep => unreachable!("keep needs no source cleanup"),
@@ -1395,6 +1582,9 @@ impl<O: Observer> Run<'_, O> {
                 CleanupMode::Recycle => super::cleanup::recycle(std::iter::once(path.as_path())),
                 CleanupMode::Keep => unreachable!("keep produced receipts without filesystem work"),
             };
+            if removed.is_ok() {
+                shell.parent(path);
+            }
             record_cleanup(outcome, path, mode, removed);
         }
         Ok(())
@@ -1536,14 +1726,60 @@ fn file_failure(error: io::Error) -> Failure {
     } else {
         FailureKind::FilesystemError
     };
-    Failure {
-        kind,
-        message: error.to_string(),
-    }
+    Failure::new(kind, error.to_string())
 }
 
 fn flag(result: &Value, name: &str) -> bool {
     result.get(name).and_then(Value::as_bool) == Some(true)
+}
+
+fn worker_evidence(
+    result: &Value,
+    recovery: Option<super::RecoveryPreview>,
+) -> Option<Box<FailureEvidence>> {
+    let diagnostics = &result["diagnostics"];
+    let field = |name: &str| {
+        [result, diagnostics].into_iter().find_map(|value| {
+            let text = worker::string(value, name);
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+    };
+    let stage = field("failure_stage");
+    let native_kind = field("failure_kind");
+    let missing_volume_name = field("missing_volume_name");
+    let missing_volume_evidence = field("missing_volume_evidence");
+    let input = diagnostics
+        .get("input_trace")
+        .unwrap_or(&result["input_trace"]);
+    let last = &input["last_read"];
+    let path = worker::string(last, "source_path");
+    let read_error = flag(input, "read_error");
+    let read = (!path.is_empty() || read_error).then(|| FailureRead {
+        source_path: path.to_owned(),
+        source_offset: worker::number(last, "source_offset"),
+        virtual_offset: worker::number(last, "virtual_offset"),
+        requested: worker::number(last, "requested"),
+        returned: worker::number(last, "returned"),
+        win32_error: input["last_win32_error"].as_i64().unwrap_or_default(),
+        read_error,
+    });
+    let recovery = recovery.filter(|preview| !preview.files.is_empty());
+    (stage.is_some()
+        || native_kind.is_some()
+        || missing_volume_name.is_some()
+        || missing_volume_evidence.is_some()
+        || read.is_some()
+        || recovery.is_some())
+    .then(|| {
+        Box::new(FailureEvidence {
+            stage,
+            native_kind,
+            missing_volume_name,
+            missing_volume_evidence,
+            read,
+            recovery,
+        })
+    })
 }
 
 fn classify_worker_failure(
@@ -1623,14 +1859,14 @@ fn classify_worker_failure(
         FailureKind::Unknown
     };
     let message = worker::string(result, "message");
-    Failure {
+    Failure::new(
         kind,
-        message: if message.is_empty() {
+        if message.is_empty() {
             format!("{kind:?}")
         } else {
             message.to_owned()
         },
-    }
+    )
 }
 
 fn recoverable_file_count(frame: &WorkerFrame) -> usize {
@@ -1656,8 +1892,8 @@ fn recoverable_file_count(frame: &WorkerFrame) -> usize {
     {
         return 0;
     }
-    if let Some(count) = frame.traced_complete_files {
-        return count;
+    if let Some(preview) = &frame.recovery {
+        return preview.complete_files;
     }
     frame.manifest.as_ref().map_or(0, |manifest| {
         manifest
@@ -1909,6 +2145,8 @@ struct Leases {
 struct LeaseState {
     active: HashSet<String>,
     requests: HashMap<u64, RequestClaim>,
+    next_waiter: u64,
+    waiters: HashMap<u64, Waker>,
 }
 
 struct RequestClaim {
@@ -2146,26 +2384,61 @@ impl Leases {
         Ok(())
     }
 
-    fn acquire(
+    async fn acquire(
         self: &Arc<Self>,
         keys: HashSet<String>,
         cancel: &Cancellation,
     ) -> io::Result<Lease<'_>> {
-        let wake = Arc::clone(self);
-        let _subscription = cancel.subscribe(move || {
-            let _state = wake.state.lock().unwrap();
-            wake.changed.notify_all();
-        });
-        let state = self.state.lock().unwrap();
-        let mut state = self
-            .changed
-            .wait_while(state, |state| {
-                !cancel.cancelled() && !keys.is_disjoint(&state.active)
-            })
-            .unwrap();
-        cancel.check_io()?;
-        state.active.extend(keys.iter().cloned());
+        let mut waiting = LeaseWait {
+            owner: self,
+            id: None,
+        };
+        let mut subscription = None;
+        poll_fn(|cx| {
+            let mut state = self.state.lock().unwrap();
+            if let Err(error) = cancel.check_io() {
+                return Poll::Ready(Err(error));
+            }
+            if keys.is_disjoint(&state.active) {
+                state.active.extend(keys.iter().cloned());
+                return Poll::Ready(Ok(()));
+            }
+            let id = *waiting.id.get_or_insert_with(|| {
+                state.next_waiter += 1;
+                state.next_waiter
+            });
+            state.waiters.insert(id, cx.waker().clone());
+            drop(state);
+            if subscription.is_none() {
+                let owner = Arc::clone(self);
+                subscription = cancel.subscribe(move || {
+                    let waker = owner.state.lock().unwrap().waiters.remove(&id);
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                });
+            }
+            Poll::Pending
+        })
+        .await?;
         Ok(Lease { owner: self, keys })
+    }
+}
+
+struct LeaseWait<'a> {
+    owner: &'a Leases,
+    id: Option<u64>,
+}
+
+impl Drop for LeaseWait<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let mut state = self.owner.state.lock().unwrap();
+            state.waiters.remove(&id);
+            if state.waiters.capacity() > 256 {
+                crate::collections::trim_map(&mut state.waiters);
+            }
+        }
     }
 }
 
@@ -2180,7 +2453,11 @@ impl Drop for Lease<'_> {
             let target = active.len().saturating_mul(2);
             active.shrink_to(target);
         }
-        self.owner.changed.notify_all();
+        let waiters = std::mem::take(&mut state.waiters);
+        drop(state);
+        for (_, waker) in waiters {
+            waker.wake();
+        }
     }
 }
 

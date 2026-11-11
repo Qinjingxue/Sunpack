@@ -16,7 +16,7 @@ mod watch;
 mod windows;
 
 #[cfg(windows)]
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, Write};
 #[cfg(windows)]
 static RUNTIME_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -57,7 +57,9 @@ pub fn main() -> i32 {
         }
         _ => {
             let host = cli::Host::new();
-            let session = Console;
+            let session = Console {
+                interactive: windows::enable_console_updates(),
+            };
             let cancel = crate::pipeline::Cancellation::new();
             let _control = windows::ConsoleControl::install(cancel.clone());
             cli::run(&host, &cwd, args, &session, cancel)
@@ -91,7 +93,7 @@ trait Session: Sync {
     fn read_line(&self, prompt: &str) -> io::Result<Option<String>>;
     fn interactive(&self) -> bool;
     fn unicode(&self) -> bool;
-    fn columns(&self) -> usize;
+    fn terminal_size(&self) -> (usize, usize);
 }
 
 #[cfg(windows)]
@@ -102,7 +104,9 @@ enum Stream {
 }
 
 #[cfg(windows)]
-struct Console;
+struct Console {
+    interactive: bool,
+}
 
 #[cfg(windows)]
 impl Session for Console {
@@ -129,14 +133,14 @@ impl Session for Console {
     }
 
     fn interactive(&self) -> bool {
-        io::stdout().is_terminal()
+        self.interactive
     }
 
     fn unicode(&self) -> bool {
         true
     }
 
-    fn columns(&self) -> usize {
-        windows::console_columns()
+    fn terminal_size(&self) -> (usize, usize) {
+        windows::console_size()
     }
 }

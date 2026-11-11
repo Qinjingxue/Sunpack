@@ -1,16 +1,76 @@
 //! Binary worker envelopes and typed manifest and trace chunks.
 use super::worker_wire::{frame_payload, protocol_error, Decoder};
+use crate::pipeline::{RecoveryFile, RecoveryPreview, RecoveryStatus};
 use crate::scan::directory::{NativeWorkerManifest, OutputFileRecord};
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{fmt, io};
 
-/// The scheduler only needs verified file counts for partial recovery.
+const PREVIEW_FILES: usize = 50;
+const PREVIEW_ISSUES: usize = 10;
+
 #[derive(Default)]
 struct TraceCounts {
     items: usize,
-    complete_files: usize,
+    preview: RecoveryPreview,
+}
+
+impl TraceCounts {
+    fn preview_slot(&self, status: RecoveryStatus) -> Option<usize> {
+        let files = &self.preview.files;
+        if files.len() < PREVIEW_FILES {
+            return Some(files.len());
+        }
+        if status != RecoveryStatus::Complete
+            && files
+                .iter()
+                .filter(|file| file.status != RecoveryStatus::Complete)
+                .count()
+                < PREVIEW_ISSUES
+        {
+            return files
+                .iter()
+                .rposition(|file| file.status == RecoveryStatus::Complete);
+        }
+        None
+    }
+
+    fn insert(&mut self, slot: usize, file: RecoveryFile) {
+        if slot == self.preview.files.len() {
+            self.preview.files.push(file);
+        } else {
+            self.preview.files[slot] = file;
+        }
+    }
+
+    fn merge(&mut self, chunk: Self) {
+        self.items += chunk.items;
+        self.preview.complete_files += chunk.preview.complete_files;
+        self.preview.partial_files += chunk.preview.partial_files;
+        self.preview.failed_files += chunk.preview.failed_files;
+        self.preview.incomplete_files += chunk.preview.incomplete_files;
+        if self.preview.files.is_empty() {
+            self.preview.files = chunk.preview.files;
+        } else {
+            for file in chunk.preview.files {
+                if let Some(slot) = self.preview_slot(file.status) {
+                    self.insert(slot, file);
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) -> RecoveryPreview {
+        let preview = &mut self.preview;
+        let count = preview.complete_files
+            + preview.partial_files
+            + preview.failed_files
+            + preview.incomplete_files;
+        preview.omitted_files = count - preview.files.len();
+        preview.files.sort_unstable_by_key(|file| file.index);
+        self.preview
+    }
 }
 
 impl<'de> Deserialize<'de> for TraceCounts {
@@ -18,21 +78,15 @@ impl<'de> Deserialize<'de> for TraceCounts {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Item<'a> {
-            #[serde(rename = "index")]
-            _index: u32,
-            #[serde(rename = "path")]
-            _path: &'a str,
-            #[serde(rename = "output_path")]
-            _output_path: &'a str,
+            index: u32,
+            path: &'a str,
+            output_path: &'a str,
             is_dir: bool,
             #[serde(rename = "encrypted")]
             _encrypted: bool,
-            #[serde(rename = "bytes_written")]
-            _bytes_written: u64,
-            #[serde(rename = "expected_size")]
-            _expected_size: u64,
-            #[serde(rename = "has_expected_size")]
-            _has_expected_size: bool,
+            bytes_written: u64,
+            expected_size: u64,
+            has_expected_size: bool,
             #[serde(rename = "source_crc32")]
             _source_crc32: u32,
             #[serde(rename = "has_source_crc32")]
@@ -66,9 +120,37 @@ impl<'de> Deserialize<'de> for TraceCounts {
                 let mut trace = TraceCounts::default();
                 while let Some(item) = seq.next_element::<Item>()? {
                     trace.items += 1;
-                    trace.complete_files += usize::from(
-                        !item.is_dir && item.done && !item.failed && item.operation_result == 0,
-                    );
+                    if item.is_dir {
+                        continue;
+                    }
+                    let status = if item.done && !item.failed && item.operation_result == 0 {
+                        trace.preview.complete_files += 1;
+                        RecoveryStatus::Complete
+                    } else if item.bytes_written != 0 {
+                        trace.preview.partial_files += 1;
+                        RecoveryStatus::Partial
+                    } else if item.failed || item.operation_result != 0 {
+                        trace.preview.failed_files += 1;
+                        RecoveryStatus::Failed
+                    } else {
+                        trace.preview.incomplete_files += 1;
+                        RecoveryStatus::Incomplete
+                    };
+                    if let Some(slot) = trace.preview_slot(status) {
+                        trace.insert(
+                            slot,
+                            RecoveryFile {
+                                index: item.index,
+                                path: item.path.to_owned(),
+                                output_path: (!item.output_path.is_empty()
+                                    && item.output_path != item.path)
+                                    .then(|| item.output_path.to_owned()),
+                                status,
+                                bytes_written: item.bytes_written,
+                                expected_size: item.has_expected_size.then_some(item.expected_size),
+                            },
+                        );
+                    }
                 }
                 Ok(trace)
             }
@@ -86,7 +168,7 @@ enum ChunkData {
 pub(crate) struct WorkerFrame {
     pub(crate) summary: Value,
     pub(crate) manifest: Option<NativeWorkerManifest>,
-    pub(crate) traced_complete_files: Option<usize>,
+    pub(crate) recovery: Option<RecoveryPreview>,
     chunk: Option<ChunkData>,
     manifest_inventory: Option<[u64; 5]>,
 }
@@ -96,7 +178,7 @@ impl WorkerFrame {
         Self {
             summary,
             manifest: None,
-            traced_complete_files: None,
+            recovery: None,
             chunk: None,
             manifest_inventory: None,
         }
@@ -299,8 +381,7 @@ impl NativeWorkerResultAccumulator {
                     self.manifest_seq += 1;
                 }
                 Some(ChunkData::Trace(trace)) if kind == "trace_chunk" => {
-                    self.trace.items += trace.items;
-                    self.trace.complete_files += trace.complete_files;
+                    self.trace.merge(trace);
                     self.trace_seq += 1;
                 }
                 _ => return Err(protocol_error("worker chunk data type mismatch")),
@@ -333,7 +414,7 @@ impl NativeWorkerResultAccumulator {
             .and_then(Value::as_object_mut)
         {
             if self.trace.items != 0 {
-                frame.traced_complete_files = Some(self.trace.complete_files);
+                frame.recovery = Some(std::mem::take(&mut self.trace).finish());
             }
             trace.remove("chunk_count");
             trace.remove("item_count");

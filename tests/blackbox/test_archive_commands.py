@@ -250,6 +250,8 @@ def test_partial_content_policy_uses_verified_members_and_retains_source(package
     source = tmp_path / "damaged.wrapped"
     with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.writestr("good.txt", b"good")
+        for index in range(54):
+            archive.writestr(f"good-{index:02}.txt", b"good")
         archive.writestr("bad.txt", b"damaged")
         bad = archive.getinfo("bad.txt")
         payload_offset = bad.header_offset + 30 + len(bad.filename)
@@ -266,6 +268,15 @@ def test_partial_content_policy_uses_verified_members_and_retains_source(package
     report = package.json("extract", "--direct-file", "-c", "d", "-o", output, source)
     assert report["summary"]["partial_success_count"] == 1
     assert report["summary"]["success_count"] == report["summary"]["failed_count"] == 0
+    detail, = report["summary"]["failure_details"]
+    assert detail["partial"]
+    evidence = detail["failure"]["evidence"]
+    assert evidence["stage"] == "item_extract"
+    files = {item["path"]: item for item in evidence["recovery"]["files"]}
+    assert len(files) == 50 and evidence["recovery"]["omitted_files"] == 6
+    assert files["good.txt"]["status"] == "complete"
+    assert files["good.txt"]["bytes_written"] == len(b"good")
+    assert files["bad.txt"]["status"] in {"partial", "failed"}
     assert next(output.rglob("good.txt")).read_bytes() == b"good"
     assert source.is_file()
 
