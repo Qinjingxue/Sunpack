@@ -18,14 +18,14 @@ fn checked(name: &str, result: io::Result<String>) -> Value {
 }
 
 pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
-    let settings = config::load(cwd);
+    let settings = config::load_snapshot(cwd);
     let mut checks = vec![
         checked(
             "config",
             settings
                 .as_ref()
-                .map_err(|error| io::Error::other(error.to_string()))
-                .and_then(|_| config::load_raw(cwd).map(|(path, _)| path.display().to_string())),
+                .map(|snapshot| snapshot.sources.primary().display().to_string())
+                .map_err(|error| io::Error::other(error.to_string())),
         ),
         checked(
             "native",
@@ -80,7 +80,7 @@ pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
         });
     }
     checks.push(match settings {
-        Ok(settings) if settings.watch.toast_enabled => checked(
+        Ok(settings) if settings.config.watch.toast_enabled => checked(
             "toast",
             windows::ToastLibrary::load(cwd)
                 .and_then(|library| library.self_test())

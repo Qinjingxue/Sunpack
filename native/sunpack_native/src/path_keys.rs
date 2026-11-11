@@ -44,6 +44,21 @@ pub(crate) fn path_key(value: &str) -> String {
     }
 }
 
+pub(crate) fn path_ancestors(key: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(key.trim_end_matches('\\')), |key| {
+        key.rsplit_once('\\').map(|(parent, _)| parent)
+    })
+}
+
+pub(crate) fn normalize_windows_extended_prefix(mut path: String) -> String {
+    if path.starts_with(r"\\?\UNC\") {
+        path.replace_range(..8, r"\\");
+    } else if path.starts_with(r"\\?\") {
+        path.replace_range(..4, "");
+    }
+    path
+}
+
 /// A trailing separator keeps each parent's descendants adjacent in sort order,
 /// even when a sibling name contains punctuation before '\\'. Only the last
 /// retained root can contain the next key, so reduction is linear after sorting.

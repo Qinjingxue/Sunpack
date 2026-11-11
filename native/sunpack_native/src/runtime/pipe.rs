@@ -502,12 +502,15 @@ impl Connection<'_> {
                     }
                 }
                 length => {
-                    let receiver = self
-                        .prompt
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .ok_or(io::ErrorKind::InvalidData)?;
+                    let receiver = self.prompt.lock().unwrap().take();
+                    let Some(receiver) = receiver else {
+                        // Cancelling a console read can still produce its empty reply.
+                        return if self.cancel.cancelled() {
+                            Ok(())
+                        } else {
+                            Err(io::ErrorKind::InvalidData.into())
+                        };
+                    };
                     let response = read_field(reader, length as usize)?;
                     let _ = receiver.send(response);
                 }
@@ -692,12 +695,9 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
     });
     // State always names this server's unique endpoint and token.
     state.publish(&name, &server.token, &server.build_id, &stamp)?;
-    let idle = config::load(cwd)
-        .ok()
-        .and_then(|settings| {
-            Duration::try_from_secs_f64(settings.performance.persistent_server_idle_seconds).ok()
-        })
-        .unwrap_or(Duration::from_secs(30));
+    if let Ok(settings) = config::load(cwd) {
+        server.host.configure_idle(&settings);
+    }
     let result = (|| {
         let mut accept = Accept::arm(&name_wide, &security, true)?;
         let mut served = false;
@@ -705,7 +705,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
             let (wait, shutting_down) = {
                 let state = server.activity.lock().unwrap();
                 let timeout = if served && state.active == 0 && !server.host.watch.is_running() {
-                    idle_wait(state.last_idle, idle)
+                    idle_wait(state.last_idle, server.host.idle_after())
                 } else {
                     INFINITE
                 };

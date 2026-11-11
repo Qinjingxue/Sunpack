@@ -63,6 +63,31 @@ impl Snapshot {
         }
     }
 
+    pub(super) fn resource_wait(
+        batch: &str,
+        language: Language,
+        path: &Path,
+        state: crate::pipeline::ResourceWait,
+    ) -> Self {
+        let mut snapshot = Self::progress(batch, language, path.to_owned(), 0, 0);
+        snapshot.title = language.text("toast.progress.paused_title").to_owned();
+        snapshot.body = if let Some(error) = state.volume_error {
+            language.translate(
+                "report.status.disk_unavailable",
+                &[("error", &error.to_string())],
+            )
+        } else if state.disk && state.memory {
+            language
+                .text("report.status.resources_resume_hint")
+                .to_owned()
+        } else if state.memory {
+            language.text("toast.progress.memory_paused").to_owned()
+        } else {
+            language.text("toast.progress.disk_paused").to_owned()
+        };
+        snapshot
+    }
+
     fn completed(
         batch: &str,
         language: Language,

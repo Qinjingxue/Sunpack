@@ -33,7 +33,7 @@ class Package:
         assert result.returncode == code, (result.stdout, result.stderr)
         return json.loads(result.stdout)
 
-    def configure(self, **overrides):
+    def configure(self, *, live=True, **overrides):
         path = self.data / "sunpack_config.json"
         config = json.loads(path.read_text(encoding="utf-8"))
         for section, values in overrides.items():
@@ -41,9 +41,13 @@ class Package:
                 config[section].update(values)
             else:
                 config[section] = values
-        pending = path.with_suffix(".tmp")
-        pending.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-        pending.replace(path)
+        text = json.dumps(config, ensure_ascii=False)
+        if live:
+            pending = path.with_suffix(".tmp")
+            pending.write_text(text, encoding="utf-8")
+            pending.replace(path)
+        else:
+            path.write_text(text, encoding="utf-8")
 
 
 @pytest.fixture

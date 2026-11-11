@@ -23,8 +23,12 @@ def _fixture_tool() -> Path:
 def native_fixture(operation: str, **arguments) -> dict:
     result = subprocess.run(
         [str(_fixture_tool())], input=json.dumps({"operation": operation, **arguments}),
-        check=True, capture_output=True, text=True, encoding="utf-8",
+        capture_output=True, text=True, encoding="utf-8",
     )
+    try:
+        result.check_returncode()
+    except subprocess.CalledProcessError as error:
+        raise error from RuntimeError(result.stderr.strip())
     return json.loads(result.stdout)
 
 

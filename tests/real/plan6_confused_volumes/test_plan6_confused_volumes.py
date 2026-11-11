@@ -33,7 +33,7 @@ def _assert_scan_group(package, case, parts, passwords):
 def test_plan6_encrypted_confused_volumes_extract(package, tmp_path, archive_format, sfx, scenario):
     if archive_format == "rar" and not RAR_AVAILABLE:
         pytest.skip("RAR generator is not configured")
-    package.configure(filesystem={"scan_filters_enabled": False})
+    package.configure(live=False, filesystem={"scan_filters_enabled": False})
     password = f"correct-{archive_format}-{scenario.case_id}"
     case = FACTORY.create(
         tmp_path, f"conf_{archive_format}_{scenario.case_id}", archive_format,
@@ -56,7 +56,7 @@ def test_plan6_encrypted_confused_volumes_extract(package, tmp_path, archive_for
 def test_plan6_confused_encrypted_groups_mixed_in_one_directory(package, tmp_path):
     if not RAR_AVAILABLE:
         pytest.skip("RAR generator is not configured")
-    package.configure(filesystem={"scan_filters_enabled": False})
+    package.configure(live=False, filesystem={"scan_filters_enabled": False})
     common = tmp_path / "plan6_mixed"
     common.mkdir()
     groups = []

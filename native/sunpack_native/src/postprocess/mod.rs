@@ -1,4 +1,3 @@
-use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -181,30 +180,6 @@ extern "system" {
     fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
 }
 
-pub(crate) fn scan_watch_candidates(
-    roots: Vec<String>,
-    recursive: bool,
-) -> io::Result<(Vec<WatchCandidateRow>, Vec<DirectoryReadError>)> {
-    let mut candidates = Vec::new();
-    let mut messages = DirectoryReadErrors::report();
-    for root in roots {
-        let scope = crate::scan::scope::NativeDiscoveryScope::new(
-            root,
-            if recursive { None } else { Some(0) },
-            Vec::new(),
-        );
-        let (paths, errors) = crate::scan::directory::scope_file_paths(&scope)?;
-        messages.extend(errors);
-        for path in paths {
-            if let Some(candidate) = watch_candidate_for_path(&path, None)? {
-                candidates.push(candidate);
-            }
-        }
-    }
-    candidates.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok((candidates, messages.into_messages()))
-}
-
 pub(crate) fn flatten_single_branch_directories(
     base: &Path,
     work_path: Option<&Path>,
@@ -291,7 +266,15 @@ pub(crate) fn watch_candidate_for_path(
 ) -> io::Result<Option<WatchCandidateRow>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(_) => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
     if !metadata.is_file() {
         return Ok(None);
@@ -345,9 +328,18 @@ fn flatten_single_branch_chain_with_publisher(
     before_move: impl FnOnce(&Path, &Path, &Path) -> io::Result<()>,
     resume_leaf: Option<&Path>,
 ) {
-    let leaf = resume_leaf
-        .map(Path::to_path_buf)
-        .or_else(|| discover_flatten_leaf(root));
+    let leaf = match resume_leaf {
+        Some(leaf) => Some(leaf.to_path_buf()),
+        None => match discover_flatten_leaf(root) {
+            Ok(leaf) => leaf,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{}: {error}", normalize_path(root)));
+                return;
+            }
+        },
+    };
     let Some(leaf) = leaf else {
         return;
     };
@@ -415,25 +407,25 @@ fn flatten_single_branch_chain_with_publisher(
     }
 }
 
-fn discover_flatten_leaf(root: &Path) -> Option<PathBuf> {
-    let mut current = only_child_directory(root)?;
-    while let Some(child) = only_child_directory(&current) {
+fn discover_flatten_leaf(root: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(mut current) = only_child_directory(root)? else {
+        return Ok(None);
+    };
+    while let Some(child) = only_child_directory(&current)? {
         current = child;
     }
-    Some(current)
+    Ok(Some(current))
 }
 
-fn only_child_directory(dir: &Path) -> Option<PathBuf> {
-    let mut entries = fs::read_dir(dir).ok()?;
-    let first = entries.next()?.ok()?;
-    if entries.next().is_some() {
-        return None;
-    }
-    if first.metadata().ok()?.is_dir() {
-        Some(first.path())
-    } else {
-        None
-    }
+fn only_child_directory(dir: &Path) -> io::Result<Option<PathBuf>> {
+    let mut entries = fs::read_dir(dir)?;
+    let Some(first) = entries.next().transpose()? else {
+        return Ok(None);
+    };
+    Ok(
+        (entries.next().transpose()?.is_none() && first.file_type()?.is_dir())
+            .then(|| first.path()),
+    )
 }
 
 fn rename_root_to_visible_work(root: &Path, stats: &mut FlattenStats) -> Option<PathBuf> {
@@ -485,17 +477,32 @@ fn is_name_collision(error: &io::Error) -> bool {
 #[cfg(windows)]
 fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
 
-    let source_wide: Vec<u16> = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let destination_wide: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide_path = |path: &Path| -> io::Result<Vec<u16>> {
+        // Win32 directory moves can fail before reaching MAX_PATH when the
+        // path leaves insufficient space for a child component.
+        if path.as_os_str().len() < 248 {
+            return Ok(path.as_os_str().encode_wide().chain([0]).collect());
+        }
+        let path = std::path::absolute(path)?;
+        let (prefix, skip) = match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(_) => (r"\\?\", 0),
+                Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+                _ => ("", 0),
+            },
+            _ => ("", 0),
+        };
+        Ok(prefix
+            .encode_utf16()
+            .chain(path.as_os_str().encode_wide().skip(skip))
+            .chain([0])
+            .collect())
+    };
+
+    let source_wide = wide_path(source)?;
+    let destination_wide = wide_path(destination)?;
     if unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -544,17 +551,7 @@ fn normalize_path(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .to_string();
-    normalize_windows_extended_prefix(text)
-}
-
-fn normalize_windows_extended_prefix(path: String) -> String {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    if let Some(rest) = path.strip_prefix(r"\\?\") {
-        return rest.to_string();
-    }
-    path
+    crate::path_keys::normalize_windows_extended_prefix(text)
 }
 
 fn mtime_seconds(metadata: &fs::Metadata) -> f64 {
@@ -743,6 +740,23 @@ mod tests {
         assert_eq!(stats.output_dir.as_deref(), Some(output.path()));
         assert_eq!(stats.source_dir.as_deref(), payload.parent());
         assert!(stats.errors.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn flatten_moves_directories_beyond_win32_max_path() {
+        let container = TestDirectory::new("long_path");
+        let output = container.path().join("x".repeat(130)).join("y".repeat(130));
+        assert!(output.as_os_str().len() > 260);
+        fs::create_dir_all(output.join("wrapper/first")).unwrap();
+        fs::create_dir_all(output.join("wrapper/second")).unwrap();
+
+        let mut stats = FlattenStats::default();
+        flatten_single_branch_chain(&output, &mut stats);
+
+        assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+        assert!(output.join("first").is_dir() && output.join("second").is_dir());
+        assert!(!output.join("wrapper").exists());
     }
 
     #[test]

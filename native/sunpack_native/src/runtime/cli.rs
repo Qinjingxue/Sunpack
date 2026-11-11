@@ -3,13 +3,13 @@ use crate::core::config::{self, CleanupMode, Config, Recursion};
 use crate::core::i18n::Language;
 use crate::core::{passwords, resources};
 use crate::pipeline::{
-    ArchiveResult, Cancellation, CleanupStatus, Engine, Event, FailureKind, InputErrorKind, Mode,
-    Observer, Outcome, Request,
+    ArchiveResult, Cancellation, CleanupStatus, Engine, Event, FailureKind, InputError,
+    InputErrorKind, Mode, Observer, Outcome, Request,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 pub(super) struct Host {
     engine: OnceLock<Arc<Engine>>,
     passwords: Mutex<Option<Arc<passwords::BuiltinStore>>>,
+    idle: Mutex<Duration>,
     pub(super) watch: watch::Watch,
 }
 
@@ -30,7 +31,20 @@ impl Host {
         Self {
             engine: OnceLock::new(),
             passwords: Mutex::default(),
+            idle: Mutex::new(Duration::from_secs(30)),
             watch: watch::Watch::new(Arc::new(wake)),
+        }
+    }
+
+    pub(super) fn idle_after(&self) -> Duration {
+        *self.idle.lock().unwrap()
+    }
+
+    pub(super) fn configure_idle(&self, settings: &Config) {
+        if let Ok(idle) =
+            Duration::try_from_secs_f64(settings.performance.persistent_server_idle_seconds)
+        {
+            *self.idle.lock().unwrap() = idle;
         }
     }
 
@@ -75,7 +89,7 @@ struct Options {
     cleanup: Option<String>,
     output: Option<String>,
     password_file: Option<String>,
-    passwords: Vec<String>,
+    passwords: Vec<Arc<str>>,
     prompt_passwords: bool,
     no_builtins: bool,
     no_tray: bool,
@@ -208,7 +222,7 @@ impl Options {
                     continue;
                 }
                 "-p" | "--password" if passwords => {
-                    options.passwords.push(take()?);
+                    options.passwords.push(take()?.into());
                     continue;
                 }
                 "-P" | "--pw-file" if passwords => {
@@ -430,10 +444,6 @@ pub(super) fn run(
             _ => 1,
         });
     }
-    let generation = config::generation(cwd);
-    let language = generation
-        .as_ref()
-        .map_or(Language::Zh, |config| config.language());
     let options = match Options::parse(&args) {
         Ok(options) => options,
         Err(error) => {
@@ -442,10 +452,11 @@ pub(super) fn run(
         }
     };
     if options.help {
-        help(&options, language, session)?;
+        help(&options, config::load_language(cwd), session)?;
         return Ok(0);
     }
     if options.json && options.prompt_passwords {
+        let language = config::load_language(cwd);
         let mut result = CommandResult::new(options.command);
         result.inputs = json!({"argv": args});
         result
@@ -455,21 +466,16 @@ pub(super) fn run(
         return Ok(2);
     }
     drop(args);
+    let generation = config::generation(cwd);
+    let language = generation.language();
     let execution = match options.command {
-        "scan" | "extract" => generation.and_then(|config| {
-            archives(
-                host,
-                cwd,
-                &options,
-                session,
-                language,
-                &cancel,
-                config.normalized()?,
-            )
+        "scan" | "extract" => generation.normalized(true).and_then(|config| {
+            host.configure_idle(&config);
+            archives(host, cwd, &options, session, language, &cancel, config)
         }),
-        "passwords" => generation.and_then(|config| {
-            show_passwords(host, cwd, &options, session, language, config.normalized()?)
-        }),
+        "passwords" => generation
+            .normalized(true)
+            .and_then(|config| show_passwords(host, cwd, &options, session, language, config)),
         "config" => show_config(cwd, &options, session, language),
         "version" => show_version(cwd, session),
         "doctor" => doctor(cwd, session, options.json, language),
@@ -529,7 +535,7 @@ fn targets(cwd: &Path, options: &Options) -> io::Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec<String>> {
+fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec<Arc<str>>> {
     line(session, Stream::Out, language.text("cli.password_prompt"))?;
     let mut passwords = Vec::new();
     while let Some(value) = session.read_line(language.text("cli.password_input_prompt"))? {
@@ -537,7 +543,7 @@ fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec
         if value.is_empty() {
             break;
         }
-        passwords.push(value.to_owned());
+        passwords.push(Arc::from(value));
     }
     Ok(passwords)
 }
@@ -547,32 +553,34 @@ fn cli_passwords(
     options: &Options,
     session: &dyn Session,
     language: Language,
-) -> io::Result<Vec<String>> {
+) -> io::Result<Vec<Arc<str>>> {
     let mut result = options.passwords.clone();
     if let Some(file) = &options.password_file {
-        result = crate::password::lists::read_password_file(
-            resolve(cwd, file)?,
-            Some(result.into_iter().map(Arc::from).collect()),
-        )?
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect();
+        result = crate::password::lists::read_password_file(resolve(cwd, file)?, Some(result))?;
     }
     if options.prompt_passwords {
         result.extend(prompt_passwords(session, language)?);
     }
-    dedupe(&mut result);
+    if options.password_file.is_none() || options.prompt_passwords {
+        dedupe(&mut result);
+    }
     Ok(result)
 }
 
-fn dedupe(values: &mut Vec<String>) {
+fn dedupe(values: &mut Vec<Arc<str>>) {
     let mut seen = HashSet::with_capacity(values.len());
-    let mut keep = values
-        .iter()
-        .map(|value| seen.insert(value.as_str()))
-        .collect::<Vec<_>>()
-        .into_iter();
-    values.retain(|_| keep.next().unwrap_or(false));
+    values.retain(|value| seen.insert(Arc::clone(value)));
+}
+
+fn cli_clipboard(settings: &Config) -> Vec<Arc<str>> {
+    if settings.passwords.clipboard_passwords_enabled {
+        passwords::clipboard_passwords()
+            .into_iter()
+            .map(Arc::from)
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn confirm(session: &dyn Session, language: Language, prompt: &str) -> io::Result<bool> {
@@ -640,6 +648,7 @@ struct ArchiveSummary {
     success: usize,
     partial: usize,
     failed: usize,
+    input_errors: usize,
     processed: usize,
     nested: usize,
     depth: usize,
@@ -651,6 +660,7 @@ impl ArchiveSummary {
     fn collect<'a>(
         archives: impl IntoIterator<Item = &'a ArchiveResult>,
         language: Language,
+        json: bool,
     ) -> Self {
         let mut groups: BTreeMap<(String, usize), Vec<&ArchiveResult>> = BTreeMap::new();
         for archive in archives {
@@ -670,11 +680,21 @@ impl ArchiveSummary {
                 .iter()
                 .find_map(|entry| (!entry.partial).then_some(entry.failure.as_ref()).flatten());
             if let Some(failure) = failure {
-                summary.failed += 1;
+                let invalid = failure.kind == FailureKind::InvalidInput;
+                summary.input_errors += usize::from(invalid);
+                summary.failed += usize::from(!invalid);
                 let message = failure_message(failure, language);
-                summary
-                    .errors
-                    .push(format!("{}: {message}", entries[0].path.display()));
+                let text = format!("{}: {message}", entries[0].path.display());
+                summary.errors.push(if json {
+                    text
+                } else {
+                    let key = if invalid {
+                        "report.input_error"
+                    } else {
+                        "report.failed"
+                    };
+                    language.translate(key, &[("task", &text)])
+                });
             } else if entries.iter().any(|entry| entry.partial) {
                 summary.partial += 1;
                 let outputs = entries
@@ -710,26 +730,101 @@ impl ArchiveSummary {
     }
 }
 
+fn input_error_message(error: &InputError, language: Language, json: bool) -> String {
+    let text = if let Some(operation) = &error.scan_operation {
+        language.translate(
+            &format!("filesystem_scan.{operation}"),
+            &[
+                ("path", &error.path.to_string_lossy()),
+                ("error", &error.message),
+            ],
+        )
+    } else if error.path.as_os_str().is_empty() {
+        error.message.clone()
+    } else {
+        format!("{}: {}", error.path.display(), error.message)
+    };
+    match (json, error.kind) {
+        (false, InputErrorKind::FilesystemScan) => {
+            language.translate("report.scan_error", &[("task", &text)])
+        }
+        (false, InputErrorKind::InvalidInput) => {
+            language.translate("report.input_error", &[("task", &text)])
+        }
+        _ => text,
+    }
+}
+
 struct Progress<'a> {
     session: &'a dyn Session,
     watch: &'a watch::Watch,
     language: Language,
     last: Mutex<Option<Instant>>,
+    branches: Mutex<HashMap<PathBuf, (PathBuf, u64, String)>>,
     prompt: bool,
     visible: bool,
+    verbose: bool,
 }
 
 impl Observer for Progress<'_> {
     fn notify(&self, event: Event) {
-        if !self.visible || !self.session.interactive() {
+        if !self.visible {
             return;
         }
+        let interactive = self.session.interactive();
         match event {
+            Event::ResourceWait { path, state } if interactive || state.disk => {
+                let _display = self.last.lock().unwrap();
+                let (status, hint) = match (state.disk, state.memory) {
+                    (true, true) => (
+                        "report.status.resources_paused",
+                        "report.status.resources_resume_hint",
+                    ),
+                    (true, false) => (
+                        "report.status.disk_paused",
+                        "report.status.disk_resume_hint",
+                    ),
+                    (false, true) => (
+                        "report.status.memory_paused",
+                        "report.status.memory_resume_hint",
+                    ),
+                    (false, false) => ("report.status.extracting", ""),
+                };
+                let hint = match state.volume_error {
+                    Some(error) => self.language.translate(
+                        "report.status.disk_unavailable",
+                        &[("error", &error.to_string())],
+                    ),
+                    None if !hint.is_empty() => self.language.text(hint).into(),
+                    None => String::new(),
+                };
+                if interactive {
+                    let _ = self.session.write(Stream::Out, b"\r\x1b[2K");
+                }
+                let filename = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                let mut message = format!("{filename}: {}", self.language.text(status));
+                if !hint.is_empty() {
+                    message.push_str(" — ");
+                    message.push_str(&hint);
+                }
+                let _ = line(
+                    self.session,
+                    if interactive {
+                        Stream::Out
+                    } else {
+                        Stream::Err
+                    },
+                    &message,
+                );
+            }
             Event::Progress {
                 path,
                 completed_bytes,
                 total_bytes,
-            } if total_bytes != 0 => {
+            } if interactive && total_bytes != 0 => {
                 let mut last = self.last.lock().unwrap();
                 let now = Instant::now();
                 if last.is_some_and(|last| now.duration_since(last) < Duration::from_millis(100)) {
@@ -754,11 +849,29 @@ impl Observer for Progress<'_> {
                 );
                 let _ = self.session.write(Stream::Out, bar.as_bytes());
             }
-            Event::Finished { .. } => {
-                let _ = self.session.write(Stream::Out, b"\r\x1b[2K");
-            }
             _ => {}
         }
+    }
+
+    fn archive_branch(&self, parent: &ArchiveResult, child: &ArchiveResult) {
+        if self.visible {
+            self.branches.lock().unwrap().insert(
+                child.path.clone(),
+                (parent.path.clone(), parent.offset, parent.format.clone()),
+            );
+        }
+    }
+
+    fn scope_finished(&self, archives: &[ArchiveResult]) -> io::Result<()> {
+        if !self.visible || archives.is_empty() {
+            return Ok(());
+        }
+        let report = ScopeReport::new(archives, self);
+        let mut last = self.last.lock().unwrap();
+        if last.take().is_some() {
+            self.session.write(Stream::Out, b"\r\x1b[2K")?;
+        }
+        report.write()
     }
 
     fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
@@ -789,6 +902,183 @@ impl Observer for Progress<'_> {
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
         if let Some(output) = &archive.output {
             self.watch.finish_external_flatten(output)?;
+        }
+        Ok(())
+    }
+}
+
+fn tree_edge(unicode: bool, last: bool) -> (&'static str, &'static str) {
+    match (unicode, last) {
+        (true, true) => ("└─ ", "   "),
+        (true, false) => ("├─ ", "│  "),
+        (false, true) => ("\\---", "    "),
+        (false, false) => ("+---", "|   "),
+    }
+}
+
+struct ScopeReport<'a> {
+    archives: &'a [ArchiveResult],
+    session: &'a dyn Session,
+    language: Language,
+    verbose: bool,
+    groups: Vec<std::ops::Range<usize>>,
+    children: Vec<Vec<usize>>,
+    roots: Vec<usize>,
+}
+
+impl<'a> ScopeReport<'a> {
+    fn new(archives: &'a [ArchiveResult], progress: &Progress<'a>) -> Self {
+        let mut report = Self {
+            archives,
+            session: progress.session,
+            language: progress.language,
+            verbose: progress.verbose,
+            groups: Vec::new(),
+            children: Vec::new(),
+            roots: Vec::new(),
+        };
+        if archives.len() == 1 {
+            return report;
+        }
+        let mut index = HashMap::new();
+        for (position, item) in archives.iter().enumerate() {
+            index.insert(
+                (item.path.as_path(), item.offset, item.format.as_str()),
+                position,
+            );
+            if let Some(original) = &item.promotion_original_path {
+                index.insert(
+                    (original.as_path(), item.offset, item.format.as_str()),
+                    position,
+                );
+            }
+        }
+        report.children.resize_with(archives.len(), Vec::new);
+        let mut branches = progress.branches.lock().unwrap();
+        let mut start = 0;
+        while let Some(item) = archives.get(start) {
+            let end = start
+                + archives[start..]
+                    .iter()
+                    .take_while(|next| next.path == item.path && next.depth == item.depth)
+                    .count();
+            let group = report.groups.len();
+            report.groups.push(start..end);
+            let parent = branches
+                .remove(&item.path)
+                .and_then(|(path, offset, format)| {
+                    index
+                        .get(&(path.as_path(), offset, format.as_str()))
+                        .copied()
+                });
+            if let Some(parent) = parent.filter(|&parent| archives[parent].depth < item.depth) {
+                report.children[parent].push(group);
+            } else {
+                report.roots.push(group);
+            }
+            start = end;
+        }
+        report
+    }
+
+    fn write(&self) -> io::Result<()> {
+        let mut prefix = String::new();
+        if self.archives.len() == 1 {
+            self.title("", "", &Self::name(&self.archives[0]))?;
+            return self.status_and_children(0, &mut prefix);
+        }
+        for &root in &self.roots {
+            self.group(root, &mut prefix, None)?;
+        }
+        Ok(())
+    }
+
+    fn name(archive: &ArchiveResult) -> Cow<'_, str> {
+        archive
+            .path
+            .file_name()
+            .unwrap_or(archive.path.as_os_str())
+            .to_string_lossy()
+    }
+
+    fn group(&self, group: usize, prefix: &mut String, last: Option<bool>) -> io::Result<()> {
+        let range = self.groups[group].clone();
+        let (edge, continuation) =
+            last.map_or(("", ""), |last| tree_edge(self.session.unicode(), last));
+        let name = Self::name(&self.archives[range.start]);
+        let len = prefix.len();
+        self.title(prefix, edge, &name)?;
+        prefix.push_str(continuation);
+        if range.len() == 1 {
+            self.status_and_children(range.start, prefix)?;
+        } else {
+            let end = range.end;
+            for (number, position) in range.enumerate() {
+                let item = &self.archives[position];
+                let label = self
+                    .language
+                    .translate("cli.scan.segment", &[("index", &(number + 1).to_string())]);
+                let label = format!(
+                    "{label} ({}) [{}, {})",
+                    item.format,
+                    item.offset,
+                    end_offset(item)
+                );
+                let (edge, continuation) = tree_edge(self.session.unicode(), position + 1 == end);
+                let segment_prefix = prefix.len();
+                self.title(prefix, edge, &label)?;
+                prefix.push_str(continuation);
+                self.status_and_children(position, prefix)?;
+                prefix.truncate(segment_prefix);
+            }
+        }
+        prefix.truncate(len);
+        Ok(())
+    }
+
+    fn title(&self, prefix: &str, edge: &str, label: &str) -> io::Result<()> {
+        let label = if label.contains(['\r', '\n']) {
+            Cow::Owned(label.replace(['\r', '\n'], " "))
+        } else {
+            Cow::Borrowed(label)
+        };
+        line(self.session, Stream::Out, &format!("{prefix}{edge}{label}"))
+    }
+
+    fn status_and_children(&self, position: usize, prefix: &mut String) -> io::Result<()> {
+        let item = &self.archives[position];
+        let (status, progress) = if item.partial {
+            ("report.status.partial", "")
+        } else if item.failure.is_some() {
+            ("report.status.error", "")
+        } else {
+            ("report.status.complete", " [####################] 100%")
+        };
+        line(
+            self.session,
+            Stream::Out,
+            &format!("{prefix}  [{}]{progress}", self.language.text(status)),
+        )?;
+        if let Some(failure) = item
+            .failure
+            .as_ref()
+            .filter(|_| !item.partial || self.verbose)
+        {
+            if !is_password_failure(failure.kind) {
+                self.title(prefix, "  ", failure_message(failure, self.language))?;
+            }
+        }
+        if let Some(output) = item.output.as_ref().filter(|_| self.verbose) {
+            let detail = self.language.translate(
+                "report.detail.output",
+                &[("output", &output.to_string_lossy())],
+            );
+            self.title(prefix, "  ", &detail)?;
+        }
+        if let Some(children) = self.children.get(position) {
+            for (i, &child) in children.iter().enumerate() {
+                self.group(child, prefix, Some(i + 1 == children.len()))?;
+            }
         }
         Ok(())
     }
@@ -860,13 +1150,9 @@ fn archives(
     let builtin = if options.no_builtins {
         None
     } else {
-        Some(host.passwords(cwd)?.reload()?)
+        Some(host.passwords(cwd)?.snapshot_for_request())
     };
-    let clipboard = if settings.passwords.clipboard_passwords_enabled {
-        passwords::clipboard_passwords()
-    } else {
-        Vec::new()
-    };
+    let clipboard = cli_clipboard(&settings);
     if cancel.cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
@@ -912,8 +1198,10 @@ fn archives(
         watch: &host.watch,
         language,
         last: Mutex::new(None),
+        branches: Mutex::default(),
         prompt: settings.recursive_extract == Recursion::Prompt,
         visible: !options.json,
+        verbose: options.verbose,
     };
     let max_depth = depth(settings.recursive_extract);
     let settings = Arc::new(settings);
@@ -924,7 +1212,7 @@ fn archives(
     let mut result = CommandResult::new(options.command);
     let mut retries = 0;
     let mut all_archives = BTreeMap::new();
-    let mut all_errors = BTreeMap::new();
+    let mut all_errors: BTreeMap<_, InputError> = BTreeMap::new();
     let mut cleanup = BTreeMap::new();
     let mut checkpoints = Vec::new();
     let mut promoted_sources = Vec::new();
@@ -940,8 +1228,7 @@ fn archives(
         request.recursive = options.recursive;
         request.direct = options.direct;
         request.deep = options.deep;
-        request.passwords = user.clone();
-        request.passwords.extend(clipboard.iter().cloned());
+        request.passwords = user.iter().chain(&clipboard).cloned().collect();
         request.password_snapshot = builtin.clone();
         request.config = Arc::clone(&settings);
         request.cancel = cancel.clone();
@@ -958,17 +1245,18 @@ fn archives(
             return report_scan(current, inputs, options, session, language);
         }
         if options.json {
-            let counts = ArchiveSummary::collect(&current.archives, language);
+            let counts = ArchiveSummary::collect(&current.archives, language, true);
             let scan_errors = current
                 .errors
                 .iter()
                 .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-                .count();
-            let input_errors = current
+                .map(InputError::count)
+                .sum::<usize>();
+            let invalid_inputs = current
                 .errors
                 .iter()
-                .filter(|error| error.kind == InputErrorKind::InvalidInput)
-                .count();
+                .filter(|error| error.kind == InputErrorKind::InvalidInput);
+            let input_errors = invalid_inputs.clone().count() + counts.input_errors;
             let failures = current
                 .archives
                 .iter()
@@ -983,6 +1271,14 @@ fn archives(
                         },
                     })
                 })
+                .chain(invalid_inputs.map(|error| FailureReport {
+                    kind: FailureKind::InvalidInput,
+                    message: &error.message,
+                    details: FailureDetails {
+                        path: &error.path,
+                        promoted_nested_input: None,
+                    },
+                }))
                 .collect::<Vec<_>>();
             result.tasks.push(json!({
                 "success_count": counts.success, "failed_count": counts.failed,
@@ -1015,7 +1311,27 @@ fn archives(
             );
         }
         for error in current.errors {
-            all_errors.insert((path_key(&error.path), error.kind as u8), error);
+            let omitted = error.scan_operation.as_deref() == Some("report_omitted");
+            let key = (
+                path_key(&error.path),
+                error.kind as u8,
+                error.scan_operation.clone(),
+                if omitted {
+                    String::new()
+                } else {
+                    error.message.clone()
+                },
+            );
+            match all_errors.entry(key) {
+                std::collections::btree_map::Entry::Occupied(mut prior) => {
+                    if error.count() > prior.get().count() {
+                        prior.insert(error);
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(error);
+                }
+            }
         }
         if candidate_paths.is_empty() {
             break;
@@ -1047,22 +1363,29 @@ fn archives(
         dedupe(&mut user);
         retries += 1;
     }
-    let counts = ArchiveSummary::collect(all_archives.values(), language);
+    let counts = ArchiveSummary::collect(all_archives.values(), language, options.json);
     result.errors = counts.errors;
     let scan_errors = all_errors
         .values()
         .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-        .count();
+        .map(InputError::count)
+        .sum::<usize>();
     let input_errors = all_errors
         .values()
         .filter(|error| error.kind == InputErrorKind::InvalidInput)
-        .count();
+        .count()
+        + counts.input_errors;
     result.errors.extend(
         all_errors
             .values()
             .filter(|error| error.kind != InputErrorKind::Cleanup)
-            .map(|error| format!("{}: {}", error.path.display(), error.message)),
+            .map(|error| input_error_message(error, language, options.json)),
     );
+    if !options.json && scan_errors != 0 {
+        result
+            .errors
+            .push(language.text("report.scan_incomplete").into());
+    }
     if options.json {
         result.inputs = json!({
             "paths": inputs, "common_root": common_root, "json": options.json, "verbose": options.verbose,
@@ -1083,29 +1406,6 @@ fn archives(
             !options.no_builtins,
         ));
     } else {
-        for item in all_archives
-            .values()
-            .filter(|item| item.failure.is_none() || item.partial)
-        {
-            let name = item
-                .path
-                .file_name()
-                .unwrap_or(item.path.as_os_str())
-                .to_string_lossy();
-            let status = if item.partial {
-                "report.status.partial"
-            } else {
-                "report.status.complete"
-            };
-            line(session, Stream::Out, &name)?;
-            let label = language.text(status);
-            let progress = if item.partial {
-                ""
-            } else {
-                " [####################] 100%"
-            };
-            line(session, Stream::Out, &format!("  [{label}]{progress}"))?;
-        }
         line(session, Stream::Out, &format!("\n{}", "-".repeat(54)))?;
         let elapsed = began.elapsed().as_secs();
         let seconds = (elapsed % 60).to_string();
@@ -1187,6 +1487,13 @@ fn archives(
                     &[("archive", &name), ("complete_files", &complete)],
                 ),
             )?;
+            if let Some(warning) = recovery["warning"]["message"].as_str() {
+                line(
+                    session,
+                    Stream::Out,
+                    &language.translate("report.partial_warning", &[("warning", warning)]),
+                )?;
+            }
         }
         if counts.partial > 0 && result.errors.is_empty() {
             line(
@@ -1200,13 +1507,14 @@ fn archives(
             .filter(|receipt| receipt.status == CleanupStatus::Failed)
             .count();
         if cleanup_failures > 0 {
+            let message = language.translate(
+                "cleanup.incomplete",
+                &[("count", &cleanup_failures.to_string())],
+            );
             line(
                 session,
                 Stream::Err,
-                &language.translate(
-                    "cleanup.incomplete",
-                    &[("count", &cleanup_failures.to_string())],
-                ),
+                &language.translate("report.postprocess_warning", &[("message", &message)]),
             )?;
         }
         line(session, Stream::Out, &"-".repeat(54))?;
@@ -1225,7 +1533,8 @@ fn report_scan(
         .errors
         .iter()
         .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-        .count();
+        .map(InputError::count)
+        .sum::<usize>();
     let input_errors = outcome
         .errors
         .iter()
@@ -1286,10 +1595,22 @@ fn report_scan(
                 let text = format!("{}: {}", entry.path.display(), failure.message);
                 if options.json {
                     result.errors.push(text);
-                } else if !password_failure(entry)
+                } else if !(password_failure(entry) && entry.password.is_none())
                     && !(failure.kind == FailureKind::MissingVolume
                         && entry.volume_completeness.as_deref() == Some("missing"))
                 {
+                    let error =
+                        language.translate("cli.scan.error", &[("error", &failure.message)]);
+                    let text = if embedded {
+                        format!(
+                            "{}: [{}, {}): {error}",
+                            entry.path.display(),
+                            entry.offset,
+                            end_offset(entry)
+                        )
+                    } else {
+                        format!("{}: {error}", entry.path.display())
+                    };
                     line(session, Stream::Err, &text)?;
                 }
             }
@@ -1334,16 +1655,8 @@ fn report_scan(
                 let last = index + 1 == group.len();
                 let (edge, prefix) = if !multiple {
                     ("", "  ")
-                } else if session.unicode() {
-                    if last {
-                        ("└─ ", "   ")
-                    } else {
-                        ("├─ ", "│  ")
-                    }
-                } else if last {
-                    ("\\---", "    ")
                 } else {
-                    ("+---", "|   ")
+                    tree_edge(session.unicode(), last)
                 };
                 if multiple {
                     let text = language
@@ -1417,14 +1730,9 @@ fn report_scan(
         start = end;
     }
     for error in outcome.errors {
-        let text = format!("{}: {}", error.path.display(), error.message);
-        if !options.json && error.kind == InputErrorKind::FilesystemScan {
-            result
-                .errors
-                .push(language.translate("report.scan_error", &[("task", &text)]));
-        } else {
-            result.errors.push(text);
-        }
+        result
+            .errors
+            .push(input_error_message(&error, language, options.json));
     }
     if !options.json && scan_errors != 0 {
         result
@@ -1544,8 +1852,8 @@ fn end_offset(entry: &ArchiveResult) -> String {
 }
 
 fn password_item(
-    user: &[String],
-    clipboard: &[String],
+    user: &[Arc<str>],
+    clipboard: &[Arc<str>],
     recent: &[Arc<str>],
     snapshot: Option<&passwords::PasswordSnapshot>,
     use_builtin: bool,
@@ -1554,7 +1862,7 @@ fn password_item(
     let configured = user
         .iter()
         .chain(clipboard)
-        .map(String::as_str)
+        .map(Arc::as_ref)
         .chain(builtin.iter().map(AsRef::as_ref));
     let mut eligible_recent = HashSet::new();
     if !recent.is_empty() {
@@ -1589,15 +1897,11 @@ fn show_passwords(
     settings: Config,
 ) -> io::Result<(i32, CommandResult)> {
     let user = cli_passwords(cwd, options, session, language)?;
-    let clipboard = if settings.passwords.clipboard_passwords_enabled {
-        passwords::clipboard_passwords()
-    } else {
-        Vec::new()
-    };
+    let clipboard = cli_clipboard(&settings);
     let snapshot = if options.no_builtins {
         None
     } else {
-        Some(host.passwords(cwd)?.reload()?)
+        Some(host.passwords(cwd)?.snapshot_for_request())
     };
     let item = password_item(
         &user,
@@ -1664,24 +1968,27 @@ fn show_config(
     }
     let (path, payload) = config::load_raw(cwd)?;
     result.summary = json!({"config_path": path, "changed": false});
+    if let Err(error) = Config::parse(&payload) {
+        if options.action == "show" {
+            return Err(error);
+        }
+        let message = language.translate(
+            "cli.config.validation_error",
+            &[("error", &error.to_string())],
+        );
+        result.summary["valid"] = Value::Bool(false);
+        result.errors.push(message);
+        result
+            .items
+            .push(json!({"ok": false, "errors":[error.to_string()], "warnings": []}));
+        return Ok((2, result));
+    }
     if options.action == "show" {
         if !options.json {
             write_json(session, &payload)?;
         }
         result.items.push(payload);
     } else {
-        if let Err(error) = Config::parse(&payload) {
-            let message = language.translate(
-                "cli.config.validation_error",
-                &[("error", &error.to_string())],
-            );
-            result.summary["valid"] = Value::Bool(false);
-            result.errors.push(message);
-            result
-                .items
-                .push(json!({"ok": false, "errors":[error.to_string()], "warnings": []}));
-            return Ok((2, result));
-        }
         if !options.json {
             line(
                 session,

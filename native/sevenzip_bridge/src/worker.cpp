@@ -1150,7 +1150,7 @@ int run_request(
                     result.password_candidate_direct = true;
                     result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
                     result.password_attempts = password_candidates.size() == 1 && direct_ok ? 0 : static_cast<int>(index + 1);
-                    result.matched_index = direct_ok ? static_cast<int>(index) : -1;
+                    result.matched_index = direct_ok || result.password_crc_proven ? static_cast<int>(index) : -1;
                     result.password_candidates_all_rejected =
                         result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
                     if (direct_ok || (!result.password_candidates_all_rejected && !uncertain_password) || password_candidates.size() == 1 ||

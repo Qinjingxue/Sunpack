@@ -4,7 +4,11 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 const WINDOW: usize = 12;
-pub(super) const CLOSE: u32 = 0x8000_0000;
+const CLOSE: u32 = 0x8000_0000;
+
+pub(super) fn is_boundary(candidate: &WatchCandidateRow) -> bool {
+    candidate.observation.change_reasons_known && candidate.observation.change_reasons & CLOSE != 0
+}
 
 #[derive(Default)]
 pub(super) struct Quiet {
@@ -30,9 +34,13 @@ impl Quiet {
         if reset {
             *self = Self::default();
         }
-        if boundary || !learn {
+        if boundary {
+            self.end_phase();
+            return;
+        }
+        if !learn {
             self.tentative = 0.0;
-            self.last = (!boundary).then_some(now);
+            self.last = Some(now);
             return;
         }
         if let Some(last) = self.last.replace(now) {
@@ -41,6 +49,11 @@ impl Quiet {
                 self.interval(interval, last, now);
             }
         }
+    }
+
+    pub(super) fn end_phase(&mut self) {
+        self.tentative = 0.0;
+        self.last = None;
     }
 
     fn interval(&mut self, value: f64, last: f64, now: f64) {

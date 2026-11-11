@@ -90,6 +90,7 @@ def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(pack
     package.json("watch", "add", watched, "-o", output)
     package.json("watch", "start", "--no-tray")
     worker = _staged_worker(package, tmp_path)
+    owner = worker.parent()
     worker.suspend()
     try:
         staging.replace(watched)
@@ -110,9 +111,20 @@ def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(pack
     finally:
         worker.resume()
 
-    # Stop drains the admitted batch. Restart must replay its deferred source.
+    # Stop drains the admitted batch. Keep the root absent during restart so
+    # the durable deferred source can only be resumed when the root returns.
     assert package.json("watch", "stop")["summary"]["stopped"]
-    package.json("watch", "start", "--once", "--no-tray")
+    assert package.run("--persistent-shutdown").returncode == 0
+    owner.wait(timeout=30)
+    worker.wait(timeout=30)
+    watched.replace(staging)
+    package.json("watch", "start", "--no-tray")
+    staging.replace(watched)
+    _wait_for(
+        lambda: b"fresh generation" in [path.read_bytes() for path in output.rglob("source.txt")],
+        "Watch did not recover the durable source when the root returned",
+    )
+    assert package.json("watch", "stop")["summary"]["stopped"]
     assert [path.read_bytes() for path in output.rglob("other.txt")] == [b"unrelated batch member"]
     assert b"fresh generation" in [path.read_bytes() for path in output.rglob("source.txt")]
 
@@ -146,6 +158,7 @@ def test_cancelled_watch_generation_is_durable_before_worker_stops(package, tmp_
     # Hold the worker so a crash immediately after cancellation cannot be
     # mistaken for a normally completed cleanup or ordinary Watch shutdown.
     worker.suspend()
+    owner_stopped = False
     try:
         incoming.replace(source)
         _wait_for(admitted, "Watch did not admit the archive before cancellation")
@@ -153,11 +166,17 @@ def test_cancelled_watch_generation_is_durable_before_worker_stops(package, tmp_
         assert cancel.returncode == 0, (cancel.stdout, cancel.stderr)
         owner.kill()
         owner.wait(timeout=30)
+        owner_stopped = True
     finally:
-        try:
-            worker.resume()
-        except psutil.NoSuchProcess:
-            pass
+        if owner_stopped:
+            # Its job object has already begun terminating the child. Windows
+            # can still return its PID while rejecting NtResumeProcess.
+            worker.wait(timeout=30)
+        else:
+            try:
+                worker.resume()
+            except psutil.NoSuchProcess:
+                pass
 
     package.json("watch", "start", "--once", "--no-tray")
     assert source.is_file()

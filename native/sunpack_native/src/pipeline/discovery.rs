@@ -4,14 +4,16 @@ use crate::core::config::{Config, ScanFilterKind};
 use crate::io::archive_state::{
     ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
 };
-use crate::io::directory_errors::DirectoryReadError;
+use crate::io::directory_errors::DirectoryReadErrors;
 use crate::password::rar::resolve_embedded_rar_boundaries;
-use crate::path_keys::path_key;
+use crate::path_keys::{path_ancestors, path_key};
 use crate::scan::directory::{
-    classify_scan_targets, filesystem_logical_name, NativeDirectoryScanOptions,
+    classify_scan_targets, filesystem_logical_name, is_reparse_point, NativeDirectoryScanOptions,
     NativeDirectorySnapshot, NativeOutputInventory,
 };
-use crate::scan::discovery::{CandidateProjection, NativeCandidateTable, NativeEmbeddedBatch};
+use crate::scan::discovery::{
+    CandidateProjection, FileTargets, NativeCandidateTable, NativeEmbeddedBatch,
+};
 use crate::scan::embedded::{EmbeddedCandidate, NativeScanResult, RarInputResolution};
 use crate::scan::nested_authorization::authorize_nested_candidates;
 use crate::scan::scope::NativeDiscoveryScope;
@@ -57,16 +59,48 @@ impl Task {
     }
 }
 
-#[derive(Default)]
 pub(super) struct Discovered {
     pub tasks: Vec<Task>,
     pub errors: Vec<InputError>,
+    pub scan_errors: DirectoryReadErrors,
+}
+
+impl Default for Discovered {
+    fn default() -> Self {
+        Self {
+            tasks: Vec::new(),
+            errors: Vec::new(),
+            scan_errors: DirectoryReadErrors::report(),
+        }
+    }
 }
 
 pub(super) struct RetryScope {
     scope: NativeDiscoveryScope,
     snapshot: NativeDirectorySnapshot,
     bucket: String,
+}
+
+type VerifiedPasswords = HashMap<(String, u64), Arc<str>>;
+
+fn password_key(input: &ArchiveInput) -> (String, u64) {
+    let offset = input
+        .physical_extents()
+        .find(|extent| extent.path == input.entry_path)
+        .map_or(0, |extent| extent.start);
+    (path_key(&input.entry_path), offset)
+}
+
+fn walk_can_reach(root: &str, target: &str) -> bool {
+    for path in Path::new(target).ancestors() {
+        if path_key(&path.to_string_lossy()).trim_end_matches('\\') == root {
+            return true;
+        }
+        if std::fs::symlink_metadata(path).map_or(true, |meta| is_reparse_point(&meta)) {
+            return false;
+        }
+    }
+    false
 }
 
 pub(crate) fn scan_options(config: &Config) -> io::Result<NativeDirectoryScanOptions> {
@@ -113,8 +147,8 @@ pub(super) fn discover(
             paths.push(path);
         }
     }
-    let (kinds, errors) = classify_scan_targets(paths.clone());
-    result.add_errors(errors);
+    let (kinds, errors) = classify_scan_targets(&paths);
+    result.scan_errors = errors;
     let mut directories = Vec::new();
     let mut files = Vec::new();
     for (path, kind) in paths.into_iter().zip(kinds) {
@@ -125,51 +159,143 @@ pub(super) fn discover(
                 path: PathBuf::from(path),
                 message: "A regular input file is required".to_owned(),
                 kind: InputErrorKind::InvalidInput,
+                scan_operation: None,
+                scan_count: None,
             }),
             _ => {}
         }
     }
     let max_depth = (!request.recursive).then_some(0);
+    let mut seen_roots = HashSet::new();
     let mut scopes: Vec<_> = directories
         .into_iter()
-        .map(|directory| {
-            if let Some(scope) = request
+        .filter_map(|directory| {
+            let scope = if let Some(scope) = request
                 .discovery_scope
                 .as_ref()
-                .filter(|scope| path_key(&scope.root) == path_key(&directory))
+                .filter(|scope| scope.key() == path_key(&directory).trim_end_matches('\\'))
             {
                 scope.clone()
             } else {
                 NativeDiscoveryScope::new(directory, max_depth, Vec::new())
-            }
+            };
+            seen_roots.insert(scope.key().to_owned()).then_some(scope)
         })
         .collect();
-    if request.recursive {
-        let superseded: HashSet<_> = scopes
+    drop(seen_roots);
+    let share_recursive = request.recursive && options.can_share_recursive_context();
+    if share_recursive && scopes.len() > 1 {
+        let roots: HashMap<_, _> = scopes.iter().map(|scope| (scope.key(), scope)).collect();
+        let covered: Vec<_> = scopes
             .iter()
-            .enumerate()
-            .filter_map(|(index, scope)| {
-                scopes
-                    .iter()
-                    .enumerate()
-                    .any(|(i, root)| i != index && root.contains(&scope.root))
-                    .then_some(index)
+            .map(|scope| {
+                path_ancestors(scope.key()).skip(1).any(|parent| {
+                    roots.get(parent).is_some_and(|root| {
+                        root.max_depth.is_none()
+                            && root.contains_key(scope.key())
+                            && walk_can_reach(root.key(), &scope.root)
+                    })
+                })
             })
             .collect();
-        let mut index = 0;
-        scopes.retain(|_| {
-            let keep = !superseded.contains(&index);
-            index += 1;
-            keep
-        });
+        let mut covered = covered.into_iter();
+        scopes.retain(|_| !covered.next().unwrap());
     }
+    let roots: HashMap<_, _> = scopes.iter().map(|scope| (scope.key(), scope)).collect();
+    let covering_root = |key: &str| {
+        path_ancestors(key).any(|parent| {
+            roots
+                .get(parent)
+                .is_some_and(|scope| scope.contains_key(key))
+        })
+    };
     let mut table = NativeCandidateTable::new();
     let mut verified = HashMap::new();
     let mut retry_scopes = Vec::new();
+    let mut by_parent = BTreeMap::<_, (_, Vec<_>, Vec<_>)>::new();
+    for path in &files {
+        let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(path));
+        if !roots.is_empty() {
+            let key = path_key(path);
+            let parent_path = parent.to_string_lossy();
+            if path_ancestors(&key).any(|candidate| {
+                roots.get(candidate).is_some_and(|scope| {
+                    scope.contains_key(&key)
+                        && (scope.key() == path_key(&parent_path).trim_end_matches('\\')
+                            || (share_recursive && walk_can_reach(scope.key(), &parent_path)))
+                })
+            }) {
+                continue;
+            }
+        }
+        let parent = request
+            .discovery_scope
+            .as_ref()
+            .map(|scope| scope.root.clone())
+            .unwrap_or_else(|| parent.to_string_lossy().into_owned());
+        let bucket = if request.watch_catalog.is_some() {
+            crate::scan::catalog::catalog_stem(path)
+        } else {
+            String::new()
+        };
+        let mut key = path_key(&parent);
+        key.truncate(key.trim_end_matches('\\').len());
+        by_parent
+            .entry((key, bucket))
+            .or_insert_with(|| (parent, Vec::new(), Vec::new()))
+            .1
+            .push((path.clone(), filesystem_logical_name(path)));
+    }
+    let mut covered_directories = HashSet::new();
+    if share_recursive
+        && !request.direct
+        && request.discovery_scope.is_none()
+        && request.watch_catalog.is_none()
+        && !by_parent.is_empty()
+        && (by_parent.len() > 1 || !scopes.is_empty())
+    {
+        // A file contributes a relation search boundary, whereas a selected
+        // directory admits all its archives. Merge their walks without widening
+        // the latter to unrelated files elsewhere in the shared snapshot.
+        let file_roots: HashMap<_, _> = by_parent
+            .iter()
+            .map(|((key, _), (root, _, _))| (key.clone(), root.clone()))
+            .collect();
+        let outer_root = |key: &str, path: &str| {
+            path_ancestors(key)
+                .filter_map(|ancestor| file_roots.get_key_value(ancestor))
+                .filter(|(root, _)| walk_can_reach(root, path))
+                .last()
+        };
+        if file_roots.len() > 1 {
+            let unmerged = std::mem::take(&mut by_parent);
+            for ((key, _), (path, mut targets, _)) in unmerged {
+                let (key, root) = outer_root(&key, &path).unwrap();
+                by_parent
+                    .entry((key.clone(), String::new()))
+                    .or_insert_with(|| (root.clone(), Vec::new(), Vec::new()))
+                    .1
+                    .append(&mut targets);
+            }
+        }
+        for scope in &scopes {
+            if let Some((key, _)) = outer_root(scope.key(), &scope.root) {
+                by_parent
+                    .get_mut(&(key.clone(), String::new()))
+                    .unwrap()
+                    .2
+                    .push(scope.key().to_owned());
+                covered_directories.insert(scope.key());
+            }
+        }
+    }
     for scope in &scopes {
+        if covered_directories.contains(scope.key()) {
+            continue;
+        }
         request.cancel.check_io()?;
         let (filtered, raw) = options.scan_scope(scope)?;
-        result.add_errors(filtered.scan_errors());
+        result.scan_errors.extend(filtered.scan_errors());
         table.extend(&mut directory_table(
             &filtered,
             &raw,
@@ -184,43 +310,25 @@ pub(super) fn discover(
             bucket: String::new(),
         }));
     }
-    let mut by_parent: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
-    for path in &files {
-        if scopes.iter().any(|scope| scope.contains(path)) {
-            continue;
-        }
-        let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(path));
-        let parent = request
-            .discovery_scope
-            .as_ref()
-            .map(|scope| scope.root.clone())
-            .unwrap_or_else(|| parent.to_string_lossy().into_owned());
-        let bucket = if request.watch_catalog.is_some() {
-            crate::scan::catalog::catalog_stem(path)
-        } else {
-            String::new()
-        };
-        by_parent
-            .entry((parent, bucket))
-            .or_default()
-            .push((path.clone(), filesystem_logical_name(path)));
-    }
-    for ((parent, bucket), targets) in by_parent {
+    for ((_, bucket), (parent, targets, directories)) in by_parent {
         request.cancel.check_io()?;
-        let scope = request
-            .discovery_scope
-            .clone()
-            .unwrap_or_else(|| NativeDiscoveryScope::new(parent, Some(0), Vec::new()));
+        let scope = request.discovery_scope.clone().unwrap_or_else(|| {
+            NativeDiscoveryScope::new(
+                parent,
+                if request.direct { Some(0) } else { max_depth },
+                Vec::new(),
+            )
+        });
         let (filtered, raw) = if let Some(catalog) = &request.watch_catalog {
             options.catalog_snapshot(catalog, &scope, &targets[0].0)?
         } else {
             options.scan_scope(&scope)?
         };
-        result.add_errors(filtered.scan_errors());
+        result.scan_errors.extend(filtered.scan_errors());
         table.extend(&mut directory_table(
             &filtered,
             &raw,
-            Some(targets),
+            Some(FileTargets::new(targets, directories)),
             candidates,
             &mut verified,
             request,
@@ -235,7 +343,8 @@ pub(super) fn discover(
     result.project(&mut table, candidates, &verified, request, false)?;
     if request.origin == Origin::Watch {
         let admitted = |path: &str| {
-            seen.contains(&path_key(path)) || scopes.iter().any(|scope| scope.contains(path))
+            let key = path_key(path);
+            seen.contains(&key) || (!roots.is_empty() && covering_root(&key))
         };
         let ready = |path: &str| {
             admitted(path) || crate::filesystem::watch_file_is_ready(path).unwrap_or(false)
@@ -285,7 +394,7 @@ pub(super) fn discover_output(
 ) -> io::Result<Discovered> {
     let (filtered, raw) = inventory.build_directory_snapshots(options)?;
     let mut result = Discovered::default();
-    result.add_errors(filtered.scan_errors());
+    result.scan_errors.extend(filtered.scan_errors());
     let mut verified = HashMap::new();
     let mut table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
     result.project(&mut table, candidates, &verified, request, true)?;
@@ -317,6 +426,16 @@ pub(super) fn discover_output(
 }
 
 fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
+    if scopes.is_empty() {
+        return;
+    }
+    let by_root = (scopes.len() > 1).then(|| {
+        scopes
+            .iter()
+            .map(|scope| ((scope.scope.key(), scope.bucket.as_str()), scope))
+            .collect::<HashMap<_, _>>()
+    });
+    let has_buckets = scopes.iter().any(|scope| !scope.bucket.is_empty());
     for task in tasks.iter_mut().filter(|task| task.inputs.len() == 1) {
         let input = task.entry();
         let may_split = input.mode.structured()
@@ -326,19 +445,23 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
                 .as_ref()
                 .is_some_and(|failure| failure.kind == FailureKind::MissingVolume);
         if may_split {
-            let mut bucket = None;
-            task.retry = scopes
-                .iter()
-                .filter(|scope| {
-                    scope.scope.contains(&input.entry_path)
-                        && (scope.bucket.is_empty()
-                            || scope.bucket
-                                == *bucket.get_or_insert_with(|| {
-                                    crate::scan::catalog::catalog_stem(&input.entry_path)
-                                }))
+            let key = path_key(&input.entry_path);
+            let bucket = has_buckets.then(|| crate::scan::catalog::catalog_stem(&input.entry_path));
+            task.retry = if let Some(by_root) = &by_root {
+                path_ancestors(&key).find_map(|root| {
+                    bucket
+                        .as_deref()
+                        .and_then(|bucket| by_root.get(&(root, bucket)))
+                        .or_else(|| by_root.get(&(root, "")))
+                        .filter(|scope| scope.scope.contains_key(&key))
+                        .map(|scope| Arc::clone(scope))
                 })
-                .max_by_key(|scope| scope.scope.root.len())
-                .cloned();
+            } else {
+                let scope = &scopes[0];
+                (scope.scope.contains_key(&key)
+                    && (scope.bucket.is_empty() || bucket.as_ref() == Some(&scope.bucket)))
+                .then(|| Arc::clone(scope))
+            };
         }
     }
 }
@@ -384,7 +507,7 @@ pub(super) fn retry_volume(
     let table = directory_table(
         &filtered,
         &raw,
-        Some(targets),
+        Some(FileTargets::new(targets, Vec::new())),
         candidates,
         &mut verified,
         request,
@@ -406,9 +529,9 @@ pub(super) fn retry_volume(
 fn directory_table(
     filtered: &NativeDirectorySnapshot,
     raw: &NativeDirectorySnapshot,
-    targets: Option<Vec<(String, String)>>,
+    targets: Option<FileTargets>,
     candidates: &CandidateSet<'_>,
-    verified: &mut HashMap<String, Arc<str>>,
+    verified: &mut VerifiedPasswords,
     request: &Request,
 ) -> io::Result<NativeCandidateTable> {
     let mut table = NativeCandidateTable::new();
@@ -417,16 +540,21 @@ fn directory_table(
     let mut refresh = Vec::new();
     let mut failures = Vec::new();
     for group in table.encrypted_rar_groups() {
-        match candidates.plan(&group.input, None, &[], &request.cancel) {
+        match candidates.plan(&group.input, None, &request.cancel) {
             Ok(Ok(plan)) if plan.verified => {
                 let value = plan.selected.unwrap();
-                verified.insert(path_key(&group.input.entry_path), value.clone());
-                passwords.extend(
-                    group
-                        .owned_paths
-                        .into_iter()
-                        .map(|path| (path, value.to_string())),
-                );
+                // A standalone RAR4 main header already establishes the layout.
+                // A full password proof can unblock it without revisiting its
+                // original (encrypted) relation facts or probing a split bucket.
+                if !group.standalone {
+                    passwords.extend(
+                        group
+                            .owned_paths
+                            .into_iter()
+                            .map(|path| (path, value.to_string())),
+                    );
+                }
+                verified.insert(password_key(&group.input), value);
             }
             Ok(Ok(_)) => failures.extend(
                 group
@@ -469,23 +597,11 @@ fn directory_table(
 }
 
 impl Discovered {
-    fn add_errors(&mut self, errors: Vec<DirectoryReadError>) {
-        self.errors.extend(
-            errors
-                .into_iter()
-                .map(|(operation, path, detail)| InputError {
-                    path: PathBuf::from(path),
-                    message: format!("{operation}: {detail}"),
-                    kind: InputErrorKind::FilesystemScan,
-                }),
-        );
-    }
-
     fn project(
         &mut self,
         table: &mut NativeCandidateTable,
         candidates: &CandidateSet<'_>,
-        verified: &HashMap<String, Arc<str>>,
+        verified: &VerifiedPasswords,
         request: &Request,
         recursive: bool,
     ) -> io::Result<()> {
@@ -533,11 +649,11 @@ impl Discovered {
                     if let Some(error) = row.error {
                         let (path, format) = table.summary(row.index)?;
                         if format.is_empty() {
-                            self.errors.push(InputError {
-                                path: PathBuf::from(path),
-                                message: error.to_string(),
-                                kind: InputErrorKind::FilesystemScan,
-                            });
+                            self.scan_errors.push_detail(
+                                Path::new(&path),
+                                "embedded_scan",
+                                error.to_string(),
+                            );
                         } else {
                             let mut task = project_task(
                                 table.project(row.index)?,
@@ -621,7 +737,7 @@ impl Discovered {
 fn project_task(
     projected: CandidateProjection<'_>,
     source: DiscoverySource,
-    verified: &HashMap<String, Arc<str>>,
+    verified: &VerifiedPasswords,
 ) -> Task {
     match projected {
         CandidateProjection::File {
@@ -640,10 +756,16 @@ fn project_task(
             failure_reason,
             ..
         } => {
-            let password = verified.get(&path_key(&relation.input.entry_path)).cloned();
-            let failure = failure_reason
-                .or(relation.failure_reason)
-                .and_then(discovery_failure);
+            let password = (!verified.is_empty())
+                .then(|| verified.get(&password_key(&relation.input)).cloned())
+                .flatten();
+            let reason = failure_reason.or(relation.failure_reason);
+            let failure =
+                if relation.standalone && password.is_some() && reason == Some("needs_password") {
+                    None
+                } else {
+                    reason.and_then(discovery_failure)
+                };
             let mut task = Task::single(relation.input, relation.owned_paths, source, failure);
             task.inputs[0].password = password;
             task

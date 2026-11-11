@@ -1,12 +1,13 @@
-//! One multiplexed worker per engine. Only live jobs retain manifests and
-//! each waiting job holds at most one undelivered progress update.
+//! One multiplexed worker per engine. Each live job retains its result
+//! assembly and coalesces byte progress and resource state independently.
 
+use super::ResourceWait;
 use crate::core::config::{ProcessMode, WorkerConfig};
 use crate::io::cancellation::Cancellation;
 use crate::scan::worker_event::{NativeWorkerResultAccumulator, WorkerFrame};
 use crate::scan::worker_wire::{encode_worker_frame, NativeWorkerFrameDecoder};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -33,11 +34,13 @@ struct Shared {
 #[derive(Default)]
 struct State {
     jobs: HashMap<String, Job>,
+    parked: VecDeque<(String, Arc<Mailbox>)>,
     ready: bool,
     applied_mode: Option<ProcessMode>,
     mode_reply: Option<(Option<ProcessMode>, bool)>,
     closed: Option<WorkerExit>,
-    capacity_epoch: u64,
+    completion_epoch: u64,
+    claimed_epoch: u64,
 }
 
 struct WorkerExit {
@@ -54,7 +57,69 @@ impl WorkerExit {
 struct Job {
     mailbox: Arc<Mailbox>,
     accumulator: NativeWorkerResultAccumulator,
+    submission_epoch: u64,
     result: Option<io::Result<WorkerFrame>>,
+    disk: Episode,
+    memory: Episode,
+    resources: ResourceWait,
+}
+
+impl Job {
+    fn new(id: &str, mailbox: Arc<Mailbox>, submission_epoch: u64) -> Self {
+        Self {
+            mailbox,
+            accumulator: NativeWorkerResultAccumulator::new(id.to_owned()),
+            submission_epoch,
+            result: None,
+            disk: Episode::default(),
+            memory: Episode::default(),
+            resources: ResourceWait::default(),
+        }
+    }
+
+    fn resource_event(&mut self, event: &str, summary: &Value) -> bool {
+        let episode = number(summary, "episode_id");
+        let previous = self.resources;
+        match event {
+            "space_blocked" | "space_status" | "space_resumed" => {
+                if self.disk.update(episode, event == "space_resumed") {
+                    self.resources.disk = !self.disk.resumed;
+                    self.resources.volume_error = (self.resources.disk
+                        && summary.get("volume_query_ok").and_then(Value::as_bool) == Some(false))
+                    .then(|| number(summary, "volume_query_error"));
+                }
+            }
+            "memory_blocked" | "memory_resumed" => {
+                if self.memory.update(episode, event == "memory_resumed") {
+                    self.resources.memory = !self.memory.resumed;
+                }
+            }
+            _ => return false,
+        }
+        if previous != self.resources {
+            self.mailbox.updates.lock().unwrap().resources = Some(self.resources);
+            self.mailbox.available.notify_one();
+        }
+        true
+    }
+}
+
+#[derive(Default)]
+struct Episode {
+    id: u64,
+    resumed: bool,
+}
+
+impl Episode {
+    fn update(&mut self, id: u64, resumed: bool) -> bool {
+        // Gate callbacks can leave the gate lock and arrive out of order.
+        if id < self.id || (id == self.id && self.resumed) {
+            return false;
+        }
+        self.id = id;
+        self.resumed = resumed;
+        true
+    }
 }
 
 #[derive(Default)]
@@ -66,7 +131,14 @@ struct Mailbox {
 #[derive(Default)]
 struct Updates {
     progress: Option<Progress>,
+    resources: Option<ResourceWait>,
     result: Option<io::Result<WorkerFrame>>,
+    retry_granted: bool,
+}
+
+pub(super) enum Update {
+    Progress(Progress),
+    ResourceWait(ResourceWait),
 }
 
 #[derive(Clone, Copy)]
@@ -223,45 +295,25 @@ impl Process {
         job_id: &str,
         request: &Value,
         cancellation: &Cancellation,
-        mut on_progress: impl FnMut(Progress),
+        mut on_update: impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
         let frame = encode_worker_frame(request)?;
         let mailbox = Arc::new(Mailbox::default());
         let wake_mailbox = Arc::clone(&mailbox);
-        let wake_shared = Arc::clone(&self.shared);
         let _subscription = cancellation.subscribe(move || {
-            {
-                let _guard = wake_mailbox.updates.lock().unwrap();
-                wake_mailbox.available.notify_one();
-            }
-            let _guard = wake_shared.state.lock().unwrap();
-            wake_shared.changed.notify_all();
+            let _guard = wake_mailbox.updates.lock().unwrap();
+            wake_mailbox.available.notify_one();
         });
 
+        cancellation.check_io()?;
+        self.shared.register(job_id, Arc::clone(&mailbox))?;
         loop {
-            cancellation.check_io()?;
-            let epoch = self.shared.register(job_id, Arc::clone(&mailbox))?;
             self.send(&frame)?;
-            let result = self.wait(job_id, &mailbox, cancellation, &mut on_progress)?;
+            let result = self.wait(job_id, &mailbox, cancellation, &mut on_update)?;
             if !rejected(&result) {
                 return Ok(result);
             }
-            // Only an admitted job finishing releases capacity. If it already
-            // finished during this submission, retry without waiting for more.
-            let state = self.shared.state.lock().unwrap();
-            let state = self
-                .shared
-                .changed
-                .wait_while(state, |state| {
-                    state.capacity_epoch == epoch
-                        && !state.jobs.is_empty()
-                        && state.closed.is_none()
-                        && !cancellation.cancelled()
-                })
-                .unwrap();
-            if let Some(reason) = &state.closed {
-                return Err(reason.error());
-            }
+            self.shared.wait_for_retry(job_id, &mailbox, cancellation)?;
         }
     }
 
@@ -270,7 +322,7 @@ impl Process {
         job_id: &str,
         mailbox: &Mailbox,
         cancellation: &Cancellation,
-        on_progress: &mut impl FnMut(Progress),
+        on_update: &mut impl FnMut(Update),
     ) -> io::Result<WorkerFrame> {
         let mut sent_cancel = false;
         loop {
@@ -280,14 +332,19 @@ impl Process {
                 .wait_while(updates, |state| {
                     state.result.is_none()
                         && state.progress.is_none()
+                        && state.resources.is_none()
                         && (sent_cancel || !cancellation.cancelled())
                 })
                 .unwrap();
             let progress = updates.progress.take();
+            let resources = updates.resources.take();
             let result = updates.result.take();
             drop(updates);
             if let Some(progress) = progress {
-                on_progress(progress);
+                on_update(Update::Progress(progress));
+            }
+            if let Some(resources) = resources {
+                on_update(Update::ResourceWait(resources));
             }
             if let Some(result) = result {
                 return result;
@@ -343,25 +400,53 @@ impl Drop for Process {
 }
 
 impl Shared {
-    fn register(&self, job_id: &str, mailbox: Arc<Mailbox>) -> io::Result<u64> {
+    fn register(&self, job_id: &str, mailbox: Arc<Mailbox>) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
         if let Some(reason) = &state.closed {
             return Err(reason.error());
         }
-        let job = Job {
-            mailbox,
-            accumulator: NativeWorkerResultAccumulator::new(job_id.to_owned()),
-            result: None,
-        };
+        let epoch = state.completion_epoch;
         match state.jobs.entry(job_id.to_owned()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(job);
+                entry.insert(Job::new(job_id, mailbox, epoch));
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(io::Error::other("duplicate native job id"))
             }
         }
-        Ok(state.capacity_epoch)
+        Ok(())
+    }
+
+    fn wait_for_retry(
+        &self,
+        job_id: &str,
+        mailbox: &Mailbox,
+        cancellation: &Cancellation,
+    ) -> io::Result<()> {
+        let updates = mailbox.updates.lock().unwrap();
+        let mut updates = mailbox
+            .available
+            .wait_while(updates, |updates| {
+                !updates.retry_granted && updates.result.is_none() && !cancellation.cancelled()
+            })
+            .unwrap();
+        if let Err(error) = cancellation.check_io() {
+            drop(updates);
+            let mut state = self.state.lock().unwrap();
+            if state.jobs.remove(job_id).is_some() {
+                // No bytes have been sent for the reserved attempt. Pass its
+                // slot to the next waiter without waiting for native completion.
+                state.grant_retry();
+            } else {
+                state.parked.retain(|(id, _)| id != job_id);
+            }
+            return Err(error);
+        }
+        if let Some(result) = updates.result.take() {
+            return result.map(|_| ());
+        }
+        updates.retry_granted = false;
+        Ok(())
     }
 
     fn event(&self, frame: WorkerFrame) {
@@ -397,12 +482,30 @@ impl Shared {
                         "native job finished without a result",
                     ))
                 });
-                if !result.as_ref().is_ok_and(rejected) {
-                    state.capacity_epoch = state.capacity_epoch.wrapping_add(1);
+                if result.as_ref().is_ok_and(rejected) {
+                    state.parked.push_back((job_id, Arc::clone(&job.mailbox)));
+                    // A completion may have arrived between submission and
+                    // rejection. Claim it once, including if other jobs are
+                    // paused and cannot produce a second completion.
+                    let earliest = state.claimed_epoch.max(job.submission_epoch);
+                    if earliest < state.completion_epoch {
+                        state.claimed_epoch = earliest + 1;
+                        state.grant_retry();
+                    } else if state.jobs.is_empty() {
+                        // With no outstanding submissions there is nothing to wait for.
+                        state.grant_retry();
+                    }
+                } else {
+                    state.completion_epoch += 1;
+                    if state.grant_retry() {
+                        state.claimed_epoch = state.completion_epoch;
+                    }
                 }
                 job.mailbox.updates.lock().unwrap().result = Some(result);
                 job.mailbox.available.notify_one();
-                self.changed.notify_all();
+                if state.jobs.capacity() > 256 {
+                    crate::collections::trim_map(&mut state.jobs);
+                }
             }
             return;
         }
@@ -410,6 +513,11 @@ impl Shared {
             return;
         };
         if job.result.is_some() {
+            return;
+        }
+        let event = string(&frame.summary, "event");
+        if matches!(kind, "progress" | "native_memory") && job.resource_event(event, &frame.summary)
+        {
             return;
         }
         match kind {
@@ -427,6 +535,7 @@ impl Shared {
                 job.mailbox.updates.lock().unwrap().progress = Some(update);
                 job.mailbox.available.notify_one();
             }
+            "native_memory" => {}
             _ => match job.accumulator.accept(frame) {
                 Ok(Some(frame)) if string(&frame.summary, "type") == "result" => {
                     job.result = Some(Ok(frame))
@@ -447,8 +556,29 @@ impl Shared {
             job.mailbox.updates.lock().unwrap().result = Some(Err(exit.error()));
             job.mailbox.available.notify_one();
         }
+        for (_, mailbox) in state.parked.drain(..) {
+            mailbox.updates.lock().unwrap().result = Some(Err(exit.error()));
+            mailbox.available.notify_one();
+        }
         state.closed = Some(exit);
         self.changed.notify_all();
+    }
+}
+
+impl State {
+    fn grant_retry(&mut self) -> bool {
+        if let Some((id, mailbox)) = self.parked.pop_front() {
+            if self.parked.capacity() > 256 {
+                crate::collections::trim_deque(&mut self.parked);
+            }
+            let job = Job::new(&id, Arc::clone(&mailbox), self.completion_epoch);
+            self.jobs.insert(id, job);
+            mailbox.updates.lock().unwrap().retry_granted = true;
+            mailbox.available.notify_one();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -494,5 +624,188 @@ fn parse_mode(value: &str) -> Option<ProcessMode> {
         "high" => Some(ProcessMode::High),
         "background" => Some(ProcessMode::Background),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dispatch(shared: &Shared, summary: Value) {
+        let bytes = encode_worker_frame(&summary).unwrap();
+        let mut decoder = NativeWorkerFrameDecoder::default();
+        for frame in decoder.feed(&bytes).unwrap() {
+            shared.event(frame);
+        }
+        decoder.finish().unwrap();
+    }
+
+    fn register(shared: &Shared, id: &str) -> Arc<Mailbox> {
+        let mailbox = Arc::new(Mailbox::default());
+        shared.register(id, Arc::clone(&mailbox)).unwrap();
+        mailbox
+    }
+
+    fn finish(shared: &Shared, id: &str, backpressure: bool) {
+        dispatch(
+            shared,
+            json!({
+                "type": "result", "job_id": id, "retryable": backpressure,
+                "native_status": if backpressure { "backpressure" } else { "ok" },
+            }),
+        );
+        dispatch(
+            shared,
+            json!({"type": "native_event", "event": "job_finished", "job_id": id}),
+        );
+    }
+
+    fn take_rejection(mailbox: &Mailbox) {
+        let result = mailbox
+            .updates
+            .lock()
+            .unwrap()
+            .result
+            .take()
+            .unwrap()
+            .unwrap();
+        assert!(rejected(&result));
+    }
+
+    #[test]
+    fn each_completion_grants_one_retry_and_cancellation_passes_its_slot() {
+        let shared = Shared::default();
+        register(&shared, "active");
+        let first = register(&shared, "first");
+        let second = register(&shared, "second");
+        let third = register(&shared, "third");
+        for (id, mailbox) in [("first", &first), ("second", &second), ("third", &third)] {
+            finish(&shared, id, true);
+            take_rejection(mailbox);
+            assert!(!mailbox.updates.lock().unwrap().retry_granted);
+        }
+
+        finish(&shared, "active", false);
+        assert!(first.updates.lock().unwrap().retry_granted);
+        assert!(!second.updates.lock().unwrap().retry_granted);
+        assert!(!third.updates.lock().unwrap().retry_granted);
+
+        let cancelled = Cancellation::new();
+        cancelled.cancel();
+        assert_eq!(
+            shared
+                .wait_for_retry("first", &first, &cancelled)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other,
+        );
+        assert!(second.updates.lock().unwrap().retry_granted);
+        assert!(!third.updates.lock().unwrap().retry_granted);
+
+        shared.fail("worker exited".into(), io::ErrorKind::BrokenPipe);
+        for (id, mailbox) in [("second", &second), ("third", &third)] {
+            assert_eq!(
+                shared
+                    .wait_for_retry(id, mailbox, &Cancellation::new())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_retries_immediately_when_no_other_job_can_finish() {
+        let shared = Shared::default();
+        let mailbox = register(&shared, "retry");
+        finish(&shared, "retry", true);
+        take_rejection(&mailbox);
+        assert!(mailbox.updates.lock().unwrap().retry_granted);
+        shared
+            .wait_for_retry("retry", &mailbox, &Cancellation::new())
+            .unwrap();
+        finish(&shared, "retry", false);
+        assert!(mailbox
+            .updates
+            .lock()
+            .unwrap()
+            .result
+            .take()
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn completion_before_rejection_can_be_claimed_once() {
+        let shared = Shared::default();
+        register(&shared, "active");
+        register(&shared, "paused");
+        let first = register(&shared, "first");
+        let second = register(&shared, "second");
+        finish(&shared, "active", false);
+        finish(&shared, "first", true);
+        finish(&shared, "second", true);
+        take_rejection(&first);
+        take_rejection(&second);
+        assert!(first.updates.lock().unwrap().retry_granted);
+        assert!(!second.updates.lock().unwrap().retry_granted);
+    }
+
+    #[test]
+    fn resource_wait_tracks_independent_episodes_through_binary_frames() {
+        let shared = Shared::default();
+        let mailbox = register(&shared, "active");
+        let take_wait = || mailbox.updates.lock().unwrap().resources.take();
+        dispatch(
+            &shared,
+            json!({
+                "type": "progress", "event": "space_blocked", "job_id": "active", "episode_id": 1,
+                "volume_query_ok": false, "volume_query_error": 21,
+            }),
+        );
+        dispatch(
+            &shared,
+            json!({"type": "native_memory", "event": "memory_blocked", "job_id": "active", "episode_id": 3}),
+        );
+        dispatch(
+            &shared,
+            json!({"type": "progress", "job_id": "active", "completed_bytes": 4, "total_bytes": 8}),
+        );
+        assert_eq!(
+            take_wait(),
+            Some(ResourceWait {
+                disk: true,
+                memory: true,
+                volume_error: Some(21)
+            }),
+        );
+        assert_eq!(
+            mailbox.updates.lock().unwrap().progress.unwrap().completed,
+            4
+        );
+
+        for event in ["space_resumed", "space_status", "space_blocked"] {
+            dispatch(
+                &shared,
+                json!({"type": "progress", "event": event, "job_id": "active", "episode_id": 1}),
+            );
+        }
+        dispatch(
+            &shared,
+            json!({"type": "native_memory", "event": "memory_resumed", "job_id": "active", "episode_id": 2}),
+        );
+        assert_eq!(
+            take_wait(),
+            Some(ResourceWait {
+                disk: false,
+                memory: true,
+                volume_error: None
+            }),
+        );
+        dispatch(
+            &shared,
+            json!({"type": "native_memory", "event": "memory_resumed", "job_id": "active", "episode_id": 3}),
+        );
+        assert_eq!(take_wait(), Some(ResourceWait::default()));
     }
 }

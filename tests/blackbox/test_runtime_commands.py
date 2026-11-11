@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -11,9 +12,10 @@ import pytest
 
 def test_config_reload_and_literal_password_sources(package, tmp_path):
     password_file = tmp_path / "密码.txt"
-    password_file.write_bytes("  spaces  \r\n#literal\n\n中文\n".encode())
+    long = "长" * 23000  # Cross the native reader's 64 KiB buffer.
+    password_file.write_bytes(f"\ufeffbom\r\n  spaces  \r#literal\n\n中文\u2028next\n{long}".encode())
     report = package.json("passwords", "--no-builtin-pw", "-p", "  spaces  ", "--pw-file", password_file)
-    assert report["items"][0]["combined_passwords"] == ["  spaces  ", "#literal", "中文"]
+    assert report["items"][0]["combined_passwords"] == ["  spaces  ", "\ufeffbom", "#literal", "中文", "next", long]
 
     before = package.json("config", "show")
     assert before["items"][0]["cli"]["language"] == "en"
@@ -28,6 +30,34 @@ def test_config_reload_and_literal_password_sources(package, tmp_path):
     assert not after["summary"]["changed"]
 
 
+@pytest.mark.parametrize("invalid", [
+    '{"cli":',
+    '{"embedded_scan":{"recursive_candidate_ratio":"many"}}',
+    '{"runtime":{"process_mode":42}}',
+    '{"extraction":{"content_requirement":true}}',
+])
+def test_invalid_config_diagnostics_preserve_last_good_request_settings(package, tmp_path, invalid):
+    archive = tmp_path / "input.zip"
+    with zipfile.ZipFile(archive, "w") as payload:
+        payload.writestr("member.txt", "payload")
+    assert package.json("scan", archive)["summary"]["archive_count"] == 1
+    path = package.data / "sunpack_config.json"
+    good = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(invalid, encoding="utf-8")
+
+    for action in ("show", "validate"):
+        assert package.json("config", action, code=2)["errors"]
+    doctor = package.json("doctor", code=1)
+    assert next(row for row in doctor["items"] if row["name"] == "config")["status"] == "fail"
+    assert package.json("scan", archive)["summary"]["archive_count"] == 1
+
+    good["embedded_scan"] = {"enabled": False}
+    path.write_text(json.dumps(good), encoding="utf-8")
+    assert package.json("config", "show")["items"][0]["embedded_scan"]["enabled"] is False
+    assert package.json("config", "validate")["items"][0]["ok"]
+    assert package.json("scan", archive)["summary"]["archive_count"] == 1
+
+
 def test_cli_password_values_and_noninteractive_prompt_contract(package):
     missing = package.run("passwords", "--json", "--password", "--no-bpw")
     assert missing.returncode == 2 and not missing.stdout
@@ -40,6 +70,83 @@ def test_cli_password_values_and_noninteractive_prompt_contract(package):
     prompt = package.json("passwords", "--ask-pw", code=2)
     assert prompt["inputs"]["argv"] == ["passwords", "--ask-pw", "--json"]
     assert prompt["errors"] == ["interactive password input is unavailable in JSON mode"]
+
+    result = package.run("passwords", "--ask-pw", "--no-bpw", input="  secret  \rquietQpassword\n\n")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "['  secret  ', 'quietQpassword']" in result.stdout
+
+
+def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
+    path = package.data / "builtin_passwords.json"
+    path.write_bytes(b'{"passwords":[{"value":"first"}]}')
+    assert package.json("passwords")["items"][0]["builtin_passwords"] == ["first"]
+
+    path.write_bytes(b'{"passwords":[{"value":"\xff"}]}')
+    assert package.json("passwords")["items"][0]["builtin_passwords"] == ["first"]
+
+    # Replace a file with the same length and last-write time while the same
+    # runtime is running. The file identity must also invalidate its snapshot.
+    path.write_bytes(b'{"passwords":[{"value":"first"}]}')
+    assert package.json("passwords")["items"][0]["builtin_passwords"] == ["first"]
+    before = path.stat()
+    replacement = path.with_suffix(".tmp")
+    replacement.write_bytes(b'{"passwords":[{"value":"other"}]}')
+    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+    replacement.replace(path)
+    assert package.json("passwords")["items"][0]["builtin_passwords"] == ["other"]
+
+    path.unlink()
+    assert package.json("passwords")["items"][0]["builtin_passwords"] == []
+    assert not path.exists()
+
+
+def test_existing_runtime_uses_latest_archive_request_idle_setting(package, tmp_path):
+    archive = tmp_path / "input.zip"
+    with zipfile.ZipFile(archive, "w") as payload:
+        payload.writestr("member.txt", "payload")
+    package.configure(performance={"persistent_server_idle_seconds": 60})
+    assert package.json("scan", archive)["summary"]["archive_count"] == 1
+    state, = package.data.glob("runtime-*.state")
+    owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
+
+    package.configure(performance={"persistent_server_idle_seconds": 0})
+    assert package.json("scan", archive)["summary"]["archive_count"] == 1
+    owner.wait(timeout=10)
+    assert not state.exists()
+
+
+def test_extract_reports_invalid_input_and_filesystem_errors_separately(package, tmp_path):
+    missing = tmp_path / "missing.zip"
+    report = package.json("extract", "--direct-file", tmp_path, missing, code=1)
+    assert report["summary"]["failed_count"] == 0
+    assert report["summary"]["input_error_count"] == 1
+    assert report["summary"]["scan_error_count"] == 1
+    assert report["tasks"][0]["failures"][0]["kind"] == "invalid_input"
+
+    result = package.run("extract", "--direct-file", tmp_path, missing)
+    assert result.returncode == 1
+    assert all(label in result.stderr for label in ("[Input error]", "[Scan error]", "[Scan incomplete]"))
+
+
+def test_text_extract_keeps_nested_archive_under_its_carrier_segment(package, tmp_path):
+    def zipped(name, data):
+        with io.BytesIO() as buffer:
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr(name, data)
+            return buffer.getvalue()
+
+    carrier = tmp_path / "carrier.opaque"
+    carrier.write_bytes(
+        b"prefix" + zipped("one.txt", b"one") + b"between" +
+        zipped("nested.zip", zipped("two.txt", b"two")) + b"trailer"
+    )
+    output = tmp_path / "output"
+    result = package.run("extract", "-d", "-r", "*", "-c", "k", "-o", output, carrier)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "\x1b" not in result.stdout
+    assert result.stdout.index("├─ Segment 1 (zip)") < result.stdout.index("└─ Segment 2 (zip)")
+    assert result.stdout.index("└─ Segment 2 (zip)") < result.stdout.index("   └─ nested.zip")
+    assert result.stdout.count("[Complete] [####################] 100%") == 3
 
 
 def test_watch_action_help_lists_available_options(package):

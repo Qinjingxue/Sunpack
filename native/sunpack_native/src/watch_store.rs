@@ -5,6 +5,7 @@
 
 use crate::collections::trim_map;
 use crate::io::resource_lifecycle::TrackedFile;
+use crate::pipeline::PromotedSource;
 use crate::wal::{self, Kind};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
@@ -328,6 +329,7 @@ enum Operation {
     SetMetadata(i64, String),
     SetCursors(BTreeMap<String, Cursor>),
     Runtime(String, Option<Value>),
+    Promoted(String, Option<Arc<PromotedSource>>),
 }
 
 // Fixed numeric opcodes and tuple fields; put records persist their path once.
@@ -344,6 +346,7 @@ impl Serialize for Operation {
             }
             Self::SetCursors(cursors) => (5u8, cursors).serialize(serializer),
             Self::Runtime(key, value) => (6u8, key, value).serialize(serializer),
+            Self::Promoted(key, value) => (8u8, key, value).serialize(serializer),
         }
     }
 }
@@ -409,6 +412,7 @@ impl<'de> Deserialize<'de> for Operation {
                         Operation::Runtime(key, field(&mut seq)?)
                     }
                     7 => Operation::Output(field(&mut seq)?, field(&mut seq)?),
+                    8 => Operation::Promoted(field(&mut seq)?, field(&mut seq)?),
                     _ => return Err(A::Error::custom("unknown operation opcode")),
                 };
                 if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -429,6 +433,7 @@ pub(crate) struct StateData {
     password_source_signature: String,
     cursors: BTreeMap<String, Cursor>,
     pub(crate) runtime: BTreeMap<String, Value>,
+    promoted: BTreeMap<String, Arc<PromotedSource>>,
 }
 
 impl StateData {
@@ -471,6 +476,13 @@ impl StateData {
                     self.runtime.insert(key.clone(), value.clone());
                 } else {
                     self.runtime.remove(key);
+                }
+            }
+            Operation::Promoted(key, value) => {
+                if let Some(receipt) = value {
+                    self.promoted.insert(key.clone(), Arc::clone(receipt));
+                } else {
+                    self.promoted.remove(key);
                 }
             }
             Operation::PutPending(key, record) => {
@@ -535,6 +547,19 @@ impl NativeWatchOperations {
             .push(Operation::PutEntry(path_key(&entry.path), entry));
     }
 
+    pub(crate) fn put_promoted(&mut self, receipt: PromotedSource) {
+        let key = path_key(&receipt.path().to_string_lossy());
+        Arc::make_mut(&mut self.operations)
+            .0
+            .push(Operation::Promoted(key, Some(Arc::new(receipt))));
+    }
+
+    pub(crate) fn retire_promoted(&mut self, key: String) {
+        Arc::make_mut(&mut self.operations)
+            .0
+            .push(Operation::Promoted(key, None));
+    }
+
     pub(crate) fn finish_pending(path: &str, entry: Option<Arc<EntryRecord>>) -> Self {
         let key = path_key(path);
         let retry = match entry {
@@ -546,6 +571,16 @@ impl NativeWatchOperations {
                 retry,
                 Operation::Delete(Collection::Pending, key),
             ])),
+        }
+    }
+
+    pub(crate) fn retire_entries(keys: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            operations: Arc::new(Operations(
+                keys.into_iter()
+                    .map(|key| Operation::Delete(Collection::Entries, key))
+                    .collect(),
+            )),
         }
     }
 
@@ -656,6 +691,8 @@ struct SnapshotDocument<'a> {
     pending_work: Records<'a, PendingRecord>,
     entries: Records<'a, EntryRecord>,
     runtime: &'a BTreeMap<String, Value>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    promoted: &'a BTreeMap<String, Arc<PromotedSource>>,
 }
 
 #[derive(Deserialize)]
@@ -668,6 +705,8 @@ struct SnapshotInput {
     #[serde(deserialize_with = "read_records")]
     entries: HashMap<String, Arc<EntryRecord>>,
     runtime: BTreeMap<String, Value>,
+    #[serde(default)]
+    promoted: BTreeMap<String, Arc<PromotedSource>>,
 }
 
 impl NativeWatchSnapshot {
@@ -685,6 +724,7 @@ impl NativeWatchSnapshot {
                 pending_work: Records(&self.data.pending),
                 entries: Records(&self.data.entries),
                 runtime: &self.data.runtime,
+                promoted: &self.data.promoted,
             };
             let mut file = TrackedFile::open_with(&path, "watch_state_snapshot", |options| {
                 options.write(true).truncate(true);
@@ -865,6 +905,11 @@ impl NativeWatchState {
                             && record.mtime == mtime
                             && record.file_id == file_id
                             && record.change_usn == change_usn
+                            && record.force == force
+                            && (root.is_empty() || record.source_input_root == root)
+                            && scope
+                                .as_ref()
+                                .is_none_or(|scope| record.discovery_scope == *scope)
                     })
                 {
                     continue;
@@ -1136,27 +1181,48 @@ impl NativeWatchState {
         self.lock().entries.get(&path_key(path)).cloned()
     }
 
-    /// Project provenance without converting complete failure/group payloads.
-    pub(crate) fn promoted_nested_input_paths(&self, paths: Vec<String>) -> Vec<String> {
+    pub(crate) fn observation_state(
+        &self,
+        key: &str,
+    ) -> (Option<Arc<EntryRecord>>, Option<Arc<PromotedSource>>) {
         let data = self.lock();
-        paths
-            .into_iter()
-            .filter(|path| {
-                let key = path_key(path);
-                data.pending.get(&key).is_some_and(|pending| {
-                    pending
-                        .promoted_destinations
-                        .iter()
-                        .any(|target| path_key(target) == key)
-                }) || data.entries.get(&key).is_some_and(|entry| {
-                    entry
-                        .failure_payload
-                        .get("details")
-                        .and_then(|details| details.get("promoted_nested_input"))
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                })
-            })
+        (
+            data.entries.get(key).cloned(),
+            data.promoted.get(key).cloned(),
+        )
+    }
+
+    pub(crate) fn promoted_source(&self, path: &str) -> Option<Arc<PromotedSource>> {
+        self.lock().promoted.get(&path_key(path)).cloned()
+    }
+
+    pub(crate) fn promoted_sources(
+        &self,
+        path: Option<&str>,
+        recursive: bool,
+    ) -> Vec<(String, Arc<PromotedSource>)> {
+        let data = self.lock();
+        if let Some(path) = path {
+            let key = path_key(path);
+            if !recursive {
+                return data
+                    .promoted
+                    .get(&key)
+                    .map(|receipt| (key, Arc::clone(receipt)))
+                    .into_iter()
+                    .collect();
+            }
+            return data
+                .promoted
+                .range(key.clone()..)
+                .take_while(|(path, _)| path.starts_with(&key))
+                .filter(|(path, _)| **path == key || is_path_under(path, &key))
+                .map(|(path, receipt)| (path.clone(), Arc::clone(receipt)))
+                .collect();
+        }
+        data.promoted
+            .iter()
+            .map(|(path, receipt)| (path.clone(), Arc::clone(receipt)))
             .collect()
     }
 
@@ -1214,6 +1280,16 @@ impl NativeWatchState {
                 .iter()
                 .filter(|(key, record)| {
                     !scopes.iter().any(|scope| scope.contains(&record.path))
+                        && !record
+                            .failure_payload
+                            .get("source_input_root")
+                            .and_then(Value::as_str)
+                            .filter(|_| record.failure_payload.contains_key("discovery_scope"))
+                            .is_some_and(|root| {
+                                scopes
+                                    .iter()
+                                    .any(|scope| path_key(&scope.root) == path_key(root))
+                            })
                         && !data.pending.contains_key(*key)
                         && !recovery_paths
                             .iter()
@@ -1613,6 +1689,7 @@ fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
     let password_generation = snapshot.password_generation;
     let data = StateData {
         runtime: snapshot.runtime,
+        promoted: snapshot.promoted,
         pending: snapshot.pending_work,
         entries: snapshot.entries,
         password_generation,

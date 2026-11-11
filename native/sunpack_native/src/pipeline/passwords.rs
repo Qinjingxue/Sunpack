@@ -137,6 +137,13 @@ impl AttemptCache {
             state.rejections -= state.entries.remove(&oldest).unwrap().rejected.len();
         }
     }
+
+    fn reject(&self, key: Key, candidates: &[Arc<str>]) {
+        self.update(key, |entry| {
+            let room = MAX_REJECTIONS.saturating_sub(entry.rejected.len());
+            entry.rejected.extend(candidates.iter().take(room).cloned());
+        });
+    }
 }
 
 impl AttemptCacheState {
@@ -155,15 +162,16 @@ pub(super) struct CandidateSet<'a> {
 
 impl<'a> CandidateSet<'a> {
     pub(super) fn new(
-        explicit: Vec<String>,
+        explicit: Arc<[Arc<str>]>,
         snapshot: Option<&'a PasswordSnapshot>,
         cache: &'a AttemptCache,
+        inherited_scope: Option<&'a Path>,
     ) -> Self {
         Self {
-            explicit: explicit.into_iter().map(Arc::from).collect(),
+            explicit,
             snapshot,
             cache,
-            inherited_scope: None,
+            inherited_scope,
         }
     }
 
@@ -172,7 +180,7 @@ impl<'a> CandidateSet<'a> {
             explicit: Arc::clone(&self.explicit),
             snapshot: self.snapshot,
             cache: self.cache,
-            inherited_scope: scope.or(self.inherited_scope),
+            inherited_scope: self.inherited_scope.or(scope),
         }
     }
 
@@ -227,7 +235,6 @@ impl<'a> CandidateSet<'a> {
         &self,
         input: &ArchiveInput,
         known: Option<Arc<str>>,
-        sessions: &[NativeArchiveSession],
         cancellation: &Cancellation,
     ) -> io::Result<Result<PasswordPlan, Failure>> {
         if let Some(password) = known {
@@ -240,12 +247,32 @@ impl<'a> CandidateSet<'a> {
         ) {
             return Ok(Ok(PasswordPlan::clear()));
         }
-        let key = Key::for_input(input, sessions);
+        let mut check_single_enc = input.format_hint == "enc";
+        let needs_password = input.analysis.password_required || check_single_enc;
+        // Discovery already identifies inputs that require a password. For the
+        // rest, an empty candidate can be confirmed by the ordinary worker
+        // open. With no other candidates, a Rust probe only repeats that I/O.
+        if !self
+            .configured(&input.entry_path)
+            .any(|value| !value.is_empty())
+        {
+            return Ok(if needs_password {
+                Err(Failure::password_required())
+            } else {
+                Ok(PasswordPlan::empty_fallback())
+            });
+        }
+        let sessions = if matches!(input.format_hint.as_str(), "zip" | "rar" | "7z" | "enc") {
+            open_sessions(input)?
+        } else {
+            Vec::new()
+        };
+        let key = Key::for_input(input, &sessions);
         if let Some(proof) = key.and_then(|key| self.cache.proof(key)) {
             match proof {
                 None => return Ok(Ok(PasswordPlan::clear())),
                 Some(password)
-                    if (!input.analysis.password_required && password.is_empty())
+                    if (!needs_password && password.is_empty())
                         || self
                             .for_path(&input.entry_path)
                             .any(|candidate| candidate == &password) =>
@@ -256,7 +283,10 @@ impl<'a> CandidateSet<'a> {
                 _ => {}
             }
         }
-        let mut candidates = self.for_path(&input.entry_path).peekable();
+        let mut candidates = self
+            .for_path(&input.entry_path)
+            .filter(|value| !value.is_empty())
+            .peekable();
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut pending = Vec::new();
         let mut evidence = None;
@@ -264,7 +294,7 @@ impl<'a> CandidateSet<'a> {
         let mut has_candidates = false;
         // The empty password has priority only when Rust has not already
         // established encryption. A backend proof may still be necessary.
-        let mut empty_probe = !input.analysis.password_required;
+        let mut empty_probe = !needs_password;
         if empty_probe {
             batch.push(Arc::from(""));
         }
@@ -274,13 +304,7 @@ impl<'a> CandidateSet<'a> {
         loop {
             cancellation.check_io()?;
             if !std::mem::take(&mut empty_probe) {
-                batch.extend(
-                    candidates
-                        .by_ref()
-                        .filter(|value| !value.is_empty())
-                        .take(BATCH_SIZE - batch.len())
-                        .cloned(),
-                );
+                batch.extend(candidates.by_ref().take(BATCH_SIZE - batch.len()).cloned());
                 has_candidates |= !batch.is_empty();
             }
             if batch.is_empty() {
@@ -292,7 +316,18 @@ impl<'a> CandidateSet<'a> {
                     continue;
                 }
             }
-            let result = password::verify(input, &batch, sessions, None)?;
+            if check_single_enc && batch.len() == 1 {
+                if candidates.peek().is_some() {
+                    // More configured candidates may survive the rejection cache.
+                    continue;
+                }
+                // The worker authenticates the sole ENC candidate when opening
+                // the archive. A host probe would repeat the same Argon2 work.
+                pending.append(&mut batch);
+                break;
+            }
+            check_single_enc = false;
+            let result = password::verify(input, &batch, &sessions, None)?;
             match result.status {
                 "not_required" => {
                     if let Some(key) = key {
@@ -316,13 +351,20 @@ impl<'a> CandidateSet<'a> {
                         }
                         return Ok(Ok(PasswordPlan::verified(password)));
                     }
+                    let tested = result.attempts.min(batch.len());
+                    let mut rejected = Vec::new();
                     for (index, value) in batch.iter().enumerate() {
                         if result.matched_index == Some(index)
                             || result.matched_indices.contains(&index)
-                            || index >= result.attempts
+                            || index >= tested
                         {
                             pending.push(value.clone());
+                        } else if key.is_some() {
+                            rejected.push(value.clone());
                         }
+                    }
+                    if let Some(key) = key.filter(|_| !rejected.is_empty()) {
+                        self.cache.reject(key, &rejected);
                     }
                     evidence = match (evidence, result.match_evidence) {
                         (None, next) => next,
@@ -333,12 +375,8 @@ impl<'a> CandidateSet<'a> {
                 "no_match" => {
                     password_rejected |= result.attempts != 0;
                     if let Some(key) = key.filter(|_| result.attempts != 0) {
-                        self.cache.update(key, |entry| {
-                            let room = MAX_REJECTIONS.saturating_sub(entry.rejected.len());
-                            entry
-                                .rejected
-                                .extend(batch.iter().take(result.attempts.min(room)).cloned());
-                        });
+                        self.cache
+                            .reject(key, &batch[..result.attempts.min(batch.len())]);
                     }
                     pending.extend(batch.iter().skip(result.attempts).cloned());
                 }
@@ -373,7 +411,7 @@ impl<'a> CandidateSet<'a> {
             if password_rejected && has_candidates {
                 return Ok(Err(Failure::password()));
             }
-            if password_rejected || input.analysis.password_required {
+            if password_rejected || needs_password {
                 return Ok(Err(Failure::password_required()));
             }
             pending.push(Arc::from(""));
@@ -384,7 +422,7 @@ impl<'a> CandidateSet<'a> {
         let plan = PasswordPlan {
             selected: Some(pending[0].clone()),
             candidates: pending,
-            encrypted: input.analysis.password_required.then_some(true),
+            encrypted: needs_password.then_some(true),
             verified: false,
             evidence,
             has_candidates,
@@ -392,6 +430,17 @@ impl<'a> CandidateSet<'a> {
         };
         Ok(Ok(plan))
     }
+}
+
+fn open_sessions(input: &ArchiveInput) -> io::Result<Vec<NativeArchiveSession>> {
+    let mut seen = HashSet::new();
+    input
+        .physical_extents()
+        .map(|extent| extent.path.as_str())
+        .chain(std::iter::once(input.entry_path.as_str()))
+        .filter(|path| seen.insert(*path))
+        .map(|path| NativeArchiveSession::new(path.to_owned()))
+        .collect()
 }
 
 pub(super) struct PasswordPlan {
@@ -405,6 +454,19 @@ pub(super) struct PasswordPlan {
 }
 
 impl PasswordPlan {
+    fn empty_fallback() -> Self {
+        let empty = Arc::from("");
+        Self {
+            selected: Some(Arc::clone(&empty)),
+            candidates: vec![empty],
+            encrypted: None,
+            verified: false,
+            evidence: Some("empty_password_direct"),
+            has_candidates: false,
+            cache_key: None,
+        }
+    }
+
     fn clear() -> Self {
         Self {
             selected: None,
@@ -430,20 +492,26 @@ impl PasswordPlan {
         }
     }
 
-    pub(super) fn selected(&self, index: Option<usize>) -> Option<&str> {
-        index
-            .and_then(|index| self.candidates.get(index))
-            .or(self.selected.as_ref())
-            .map(Arc::as_ref)
+    pub(super) fn remember_confirmation(
+        &self,
+        index: Option<usize>,
+        cache: &AttemptCache,
+    ) -> Option<&str> {
+        let password = match index {
+            Some(index) => self.candidates.get(index)?,
+            None if self.candidates.len() <= 1 => self.selected.as_ref()?,
+            None => return None,
+        };
+        cache.remember_recent(Arc::clone(password));
+        if let Some(key) = self.cache_key {
+            cache.update(key, |entry| entry.proof = Some(Some(Arc::clone(password))));
+        }
+        Some(password)
     }
 
-    pub(super) fn remember_confirmation(&self, index: Option<usize>, cache: &AttemptCache) {
-        if let Some(password) = self.selected(index) {
-            let password: Arc<str> = Arc::from(password);
-            cache.remember_recent(password.clone());
-            if let Some(key) = self.cache_key {
-                cache.update(key, |entry| entry.proof = Some(Some(password)));
-            }
+    pub(super) fn remember_rejections(&self, cache: &AttemptCache) {
+        if let Some(key) = self.cache_key.filter(|_| !self.candidates.is_empty()) {
+            cache.reject(key, &self.candidates);
         }
     }
 }
@@ -461,5 +529,42 @@ impl Failure {
             kind: FailureKind::PasswordRequired,
             message: "Password not found in the password list".to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
+        // A host ENC probe would fail on this header. Planning can proceed
+        // because the worker will confirm the sole remaining candidate.
+        let path = crate::test_support::temp_file("enc_single_candidate_plan", b"short");
+        let name = path.to_string_lossy().into_owned();
+        let input = ArchiveInput::file(name.clone(), "enc".into(), "archive".into());
+        let sessions = [NativeArchiveSession::new(name).unwrap()];
+        let cache = AttemptCache::default();
+        cache.reject(
+            Key::for_input(&input, &sessions).unwrap(),
+            &[Arc::from("rejected")],
+        );
+        let candidates = CandidateSet::new(
+            Arc::from(["rejected".into(), "confirm-in-worker".into()]),
+            None,
+            &cache,
+            None,
+        );
+        let plan = candidates
+            .plan(&input, None, &Cancellation::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.selected.as_deref(), Some("confirm-in-worker"));
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.encrypted, Some(true));
+        assert!(!plan.verified);
+
+        drop(sessions);
+        let _ = std::fs::remove_file(path);
     }
 }

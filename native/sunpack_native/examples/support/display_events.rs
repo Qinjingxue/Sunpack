@@ -99,12 +99,8 @@ fn read_run(folder: &Path, run: &Run) -> io::Result<Vec<Value>> {
     Ok(rows)
 }
 
-pub(super) fn read(path: &Path) -> io::Result<Value> {
-    let manifest: Manifest =
-        serde_json::from_reader(File::open(path)?).map_err(io::Error::other)?;
-    let mut directory = path.as_os_str().to_owned();
-    directory.push(".store");
-    let folder = Path::new(&directory);
+fn read_snapshot(folder: &Path, bytes: &[u8]) -> io::Result<Value> {
+    let manifest: Manifest = serde_json::from_slice(bytes).map_err(io::Error::other)?;
     let mut history = Vec::new();
     for run in &manifest.runs {
         history.extend(read_run(folder, run)?);
@@ -115,4 +111,25 @@ pub(super) fn read(path: &Path) -> io::Result<Value> {
         .map(|run| read_run(folder, run))
         .transpose()?;
     Ok(json!({"history":history,"live":live.unwrap_or_default()}))
+}
+
+pub(super) fn read(path: &Path) -> io::Result<Value> {
+    let mut directory = path.as_os_str().to_owned();
+    directory.push(".store");
+    let folder = Path::new(&directory);
+    let mut manifest = std::fs::read(path)?;
+    loop {
+        match read_snapshot(folder, &manifest) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                // A writer can publish a new manifest and reclaim the old
+                // runs between these opens. A stable snapshot must still decode.
+                let current = std::fs::read(path)?;
+                if current == manifest {
+                    return Err(error);
+                }
+                manifest = current;
+            }
+        }
+    }
 }

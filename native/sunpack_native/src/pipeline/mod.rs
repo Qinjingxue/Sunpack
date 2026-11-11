@@ -62,8 +62,9 @@ pub struct Request {
     pub recursive: bool,
     pub direct: bool,
     pub deep: bool,
-    pub passwords: Vec<String>,
+    pub passwords: Arc<[Arc<str>]>,
     pub password_snapshot: Option<Arc<PasswordSnapshot>>,
+    pub(crate) password_scope: Option<PathBuf>,
     pub config: Arc<Config>,
     pub checkpoints: Vec<InputCheckpoint>,
     pub(crate) promoted_sources: Vec<PromotedSource>,
@@ -84,8 +85,9 @@ impl Request {
             recursive: false,
             direct: false,
             deep: false,
-            passwords: Vec::new(),
+            passwords: Arc::from([]),
             password_snapshot: None,
+            password_scope: None,
             config: Arc::new(Config::default()),
             checkpoints: Vec::new(),
             promoted_sources: Vec::new(),
@@ -105,7 +107,7 @@ pub enum DiscoverySource {
     Direct,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     Cancelled,
@@ -123,7 +125,7 @@ pub enum FailureKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
@@ -134,6 +136,16 @@ pub struct InputError {
     pub path: PathBuf,
     pub message: String,
     pub kind: InputErrorKind,
+    #[serde(rename = "operation", skip_serializing_if = "Option::is_none")]
+    pub scan_operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_count: Option<usize>,
+}
+
+impl InputError {
+    pub(crate) fn count(&self) -> usize {
+        self.scan_count.unwrap_or(1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -201,6 +213,8 @@ pub struct Outcome {
     pub(crate) promoted_sources: Vec<PromotedSource>,
     #[serde(skip)]
     pub(crate) removed_promotion_dirs: Vec<String>,
+    #[serde(skip)]
+    scan_incomplete: bool,
 }
 
 impl Outcome {
@@ -217,8 +231,16 @@ impl Outcome {
                 .errors
                 .iter()
                 .filter(|error| error.kind != InputErrorKind::Cleanup)
-                .count()
+                .map(InputError::count)
+                .sum::<usize>()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceWait {
+    pub disk: bool,
+    pub memory: bool,
+    pub volume_error: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -232,6 +254,10 @@ pub enum Event {
         completed_bytes: u64,
         total_bytes: u64,
     },
+    ResourceWait {
+        path: PathBuf,
+        state: ResourceWait,
+    },
     Finished {
         path: PathBuf,
         depth: usize,
@@ -243,6 +269,12 @@ pub enum Event {
 /// stops the corresponding filesystem operation and propagates to the request.
 pub(crate) trait Observer: Sync {
     fn notify(&self, event: Event);
+
+    fn archive_branch(&self, _parent: &ArchiveResult, _child: &ArchiveResult) {}
+
+    fn scope_finished(&self, _archives: &[ArchiveResult]) -> io::Result<()> {
+        Ok(())
+    }
 
     fn claim_sources(&self, _path: &Path, _members: &[String], _depth: usize) -> io::Result<()> {
         Ok(())
@@ -263,6 +295,10 @@ pub(crate) trait Observer: Sync {
         _generations: &HashMap<String, PhysicalFileGeneration>,
     ) -> io::Result<()> {
         Ok(())
+    }
+
+    fn promoted_source(&self, _path: &str) -> Option<PromotedSource> {
+        None
     }
 
     fn before_output(&self, _archive: &ArchiveResult, _output: &Path) -> io::Result<()> {
@@ -315,6 +351,7 @@ pub(crate) trait Observer: Sync {
         _archive: &ArchiveResult,
         _moves: &[(PathBuf, PathBuf)],
         _success: bool,
+        _receipts: &[PromotedSource],
     ) -> io::Result<()> {
         Ok(())
     }

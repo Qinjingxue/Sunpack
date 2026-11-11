@@ -7,7 +7,7 @@ use crate::io::config_changes::NativeConfigChanges;
 use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
-    PromotedSource, Request,
+    PromotedSource, Request, ResourceWait,
 };
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
@@ -587,7 +587,7 @@ struct Running {
 
 #[derive(Default)]
 struct Signals {
-    changed_roots: HashSet<String>,
+    changed_roots: HashMap<String, HashSet<PathBuf>>,
     reload: bool,
     reload_waiters: Vec<mpsc::SyncSender<io::Result<()>>>,
     once: Vec<mpsc::SyncSender<io::Result<()>>>,
@@ -604,7 +604,7 @@ struct Hub {
     stopped: AtomicBool,
     signals: Mutex<Signals>,
     wake: std::sync::Condvar,
-    claims: Mutex<HashMap<String, String>>,
+    claims: Mutex<HashMap<String, Arc<str>>>,
     seeds: Mutex<HashMap<String, Seed>>,
     pending_count: AtomicUsize,
 }
@@ -771,10 +771,58 @@ struct Pending {
     quiet: quiet::Quiet,
     due: Instant,
     force: bool,
+    recovery: Option<Arc<Recovery>>,
+}
+
+#[derive(Debug)]
+struct Recovery {
+    scope: NativeDiscoveryScope,
+    password_scope: PathBuf,
+}
+
+impl Recovery {
+    fn from_record(scope: &serde_json::Map<String, Value>, password_scope: &str) -> Option<Self> {
+        let root = scope.get("root")?.as_str()?.to_owned();
+        let depth = scope
+            .get("max_depth")
+            .and_then(Value::as_u64)
+            .map(|depth| depth as usize);
+        let excluded = scope
+            .get("excluded_subtrees")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        Some(Self {
+            scope: NativeDiscoveryScope::new(root, depth, excluded),
+            password_scope: PathBuf::from(password_scope),
+        })
+    }
+
+    fn password_dir<'a>(&'a self, path: &'a Path) -> &'a Path {
+        if self.password_scope.as_os_str().is_empty() {
+            path.parent().unwrap_or(Path::new(""))
+        } else {
+            &self.password_scope
+        }
+    }
+}
+
+fn scope_record(scope: &NativeDiscoveryScope) -> serde_json::Map<String, Value> {
+    let mut excluded = scope.excluded_subtrees();
+    excluded.sort_unstable();
+    serde_json::Map::from_iter([
+        ("root".to_owned(), json!(scope.root)),
+        ("max_depth".to_owned(), json!(scope.max_depth)),
+        ("excluded_subtrees".to_owned(), json!(excluded)),
+    ])
 }
 
 struct Active {
     root: String,
+    recovery: Option<Arc<Recovery>>,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
     touched: HashSet<String>,
@@ -786,7 +834,7 @@ struct Active {
 struct Completed {
     cancelled: bool,
     result: io::Result<Outcome>,
-    promoted: HashMap<String, WatchCandidateRow>,
+    promoted: HashMap<String, Option<WatchCandidateRow>>,
 }
 
 #[derive(serde::Serialize)]
@@ -801,6 +849,7 @@ struct Scheduler {
     cwd: PathBuf,
     root_file: PathBuf,
     roots: BTreeMap<String, (Root, NativeDiscoveryScope)>,
+    available_roots: HashSet<String>,
     settings: Arc<Config>,
     engine: Arc<Engine>,
     journal: Arc<journal::Journal>,
@@ -855,6 +904,7 @@ impl Scheduler {
             cwd,
             root_file,
             roots: BTreeMap::new(),
+            available_roots: HashSet::new(),
             settings: Arc::new(snapshot.config),
             engine,
             journal,
@@ -881,12 +931,14 @@ impl Scheduler {
             _lease: lease,
         };
         scheduler.reconcile_roots()?;
+        scheduler.retire_missing_entries(None, true)?;
+        scheduler.retire_stale_promoted(None, true)?;
         scheduler.reconcile_shell();
         windows::configure_priority(&scheduler.engine, scheduler.settings.runtime.process_mode);
-        scheduler.recover_pending()?;
+        scheduler.recover_pending(None)?;
         scheduler.password_update()?;
-        scheduler.checkpoint(None, true)?;
-        scheduler.retry_missing_volumes()?;
+        scheduler.checkpoint(&HashMap::new(), true, true)?;
+        scheduler.retry_missing_volumes(None)?;
         scheduler
             .hub
             .pending_count
@@ -1078,7 +1130,7 @@ impl Scheduler {
             filesystem::validate_ntfs_watch_root(&directory.to_string_lossy())?;
         }
         let dir = state_dir(&self.cwd)?;
-        let mut next = entries
+        let next = entries
             .iter()
             .map(|root| (key(&root.path), (root.clone(), root.scope(&entries, &dir))))
             .collect::<BTreeMap<_, _>>();
@@ -1086,30 +1138,41 @@ impl Scheduler {
             || next.iter().any(|(id, (root, _))| {
                 self.roots.get(id).is_none_or(|(old, _)| {
                     old.recursive != root.recursive
-                        || old.output != root.output
+                        || old.output.as_deref().map(key) != root.output.as_deref().map(key)
                         || old.deep != root.deep
                 })
             });
-        for (id, (root, _)) in &mut next {
-            if self
-                .roots
-                .get(id)
-                .is_some_and(|(old, _)| old.deep != root.deep)
-            {
-                root.scanned = false;
-            }
-        }
-        let removed: Vec<_> = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| !next.contains_key(&pending.root))
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in removed {
-            if let Some(pending) = self.pending.remove(&key) {
-                self.hub.retire_seed(&key);
-                self.due.remove(&(pending.due, key.clone()));
-                self.unpublished.remove(&key);
+        if policy_changed {
+            let reroute = self
+                .pending
+                .iter()
+                .filter_map(|(id, pending)| {
+                    if pending.recovery.is_some() {
+                        return (!next.contains_key(&pending.root)).then(|| (id.clone(), None));
+                    }
+                    if next
+                        .get(&pending.root)
+                        .is_some_and(|(_, scope)| scope.contains(&pending.candidate.path))
+                    {
+                        return None;
+                    }
+                    let root = next.iter().find_map(|(root, (_, scope))| {
+                        scope
+                            .contains(&pending.candidate.path)
+                            .then(|| root.clone())
+                    });
+                    Some((id.clone(), root))
+                })
+                .collect::<Vec<_>>();
+            for (id, root) in reroute {
+                if let Some(root) = root {
+                    self.pending.get_mut(&id).unwrap().root = root;
+                    self.unpublished.insert(id);
+                } else if let Some(pending) = self.pending.remove(&id) {
+                    self.hub.retire_seed(&id);
+                    self.due.remove(&(pending.due, id.clone()));
+                    self.unpublished.remove(&id);
+                }
             }
         }
         let catalog_roots = entries
@@ -1132,6 +1195,7 @@ impl Scheduler {
                 scopes,
             });
         }
+        self.available_roots.retain(|id| next.contains_key(id));
         self.roots = next;
         self.rearm_root_observers();
         Ok(())
@@ -1143,7 +1207,7 @@ impl Scheduler {
                 .get(id)
                 .and_then(|(root, _)| nearest_directory(&root.path))
                 .is_some_and(|path| {
-                    path == observer.path && !observer.stopping.load(Ordering::Acquire)
+                    key(path) == key(&observer.path) && !observer.stopping.load(Ordering::Acquire)
                 })
         });
         for (id, (root, scope)) in &self.roots {
@@ -1160,17 +1224,26 @@ impl Scheduler {
             let watched_dir = directory.clone();
             let hub = Arc::clone(&self.hub);
             let observer = FileObserver::start(&directory, recursive, move |names| {
-                if let (Some(scope), Some(names)) = (&filter, &names) {
-                    if !names
-                        .iter()
-                        .any(|name| scope.contains(&watched_dir.join(name).to_string_lossy()))
-                    {
-                        return;
-                    }
-                }
-                hub.update(|signals| {
-                    signals.changed_roots.insert(key.clone());
+                let paths = names.map(|names| {
+                    names
+                        .into_iter()
+                        .map(|name| watched_dir.join(name))
+                        .filter(|path| {
+                            filter
+                                .as_ref()
+                                .is_none_or(|scope| scope.contains(&path.to_string_lossy()))
+                        })
+                        .collect::<Vec<_>>()
                 });
+                if paths.as_ref().is_none_or(|paths| !paths.is_empty()) {
+                    hub.update(|signals| {
+                        signals
+                            .changed_roots
+                            .entry(key.clone())
+                            .or_default()
+                            .extend(paths.into_iter().flatten());
+                    });
+                }
             });
             match observer {
                 Ok(observer) => { self.root_observers.insert(id.clone(), observer); }
@@ -1192,7 +1265,7 @@ impl Scheduler {
         self.options = options;
         self.config_observers = config_observers;
         self.reconcile_shell();
-        self.checkpoint(None, false)?;
+        self.checkpoint(&HashMap::new(), true, false)?;
         Ok(())
     }
 
@@ -1306,15 +1379,16 @@ impl Scheduler {
                 || !signals.once.is_empty()
             {
                 self.rearm_root_observers();
-                let changed = (!signals.volumes_changed && signals.once.is_empty())
-                    .then_some(&signals.changed_roots);
-                let result = self.checkpoint(changed, false).and_then(|_| {
-                    if signals.once.is_empty() {
-                        Ok(())
-                    } else {
-                        self.dispatch_ready()
-                    }
-                });
+                let all_roots = signals.volumes_changed || !signals.once.is_empty();
+                let result = self
+                    .checkpoint(&signals.changed_roots, all_roots, false)
+                    .and_then(|_| {
+                        if signals.once.is_empty() {
+                            Ok(())
+                        } else {
+                            self.dispatch_ready()
+                        }
+                    });
                 self.hub
                     .pending_count
                     .store(self.pending.len(), Ordering::Relaxed);
@@ -1360,19 +1434,29 @@ impl Scheduler {
         }
     }
 
-    fn checkpoint(&mut self, changed: Option<&HashSet<String>>, startup: bool) -> io::Result<()> {
+    fn checkpoint(
+        &mut self,
+        changed: &HashMap<String, HashSet<PathBuf>>,
+        all_roots: bool,
+        startup: bool,
+    ) -> io::Result<()> {
         let selected = self
             .roots
             .iter()
-            .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
+            .filter(|(id, _)| all_roots || changed.contains_key(*id))
             .map(|(id, (root, scope))| (id.clone(), root.clone(), scope.clone()))
             .collect::<Vec<_>>();
         let mut groups: HashMap<(String, u64), (i64, i64, Vec<NativeDiscoveryScope>)> =
             HashMap::new();
         let mut probes = Vec::new();
+        let mut reopened = HashSet::new();
         for (id, root, scope) in selected {
             if !root.path.is_dir() {
+                self.available_roots.remove(&id);
                 continue;
+            }
+            if self.available_roots.insert(id.clone()) && !startup {
+                reopened.insert(id.clone());
             }
             let current = filesystem::watch_volume_cursor(&scope.root);
             let cached = self.catalog.cursor(&scope);
@@ -1401,6 +1485,14 @@ impl Scheduler {
             }
             probes.push((id, root, scope, current, cached));
         }
+        if !reopened.is_empty() {
+            // A returning root can have durable work with the same inventory
+            // and no USN delta. Resume only the affected ownership scopes.
+            self.recover_pending(Some(&reopened))?;
+            self.retry_missing_volumes(Some(&reopened))?;
+            let passwords = self.passwords.snapshot();
+            self.retry_password_failures(&passwords, Some(&reopened))?;
+        }
         let mut ranges = HashMap::new();
         for ((volume, journal), (start, end, scopes)) in groups {
             let changed = self
@@ -1418,8 +1510,10 @@ impl Scheduler {
         let mut failures = HashSet::new();
         for (id, root, scope, current, cached) in probes {
             let range = match (&current, &cached) {
-                (Ok((volume, journal, _)), Some((old_volume, old_journal, _)))
-                    if volume == old_volume && journal == old_journal =>
+                (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end)))
+                    if volume == old_volume
+                        && journal == old_journal
+                        && (1..=*end).contains(old_end) =>
                 {
                     ranges.get(&(volume.clone(), *journal))
                 }
@@ -1429,14 +1523,15 @@ impl Scheduler {
             let mut errors = Vec::new();
             let rebuild = !root.scanned || range.is_none_or(|(_, entries)| entries.is_err());
             if rebuild {
-                let scan = if startup && cached.is_none() && root.scanned {
-                    self.scan_options(root.deep)
-                        .catalog_update(&self.catalog, &scope, None)
-                        .map(|errors| (errors, Vec::new()))
-                } else {
-                    self.scan_options(root.deep)
-                        .catalog_refresh(&self.catalog, &scope, None)
-                };
+                let scan =
+                    if (startup || reopened.contains(&id)) && cached.is_none() && root.scanned {
+                        self.scan_options(root.deep)
+                            .catalog_update(&self.catalog, &scope, None)
+                            .map(|errors| (errors, Vec::new()))
+                    } else {
+                        self.scan_options(root.deep)
+                            .catalog_refresh(&self.catalog, &scope, None)
+                    };
                 match scan {
                     Ok((failures, entries)) => {
                         errors = failures;
@@ -1452,27 +1547,62 @@ impl Scheduler {
                 }
                 self.journal
                     .log(json!({"event":"catalog_rebuilt","root":root.path,"errors":errors}));
+                // The catalog compares size and timestamps. Named notifications
+                // can also report a replacement or overwrite with identical metadata.
+                if let Some(changes) = changed.get(&id) {
+                    for path in changes {
+                        let path = path.to_string_lossy();
+                        if !scope.contains(&path) || self.catalog.is_owned(&path) {
+                            continue;
+                        }
+                        match fs::metadata(path.as_ref()) {
+                            Ok(metadata) if metadata.is_file() => paths.push(path.into_owned()),
+                            Err(error) if missing_path(&error) => {
+                                self.departed(&path, true)?;
+                                paths.push(path.into_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             } else if let Some((_, Ok(changes))) = range {
                 let mut covered = HashSet::new();
-                for path in changes {
-                    if !scope.contains(path)
-                        || self.catalog.is_owned(path)
-                        || has_covered_parent(path, &covered)
-                    {
+                // A directory notification can arrive before its USN record
+                // becomes readable. Visit both sources through the same catalog.
+                let mut named = changed.get(&id).into_iter().flatten().collect::<Vec<_>>();
+                named.sort_unstable_by_key(|path| path.as_os_str().len());
+                for path in changes
+                    .iter()
+                    .map(|path| std::borrow::Cow::Borrowed(path.as_str()))
+                    .chain(named.into_iter().map(|path| path.to_string_lossy()))
+                {
+                    let path = path.as_ref();
+                    if !scope.contains(path) || self.catalog.is_owned(path) {
                         continue;
                     }
-                    let (failed, mut arrivals) = self.scan_options(root.deep).catalog_refresh(
-                        &self.catalog,
-                        &scope,
-                        Some(path),
-                    )?;
-                    paths.append(&mut arrivals);
-                    errors.extend(failed);
-                    covered.insert(watch_path_key(path));
-                    if Path::new(path).is_file() {
-                        paths.push(path.clone());
-                    } else if NativePresence::at(path).is_absent() {
-                        self.departed(path)?;
+                    let path_id = watch_path_key(path);
+                    if covered.contains(&path_id) {
+                        continue;
+                    }
+                    let metadata = fs::metadata(path);
+                    let missing = metadata.as_ref().is_err_and(missing_path);
+                    let recursive_departure =
+                        missing && self.catalog.path_is_directory(&scope, path).unwrap_or(true);
+                    if !has_covered_parent(&path_id, &covered) {
+                        let (failed, mut arrivals) = self.scan_options(root.deep).catalog_refresh(
+                            &self.catalog,
+                            &scope,
+                            Some(path),
+                        )?;
+                        paths.append(&mut arrivals);
+                        errors.extend(failed);
+                    }
+                    covered.insert(path_id);
+                    if metadata.is_ok_and(|metadata| metadata.is_file()) {
+                        paths.push(path.to_owned());
+                    } else if missing {
+                        self.departed(path, recursive_departure)?;
+                        paths.push(path.to_owned());
                     }
                 }
             }
@@ -1553,8 +1683,7 @@ impl Scheduler {
                 let id = key(&root.path);
                 if marks.contains(&id) {
                     if let Some((current, _)) = self.roots.get_mut(&id) {
-                        if root.path == current.path
-                            && root.output == current.output
+                        if root.output.as_deref().map(key) == current.output.as_deref().map(key)
                             && root.deep == current.deep
                             && root.recursive == current.recursive
                         {
@@ -1581,57 +1710,156 @@ impl Scheduler {
         Ok(())
     }
 
-    fn departed(&mut self, path: &str) -> io::Result<()> {
+    fn retire_missing_entries(&self, path: Option<&str>, recursive: bool) -> io::Result<()> {
+        let mut available = HashMap::new();
+        let missing = self
+            .journal
+            .state()
+            .entry_paths(path, recursive)
+            .into_iter()
+            .filter_map(|(id, recorded_path)| {
+                let root = self
+                    .roots
+                    .values()
+                    .find_map(|(root, scope)| scope.contains(&recorded_path).then_some(&root.path))
+                    .or_else(|| {
+                        let entry = self.journal.state().entry(&recorded_path)?;
+                        let source = entry.failure_payload.get("source_input_root")?.as_str()?;
+                        self.roots
+                            .get(&watch_path_key(source))
+                            .map(|(root, _)| &root.path)
+                    })?;
+                (*available.entry(root).or_insert_with(|| root.is_dir())
+                    && NativePresence::at(&recorded_path).is_absent())
+                .then_some((id, root))
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // A volume can disappear during the probe. Keep its durable blockers.
+        available.clear();
+        let keys = missing.into_iter().filter_map(|(id, root)| {
+            available
+                .entry(root)
+                .or_insert_with(|| root.is_dir())
+                .then_some(id)
+        });
+        self.journal.commit(false, |_| {
+            Ok(crate::watch_store::NativeWatchOperations::retire_entries(
+                keys,
+            ))
+        })
+    }
+
+    fn retire_stale_promoted(&self, path: Option<&str>, recursive: bool) -> io::Result<()> {
+        let candidates = self.journal.state().promoted_sources(path, recursive);
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        self.journal.commit(false, |state| {
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            for (key, receipt) in candidates {
+                let path = receipt.path().to_string_lossy();
+                if self
+                    .roots
+                    .values()
+                    .any(|(root, scope)| scope.contains(&path) && root.path.is_dir())
+                    && (NativePresence::at(&path).is_absent() || receipt.is_replaced())
+                    && state
+                        .promoted_source(&path)
+                        .is_some_and(|current| Arc::ptr_eq(&receipt, &current))
+                {
+                    operations.retire_promoted(key);
+                }
+            }
+            Ok(operations)
+        })
+    }
+
+    fn departed(&mut self, path: &str, recursive: bool) -> io::Result<()> {
         let path_key = watch_path_key(path);
-        let removed: Vec<_> = self
-            .pending
-            .keys()
-            .filter(|key| *key == &path_key || is_path_under(key, &path_key))
-            .cloned()
-            .collect();
+        let is_missing = |pending: &Pending| {
+            NativePresence::at(&pending.candidate.path).is_absent()
+                && self
+                    .roots
+                    .get(&pending.root)
+                    .is_some_and(|(root, _)| root.path.is_dir())
+        };
+        let removed: Vec<_> = if recursive {
+            self.pending
+                .iter()
+                .filter(|(key, pending)| {
+                    (*key == &path_key || is_path_under(key, &path_key)) && is_missing(pending)
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        } else {
+            self.pending
+                .get(&path_key)
+                .filter(|pending| is_missing(pending))
+                .map(|_| path_key.clone())
+                .into_iter()
+                .collect()
+        };
         for id in removed {
             if let Some(pending) = self.pending.remove(&id) {
                 self.hub.retire_seed(&id);
                 self.due.remove(&(pending.due, id.clone()));
                 self.unpublished.remove(&id);
-                let claimed = self.active_paths.contains_key(&id)
-                    || self.hub.claims.lock().unwrap().contains_key(&id);
-                if !claimed {
-                    self.journal.commit(false, |state| {
-                        use crate::watch_store::NativeWatchOperations;
-                        let path = &pending.candidate.path;
-                        let recoverable = state.pending(path).is_some_and(|record| {
-                            !record.active_outputs.is_empty()
-                                || record.committed_roots.iter().next().is_some()
-                                || record.promoted_destinations.iter().next().is_some()
-                        });
-                        Ok(if recoverable {
-                            NativeWatchOperations::empty()
-                        } else {
-                            NativeWatchOperations::finish_pending(path, None)
-                        })
-                    })?;
-                }
+                self.retire_departed_owner(&id, &pending.candidate.path)?;
             }
         }
-        self.catalog.forget_observation(path, true, true);
-        Ok(())
+        self.catalog.forget_observation(path, recursive, true);
+        self.retire_stale_promoted(Some(path), recursive)?;
+        self.retire_missing_entries(Some(path), recursive)
+    }
+
+    fn retire_departed_owner(&self, id: &str, path: &str) -> io::Result<()> {
+        let claimed =
+            self.active_paths.contains_key(id) || self.hub.claims.lock().unwrap().contains_key(id);
+        if claimed {
+            return Ok(());
+        }
+        self.journal.commit(false, |state| {
+            use crate::watch_store::NativeWatchOperations;
+            let recoverable = state.pending(path).is_some_and(|record| {
+                !record.active_outputs.is_empty()
+                    || record.committed_roots.iter().next().is_some()
+                    || record.promoted_destinations.iter().next().is_some()
+            });
+            Ok(if recoverable {
+                NativeWatchOperations::empty()
+            } else {
+                NativeWatchOperations::finish_pending(path, None)
+            })
+        })
     }
 
     fn enqueue(&mut self, root_id: &str, path: String, force: bool) -> io::Result<()> {
+        self.enqueue_with_recovery(root_id, path, force, None)
+    }
+
+    fn enqueue_with_recovery(
+        &mut self,
+        root_id: &str,
+        path: String,
+        force: bool,
+        recovery: Option<Arc<Recovery>>,
+    ) -> io::Result<()> {
         let Some((_, scope)) = self.roots.get(root_id) else {
             return Ok(());
         };
-        if !scope.contains(&path) || self.catalog.is_owned(&path) {
+        if recovery.as_ref().map_or_else(
+            || !scope.contains(&path) || self.catalog.is_owned(&path),
+            |recovery| !recovery.scope.contains(&path),
+        ) {
             return Ok(());
         }
         let id = watch_path_key(&path);
         let previous = self.catalog.observation(&path);
-        let blocked = self.journal.state().entry(&path);
-        let pending_usn = self
-            .pending
-            .get(&id)
-            .map(|entry| entry.candidate.observation.change_usn);
+        let (blocked, promoted) = self.journal.state().observation_state(&id);
+        let pending_candidate = self.pending.get(&id).map(|entry| &entry.candidate);
         let active_candidate = self.active_paths.get(&id).and_then(|(batch, index)| {
             self.active
                 .get(batch.as_ref())
@@ -1642,7 +1870,7 @@ impl Scheduler {
             .filter(|entry| entry.status == "interrupted");
         let baseline = interrupted
             .map(|entry| entry.change_usn)
-            .or(pending_usn)
+            .or_else(|| pending_candidate.map(|entry| entry.observation.change_usn))
             .or_else(|| previous.as_ref().map(|value| value.change_usn))
             .or_else(|| active_candidate.map(|input| input.observation.change_usn))
             .or_else(|| blocked.as_ref().map(|value| value.change_usn));
@@ -1656,51 +1884,98 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        if interrupted.is_some_and(|before| !entry_changed(before, &candidate)) {
-            return Ok(());
-        }
-        let unchanged = previous.as_ref().map_or_else(
-            || active_candidate.is_some_and(|before| !quiet::changed(before, &candidate)),
-            |before| {
-                !quiet::content_changed(
-                    before.size,
-                    before.mtime,
-                    &before.file_id(),
-                    before.change_usn,
-                    &candidate,
-                )
-            },
-        );
-        if !force {
-            if blocked
-                .as_ref()
-                .is_some_and(|before| !entry_changed(before, &candidate))
-            {
-                return Ok(());
-            }
-            if unchanged {
-                if let Some(pending) = self.pending.get_mut(&id) {
-                    let boundary = candidate.observation.change_reasons_known
-                        && candidate.observation.change_reasons & quiet::CLOSE != 0;
-                    if boundary && baseline != Some(candidate.observation.change_usn) {
-                        let now = Instant::now();
-                        if now < pending.due {
-                            self.due.remove(&(pending.due, id.clone()));
-                            pending.due = now;
-                            self.due.insert((now, id), ());
-                        }
-                    }
-                    pending.candidate = candidate;
+        if let Some(receipt) = promoted.filter(|receipt| receipt.is_replaced()) {
+            self.journal.commit(false, |state| {
+                let mut operations = crate::watch_store::NativeWatchOperations::empty();
+                if state
+                    .promoted_source(&path)
+                    .is_some_and(|current| Arc::ptr_eq(&receipt, &current))
+                {
+                    operations.retire_promoted(id.clone());
                 }
-                return Ok(());
+                Ok(operations)
+            })?;
+        }
+        let blocked_unchanged = blocked
+            .as_ref()
+            .is_some_and(|before| !entry_changed(before, &candidate));
+        let unchanged = if let Some(before) = pending_candidate {
+            !quiet::changed(before, &candidate)
+        } else if let Some(before) = &previous {
+            !quiet::content_changed(
+                before.size,
+                before.mtime,
+                &before.file_id(),
+                before.change_usn,
+                &candidate,
+            )
+        } else if let Some(before) = active_candidate {
+            !quiet::changed(before, &candidate)
+        } else {
+            blocked_unchanged
+        };
+        let boundary = quiet::is_boundary(&candidate);
+        if (interrupted.is_some() && blocked_unchanged)
+            || (!force && (unchanged || blocked_unchanged))
+        {
+            if let Some(before) = blocked.filter(|before| {
+                blocked_unchanged
+                    && (before.change_usn != candidate.observation.change_usn
+                        || before.mtime != candidate.mtime)
+            }) {
+                self.journal.commit(false, |state| {
+                    let mut operations = crate::watch_store::NativeWatchOperations::empty();
+                    if state
+                        .entry(&candidate.path)
+                        .is_some_and(|current| Arc::ptr_eq(&current, &before))
+                    {
+                        let mut updated = (*before).clone();
+                        updated.mtime = candidate.mtime;
+                        updated.change_usn = candidate.observation.change_usn;
+                        operations.put_entry(Arc::new(updated));
+                    }
+                    Ok(operations)
+                })?;
             }
+            if recovery.is_none()
+                && previous.as_ref().is_some_and(|before| {
+                    before.mtime != candidate.mtime
+                        || before.change_usn != candidate.observation.change_usn
+                })
+            {
+                self.catalog.remember_observation(
+                    &candidate.path,
+                    candidate.size,
+                    candidate.mtime,
+                    &candidate.observation.file_id,
+                    candidate.observation.change_usn,
+                    boundary,
+                );
+            }
+            if let Some(pending) = self.pending.get_mut(&id) {
+                let now = Instant::now();
+                if boundary && baseline != Some(candidate.observation.change_usn) {
+                    pending.quiet.end_phase();
+                    // CLOSE is a useful hint only if a writer hasn't reopened
+                    // the file. Keep short existing waits on their cadence.
+                    if pending.due.saturating_duration_since(now).as_millis() >= 100
+                        && filesystem::watch_file_is_ready(&candidate.path).unwrap_or(false)
+                    {
+                        self.due.remove(&(pending.due, id.clone()));
+                        pending.due = now;
+                        self.due.insert((now, id), ());
+                    }
+                }
+                pending.candidate = candidate;
+            }
+            return Ok(());
         }
         let claim = self.hub.claims.lock().unwrap();
         let batch = self
             .active_paths
             .get(&id)
             .map(|(batch, _)| batch.as_ref())
-            .or_else(|| claim.get(&id).map(String::as_str));
+            .or_else(|| claim.get(&id).map(AsRef::as_ref));
         if let Some(active) = batch.and_then(|batch| self.active.get_mut(batch)) {
             // Let the running request finish. A new generation of one source
             // must never interrupt the other sources in its batch.
@@ -1731,16 +2006,17 @@ impl Scheduler {
                 .as_ref()
                 .map_or_else(quiet::Quiet::default, quiet::Quiet::saved)
         };
-        let boundary = candidate.observation.change_reasons & quiet::CLOSE != 0;
         quiet.observe(windows::monotonic_seconds(), boundary, new_identity, true);
-        self.catalog.remember_observation(
-            &candidate.path,
-            candidate.size,
-            candidate.mtime,
-            &candidate.observation.file_id,
-            candidate.observation.change_usn,
-            boundary,
-        );
+        if recovery.is_none() {
+            self.catalog.remember_observation(
+                &candidate.path,
+                candidate.size,
+                candidate.mtime,
+                &candidate.observation.file_id,
+                candidate.observation.change_usn,
+                boundary,
+            );
+        }
         let delay = if force && unchanged {
             0.0
         } else if boundary {
@@ -1761,6 +2037,7 @@ impl Scheduler {
                 quiet,
                 due,
                 force,
+                recovery,
             },
         );
         self.cache_deadline = None;
@@ -1772,7 +2049,16 @@ impl Scheduler {
         cursors: BTreeMap<String, crate::watch_store::Cursor>,
         durable: bool,
     ) -> io::Result<()> {
-        if self.unpublished.is_empty() && cursors.is_empty() {
+        self.persist_candidates_and_retire(cursors, durable, None)
+    }
+
+    fn persist_candidates_and_retire(
+        &mut self,
+        cursors: BTreeMap<String, crate::watch_store::Cursor>,
+        durable: bool,
+        retire: Option<&str>,
+    ) -> io::Result<()> {
+        if self.unpublished.is_empty() && cursors.is_empty() && retire.is_none() {
             return Ok(());
         }
         let keys = std::mem::take(&mut self.unpublished);
@@ -1780,20 +2066,58 @@ impl Scheduler {
             use crate::watch_store::PendingObservation;
             let mut ordinary = Vec::new();
             let mut forced = Vec::new();
+            let mut recoveries = Vec::new();
             for pending in keys.iter().filter_map(|key| self.pending.get(key)) {
-                let Some((_, scope)) = self.roots.get(&pending.root) else { continue; };
+                let Some((root, scope)) = self.roots.get(&pending.root) else {
+                    continue;
+                };
                 let candidate = &pending.candidate;
-                let observation = PendingObservation(candidate.path.clone(), candidate.size.min(i64::MAX as u64) as i64,
-                    candidate.mtime, candidate.observation.file_id.clone(), candidate.observation.change_usn);
-                let metadata = json!({"root":scope.root,"max_depth":scope.max_depth,"excluded_subtrees":scope.excluded_subtrees()});
-                let target = if pending.force { &mut forced } else { &mut ordinary };
-                target.push((observation, scope.root.clone(), metadata.as_object().cloned()));
+                let observation = PendingObservation(
+                    candidate.path.clone(),
+                    candidate.size.min(i64::MAX as u64) as i64,
+                    candidate.mtime,
+                    candidate.observation.file_id.clone(),
+                    candidate.observation.change_usn,
+                );
+                if let Some(recovery) = &pending.recovery {
+                    let update = (
+                        observation,
+                        root.path.to_string_lossy().into_owned(),
+                        Some(scope_record(&recovery.scope)),
+                    );
+                    recoveries.push((update, pending.force, &recovery.password_scope));
+                } else {
+                    let target = if pending.force {
+                        &mut forced
+                    } else {
+                        &mut ordinary
+                    };
+                    target.push((observation, scope.root.clone(), Some(scope_record(scope))));
+                }
             }
             let cursors = (!cursors.is_empty()).then_some(cursors);
-            let (mut operations, _) = state.pending_operations(ordinary, false, "", false, true, cursors)?;
+            let (mut operations, _) =
+                state.pending_operations(ordinary, false, "", false, true, cursors)?;
             if !forced.is_empty() {
                 let (force, _) = state.pending_operations(forced, true, "", false, true, None)?;
                 operations.extend(force);
+            }
+            for (update, force, password_scope) in recoveries {
+                let (recovery, _) = state.pending_operations(
+                    std::iter::once(update),
+                    force,
+                    &password_scope.to_string_lossy(),
+                    true,
+                    true,
+                    None,
+                )?;
+                operations.extend(recovery);
+            }
+            if let Some(owner) = retire {
+                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                    owner,
+                    state.entry(owner),
+                ));
             }
             Ok(operations)
         })?;
@@ -1815,30 +2139,7 @@ impl Scheduler {
             return Ok(());
         }
         let generation = state.password_generation().saturating_add(1);
-        let blocked = state.entry_items(Some("password"));
-        for entry in blocked {
-            let Some((root, _)) = self
-                .roots
-                .iter()
-                .rev()
-                .find(|(_, (_, scope))| scope.contains(&entry.path))
-            else {
-                continue;
-            };
-            let directory = Path::new(&entry.path).parent().unwrap_or(Path::new(""));
-            if entry
-                .failure_payload
-                .get("password_signature")
-                .and_then(Value::as_str)
-                .is_some_and(|before| before == snapshot.scope_signature(directory))
-            {
-                continue;
-            }
-            let root = root.clone();
-            self.enqueue(&root, entry.path.clone(), true)?;
-            self.journal
-                .log(json!({"event":"retry_password_failure","path":entry.path}));
-        }
+        self.retry_password_failures(&snapshot, None)?;
         self.persist_candidates(BTreeMap::new(), false)?;
         self.journal.commit(true, |_| {
             Ok(
@@ -1852,75 +2153,186 @@ impl Scheduler {
         Ok(())
     }
 
-    fn retry_missing_volumes(&mut self) -> io::Result<()> {
-        for entry in self.journal.state().entry_items(Some("missing_volume")) {
-            let Some((root, _)) = self
-                .roots
-                .iter()
-                .find(|(_, (_, scope))| scope.contains(&entry.path))
-            else {
+    fn retry_password_failures(
+        &mut self,
+        snapshot: &crate::core::passwords::PasswordSnapshot,
+        roots: Option<&HashSet<String>>,
+    ) -> io::Result<()> {
+        for entry in self.journal.state().entry_items(Some("password")) {
+            let Some((root, recovery)) = self.blocker_route(&entry) else {
                 continue;
             };
+            if roots.is_some_and(|roots| !roots.contains(&root)) {
+                continue;
+            }
+            let path = Path::new(&entry.path);
+            let directory = recovery.as_ref().map_or_else(
+                || path.parent().unwrap_or(Path::new("")),
+                |recovery| recovery.password_dir(path),
+            );
+            if entry
+                .failure_payload
+                .get("password_signature")
+                .and_then(Value::as_str)
+                .is_some_and(|before| before == snapshot.scope_signature(directory))
+            {
+                continue;
+            }
+            self.enqueue_with_recovery(&root, entry.path.clone(), true, recovery)?;
+            self.journal
+                .log(json!({"event":"retry_password_failure","path":entry.path}));
+        }
+        Ok(())
+    }
+
+    fn retry_missing_volumes(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
+        for entry in self.journal.state().entry_items(Some("missing_volume")) {
+            let Some((root, recovery)) = self.blocker_route(&entry) else {
+                continue;
+            };
+            if roots.is_some_and(|roots| !roots.contains(&root)) {
+                continue;
+            }
             let id = watch_path_key(&entry.path);
             if !self.pending.contains_key(&id) {
-                self.enqueue(&root.clone(), entry.path.clone(), true)?;
+                self.enqueue_with_recovery(&root, entry.path.clone(), true, recovery)?;
             }
         }
         self.persist_candidates(BTreeMap::new(), true)
     }
 
-    fn recover_pending(&mut self) -> io::Result<()> {
-        recover_flattens(&self.journal)?;
+    fn blocker_route(
+        &self,
+        entry: &crate::watch_store::EntryRecord,
+    ) -> Option<(String, Option<Arc<Recovery>>)> {
+        let payload = &entry.failure_payload;
+        if let Some(root) = payload.get("source_input_root").and_then(Value::as_str) {
+            let root = watch_path_key(root);
+            let (_, watched_scope) = self.roots.get(&root)?;
+            if let Some(scope) = payload.get("discovery_scope").and_then(Value::as_object) {
+                let password_scope = payload
+                    .get("password_scope_dir")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let recovery = Recovery::from_record(scope, password_scope)?;
+                if recovery.scope.contains(&entry.path)
+                    && (watch_path_key(&recovery.scope.root) != root
+                        || !watched_scope.contains(&entry.path)
+                        || self.catalog.is_owned(&entry.path))
+                {
+                    return Some((root, Some(Arc::new(recovery))));
+                }
+            }
+        }
+        self.roots
+            .iter()
+            .find_map(|(id, (_, scope))| scope.contains(&entry.path).then(|| (id.clone(), None)))
+    }
+
+    fn recover_pending(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
+        recover_flattens(&self.journal, |owner| {
+            roots.is_none_or(|roots| {
+                self.journal.state().pending(owner).is_some_and(|record| {
+                    roots.contains(&watch_path_key(&record.source_input_root))
+                }) && !self.active_paths.contains_key(&watch_path_key(owner))
+                    && !self
+                        .hub
+                        .claims
+                        .lock()
+                        .unwrap()
+                        .contains_key(&watch_path_key(owner))
+            })
+        })?;
+        let journal = Arc::clone(&self.journal);
+        let state = journal.state();
+        let flatten_owners: HashSet<_> = state
+            .runtime_keys("flatten|")
+            .into_iter()
+            .filter_map(|key| {
+                let record = state.runtime_record(&key)?;
+                record["owner"].as_str().map(watch_path_key)
+            })
+            .collect();
         for pending in self.journal.state().pending_items() {
+            let id = watch_path_key(&pending.path);
+            if flatten_owners.contains(&id)
+                || self.pending.contains_key(&id)
+                || self.active_paths.contains_key(&id)
+                || self.hub.claims.lock().unwrap().contains_key(&id)
+            {
+                continue;
+            }
+            let original = watch_path_key(&pending.source_input_root);
             let root = self
                 .roots
-                .iter()
-                .find(|(_, (_, scope))| scope.contains(&pending.path))
-                .map(|(id, _)| id.clone());
+                .get(&original)
+                .and_then(|(_, scope)| {
+                    (pending.internal_recovery || scope.contains(&pending.path)).then_some(original)
+                })
+                .or_else(|| {
+                    self.roots.iter().find_map(|(id, (_, scope))| {
+                        scope.contains(&pending.path).then(|| id.clone())
+                    })
+                });
             let Some(root) = root else {
                 continue;
             };
-            let source = Path::new(&pending.path);
-            let source_available = self
-                .roots
-                .get(&root)
-                .is_some_and(|(entry, _)| entry.path.is_dir());
-            if !source_available {
+            if roots.is_some_and(|roots| !roots.contains(&root)) {
                 continue;
             }
-            let mut revisit = Vec::new();
+            let Some((source_root, scope)) = self.roots.get(&root) else {
+                continue;
+            };
+            if !source_root.path.is_dir() {
+                continue;
+            }
+            let scope = scope.clone();
+            if pending.internal_recovery
+                && pending
+                    .discovery_scope
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .is_some_and(|root| !Path::new(root).is_dir())
+            {
+                continue;
+            }
+            let source = Path::new(&pending.path);
+            let entry = state.entry(&pending.path);
+            let borrowed = entry.as_ref().and_then(|entry| {
+                entry
+                    .failure_payload
+                    .get("details")?
+                    .get("retry_output_dir")?
+                    .as_str()
+            });
+            let mut revisit = BTreeMap::new();
             let mut cleanup_failed = false;
             for (task, output) in &pending.active_outputs {
-                if pending.committed_roots.contains(output) {
+                if pending.committed_roots.contains(output) || borrowed == Some(output.as_str()) {
                     continue;
                 }
-                let Some(expected) = pending.output_identities.get(output) else {
-                    cleanup_failed = true;
-                    continue;
-                };
-                match output_identity(output) {
-                    Ok(identity) if identity == *expected => {
+                match recovery_output_matches(state, &pending, output) {
+                    Ok(true) => {
                         if let Err(error) = crate::postprocess::remove_owned_tree(Path::new(output)) {
                             cleanup_failed = true;
                             self.journal.log(json!({"event":"crash_output_cleanup","path":output,"error":error.to_string()}));
                             continue;
                         }
                     }
-                    Ok(_) => self.journal.log(json!({"event":"crash_output_identity_changed","owner_path":pending.path,"output_dir":output})),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Ok(false) => self.journal.log(json!({"event":"crash_output_identity_changed","owner_path":pending.path,"output_dir":output})),
                     Err(_) => {
                         cleanup_failed = true;
                         continue;
                     }
                 }
                 if Path::new(task).is_file() && !pending.completed_sources.contains(task) {
-                    revisit.push(task.clone());
+                    revisit.insert(watch_path_key(task), task.clone());
                 }
             }
             if cleanup_failed {
                 continue;
             }
-            let interrupted = self.journal.state().entry(&pending.path).filter(|entry| {
+            let interrupted = entry.filter(|entry| {
                 if entry.status != "interrupted" {
                     return false;
                 }
@@ -1943,36 +2355,135 @@ impl Scheduler {
                 })?;
                 continue;
             }
+            let mut destinations_unavailable = false;
             for promoted in pending.promoted_destinations.iter() {
-                if Path::new(promoted).is_file() {
-                    revisit.push(promoted.clone());
+                match crate::watch_store::NativeWatchState::file_presence(promoted) {
+                    Some(true) => {
+                        revisit.insert(watch_path_key(promoted), promoted.clone());
+                    }
+                    Some(false) => {}
+                    None => destinations_unavailable = true,
                 }
             }
-            if !self.checkpoints_for(&pending.path)?.is_empty() && source.is_file() {
-                revisit.push(pending.path.clone());
+            if destinations_unavailable {
+                continue;
             }
-            if pending
-                .committed_roots
+            let promoted_present = pending
+                .promoted_destinations
                 .iter()
-                .any(|output| !Path::new(output).is_dir())
-                || (revisit.is_empty()
-                    && pending.committed_roots.iter().next().is_none()
-                    && source.is_file())
-            {
-                revisit.push(pending.path.clone());
-            }
-            if revisit.is_empty() {
-                self.journal.commit(true, |_| {
-                    Ok(crate::watch_store::NativeWatchOperations::finish_pending(
-                        &pending.path,
-                        None,
-                    ))
-                })?;
-            } else {
-                for path in revisit {
-                    self.enqueue(&root, path, true)?;
+                .any(|path| revisit.contains_key(&watch_path_key(path)));
+            let mut verified = Vec::new();
+            let mut missing_output = false;
+            let mut unavailable = false;
+            for output in pending.committed_roots.iter() {
+                match recovery_output_matches(state, &pending, output) {
+                    Ok(true) => verified.push(output),
+                    Ok(false) => missing_output = true,
+                    Err(_) => unavailable = true,
                 }
             }
+            if unavailable {
+                continue;
+            }
+            let has_checkpoint =
+                source.is_file() && !self.checkpoints_for(&pending.path)?.is_empty();
+            if (missing_output && !promoted_present) || has_checkpoint {
+                if !source.is_file() {
+                    self.journal.log(
+                        json!({"event":"crash_committed_output_missing","owner_path":pending.path}),
+                    );
+                    continue;
+                }
+                revisit.insert(watch_path_key(&pending.path), pending.path.clone());
+            } else {
+                // Python's WAL records predate the logical-input receipt. Only
+                // scan the verified committed output for unfinished descendants.
+                for output in &verified {
+                    let output_scope =
+                        NativeDiscoveryScope::new((*output).clone(), None, Vec::new());
+                    match crate::scan::directory::scope_file_paths(&output_scope) {
+                        Ok((paths, errors)) if errors.is_empty() => {
+                            for path in paths {
+                                let path = path.to_string_lossy().into_owned();
+                                if !pending.completed_sources.contains(&path)
+                                    && fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0)
+                                {
+                                    revisit.insert(watch_path_key(&path), path);
+                                }
+                            }
+                        }
+                        _ => {
+                            unavailable = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if unavailable {
+                continue;
+            }
+            if revisit.is_empty() && verified.is_empty() {
+                if source.is_file() {
+                    revisit.insert(watch_path_key(&pending.path), pending.path.clone());
+                } else if !pending.active_outputs.is_empty()
+                    || !NativePresence::at(&pending.path).is_absent()
+                {
+                    continue;
+                }
+            }
+            let owner = watch_path_key(&pending.path);
+            let mut rebase = !revisit.contains_key(&owner);
+            for (id, path) in revisit {
+                if state.entry(&path).is_some_and(|entry| {
+                    matches!(
+                        entry.status.as_str(),
+                        "failed_password" | "suspended_missing_volume"
+                    )
+                }) {
+                    continue;
+                }
+                let recovery = if id == owner && !pending.internal_recovery {
+                    None
+                } else {
+                    let nested = verified
+                        .iter()
+                        .filter(|output| is_path_under(&id, &watch_path_key(output)))
+                        .max_by_key(|output| output.len());
+                    let recovery = if let Some(output) = nested {
+                        Recovery {
+                            scope: NativeDiscoveryScope::new((**output).clone(), None, Vec::new()),
+                            password_scope: PathBuf::from(&pending.password_scope_dir),
+                        }
+                    } else {
+                        Recovery::from_record(&pending.discovery_scope, &pending.password_scope_dir)
+                            .filter(|recovery| recovery.scope.contains(&path))
+                            .unwrap_or_else(|| Recovery {
+                                scope: if scope.contains(&path) {
+                                    scope.clone()
+                                } else {
+                                    let parent =
+                                        Path::new(&path).parent().unwrap_or(Path::new("."));
+                                    NativeDiscoveryScope::new(
+                                        parent.to_string_lossy().into_owned(),
+                                        Some(0),
+                                        Vec::new(),
+                                    )
+                                },
+                                password_scope: PathBuf::from(&pending.password_scope_dir),
+                            })
+                    };
+                    Some(Arc::new(recovery))
+                };
+                self.enqueue_with_recovery(&root, path.clone(), true, recovery)?;
+                if !self.pending.contains_key(&id) && !NativePresence::at(&path).is_absent() {
+                    rebase = false;
+                }
+            }
+            self.persist_candidates_and_retire(
+                BTreeMap::new(),
+                true,
+                rebase.then_some(pending.path.as_str()),
+            )?;
         }
         self.persist_candidates(BTreeMap::new(), true)?;
         Ok(())
@@ -1990,9 +2501,15 @@ impl NativePresence {
     }
 }
 
+fn missing_path(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
 fn has_covered_parent(path: &str, covered: &HashSet<String>) -> bool {
-    let path = watch_path_key(path);
-    let mut ancestor = path.as_str();
+    let mut ancestor = path;
     loop {
         if covered.contains(ancestor) {
             return true;
@@ -2009,6 +2526,25 @@ fn output_identity(path: &str) -> io::Result<String> {
     Ok(format!("{volume}|{identity}"))
 }
 
+fn recovery_output_matches(
+    state: &crate::watch_store::NativeWatchState,
+    pending: &crate::watch_store::PendingRecord,
+    path: &str,
+) -> io::Result<bool> {
+    let Some(actual) = identity_if_present(path)? else {
+        return Ok(false);
+    };
+    if let Some(record) = state.runtime_record(&format!("owned|{}", watch_path_key(path))) {
+        if let Some(ids) = record["identities"]
+            .as_array()
+            .filter(|ids| !ids.is_empty())
+        {
+            return Ok(ids.iter().any(|id| id.as_str() == Some(&actual)));
+        }
+    }
+    Ok(pending.output_identities.get(path) == Some(&actual))
+}
+
 impl Scheduler {
     fn dispatch_ready(&mut self) -> io::Result<()> {
         let now = Instant::now();
@@ -2023,7 +2559,7 @@ impl Scheduler {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let mut groups: BTreeMap<String, Vec<WatchCandidateRow>> = BTreeMap::new();
+        let mut groups = BTreeMap::new();
         for (due, id) in ready {
             let Some(mut pending) = self.pending.remove(&id) else {
                 continue;
@@ -2034,24 +2570,11 @@ impl Scheduler {
             let current = match watch_candidate_for_path(path, Some(previous_usn)) {
                 Ok(Some(current)) => current,
                 Ok(None) => {
-                    self.hub.retire_seed(&id);
-                    self.departed(&pending.candidate.path)?;
-                    self.journal.commit(false, |_| {
-                        Ok(crate::watch_store::NativeWatchOperations::finish_pending(
-                            &pending.candidate.path,
-                            None,
-                        ))
-                    })?;
+                    self.retire_admission(&id, &pending)?;
                     continue;
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.hub.retire_seed(&id);
-                    self.journal.commit(false, |_| {
-                        Ok(crate::watch_store::NativeWatchOperations::finish_pending(
-                            &pending.candidate.path,
-                            None,
-                        ))
-                    })?;
+                Err(error) if missing_path(&error) => {
+                    self.retire_admission(&id, &pending)?;
                     continue;
                 }
                 Err(_) => {
@@ -2060,7 +2583,7 @@ impl Scheduler {
                 }
             };
             if quiet::changed(&pending.candidate, &current) {
-                let boundary = current.observation.change_reasons & quiet::CLOSE != 0;
+                let boundary = quiet::is_boundary(&current);
                 let reset = pending.candidate.size > current.size
                     || pending.candidate.observation.file_id != current.observation.file_id;
                 pending
@@ -2079,6 +2602,22 @@ impl Scheduler {
                 self.delay(id, pending, now);
                 continue;
             }
+            if quiet::is_boundary(&current) {
+                pending.quiet.end_phase();
+            }
+            if pending.recovery.is_none()
+                && (current.mtime != pending.candidate.mtime
+                    || current.observation.change_usn != previous_usn)
+            {
+                self.catalog.remember_observation(
+                    &current.path,
+                    current.size,
+                    current.mtime,
+                    &current.observation.file_id,
+                    current.observation.change_usn,
+                    quiet::is_boundary(&current),
+                );
+            }
             pending.candidate = current;
             match filesystem::watch_file_is_ready(&pending.candidate.path) {
                 Ok(true) => {}
@@ -2086,14 +2625,8 @@ impl Scheduler {
                     self.delay(id, pending, now);
                     continue;
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.hub.retire_seed(&id);
-                    self.journal.commit(false, |_| {
-                        Ok(crate::watch_store::NativeWatchOperations::finish_pending(
-                            &pending.candidate.path,
-                            None,
-                        ))
-                    })?;
+                Err(error) if missing_path(&error) => {
+                    self.retire_admission(&id, &pending)?;
                     continue;
                 }
                 Err(_) => {
@@ -2101,21 +2634,53 @@ impl Scheduler {
                     continue;
                 }
             }
-            self.catalog.retire_observation(
-                &pending.candidate.path,
-                Some(pending.quiet.seconds),
-                pending.quiet.last,
-                pending.quiet.cadence,
-                pending.quiet.tentative,
-            );
-            groups
-                .entry(pending.root)
-                .or_default()
-                .push(pending.candidate);
+            if pending.recovery.is_none() {
+                self.catalog.retire_observation(
+                    &pending.candidate.path,
+                    Some(pending.quiet.seconds),
+                    pending.quiet.last,
+                    pending.quiet.cadence,
+                    pending.quiet.tentative,
+                );
+            }
+            let recovery_key = pending.recovery.as_ref().map(|recovery| {
+                let mut excluded = recovery.scope.excluded_subtrees();
+                excluded.sort_unstable();
+                (
+                    recovery.scope.root.clone(),
+                    recovery.scope.max_depth,
+                    excluded,
+                    recovery.password_scope.clone(),
+                )
+            });
+            let (_, candidates) = groups
+                .entry((pending.root, recovery_key))
+                .or_insert_with(|| (pending.recovery, Vec::new()));
+            candidates.push(pending.candidate);
         }
         self.persist_candidates(BTreeMap::new(), false)?;
-        for (root, candidates) in groups {
-            self.start_batch(root, candidates)?;
+        for ((root, _), (recovery, candidates)) in groups {
+            self.start_batch(root, candidates, recovery)?;
+        }
+        Ok(())
+    }
+
+    fn retire_admission(&mut self, id: &str, pending: &Pending) -> io::Result<()> {
+        self.hub.retire_seed(id);
+        self.unpublished.remove(id);
+        let path = &pending.candidate.path;
+        if self
+            .roots
+            .get(&pending.root)
+            .is_some_and(|(root, _)| root.path.is_dir())
+            && pending
+                .recovery
+                .as_ref()
+                .is_none_or(|recovery| Path::new(&recovery.scope.root).is_dir())
+            && NativePresence::at(path).is_absent()
+        {
+            self.departed(path, false)?;
+            self.retire_departed_owner(id, path)?;
         }
         Ok(())
     }
@@ -2134,7 +2699,12 @@ impl Scheduler {
         self.pending.insert(id, pending);
     }
 
-    fn start_batch(&mut self, id: String, candidates: Vec<WatchCandidateRow>) -> io::Result<()> {
+    fn start_batch(
+        &mut self,
+        id: String,
+        candidates: Vec<WatchCandidateRow>,
+        recovery: Option<Arc<Recovery>>,
+    ) -> io::Result<()> {
         let Some((root, scope)) = self.roots.get(&id) else {
             return Ok(());
         };
@@ -2153,13 +2723,24 @@ impl Scheduler {
         request.origin = Origin::Watch;
         request.cancel = cancel.clone();
         request.config = Arc::clone(&self.settings);
-        request.output_root = root.output.clone();
+        let nested_recovery = recovery.as_ref().is_some_and(|recovery| {
+            watch_path_key(&recovery.scope.root) != watch_path_key(&scope.root)
+        });
+        if !nested_recovery {
+            request.output_root = root.output.clone();
+        }
         request.max_depth = cli::depth(self.settings.recursive_extract);
         request.deep = root.deep;
         let passwords = self.passwords.snapshot();
         request.password_snapshot = Some(Arc::clone(&passwords));
-        request.discovery_scope = Some(scope.clone());
-        request.watch_catalog = Some(Arc::clone(&self.catalog));
+        if let Some(recovery) = &recovery {
+            request.discovery_scope = Some(recovery.scope.clone());
+            request.password_scope = (!recovery.password_scope.as_os_str().is_empty())
+                .then(|| recovery.password_scope.clone());
+        } else {
+            request.discovery_scope = Some(scope.clone());
+            request.watch_catalog = Some(Arc::clone(&self.catalog));
+        }
         for candidate in &candidates {
             request
                 .checkpoints
@@ -2175,6 +2756,8 @@ impl Scheduler {
         let journal = Arc::clone(&self.journal);
         let hub = Arc::clone(&self.hub);
         let send_batch = batch.clone();
+        let batch_id: Arc<str> = Arc::from(batch.as_str());
+        let worker_batch = Arc::clone(&batch_id);
         let owners = candidates
             .iter()
             .map(|input| (watch_path_key(&input.path), input.path.clone()))
@@ -2197,8 +2780,9 @@ impl Scheduler {
                     owners,
                     scope,
                     outputs: Mutex::default(),
-                    batch: send_batch.clone(),
+                    batch: worker_batch,
                     toast,
+                    toast_progress: Mutex::default(),
                     language,
                     began: Instant::now(),
                     hub: Arc::clone(&hub),
@@ -2216,7 +2800,6 @@ impl Scheduler {
                     promoted,
                 }
             })?;
-        let batch_id: Arc<str> = Arc::from(batch.as_str());
         for (index, candidate) in candidates.iter().enumerate() {
             self.active_paths.insert(
                 watch_path_key(&candidate.path),
@@ -2227,6 +2810,7 @@ impl Scheduler {
             batch,
             Active {
                 root: id,
+                recovery,
                 passwords,
                 inputs: candidates,
                 touched: HashSet::new(),
@@ -2239,14 +2823,7 @@ impl Scheduler {
     }
 
     fn checkpoints_for(&self, owner: &str) -> io::Result<Vec<crate::pipeline::InputCheckpoint>> {
-        let prefix = format!("checkpoint|{}\0", watch_path_key(owner));
-        self.journal
-            .state()
-            .runtime_keys(&prefix)
-            .into_iter()
-            .filter_map(|key| self.journal.state().runtime_record(&key))
-            .map(|record| serde_json::from_value(record).map_err(io::Error::other))
-            .collect()
+        input_checkpoints(self.journal.state(), owner).collect()
     }
 
     fn cancel_batch(&mut self, batch: &str) -> bool {
@@ -2317,12 +2894,19 @@ impl Scheduler {
             .join()
             .map_err(|_| io::Error::other("Watch extraction thread failed"))?;
         completed.cancelled |= active.cancel.cancelled();
-        self.hub
-            .claims
-            .lock()
-            .unwrap()
-            .retain(|_, owner| owner != batch);
         let groups = std::mem::take(&mut *active.groups.lock().unwrap());
+        {
+            let mut claims = self.hub.claims.lock().unwrap();
+            for path in groups.keys().chain(completed.promoted.keys()) {
+                if claims
+                    .get(path)
+                    .is_some_and(|owner| owner.as_ref() == batch)
+                {
+                    claims.remove(path);
+                }
+            }
+            crate::collections::trim_map(&mut claims);
+        }
         for candidate in &active.inputs {
             let id = watch_path_key(&candidate.path);
             self.active_paths.remove(&id);
@@ -2378,11 +2962,6 @@ impl Scheduler {
             .collect::<HashMap<_, _>>();
         let mut operations = crate::watch_store::NativeWatchOperations::empty();
         let current_passwords = self.passwords.snapshot();
-        let promoted_sources = outcome
-            .promoted_sources
-            .iter()
-            .map(|source| (key(source.path()), source))
-            .collect::<HashMap<_, _>>();
         let mut retry = Vec::new();
         let mut published = HashSet::new();
         for archive in outcome
@@ -2394,7 +2973,7 @@ impl Scheduler {
                 continue;
             };
             let id = key(&archive.path);
-            let Some(candidate) = completed.promoted.remove(&id) else {
+            let Some(candidate) = completed.promoted.remove(&id).flatten() else {
                 continue;
             };
             if self.active_paths.contains_key(&id) {
@@ -2434,14 +3013,16 @@ impl Scheduler {
                 self.journal.state().entry(&candidate.path).as_deref(),
                 &active.passwords,
                 Some(&group),
+                active.recovery.as_deref(),
             );
-            let directory = archive.path.parent().unwrap_or(Path::new(""));
+            let directory = active.recovery.as_ref().map_or_else(
+                || archive.path.parent().unwrap_or(Path::new("")),
+                |recovery| recovery.password_dir(&archive.path),
+            );
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
             if let Some((_, scope)) = self.roots.get(&active.root) {
                 payload.insert("source_input_root".into(), json!(scope.root));
             }
-            payload.insert("promoted_nested_input".into(), Value::Bool(true));
-            record_promoted_sources(payload, &candidate.path, Some(&group), &promoted_sources);
             let password_updated = payload
                 .get("password_signature")
                 .and_then(Value::as_str)
@@ -2548,18 +3129,24 @@ impl Scheduler {
                         self.journal.state().entry(&candidate.path).as_deref(),
                         &active.passwords,
                         group.map(Arc::as_ref),
+                        active.recovery.as_deref(),
                     );
-                    record_promoted_sources(
-                        &mut Arc::make_mut(&mut entry).failure_payload,
-                        &candidate.path,
-                        group.map(Arc::as_ref),
-                        &promoted_sources,
-                    );
+                    if active.recovery.is_some() {
+                        if let Some((root, _)) = self.roots.get(&active.root) {
+                            Arc::make_mut(&mut entry)
+                                .failure_payload
+                                .insert("source_input_root".into(), json!(root.path));
+                        }
+                    }
                     entry
                 })
             };
             if let Some(record) = &record {
-                let directory = Path::new(&candidate.path).parent().unwrap_or(Path::new(""));
+                let path = Path::new(&candidate.path);
+                let directory = active.recovery.as_ref().map_or_else(
+                    || path.parent().unwrap_or(Path::new("")),
+                    |recovery| recovery.password_dir(path),
+                );
                 if record
                     .failure_payload
                     .get("password_signature")
@@ -2594,10 +3181,26 @@ impl Scheduler {
                 record.filter(|entry| entry.status != "failed_terminal"),
             ));
         }
-        self.journal.commit(true, |_| Ok(operations))?;
+        self.journal.commit(true, |state| {
+            for archive in outcome
+                .archives
+                .iter()
+                .filter(|archive| archive.failure.is_none())
+            {
+                for path in &archive.source_paths {
+                    let path = path.to_string_lossy();
+                    if state.promoted_source(&path).is_some()
+                        && NativePresence::at(&path).is_absent()
+                    {
+                        operations.retire_promoted(watch_path_key(&path));
+                    }
+                }
+            }
+            Ok(operations)
+        })?;
         self.release_display_claims(batch, &groups);
         for path in retry {
-            self.enqueue(&active.root, path, true)?;
+            self.enqueue_with_recovery(&active.root, path, true, active.recovery.clone())?;
         }
         self.persist_candidates(BTreeMap::new(), false)?;
         self.arm_idle_cleanup();
@@ -2623,32 +3226,6 @@ impl Scheduler {
     }
 }
 
-fn record_promoted_sources(
-    payload: &mut serde_json::Map<String, Value>,
-    path: &str,
-    group: Option<&SourceGroup>,
-    receipts: &HashMap<String, &PromotedSource>,
-) {
-    if receipts.is_empty() {
-        return;
-    }
-    let sources = match group {
-        Some(group) => group
-            .members
-            .iter()
-            .filter_map(|path| receipts.get(&watch_path_key(path)).copied())
-            .collect::<Vec<_>>(),
-        None => receipts
-            .get(&watch_path_key(path))
-            .copied()
-            .into_iter()
-            .collect(),
-    };
-    if !sources.is_empty() {
-        payload.insert("promoted_sources".into(), json!(sources));
-    }
-}
-
 fn make_entry(
     candidate: &WatchCandidateRow,
     error: &str,
@@ -2656,6 +3233,7 @@ fn make_entry(
     previous: Option<&crate::watch_store::EntryRecord>,
     passwords: &crate::core::passwords::PasswordSnapshot,
     group: Option<&SourceGroup>,
+    recovery: Option<&Recovery>,
 ) -> Arc<crate::watch_store::EntryRecord> {
     let (status, blockers) = match kind {
         Some(
@@ -2670,8 +3248,16 @@ fn make_entry(
     if let Some(group) = group {
         payload["source_group"] = json!(group);
     }
+    if let Some(recovery) = recovery {
+        payload["discovery_scope"] = Value::Object(scope_record(&recovery.scope));
+        payload["password_scope_dir"] = json!(recovery.password_scope);
+    }
     if status == "failed_password" {
-        let dir = Path::new(&candidate.path).parent().unwrap_or(Path::new(""));
+        let path = Path::new(&candidate.path);
+        let dir = recovery.map_or_else(
+            || path.parent().unwrap_or(Path::new("")),
+            |recovery| recovery.password_dir(path),
+        );
         payload["password_scope_dir"] = json!(dir);
         payload["password_signature"] = json!(passwords.scope_signature(dir));
     }
@@ -2726,13 +3312,20 @@ struct WatchObserver {
     owners: HashMap<String, String>,
     scope: NativeDiscoveryScope,
     outputs: Mutex<BTreeMap<String, String>>,
-    batch: String,
+    batch: Arc<str>,
     toast: Option<super::toast::Publisher>,
+    toast_progress: Mutex<ToastProgress>,
     language: crate::core::i18n::Language,
     began: Instant,
     hub: Arc<Hub>,
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
-    promoted: Mutex<HashMap<String, WatchCandidateRow>>,
+    promoted: Mutex<HashMap<String, Option<WatchCandidateRow>>>,
+}
+
+#[derive(Default)]
+struct ToastProgress {
+    latest: Option<(PathBuf, u64, u64)>,
+    waiting: HashMap<PathBuf, ResourceWait>,
 }
 
 impl WatchObserver {
@@ -2774,6 +3367,13 @@ impl WatchObserver {
 }
 
 impl Observer for WatchObserver {
+    fn promoted_source(&self, path: &str) -> Option<PromotedSource> {
+        self.journal
+            .state()
+            .promoted_source(path)
+            .map(|receipt| (*receipt).clone())
+    }
+
     fn should_process_sources(
         &self,
         _path: &Path,
@@ -2854,9 +3454,12 @@ impl Observer for WatchObserver {
                 .promotion_operation(&owner, destinations, sources)
                 .ok_or_else(|| io::Error::other("Promoted input owner was retired"))
         })?;
+        let mut promoted = self.promoted.lock().unwrap();
         let mut claims = self.hub.claims.lock().unwrap();
         for (_, target) in moves {
-            claims.insert(key(target), self.batch.clone());
+            let id = key(target);
+            promoted.entry(id.clone()).or_insert(None);
+            claims.insert(id, Arc::clone(&self.batch));
         }
         Ok(())
     }
@@ -2866,10 +3469,20 @@ impl Observer for WatchObserver {
         archive: &ArchiveResult,
         moves: &[(PathBuf, PathBuf)],
         success: bool,
+        receipts: &[PromotedSource],
     ) -> io::Result<()> {
         let Some(owner) = self.owner(archive) else {
             return Ok(());
         };
+        if !receipts.is_empty() {
+            // Publish before releasing destination leases. Another request
+            // can adopt the newly visible family before this batch completes.
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            for receipt in receipts {
+                operations.put_promoted(receipt.clone());
+            }
+            self.journal.commit(true, |_| Ok(operations))?;
+        }
         for (_, target) in moves {
             let id = key(target);
             self.outputs
@@ -2878,7 +3491,7 @@ impl Observer for WatchObserver {
                 .insert(id.clone(), owner.clone());
             if success {
                 if let Ok(Some(candidate)) = watch_candidate_for_path(target, None) {
-                    self.promoted.lock().unwrap().insert(id, candidate);
+                    self.promoted.lock().unwrap().insert(id, Some(candidate));
                 }
             }
         }
@@ -2923,7 +3536,7 @@ impl Observer for WatchObserver {
             for member in &group.members {
                 let key = watch_path_key(member);
                 aliases.insert(key.clone(), Arc::clone(&group));
-                claims.insert(key, self.batch.clone());
+                claims.insert(key, Arc::clone(&self.batch));
             }
         }
         self.journal.log(
@@ -2934,23 +3547,61 @@ impl Observer for WatchObserver {
     }
 
     fn notify(&self, event: Event) {
+        let Some(toast) = &self.toast else {
+            return;
+        };
+        let mut progress = self.toast_progress.lock().unwrap();
         match event {
             Event::Progress {
                 path,
                 completed_bytes,
                 total_bytes,
             } => {
-                if let Some(toast) = &self.toast {
-                    toast.publish(super::toast::Snapshot::progress(
-                        &self.batch,
-                        self.language,
-                        path,
-                        completed_bytes,
-                        total_bytes,
-                    ));
+                progress.latest = Some((path, completed_bytes, total_bytes));
+                if !progress.waiting.is_empty() {
+                    return;
                 }
             }
-            _ => {}
+            Event::ResourceWait { path, state } => {
+                if state.disk || state.memory {
+                    progress.waiting.insert(path, state);
+                } else {
+                    progress.waiting.remove(&path);
+                    if progress.latest.is_none() {
+                        progress.latest = Some((path, 0, 0));
+                    }
+                }
+            }
+            Event::Finished { path, .. } => {
+                if progress.waiting.remove(&path).is_none() {
+                    return;
+                }
+            }
+            _ => return,
+        }
+        if let Some((path, _)) = progress.waiting.iter().next() {
+            let state = progress
+                .waiting
+                .values()
+                .fold(ResourceWait::default(), |left, right| ResourceWait {
+                    disk: left.disk || right.disk,
+                    memory: left.memory || right.memory,
+                    volume_error: left.volume_error.or(right.volume_error),
+                });
+            toast.publish(super::toast::Snapshot::resource_wait(
+                &self.batch,
+                self.language,
+                path,
+                state,
+            ));
+        } else if let Some((path, completed, total)) = &progress.latest {
+            toast.publish(super::toast::Snapshot::progress(
+                &self.batch,
+                self.language,
+                path.clone(),
+                *completed,
+                *total,
+            ));
         }
     }
 
@@ -2980,7 +3631,11 @@ impl Observer for WatchObserver {
 
     fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path) -> io::Result<()> {
         let owner = self.owner_for_path(root).unwrap_or_default();
-        prepare_flatten(&self.journal, &owner, root, work, leaf)
+        prepare_flatten(&self.journal, &owner, root, work, leaf)?;
+        if !owner.is_empty() {
+            self.outputs.lock().unwrap().insert(key(work), owner);
+        }
+        Ok(())
     }
 
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
@@ -3068,9 +3723,13 @@ fn prepare_flatten(
 ) -> io::Result<()> {
     let old = output_identity(&root.to_string_lossy())?;
     let new = output_identity(&leaf.to_string_lossy())?;
+    let wrapper = (!owner.is_empty())
+        .then(|| crate::io::reader::capture_directory_identity(root))
+        .transpose()?;
     let mut operations = vec![
         json!({"op":"runtime","key":format!("flatten|{}",key(root)),
-            "value":{"owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,"new_identity":new}}),
+            "value":{"owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,"new_identity":new,
+                "checkpoint_wrapper_identity":wrapper}}),
         json!({"op":"runtime","key":format!("owned|{}",key(root)),
             "value":{"path":root,"identities":[old,new]}}),
         json!({"op":"runtime","key":format!("owned|{}",key(work)),
@@ -3087,41 +3746,105 @@ fn finish_flatten(journal: &journal::Journal, root: &str) -> io::Result<()> {
     let Some(record) = journal.state().runtime_record(&record_key) else {
         return Ok(());
     };
-    let Some(work) = record["work"].as_str() else {
+    let (Some(work), Some(leaf)) = (record["work"].as_str(), record["leaf"].as_str()) else {
         return Ok(());
     };
     let current = output_identity(root)?;
-    if Path::new(work).exists()
-        || ![
-            record["new_identity"].as_str(),
-            record["old_identity"].as_str(),
-        ]
-        .contains(&Some(current.as_str()))
-    {
+    let work_exists = Path::new(work).try_exists()?;
+    let published = record["new_identity"].as_str() == Some(&current);
+    if !published && (work_exists || record["old_identity"].as_str() != Some(&current)) {
+        return Ok(());
+    }
+    let already_rebased = record["outputs_rebased"].as_bool() == Some(true);
+    if work_exists && already_rebased {
         return Ok(());
     }
     let mut operations = vec![
         json!({"op":"runtime","key":format!("owned|{}",watch_path_key(root)),
-            "value":{"path":root,"identities":[current]}}),
-        json!({"op":"runtime","key":record_key}),
-        json!({"op":"runtime","key":format!("owned|{}",watch_path_key(work))}),
+        "value":{"path":root,"identities":[current]}}),
     ];
-    if record["new_identity"].as_str() == Some(&current) {
-        if let Some(owner) = record["owner"].as_str().filter(|owner| !owner.is_empty()) {
-            for source in [Some(work), record["leaf"].as_str()].into_iter().flatten() {
-                operations.push(json!({"op":"relocate_output","owner":owner,"source":source,
-                    "destination":root,"identity":current}));
-            }
+    if !work_exists {
+        operations.extend([
+            json!({"op":"runtime","key":record_key}),
+            json!({"op":"runtime","key":format!("owned|{}",watch_path_key(work))}),
+        ]);
+    } else {
+        let mut next = record.clone();
+        next["outputs_rebased"] = Value::Bool(true);
+        operations.push(json!({"op":"runtime","key":record_key,"value":next}));
+    }
+    let owner = record["owner"]
+        .as_str()
+        .filter(|owner| published && !already_rebased && !owner.is_empty());
+    if let Some(owner) = owner {
+        for source in [work, leaf] {
+            operations.push(json!({"op":"relocate_output","owner":owner,"source":source,
+                "destination":root,"identity":current}));
         }
     }
-    journal.commit(true, |state| state.decode_operations(&operations))
+    journal.commit(true, |state| {
+        use crate::watch_store::NativeWatchOperations;
+        let mut operations = state.decode_operations(&operations)?;
+        if let Some(owner) = owner {
+            let mut checkpoints = input_checkpoints(state, owner).peekable();
+            if checkpoints.peek().is_some() {
+                let root = Path::new(root);
+                let identity = crate::io::reader::capture_directory_identity(root)?;
+                let wrapper =
+                    serde_json::from_value(record["checkpoint_wrapper_identity"].clone()).ok();
+                let mut moved = Vec::new();
+                for checkpoint in checkpoints {
+                    let mut checkpoint = checkpoint?;
+                    let before = checkpoint.output().to_string_lossy().into_owned();
+                    if checkpoint.rebase_flatten(
+                        root,
+                        Path::new(work),
+                        Path::new(leaf),
+                        wrapper.as_ref(),
+                        &identity,
+                    ) {
+                        let after = checkpoint.output().to_string_lossy();
+                        if watch_path_key(&before) != watch_path_key(&after) {
+                            operations
+                                .extend(NativeWatchOperations::checkpoint(owner, &before, None));
+                        }
+                        moved.push(NativeWatchOperations::checkpoint(
+                            owner,
+                            &after,
+                            Some(serde_json::to_value(&checkpoint)?),
+                        ));
+                    }
+                }
+                // Retire old aliases before publishing any new receipt keys.
+                for checkpoint in moved {
+                    operations.extend(checkpoint);
+                }
+            }
+        }
+        Ok(operations)
+    })
 }
 
-fn recover_flattens(journal: &journal::Journal) -> io::Result<()> {
+fn input_checkpoints<'a>(
+    state: &'a crate::watch_store::NativeWatchState,
+    owner: &str,
+) -> impl Iterator<Item = io::Result<crate::pipeline::InputCheckpoint>> + 'a {
+    let prefix = format!("checkpoint|{}\0", watch_path_key(owner));
+    state
+        .runtime_keys(&prefix)
+        .into_iter()
+        .filter_map(|key| state.runtime_record(&key))
+        .map(|record| serde_json::from_value(record).map_err(io::Error::other))
+}
+
+fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool) -> io::Result<()> {
     for id in journal.state().runtime_keys("flatten|") {
         let Some(record) = journal.state().runtime_record(&id) else {
             continue;
         };
+        if !eligible(record["owner"].as_str().unwrap_or_default()) {
+            continue;
+        }
         let (Some(root), Some(work), Some(leaf), Some(old), Some(new)) = (
             record["root"].as_str(),
             record["work"].as_str(),
@@ -3157,13 +3880,13 @@ fn recover_flattens(journal: &journal::Journal) -> io::Result<()> {
                 continue;
             }
         }
-        let result = crate::postprocess::flatten_single_branch_directories(
+        crate::postprocess::flatten_single_branch_directories(
             Path::new(root),
             Some(Path::new(work)),
             |_, _, _| Ok(()),
             Some(Path::new(leaf)),
         );
-        if result.errors.is_empty() {
+        if identity_if_present(root).is_ok_and(|identity| identity.as_deref() == Some(new)) {
             finish_flatten(journal, root)?;
         }
     }
@@ -3175,5 +3898,126 @@ fn identity_if_present(path: &str) -> io::Result<Option<String>> {
         Ok(identity) => Ok(Some(identity)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::reader::{capture_directory_identity, capture_file_generation};
+    use crate::watch_store::{NativeWatchOperations, PendingObservation};
+
+    #[test]
+    fn flatten_recovery_rebases_durable_parent_and_nested_receipts() {
+        let owner_file = crate::test_support::temp_file("flatten_watch_owner", b"outer archive");
+        let directory = owner_file.with_extension("state");
+        let root = directory.join("output");
+        let work = directory.join("work");
+        let leaf = root.join("wrapper").join("inner");
+        let work_leaf = work.join("wrapper").join("inner");
+        let nested = work_leaf.join("nested.zip");
+        let nested_output = work_leaf.join("nested");
+        let owner = owner_file.to_str().unwrap();
+        let root_text = root.to_str().unwrap();
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(leaf.join("nested.zip"), b"inner archive").unwrap();
+        fs::create_dir(leaf.join("nested")).unwrap();
+        fs::write(leaf.join("nested/payload"), b"extracted").unwrap();
+
+        {
+            let journal = journal::Journal::open(&directory).unwrap();
+            journal
+                .commit(true, |state| {
+                    let (operations, _) = state.pending_operations(
+                        [(
+                            PendingObservation(owner.to_owned(), 13, 1.0, String::new(), 0),
+                            String::new(),
+                            None,
+                        )],
+                        false,
+                        "",
+                        false,
+                        true,
+                        None,
+                    )?;
+                    Ok(operations)
+                })
+                .unwrap();
+            journal
+                .commit(true, |state| {
+                    Ok(state
+                        .output_operation(
+                            owner,
+                            owner.to_owned(),
+                            root_text.to_owned(),
+                            None,
+                            Vec::new(),
+                        )?
+                        .unwrap())
+                })
+                .unwrap();
+            prepare_flatten(&journal, owner, &root, &work, &leaf).unwrap();
+            fs::rename(&root, &work).unwrap();
+            // Simulate a collision after the first rename. The task can finish
+            // with a committed output and durable receipts at the work path.
+            journal.commit(true, |state| {
+                let mut operations = state.output_operation(
+                    owner, owner.to_owned(), work.to_str().unwrap().to_owned(), Some(true), Vec::new(),
+                )?.unwrap();
+                for (source, output) in [(&owner_file, &work), (&nested, &nested_output)] {
+                    let value = json!({
+                        "schema_version":1,"carrier":source,
+                        "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
+                        "sources":[{"path":source,"generation":capture_file_generation(source)?.persisted()}],
+                        "output":{"path":output,"identity":capture_directory_identity(output)?},
+                        "container":{"path":work,"identity":capture_directory_identity(&work)?},
+                        "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",
+                        "children_complete":true,"remaining_depth":1,
+                    });
+                    operations.extend(NativeWatchOperations::checkpoint(
+                        owner, output.to_str().unwrap(), Some(value),
+                    ));
+                }
+                Ok(operations)
+            }).unwrap();
+            journal.flush().unwrap();
+        }
+
+        {
+            let journal = journal::Journal::open(&directory).unwrap();
+            recover_flattens(&journal, |_| true).unwrap();
+            assert_eq!(fs::read(root.join("nested/payload")).unwrap(), b"extracted");
+            assert!(!work.exists());
+            assert!(journal.state().runtime_keys("flatten|").is_empty());
+            let pending = journal.state().pending(owner).unwrap();
+            assert_eq!(
+                pending
+                    .committed_roots
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [root_text]
+            );
+            assert!(recovery_output_matches(journal.state(), &pending, root_text).unwrap());
+            let checkpoints = input_checkpoints(journal.state(), owner)
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(checkpoints.len(), 2);
+            assert!(checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.entry() == owner_file && checkpoint.output() == root));
+            assert!(checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.entry() == root.join("nested.zip")
+                    && checkpoint.output() == root.join("nested")));
+            let identity =
+                serde_json::to_value(capture_directory_identity(&root).unwrap()).unwrap();
+            for checkpoint in checkpoints {
+                let receipt = serde_json::to_value(checkpoint).unwrap();
+                assert_eq!(receipt["container"]["identity"], identity);
+            }
+        }
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(owner_file).unwrap();
     }
 }

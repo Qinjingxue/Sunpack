@@ -11,6 +11,7 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
 
 const CHECKPOINT_RECORDS: u64 = 8192;
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -23,10 +24,17 @@ struct Frontier {
     fault: Option<String>,
 }
 
+impl Frontier {
+    fn needs_checkpoint(&self) -> bool {
+        self.records >= CHECKPOINT_RECORDS || self.bytes >= CHECKPOINT_BYTES
+    }
+}
+
 pub(super) struct Journal {
     state: NativeWatchState,
     log: NativeEventLog,
     frontier: Mutex<Frontier>,
+    checkpoint: Mutex<Option<JoinHandle<io::Result<()>>>>,
     snapshot: PathBuf,
     stream_id: String,
     _stream: NativeJournalStream,
@@ -90,6 +98,7 @@ impl Journal {
             state,
             log,
             frontier: Mutex::new(frontier),
+            checkpoint: Mutex::default(),
             snapshot,
             stream_id,
             _stream: stream,
@@ -166,7 +175,13 @@ impl Journal {
         if frontier.segment == segment {
             frontier.bytes += ticket.bytes_written();
         }
-        ensure_healthy(&frontier)
+        ensure_healthy(&frontier)?;
+        let needs_checkpoint = frontier.needs_checkpoint();
+        drop(frontier);
+        if needs_checkpoint {
+            self.compact()?;
+        }
+        Ok(())
     }
 
     pub(super) fn flush(&self) -> io::Result<()> {
@@ -176,21 +191,30 @@ impl Journal {
             watch_journal_request_flush(self.stream_id.clone(), frontier.seq)?
         };
         ticket.wait()?;
+        self.wait_for_checkpoint()?;
+        self.compact()?;
+        self.wait_for_checkpoint()?;
         self.log.flush()
     }
 
     pub(super) fn compact(&self) -> io::Result<()> {
-        let dir = self.snapshot.parent().unwrap();
+        let mut active = self.checkpoint.lock().unwrap();
+        if active.as_ref().is_some_and(|job| !job.is_finished()) {
+            return Ok(());
+        }
+        join_checkpoint(active.take())?;
         let (checkpoint, seal, segment) = {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
-            if frontier.records < CHECKPOINT_RECORDS && frontier.bytes < CHECKPOINT_BYTES {
+            if !frontier.needs_checkpoint() {
                 return Ok(());
             }
             let segment = frontier.segment;
             let seal = watch_journal_submit_seal(
                 self.stream_id.clone(),
-                segment_path(dir, segment).to_string_lossy().into_owned(),
+                segment_path(self.snapshot.parent().unwrap(), segment)
+                    .to_string_lossy()
+                    .into_owned(),
                 segment,
                 frontier.seq,
             )?;
@@ -200,19 +224,52 @@ impl Journal {
             frontier.bytes = 0;
             (checkpoint, seal, segment)
         };
-        seal.wait()?;
-        let temp = dir.join("state.snapshot.tmp");
-        drop(File::create(&temp)?);
-        checkpoint.write(temp.to_string_lossy().into_owned())?;
-        crate::io::atomic_file::replace(&temp, &self.snapshot)?;
-        for (_, path) in segments(dir)?
-            .into_iter()
-            .take_while(|(start, _)| *start <= segment)
-        {
-            let _ = fs::remove_file(path);
-        }
+        let snapshot = self.snapshot.clone();
+        // The append stream already seals the captured prefix in sequence.
+        // Leave serialization and disk I/O off the Watch and extraction paths.
+        *active = Some(
+            thread::Builder::new()
+                .name("sunpack-watch-checkpoint".into())
+                .stack_size(512 * 1024)
+                .spawn(move || {
+                    seal.wait()?;
+                    let dir = snapshot.parent().unwrap();
+                    let temp = dir.join("state.snapshot.tmp");
+                    drop(File::create(&temp)?);
+                    checkpoint.write(temp.to_string_lossy().into_owned())?;
+                    crate::io::atomic_file::replace(&temp, &snapshot)?;
+                    for (_, path) in segments(dir)?
+                        .into_iter()
+                        .take_while(|(start, _)| *start <= segment)
+                    {
+                        let _ = fs::remove_file(path);
+                    }
+                    Ok(())
+                })?,
+        );
         Ok(())
     }
+
+    fn wait_for_checkpoint(&self) -> io::Result<()> {
+        let mut active = self.checkpoint.lock().unwrap();
+        join_checkpoint(active.take())
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        if let Ok(active) = self.checkpoint.get_mut() {
+            let _ = join_checkpoint(active.take());
+        }
+    }
+}
+
+fn join_checkpoint(active: Option<JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    if let Some(job) = active {
+        job.join()
+            .map_err(|_| io::Error::other("Watch checkpoint thread failed"))??;
+    }
+    Ok(())
 }
 
 fn ensure_healthy(frontier: &Frontier) -> io::Result<()> {
@@ -245,4 +302,56 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     }
     paths.sort_unstable_by_key(|(start, _)| *start);
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_replays_append_after_the_sealed_prefix() {
+        let marker = crate::test_support::temp_file("active_watch_checkpoint", b"");
+        let dir = marker.with_extension("state");
+        {
+            let journal = Journal::open(&dir).unwrap();
+            // Position just below the threshold without doing thousands of
+            // unrelated writes. Every subsequent record uses the real writer.
+            journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS - 2;
+            for generation in 1..=3 {
+                journal
+                    .commit(true, |_| {
+                        let mut operations = NativeWatchOperations::password_generation(
+                            generation,
+                            generation.to_string(),
+                        );
+                        if generation == 1 {
+                            operations.put_promoted(serde_json::from_value(serde_json::json!({
+                                "path": marker,
+                                "generation": crate::io::reader::capture_file_generation(&marker)?.persisted(),
+                            }))?);
+                        }
+                        Ok(operations)
+                    })
+                    .unwrap();
+            }
+            journal.flush().unwrap();
+        }
+        let segments = segments(&dir).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].0, 3);
+        {
+            let journal = Journal::open(&dir).unwrap();
+            assert_eq!(journal.state().password_generation(), 3);
+            let receipt = journal
+                .state()
+                .promoted_source(marker.to_str().unwrap())
+                .unwrap();
+            assert_eq!(receipt.path(), marker);
+            assert!(!receipt.is_replaced());
+            fs::write(&marker, b"replacement data").unwrap();
+            assert!(receipt.is_replaced());
+        }
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
 }

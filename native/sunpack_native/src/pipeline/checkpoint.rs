@@ -1,7 +1,7 @@
 //! Durable receipts hold physical layouts and counters, never archive file
 //! tables, analysis caches, password lists, or native reader handles.
 
-use super::{ArchiveResult, DiscoverySource};
+use super::{ArchiveResult, DiscoverySource, Failure, FailureKind};
 use crate::io::archive_state::{ArchiveInput, InputExtent, InputPart, OpenMode};
 use crate::io::reader::{
     capture_directory_identity, capture_file_generation, DirectoryIdentity,
@@ -31,6 +31,14 @@ pub struct InputCheckpoint {
     discovery_source: DiscoverySource,
     children_complete: bool,
     remaining_depth: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial: Option<PartialReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PartialReceipt {
+    failure: Failure,
+    complete_files: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +74,10 @@ impl PromotedSource {
 
     pub(super) fn matches(&self, generation: &PhysicalFileGeneration) -> bool {
         generation.persisted() == self.0.generation
+    }
+
+    pub(crate) fn is_replaced(&self) -> bool {
+        capture_file_generation(self.path()).is_ok_and(|generation| !self.matches(&generation))
     }
 }
 
@@ -124,7 +136,7 @@ impl InputCheckpoint {
         children_complete: bool,
         remaining_depth: usize,
     ) -> io::Result<Option<Self>> {
-        if result.failure.is_some() || result.partial || input.volume_attempts.is_some() {
+        if input.volume_attempts.is_some() || (result.failure.is_some() && !result.partial) {
             return Ok(None);
         }
         let Some(output) = result.output.as_deref() else {
@@ -162,6 +174,10 @@ impl InputCheckpoint {
             discovery_source: result.discovery_source,
             children_complete,
             remaining_depth,
+            partial: result.failure.as_ref().map(|failure| PartialReceipt {
+                failure: failure.clone(),
+                complete_files: result.recovered_complete_files,
+            }),
         }))
     }
 
@@ -197,32 +213,61 @@ impl InputCheckpoint {
         input.volume_attempts = None;
     }
 
-    pub(super) fn relocate(&mut self, source: &Path, destination: &Path) {
-        fn mapped(path: &mut PathBuf, source: &Path, destination: &Path) {
+    pub(super) fn relocate(&mut self, source: &Path, destination: &Path) -> bool {
+        let mut changed = false;
+        let mut mapped = |path: &mut PathBuf| {
             if let Ok(relative) = path.strip_prefix(source) {
                 *path = destination.join(relative);
+                changed = true;
             }
-        }
-        fn extent(extent: &mut InputExtent, source: &Path, destination: &Path) {
-            let mut path = PathBuf::from(&extent.path);
-            mapped(&mut path, source, destination);
-            extent.path = path.to_string_lossy().into_owned();
-        }
-        mapped(&mut self.carrier, source, destination);
-        mapped(&mut self.input.entry, source, destination);
-        mapped(&mut self.output.path, source, destination);
+        };
+        mapped(&mut self.carrier);
+        mapped(&mut self.input.entry);
+        mapped(&mut self.output.path);
         if let Some(container) = &mut self.container {
-            mapped(&mut container.path, source, destination);
-        }
-        for part in &mut self.input.parts {
-            extent(&mut part.extent, source, destination);
-        }
-        for range in &mut self.input.ranges {
-            extent(range, source, destination);
+            mapped(&mut container.path);
         }
         for generation in &mut self.sources {
-            mapped(&mut generation.path, source, destination);
+            mapped(&mut generation.path);
         }
+        for extent in self
+            .input
+            .parts
+            .iter_mut()
+            .map(|part| &mut part.extent)
+            .chain(&mut self.input.ranges)
+        {
+            if let Ok(relative) = Path::new(&extent.path).strip_prefix(source) {
+                extent.path = destination.join(relative).to_string_lossy().into_owned();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Flatten first moves the wrapper to work, then publishes the inner leaf.
+    /// The wrapper itself is the only directory whose identity changes.
+    pub(crate) fn rebase_flatten(
+        &mut self,
+        root: &Path,
+        work: &Path,
+        leaf: &Path,
+        wrapper: Option<&DirectoryIdentity>,
+        published: &DirectoryIdentity,
+    ) -> bool {
+        let mut changed = self.relocate(work, root);
+        // Live publication can already have written a receipt at its new path.
+        // An inner subtree may happen to have the old leaf's name as well.
+        if changed || !self.output.path.starts_with(leaf) || !self.output.valid() {
+            changed |= self.relocate(leaf, root);
+        }
+        for directory in std::iter::once(&mut self.output).chain(self.container.iter_mut()) {
+            if directory.path == root && wrapper == Some(&directory.identity) {
+                directory.identity = published.clone();
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub(super) fn promoted(&mut self, moves: &[(PathBuf, PathBuf)]) -> io::Result<()> {
@@ -236,6 +281,7 @@ impl InputCheckpoint {
     }
 
     pub(super) fn result(&self, depth: usize) -> ArchiveResult {
+        let failure = self.partial.as_ref().map(|receipt| receipt.failure.clone());
         let extent = self
             .input
             .parts
@@ -246,14 +292,23 @@ impl InputCheckpoint {
             path: self.input.entry.clone(),
             format: self.input.format.clone(),
             output: Some(self.output.path.clone()),
-            failure: None,
+            volume_completeness: self.input.mode.structured().then(|| {
+                if failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
+                {
+                    "missing".to_owned()
+                } else {
+                    "complete".to_owned()
+                }
+            }),
+            failure,
             files: self.files,
             bytes: self.bytes,
             encrypted: self.encrypted,
             depth,
             offset: extent.map_or(0, |extent| extent.start),
             end_offset: extent.and_then(|extent| extent.end),
-            volume_completeness: self.input.mode.structured().then(|| "complete".to_owned()),
             volume_attempts: None,
             source_paths: self
                 .sources
@@ -263,9 +318,12 @@ impl InputCheckpoint {
             password: None,
             discovery_source: self.discovery_source,
             damage_flags: None,
-            partial: false,
+            partial: self.partial.is_some(),
             retained: true,
-            recovered_complete_files: 0,
+            recovered_complete_files: self
+                .partial
+                .as_ref()
+                .map_or(0, |receipt| receipt.complete_files),
             promoted: false,
             promotion_original_path: None,
         }

@@ -187,6 +187,7 @@ pub(super) static MESSAGES: &[(&str, &str, &str)] = &[
     ("failure.user_interrupted", "User interrupted", "用户中断"),
     ("failure.warning_busy_or_partial", "Warning (file is busy or partially failed)", "警告 (文件被占用或部分失败)"),
     ("failure.worker_process_failed", "7z worker failure ({kind}): {message}", "7z 工作进程故障（{kind}）：{message}"),
+    ("filesystem_scan.embedded_scan", "Cannot scan for embedded archives: {path} ({error})", "无法扫描内嵌压缩包：{path}（{error}）"),
     ("filesystem_scan.metadata", "Cannot read file or directory information: {path} ({error})", "无法读取文件或目录信息：{path}（{error}）"),
     ("filesystem_scan.omitted", "Additional filesystem scan errors in {path}: {error}", "{path} 中另有 {error} 项文件系统扫描错误"),
     ("filesystem_scan.output_scan", "Output scan incomplete: {path} ({error} unreadable entries)", "输出扫描不完整：{path}（{error} 个条目无法读取）"),

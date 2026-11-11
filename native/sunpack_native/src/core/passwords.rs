@@ -1,7 +1,11 @@
 use super::resources::{self, FileMutex};
 use crate::{
     fast_hash_core::{xxh64, Hash128},
-    io::{atomic_file, resource_lifecycle::TrackedFile},
+    io::{
+        atomic_file,
+        reader::{physical_file_generation, PhysicalFileGeneration},
+        resource_lifecycle::TrackedFile,
+    },
     path_keys::path_key,
 };
 use serde::{
@@ -300,6 +304,7 @@ fn read_text(path: &Path) -> io::Result<String> {
 
 #[derive(Default)]
 struct StoreState {
+    generation: Option<PhysicalFileGeneration>,
     observed: Option<[u64; 2]>,
     snapshot: Arc<PasswordSnapshot>,
 }
@@ -319,10 +324,6 @@ impl BuiltinStore {
             .and_then(Weak::upgrade)
             .filter(|store| store.path == path);
         if let Some(store) = existing {
-            drop(source);
-            if let Err(error) = store.reload() {
-                eprintln!("Cannot load password JSON; keeping the last valid snapshot: {error}");
-            }
             return Ok(store);
         }
         let store = Arc::new(Self::open(cwd)?);
@@ -364,23 +365,46 @@ impl BuiltinStore {
     }
 
     pub fn reload(&self) -> io::Result<Arc<PasswordSnapshot>> {
+        // File change notifications can observe writes with identical metadata.
+        self.read_snapshot(true)
+    }
+
+    pub(crate) fn snapshot_for_request(&self) -> Arc<PasswordSnapshot> {
+        self.read_snapshot(false).unwrap_or_else(|error| {
+            eprintln!("Cannot load password JSON; keeping the last valid snapshot: {error}");
+            self.snapshot()
+        })
+    }
+
+    fn read_snapshot(&self, force: bool) -> io::Result<Arc<PasswordSnapshot>> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let text = match read_text(&self.path) {
-            Ok(text) => text,
+        let mut file = match TrackedFile::open_reader(&self.path, "builtin_passwords") {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                *state = StoreState::default();
+                if state.observed.is_some() {
+                    *state = StoreState::default();
+                }
                 return Ok(state.snapshot.clone());
             }
             Err(error) => return Err(error),
         };
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-        let observed = [xxh64(text.as_bytes(), 0), xxh64(text.as_bytes(), 1)];
+        let generation = physical_file_generation(&file).ok();
+        if !force && generation.is_some() && generation == state.generation {
+            return Ok(state.snapshot.clone());
+        }
+        let mut text = Vec::new();
+        file.read_to_end(&mut text)?;
+        drop(file);
+        state.generation = generation;
+        let observed = [xxh64(&text, 0), xxh64(&text, 1)];
         if state.observed == Some(observed) {
             return Ok(state.snapshot.clone());
         }
-        // Event notifications can arrive for writes with identical metadata.
-        // Fingerprint the actual bytes and remember invalid generations too.
+        // Cache invalid documents too so that only another edit needs parsing.
         state.observed = Some(observed);
+        let text = std::str::from_utf8(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         let document = Document::parse(text)?;
         let mut index = IndexBuilder::default();
         document.read_passwords(Some(&mut index))?;

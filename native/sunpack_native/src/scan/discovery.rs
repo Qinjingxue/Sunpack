@@ -84,32 +84,45 @@ pub(crate) struct NativeCandidateTable {
     relation_sources: Vec<NativeDirectorySnapshot>,
 }
 
-struct FileTargets {
+pub(crate) struct FileTargets {
     names_by_path: HashMap<String, String>,
+    directories: HashSet<String>,
 }
 
 impl FileTargets {
-    fn new(targets: Vec<(String, String)>) -> Self {
+    pub(crate) fn new(targets: Vec<(String, String)>, directories: Vec<String>) -> Self {
         Self {
             names_by_path: targets
                 .into_iter()
                 .map(|(path, name)| (path_key(&path), case_key(&name)))
                 .collect(),
+            directories: directories.into_iter().collect(),
         }
     }
 
+    fn in_directory(&self, key: &str) -> bool {
+        !self.directories.is_empty()
+            && crate::path_keys::path_ancestors(key).any(|parent| self.directories.contains(parent))
+    }
+
     fn select(&self, snapshot: &NativeDirectorySnapshot) -> Option<NativeDirectorySnapshot> {
+        let mut exact = 0;
         let rows: Vec<_> = snapshot
             .rows
             .iter()
             .copied()
             .filter(|&row| {
-                self.names_by_path
-                    .contains_key(&path_key(&snapshot.table.paths[row]))
+                let key = path_key(&snapshot.table.paths[row]);
+                if self.names_by_path.contains_key(&key) {
+                    exact += 1;
+                    true
+                } else {
+                    self.in_directory(&key)
+                }
             })
             .collect();
         // Preserve logical-name recovery for targets excluded from the view.
-        (rows.len() == self.names_by_path.len()).then(|| snapshot.view(rows))
+        (exact == self.names_by_path.len()).then(|| snapshot.view(rows))
     }
 
     fn retain(&self, rows: &mut Vec<Candidate>) {
@@ -122,7 +135,7 @@ impl FileTargets {
                     physical_matches.insert(key);
                     true
                 } else {
-                    false
+                    self.in_directory(&key)
                 }
             };
             let contains = match row {
@@ -848,11 +861,11 @@ impl NativeCandidateTable {
 
         raw_snapshot: &NativeDirectorySnapshot,
         filtered_snapshot: &NativeDirectorySnapshot,
-        targets: Option<Vec<(String, String)>>,
+        targets: Option<FileTargets>,
     ) -> std::io::Result<()> {
         (|| {
             self.filesystem_routed = true;
-            self.targets = targets.map(FileTargets::new);
+            self.targets = targets;
             let selected = self
                 .targets
                 .as_ref()

@@ -273,6 +273,8 @@ impl NativeRelationGroup {
         };
         RelationProjection {
             input,
+            standalone: matches!(self, Self::Ordinary(..))
+                && anchor.is_some_and(|anchor| anchor.standalone),
             carrier_path: data.carrier_path.to_owned(),
             owned_paths: data
                 .parts()
@@ -393,6 +395,7 @@ impl NativeRelationGroup {
 
 pub(crate) struct RelationProjection {
     pub input: ArchiveInput,
+    pub standalone: bool,
     pub carrier_path: String,
     pub owned_paths: Vec<String>,
     pub failure_reason: Option<&'static str>,

@@ -10,16 +10,17 @@ use super::{
 use crate::analysis_native::{analyze_input, NativeAnalysisConfig};
 use crate::core::config::{CleanupMode, ContentRequirement, ProcessMode, Recursion, WorkerConfig};
 use crate::io::archive_state::{
-    archive_input_slices, ArchiveInput, VolumeCompleteness, VolumeSelection,
+    archive_input_slices, ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
 };
+use crate::io::directory_errors::{directory_error_count, DirectoryReadErrors};
 use crate::io::reader::{
     capture_directory_identity, capture_file_generation, release_reader_resources_under_roots,
-    NativeArchiveSession, PhysicalFileGeneration,
+    PhysicalFileGeneration,
 };
 use crate::io::resource_lifecycle::{
     native_begin_promotion, native_end_promotion, native_wait_for_resources,
 };
-use crate::path_keys::path_key;
+use crate::path_keys::{normalize_windows_extended_prefix, path_key};
 use crate::postprocess::{
     flatten_single_branch_directories, remove_owned_file, remove_owned_tree,
     NativeBlockedInputPromotion,
@@ -119,10 +120,12 @@ impl Engine {
         } else {
             None
         };
+        let resolve_aliases = request.inputs.len() > 1 && self.leases.has_aliases(request_id);
         let candidates = CandidateSet::new(
             std::mem::take(&mut request.passwords),
             request.password_snapshot.as_deref(),
             &self.password_attempts,
+            request.password_scope.as_deref(),
         );
         let options = discovery::scan_options(&request.config)?;
         let deep_options = request
@@ -162,6 +165,7 @@ impl Engine {
             engine: self,
             request: &request,
             request_id,
+            resolve_aliases,
             candidates,
             options,
             deep_options,
@@ -172,12 +176,32 @@ impl Engine {
             output_base,
             checkpoints,
             promoted_sources,
+            scan_errors: Mutex::new(DirectoryReadErrors::report()),
         };
-        request.cancel.run(|| {
+        let mut outcome = request.cancel.run(|| {
             request.cancel.check_io()?;
             let discovered = discovery::discover(&request, run.options_at(1), &run.candidates)?;
-            run.execute_batch(discovered, 1, None)
-        })
+            run.execute_batch(discovered, 1, None, None)
+        })?;
+        outcome.errors.extend(
+            run.scan_errors
+                .into_inner()
+                .unwrap()
+                .into_messages()
+                .into_iter()
+                .map(|error| {
+                    let count = directory_error_count(&error);
+                    let (operation, path, detail) = error;
+                    InputError {
+                        path: PathBuf::from(path),
+                        message: detail,
+                        kind: InputErrorKind::FilesystemScan,
+                        scan_operation: Some(operation),
+                        scan_count: (count != 1).then_some(count),
+                    }
+                }),
+        );
+        Ok(outcome)
     }
 
     fn worker(&self, config: &WorkerConfig) -> io::Result<Arc<Process>> {
@@ -217,6 +241,7 @@ struct Run<'a, O> {
     engine: &'a Engine,
     request: &'a Request,
     request_id: u64,
+    resolve_aliases: bool,
     candidates: CandidateSet<'a>,
     options: NativeDirectoryScanOptions,
     deep_options: Option<NativeDirectoryScanOptions>,
@@ -227,6 +252,7 @@ struct Run<'a, O> {
     output_base: Option<PathBuf>,
     checkpoints: HashMap<CheckpointKey, Vec<usize>>,
     promoted_sources: HashMap<String, &'a PromotedSource>,
+    scan_errors: Mutex<DirectoryReadErrors>,
 }
 
 struct Executed {
@@ -246,10 +272,14 @@ impl<O: Observer> Run<'_, O> {
 
     fn execute_batch(
         &self,
-        batch: Discovered,
+        mut batch: Discovered,
         depth: usize,
         inherited_scope: Option<&Path>,
+        parent_archive: Option<&ArchiveResult>,
     ) -> io::Result<Outcome> {
+        if depth == 1 && self.resolve_aliases {
+            dedup_resolved_plans(&mut batch.tasks);
+        }
         if depth == 1 && self.request.mode == Mode::Extract {
             self.engine.leases.extend_request(
                 self.request_id,
@@ -263,6 +293,7 @@ impl<O: Observer> Run<'_, O> {
         }
         let mut outcome = Outcome {
             errors: batch.errors,
+            scan_incomplete: self.record_scan_errors(batch.scan_errors),
             ..Outcome::default()
         };
         let executed: Vec<_> = batch
@@ -276,8 +307,12 @@ impl<O: Observer> Run<'_, O> {
             .collect();
         for branch in executed {
             let mut branch = branch?;
+            if let Some((parent, child)) = parent_archive.zip(branch.archives.first()) {
+                self.observer.archive_branch(parent, child);
+            }
             outcome.archives.append(&mut branch.archives);
             outcome.errors.append(&mut branch.errors);
+            outcome.scan_incomplete |= branch.scan_incomplete;
             outcome.checkpoints.append(&mut branch.checkpoints);
             outcome.cleanup_results.append(&mut branch.cleanup_results);
             outcome
@@ -288,6 +323,14 @@ impl<O: Observer> Run<'_, O> {
                 .append(&mut branch.removed_promotion_dirs);
         }
         Ok(outcome)
+    }
+
+    fn record_scan_errors(&self, errors: DirectoryReadErrors) -> bool {
+        if errors.is_empty() {
+            return false;
+        }
+        self.scan_errors.lock().unwrap().merge_report(errors);
+        true
     }
 
     fn execute_task(
@@ -336,7 +379,15 @@ impl<O: Observer> Run<'_, O> {
                 Some(path) => Some(path),
                 None if task.inputs.iter().any(|input| input.failure.is_none()) => {
                     let receipt = receipt(&task.inputs[0].input, task.source, depth);
-                    Some(self.reserve_output(preferred_carrier, &receipt)?)
+                    match self.reserve_output(preferred_carrier, &receipt)? {
+                        Ok(path) => Some(path),
+                        Err(failure) => {
+                            for logical in &mut task.inputs {
+                                logical.failure.get_or_insert_with(|| failure.clone());
+                            }
+                            None
+                        }
+                    }
                 }
                 None => None,
             }
@@ -366,7 +417,20 @@ impl<O: Observer> Run<'_, O> {
             let mut executed = if let Some(checkpoint) = checkpoint {
                 let mut input = logical.input;
                 checkpoint.restore_input(&mut input);
-                let result = checkpoint.result(depth);
+                let mut result = checkpoint.result(depth);
+                if result.partial
+                    && self.request.config.extraction.content_requirement
+                        == ContentRequirement::Complete
+                {
+                    let output = checkpoint.output();
+                    cleanup_owned_output(output)?;
+                    self.observer.discard_output(&result, output)?;
+                    result.output = None;
+                    result.partial = false;
+                    result.files = 0;
+                    result.bytes = 0;
+                    result.recovered_complete_files = 0;
+                }
                 let inventory = if children_already_complete {
                     None
                 } else {
@@ -450,7 +514,9 @@ impl<O: Observer> Run<'_, O> {
             }
             let mut descendants = Outcome::default();
             let mut ran_recursive_children = false;
-            if let Some(inventory) = inventory.filter(|inventory| inventory.file_count() > 0) {
+            if let Some(inventory) = inventory
+                .filter(|inventory| inventory.file_count() > 0 || inventory.unreadable_count() > 0)
+            {
                 if depth <= self.request.max_depth && !cancel.cancelled() {
                     let nested = discovery::discover_output(
                         &inventory,
@@ -463,9 +529,11 @@ impl<O: Observer> Run<'_, O> {
                         && self.allow_recursive(depth + 1, nested.tasks.len())
                     {
                         ran_recursive_children = true;
-                        descendants = self.execute_batch(nested, depth + 1, source_scope)?;
+                        descendants =
+                            self.execute_batch(nested, depth + 1, source_scope, Some(&result))?;
                     } else {
                         descendants.errors.extend(nested.errors);
+                        descendants.scan_incomplete = self.record_scan_errors(nested.scan_errors);
                     }
                 }
             }
@@ -488,7 +556,7 @@ impl<O: Observer> Run<'_, O> {
                 && children_complete
                 && !cancel.cancelled()
             {
-                self.flatten(&mut result, &mut descendants)?;
+                flatten_result(self.observer, &mut result, &mut descendants)?;
             }
             let checkpoint = if self.request.mode == Mode::Extract {
                 InputCheckpoint::create(
@@ -516,6 +584,7 @@ impl<O: Observer> Run<'_, O> {
                 .append(&mut descendants.removed_promotion_dirs);
             children.archives.append(&mut descendants.archives);
             children.errors.append(&mut descendants.errors);
+            children.scan_incomplete |= descendants.scan_incomplete;
             children
                 .cleanup_results
                 .append(&mut descendants.cleanup_results);
@@ -574,32 +643,76 @@ impl<O: Observer> Run<'_, O> {
             .all(|result| result.failure.is_none() && !result.partial)
             && subtree_complete(&children)
             && !cancel.cancelled();
-        let admitted_promoted = promotion_sources.iter().filter_map(|path| {
-            if self.promoted_sources.is_empty() {
-                return None;
-            }
-            let key = path_key(path);
-            let source = self.promoted_sources.get(&key)?;
-            source.matches(generations.get(&key)?).then_some(*source)
-        });
+        // A Watch request may have been admitted before another batch moved
+        // these members. The source leases now cover the actual resolved family.
+        let admitted_promoted: Vec<_> = promotion_sources
+            .iter()
+            .filter_map(|path| {
+                if !watch_root && self.promoted_sources.is_empty() {
+                    return None;
+                }
+                let key = path_key(path);
+                let generation = generations.get(&key)?;
+                self.promoted_sources
+                    .get(&key)
+                    .filter(|source| source.matches(generation))
+                    .map(|source| (*source).clone())
+                    .or_else(|| {
+                        watch_root
+                            .then(|| self.observer.promoted_source(path))
+                            .flatten()
+                            .filter(|source| source.matches(generation))
+                    })
+                    .map(|source| (path, source))
+            })
+            .collect();
         if complete && self.request.mode == Mode::Extract {
             if watch_root {
                 self.observer.sources_processed(&completed, &generations)?;
             }
-            let mode = if depth > 1 || admitted_promoted.count() > 0 {
+            let mode = if depth > 1 {
                 CleanupMode::Delete
             } else {
                 self.request.config.post_extract.archive_cleanup_mode
             };
-            if mode != CleanupMode::Keep {
-                let mut selected: Vec<_> = promotion_sources.iter().map(PathBuf::from).collect();
-                dedup_paths(&mut selected);
-                if let Some(first) = completed.first_mut() {
-                    self.cleanup_sources(first, &selected, &generations, mode, &mut outcome)?;
+            if let Some(first) = completed.first_mut() {
+                if admitted_promoted.is_empty() || mode == CleanupMode::Delete {
+                    if mode != CleanupMode::Keep {
+                        let mut selected: Vec<_> =
+                            promotion_sources.iter().map(PathBuf::from).collect();
+                        dedup_paths(&mut selected);
+                        self.cleanup_sources(first, &selected, &generations, mode, &mut outcome)?;
+                    }
+                } else {
+                    let mut generated: Vec<_> = admitted_promoted
+                        .iter()
+                        .map(|(path, _)| PathBuf::from(path))
+                        .collect();
+                    dedup_paths(&mut generated);
+                    if mode != CleanupMode::Keep {
+                        let generated_keys: HashSet<_> =
+                            admitted_promoted.iter().map(|(path, _)| *path).collect();
+                        let mut originals: Vec<_> = promotion_sources
+                            .iter()
+                            .filter(|path| !generated_keys.contains(path))
+                            .map(PathBuf::from)
+                            .collect();
+                        dedup_paths(&mut originals);
+                        self.cleanup_sources(first, &originals, &generations, mode, &mut outcome)?;
+                    }
+                    self.cleanup_sources(
+                        first,
+                        &generated,
+                        &generations,
+                        CleanupMode::Delete,
+                        &mut outcome,
+                    )?;
                 }
             }
         } else {
-            outcome.promoted_sources.extend(admitted_promoted.cloned());
+            outcome
+                .promoted_sources
+                .extend(admitted_promoted.into_iter().map(|(_, source)| source));
         }
         for result in &completed {
             self.observer.notify(Event::Finished {
@@ -611,10 +724,14 @@ impl<O: Observer> Run<'_, O> {
         outcome.archives.extend(completed);
         outcome.archives.append(&mut children.archives);
         outcome.errors.append(&mut children.errors);
+        outcome.scan_incomplete |= children.scan_incomplete;
         outcome
             .cleanup_results
             .append(&mut children.cleanup_results);
         drop(lease);
+        if depth == 1 && self.request.mode == Mode::Extract && !cancel.cancelled() {
+            self.observer.scope_finished(&outcome.archives)?;
+        }
         Ok(outcome)
     }
 
@@ -640,7 +757,7 @@ impl<O: Observer> Run<'_, O> {
             .iter()
             .position(|result| result.failure.is_some())
             .expect("blocked task has a failure");
-        let promoted = (|| -> io::Result<(Vec<(PathBuf, PathBuf)>, bool, Option<String>)> {
+        let promoted = (|| -> io::Result<(Vec<(PathBuf, PathBuf)>, Vec<PromotedSource>, bool, Option<String>)> {
             for source in sources {
                 let before = generations.get(&path_key(source)).ok_or_else(|| {
                     io::Error::other("promotion source has no admitted generation")
@@ -676,23 +793,19 @@ impl<O: Observer> Run<'_, O> {
                         .map(|(source, target)| (PathBuf::from(source), PathBuf::from(target)))
                         .collect()
                 };
-                self.observer
-                    .after_promotion(&results[representative], &moves, success)?;
+                let receipts: Vec<_> = moves.iter()
+                    .filter_map(|(_, target)| PromotedSource::capture(target).ok())
+                    .collect();
+                self.observer.after_promotion(&results[representative], &moves, success, &receipts)?;
                 outcome
                     .removed_promotion_dirs
                     .extend(removed.iter().map(|path| path_key(path)));
-                return Ok((moves, success, (!error.is_empty()).then_some(error)));
+                return Ok((moves, receipts, success, (!error.is_empty()).then_some(error)));
             }
         })();
         match promoted {
-            Ok((moves, success, error)) => {
-                if success {
-                    outcome.promoted_sources.extend(
-                        moves
-                            .iter()
-                            .filter_map(|(_, target)| PromotedSource::capture(target).ok()),
-                    );
-                }
+            Ok((moves, receipts, success, error)) => {
+                outcome.promoted_sources.extend(receipts);
                 for result in results {
                     if success {
                         result.promotion_original_path = Some(result.path.clone());
@@ -895,16 +1008,7 @@ impl<O: Observer> Run<'_, O> {
             });
         }
         self.request.cancel.check_io()?;
-        let sessions = if matches!(input.format_hint.as_str(), "zip" | "rar" | "7z" | "enc")
-            && password.is_none()
-        {
-            open_sessions(&input)
-        } else {
-            Ok(Vec::new())
-        };
-        let plan = match sessions
-            .and_then(|sessions| candidates.plan(&input, password, &sessions, &self.request.cancel))
-        {
+        let plan = match candidates.plan(&input, password, &self.request.cancel) {
             Ok(Ok(plan)) => plan,
             Ok(Err(failure)) => {
                 result.failure = Some(failure);
@@ -947,7 +1051,17 @@ impl<O: Observer> Run<'_, O> {
                 || self.preferred_output(&input, depth),
                 |root| root.join(archive_name(&input)),
             );
-            Some(self.reserve_output(preferred, &result)?)
+            match self.reserve_output(preferred, &result)? {
+                Ok(path) => Some(path),
+                Err(failure) => {
+                    result.failure = Some(failure);
+                    return Ok(Executed {
+                        result,
+                        inventory: None,
+                        input,
+                    });
+                }
+            }
         } else {
             None
         };
@@ -982,12 +1096,19 @@ impl<O: Observer> Run<'_, O> {
             .engine
             .worker(&self.request.config.performance.worker)
             .and_then(|worker| {
-                worker.submit(&job_id, &request, &self.request.cancel, |progress| {
-                    self.observer.notify(Event::Progress {
-                        path: result.path.clone(),
-                        completed_bytes: progress.completed,
-                        total_bytes: progress.total,
-                    });
+                worker.submit(&job_id, &request, &self.request.cancel, |update| {
+                    let event = match update {
+                        worker::Update::Progress(progress) => Event::Progress {
+                            path: result.path.clone(),
+                            completed_bytes: progress.completed,
+                            total_bytes: progress.total,
+                        },
+                        worker::Update::ResourceWait(state) => Event::ResourceWait {
+                            path: result.path.clone(),
+                            state,
+                        },
+                    };
+                    self.observer.notify(event);
                 })
             });
         drop(request);
@@ -1005,6 +1126,10 @@ impl<O: Observer> Run<'_, O> {
                     .get("encrypted")
                     .and_then(Value::as_bool)
                     .or(plan.encrypted);
+                let matched_index = value
+                    .get("matched_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok());
                 let success = worker::string(value, "status") == "ok";
                 if success && self.request.mode == Mode::Extract && input.volume_attempts.is_some()
                 {
@@ -1039,12 +1164,9 @@ impl<O: Observer> Run<'_, O> {
                         || plan.verified
                         || flag(value, "password_verified");
                     if result.encrypted == Some(true) && password_verified {
-                        let index = value
-                            .get("matched_index")
-                            .and_then(Value::as_u64)
-                            .and_then(|index| usize::try_from(index).ok());
-                        result.password = plan.selected(index).map(str::to_owned);
-                        plan.remember_confirmation(index, &self.engine.password_attempts);
+                        result.password = plan
+                            .remember_confirmation(matched_index, &self.engine.password_attempts)
+                            .map(str::to_owned);
                     }
                     if let Some(output) = &output {
                         let stats = inventory_for(&frame, &output_string);
@@ -1058,6 +1180,17 @@ impl<O: Observer> Run<'_, O> {
                     let mut failure = classify_worker_failure(value, plan.evidence, split);
                     if failure.kind == FailureKind::WrongPassword && !plan.has_candidates {
                         failure = Failure::password_required();
+                    }
+                    if failure.kind == FailureKind::Damaged && flag(value, "password_crc_proven") {
+                        result.password = plan
+                            .remember_confirmation(matched_index, &self.engine.password_attempts)
+                            .map(str::to_owned);
+                    } else if matches!(
+                        failure.kind,
+                        FailureKind::WrongPassword | FailureKind::PasswordRequired
+                    ) && flag(value, "password_candidates_all_rejected")
+                    {
+                        plan.remember_rejections(&self.engine.password_attempts);
                     }
                     if self.request.config.extraction.content_requirement
                         == ContentRequirement::AllowPartial
@@ -1167,7 +1300,11 @@ impl<O: Observer> Run<'_, O> {
         root.join(archive_name(input))
     }
 
-    fn reserve_output(&self, preferred: PathBuf, result: &ArchiveResult) -> io::Result<PathBuf> {
+    fn reserve_output(
+        &self,
+        preferred: PathBuf,
+        result: &ArchiveResult,
+    ) -> io::Result<Result<PathBuf, Failure>> {
         // Serialize only the name claim and durable publication. No worker or
         // recursive scan runs while this allocator is held.
         let mut indices = self.output_indices.lock().unwrap();
@@ -1178,65 +1315,34 @@ impl<O: Observer> Run<'_, O> {
             } else {
                 numbered(&preferred, index)
             };
-            if !path.try_exists()? {
+            let exists = match path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => return Ok(Err(file_failure(error))),
+            };
+            if !exists {
                 match self.observer.register_output(result, &path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        index += 1;
-                        continue;
+                        // A non-directory ancestor can also yield AlreadyExists.
+                        // A numbered name only resolves a collision at the leaf.
+                        if fs::symlink_metadata(&path).is_ok() {
+                            index += 1;
+                            continue;
+                        }
+                        return Ok(Err(file_failure(error)));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                        return Ok(Err(file_failure(error)));
                     }
                     Err(error) => return Err(error),
                 }
                 if index != 0 {
                     indices.insert(preferred, index + 1);
                 }
-                return Ok(path);
+                return Ok(Ok(path));
             }
             index += 1;
         }
-    }
-
-    fn flatten(&self, result: &mut ArchiveResult, children: &mut Outcome) -> io::Result<()> {
-        let Some(output) = result.output.as_ref() else {
-            return Ok(());
-        };
-        let mut work = output.as_os_str().to_os_string();
-        work.push(".__sunpack_flatten_work__");
-        let work = PathBuf::from(work);
-        let mut available = work.clone();
-        let mut index = 1;
-        while available.try_exists()? {
-            available = numbered(&work, index);
-            index += 1;
-        }
-        let _promotion = Promotion::begin(vec![output.to_string_lossy().into_owned()])?;
-        let stats = flatten_single_branch_directories(
-            output,
-            Some(&available),
-            |root, work, leaf| self.observer.before_flatten(root, work, leaf),
-            None,
-        );
-        if !stats.errors.is_empty() {
-            result.failure = Some(Failure {
-                kind: FailureKind::FilesystemError,
-                message: stats.errors.join("\n"),
-            });
-        }
-        if let (Some(old), Some(new)) = (stats.source_dir, stats.output_dir) {
-            for checkpoint in &mut children.checkpoints {
-                checkpoint.relocate(&old, &new);
-                self.observer.checkpoint(checkpoint)?;
-            }
-            for child in &mut children.archives {
-                if let Some(path) = child.output.as_mut() {
-                    if let Ok(suffix) = path.strip_prefix(&old) {
-                        *path = new.join(suffix);
-                    }
-                }
-            }
-            result.output = Some(new);
-        }
-        Ok(())
     }
 
     fn cleanup_sources(
@@ -1295,6 +1401,71 @@ impl<O: Observer> Run<'_, O> {
     }
 }
 
+fn flatten_result(
+    observer: &impl Observer,
+    result: &mut ArchiveResult,
+    children: &mut Outcome,
+) -> io::Result<()> {
+    let Some(output) = result.output.as_ref() else {
+        return Ok(());
+    };
+    let attempt = || -> io::Result<_> {
+        let mut work = output.as_os_str().to_os_string();
+        work.push(".__sunpack_flatten_work__");
+        let work = PathBuf::from(work);
+        let mut available = work.clone();
+        let mut index = 1;
+        while available.try_exists()? {
+            available = numbered(&work, index);
+            index += 1;
+        }
+        let _promotion = Promotion::begin(vec![output.to_string_lossy().into_owned()])?;
+        Ok(flatten_single_branch_directories(
+            output,
+            Some(&available),
+            |root, work, leaf| observer.before_flatten(root, work, leaf),
+            None,
+        ))
+    };
+    let stats = match attempt() {
+        Ok(stats) => stats,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+        Err(error) => {
+            record_cleanup(children, output, "flatten", Err(io::Error::other(error)));
+            return Ok(());
+        }
+    };
+    if !stats.errors.is_empty() {
+        let retained = stats.output_dir.as_deref().unwrap_or(output);
+        record_cleanup(
+            children,
+            retained,
+            "flatten",
+            Err(io::Error::other(stats.errors.join("; "))),
+        );
+    }
+    if let (Some(old), Some(new)) = (stats.source_dir, stats.output_dir) {
+        for checkpoint in &mut children.checkpoints {
+            checkpoint.relocate(&old, &new);
+            observer.checkpoint(checkpoint)?;
+        }
+        for child in &mut children.archives {
+            if let Some(path) = child.output.as_mut() {
+                if let Ok(suffix) = path.strip_prefix(&old) {
+                    *path = new.join(suffix);
+                }
+            }
+        }
+        for receipt in &mut children.cleanup_results {
+            if let Ok(suffix) = receipt.path.strip_prefix(&old) {
+                receipt.path = new.join(suffix);
+            }
+        }
+        result.output = Some(new);
+    }
+    Ok(())
+}
+
 fn map_promoted_path(path: &mut PathBuf, moves: &[(PathBuf, PathBuf)]) {
     let key = resolved_key(path);
     if let Some((_, target)) = moves.iter().find(|(source, _)| resolved_key(source) == key) {
@@ -1314,6 +1485,8 @@ fn record_cleanup(outcome: &mut Outcome, path: &Path, mode: &'static str, remove
         path: path.to_path_buf(),
         message: message.clone(),
         kind: InputErrorKind::Cleanup,
+        scan_operation: None,
+        scan_count: None,
     });
     outcome.cleanup_results.push(CleanupResult {
         path: path.to_path_buf(),
@@ -1355,18 +1528,6 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
         promoted: false,
         promotion_original_path: None,
     }
-}
-
-fn open_sessions(input: &ArchiveInput) -> io::Result<Vec<NativeArchiveSession>> {
-    let mut seen = HashSet::new();
-    let paths = input
-        .physical_extents()
-        .map(|extent| extent.path.as_str())
-        .chain(std::iter::once(input.entry_path.as_str()));
-    paths
-        .filter(|path| seen.insert(*path))
-        .map(|path| NativeArchiveSession::new(path.to_owned()))
-        .collect()
 }
 
 fn file_failure(error: io::Error) -> Failure {
@@ -1536,10 +1697,11 @@ fn remove_empty_or_promoted(output: &Path, promoted_dirs: &[String]) -> bool {
 }
 
 fn subtree_complete(outcome: &Outcome) -> bool {
-    !outcome
-        .errors
-        .iter()
-        .any(|error| error.kind != InputErrorKind::Cleanup)
+    !outcome.scan_incomplete
+        && !outcome
+            .errors
+            .iter()
+            .any(|error| error.kind != InputErrorKind::Cleanup)
         && outcome
             .archives
             .iter()
@@ -1655,12 +1817,49 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
 }
 
 fn resolved_key(path: &Path) -> String {
-    path_key(
-        &fs::canonicalize(path)
-            .as_deref()
-            .unwrap_or(path)
-            .to_string_lossy(),
-    )
+    match fs::canonicalize(path) {
+        Ok(canonical) => namespace_key(&canonical),
+        Err(_) => namespace_key(path),
+    }
+}
+
+fn dedup_resolved_plans(tasks: &mut Vec<Task>) {
+    // Alias paths can have different scan filters. Resolve them after discovery
+    // so the path that actually supplied a plan stays eligible for extraction.
+    type Extent = (Arc<str>, u64, Option<u64>);
+    let mut paths = HashMap::<String, Arc<str>>::new();
+    let mut resolved = |path: &str| {
+        if let Some(key) = paths.get(path) {
+            return Arc::clone(key);
+        }
+        let key: Arc<str> = resolved_key(Path::new(path)).into();
+        paths.insert(path.to_owned(), Arc::clone(&key));
+        key
+    };
+    let mut plans = HashSet::<(OpenMode, String, Box<[Extent]>)>::new();
+    tasks.retain_mut(|task| {
+        task.inputs.retain(|logical| {
+            let input = &logical.input;
+            if input.volume_attempts.is_some() || logical.failure.is_some() {
+                return true;
+            }
+            let mut extents: Box<[Extent]> = input
+                .physical_extents()
+                .map(|extent| (resolved(&extent.path), extent.start, extent.end))
+                .collect();
+            if extents.is_empty() {
+                extents = Box::new([(resolved(&input.entry_path), 0, None)]);
+            }
+            plans.insert((input.mode, input.format_hint.clone(), extents))
+        });
+        !task.inputs.is_empty()
+    });
+}
+
+fn namespace_key(path: &Path) -> String {
+    path_key(&normalize_windows_extended_prefix(
+        path.to_string_lossy().into_owned(),
+    ))
 }
 
 fn cleanup_owned_output(path: &Path) -> io::Result<()> {
@@ -1715,6 +1914,7 @@ struct LeaseState {
 struct RequestClaim {
     origin: Origin,
     paths: HashMap<String, PathBuf>,
+    has_aliases: bool,
     directories: HashSet<String>,
     objects: HashSet<(u64, [u8; 16])>,
 }
@@ -1724,6 +1924,7 @@ impl RequestClaim {
         Self {
             origin,
             paths: HashMap::new(),
+            has_aliases: false,
             directories: HashSet::new(),
             objects: HashSet::new(),
         }
@@ -1737,6 +1938,7 @@ impl RequestClaim {
         if let Some(identity) = input.object {
             self.objects.insert(identity);
         }
+        self.has_aliases |= input.alias;
         self.paths.entry(input.key).or_insert(input.path);
     }
 
@@ -1793,6 +1995,7 @@ struct ClaimedInput {
     path: PathBuf,
     key: String,
     directory: bool,
+    alias: bool,
     object: Option<(u64, [u8; 16])>,
 }
 
@@ -1810,10 +2013,19 @@ impl ClaimedInput {
                 .ok()
                 .and_then(|generation| generation.object_id())
         };
+        let key = namespace_key(&canonical);
+        let spelling = path.to_string_lossy();
+        let alias =
+            if spelling.is_ascii() && !spelling.starts_with(r"\\?\") && !spelling.contains('/') {
+                !key.eq_ignore_ascii_case(&spelling)
+            } else {
+                key != namespace_key(&path)
+            };
         Ok(Self {
-            key: resolved_key(&canonical),
+            key,
             path,
             directory,
+            alias,
             object,
         })
     }
@@ -1839,6 +2051,15 @@ struct Lease<'a> {
 }
 
 impl Leases {
+    fn has_aliases(&self, id: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .get(&id)
+            .is_some_and(|claim| claim.has_aliases)
+    }
+
     fn reserve_request(
         self: &Arc<Self>,
         id: u64,
@@ -1960,5 +2181,51 @@ impl Drop for Lease<'_> {
             active.shrink_to(target);
         }
         self.owner.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flatten_failure_keeps_extraction_successful_and_reports_output() {
+        struct DenyFlatten;
+        impl Observer for DenyFlatten {
+            fn notify(&self, _: Event) {}
+
+            fn before_flatten(&self, _: &Path, _: &Path, _: &Path) -> io::Result<()> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+
+        let source = crate::test_support::temp_file("flatten_warning", b"input");
+        let output = source.with_extension("output");
+        let wrapper = output.join("wrapper");
+        fs::create_dir_all(&wrapper).unwrap();
+        fs::write(wrapper.join("payload.txt"), b"payload").unwrap();
+        let input = ArchiveInput::file(
+            source.to_string_lossy().into_owned(),
+            "zip".into(),
+            "sample".into(),
+        );
+        let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+        archive.output = Some(output.clone());
+        let mut outcome = Outcome::default();
+
+        let result = flatten_result(&DenyFlatten, &mut archive, &mut outcome);
+        let payload = fs::read(wrapper.join("payload.txt"));
+        fs::remove_dir_all(&output).unwrap();
+        fs::remove_file(source).unwrap();
+
+        result.unwrap();
+        outcome.archives.push(archive);
+        assert_eq!(outcome.succeeded(), 1);
+        assert_eq!(outcome.failed(), 0);
+        assert_eq!(outcome.archives[0].output.as_ref(), Some(&output));
+        assert_eq!(payload.unwrap(), b"payload");
+        assert!(
+            matches!(&outcome.cleanup_results[..], [CleanupResult { path, mode: "flatten", status: CleanupStatus::Failed, .. }] if path == &output)
+        );
     }
 }

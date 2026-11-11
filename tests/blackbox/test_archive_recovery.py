@@ -1,8 +1,10 @@
 import json
+import os
 import subprocess
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 
@@ -203,19 +205,42 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     assert not list(output.rglob("nested.zip"))
 
 
-def test_scan_keeps_missing_target_in_filesystem_errors(package, tmp_path):
+def test_scan_bounds_filesystem_diagnostics_across_targets_and_subtrees(package, tmp_path):
     archive = tmp_path / "good.wrapped"
     archive.write_bytes(_zip_bytes({"payload.txt": b"valid archive"}))
     plain = tmp_path / "plain.txt"
     plain.write_bytes(b"ordinary text")
-    missing = tmp_path / "missing.zip"
+    missing = [tmp_path / f"missing-{index:02d}.zip" for index in range(96)]
+    roots = [tmp_path / "first-root", tmp_path / "second-root"]
+    principal = os.environ["USERNAME"]
+    denied = []
+    try:
+        for root in roots:
+            for index in range(3):
+                blocked = root / f"blocked-{index}"
+                blocked.mkdir(parents=True)
+                subprocess.run(["icacls", blocked, "/deny", f"{principal}:(RD)"],
+                               check=True, capture_output=True)
+                denied.append(blocked)
+        inside = roots[0] / "selected.zip"
+        inside.write_bytes(_zip_bytes({"inside.txt": b"selected directory"}))
+        unselected = tmp_path / "unselected.zip"
+        unselected.write_bytes(_zip_bytes({"unselected.txt": b"relation context only"}))
+        report = package.json("scan", "-R", archive, plain, *missing, *roots, code=1)
+    finally:
+        for blocked in denied:
+            subprocess.run(["icacls", blocked, "/remove:d", principal],
+                           check=True, capture_output=True)
 
-    report = package.json("scan", archive, plain, missing, code=1)
     assert report["summary"] == {
-        "archive_count": 1,
+        "archive_count": 2,
         "failed_count": 0,
         "input_error_count": 0,
-        "scan_error_count": 1,
+        "scan_error_count": 102,
     }
-    assert len(report["errors"]) == 1
-    assert missing.name in report["errors"][0]
+    assert {Path(item["main_path"]) for item in report["items"]} == {archive, inside}
+    assert len(report["errors"]) == 101
+    assert any(missing[0].name in message for message in report["errors"])
+    assert any(message.startswith("Cannot read directory:") and "blocked-" in message
+               for message in report["errors"])
+    assert report["errors"][-1] == "Additional filesystem scan errors omitted from this report: 2"

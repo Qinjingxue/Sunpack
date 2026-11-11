@@ -140,6 +140,78 @@ def test_mixed_archive_batch_recovers_complete_inputs_and_preserves_missing_volu
     assert [path.read_bytes() for path in output.rglob("payload.txt")] == [content, content]
 
 
+def test_split_discovery_keeps_small_tail_unless_a_path_rule_rejects_it(package, tmp_path):
+    inputs = tmp_path / "parts"
+    inputs.mkdir()
+    content = random.Random(37).randbytes(2600)
+    payload = tmp_path / "payload.txt"
+    payload.write_bytes(content)
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v1k",
+         str(inputs / "parts.7z"), str(payload)],
+        check=True, capture_output=True,
+    )
+    tail = sorted(inputs.glob("parts.7z.*"))[-1]
+    assert 0 < tail.stat().st_size < 1024
+
+    size = {"name": "size_range", "enabled": True, "min_bytes": 1024}
+    package.configure(filesystem={"scan_filters_enabled": True, "scan_filters": [size]})
+    output = tmp_path / "complete"
+    report = package.json("extract", "-c", "k", "-o", output, inputs)
+    assert report["summary"]["success_count"] == 1
+    assert next(output.rglob(payload.name)).read_bytes() == content
+
+    blacklist = {"name": "blacklist", "enabled": True,
+                 "full_names": [{"value": tail.name, "regex": False}]}
+    package.configure(filesystem={"scan_filters": [size, blacklist]})
+    output = tmp_path / "blocked"
+    report = package.json("extract", "-c", "k", "-o", output, inputs, code=1)
+    assert report["summary"]["success_count"] == 0
+    assert not list(output.rglob(payload.name))
+
+
+def test_recursive_file_target_admits_related_volumes_in_subdirectories(package, tmp_path):
+    inputs = tmp_path / "parts"
+    subdir = inputs / "download"
+    subdir.mkdir(parents=True)
+    payload = tmp_path / "payload.txt"
+    content = random.Random(39).randbytes(2600)
+    payload.write_bytes(content)
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v1k",
+         str(inputs / "parts.7z"), str(payload)],
+        check=True, capture_output=True,
+    )
+    head, *members = sorted(inputs.glob("parts.7z.*"))
+    for member in members:
+        member.rename(subdir / member.name)
+    (subdir / "unselected.zip").write_bytes(_zip({"unselected.txt": b"unselected"}))
+
+    # The parent walk skips junctions. An explicit junction remains a separate
+    # selected root even when its lexical path lies inside the relation scope.
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "separate.zip").write_bytes(_zip({"separate.txt": b"explicit junction"}))
+    junction = inputs / "junction"
+    subprocess.run(
+        [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "New-Item -ItemType Junction -Path $env:SUNPACK_TEST_ALIAS -Target $env:SUNPACK_TEST_REAL",
+        ],
+        env={**package.env, "SUNPACK_TEST_ALIAS": str(junction), "SUNPACK_TEST_REAL": str(linked)},
+        check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    output = tmp_path / "output"
+    try:
+        report = package.json("extract", "-R", "-c", "k", "-o", output, head, junction)
+    finally:
+        junction.rmdir()
+    assert report["summary"]["success_count"] == 2
+    assert next(output.rglob(payload.name)).read_bytes() == content
+    assert next(output.rglob("separate.txt")).read_bytes() == b"explicit junction"
+    assert not list(output.rglob("unselected.txt"))
+
+
 def test_concurrent_launcher_requests_reserve_distinct_outputs(package, tmp_path):
     # Start one server before the two clients race for the same output name.
     assert package.run("--help").returncode == 0

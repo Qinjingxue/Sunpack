@@ -1,7 +1,9 @@
 use super::{i18n::Language, resources};
+use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
 use crate::scan::path_filter::{NativePathRule, RuleEntry};
 use serde_json::{Map, Value};
 use std::{
+    collections::VecDeque,
     env, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -11,6 +13,7 @@ const SIMPLE: &str = "sunpack_config.json";
 const ADVANCED: &str = "sunpack_advanced_config.json";
 const OVERRIDES: &str = "SUNPACK_CONFIG_OVERRIDES";
 const DEFAULTS: &str = include_str!("../../../../sunpack_advanced_config.json");
+const CONFIG_CACHE_LIMIT: usize = 64;
 
 #[derive(Clone)]
 pub struct Config {
@@ -161,6 +164,25 @@ pub struct ConfigSources {
     pub simple: Option<PathBuf>,
     pub advanced: Option<PathBuf>,
     pub override_file: Option<PathBuf>,
+    inline_override: Option<Box<str>>,
+}
+
+impl ConfigSources {
+    fn stamp(&self) -> io::Result<[Option<PhysicalFileGeneration>; 3]> {
+        let stamp = |path: Option<&Path>| path.map(capture_file_generation).transpose();
+        Ok([
+            stamp(self.advanced.as_deref())?,
+            stamp(self.simple.as_deref())?,
+            stamp(self.override_file.as_deref())?,
+        ])
+    }
+
+    pub(crate) fn primary(&self) -> &Path {
+        self.simple
+            .as_deref()
+            .or(self.advanced.as_deref())
+            .expect("valid configuration has a source")
+    }
 }
 
 pub struct Snapshot {
@@ -177,7 +199,7 @@ fn defaults() -> &'static Value {
     DEFAULT.get_or_init(|| serde_json::from_str(DEFAULTS).expect("valid built-in configuration"))
 }
 
-fn resolve_sources(cwd: &Path) -> (ConfigSources, Option<String>) {
+fn resolve_sources(cwd: &Path) -> ConfigSources {
     let roots = resources::resource_roots(cwd);
     let search = |name| {
         roots
@@ -197,6 +219,7 @@ fn resolve_sources(cwd: &Path) -> (ConfigSources, Option<String>) {
         simple,
         advanced: search(ADVANCED),
         override_file: None,
+        inline_override: None,
     };
     let mut inline = env::var(OVERRIDES)
         .ok()
@@ -210,7 +233,8 @@ fn resolve_sources(cwd: &Path) -> (ConfigSources, Option<String>) {
         sources.override_file = Some(path);
         inline = None;
     }
-    (sources, inline)
+    sources.inline_override = inline.map(String::into_boxed_str);
+    sources
 }
 
 fn parse_json(text: &str, path: &Path) -> io::Result<Value> {
@@ -291,9 +315,8 @@ struct Layers {
 }
 
 impl Layers {
-    fn read(cwd: &Path) -> io::Result<Self> {
+    fn read(sources: ConfigSources) -> io::Result<Self> {
         use crate::io::resource_lifecycle::read_shared_utf8_text;
-        let (sources, inline) = resolve_sources(cwd);
         if sources.simple.is_none() && sources.advanced.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -312,7 +335,7 @@ impl Layers {
             .transpose()?;
         let overrides = match sources.override_file.clone() {
             Some(path) => Some(read_shared_utf8_text(path)?),
-            None => inline,
+            None => sources.inline_override.as_deref().map(str::to_owned),
         };
         Ok(Self {
             sources,
@@ -360,112 +383,125 @@ impl Layers {
         }
         Ok(value)
     }
-
-    fn stamp(&self) -> [Option<[u64; 2]>; 3] {
-        use crate::fast_hash_core::xxh64;
-        [&self.advanced, &self.simple, &self.overrides].map(|source| {
-            source
-                .as_deref()
-                .map(|text| [xxh64(text.as_bytes(), 0), xxh64(text.as_bytes(), 1)])
-        })
-    }
 }
 
 pub fn load_raw(cwd: &Path) -> io::Result<(PathBuf, Value)> {
-    let layers = Layers::read(cwd)?;
+    let layers = Layers::read(resolve_sources(cwd))?;
     let value = layers.parse()?;
-    Ok((
-        layers
-            .sources
-            .simple
-            .or(layers.sources.advanced)
-            .expect("configuration has a source"),
-        value,
-    ))
+    Ok((layers.sources.primary().to_path_buf(), value))
 }
 
-enum Data {
-    Raw(Value),
-    Normalized(Result<Config, Box<str>>),
+struct Generation {
+    stamp: Option<[Option<PhysicalFileGeneration>; 3]>,
+    snapshot: Snapshot,
 }
 
-pub(crate) struct Generation {
-    stamp: [Option<[u64; 2]>; 3],
-    sources: ConfigSources,
+pub(crate) struct ConfigRead {
+    observed: io::Result<Arc<Generation>>,
+    previous: Option<Arc<Generation>>,
     language: Language,
-    data: Mutex<Data>,
 }
 
-impl Generation {
+impl ConfigRead {
     pub(crate) fn language(&self) -> Language {
         self.language
     }
 
-    pub(crate) fn normalized(&self) -> io::Result<Config> {
-        let mut data = self.data.lock().unwrap_or_else(|error| error.into_inner());
-        if let Data::Raw(raw) = &*data {
-            *data = Data::Normalized(Config::parse(raw).map_err(|error| error.to_string().into()));
-        }
-        match &*data {
-            Data::Normalized(Ok(config)) => Ok(config.clone()),
-            Data::Normalized(Err(message)) => Err(invalid(message.as_ref())),
-            Data::Raw(_) => unreachable!(),
+    pub(crate) fn normalized(self, keep_previous: bool) -> io::Result<Config> {
+        match self.observed {
+            Ok(current) => Ok(current.snapshot.config.clone()),
+            Err(error) => match self.previous.filter(|_| keep_previous) {
+                Some(previous) => Ok(previous.snapshot.config.clone()),
+                None => Err(error),
+            },
         }
     }
 }
 
-pub(crate) fn generation(cwd: &Path) -> io::Result<Arc<Generation>> {
-    static CACHE: Mutex<Option<Arc<Generation>>> = Mutex::new(None);
-    let layers = Layers::read(cwd)?;
-    let stamp = layers.stamp();
-    let before = {
-        let cached = CACHE.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(hit) = cached
-            .as_ref()
-            .filter(|hit| hit.stamp == stamp && hit.sources == layers.sources)
-        {
-            return Ok(hit.clone());
-        }
-        cached.clone()
+pub(crate) fn generation(cwd: &Path) -> ConfigRead {
+    static CACHE: Mutex<VecDeque<Arc<Generation>>> = Mutex::new(VecDeque::new());
+    let sources = resolve_sources(cwd);
+    let previous = {
+        let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        cache
+            .iter()
+            .position(|entry| entry.snapshot.sources == sources)
+            .and_then(|index| cache.remove(index))
+            .inspect(|entry| cache.push_front(Arc::clone(entry)))
     };
-    let raw = layers.parse()?;
-    let language = if raw["cli"].is_object() {
-        Language::parse(raw["cli"]["language"].as_str().unwrap_or(""))
-    } else {
-        Language::Zh
-    };
-    let current = Arc::new(Generation {
-        stamp,
-        sources: layers.sources,
-        language,
-        data: Mutex::new(Data::Raw(raw)),
-    });
-    let mut cached = CACHE.lock().unwrap_or_else(|error| error.into_inner());
-    match (cached.as_ref(), before.as_ref()) {
-        (Some(hit), _) if hit.stamp == current.stamp && hit.sources == current.sources => {
-            return Ok(hit.clone())
-        }
-        (Some(hit), Some(before)) if Arc::ptr_eq(hit, before) => *cached = Some(current.clone()),
-        (None, None) => *cached = Some(current.clone()),
-        _ => {}
+    let stamp = sources.stamp().ok();
+    if let Some(hit) = previous
+        .as_ref()
+        .filter(|hit| stamp.is_some() && hit.stamp == stamp)
+    {
+        return ConfigRead {
+            observed: Ok(Arc::clone(hit)),
+            previous: None,
+            language: hit.snapshot.config.cli.language,
+        };
     }
-    Ok(current)
+    let mut language = Language::Zh;
+    let observed = (|| {
+        let layers = Layers::read(sources)?;
+        let raw = layers.parse()?;
+        language = raw_language(&raw);
+        let config = Config::parse(&raw)?;
+        let current = Arc::new(Generation {
+            stamp,
+            snapshot: Snapshot {
+                config,
+                sources: layers.sources,
+            },
+        });
+        let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        let index = cache
+            .iter()
+            .position(|entry| entry.snapshot.sources == current.snapshot.sources);
+        if let Some(hit) = index.map(|index| &cache[index]) {
+            if current.stamp.is_some() && hit.stamp == current.stamp {
+                return Ok(Arc::clone(hit));
+            }
+            if !previous
+                .as_ref()
+                .is_some_and(|previous| Arc::ptr_eq(previous, hit))
+            {
+                // A later request already published a different generation.
+                return Ok(current);
+            }
+            cache.remove(index.unwrap());
+        } else if previous.is_some() {
+            // This source was evicted while it was being read.
+            return Ok(current);
+        }
+        cache.push_front(Arc::clone(&current));
+        cache.truncate(CONFIG_CACHE_LIMIT);
+        Ok(current)
+    })();
+    ConfigRead {
+        observed,
+        previous,
+        language,
+    }
 }
 
 pub fn load_language(cwd: &Path) -> Language {
-    generation(cwd).map_or(Language::Zh, |generation| generation.language)
+    load_raw(cwd).map_or(Language::Zh, |(_, raw)| raw_language(&raw))
+}
+
+fn raw_language(raw: &Value) -> Language {
+    Language::parse(field(raw, &["cli", "language"]).as_str().unwrap_or(""))
 }
 
 pub fn load_snapshot(cwd: &Path) -> io::Result<Snapshot> {
-    let generation = generation(cwd)?;
+    let generation = generation(cwd).observed?;
     Ok(Snapshot {
-        config: generation.normalized()?,
-        sources: generation.sources.clone(),
+        config: generation.snapshot.config.clone(),
+        sources: generation.snapshot.sources.clone(),
     })
 }
 
 pub fn load(cwd: &Path) -> io::Result<Config> {
-    generation(cwd)?.normalized()
+    generation(cwd).normalized(false)
 }
 
 fn field<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
@@ -498,6 +534,17 @@ fn string_field(value: &Value, path: &[&str]) -> String {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
+}
+
+fn selection_field(value: &Value, path: &[&str], default: &str) -> io::Result<String> {
+    let value = field(value, path);
+    if !json_truthy(value) {
+        return Ok(default.into());
+    }
+    value
+        .as_str()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .ok_or_else(|| invalid(format!("{} must be a string", path.join("."))))
 }
 
 fn number_field(value: &Value, path: &[&str]) -> io::Result<f64> {
@@ -592,7 +639,11 @@ impl Config {
                 1,
             )?,
         };
-        let process_mode = ProcessMode::parse(&string_field(value, &["runtime", "process_mode"]))?;
+        let process_mode = ProcessMode::parse(&selection_field(
+            value,
+            &["runtime", "process_mode"],
+            "normal",
+        )?)?;
         let recursive_extract = Recursion::parse(
             &field(value, &["recursive_extract"])
                 .as_str()
@@ -658,7 +709,7 @@ impl Config {
             .collect();
         Ok(Self {
             cli: CliConfig {
-                language: Language::parse(&string_field(value, &["cli", "language"])),
+                language: raw_language(value),
             },
             runtime: RuntimeConfig { process_mode },
             watch,
@@ -675,10 +726,11 @@ impl Config {
                 recursive_candidate_ratio,
             },
             extraction: ExtractionConfig {
-                content_requirement: ContentRequirement::parse(&string_field(
+                content_requirement: ContentRequirement::parse(&selection_field(
                     value,
                     &["extraction", "content_requirement"],
-                ))?,
+                    "complete",
+                )?)?,
             },
             post_extract: PostExtractConfig {
                 archive_cleanup_mode: CleanupMode::parse(&string_field(
@@ -759,7 +811,7 @@ impl ProcessMode {
     pub fn parse(value: &str) -> io::Result<Self> {
         match value {
             "background" => Ok(Self::Background),
-            "" | "normal" => Ok(Self::Normal),
+            "normal" => Ok(Self::Normal),
             "high" => Ok(Self::High),
             _ => Err(invalid(
                 "runtime.process_mode must be background, normal, or high",
@@ -782,7 +834,7 @@ impl CleanupMode {
 impl ContentRequirement {
     pub fn parse(value: &str) -> io::Result<Self> {
         match value {
-            "" | "complete" => Ok(Self::Complete),
+            "complete" => Ok(Self::Complete),
             "allow_partial" => Ok(Self::AllowPartial),
             _ => Err(invalid(
                 "extraction.content_requirement must be 'complete' or 'allow_partial'",

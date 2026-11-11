@@ -78,6 +78,11 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(package, tmp_p
     assert scan_events() == [["pending"]]
     assert not marker_present(old.output, ignored.marker_name)
 
+    save_roots(f"{pending.root} | {pending.output} | true | true\n{old.root} | {old.output} | true | true\n")
+    package.json("watch", "reload")
+    assert scan_events() == [["pending"]]
+    assert not marker_present(old.output, ignored.marker_name)
+
     save_roots(f"{pending.root} | {pending.output} | true | true\n{old.root} | {old.output} | false | false\n")
     old.await_archive(ignored)
     wait_for(lambda: scan_events() == [["pending"], ["old"]], "live scan-flag reset")

@@ -2062,7 +2062,7 @@ pub(crate) fn capture_file_generation(path: &Path) -> io::Result<PhysicalFileGen
     physical_file_generation(&file)
 }
 
-fn physical_file_generation(file: &File) -> io::Result<PhysicalFileGeneration> {
+pub(crate) fn physical_file_generation(file: &File) -> io::Result<PhysicalFileGeneration> {
     let metadata = file.metadata()?;
     Ok(PhysicalFileGeneration {
         len: metadata.len(),

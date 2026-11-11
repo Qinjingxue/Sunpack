@@ -71,9 +71,6 @@ struct TextMatcher {
 }
 
 impl TextMatcher {
-    fn regex_memory_usage(&self) -> usize {
-        self.patterns.as_ref().map_or(0, Regex::memory_usage)
-    }
     fn compile(values: Vec<String>, mut patterns: Vec<String>) -> io::Result<Self> {
         let mut exact = HashSet::new();
         for value in values {
@@ -298,17 +295,6 @@ pub(super) struct PathRuleScratch {
     paths: PathScratch,
     files: [TextScratch; 3],
 }
-impl PathRuleScratch {
-    pub(super) fn regex_memory_usage(&self) -> usize {
-        self.files
-            .iter()
-            .chain([&self.paths.names, &self.paths.rooted, &self.paths.patterns])
-            .filter_map(Option::as_ref)
-            .map(Cache::memory_usage)
-            .sum::<usize>()
-    }
-}
-
 pub(super) struct FilterPath<'a> {
     path: &'a Path,
     root: &'a Path,
@@ -358,15 +344,10 @@ impl<'a> FilterPath<'a> {
 }
 
 impl PathRule {
-    pub(super) fn regex_memory_usage(&self) -> usize {
-        self.files
-            .iter()
-            .map(|(_, matcher)| matcher.regex_memory_usage())
-            .sum::<usize>()
-            + self.paths.names.regex_memory_usage()
-            + self.paths.rooted.regex_memory_usage()
-            + self.paths.patterns.regex_memory_usage()
+    pub(super) fn has_directory_rules(&self) -> bool {
+        !self.paths.is_empty()
     }
+
     fn compile(
         paths: Vec<RuleEntry>,
         files: Vec<RuleEntry>,

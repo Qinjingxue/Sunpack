@@ -379,10 +379,10 @@ fn check_chunk_summary(
 /// One fixed 14-column array per regular file in the worker manifest.
 struct WorkerRows(Vec<OutputFileRecord>);
 
-type WorkerRow = (
+type WorkerRow<'a> = (
     u32,
-    String,
-    String,
+    &'a str,
+    &'a str,
     u64,
     u64,
     u8,
@@ -409,34 +409,31 @@ impl<'de> Deserialize<'de> for WorkerRows {
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<WorkerRows, A::Error> {
                 let mut files = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(row) = seq.next_element::<WorkerRow>()? {
+                while let Some(row) = seq.next_element::<WorkerRow<'de>>()? {
                     let (
-                        index,
+                        _,
                         path,
-                        raw_output_path,
+                        output_path,
                         size,
-                        bytes_written,
-                        has_crc,
-                        source_crc32,
-                        has_output_crc,
-                        output_crc32,
-                        crc_ok,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
                         status,
                         has_mtime,
                         mtime_ns,
                         magic,
                     ) = row;
                     files.push(OutputFileRecord {
-                        index,
-                        output_path: (!raw_output_path.is_empty() && raw_output_path != path)
-                            .then_some(raw_output_path),
-                        path,
-                        abs_path: None,
+                        path: if output_path.is_empty() {
+                            path
+                        } else {
+                            output_path
+                        }
+                        .to_owned(),
                         size,
-                        bytes_written,
-                        crc32: (has_crc != 0).then_some(source_crc32),
-                        output_crc32: (has_output_crc != 0).then_some(output_crc32),
-                        crc_ok: Some(crc_ok != 0),
                         status,
                         mtime_ns: (has_mtime != 0).then_some(mtime_ns),
                         magic: magic.0,
@@ -450,7 +447,7 @@ impl<'de> Deserialize<'de> for WorkerRows {
     }
 }
 
-struct MagicBytes(Vec<u8>);
+struct MagicBytes(Box<[u8]>);
 impl<'de> Deserialize<'de> for MagicBytes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct BytesVisitor;
@@ -460,7 +457,7 @@ impl<'de> Deserialize<'de> for MagicBytes {
                 f.write_str("worker magic bytes")
             }
             fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<MagicBytes, E> {
-                Ok(MagicBytes(bytes.to_vec()))
+                Ok(MagicBytes(bytes.into()))
             }
         }
         deserializer.deserialize_bytes(BytesVisitor)
@@ -476,7 +473,7 @@ mod tests {
         let sentinel = "__binary_magic__";
         let mut bytes = encode_worker_frame(&json!({
             "type": "manifest_chunk", "job_id": job, "seq": 0,
-            "rows": [[0, job, "renamed.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, sentinel]],
+            "rows": [[0, job, format!("{job}-renamed.txt"), 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, sentinel]],
         }))
         .unwrap();
         let body = bytes
@@ -529,9 +526,8 @@ mod tests {
                 .unwrap();
             assert!(manifest.complete());
             let row = &manifest.records()[0];
-            assert_eq!(row.path, job);
-            assert_eq!(row.output_path.as_deref(), Some("renamed.txt"));
-            assert_eq!(row.magic, b"abc");
+            assert_eq!(row.path, format!("{job}-renamed.txt"));
+            assert_eq!(&*row.magic, b"abc");
             assert_eq!(row.mtime_ns, Some(123));
         }
     }

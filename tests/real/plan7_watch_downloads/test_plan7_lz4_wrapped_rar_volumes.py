@@ -90,3 +90,28 @@ def test_plan7_lz4_wrapped_rar_volumes(package, tmp_path, mode, cleanup, separat
     )
     assert all(completed[path.name] == 1 for path in arrived), completed
     watch.assert_no_terminal_failures()
+
+
+def test_plan7_mixed_rar_family_keeps_original_volumes_after_watch_restart(package, tmp_path):
+    require_generator("rar")
+    case = create_encrypted_rar_archive(
+        tmp_path / "fixtures", "mixed-rar", password=PASSWORD,
+        header_encrypt=True, split=True, split_volume_size=100 * 1024, payload_size=160 * 1024,
+    )
+    head, tail = sorted(case.archive_dir.glob("*.rar"))
+    wrapper = tmp_path / f"{tail.name}.lz4"
+    create_lz4_frames(wrapper, [tail])
+    watch = watch_setup(package, tmp_path, cleanup="k")
+    downloaded = download(watch, wrapper)
+    watch.await_event("done", path=downloaded.name)
+    promoted = watch.root / tail.name
+    assert promoted.read_bytes() == tail.read_bytes()
+
+    watch.restart()
+    original = download(watch, head)
+    watch.await_archive(case)
+    wait_for(lambda: not promoted.exists(), "retirement of the generated RAR member")
+    watch.stop()
+    assert original.read_bytes() == head.read_bytes()
+    assert downloaded.read_bytes() == wrapper.read_bytes()
+    assert_once(watch, case)

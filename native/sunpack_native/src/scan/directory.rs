@@ -3,8 +3,8 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
 use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCatalog};
 use super::path_filter::{FilterPath, NativePathRule, PathRule, PathRuleScratch};
@@ -47,7 +47,6 @@ const FORMAT_REJECT_TAR: u32 = 1 << 3;
 pub(crate) struct NativeDirectorySnapshot {
     pub(crate) table: Arc<DirectorySnapshotTable>,
     pub(crate) rows: Arc<Vec<usize>>,
-    buckets: OnceLock<HashMap<String, Vec<usize>>>,
 }
 
 impl NativeDirectorySnapshot {
@@ -55,7 +54,6 @@ impl NativeDirectorySnapshot {
         Self {
             table: Arc::clone(&self.table),
             rows: Arc::new(rows),
-            buckets: OnceLock::new(),
         }
     }
 
@@ -63,7 +61,6 @@ impl NativeDirectorySnapshot {
         Self {
             table: Arc::clone(&self.table),
             rows: Arc::clone(&self.rows),
-            buckets: OnceLock::new(),
         }
     }
 
@@ -91,12 +88,10 @@ impl NativeDirectorySnapshot {
         let raw_rows = (0..table.paths.len()).collect();
         (
             Self {
-                buckets: OnceLock::new(),
                 table: Arc::clone(&table),
                 rows: Arc::new(filtered_rows),
             },
             Self {
-                buckets: OnceLock::new(),
                 table,
                 rows: Arc::new(raw_rows),
             },
@@ -242,27 +237,18 @@ impl DirectoryScanRecords {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OutputFileRecord {
-    pub(crate) index: u32,
     pub(crate) path: String,
-    pub(crate) abs_path: Option<String>,
-    pub(crate) output_path: Option<String>,
     pub(crate) size: u64,
-    pub(crate) bytes_written: u64,
-    pub(crate) crc32: Option<u32>,
-    pub(crate) output_crc32: Option<u32>,
-    pub(crate) crc_ok: Option<bool>,
     pub(crate) status: u8,
     pub(crate) mtime_ns: Option<u64>,
-    pub(crate) magic: Vec<u8>,
+    pub(crate) magic: Box<[u8]>,
 }
 
 pub(crate) struct NativeWorkerManifest {
     files: Arc<Vec<OutputFileRecord>>,
     complete: bool,
     file_count: usize,
-    dir_count: usize,
     total_size: u64,
-    identity_paths: bool,
 }
 
 impl NativeWorkerManifest {
@@ -286,9 +272,7 @@ impl NativeWorkerManifest {
             files: Arc::new(files),
             complete,
             file_count,
-            dir_count: count(inventory[2], "directory count")?,
             total_size: inventory[3],
-            identity_paths: inventory[4] != 0,
         })
     }
 
@@ -301,33 +285,13 @@ impl NativeWorkerManifest {
     pub(crate) fn complete(&self) -> bool {
         self.complete
     }
-    pub(crate) fn file_count(&self) -> usize {
-        self.file_count
-    }
-    pub(crate) fn dir_count(&self) -> usize {
-        self.dir_count
-    }
-    pub(crate) fn total_size(&self) -> u64 {
-        self.total_size
-    }
-    pub(crate) fn identity_paths(&self) -> bool {
-        self.identity_paths
-    }
-    pub(crate) fn len(&self) -> usize {
-        self.files.len()
-    }
     pub(crate) fn to_output_inventory(&self, root: String) -> NativeOutputInventory {
         NativeOutputInventory {
             root,
-            exists: true,
-            is_dir: true,
             file_count: self.file_count,
-            dir_count: self.dir_count,
             total_size: self.total_size,
             unreadable_count: 0,
             files: Arc::clone(&self.files),
-            worker_inventory_complete: self.complete,
-            identity_paths: self.identity_paths,
         }
     }
 }
@@ -335,69 +299,24 @@ impl NativeWorkerManifest {
 #[derive(Clone)]
 pub(crate) struct NativeOutputInventory {
     root: String,
-    exists: bool,
-    is_dir: bool,
     file_count: usize,
-    dir_count: usize,
     total_size: u64,
     unreadable_count: usize,
     files: Arc<Vec<OutputFileRecord>>,
-    worker_inventory_complete: bool,
-    identity_paths: bool,
 }
 
 impl NativeOutputInventory {
-    pub(crate) fn records(&self) -> &Arc<Vec<OutputFileRecord>> {
-        &self.files
-    }
-}
-
-impl NativeOutputInventory {
-    pub(crate) fn empty() -> Self {
-        Self {
-            root: String::new(),
-            exists: false,
-            is_dir: false,
-            file_count: 0,
-            dir_count: 0,
-            total_size: 0,
-            unreadable_count: 0,
-            files: Arc::new(Vec::new()),
-            worker_inventory_complete: false,
-            identity_paths: false,
-        }
-    }
-
     pub(crate) fn root(&self) -> &str {
         &self.root
     }
-    pub(crate) fn exists(&self) -> bool {
-        self.exists
-    }
-    pub(crate) fn is_dir(&self) -> bool {
-        self.is_dir
-    }
     pub(crate) fn file_count(&self) -> usize {
         self.file_count
-    }
-    pub(crate) fn dir_count(&self) -> usize {
-        self.dir_count
     }
     pub(crate) fn total_size(&self) -> u64 {
         self.total_size
     }
     pub(crate) fn unreadable_count(&self) -> usize {
         self.unreadable_count
-    }
-    pub(crate) fn worker_inventory_complete(&self) -> bool {
-        self.worker_inventory_complete
-    }
-    pub(crate) fn identity_paths(&self) -> bool {
-        self.identity_paths
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.files.len()
     }
 
     pub(crate) fn build_directory_snapshots(
@@ -429,108 +348,8 @@ impl NativeOutputInventory {
 }
 
 impl NativeDirectorySnapshot {
-    /// A lazy name index over this view; rows and existing Rust head facts stay shared.
-    pub(crate) fn relation_bucket(&self, seed: &str) -> Self {
-        let stem = |path: &str| {
-            crate::path_keys::case_key(crate::relations::first_dot_stem(
-                Path::new(path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default(),
-            ))
-        };
-        let buckets = self.buckets.get_or_init(|| {
-            let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
-            for &row in self.rows.iter() {
-                if !self.table.is_dirs[row] {
-                    buckets
-                        .entry(stem(&self.table.paths[row]))
-                        .or_default()
-                        .push(row);
-                }
-            }
-            buckets
-        });
-        self.view(buckets.get(&stem(seed)).cloned().unwrap_or_default())
-    }
-
     pub(crate) fn scan_errors(&self) -> Vec<DirectoryReadError> {
         self.table.scan_errors.clone()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    pub(crate) fn has_files(&self) -> bool {
-        self.rows.iter().any(|&row| !self.table.is_dirs[row])
-    }
-
-    pub(crate) fn materialize_columns(
-        &self,
-    ) -> (Vec<String>, Vec<bool>, Vec<Option<u64>>, Vec<Option<u64>>) {
-        let mut paths = Vec::with_capacity(self.rows.len());
-        let mut is_dirs = Vec::with_capacity(self.rows.len());
-        let mut sizes = Vec::with_capacity(self.rows.len());
-        let mut mtimes_ns = Vec::with_capacity(self.rows.len());
-        for &row in self.rows.iter() {
-            paths.push(self.table.paths[row].clone());
-            is_dirs.push(self.table.is_dirs[row]);
-            sizes.push(self.table.sizes[row]);
-            mtimes_ns.push(self.table.mtimes_ns[row]);
-        }
-        (paths, is_dirs, sizes, mtimes_ns)
-    }
-
-    pub(crate) fn file_columns(&self) -> (Vec<String>, Vec<Option<u64>>, Vec<Option<u64>>) {
-        let mut paths = Vec::new();
-        let mut sizes = Vec::new();
-        let mut mtimes_ns = Vec::new();
-        for &row in self.rows.iter() {
-            if self.table.is_dirs[row] {
-                continue;
-            }
-            paths.push(self.table.paths[row].clone());
-            sizes.push(self.table.sizes[row]);
-            mtimes_ns.push(self.table.mtimes_ns[row]);
-        }
-        (paths, sizes, mtimes_ns)
-    }
-
-    pub(crate) fn relation_anchor_rows(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            &str,
-            Option<u64>,
-            &crate::analysis_native::volume_anchor::VolumeAnchor,
-        ),
-    > {
-        self.rows
-            .iter()
-            .filter_map(|&row| {
-                (!self.table.is_dirs[row] && self.table.file_routes[row] == FILE_ROUTE_RELATIONS)
-                    .then(|| {
-                        (
-                            row,
-                            self.table.relation_anchors[row]
-                                .as_ref()
-                                .and_then(CheapAnchor::anchor),
-                        )
-                    })
-            })
-            .filter_map(|(row, anchor)| anchor.map(|anchor| (row, anchor)))
-            .map(|(row, anchor)| {
-                (
-                    self.table.paths[row].as_str(),
-                    self.table.sizes[row],
-                    anchor,
-                )
-            })
     }
 }
 
@@ -584,64 +403,6 @@ impl NativeNumericRange {
     }
 }
 
-#[derive(Default)]
-struct DirectoryScanProfile {
-    regex_compiled_bytes: usize,
-    regex_cache_bytes: usize,
-    directory_enumeration: Duration,
-    metadata_reads: Duration,
-    path_matching: Duration,
-    record_building: Duration,
-    traversal_overhead: Duration,
-    scan_total: Duration,
-    directories_opened: usize,
-    entries_seen: usize,
-    metadata_read_count: usize,
-    accepted_entries: usize,
-    pruned_directories: usize,
-    rejected_files: usize,
-}
-
-#[derive(Clone, Copy)]
-enum ProfileBucket {
-    DirectoryEnumeration,
-    MetadataReads,
-    PathMatching,
-    RecordBuilding,
-    TraversalOverhead,
-}
-
-impl DirectoryScanProfile {
-    fn add_elapsed(&mut self, bucket: ProfileBucket, started: Instant) {
-        let elapsed = started.elapsed();
-        match bucket {
-            ProfileBucket::DirectoryEnumeration => self.directory_enumeration += elapsed,
-            ProfileBucket::MetadataReads => self.metadata_reads += elapsed,
-            ProfileBucket::PathMatching => self.path_matching += elapsed,
-            ProfileBucket::RecordBuilding => self.record_building += elapsed,
-            ProfileBucket::TraversalOverhead => self.traversal_overhead += elapsed,
-        }
-    }
-
-}
-
-fn measure<const ENABLED: bool, T>(
-    profile: &mut Option<&mut DirectoryScanProfile>,
-    bucket: ProfileBucket,
-    operation: impl FnOnce() -> T,
-) -> T {
-    if !ENABLED {
-        return operation();
-    }
-    let Some(profile) = profile.as_deref_mut() else {
-        return operation();
-    };
-    let started = Instant::now();
-    let result = operation();
-    profile.add_elapsed(bucket, started);
-    result
-}
-
 impl DirectoryScanOptions {
     fn new(
         blacklist_rules: Vec<NativePathRule>,
@@ -677,6 +438,16 @@ pub(crate) struct NativeDirectoryScanOptions {
 }
 
 impl NativeDirectoryScanOptions {
+    pub(crate) fn can_share_recursive_context(&self) -> bool {
+        self.options.size_ranges.is_empty()
+            && self
+                .options
+                .blacklist_rules
+                .iter()
+                .chain(&self.options.whitelist_rules)
+                .all(|rule| !rule.has_directory_rules())
+    }
+
     pub(crate) fn new(
         blacklist_rules: Vec<NativePathRule>,
         size_ranges: Vec<NumericRangeTuple>,
@@ -863,7 +634,6 @@ impl NativeDirectoryScanOptions {
         options.scope = Some(scope.clone());
         scan_snapshots_with_options(&scope.root, scope.max_depth, &options)
     }
-
 }
 
 fn scan_snapshots_with_options(
@@ -885,27 +655,25 @@ fn scan_snapshots_with_options(
 }
 
 /// Filesystem target classification only; archive analysis remains in discovery.
-pub(crate) fn classify_scan_targets(paths: Vec<String>) -> (Vec<u8>, Vec<DirectoryReadError>) {
-    (|| {
-        let mut kinds = Vec::with_capacity(paths.len());
-        let mut errors = DirectoryReadErrors::report();
-        for path in paths {
-            match fs::metadata(&path) {
-                Ok(metadata) => kinds.push(if metadata.is_file() {
-                    1
-                } else if metadata.is_dir() {
-                    2
-                } else {
-                    3
-                }),
-                Err(error) => {
-                    kinds.push(0);
-                    errors.push(Path::new(&path), "metadata", error);
-                }
+pub(crate) fn classify_scan_targets(paths: &[String]) -> (Vec<u8>, DirectoryReadErrors) {
+    let mut kinds = Vec::with_capacity(paths.len());
+    let mut errors = DirectoryReadErrors::report();
+    for path in paths {
+        match fs::metadata(path) {
+            Ok(metadata) => kinds.push(if metadata.is_file() {
+                1
+            } else if metadata.is_dir() {
+                2
+            } else {
+                3
+            }),
+            Err(error) => {
+                kinds.push(0);
+                errors.push(Path::new(path), "metadata", error);
             }
         }
-        (kinds, errors.into_messages())
-    })()
+    }
+    (kinds, errors)
 }
 
 fn build_inventory_snapshot_views(
@@ -1039,8 +807,7 @@ fn build_inventory_snapshot_views(
 }
 
 fn inventory_file_path(root: &Path, item: &OutputFileRecord) -> Option<PathBuf> {
-    let raw_path = item.output_path.as_ref().unwrap_or(&item.path);
-    let path = Path::new(raw_path);
+    let path = Path::new(&item.path);
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1122,87 +889,84 @@ fn ancestor_directory_records<'a>(
 
 pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {
     let root = PathBuf::from(output_dir);
-    let exists = root.exists();
-    let is_dir = root.is_dir();
     let mut stats = OutputTreeStats::default();
-    if is_dir {
-        walk_output_tree(&root, &root, &mut stats);
+    if fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+        walk_output_tree(&root, &mut stats);
+    } else {
+        stats.unreadable_count += 1;
     }
     NativeOutputInventory {
         root: path_to_string(&root),
-        exists,
-        is_dir,
-        file_count: stats.file_count,
-        dir_count: stats.dir_count,
+        file_count: stats.files.len(),
         total_size: stats.total_size,
         unreadable_count: stats.unreadable_count,
         files: Arc::new(stats.files),
-        worker_inventory_complete: false,
-        identity_paths: false,
     }
 }
 
 #[derive(Default)]
 struct OutputTreeStats {
-    file_count: usize,
-    dir_count: usize,
     total_size: u64,
     unreadable_count: usize,
     files: Vec<OutputFileRecord>,
 }
 
-fn walk_output_tree(root: &Path, current: &Path, stats: &mut OutputTreeStats) {
-    let entries = match fs::read_dir(current) {
-        Ok(entries) => entries,
-        Err(_) => {
-            stats.unreadable_count += 1;
-            return;
-        }
-    };
-    for item in entries {
-        let Ok(entry) = item else {
-            stats.unreadable_count += 1;
-            continue;
-        };
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
+fn walk_output_tree(root: &Path, stats: &mut OutputTreeStats) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let entries = match fs::read_dir(current) {
+            Ok(entries) => entries,
             Err(_) => {
                 stats.unreadable_count += 1;
                 continue;
             }
         };
-        if metadata.is_dir() {
-            stats.dir_count += 1;
-            walk_output_tree(root, &path, stats);
-            continue;
+        for item in entries {
+            let Ok(entry) = item else {
+                stats.unreadable_count += 1;
+                continue;
+            };
+            let Ok(metadata) = entry.metadata() else {
+                stats.unreadable_count += 1;
+                continue;
+            };
+            #[cfg(windows)]
+            if is_reparse_point(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map(path_to_string)
+                .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned());
+            let size = metadata.len();
+            stats.total_size = stats.total_size.saturating_add(size);
+            stats.files.push(OutputFileRecord {
+                path: normalize_path_separator(relative),
+                size,
+                status: 0,
+                mtime_ns: metadata_mtime_ns(&metadata),
+                magic: Box::default(),
+            });
         }
-        if !metadata.is_file() {
-            continue;
-        }
-        stats.file_count += 1;
-        let size = metadata.len();
-        stats.total_size = stats.total_size.saturating_add(size);
-        let relative = path
-            .strip_prefix(root)
-            .map(path_to_string)
-            .unwrap_or_else(|_| file_name.clone());
-        stats.files.push(OutputFileRecord {
-            index: stats.files.len() as u32,
-            path: normalize_path_separator(relative),
-            abs_path: Some(path_to_string(&path)),
-            output_path: None,
-            size,
-            bytes_written: size,
-            crc32: None,
-            output_crc32: None,
-            crc_ok: None,
-            status: 0,
-            mtime_ns: metadata_mtime_ns(&metadata),
-            magic: Vec::new(),
-        });
     }
+}
+
+pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    metadata.file_type().is_symlink()
 }
 
 fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
@@ -1264,18 +1028,15 @@ fn scan_directory_views(
     max_depth: Option<usize>,
     options: &DirectoryScanOptions,
 ) -> std::io::Result<DirectoryScanRecords> {
-    scan_directory_impl::<false>(root_path, max_depth, options, true, None, None)
+    scan_directory_impl(root_path, max_depth, options, None)
 }
 
-fn scan_directory_impl<const PROFILE: bool>(
+fn scan_directory_impl(
     root_path: &str,
     max_depth: Option<usize>,
     options: &DirectoryScanOptions,
-    collect_raw: bool,
-    mut profile: Option<&mut DirectoryScanProfile>,
     known_metadata: Option<fs::Metadata>,
 ) -> std::io::Result<DirectoryScanRecords> {
-    let scan_started = PROFILE.then(Instant::now);
     let root = PathBuf::from(root_path);
     let filter_root = options
         .scope
@@ -1294,11 +1055,6 @@ fn scan_directory_impl<const PROFILE: bool>(
         }
     };
     if metadata.is_none() {
-        if PROFILE {
-            if let Some(profile) = profile.as_deref_mut() {
-                profile.scan_total = scan_started.map_or(Duration::ZERO, |start| start.elapsed());
-            }
-        }
         return Ok(DirectoryScanRecords {
             filtered: Vec::new(),
             raw: Vec::new(),
@@ -1359,20 +1115,9 @@ fn scan_directory_impl<const PROFILE: bool>(
         };
         let accepted = eligible && numeric_ranges_allow(&options.size_ranges, Some(size));
         let filtered = if accepted { vec![0] } else { Vec::new() };
-        let raw = if collect_raw || accepted {
-            vec![record]
-        } else {
-            Vec::new()
-        };
-        if PROFILE {
-            if let Some(profile) = profile.as_deref_mut() {
-                profile.scan_total = scan_started.map_or(Duration::ZERO, |start| start.elapsed());
-                filter_scratch.record_memory(options, profile);
-            }
-        }
         return Ok(DirectoryScanRecords {
             filtered,
-            raw,
+            raw: vec![record],
             errors,
         });
     }
@@ -1399,31 +1144,15 @@ fn scan_directory_impl<const PROFILE: bool>(
     }
     let mut stack = vec![(root.clone(), start_depth)];
     while let Some((dir, depth)) = stack.pop() {
-        let read_dir =
-            match measure::<PROFILE, _>(&mut profile, ProfileBucket::DirectoryEnumeration, || {
-                fs::read_dir(&dir)
-            }) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    errors.push(&dir, "read_dir", error);
-                    continue;
-                }
-            };
-        if PROFILE {
-            if let Some(profile) = profile.as_deref_mut() {
-                profile.directories_opened += 1;
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                errors.push(&dir, "read_dir", error);
+                continue;
             }
-        }
+        };
         let mut child_dirs = Vec::new();
-        let mut read_dir = read_dir;
-        loop {
-            let item =
-                measure::<PROFILE, _>(&mut profile, ProfileBucket::DirectoryEnumeration, || {
-                    read_dir.next()
-                });
-            let Some(item) = item else {
-                break;
-            };
+        for item in read_dir {
             let entry = match item {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -1431,15 +1160,7 @@ fn scan_directory_impl<const PROFILE: bool>(
                     continue;
                 }
             };
-            if PROFILE {
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.entries_seen += 1;
-                }
-            }
-            let path =
-                measure::<PROFILE, _>(&mut profile, ProfileBucket::DirectoryEnumeration, || {
-                    entry.path()
-                });
+            let path = entry.path();
             if exclusion_scope.is_some_and(|scope| scope.excludes(&path.to_string_lossy())) {
                 continue;
             }
@@ -1454,61 +1175,31 @@ fn scan_directory_impl<const PROFILE: bool>(
             if outside_relation && entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 continue;
             }
-            let metadata =
-                match measure::<PROFILE, _>(&mut profile, ProfileBucket::MetadataReads, || {
-                    entry.metadata()
-                }) {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        errors.push(&path, "metadata", error);
-                        continue;
-                    }
-                };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    errors.push(&path, "metadata", error);
+                    continue;
+                }
+            };
             #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                if metadata.file_attributes() & 0x400 != 0 {
-                    continue;
-                }
+            if is_reparse_point(&metadata) {
+                continue;
             }
-            if PROFILE {
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.metadata_read_count += 1;
-                }
-            }
-
             if metadata.is_dir() {
-                let rejected =
-                    measure::<PROFILE, _>(&mut profile, ProfileBucket::PathMatching, || {
-                        max_depth.is_some_and(|limit| depth >= limit)
-                            || dir_rejected(&path, filter_root, options, &mut filter_scratch)
-                    });
-                if collect_raw || !rejected {
-                    raw_records.push(DirectoryEntryRecord {
-                        path: path_to_string(&path),
-                        is_dir: true,
-                        size: None,
-                        mtime_ns: None,
-                        relation_member_eligible: false,
-                        relation_anchor: None,
-                    });
-                }
-                if rejected {
-                    if PROFILE {
-                        if let Some(profile) = profile.as_deref_mut() {
-                            profile.pruned_directories += 1;
-                        }
-                    }
-                    continue;
-                }
-                measure::<PROFILE, _>(&mut profile, ProfileBucket::RecordBuilding, || {
+                let rejected = max_depth.is_some_and(|limit| depth >= limit)
+                    || dir_rejected(&path, filter_root, options, &mut filter_scratch);
+                raw_records.push(DirectoryEntryRecord {
+                    path: path_to_string(&path),
+                    is_dir: true,
+                    size: None,
+                    mtime_ns: None,
+                    relation_member_eligible: false,
+                    relation_anchor: None,
+                });
+                if !rejected {
                     records.push(raw_records.len() - 1);
                     child_dirs.push(path);
-                });
-                if PROFILE {
-                    if let Some(profile) = profile.as_deref_mut() {
-                        profile.accepted_entries += 1;
-                    }
                 }
                 continue;
             }
@@ -1518,70 +1209,38 @@ fn scan_directory_impl<const PROFILE: bool>(
 
             let size = metadata.len();
             let mtime_ns = metadata_mtime_ns(&metadata);
-            let hard_rejected =
-                measure::<PROFILE, _>(&mut profile, ProfileBucket::PathMatching, || {
-                    !metadata.is_file()
-                        || file_rejected_by_path(&path, filter_root, options, &mut filter_scratch)
-                        || !numeric_ranges_allow(&options.mtime_ranges, mtime_ns)
-                });
-            let split_family_keys = if hard_rejected || options.size_ranges.is_empty() {
+            let hard_rejected = !metadata.is_file()
+                || file_rejected_by_path(&path, filter_root, options, &mut filter_scratch)
+                || !numeric_ranges_allow(&options.mtime_ranges, mtime_ns);
+            let raw_file_index = raw_records.len();
+            raw_records.push(DirectoryEntryRecord {
+                path: path_to_string(&path),
+                is_dir: false,
+                size: Some(size),
+                mtime_ns,
+                relation_member_eligible: !hard_rejected,
+                relation_anchor: None,
+            });
+            if hard_rejected {
+                continue;
+            }
+            let split_family_keys = if options.size_ranges.is_empty() {
                 Vec::new()
             } else {
                 crate::relations::relations_size_filter_split_family_keys(
-                    path.to_string_lossy().as_ref(),
+                    &raw_records[raw_file_index].path,
                 )
             };
-            let size_accepted = numeric_ranges_allow(&options.size_ranges, Some(size));
-            let raw_file_index = raw_records.len();
-            if collect_raw || (!hard_rejected && (size_accepted || !split_family_keys.is_empty())) {
-                measure::<PROFILE, _>(&mut profile, ProfileBucket::RecordBuilding, || {
-                    raw_records.push(DirectoryEntryRecord {
-                        path: path_to_string(&path),
-                        is_dir: false,
-                        size: Some(size),
-                        mtime_ns,
-                        relation_member_eligible: !hard_rejected,
-                        relation_anchor: None,
-                    });
-                });
-            }
-            if hard_rejected {
-                if PROFILE {
-                    if let Some(profile) = profile.as_deref_mut() {
-                        profile.rejected_files += 1;
-                    }
-                }
-                continue;
-            }
-            if !size_accepted {
-                if split_family_keys.is_empty() {
-                    if PROFILE {
-                        if let Some(profile) = profile.as_deref_mut() {
-                            profile.rejected_files += 1;
-                        }
-                    }
-                } else {
-                    size_deferred_split_records.push((raw_file_index, split_family_keys));
-                }
-                continue;
-            }
-            size_accepted_split_families.extend(split_family_keys);
-            measure::<PROFILE, _>(&mut profile, ProfileBucket::RecordBuilding, || {
+            if numeric_ranges_allow(&options.size_ranges, Some(size)) {
+                size_accepted_split_families.extend(split_family_keys);
                 records.push(raw_file_index);
-            });
-            if PROFILE {
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.accepted_entries += 1;
-                }
+            } else if !split_family_keys.is_empty() {
+                size_deferred_split_records.push((raw_file_index, split_family_keys));
             }
         }
 
-        measure::<PROFILE, _>(&mut profile, ProfileBucket::TraversalOverhead, || {
-            child_dirs.sort();
-            for child in child_dirs.into_iter().rev() {
-                stack.push((child, depth + 1));
-            }
-        });
+        child_dirs.sort();
+        stack.extend(child_dirs.into_iter().rev().map(|child| (child, depth + 1)));
     }
     for (record, family_keys) in size_deferred_split_records {
         if family_keys
@@ -1589,21 +1248,6 @@ fn scan_directory_impl<const PROFILE: bool>(
             .any(|key| size_accepted_split_families.contains(key))
         {
             records.push(record);
-            if PROFILE {
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.accepted_entries += 1;
-                }
-            }
-        } else if PROFILE {
-            if let Some(profile) = profile.as_deref_mut() {
-                profile.rejected_files += 1;
-            }
-        }
-    }
-    if PROFILE {
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.scan_total = scan_started.map_or(Duration::ZERO, |start| start.elapsed());
-            filter_scratch.record_memory(options, profile);
         }
     }
     Ok(DirectoryScanRecords {
@@ -1618,20 +1262,6 @@ struct PathFilterScratch {
     whitelist: Vec<PathRuleScratch>,
 }
 impl PathFilterScratch {
-    fn record_memory(&self, options: &DirectoryScanOptions, profile: &mut DirectoryScanProfile) {
-        profile.regex_compiled_bytes = options
-            .blacklist_rules
-            .iter()
-            .chain(&options.whitelist_rules)
-            .map(|r| r.regex_memory_usage())
-            .sum();
-        profile.regex_cache_bytes = self
-            .blacklist
-            .iter()
-            .chain(&self.whitelist)
-            .map(|s| s.regex_memory_usage())
-            .sum();
-    }
     fn new(options: &DirectoryScanOptions) -> Self {
         Self {
             blacklist: options
@@ -2043,6 +1673,20 @@ impl NativeWatchCatalog {
             .map(|row| row.path())
             .collect()
     }
+
+    pub(crate) fn path_is_directory(
+        &self,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        path: &str,
+    ) -> Option<bool> {
+        self.catalogs
+            .lock()
+            .unwrap()
+            .get(&crate::path_keys::path_key(&scope.root))?
+            .rows
+            .get(crate::path_keys::path_key(path).as_str())
+            .map(CatalogRow::is_dir)
+    }
     pub(crate) fn retain_roots(&self, roots: Vec<String>) {
         self.recovery_ids.lock().unwrap().clear();
         let keys: HashSet<_> = roots
@@ -2248,7 +1892,7 @@ impl NativeWatchCatalog {
 }
 
 impl NativeWatchCatalog {
-    pub(crate) fn stamp(
+    fn stamp(
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
     ) -> Option<super::catalog_store::Stamp> {
@@ -2262,7 +1906,7 @@ impl NativeWatchCatalog {
             cursor: None,
         })
     }
-    pub(crate) fn persist(
+    fn persist(
         &self,
         tables: &HashMap<String, ScopeCatalog>,
         delta: super::catalog_store::DeltaView<'_>,
@@ -2333,14 +1977,9 @@ fn update_catalog(
             }
         } else {
             match &metadata {
-                Ok(metadata) => scan_directory_impl::<false>(
-                    target,
-                    scope.max_depth,
-                    &options,
-                    true,
-                    None,
-                    Some(metadata.clone()),
-                )?,
+                Ok(metadata) => {
+                    scan_directory_impl(target, scope.max_depth, &options, Some(metadata.clone()))?
+                }
                 Err(error) => {
                     let mut errors = DirectoryReadErrors::new(Path::new(target));
                     if error.kind() != std::io::ErrorKind::NotFound {

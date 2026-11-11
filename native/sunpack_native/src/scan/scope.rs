@@ -15,7 +15,11 @@ impl NativeDiscoveryScope {
         !self.excluded.is_empty()
     }
 
-    fn contains_key(&self, key: &str) -> bool {
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
         if key == self.key {
             return !self.excluded.contains(key);
         }
