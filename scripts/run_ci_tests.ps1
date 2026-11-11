@@ -38,7 +38,7 @@ function Invoke-TestStep {
     }
 
     $startTime = Get-Date
-    & $Command[0] $argsList
+    & $Command[0] @argsList
     $exitCode = $LASTEXITCODE
     $duration = ((Get-Date) - $startTime).TotalSeconds
 

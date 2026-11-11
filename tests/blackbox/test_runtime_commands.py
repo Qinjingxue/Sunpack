@@ -4,6 +4,8 @@ import os
 import subprocess
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 
 import psutil
@@ -98,6 +100,64 @@ def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
     path.unlink()
     assert package.json("passwords")["items"][0]["builtin_passwords"] == []
     assert not path.exists()
+
+
+def test_concurrent_cold_start_clients_share_one_runtime(package):
+    # Unlike warm concurrent requests, this starts every launcher with no state
+    # file. A losing bootstrap child must not make its client fail.
+    package.configure(performance={"persistent_server_idle_seconds": 60})
+    for _ in range(3):
+        assert package.run("--persistent-shutdown").returncode == 0
+        for state in package.data.glob("runtime-*.state"):
+            try:
+                psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3])).wait(timeout=10)
+            except (FileNotFoundError, psutil.NoSuchProcess):
+                pass
+        gate = Barrier(8)
+
+        def show_config(_):
+            gate.wait(timeout=10)
+            return package.json("config", "show", timeout=30)
+
+        with ThreadPoolExecutor(max_workers=8) as clients:
+            reports = list(clients.map(show_config, range(8)))
+        assert all(report["items"][0]["cli"]["language"] == "en" for report in reports)
+        state, = package.data.glob("runtime-*.state")
+        assert psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3])).is_running()
+
+
+def test_cold_start_releases_startup_ownership_before_prompt_completion(package):
+    assert package.run("--persistent-shutdown").returncode == 0
+    for state in package.data.glob("runtime-*.state"):
+        try:
+            psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3])).wait(timeout=10)
+        except (FileNotFoundError, psutil.NoSuchProcess):
+            pass
+    prompt = subprocess.Popen(
+        [str(package.launcher), "passwords", "--ask-pw", "--no-bpw"],
+        cwd=package.data, env=package.env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        # Its pending stdin keeps the first command alive while a second client
+        # must still be able to connect and finish through the same host.
+        with ThreadPoolExecutor(max_workers=1) as reader:
+            first_output = reader.submit(prompt.stdout.read, 1)
+            try:
+                assert first_output.result(timeout=15)
+                assert prompt.poll() is None
+                assert package.json("config", "show", timeout=15)["items"]
+                prompt.stdin.write(b"\n")
+                prompt.stdin.flush()
+            except BaseException:
+                prompt.kill()  # Unblock the reader before its executor joins.
+                raise
+        _, error = prompt.communicate(timeout=15)
+        assert prompt.returncode == 0, error
+    finally:
+        if prompt.poll() is None:
+            prompt.kill()
+            prompt.communicate(timeout=10)
 
 
 def test_existing_runtime_uses_latest_archive_request_idle_setting(package, tmp_path):

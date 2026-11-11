@@ -199,6 +199,26 @@ fn defaults() -> &'static Value {
     DEFAULT.get_or_init(|| serde_json::from_str(DEFAULTS).expect("valid built-in configuration"))
 }
 
+// Include absent candidates: a deletion must not unsubscribe its recreation,
+// and a new higher-priority config must supersede the current source.
+pub(crate) fn watch_paths(cwd: &Path, sources: &ConfigSources) -> Vec<PathBuf> {
+    let roots = resources::resource_roots(cwd);
+    let mut paths: Vec<_> = roots.iter().map(|root| root.join(ADVANCED)).collect();
+    if resources::package_root().is_some() {
+        if let Ok(root) = resources::program_data_dir() {
+            paths.push(root.join(SIMPLE));
+        }
+    } else {
+        paths.extend(roots.iter().map(|root| root.join(SIMPLE)));
+    }
+    paths.extend(sources.simple.iter().cloned());
+    paths.extend(sources.advanced.iter().cloned());
+    paths.extend(sources.override_file.iter().cloned());
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
 fn resolve_sources(cwd: &Path) -> ConfigSources {
     let roots = resources::resource_roots(cwd);
     let search = |name| {

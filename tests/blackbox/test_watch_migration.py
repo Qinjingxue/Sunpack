@@ -129,14 +129,39 @@ def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(pack
     assert b"fresh generation" in [path.read_bytes() for path in output.rglob("source.txt")]
 
 
-def test_cancelled_watch_generation_is_durable_before_worker_stops(package, tmp_path):
+@pytest.mark.parametrize("cancel_before_crash", [False, True], ids=["interrupted", "cancelled"])
+def test_watch_hard_crash_recovers_pending_work_but_preserves_cancellation(package, tmp_path, cancel_before_crash):
     watched = tmp_path / "watched"
     watched.mkdir()
     output = tmp_path / "out"
-    incoming = tmp_path / "incoming.zip"
+    incoming = tmp_path / ("incoming.zip" if cancel_before_crash else "incoming.opaque")
     source = watched / incoming.name
-    _zip(incoming, "payload.txt", b"cancelled generation")
-    package.json("watch", "add", watched, "-o", output)
+    _zip(incoming, "payload.txt", b"original generation")
+    nested_content = random.Random(73).randbytes(4500)
+    if not cancel_before_crash:
+        # Main's former process-death matrix covered disguise, carriers, nested
+        # archives, encryption and volumes separately. Combine these in one
+        # recovery path rather than repeat the expensive process setup five times.
+        fixtures = tmp_path / "fixtures"
+        fixtures.mkdir()
+        payload = fixtures / "nested-payload.bin"
+        payload.write_bytes(nested_content)
+        subprocess.run(
+            [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-mhe=on",
+             "-pcrash-key", "-v1k", str(fixtures / "nested.data"), payload.name],
+            cwd=fixtures, check=True, capture_output=True,
+        )
+        parts = sorted(fixtures.glob("nested.data.*"))
+        assert len(parts) >= 3
+        with zipfile.ZipFile(incoming, "a") as archive:
+            for part in parts:
+                archive.write(part, part.name)
+        incoming.write_bytes(b"carrier prefix" + incoming.read_bytes() + b"carrier suffix")
+        (package.data / "builtin_passwords.json").write_text(
+            json.dumps({"passwords": [{"value": "crash-key"}]}), encoding="utf-8",
+        )
+        package.configure(recursive_extract="*")
+    package.json("watch", "add", watched, "-o", output, "--deep-detect")
     package.json("watch", "start", "--no-tray")
     worker = _staged_worker(package, tmp_path)
     owner = worker.parent()
@@ -155,15 +180,20 @@ def test_cancelled_watch_generation_is_durable_before_worker_stops(package, tmp_
                       if row["event"] == "pipeline_request_started"), None)
         return batch is not None
 
-    # Hold the worker so a crash immediately after cancellation cannot be
-    # mistaken for a normally completed cleanup or ordinary Watch shutdown.
+    # Hold the worker so hard process death (with or without prior cancellation)
+    # cannot be mistaken for completed cleanup or an ordinary Watch shutdown.
     worker.suspend()
     owner_stopped = False
     try:
         incoming.replace(source)
         _wait_for(admitted, "Watch did not admit the archive before cancellation")
-        cancel = package.run("--cancel-watch-batch", batch)
-        assert cancel.returncode == 0, (cancel.stdout, cancel.stderr)
+        # An uncommitted output must be removed on replay, not adopted as a
+        # completed extraction or left as an orphan beside the retried output.
+        partial = output / "incoming" / "uncommitted.txt"
+        partial.write_bytes(b"incomplete output")
+        if cancel_before_crash:
+            cancel = package.run("--cancel-watch-batch", batch)
+            assert cancel.returncode == 0, (cancel.stdout, cancel.stderr)
         owner.kill()
         owner.wait(timeout=30)
         owner_stopped = True
@@ -180,7 +210,22 @@ def test_cancelled_watch_generation_is_durable_before_worker_stops(package, tmp_
 
     package.json("watch", "start", "--once", "--no-tray")
     assert source.is_file()
-    assert not list(output.rglob("payload.txt"))
+    assert not list(output.rglob("uncommitted.txt"))
+    expected = [] if cancel_before_crash else [b"original generation"]
+    assert [path.read_bytes() for path in output.rglob("payload.txt")] == expected
+    if not cancel_before_crash:
+        nested_outputs = list(output.rglob("nested-payload.bin"))
+        assert len(nested_outputs) == 1
+        assert nested_outputs[0].read_bytes() == nested_content
+        assert not list(output.rglob("nested.data.*"))
+        assert not list(watched.glob("nested.data.*"))
+        # A second fresh runtime must not replay the recovered generation again.
+        assert package.run("--persistent-shutdown").returncode == 0
+        package.json("watch", "start", "--once", "--no-tray")
+        assert [path.read_bytes() for path in output.rglob("payload.txt")] == expected
+        assert list(output.rglob("nested-payload.bin")) == nested_outputs
+        assert nested_outputs[0].read_bytes() == nested_content
+        return
     _zip(incoming, "payload.txt", b"replacement generation")
     incoming.replace(source)
     package.json("watch", "start", "--once", "--no-tray")

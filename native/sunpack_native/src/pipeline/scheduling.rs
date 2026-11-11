@@ -5,7 +5,7 @@ use super::{Cancellation, Origin};
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -137,7 +137,13 @@ impl Scheduler {
         let (tx, rx) = mpsc::channel();
         let (signals, ready) = mpsc::channel::<Signal>();
         let signal_tx = signals.clone();
-        let spawner = Spawner { tx, signals };
+        let spawner = Spawner {
+            tx,
+            signals,
+            // Match main's request-level consumer budget. Rayon limits polls;
+            // this separately bounds retained recursive consumer futures.
+            consumers: Arc::new(AtomicUsize::new(4096.max(self.capacity))),
+        };
         let mut result = spawner.spawn(run(spawner.clone()));
         let mut tasks = HashMap::new();
         let mut next_id = 0;
@@ -283,6 +289,18 @@ pub(super) type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub(super) struct Spawner<'a> {
     tx: mpsc::Sender<Task<'a, ()>>,
     signals: mpsc::Sender<Signal>,
+    consumers: Arc<AtomicUsize>,
+}
+
+struct ConsumerReservation {
+    available: Arc<AtomicUsize>,
+    count: usize,
+}
+
+impl Drop for ConsumerReservation {
+    fn drop(&mut self) {
+        self.available.fetch_add(self.count, Ordering::AcqRel);
+    }
 }
 
 type ResultCell<T> = Arc<Mutex<(Option<T>, Option<Waker>)>>;
@@ -309,6 +327,67 @@ impl<T> Join<T> {
 }
 
 impl<'a> Spawner<'a> {
+    /// Consume a batch using a shared request-level budget, as the original
+    /// coordinator did. A recursive batch with no free consumers runs inline
+    /// in its parent, so parents never wait for admission held by themselves.
+    /// Each consumer takes the next item immediately after finishing its own;
+    /// a slow early item cannot stall admission of the rest of the batch.
+    pub(super) fn bounded_map<I, T, F>(&self, items: Vec<I>, operation: F) -> Task<'a, Vec<T>>
+    where
+        I: Send + 'a,
+        T: Send + 'a,
+        F: Fn(I) -> Task<'a, T> + Send + Sync + 'a,
+    {
+        let spawner = self.clone();
+        Box::pin(async move {
+            let available = spawner.consumers.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |available| Some(available.saturating_sub(items.len())),
+            ).unwrap();
+            let count = available.min(items.len());
+            let _reservation = ConsumerReservation {
+                available: Arc::clone(&spawner.consumers),
+                count,
+            };
+            if count == 0 {
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    results.push(operation(item).await);
+                }
+                return results;
+            }
+            let results = Arc::new(Mutex::new(
+                std::iter::repeat_with(|| None).take(items.len()).collect::<Vec<Option<T>>>(),
+            ));
+            let remaining = Arc::new(Mutex::new(items.into_iter().enumerate()));
+            let operation = Arc::new(operation);
+            let mut consumers = Vec::with_capacity(count);
+            for _ in 0..count {
+                let remaining = Arc::clone(&remaining);
+                let operation = Arc::clone(&operation);
+                let results = Arc::clone(&results);
+                consumers.push(spawner.spawn(Box::pin(async move {
+                    loop {
+                        // Never hold the iterator mutex across an await.
+                        let next = remaining.lock().unwrap().next();
+                        let Some((index, item)) = next else { break };
+                        let result = operation(item).await;
+                        results.lock().unwrap()[index] = Some(result);
+                    }
+                })));
+            }
+            for consumer in consumers {
+                consumer.wait().await;
+            }
+            // Keep discovery-order aggregation and first-error behavior in
+            // linear time, without retaining a result vector for each worker.
+            // Every consumer has joined, so all indexed slots are initialized.
+            let results = std::mem::take(&mut *results.lock().unwrap());
+            results.into_iter().map(|result| result.expect("consumer produced a result")).collect()
+        })
+    }
+
     pub(super) fn spawn<T: Send + 'a>(&self, future: Task<'a, T>) -> Join<T> {
         let cell = Arc::new(Mutex::new((None, None::<Waker>)));
         let receiver = Arc::clone(&cell);
@@ -386,6 +465,49 @@ mod tests {
         assert_eq!(watch.join().unwrap(), 42);
         foreground.join().unwrap();
         independent.expect("foreground needed a host slot held by suspended Watch work");
+    }
+
+    #[test]
+    fn bounded_consumers_drain_past_slow_items_and_recurse_inline() {
+        // Two consumers, more items than permits: item zero cannot finish
+        // until a later item runs. Nested work must not await another permit.
+        let scheduler = single_slot();
+        let results = scheduler.run(1, Origin::Foreground, &Cancellation::new(), |spawner| {
+            Box::pin(async move {
+                spawner.consumers.store(2, Ordering::Release);
+                let gate = Arc::new(Mutex::new((false, None::<Waker>)));
+                let children = spawner.clone();
+                let results = spawner.bounded_map((0..8).collect(), move |item| {
+                    let gate = Arc::clone(&gate);
+                    let children = children.clone();
+                    Box::pin(async move {
+                        assert_eq!(children.consumers.load(Ordering::Acquire), 0);
+                        if item == 0 {
+                            poll_fn(|cx| {
+                                let mut gate = gate.lock().unwrap();
+                                if gate.0 { Poll::Ready(()) } else {
+                                    gate.1 = Some(cx.waker().clone());
+                                    Poll::Pending
+                                }
+                            }).await;
+                        } else if item == 1 {
+                            let nested = children.bounded_map(vec![10, 11], |value| {
+                                Box::pin(async move { value })
+                            }).await;
+                            assert_eq!(nested, [10, 11]);
+                        } else if item == 2 {
+                            let mut gate = gate.lock().unwrap();
+                            gate.0 = true;
+                            if let Some(waker) = gate.1.take() { waker.wake(); }
+                        }
+                        item
+                    })
+                }).await;
+                assert_eq!(spawner.consumers.load(Ordering::Acquire), 2);
+                results
+            })
+        });
+        assert_eq!(results, (0..8).collect::<Vec<_>>());
     }
 
     #[test]

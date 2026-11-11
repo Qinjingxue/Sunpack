@@ -42,7 +42,7 @@ sunpack w st
 | `--pause` | 命令结束后等待按键退出。 |
 | `--no-pause` | 命令结束后不暂停。 |
 
-`extract` 和 `scan` 使用高进程优先级。共享运行时达到 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`）后，恢复配置中的 `runtime.process_mode`。
+`extract` 和 `scan` 在有前台归档请求运行期间使用高进程优先级。最后一个前台请求结束后，共享运行时和原生 worker 立即恢复配置中的 `runtime.process_mode`。Watch 缓存清理仍独立遵循 `watch.runtime_cache_cleanup_idle_seconds`。
 
 `passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
 

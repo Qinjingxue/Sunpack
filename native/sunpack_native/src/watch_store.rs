@@ -1019,7 +1019,8 @@ impl NativeWatchState {
         let identity = (|| -> std::io::Result<Option<String>> {
             let path = Path::new(&output);
             if register {
-                crate::scan::scope::create_output_root_exclusive(path)?;
+                crate::scan::scope::create_output_root_exclusive(path)
+                    .map_err(crate::pipeline::OutputCreateError::wrap)?;
             } else if keep.is_none() {
                 std::fs::create_dir_all(path)?;
             }

@@ -370,3 +370,24 @@ pub(crate) fn launch_unelevated(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreground_priority_restores_only_after_the_last_request() {
+        // Pure policy check: no global process-priority changes and no sleeps.
+        // Cache maintenance must not control the lifetime of this override.
+        let mut policy = PriorityPolicy { configured: ProcessMode::Background, foreground: 2 };
+        assert_eq!(policy.effective(), ProcessMode::High);
+        policy.foreground -= 1;
+        assert_eq!(policy.effective(), ProcessMode::High);
+        policy.configured = ProcessMode::Normal;
+        assert_eq!(policy.effective(), ProcessMode::High);
+        policy.foreground -= 1;
+        assert_eq!(policy.effective(), ProcessMode::Normal);
+        policy.configured = ProcessMode::Background;
+        assert_eq!(policy.effective(), ProcessMode::Background);
+    }
+}

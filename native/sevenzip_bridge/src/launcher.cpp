@@ -267,6 +267,32 @@ std::wstring state_path(const InstallContext& context) {
     return std::wstring(program_data.data(), length) + L"\\SunPack\\runtime-" + wide_utf8(context.runtime_id) + L".state";
 }
 
+// Serialize only endpoint startup, never command execution. A readiness event
+// replaces polling and is signalled after the server has armed its first pipe.
+struct RuntimeStartup {
+    HANDLE mutex = nullptr;
+    HANDLE ready = nullptr;
+    bool held = false;
+
+    explicit RuntimeStartup(const InstallContext& context) {
+        const std::wstring prefix = L"Global\\SunPack-" + wide_utf8(context.runtime_id);
+        mutex = CreateMutexW(nullptr, FALSE, (prefix + L"-startup").c_str());
+        ready = CreateEventW(nullptr, TRUE, FALSE, (prefix + L"-ready").c_str());
+        if (mutex && ready) {
+            const DWORD result = WaitForSingleObject(mutex, INFINITE);
+            held = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+        }
+    }
+    void release() {
+        if (held) { ReleaseMutex(mutex); held = false; }
+    }
+    ~RuntimeStartup() {
+        release();
+        if (ready) CloseHandle(ready);
+        if (mutex) CloseHandle(mutex);
+    }
+};
+
 bool parse_state(const InstallContext& context, std::wstring& pipe_name,
                  std::array<unsigned char, 32>& token, std::string& runtime_build_id) {
     std::ifstream stream(state_path(context));
@@ -510,7 +536,7 @@ public:
 };
 
 RequestOutcome request(const InstallContext& context, const std::vector<std::wstring>& arguments, bool shutdown,
-                       int& exit_code, const std::wstring& request_cwd) {
+                       int& exit_code, const std::wstring& request_cwd, RuntimeStartup* startup = nullptr) {
     std::wstring pipe_name;
     std::array<unsigned char, 32> token{};
     std::string runtime_build_id;
@@ -518,6 +544,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     const HANDLE pipe = connect_pipe(pipe_name);
     if (pipe == INVALID_HANDLE_VALUE) return RequestOutcome::NotDelivered;
     const std::unique_ptr<void, decltype(&CloseHandle)> pipe_owner(pipe, CloseHandle);
+    if (startup) startup->release();
 
     const std::string cwd = utf8(request_cwd);
     if (cwd.size() > kMaxFieldBytes) {
@@ -732,23 +759,30 @@ int wmain(int argc, wchar_t** argv) {
     int code = 1;
     RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd);
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
+        RuntimeStartup startup(context);
+        if (startup.held) {
+            // Another launcher may have completed startup while we waited.
+            outcome = request(context, request_arguments, false, code, invocation_cwd, &startup);
+        }
         const std::string language = cli_language_from_config(launcher_cwd);
         DWORD spawn_error = ERROR_SUCCESS;
         HANDLE runtime_process = nullptr;
         DWORD runtime_exit_code = STILL_ACTIVE;
         bool runtime_failed = false;
-        if (spawn_runtime(context, {L"--persistent-server"}, true, nullptr, &spawn_error, &runtime_process)) {
-            while (outcome == RequestOutcome::NotDelivered) {
-                if (runtime_process != nullptr && WaitForSingleObject(runtime_process, 0) == WAIT_OBJECT_0) {
+        if (outcome == RequestOutcome::NotDelivered && startup.held) {
+            ResetEvent(startup.ready);
+            if (spawn_runtime(context, {L"--persistent-server"}, true, nullptr, &spawn_error, &runtime_process)) {
+                const HANDLE handles[] = {startup.ready, runtime_process};
+                const DWORD ready = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                outcome = request(context, request_arguments, false, code, invocation_cwd, &startup);
+                if (outcome == RequestOutcome::NotDelivered && ready == WAIT_OBJECT_0 + 1) {
                     GetExitCodeProcess(runtime_process, &runtime_exit_code);
                     runtime_failed = true;
-                    break;
                 }
-                Sleep(25);
-                outcome = request(context, request_arguments, false, code, invocation_cwd);
+                CloseHandle(runtime_process);
             }
-            if (runtime_process != nullptr) CloseHandle(runtime_process);
-        } else {
+        }
+        if (spawn_error != ERROR_SUCCESS) {
             std::string startup_error = localized_value(
                 language,
                 kRuntimeLaunchFailedEn,

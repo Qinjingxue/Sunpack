@@ -237,6 +237,29 @@ pub struct CleanupResult {
     pub message: String,
 }
 
+/// An output directory could not be created; unlike a journal failure this
+/// belongs to the individual archive, not the whole request.
+#[derive(Debug)]
+pub(crate) struct OutputCreateError(pub io::Error);
+
+impl OutputCreateError {
+    pub(crate) fn wrap(error: io::Error) -> io::Error {
+        io::Error::new(error.kind(), Self(error))
+    }
+}
+
+impl std::fmt::Display for OutputCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for OutputCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct OutputCleanupError {
     pub path: PathBuf,
@@ -434,7 +457,7 @@ pub(crate) trait Observer: Sync {
 
     fn register_output(&self, archive: &ArchiveResult, output: &Path) -> io::Result<()> {
         self.before_output(archive, output)?;
-        crate::scan::scope::create_output_root_exclusive(output)
+        crate::scan::scope::create_output_root_exclusive(output).map_err(OutputCreateError::wrap)
     }
 
     fn before_cleanup(&self, _archive: &ArchiveResult) -> io::Result<()> {

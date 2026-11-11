@@ -207,6 +207,7 @@ impl Drop for BrokerLease {
 }
 
 pub(super) struct Watch {
+    lifecycle: Mutex<()>,
     running: Mutex<Option<Running>>,
     wake_host: Arc<dyn Fn() + Send + Sync>,
     external: Arc<Mutex<Option<ExternalOutputs>>>,
@@ -222,6 +223,7 @@ struct ExternalOutputs {
 impl Watch {
     pub(super) fn new(wake_host: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
+            lifecycle: Mutex::new(()),
             running: Mutex::default(),
             wake_host,
             external: Arc::default(),
@@ -256,6 +258,7 @@ impl Watch {
     }
 
     pub(super) fn start(&self, cwd: &Path, engine: Arc<Engine>, tray: bool) -> io::Result<Value> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         let mut slot = self.running.lock().unwrap();
         if slot
             .as_ref()
@@ -307,11 +310,13 @@ impl Watch {
     }
 
     pub(super) fn stop(&self) -> io::Result<Value> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         let mut slot = self.running.lock().unwrap();
         let generation = self.generation.load(Ordering::Relaxed);
         let Some(running) = slot.take() else {
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
         };
+        drop(slot);
         if running.thread.is_finished() {
             let _ = running.thread.join();
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
@@ -326,15 +331,18 @@ impl Watch {
     }
 
     pub(super) fn run_once(&self, cwd: &Path, engine: Arc<Engine>) -> io::Result<i32> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         let slot = self.running.lock().unwrap();
         if let Some(run) = slot.as_ref().filter(|run| !run.thread.is_finished()) {
             let hub = Arc::clone(&run.hub);
             drop(slot);
+            drop(_lifecycle);
             let (send, receive) = mpsc::sync_channel(1);
             hub.update(|signals| signals.once.push(send));
             receive.recv().map_err(io::Error::other)??;
             return Ok(0);
         }
+        drop(slot);
         let mut scheduler = Scheduler::open(
             cwd.to_owned(),
             engine,
@@ -526,7 +534,8 @@ impl Watch {
 
     pub(super) fn register_external_output(&self, path: &Path) -> io::Result<()> {
         let journal = self.external_journal(path);
-        crate::scan::scope::create_output_root_exclusive(path)?;
+        crate::scan::scope::create_output_root_exclusive(path)
+            .map_err(crate::pipeline::OutputCreateError::wrap)?;
         if let Some(journal) = journal {
             let text = path.to_string_lossy();
             let identity = output_identity(&text)?;
@@ -820,6 +829,30 @@ fn scope_record(scope: &NativeDiscoveryScope) -> serde_json::Map<String, Value> 
     ])
 }
 
+#[derive(Default)]
+struct ClaimedSources {
+    cancelled: bool,
+    candidates: HashMap<String, Option<WatchCandidateRow>>,
+}
+
+impl ClaimedSources {
+    fn capture(&mut self, members: &[String]) -> io::Result<()> {
+        if self.cancelled {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Watch batch cancelled"));
+        }
+        for member in members {
+            let id = watch_path_key(member);
+            // Cancellation bookkeeping must not fail an unrelated archive.
+            // Retain failed/missing observations too: sampling again on a later
+            // claim could mistake a replacement for this request's generation.
+            self.candidates.entry(id).or_insert_with(|| {
+                watch_candidate_for_path(Path::new(member), None).ok().flatten()
+            });
+        }
+        Ok(())
+    }
+}
+
 struct Active {
     root: String,
     recovery: Option<Arc<Recovery>>,
@@ -828,6 +861,7 @@ struct Active {
     touched: HashSet<String>,
     cancel: Cancellation,
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
+    claimed: Arc<Mutex<ClaimedSources>>,
     toast: Option<super::toast::Activity>,
     thread: JoinHandle<Completed>,
 }
@@ -904,7 +938,7 @@ impl Scheduler {
         let deep_options =
             NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
         let passwords = BuiltinStore::shared(&cwd)?;
-        let config_observers = Self::observe_config(&snapshot, &root_file, passwords.path(), &hub);
+        let config_observers = Self::observe_config(&cwd, &snapshot, &root_file, passwords.path(), &hub)?;
         let mut scheduler = Self {
             cwd,
             root_file,
@@ -955,24 +989,19 @@ impl Scheduler {
     }
 
     fn observe_config(
+        cwd: &Path,
         snapshot: &Snapshot,
         roots: &Path,
         passwords: &Path,
         hub: &Arc<Hub>,
-    ) -> Vec<FileObserver> {
+    ) -> io::Result<Vec<FileObserver>> {
         let mut targets: HashMap<PathBuf, HashMap<String, bool>> = HashMap::new();
-        for path in snapshot
-            .sources
-            .simple
-            .iter()
-            .chain(snapshot.sources.advanced.iter())
-            .chain(snapshot.sources.override_file.iter())
-            .map(PathBuf::as_path)
-            .chain([roots, passwords])
+        let paths = config::watch_paths(cwd, &snapshot.sources);
+        for path in paths.iter().map(PathBuf::as_path).chain([roots, passwords])
         {
-            let Some(parent) = path.parent().and_then(nearest_directory) else {
-                continue;
-            };
+            let parent = path.parent().and_then(nearest_directory).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("No observable configuration directory for {}", path.display()))
+            })?;
             let Some(name) = path
                 .strip_prefix(parent)
                 .ok()
@@ -980,20 +1009,23 @@ impl Scheduler {
             else {
                 continue;
             };
-            targets.entry(parent.to_owned()).or_default().insert(
+            let password = targets.entry(parent.to_owned()).or_default().entry(
                 name.as_os_str().to_string_lossy().to_lowercase(),
-                path == passwords,
-            );
+            ).or_default();
+            *password |= path == passwords;
         }
         targets
             .into_iter()
-            .filter_map(|(dir, files)| {
+            .map(|(dir, files)| {
                 let hub = Arc::clone(hub);
                 FileObserver::start(&dir, false, move |names| {
                     let mut reload = false;
                     let mut passwords = false;
                     let mut affected = |name: &str| match files.get(&name.to_lowercase()) {
-                        Some(true) => passwords = true,
+                        Some(true) => {
+                            passwords = true;
+                            reload = true;
+                        }
                         Some(false) => reload = true,
                         None => {}
                     };
@@ -1013,7 +1045,6 @@ impl Scheduler {
                         });
                     }
                 })
-                .ok()
             })
             .collect()
     }
@@ -1261,7 +1292,7 @@ impl Scheduler {
         let snapshot = config::load_snapshot(&self.cwd)?;
         let options = crate::pipeline::scan_options(&snapshot.config)?;
         let config_observers =
-            Self::observe_config(&snapshot, &self.root_file, self.passwords.path(), &self.hub);
+            Self::observe_config(&self.cwd, &snapshot, &self.root_file, self.passwords.path(), &self.hub)?;
         self.reconcile_roots()?;
         self.journal
             .set_retention(snapshot.config.watch.event_log_retention_days)?;
@@ -1369,6 +1400,11 @@ impl Scheduler {
                 if let Err(error) = &reload {
                     self.journal
                         .log(json!({"event":"watch_reload_failed","error":error.to_string()}));
+                    if self.config_observers.iter().any(|observer| observer.stopping.load(Ordering::Acquire)) {
+                        // Do not advertise a healthy Watch after a failed event
+                        // subscription. Startup/restart can report the real error.
+                        return Err(io::Error::other(format!("Configuration observer recovery failed: {error}")));
+                    }
                 }
                 for waiter in signals.reload_waiters {
                     let _ = waiter.send(
@@ -1528,15 +1564,10 @@ impl Scheduler {
             let mut errors = Vec::new();
             let rebuild = !root.scanned || range.is_none_or(|(_, entries)| entries.is_err());
             if rebuild {
-                let scan =
-                    if (startup || reopened.contains(&id)) && cached.is_none() && root.scanned {
-                        self.scan_options(root.deep)
-                            .catalog_update(&self.catalog, &scope, None)
-                            .map(|errors| (errors, Vec::new()))
-                    } else {
-                        self.scan_options(root.deep)
-                            .catalog_refresh(&self.catalog, &scope, None)
-                    };
+                // Without an inventory there is no evidence that current files
+                // were seen before shutdown. Reconcile every arrival against WAL.
+                let scan = self.scan_options(root.deep)
+                    .catalog_refresh(&self.catalog, &scope, None);
                 match scan {
                     Ok((failures, entries)) => {
                         errors = failures;
@@ -2782,6 +2813,8 @@ impl Scheduler {
             .map(|candidate| PathBuf::from(&candidate.path));
         let groups = Arc::new(Mutex::new(HashMap::new()));
         let worker_groups = Arc::clone(&groups);
+        let claimed = Arc::new(Mutex::new(ClaimedSources::default()));
+        let worker_claimed = Arc::clone(&claimed);
         let worker_cancel = cancel.clone();
         self.journal
             .log(json!({"event":"pipeline_request_started","owner":batch,
@@ -2799,6 +2832,7 @@ impl Scheduler {
                     toast: worker_toast,
                     hub: Arc::clone(&hub),
                     groups: worker_groups,
+                    claimed: worker_claimed,
                     promoted: Mutex::default(),
                 };
                 let result = engine.run_with(request, &observer);
@@ -2835,6 +2869,7 @@ impl Scheduler {
                 touched: HashSet::new(),
                 cancel,
                 groups,
+                claimed,
                 toast,
                 thread,
             },
@@ -2872,33 +2907,19 @@ impl Scheduler {
         if active.thread.is_finished() || active.cancel.cancelled() {
             return false;
         }
-        let mut seen: HashSet<_> = active
-            .inputs
-            .iter()
-            .map(|input| key(Path::new(&input.path)))
-            .collect();
-        let siblings = active
-            .groups
-            .lock()
-            .unwrap()
-            .keys()
-            .filter_map(|path| seen.insert(path.clone()).then(|| path.clone()))
-            .collect::<Vec<_>>();
-        let siblings = siblings
-            .iter()
-            .filter_map(|path| {
-                let previous = self.catalog.observation(path);
-                watch_candidate_for_path(
-                    Path::new(path),
-                    previous.as_ref().map(|row| row.change_usn),
-                )
-                .ok()
-                .flatten()
-            })
-            .collect::<Vec<_>>();
+        let mut claimed = active.claimed.lock().unwrap();
+        claimed.cancelled = true;
+        let inputs: HashSet<_> = active.inputs.iter().map(|input| watch_path_key(&input.path)).collect();
+        let siblings = claimed.candidates.iter()
+            .filter(|(path, _)| !inputs.contains(*path))
+            .filter_map(|(_, candidate)| candidate.as_ref());
         let mut interrupted = crate::watch_store::NativeWatchOperations::empty();
-        for input in active.inputs.iter().chain(&siblings) {
+        for input in active.inputs.iter().chain(siblings) {
             if NativePresence::at(&input.path).is_absent() {
+                continue;
+            }
+            let id = watch_path_key(&input.path);
+            if self.pending.get(&id).is_some_and(|pending| quiet::changed(input, &pending.candidate)) {
                 continue;
             }
             interrupted.put_entry(Arc::new(observed_entry(
@@ -3405,6 +3426,7 @@ struct WatchObserver {
     toast: Option<super::toast::Activity>,
     hub: Arc<Hub>,
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
+    claimed: Arc<Mutex<ClaimedSources>>,
     promoted: Mutex<HashMap<String, Option<WatchCandidateRow>>>,
 }
 
@@ -3603,6 +3625,9 @@ impl Observer for WatchObserver {
             members,
         });
         {
+            let mut claimed = self.claimed.lock().unwrap();
+            // Seal the original generations, never resample on cancellation.
+            claimed.capture(&group.members)?;
             let mut aliases = self.groups.lock().unwrap();
             let mut claims = self.hub.claims.lock().unwrap();
             for member in &group.members {
@@ -3637,7 +3662,8 @@ impl Observer for WatchObserver {
                 } else {
                     // Physical output directories still require an exclusive
                     // reservation when a parent is already excluded from Watch.
-                    crate::scan::scope::create_output_root_exclusive(path)?;
+                    crate::scan::scope::create_output_root_exclusive(path)
+                        .map_err(crate::pipeline::OutputCreateError::wrap)?;
                     Vec::new()
                 };
             state
@@ -3925,6 +3951,82 @@ mod tests {
     use super::*;
     use crate::io::reader::{capture_directory_identity, capture_file_generation};
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
+
+    #[test]
+    fn stopping_watch_allows_worker_foreground_callbacks() {
+        let watch = Arc::new(Watch::new(Arc::new(|| {})));
+        let hub = Arc::new(Hub::new());
+        let worker_hub = Arc::clone(&hub);
+        let worker_watch = Arc::clone(&watch);
+        let worker = thread::spawn(move || {
+            worker_hub.wait(None);
+            worker_watch.foreground_finished();
+            Ok(())
+        });
+        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker });
+        let (send, receive) = mpsc::channel();
+        let stop = thread::spawn(move || {
+            let _ = send.send(watch.stop());
+        });
+        receive.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+        stop.join().unwrap();
+    }
+
+    #[test]
+    fn cancelling_claimed_volumes_preserves_a_replaced_sibling_generation() {
+        let head = crate::test_support::temp_file("cancel_head", b"first volume");
+        let sibling = crate::test_support::temp_file("cancel_sibling", b"old volume");
+        let late = sibling.with_extension("late");
+        let unreadable = format!("{}\0", head.display());
+        let members = vec![
+            head.to_string_lossy().into_owned(),
+            sibling.to_string_lossy().into_owned(),
+            late.to_string_lossy().into_owned(),
+            unreadable.clone(),
+        ];
+        let mut claimed = ClaimedSources::default();
+        claimed.capture(&members).unwrap();
+        fs::write(&sibling, b"a newer independently queued volume").unwrap();
+        fs::write(&late, b"a volume arriving after the original claim").unwrap();
+        // Repeated claims and cancellation must retain the generation the
+        // request started with, rather than consuming the replacement.
+        claimed.capture(&members).unwrap();
+        let current = watch_candidate_for_path(&sibling, None).unwrap().unwrap();
+        assert!(quiet::changed(claimed.candidates[&key(&sibling)].as_ref().unwrap(), &current));
+        assert!(claimed.candidates[&key(&late)].is_none());
+        assert!(claimed.candidates[&watch_path_key(&unreadable)].is_none());
+        claimed.cancelled = true;
+        assert_eq!(claimed.capture(&members).unwrap_err().kind(), io::ErrorKind::Interrupted);
+        fs::remove_file(head).unwrap();
+        fs::remove_file(sibling).unwrap();
+        fs::remove_file(late).unwrap();
+    }
+
+    #[test]
+    fn configuration_candidates_remain_subscribed_after_deletion() {
+        let marker = crate::test_support::temp_file("config_recreation", b"");
+        let directory = marker.with_extension("dir");
+        fs::create_dir(&directory).unwrap();
+        let config = directory.join("sunpack_advanced_config.json");
+        fs::write(&config, b"{}").unwrap();
+        let sources = config::ConfigSources::default();
+        assert!(config::watch_paths(&directory, &sources).contains(&config));
+        fs::remove_file(&config).unwrap();
+        let paths = config::watch_paths(&directory, &sources);
+        assert!(paths.contains(&config));
+        // Arm before recreating: verifies actual notification delivery, with
+        // a bounded receive only as a test failure guard, never idle polling.
+        let (send, receive) = mpsc::channel();
+        let observer = FileObserver::start(&directory, false, move |names| {
+            let _ = send.send(names);
+        }).unwrap();
+        fs::write(&config, b"{}").unwrap();
+        let names = receive.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+        assert!(names.iter().any(|name| name.eq_ignore_ascii_case("sunpack_advanced_config.json")));
+        drop(observer);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
 
     #[test]
     fn flatten_recovery_rebases_durable_parent_and_nested_receipts() {

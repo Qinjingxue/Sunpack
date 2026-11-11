@@ -32,7 +32,7 @@ use crate::scan::directory::{
 };
 use crate::scan::worker_event::WorkerFrame;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::future::poll_fn;
 use std::io;
@@ -49,6 +49,7 @@ pub struct Engine {
     password_attempts: AttemptCache,
     scheduler: OnceLock<Arc<Scheduler>>,
     shell: ShellNotifier,
+    output_names: Mutex<OutputNames>,
 }
 
 struct WorkerOwner {
@@ -69,6 +70,7 @@ impl Engine {
             password_attempts: AttemptCache::default(),
             scheduler: OnceLock::new(),
             shell: ShellNotifier::default(),
+            output_names: Mutex::default(),
         }
     }
 
@@ -178,7 +180,8 @@ impl Engine {
             analysis,
             observer,
             recursion: Mutex::new(HashMap::new()),
-            output_indices: Mutex::new(HashMap::new()),
+            output_names: OutputReservationGuard { registry: &self.output_names, owner: request_id },
+            created_outputs: Mutex::default(),
             output_base,
             checkpoints,
             promoted_sources,
@@ -209,10 +212,19 @@ impl Engine {
                 &request.cancel,
             )?;
         }
-        let mut outcome =
+        let mut executed =
             scheduler.run(request_id, request.origin, &request.cancel, |spawner| {
                 Box::pin(run.execute_batch(discovered, 1, None, None, spawner))
-            })?;
+            });
+        // Scheduler completion joins every writer, even on cancellation. Never
+        // roll back a tree while a native job or recursive branch can write it.
+        if request.cancel.cancelled() {
+            let mut discarded = Outcome::default();
+            run.created_outputs.lock().unwrap().rollback(
+                observer, executed.as_mut().unwrap_or(&mut discarded),
+            )?;
+        }
+        let mut outcome = executed?;
         outcome.errors.extend(
             run.scan_errors
                 .into_inner()
@@ -277,11 +289,333 @@ struct Run<'a, O> {
     analysis: NativeAnalysisConfig,
     observer: &'a O,
     recursion: Mutex<HashMap<usize, bool>>,
-    output_indices: Mutex<HashMap<PathBuf, usize>>,
+    output_names: OutputReservationGuard<'a>,
+    created_outputs: Mutex<CreatedOutputs>,
     output_base: Option<PathBuf>,
     checkpoints: HashMap<CheckpointKey, Vec<usize>>,
     promoted_sources: HashMap<String, &'a PromotedSource>,
     scan_errors: Mutex<DirectoryReadErrors>,
+}
+
+/// Shared across requests, with the same ownership rule as main's
+/// OutputReservationRegistry: only recursive inputs inside this request's
+/// generated tree may enter it. Independent siblings must never overlap.
+#[derive(Default)]
+struct OutputNames {
+    indices: HashMap<String, usize>,
+    hints: HashMap<u64, HashSet<String>>,
+    claimed: BTreeMap<String, OutputClaim>,
+    owners: HashMap<u64, Vec<String>>,
+}
+
+struct OutputClaim {
+    owner: u64,
+    source: String,
+    path: PathBuf,
+}
+
+struct OutputReservationGuard<'a> {
+    registry: &'a Mutex<OutputNames>,
+    owner: u64,
+}
+
+impl Drop for OutputReservationGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.lock().unwrap().release(self.owner);
+    }
+}
+
+impl OutputNames {
+    fn claim(&mut self, path: &Path, owner: u64, source: &Path) {
+        let key = output_key(path);
+        if !self.claimed.contains_key(&key) {
+            self.owners.entry(owner).or_default().push(key.clone());
+        }
+        self.claimed.insert(key, OutputClaim {
+            owner, source: resolved_key(source), path: path.to_owned(),
+        });
+    }
+
+    fn release(&mut self, owner: u64) {
+        for key in self.hints.remove(&owner).into_iter().flatten() {
+            self.indices.remove(&key);
+        }
+        for key in self.owners.remove(&owner).into_iter().flatten() {
+            self.claimed.remove(&key);
+            for ancestor in crate::path_keys::path_ancestors(&key) {
+                self.indices.remove(ancestor);
+            }
+        }
+        if self.owners.is_empty() {
+            self.indices.clear();
+            self.claimed.clear();
+        }
+        crate::collections::trim_map(&mut self.owners);
+        crate::collections::trim_map(&mut self.indices);
+        crate::collections::trim_map(&mut self.hints);
+    }
+
+    fn has_under(&self, key: &str) -> bool {
+        if self.claimed.contains_key(key) {
+            return true;
+        }
+        let prefix = format!("{}\\", key.trim_end_matches('\\'));
+        self.claimed.range(prefix.clone()..).next()
+            .is_some_and(|(path, _)| path.starts_with(&prefix))
+    }
+
+    fn conflicting_ancestor(&self, path: &Path, owner: u64, input: Option<&Path>) -> Option<PathBuf> {
+        let parent = output_key(path.parent()?);
+        let input = input.map(output_key);
+        // Check root-first, so rerouting leaves every unrelated owning tree.
+        let ancestors: Vec<_> = crate::path_keys::path_ancestors(&parent).collect();
+        for ancestor in ancestors.into_iter().rev() {
+            if let Some(claim) = self.claimed.get(ancestor) {
+                if claim.owner == owner && input.as_deref().is_some_and(|input| {
+                    input == ancestor || input.strip_prefix(ancestor).is_some_and(|tail| tail.starts_with('\\'))
+                }) {
+                    continue;
+                }
+                return Some(claim.path.clone());
+            }
+        }
+        None
+    }
+
+    fn retain(&mut self, path: &Path, owner: u64, source: &Path, input: Option<&Path>) -> bool {
+        let key = output_key(path);
+        // Several continued carrier segments share one container. Only the
+        // same physical source in this request may reuse that exact claim.
+        if self.claimed.get(&key).is_some_and(|claim| {
+            claim.owner == owner && claim.source == resolved_key(source)
+        }) {
+            return true;
+        }
+        if self.conflicting_ancestor(path, owner, input).is_some() || self.has_under(&key) {
+            return false;
+        }
+        self.claim(path, owner, source);
+        true
+    }
+
+    fn reserve(
+        &mut self,
+        mut preferred: PathBuf,
+        result: &ArchiveResult,
+        observer: &impl Observer,
+        owner: u64,
+        input: Option<&Path>,
+    ) -> io::Result<Result<PathBuf, Failure>> {
+        // A different request may own an ancestor even though this leaf does
+        // not exist. Number that ancestor, preserving the mirrored suffix.
+        while let Some(ancestor) = self.conflicting_ancestor(&preferred, owner, input) {
+            let (base, relative) = conflicting_output_base(
+                &preferred, &output_key(&preferred), &output_key(&ancestor),
+            )?;
+            let mut index = 1;
+            let replacement = loop {
+                let candidate = numbered(base, index);
+                let exists = match candidate.try_exists() {
+                    Ok(exists) => exists,
+                    Err(error) => return Ok(Err(file_failure(error))),
+                };
+                if !exists && !self.has_under(&output_key(&candidate)) {
+                    break candidate;
+                }
+                index += 1;
+            };
+            preferred = replacement.join(relative);
+        }
+        let preferred_key = output_key(&preferred);
+        let mut index = *self.indices.get(&preferred_key).unwrap_or(&0);
+        loop {
+            let path = if index == 0 { preferred.clone() } else { numbered(&preferred, index) };
+            if self.has_under(&output_key(&path)) {
+                index += 1;
+                continue;
+            }
+            let exists = match path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => return Ok(Err(file_failure(error))),
+            };
+            if !exists {
+                match observer.register_output(result, &path) {
+                    Ok(()) => {}
+                    Err(error) if !error.get_ref().is_some_and(|inner| {
+                        inner.is::<super::OutputCreateError>()
+                    }) => return Err(error),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        if fs::symlink_metadata(&path).is_ok() {
+                            index += 1;
+                            continue;
+                        }
+                        return Ok(Err(file_failure(error)));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                        return Ok(Err(file_failure(error)));
+                    }
+                    Err(error) if error.get_ref().is_some_and(|inner| {
+                        inner.is::<super::OutputCreateError>()
+                    }) => return Ok(Err(file_failure(error))),
+                    Err(error) => return Err(error),
+                }
+                if index != 0 {
+                    self.indices.insert(preferred_key.clone(), index + 1);
+                    self.hints.entry(owner).or_default().insert(preferred_key);
+                }
+                self.claim(&path, owner, &result.path);
+                return Ok(Ok(path));
+            }
+            index += 1;
+        }
+    }
+}
+
+fn conflicting_output_base<'a>(
+    preferred: &'a Path,
+    key: &str,
+    ancestor_key: &str,
+) -> io::Result<(&'a Path, PathBuf)> {
+    let prefix = format!("{}\\", ancestor_key.trim_end_matches('\\'));
+    let count = key.strip_prefix(&prefix).map(|tail| tail.split('\\').count())
+        .ok_or_else(|| io::Error::other("unable to relocate conflicting output ancestor"))?;
+    let base = preferred.ancestors().nth(count).ok_or_else(|| {
+        io::Error::other("unable to locate conflicting output ancestor")
+    })?;
+    let relative = preferred.strip_prefix(base).map_err(io::Error::other)?.to_path_buf();
+    Ok((base, relative))
+}
+
+/// Canonicalize the existing prefix too: a new leaf below a directory alias
+/// must collide with a reservation reached through its physical spelling.
+fn output_key(path: &Path) -> String {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = fs::canonicalize(ancestor) {
+            if let Ok(relative) = path.strip_prefix(ancestor) {
+                return namespace_key(&canonical.join(relative));
+            }
+        }
+    }
+    namespace_key(path)
+}
+
+/// Newly created trees only. Continued roots are never registered here; their
+/// newly created children are. Completed subtrees retire once no other tracked
+/// uncommitted ancestor owns them, before their archive source can be deleted.
+#[derive(Default)]
+struct CreatedOutputs(BTreeMap<String, (PathBuf, ArchiveResult)>);
+
+impl CreatedOutputs {
+    fn register(&mut self, path: &Path, result: &ArchiveResult) {
+        // Keep a small ownership receipt, not analysis plans, passwords, native
+        // handles, or worker futures. Registration precedes worker execution.
+        let archive = ArchiveResult {
+            path: result.path.clone(),
+            format: result.format.clone(),
+            output: None,
+            failure: None,
+            files: 0,
+            bytes: 0,
+            encrypted: result.encrypted,
+            depth: result.depth,
+            offset: result.offset,
+            end_offset: result.end_offset,
+            volume_completeness: None,
+            volume_attempts: None,
+            source_paths: result.source_paths.clone(),
+            password: None,
+            discovery_source: result.discovery_source,
+            damage_flags: None,
+            partial: false,
+            retained: false,
+            recovered_complete_files: 0,
+            promoted: false,
+            promotion_original_path: None,
+        };
+        self.0.insert(output_key(path), (path.to_owned(), archive));
+    }
+
+    fn commit_if_unowned(&mut self, root: &Path) {
+        let key = output_key(root);
+        if !crate::path_keys::path_ancestors(&key).skip(1)
+            .any(|ancestor| self.0.contains_key(ancestor))
+        {
+            self.commit(root);
+        }
+    }
+
+    fn commit(&mut self, root: &Path) {
+        let key = output_key(root);
+        self.0.remove(&key);
+        let prefix = format!("{}\\", key.trim_end_matches('\\'));
+        let keys: Vec<_> = self.0.range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, _)| key.clone()).collect();
+        for key in keys {
+            self.0.remove(&key);
+        }
+    }
+
+    fn relocate(&mut self, source: &Path, destination: &Path) {
+        let key = output_key(source);
+        let prefix = format!("{}\\", key.trim_end_matches('\\'));
+        let mut keys = Vec::new();
+        if self.0.contains_key(&key) {
+            keys.push(key);
+        }
+        keys.extend(self.0.range(prefix.clone()..)
+            .take_while(|(item, _)| item.starts_with(&prefix))
+            .map(|(item, _)| item.clone()));
+        for key in keys {
+            if let Some((path, mut result)) = self.0.remove(&key) {
+                let mapped = path.strip_prefix(source).map(|tail| destination.join(tail)).unwrap_or(path);
+                if let Ok(tail) = result.path.strip_prefix(source) {
+                    result.path = destination.join(tail);
+                }
+                for path in &mut result.source_paths {
+                    if let Ok(tail) = path.strip_prefix(source) {
+                        *path = destination.join(tail);
+                    }
+                }
+                // Flattening a leaf into an already tracked root must retain
+                // the original root owner's receipt rather than overwrite it.
+                self.0.entry(output_key(&mapped)).or_insert((mapped, result));
+            }
+        }
+    }
+
+    fn rollback(&mut self, observer: &impl Observer, outcome: &mut Outcome) -> io::Result<()> {
+        let mut roots = HashSet::new();
+        for (key, (path, _)) in &self.0 {
+            if crate::path_keys::path_ancestors(key).any(|ancestor| roots.contains(ancestor)) {
+                continue;
+            }
+            cleanup_owned_output(path).map_err(|error| {
+                io::Error::other(super::OutputCleanupError { path: path.clone(), error })
+            })?;
+            roots.insert(key.clone());
+        }
+        for (path, archive) in self.0.values() {
+            observer.discard_output(archive, path)?;
+        }
+        let discarded = |path: &Path| {
+            let key = output_key(path);
+            crate::path_keys::path_ancestors(&key).any(|ancestor| roots.contains(ancestor))
+        };
+        for archive in &mut outcome.archives {
+            if archive.output.as_deref().is_some_and(&discarded) {
+                archive.output = None;
+                archive.files = 0;
+                archive.bytes = 0;
+                archive.partial = false;
+                archive.recovered_complete_files = 0;
+                archive.failure = Some(Failure::new(FailureKind::Cancelled, "Operation interrupted"));
+            }
+        }
+        outcome.checkpoints.retain(|checkpoint| !discarded(checkpoint.output()));
+        self.0.clear();
+        Ok(())
+    }
 }
 
 struct Executed {
@@ -312,24 +646,34 @@ impl<'run, O: Observer> Run<'run, O> {
             scan_incomplete: self.record_scan_errors(batch.scan_errors),
             ..Outcome::default()
         };
-        let executed: Vec<_> = batch
-            .tasks
-            .into_iter()
-            .map(|task| {
-                let id = self.queue_task(task.entry(), depth, parent.map(|(id, _)| id), None);
-                spawner.spawn(self.execute_task(
-                    task,
-                    id,
-                    depth,
-                    inherited_scope.clone(),
-                    spawner.clone(),
-                ))
-            })
-            .collect();
+        let children = spawner.clone();
+        let parent_id = parent.map(|(id, _)| id);
+        let executed = spawner.bounded_map(batch.tasks, move |task| {
+            let id = self.queue_task(task.entry(), depth, parent_id, None);
+            let cancelled = receipt(task.entry(), task.source, depth);
+            let branch = self.execute_task(
+                task,
+                id,
+                depth,
+                inherited_scope.clone(),
+                children.clone(),
+            );
+            Box::pin(async move { (id, cancelled, branch.await) })
+        }).await;
         let mut first_error = None;
-        for branch in executed {
-            let mut branch = match branch.wait().await {
+        for (id, mut cancelled, branch) in executed {
+            let mut branch = match branch {
                 Ok(branch) => branch,
+                Err(error) if is_cancellation(&error, &self.request.cancel) => {
+                    cancelled.failure = Some(Failure::new(
+                        FailureKind::Cancelled, "Operation interrupted",
+                    ));
+                    self.observer.notify(Event::Finished {
+                        id, path: cancelled.path.clone(), depth, success: false,
+                    });
+                    outcome.archives.push(cancelled);
+                    continue;
+                }
                 Err(error) => {
                     first_error.get_or_insert(error);
                     continue;
@@ -459,7 +803,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     Some(path) => Some(path),
                     None if task.inputs.iter().any(|input| input.failure.is_none()) => {
                         let receipt = receipt(&task.inputs[0].input, task.source, depth);
-                        match self.reserve_output(preferred_carrier, &receipt)? {
+                        match self.reserve_output(preferred_carrier, &receipt, None)? {
                             Ok(path) => {
                                 shell.output(&path);
                                 Some(path)
@@ -635,12 +979,20 @@ impl<'run, O: Observer> Run<'run, O> {
                     inventory.file_count() > 0 || inventory.unreadable_count() > 0
                 }) {
                     if depth <= self.request.max_depth && !cancel.cancelled() {
-                        let nested = discovery::discover_output(
+                        let nested = match discovery::discover_output(
                             &inventory,
                             &self.options,
                             &candidates,
                             self.request,
-                        )?;
+                        ) {
+                            Ok(nested) => nested,
+                            Err(error) if is_cancellation(&error, cancel) => Discovered {
+                                tasks: Vec::new(),
+                                errors: Vec::new(),
+                                scan_errors: DirectoryReadErrors::report(),
+                            },
+                            Err(error) => return Err(error),
+                        };
                         drop(inventory);
                         if !nested.tasks.is_empty()
                             && self.allow_recursive(depth + 1, nested.tasks.len())
@@ -662,7 +1014,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                     }
                 }
-                let children_complete = children_already_complete || subtree_complete(&descendants);
+                let children_complete = children_already_complete
+                    || (!cancel.cancelled() && subtree_complete(&descendants));
                 if ran_recursive_children
                     && result.failure.is_none()
                     && children_complete
@@ -681,7 +1034,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     && children_complete
                     && !cancel.cancelled()
                 {
-                    flatten_result(self.observer, &mut result, &mut descendants)?;
+                    flatten_result(
+                        self.observer, &mut result, &mut descendants, Some(&self.created_outputs),
+                    )?;
                 }
                 let checkpoint = if self.request.mode == Mode::Extract {
                     InputCheckpoint::create(
@@ -696,7 +1051,19 @@ impl<'run, O: Observer> Run<'run, O> {
                 } else {
                     None
                 };
-                self.observer.commit_output(&result, checkpoint.as_ref())?;
+                // A cancelled newly created root remains uncommitted until
+                // request-level rollback has joined all recursive writers.
+                let commit_completed = !cancel.cancelled();
+                if commit_completed || result.retained {
+                    self.observer.commit_output(&result, checkpoint.as_ref())?;
+                    // Cancellation after this durable commit must not roll it
+                    // back. Match main's commit/check then retire ordering.
+                    if commit_completed && !multi && result.failure.is_none() {
+                        if let Some(output) = result.output.as_deref() {
+                            self.created_outputs.lock().unwrap().commit_if_unowned(output);
+                        }
+                    }
+                }
                 if let Some(checkpoint) = checkpoint {
                     outcome.checkpoints.push(checkpoint);
                 }
@@ -722,6 +1089,17 @@ impl<'run, O: Observer> Run<'run, O> {
                     });
                 }
                 completed.push(result);
+            }
+            if multi && !cancel.cancelled()
+                && completed.iter().all(|result| result.failure.is_none())
+            {
+                let mut created = self.created_outputs.lock().unwrap();
+                if let Some(root) = carrier.as_deref() {
+                    created.commit_if_unowned(root);
+                }
+                for output in completed.iter().filter_map(|result| result.output.as_deref()) {
+                    created.commit_if_unowned(output);
+                }
             }
             if !superseded_candidates.is_empty() {
                 let retained: HashSet<_> = completed
@@ -1053,8 +1431,19 @@ impl<'run, O: Observer> Run<'run, O> {
                     Some(container) => output_candidate(preferred_carrier, container),
                     None => output_candidate(&preferred, checkpoint.output()),
                 };
-                (destination_matches && checkpoint.valid_for(input, generations))
-                    .then_some(checkpoint)
+                if !destination_matches || !checkpoint.valid_for(input, generations) {
+                    return None;
+                }
+                let mut names = self.output_names.registry.lock().unwrap();
+                let source = Path::new(&input.entry_path);
+                let nested = (depth > 1).then_some(source);
+                if let Some(container) = checkpoint.container() {
+                    if !names.retain(container, self.output_names.owner, source, nested) {
+                        return None;
+                    }
+                }
+                names.retain(checkpoint.output(), self.output_names.owner, source,
+                    checkpoint.container().or(nested)).then_some(checkpoint)
             })
     }
 
@@ -1191,7 +1580,10 @@ impl<'run, O: Observer> Run<'run, O> {
                 input,
             });
         }
-        self.request.cancel.check_io()?;
+        if self.request.cancel.cancelled() {
+            result.failure = Some(Failure::new(FailureKind::Cancelled, "Operation interrupted"));
+            return Ok(Executed { result, inventory: None, input });
+        }
         let plan = match candidates.plan(&input, password, &self.request.cancel) {
             Ok(Ok(plan)) => plan,
             Ok(Err(failure)) => {
@@ -1232,7 +1624,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 || self.preferred_output(&input, depth),
                 |root| root.join(archive_name(&input)),
             );
-            match self.reserve_output(preferred, &result)? {
+            match self.reserve_output(preferred, &result, carrier)? {
                 Ok(path) => {
                     shell.output(&path);
                     Some(path)
@@ -1420,6 +1812,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     return Err(io::Error::other(super::OutputCleanupError { path, error }));
                 }
                 self.observer.discard_output(&result, &path)?;
+                // This worker has stopped and no recursive children were
+                // started for its failed output. Retire the empty receipt now.
+                self.created_outputs.lock().unwrap().commit(&path);
             }
         }
         Ok(Executed {
@@ -1490,45 +1885,17 @@ impl<'run, O: Observer> Run<'run, O> {
         &self,
         preferred: PathBuf,
         result: &ArchiveResult,
+        carrier: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
-        // Serialize only the name claim and durable publication. No worker or
-        // recursive scan runs while this allocator is held.
-        let mut indices = self.output_indices.lock().unwrap();
-        let mut index = *indices.get(&preferred).unwrap_or(&0);
-        loop {
-            let path = if index == 0 {
-                preferred.clone()
-            } else {
-                numbered(&preferred, index)
-            };
-            let exists = match path.try_exists() {
-                Ok(exists) => exists,
-                Err(error) => return Ok(Err(file_failure(error))),
-            };
-            if !exists {
-                match self.observer.register_output(result, &path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        // A non-directory ancestor can also yield AlreadyExists.
-                        // A numbered name only resolves a collision at the leaf.
-                        if fs::symlink_metadata(&path).is_ok() {
-                            index += 1;
-                            continue;
-                        }
-                        return Ok(Err(file_failure(error)));
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
-                        return Ok(Err(file_failure(error)));
-                    }
-                    Err(error) => return Err(error),
-                }
-                if index != 0 {
-                    indices.insert(preferred, index + 1);
-                }
-                return Ok(Ok(path));
-            }
-            index += 1;
+        // Serialize only the name claim and durable publication, not workers.
+        let input = carrier.or_else(|| (result.depth > 1).then_some(result.path.as_path()));
+        let reserved = self.output_names.registry.lock().unwrap().reserve(
+            preferred, result, self.observer, self.output_names.owner, input,
+        )?;
+        if let Ok(path) = &reserved {
+            self.created_outputs.lock().unwrap().register(path, result);
         }
+        Ok(reserved)
     }
 
     fn cleanup_sources(
@@ -1595,6 +1962,7 @@ fn flatten_result(
     observer: &impl Observer,
     result: &mut ArchiveResult,
     children: &mut Outcome,
+    created: Option<&Mutex<CreatedOutputs>>,
 ) -> io::Result<()> {
     let Some(output) = result.output.as_ref() else {
         return Ok(());
@@ -1635,6 +2003,12 @@ fn flatten_result(
         );
     }
     if let (Some(old), Some(new)) = (stats.source_dir, stats.output_dir) {
+        // Successful flatten commonly keeps the root spelling unchanged while
+        // moving its leaf's descendants. Rebase rollback receipts with the same
+        // mapping as checkpoints, before any fallible durable publication.
+        if let Some(created) = created {
+            created.lock().unwrap().relocate(&old, &new);
+        }
         for checkpoint in &mut children.checkpoints {
             checkpoint.relocate(&old, &new);
             observer.checkpoint(checkpoint)?;
@@ -1721,7 +2095,9 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
 }
 
 fn file_failure(error: io::Error) -> Failure {
-    let kind = if crate::io::resource_error::is_memory_error(&error) {
+    let original = error.get_ref().and_then(|inner| inner.downcast_ref::<super::OutputCreateError>())
+        .map_or(&error, |created| &created.0);
+    let kind = if crate::io::resource_error::is_memory_error(original) {
         FailureKind::ResourceUnavailable
     } else {
         FailureKind::FilesystemError
@@ -1930,6 +2306,10 @@ fn remove_empty_or_promoted(output: &Path, promoted_dirs: &[String]) -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn is_cancellation(error: &io::Error, cancel: &Cancellation) -> bool {
+    error.kind() == io::ErrorKind::Interrupted && cancel.cancelled()
 }
 
 fn subtree_complete(outcome: &Outcome) -> bool {
@@ -2466,6 +2846,311 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conflicting_output_ancestor_preserves_alias_spelling() {
+        for spelling in ["physical", "junction-alias"] {
+            let path = PathBuf::from(spelling).join("branch").join("archive");
+            let (base, tail) = conflicting_output_base(
+                &path, "physical\\branch\\archive", "physical",
+            ).unwrap();
+            assert_eq!(base, Path::new(spelling));
+            assert_eq!(numbered(base, 1).join(tail),
+                PathBuf::from(format!("{spelling}(1)")).join("branch").join("archive"));
+        }
+    }
+
+    #[test]
+    fn independent_output_trees_survive_peer_cleanup_and_creation_failure() {
+        struct ObserverWithFailure;
+        impl Observer for ObserverWithFailure {
+            fn notify(&self, _: Event) {}
+            fn register_output(&self, _: &ArchiveResult, path: &Path) -> io::Result<()> {
+                if path.file_name().is_some_and(|name| name == "denied") {
+                    return Err(super::super::OutputCreateError::wrap(
+                        io::ErrorKind::PermissionDenied.into(),
+                    ));
+                }
+                if path.file_name().is_some_and(|name| name == "journal") {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "journal unavailable"));
+                }
+                crate::scan::scope::create_output_root_exclusive(path)
+                    .map_err(super::super::OutputCreateError::wrap)
+            }
+        }
+        let source = crate::test_support::temp_file("output_isolation", b"input");
+        let root = source.with_extension("output");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
+        let result = receipt(&input, DiscoverySource::Direct, 1);
+        // Match main's coarse lifecycle: both orders, same/different request
+        // owners, owned recursion, foreign input and continued output refusal.
+        for descendant_first in [false, true] {
+          for shared_request in [false, true] {
+            let registry = Mutex::new(OutputNames::default());
+            let owner = if shared_request { 1 } else { 2 };
+            let first = OutputReservationGuard { registry: &registry, owner: 1 };
+            let second = OutputReservationGuard { registry: &registry, owner };
+            let mut names = registry.lock().unwrap();
+            let preferred = root.join("a");
+            let descendant = preferred.join("sub").join("b");
+            let (failed, successful) = if descendant_first {
+                let successful = names.reserve(descendant.clone(), &result, &ObserverWithFailure, owner, None).unwrap().unwrap();
+                (names.reserve(preferred.clone(), &result, &ObserverWithFailure, 1, None).unwrap().unwrap(), successful)
+            } else {
+                let failed = names.reserve(preferred.clone(), &result, &ObserverWithFailure, 1, None).unwrap().unwrap();
+                (failed, names.reserve(descendant.clone(), &result, &ObserverWithFailure, owner, None).unwrap().unwrap())
+            };
+            assert!(!successful.starts_with(&failed) && !failed.starts_with(&successful));
+            fs::write(successful.join("payload"), b"keep").unwrap();
+            let generated = successful.join("nested.zip");
+            let nested = successful.join("nested");
+            assert_eq!(names.reserve(nested.clone(), &result, &ObserverWithFailure, owner, Some(&generated))
+                .unwrap().unwrap(), nested);
+            let foreign = names.reserve(successful.join("foreign"), &result, &ObserverWithFailure, 3, Some(&generated))
+                .unwrap().unwrap();
+            assert!(!foreign.starts_with(&successful));
+            assert!(!names.retain(&successful.join("continued"), 3, &result.path, None));
+            cleanup_owned_output(&failed).unwrap();
+            assert_eq!(fs::read(successful.join("payload")).unwrap(), b"keep");
+            assert_eq!(names.reserve(root.join("denied"), &result, &ObserverWithFailure, owner, None)
+                .unwrap().unwrap_err().kind, FailureKind::FilesystemError);
+            assert!(names.reserve(root.join("journal"), &result, &ObserverWithFailure, owner, None).is_err());
+            // A long-lived owner must not retain numbering hints belonging
+            // to many short-lived requests with different output families.
+            for short_owner in 10..42 {
+                let family = root.join(format!("family-{short_owner}"));
+                fs::create_dir(&family).unwrap();
+                names.reserve(family.clone(), &result, &ObserverWithFailure, short_owner, None)
+                    .unwrap().unwrap();
+                assert!(names.indices.contains_key(&output_key(&family)));
+                names.release(short_owner);
+                assert!(!names.indices.contains_key(&output_key(&family)));
+                assert!(!names.hints.contains_key(&short_owner));
+            }
+            names.release(3);
+            drop(names);
+            drop(second);
+            drop(first);
+            assert!(registry.lock().unwrap().claimed.is_empty());
+            assert!(registry.lock().unwrap().indices.is_empty());
+            fs::remove_dir_all(&root).unwrap();
+          }
+        }
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn cancellation_joins_nested_writer_then_rolls_back_only_uncommitted_trees() {
+        struct Discards(Mutex<Vec<PathBuf>>);
+        impl Observer for Discards {
+            fn notify(&self, _: Event) {}
+            fn discard_output(&self, _: &ArchiveResult, output: &Path) -> io::Result<()> {
+                self.0.lock().unwrap().push(output.to_owned());
+                Ok(())
+            }
+        }
+        let source = crate::test_support::temp_file("cancel_output_trees", b"source");
+        let root = source.with_extension("output");
+        let parent = root.join("parent");
+        let nested = parent.join("child");
+        let sibling = root.join("completed");
+        let retained = root.join("continued");
+        let retry_child = retained.join("new-segment");
+        let retained_finished = retained.join("finished-carrier");
+        let retained_segment = retained_finished.join("segment");
+        let retained_source = retained.join("finished-carrier.zip");
+        for path in [&nested, &sibling, &retry_child, &retained_segment] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(parent.join("ordinary.txt"), b"parent data").unwrap();
+        fs::write(nested.join("partial.txt"), b"in flight").unwrap();
+        fs::write(sibling.join("kept.txt"), b"committed").unwrap();
+        fs::write(retained.join("old.txt"), b"continued data").unwrap();
+        fs::write(retained_source.clone(), b"nested source").unwrap();
+        fs::write(retained_segment.join("payload.txt"), b"completed nested data").unwrap();
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "parent".into());
+        // A punctuation sibling sorts between the exact key and descendants.
+        // Relocation must scan the separator-prefixed range independently.
+        let mut moving = CreatedOutputs::default();
+        let old = root.join("a");
+        let punctuation = root.join("a (2)");
+        let new = root.join("relocated");
+        let ownership = receipt(&input, DiscoverySource::Direct, 1);
+        for path in [&old, &old.join("child"), &punctuation] {
+            moving.register(path, &ownership);
+        }
+        moving.relocate(&old, &new);
+        assert!(moving.0.contains_key(&output_key(&new.join("child"))));
+        assert!(!moving.0.contains_key(&output_key(&old.join("child"))));
+        assert!(moving.0.contains_key(&output_key(&punctuation)));
+        let mut outcome = Outcome::default();
+        let mut created = CreatedOutputs::default();
+        for path in [&parent, &nested, &sibling, &retry_child, &retained_finished, &retained_segment] {
+            let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+            archive.output = Some(path.clone());
+            created.register(path, &archive);
+            outcome.archives.push(archive);
+        }
+        created.commit_if_unowned(&sibling);
+        // A freshly created parent still owns its completed nested output.
+        created.commit_if_unowned(&nested);
+        assert!(created.0.contains_key(&output_key(&nested)));
+        // A retained parent does not own rollback: commit the completed child
+        // before deleting its archive source. A later sibling cancellation
+        // must not delete the only remaining copy of that child's content.
+        created.commit_if_unowned(&retained_finished);
+        fs::remove_file(&retained_source).unwrap();
+        let cancel = Cancellation::new();
+        let gate = Arc::new(Mutex::new((false, None::<Waker>)));
+        let (started, entered) = std::sync::mpsc::channel();
+        let signal = Arc::clone(&gate);
+        let stop = cancel.clone();
+        let parent_check = parent.clone();
+        let nested_check = nested.clone();
+        let stopper = std::thread::spawn(move || {
+            entered.recv().unwrap();
+            stop.cancel();
+            let exists_while_writing = parent_check.join("ordinary.txt").is_file()
+                && nested_check.join("partial.txt").is_file();
+            let mut signal = signal.lock().unwrap();
+            signal.0 = true;
+            if let Some(waker) = signal.1.take() {
+                waker.wake();
+            }
+            assert!(exists_while_writing, "rollback ran before the nested writer stopped");
+        });
+        let nested_writer = nested.clone();
+        Scheduler::new().run(1, Origin::Foreground, &cancel, |spawner| {
+            Box::pin(async move {
+                spawner.spawn(Box::pin(async move {
+                    let mut started = Some(started);
+                    poll_fn(move |cx| {
+                        let mut gate = gate.lock().unwrap();
+                        if gate.0 {
+                            Poll::Ready(())
+                        } else {
+                            gate.1 = Some(cx.waker().clone());
+                            if let Some(started) = started.take() {
+                                started.send(()).unwrap();
+                            }
+                            Poll::Pending
+                        }
+                    }).await;
+                    fs::write(nested_writer.join("writer-finished.txt"), b"joined").unwrap();
+                })).wait().await;
+            })
+        });
+        stopper.join().unwrap();
+        assert!(nested.join("writer-finished.txt").is_file());
+        let observer = Discards(Mutex::default());
+        created.rollback(&observer, &mut outcome).unwrap();
+        assert!(!parent.exists());
+        assert!(!retry_child.exists());
+        assert_eq!(fs::read(sibling.join("kept.txt")).unwrap(), b"committed");
+        assert_eq!(fs::read(retained.join("old.txt")).unwrap(), b"continued data");
+        assert_eq!(fs::read(retained_segment.join("payload.txt")).unwrap(), b"completed nested data");
+        assert!(!retained_source.exists());
+        assert!(source.is_file());
+        assert_eq!(outcome.archives.iter().filter(|archive| archive.output.is_some()).count(), 3);
+        assert!(!observer.0.lock().unwrap().contains(&sibling));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn cancelled_recursive_batch_returns_incomplete_outcome_not_parent_unwind() {
+        struct CancelOnQueue(Cancellation);
+        impl Observer for CancelOnQueue {
+            fn notify(&self, event: Event) {
+                if matches!(event, Event::Queued { .. }) {
+                    self.0.cancel();
+                }
+            }
+        }
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let request = Request::new(Vec::new(), Mode::Extract);
+        let observer = CancelOnQueue(request.cancel.clone());
+        let run = Run {
+            engine: &engine,
+            request: &request,
+            resolve_aliases: false,
+            candidates: CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None),
+            options: discovery::scan_options(&request.config).unwrap(),
+            deep_options: None,
+            analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
+            observer: &observer,
+            recursion: Mutex::default(),
+            output_names: OutputReservationGuard { registry: &engine.output_names, owner: 1 },
+            created_outputs: Mutex::default(),
+            output_base: None,
+            checkpoints: HashMap::new(),
+            promoted_sources: HashMap::new(),
+            scan_errors: Mutex::new(DirectoryReadErrors::report()),
+        };
+        let input = ArchiveInput::file("parent/child.zip".into(), "zip".into(), "child".into());
+        let parent = receipt(&input, DiscoverySource::Direct, 1);
+        let batch = Discovered {
+            tasks: vec![Task {
+                inputs: vec![LogicalInput { input, password: None, failure: None }],
+                owned_paths: Vec::new(),
+                source: DiscoverySource::Direct,
+                retry: None,
+            }],
+            errors: Vec::new(),
+            scan_errors: DirectoryReadErrors::report(),
+        };
+        let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
+            Box::pin(run.execute_batch(batch, 2, None, Some((1, &parent)), spawner))
+        }).expect("cancellation must not bypass the parent's output commit");
+        assert_eq!(outcome.archives.len(), 1);
+        assert_eq!(outcome.archives[0].failure.as_ref().unwrap().kind, FailureKind::Cancelled);
+        assert!(!subtree_complete(&outcome));
+        assert!(!is_cancellation(&io::Error::other("journal failure"), &request.cancel));
+    }
+
+    #[test]
+    fn flatten_rebases_rollback_receipts_when_root_spelling_is_unchanged() {
+        struct Discards(Mutex<Vec<PathBuf>>);
+        impl Observer for Discards {
+            fn notify(&self, _: Event) {}
+            fn discard_output(&self, _: &ArchiveResult, output: &Path) -> io::Result<()> {
+                self.0.lock().unwrap().push(output.to_owned());
+                Ok(())
+            }
+        }
+        let source = crate::test_support::temp_file("flatten_cancel_receipts", b"input");
+        let output = source.with_extension("output");
+        let leaf = output.join("wrapper");
+        let child = leaf.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(leaf.join("ordinary.txt"), b"keep").unwrap();
+        fs::write(child.join("payload.txt"), b"child").unwrap();
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "parent".into());
+        let mut archive = receipt(&input, DiscoverySource::Direct, 1);
+        archive.output = Some(output.clone());
+        let mut nested = receipt(&input, DiscoverySource::Direct, 2);
+        nested.output = Some(child.clone());
+        let created = Mutex::new(CreatedOutputs::default());
+        created.lock().unwrap().register(&output, &archive);
+        let mut leaf_archive = receipt(&input, DiscoverySource::Direct, 2);
+        leaf_archive.path = output.join("inner.zip");
+        created.lock().unwrap().register(&leaf, &leaf_archive);
+        created.lock().unwrap().register(&child, &nested);
+        let mut children = Outcome::default();
+        children.archives.push(nested);
+        let observer = Discards(Mutex::default());
+        flatten_result(&observer, &mut archive, &mut children, Some(&created)).unwrap();
+        assert_eq!(archive.output.as_ref(), Some(&output));
+        assert_eq!(created.lock().unwrap().0.get(&output_key(&output)).unwrap().1.path, source);
+        let published_child = output.join("child");
+        assert!(published_child.join("payload.txt").is_file());
+        created.lock().unwrap().rollback(&observer, &mut children).unwrap();
+        let discarded = observer.0.lock().unwrap();
+        assert!(discarded.contains(&published_child));
+        assert!(!discarded.contains(&child));
+        assert!(!output.exists());
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
     fn flatten_failure_keeps_extraction_successful_and_reports_output() {
         struct DenyFlatten;
         impl Observer for DenyFlatten {
@@ -2490,7 +3175,7 @@ mod tests {
         archive.output = Some(output.clone());
         let mut outcome = Outcome::default();
 
-        let result = flatten_result(&DenyFlatten, &mut archive, &mut outcome);
+        let result = flatten_result(&DenyFlatten, &mut archive, &mut outcome, None);
         let payload = fs::read(wrapper.join("payload.txt"));
         fs::remove_dir_all(&output).unwrap();
         fs::remove_file(source).unwrap();

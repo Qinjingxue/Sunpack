@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
 };
-use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const MAX_FIELD: usize = 16 * 1024 * 1024;
@@ -696,13 +696,22 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         token,
         build_id,
     });
-    // State always names this server's unique endpoint and token.
-    state.publish(&name, &server.token, &server.build_id, &stamp)?;
+    let ready_name = windows::wide(OsStr::new(&format!("Global\\SunPack-{identity}-ready")));
+    let ready = unsafe { CreateEventW(std::ptr::null(), 1, 0, ready_name.as_ptr()) };
+    if ready.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let ready = unsafe { OwnedHandle::from_raw_handle(ready) };
     if let Ok(settings) = config::load(cwd) {
         server.host.configure_idle(&settings);
     }
     let result = (|| {
         let mut accept = Accept::arm(&name_wide, &security, true)?;
+        // Publish only an already-listening endpoint, then wake startup clients.
+        state.publish(&name, &server.token, &server.build_id, &stamp)?;
+        if unsafe { SetEvent(ready.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
         let mut served = false;
         loop {
             let (wait, shutting_down) = {

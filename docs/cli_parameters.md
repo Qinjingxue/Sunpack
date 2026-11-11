@@ -42,7 +42,7 @@ These options apply to `extract` and `scan`:
 | `--pause` | Wait for a key press before exiting. |
 | `--no-pause` | Do not pause after the command finishes. |
 
-`extract` and `scan` use high process priority. When the shared runtime reaches the Watch idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`), it returns to the configured `runtime.process_mode`.
+`extract` and `scan` use high process priority while any foreground archive request is active. When the last foreground request finishes, the shared runtime and native worker return to the configured `runtime.process_mode`. Watch cache cleanup still uses `watch.runtime_cache_cleanup_idle_seconds` independently.
 
 `passwords` supports only `--json` plus the password input options; `config` supports `--json`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
 

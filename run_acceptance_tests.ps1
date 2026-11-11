@@ -97,6 +97,13 @@ function Get-ChildExitCode {
     return $null
 }
 
+function ConvertTo-WindowsCommandLineArgument {
+    param([AllowEmptyString()][string]$Value)
+    # Start-Process joins ArgumentList without quoting. Follow CommandLineToArgvW
+    # escaping so spaces, embedded quotes and trailing backslashes survive.
+    return '"' + (($Value -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+}
+
 function Invoke-TestStep {
     param(
         [Parameter(Mandatory = $true)]
@@ -105,7 +112,8 @@ function Invoke-TestStep {
         [string[]]$Command,
         [int]$TimeoutSeconds = $StepTimeoutSeconds,
         [switch]$QuietOutput,
-        [switch]$KeepElevationIfAdministrator
+        [switch]$KeepElevationIfAdministrator,
+        [switch]$RequireExecutedTests
     )
 
     Write-Host ""
@@ -137,7 +145,7 @@ function Invoke-TestStep {
         if ($env:SUNPACK_ACCEPTANCE_DIAGNOSTICS_DIR) {
             $diagnosticStep = Join-Path $env:SUNPACK_ACCEPTANCE_DIAGNOSTICS_DIR ($Label -replace '[^a-zA-Z0-9]+', '-')
             New-Item -ItemType Directory -Force -Path $diagnosticStep | Out-Null
-            $argsList += @(('"--diagnostics-dir={0}"' -f $diagnosticStep), "-o", "faulthandler_timeout=60")
+            $argsList += @(("--diagnostics-dir=$diagnosticStep"), "-o", "faulthandler_timeout=60")
         }
     }
 
@@ -146,8 +154,10 @@ function Invoke-TestStep {
     }
 
     $runnerArguments = @()
+    $runnerExecutable = $python
     if ($KeepElevationIfAdministrator -and $script:AcceptanceProcessIsAdministrator) {
         Write-Host "    Running this step with the acceptance process administrator token" -ForegroundColor DarkGray
+        $runnerExecutable = $Command[0]
         $runnerArguments = $argsList
         if ($diagnosticStep) {
             $stdoutPath = Join-Path $diagnosticStep "stdout.bin"
@@ -163,7 +173,7 @@ function Invoke-TestStep {
             "--cwd", $repoRoot,
             "--timeout-seconds", [string]$TimeoutSeconds
         )
-        if ($diagnosticStep) { $runnerArguments += @("--output-directory", ('"{0}"' -f $diagnosticStep)) }
+        if ($diagnosticStep) { $runnerArguments += @("--output-directory", $diagnosticStep) }
         $runnerArguments += @("--", $Command[0])
         $runnerArguments += $argsList
     }
@@ -171,8 +181,8 @@ function Invoke-TestStep {
     $process = $null
     try {
         $startProcessArgs = @{
-            FilePath = $Command[0]
-            ArgumentList = $runnerArguments
+            FilePath = $runnerExecutable
+            ArgumentList = @($runnerArguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument $_ })
             NoNewWindow = $true
             PassThru = $true
         }
@@ -234,6 +244,12 @@ function Invoke-TestStep {
                         $junitReportPath, [System.Text.Encoding]::UTF8
                     )
                     $reportedFailures = @($junitReport.SelectNodes("//testcase/failure | //testcase/error")).Count
+                    $reportedTests = @($junitReport.SelectNodes("//testcase")).Count
+                    $reportedSkips = @($junitReport.SelectNodes("//testcase/skipped")).Count
+                    if ($RequireExecutedTests -and ($reportedTests -eq 0 -or $reportedSkips -gt 0)) {
+                        Write-Host "    FAIL - this required step must execute every test (tests=$reportedTests, skipped=$reportedSkips)" -ForegroundColor Red
+                        $exitCode = 1
+                    }
                     if ($reportedFailures -gt 0) {
                         Write-Host "    FAIL - pytest JUnit report contains $reportedFailures failure(s) or error(s)" -ForegroundColor Red
                         $exitCode = if ($null -eq $exitCode -or $exitCode -eq 0) { 1 } else { $exitCode }
@@ -250,7 +266,7 @@ function Invoke-TestStep {
                     }
                 } catch {
                     Write-Host ("    FAIL - could not read pytest JUnit report: " + $_.Exception.Message) -ForegroundColor Red
-                    $exitCode = if ($null -eq $exitCode) { -2 } else { $exitCode }
+                    $exitCode = if ($null -eq $exitCode -or $exitCode -eq 0) { -2 } else { $exitCode }
                 }
             }
         } elseif ($null -eq $exitCode) {
@@ -530,7 +546,14 @@ try {
     )
     Invoke-TestStep -Label "CLI and Watch acceptance tests" -Command @(
         $python, "-m", "pytest", "-q", "-rs", "-n", [string]$ParallelWorkers,
-        "--dist", "worksteal", "tests/blackbox", "tests/unit", "tests/integration", "tests/real"
+        "--dist", "worksteal", "tests/blackbox", "tests/unit", "tests/integration", "tests/real",
+        "--ignore=tests/integration/test_disk_full_pause_resume.py"
+    )
+    # DiskPart must retain elevation, unlike ordinary launcher/GUI tests.
+    # Missing elevation or any prerequisite skip is an incomplete acceptance run.
+    Invoke-TestStep -Label "Real disk-full recovery tests" -KeepElevationIfAdministrator -RequireExecutedTests -Command @(
+        $python, "-m", "pytest", "-q", "-rs", "-n", "0",
+        "tests/integration/test_disk_full_pause_resume.py"
     )
 } finally {
     if ($watchServiceInstalled) {

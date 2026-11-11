@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 
+import psutil
 import pytest
 
 
@@ -64,7 +65,7 @@ def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, 
 
 
 @pytest.mark.requires_watch_broker
-def test_watch_password_retry_recovers_the_failed_sibling_after_restart(package, tmp_path):
+def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(package, tmp_path):
     if "SUNPACK_WATCH_BROKER_PIPE_NAME" not in package.env:
         pytest.skip("The isolated Watch Broker service is required")
     watched = tmp_path / "watched"
@@ -82,7 +83,15 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_restart(package,
     assert not list(output.rglob("second.txt"))
     assert carrier.is_file()
 
-    assert package.run("--persistent-shutdown").returncode == 0
+    # Unlike graceful shutdown, TerminateProcess cannot flush or retire state.
+    # The completed sibling and the password blocker must already be durable.
+    state, = package.data.glob("runtime-*.state")
+    owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
+    workers = owner.children(recursive=True)
+    owner.kill()
+    owner.wait(timeout=30)
+    for worker in workers:
+        worker.wait(timeout=30)
     # Reopening the successful sibling would now fail its password probe.
     passwords.write_text(json.dumps({"passwords": [{"value": "second-key"}]}), encoding="utf-8")
     package.json("watch", "start", "--once", "--no-tray")
