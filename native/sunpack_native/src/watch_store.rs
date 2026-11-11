@@ -563,7 +563,7 @@ impl StateData {
             }
             Operation::Delete(Collection::Pending, key) => {
                 self.pending.remove(key);
-                if self.entries.get(key).is_none_or(|entry| entry.status == "processed") {
+                if !self.entries.contains_key(key) {
                     self.retire_checkpoints(key);
                 }
             }
@@ -632,18 +632,15 @@ impl NativeWatchOperations {
 
     pub(crate) fn finish_pending(path: &str, entry: Option<Arc<EntryRecord>>) -> Self {
         let key = path_key(path);
-        let mut operations = Vec::with_capacity(3);
-        // Clear the old blocker projection before publishing a compact terminal
-        // observation. Both changes and pending retirement share one WAL record.
-        if entry.as_ref().is_none_or(|entry| entry.status == "processed") {
-            operations.push(Operation::Delete(Collection::Entries, key.clone()));
-        }
-        if let Some(entry) = entry {
-            operations.push(Operation::PutEntry(key.clone(), entry));
-        }
-        operations.push(Operation::Delete(Collection::Pending, key));
+        let retry = match entry {
+            Some(entry) => Operation::PutEntry(key.clone(), entry),
+            None => Operation::Delete(Collection::Entries, key.clone()),
+        };
         Self {
-            operations: Arc::new(Operations(operations)),
+            operations: Arc::new(Operations(vec![
+                retry,
+                Operation::Delete(Collection::Pending, key),
+            ])),
         }
     }
 
@@ -907,7 +904,7 @@ impl NativeWatchState {
                 let removed = if let (Some(_), Operation::Delete(Collection::Entries, path)) =
                     (&events, operation)
                 {
-                    data.entries.get(path).filter(|record| record.status != "processed").cloned()
+                    data.entries.get(path).cloned()
                 } else {
                     None
                 };
@@ -1904,43 +1901,6 @@ mod tests {
         assert!(!pending.output_identities.contains_key(&second));
         fs::remove_file(snapshot).unwrap();
         fs::remove_file(journal).unwrap();
-    }
-
-    #[test]
-    fn processed_observation_retires_recovery_but_survives_snapshot() {
-        let source = crate::test_support::temp_file("processed_source", b"kept input");
-        let snapshot = crate::test_support::temp_file("processed_snapshot", b"");
-        let path = source.to_string_lossy().into_owned();
-        let key = path_key(&path);
-        let record: EntryRecord = serde_json::from_value(serde_json::json!({
-            "path": path, "size": 10, "mtime": 1.0, "file_id": "retained-id", "change_usn": 42,
-            "status": "processed", "last_error": "", "attempt_count": 1, "failure_kind": "",
-            "failure_stage": "", "failure_payload": {}, "last_attempt_at": 1.0,
-        })).unwrap();
-        let state = NativeWatchState::new();
-        state.apply_operations(&Operations(vec![Operation::PutPending(key.clone(), Arc::new(PendingRecord {
-            path: path.clone(), ..Default::default()
-        }))]));
-        state.apply(&NativeWatchOperations::checkpoint(&path, "completed-output", Some(serde_json::json!({}))));
-        state.apply(&NativeWatchOperations::finish_pending(&path, Some(Arc::new(record))));
-        assert!(!state.has_pending(&path));
-        assert!(state.runtime_keys("checkpoint|").is_empty());
-        assert!(state.entry_items(Some("password")).is_empty());
-        assert!(NativeWatchState::event_projection(&state.data).is_empty());
-        state.capture(1).write(snapshot.to_string_lossy().into_owned()).unwrap();
-        let restored = NativeWatchState::new();
-        restored.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap();
-        let observed = restored.entry(&path).unwrap();
-        assert_eq!(observed.file_id, "retained-id");
-        assert_eq!(observed.change_usn, 42);
-        assert_eq!(observed.status, "processed");
-        // Completed observations use the existing departure/scope lifecycle,
-        // rather than growing a second ledger for files no longer watched.
-        assert_eq!(restored.entry_paths(None, true), vec![(key.clone(), path.clone())]);
-        restored.apply(&restored.scope_retirement_operations(&[]));
-        assert!(!restored.has_entry(&path));
-        std::fs::remove_file(source).unwrap();
-        std::fs::remove_file(snapshot).unwrap();
     }
 
     #[test]

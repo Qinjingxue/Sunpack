@@ -40,7 +40,7 @@ def _staged_worker(package, tmp_path):
     )
 
 
-def test_watch_rebuild_preserves_completed_generations_and_recovers_offline_arrivals(package, tmp_path):
+def test_watch_catalog_loss_rebuilds_baseline_without_replaying_existing_sources(package, tmp_path):
     watched = tmp_path / "watched"
     watched.mkdir()
     output = tmp_path / "out"
@@ -69,12 +69,17 @@ def test_watch_rebuild_preserves_completed_generations_and_recovers_offline_arri
     assert len(retained_outputs) == 1
     assert [path.read_bytes() for path in output.rglob("changed.txt")] == [b"old generation"]
     assert retained.is_file() and changed.is_file()
+    state = package.data / ".sunpack_watch"
+    display = native_fixture("display_events", path=str(state / "events.json"))
+    assert any(
+        row["event"] == "suspended_missing_volume"
+        for row in (*display["history"], *display["live"])
+    )
     assert package.run("--persistent-shutdown").returncode == 0
 
-    # Lose only the disposable catalog. Kept successful sources must not replay,
-    # but a new offline file, a content edit with identical metadata, and a
-    # previously missing volume must all be admitted through the rebuilt view.
-    state = package.data / ".sunpack_watch"
+    # Without trusted history, kept sources, offline arrivals, and offline
+    # edits all become the baseline. Only the explicit missing-volume blocker
+    # still authorizes recovery when its missing peer appears.
     roots = package.data / "sunpack_watch_roots.txt"
     assert roots.read_text(encoding="utf-8").split("|")[3].strip() == "true"
     catalog = list(state.glob("catalog.*.bin"))
@@ -91,16 +96,25 @@ def test_watch_rebuild_preserves_completed_generations_and_recovers_offline_arri
     assert [path.read_bytes() for path in output.rglob(payload.name)] == [content]
     assert list(output.rglob("retained.txt")) == retained_outputs
     assert retained_outputs[0].read_bytes() == b"already completed"
-    assert [path.read_bytes() for path in output.rglob("offline.txt")] == [b"arrived while stopped"]
-    assert sorted(path.read_bytes() for path in output.rglob("changed.txt")) == [
-        b"new generation", b"old generation",
-    ]
+    assert not list(output.rglob("offline.txt"))
+    assert [path.read_bytes() for path in output.rglob("changed.txt")] == [b"old generation"]
     completed = sorted(path.relative_to(output) for path in output.rglob("*") if path.is_file())
     assert package.run("--persistent-shutdown").returncode == 0
     for path in state.glob("catalog.*.bin"):
         path.unlink()
-    package.json("watch", "start", "--once", "--no-tray")
-    assert sorted(path.relative_to(output) for path in output.rglob("*") if path.is_file()) == completed
+    package.json("watch", "start", "--no-tray")
+    # A new arrival after the baseline is established must still be processed.
+    # Stage it outside the root so Watch sees the completed input move into place.
+    incoming = tmp_path / "live.zip"
+    _zip(incoming, "live.txt", b"arrived while watching")
+    incoming.replace(watched / incoming.name)
+    _wait_for(lambda: bool(list(output.rglob("live.txt"))), "Watch ignored an arrival after catalog rebuild")
+    assert package.json("watch", "stop")["summary"]["stopped"]
+    assert [path.read_bytes() for path in output.rglob("live.txt")] == [b"arrived while watching"]
+    assert sorted(
+        path.relative_to(output) for path in output.rglob("*")
+        if path.is_file() and path.name != "live.txt"
+    ) == completed
 
 
 def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(package, tmp_path):

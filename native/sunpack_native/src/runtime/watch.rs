@@ -1634,15 +1634,13 @@ impl Scheduler {
             let mut errors = Vec::new();
             let rebuild = !root.scanned || range.is_none_or(|(_, entries)| entries.is_err());
             if rebuild {
-                // Without an inventory there is no evidence that current files
-                // were seen before shutdown. Reconcile every arrival against WAL.
+                // An untrusted history cannot distinguish old files from new
+                // arrivals. Rebuild only the baseline; an unscanned root still
+                // admits its initial inventory below.
                 let scan = self.scan_options(root.deep)
-                    .catalog_refresh(&self.catalog, &scope, None);
+                    .catalog_update(&self.catalog, &scope, None);
                 match scan {
-                    Ok((failures, entries)) => {
-                        errors = failures;
-                        paths = entries;
-                    }
+                    Ok(failures) => errors = failures,
                     Err(error) => {
                         self.journal.log(json!({"event":"filesystem_scan_failed","path":root.path,"error":error.to_string()}));
                         if let Ok((volume, _, _)) = current {
@@ -3367,16 +3365,9 @@ impl Scheduler {
                     .log(json!({"event":event,"path":canonical,"owner":batch,
                     "error":error,"output_dirs":outputs,"retire_group":true}));
             }
-            let record = record.filter(|entry| entry.status != "failed_terminal").or_else(|| {
-                // The catalog is disposable. Retain the accepted generation of
-                // a finished source in the task WAL, not a fresh probe that could
-                // accidentally acknowledge a replacement written during cleanup.
-                (!completed.cancelled && !NativePresence::at(&candidate.path).is_absent())
-                    .then(|| Arc::new(observed_entry(&candidate, "processed", None)))
-            });
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
                 &candidate.path,
-                record,
+                record.filter(|entry| entry.status != "failed_terminal"),
             ));
         }
         self.journal.commit(true, |state| {

@@ -2,8 +2,11 @@ import json
 import subprocess
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
+
+from tests.helpers.native_fixture import native_fixture
 
 
 pytestmark = pytest.mark.requires_watch_broker
@@ -33,12 +36,34 @@ def test_watch_rearms_the_root_object_after_rename_and_recreation(package, tmp_p
     output = tmp_path / "out"
     package.json("watch", "add", watched, "-R", "-o", output)
     package.json("watch", "start", "--no-tray")
+    events = package.data / ".sunpack_watch" / "events.json"
 
+    def wait_for_rebuild(previous):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                history = native_fixture("display_events", path=str(events))["history"]
+            except subprocess.CalledProcessError:
+                pass  # The display store may still be publishing its manifest.
+            else:
+                count = sum(
+                    row["event"] == "catalog_rebuilt" and Path(row.get("root", "")) == watched
+                    for row in history
+                )
+                if count > previous:
+                    return count
+            time.sleep(0.05)
+        pytest.fail("Watch did not rebuild the configured root after its directory changed")
+
+    rebuilt = wait_for_rebuild(0)
     # The old directory remains alive, so an old handle can remain healthy
     # even though the configured path now denotes a different object.
     watched.rename(tmp_path / "old-root")
     nested = watched / "nested"
     nested.mkdir(parents=True)
+    # Let the parent sentinel rebuild the replacement root's empty baseline.
+    # Files present before this point are intentionally not treated as arrivals.
+    wait_for_rebuild(rebuilt)
     _zip(nested / "first.zip", "first.txt", b"replacement root")
     _wait_for_output(output, "first.txt", b"replacement root")
 
