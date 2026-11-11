@@ -396,7 +396,9 @@ impl Watch {
                     }
                     continue;
                 }
-                if running && filesystem::validate_ntfs_watch_root(&root.to_string_lossy()).is_err()
+                if running
+                    && filesystem::watch_filesystem_type(&root.to_string_lossy())
+                        .is_ok_and(|name| !name.eq_ignore_ascii_case("NTFS"))
                 {
                     rejected.push(root.clone());
                     continue;
@@ -415,10 +417,16 @@ impl Watch {
                 write_roots(&path, &roots)?;
             }
         }
-        let applied = self.reload()?;
+        let apply = self.root_change_status(running, !added.is_empty() || !updated.is_empty())?;
+        let apply = apply.map(|(applied, generation)| {
+            json!({
+                "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
+                "applied":applied,"running":true,"generation":generation,
+            })
+        });
         Ok(json!({
             "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
-            "apply":running.then_some(applied),"start":null,
+            "apply":apply,"start":null,
         }))
     }
 
@@ -441,9 +449,23 @@ impl Watch {
                 write_roots(&path, &roots)?;
             }
         }
-        let running = self.is_running();
-        let applied = self.reload()?;
-        Ok(json!({"roots_path":path,"removed":removed,"apply":running.then_some(applied)}))
+        let apply = self
+            .root_change_status(self.is_running(), !removed.is_empty())?
+            .map(|(applied, generation)| {
+                json!({
+                    "roots_path":path,"removed":removed,"applied":applied,
+                    "running":true,"generation":generation,
+                })
+            });
+        Ok(json!({"roots_path":path,"removed":removed,"apply":apply}))
+    }
+
+    fn root_change_status(&self, running: bool, changed: bool) -> io::Result<Option<(bool, u64)>> {
+        if !running {
+            return Ok(None);
+        }
+        let applied = changed && self.reload()?["reloaded"] == true;
+        Ok(Some((applied, self.generation.load(Ordering::Relaxed))))
     }
 
     pub(super) fn rebuild_log(&self, cwd: &Path) -> io::Result<bool> {
@@ -1000,6 +1022,14 @@ impl Scheduler {
             let mut latest = read_roots(&self.root_file)?;
             latest.retain(|root| !rejected.contains(&key(&root.path)));
             write_roots(&self.root_file, &latest)?;
+        }
+        let new_directories: HashSet<_> = entries
+            .iter()
+            .filter(|root| !self.roots.contains_key(&key(&root.path)))
+            .filter_map(|root| nearest_directory(&root.path))
+            .collect();
+        for directory in new_directories {
+            filesystem::validate_ntfs_watch_root(&directory.to_string_lossy())?;
         }
         let dir = state_dir(&self.cwd)?;
         let mut next = entries

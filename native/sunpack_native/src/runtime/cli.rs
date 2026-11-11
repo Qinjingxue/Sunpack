@@ -1585,18 +1585,60 @@ fn watch_command(
             if output.is_some() && paths.len() != 1 {
                 return Err(invalid(language.text("cli.watch.output_dir_single_path")));
             }
-            result.inputs = json!({"action": "add", "paths": paths, "output_dir": output, "deep_detect": options.deep});
+            result.inputs = json!({
+                "action": "add", "paths": paths, "output_dir": output,
+                "deep_detect": options.deep.then_some(true),
+            });
             result.summary =
                 host.watch
                     .add(cwd, &paths, output, options.deep, options.recursive)?;
             result.summary["start_requested"] = Value::Bool(options.start);
             if options.start && !host.watch.is_running() {
                 result.summary["start"] = host.watch.start(cwd, host.engine(cwd)?, true)?;
+                let (_, effective) = host.watch.roots(cwd)?;
+                let effective: HashSet<_> = effective.iter().map(|path| path_key(path)).collect();
+                let mut rejected = Vec::new();
+                for name in ["added", "updated"] {
+                    if let Some(paths) = result.summary[name].as_array_mut() {
+                        paths.retain(|path| {
+                            let present = path.as_str().is_some_and(|value| {
+                                effective.contains(&path_key(Path::new(value)))
+                            });
+                            if !present {
+                                rejected.push(path.clone());
+                            }
+                            present
+                        });
+                    }
+                }
+                if let Some(previous) = result.summary["rejected"].as_array_mut() {
+                    previous.extend(rejected);
+                }
             }
             result.items = result.summary["added"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
+            if result.items.is_empty()
+                && result.summary["updated"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+            {
+                if let Some(rejected) = result.summary["rejected"]
+                    .as_array()
+                    .filter(|items| !items.is_empty())
+                {
+                    let paths = rejected
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    result.errors.push(
+                        language.translate("cli.watch.add_all_rejected", &[("paths", &paths)]),
+                    );
+                    code = 1;
+                }
+            }
         }
         "remove" => {
             let paths = targets(cwd, options)?;

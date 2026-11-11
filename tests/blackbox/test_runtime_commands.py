@@ -84,6 +84,9 @@ def test_continuous_watch_retries_promoted_nested_input_after_password_edit(pack
     started = package.json("watch", "start", "--no-tray")["summary"]
     assert started["started"] and started["running"]
     assert package.json("watch", "reload")["summary"]["reloaded"]
+    same_root = package.json("watch", "add", watched, "--deep-detect")["summary"]
+    assert same_root["apply"]["applied"] is False
+    assert same_root["apply"]["generation"] == started["generation"]
 
     source = watched / incoming.name
     promoted = watched / inner.name
