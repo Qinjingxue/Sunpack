@@ -5,6 +5,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import psutil
 import pytest
 
 
@@ -112,6 +113,34 @@ def test_continuous_watch_retries_promoted_nested_input_after_password_edit(pack
     extracted = list(output.rglob(marker.name))
     assert len(extracted) == 1
     assert extracted[0].read_bytes() == marker.read_bytes()
+
+
+@pytest.mark.requires_watch_broker
+def test_idle_watch_releases_reader_handles_after_foreground_scan(package, tmp_path):
+    settings_path = package.data / "sunpack_config.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings["watch"]["runtime_cache_cleanup_idle_seconds"] = 0.25
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    for number in range(128):
+        with zipfile.ZipFile(inputs / f"archive-{number}.zip", "w") as archive:
+            archive.writestr("payload.txt", str(number))
+
+    package.json("watch", "start", "--no-tray")
+    runtime = package.launcher.parent.parent / "sunpack-runtime.exe"
+    owner = next(
+        process for process in psutil.process_iter(["exe"])
+        if process.info["exe"] and Path(process.info["exe"]) == runtime
+    )
+    idle_handles = owner.num_handles()
+    assert package.json("scan", inputs)["summary"]["archive_count"] == 128
+    # Allow worker transport and its threads to remain warm. Idle Watch must
+    # release the archive readers even when all archive work came from CLI.
+    _await_watch(
+        lambda: owner.num_handles() <= idle_handles + 48,
+        "Watch retained reader handles after foreground archive work became idle",
+    )
 
 
 def test_gui_password_edits_are_visible_to_running_runtime(package):

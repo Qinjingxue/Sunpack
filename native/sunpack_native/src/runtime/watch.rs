@@ -236,6 +236,12 @@ impl Watch {
             .is_some_and(|run| !run.thread.is_finished())
     }
 
+    pub(super) fn foreground_finished(&self) {
+        if let Some(run) = self.running.lock().unwrap().as_ref() {
+            run.hub.update(|signals| signals.foreground_finished = true);
+        }
+    }
+
     pub(super) fn status(&self, cwd: &Path) -> io::Result<Value> {
         let slot = self.running.lock().unwrap();
         let run = slot.as_ref().filter(|run| !run.thread.is_finished());
@@ -582,6 +588,7 @@ struct Signals {
     reload_waiters: Vec<mpsc::SyncSender<io::Result<()>>>,
     once: Vec<mpsc::SyncSender<io::Result<()>>>,
     password_changed: bool,
+    foreground_finished: bool,
     clipboard: Option<Vec<String>>,
     volumes_changed: bool,
     rebuild: Vec<mpsc::SyncSender<io::Result<bool>>>,
@@ -644,6 +651,7 @@ impl Hub {
                 && value.changed_roots.is_empty()
                 && !value.reload
                 && !value.password_changed
+                && !value.foreground_finished
                 && value.clipboard.is_none()
                 && !value.volumes_changed
                 && value.rebuild.is_empty()
@@ -1235,6 +1243,9 @@ impl Scheduler {
             if signals.password_changed {
                 self.password_update()?;
             }
+            if signals.foreground_finished {
+                self.arm_idle_cleanup();
+            }
             if signals.reload {
                 let reload = self.reload();
                 if let Err(error) = &reload {
@@ -1282,17 +1293,16 @@ impl Scheduler {
                 .is_some_and(|deadline| deadline <= Instant::now())
             {
                 self.cache_deadline = None;
-                if self.active.is_empty()
-                    && self.pending.is_empty()
-                    && !windows::foreground_active()
-                {
-                    let _ = crate::io::reader::clear_reader_resources();
-                    self.engine.clear_idle_passwords();
-                    self.journal.state().trim_idle_storage();
-                    self.pending.shrink_to_fit();
-                    self.unpublished.shrink_to_fit();
-                    self.active.shrink_to_fit();
-                    self.active_paths.shrink_to_fit();
+                if self.active.is_empty() && self.pending.is_empty() {
+                    windows::maintain_when_foreground_idle(|| {
+                        let _ = crate::io::reader::clear_reader_resources();
+                        self.engine.clear_idle_passwords();
+                        self.journal.state().trim_idle_storage();
+                        self.pending.shrink_to_fit();
+                        self.unpublished.shrink_to_fit();
+                        self.active.shrink_to_fit();
+                        self.active_paths.shrink_to_fit();
+                    });
                 }
             }
         }
@@ -2315,11 +2325,15 @@ impl Scheduler {
             self.enqueue(&active.root, path, true)?;
         }
         self.persist_candidates(BTreeMap::new(), false)?;
-        if self.active.is_empty() && self.pending.is_empty() {
+        self.arm_idle_cleanup();
+        Ok(())
+    }
+
+    fn arm_idle_cleanup(&mut self) {
+        if self.active.is_empty() && self.pending.is_empty() && !windows::foreground_active() {
             let idle = self.settings.watch.runtime_cache_cleanup_idle_seconds;
             self.cache_deadline = (idle > 0.0).then(|| quiet::after(Instant::now(), idle));
         }
-        Ok(())
     }
 
     fn release_display_claims(&self, batch: &str, groups: &HashMap<String, Arc<SourceGroup>>) {

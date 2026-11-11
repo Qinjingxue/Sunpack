@@ -803,7 +803,7 @@ fn archives(
     if !host.watch.is_running() {
         windows::configure_priority(&engine, settings.runtime.process_mode);
     }
-    let _foreground = windows::Foreground::enter(&engine);
+    let _foreground = windows::Foreground::enter(&engine, &host.watch);
     let mut result = CommandResult::new(options.command);
     let mut retries = 0;
     let mut all_archives = BTreeMap::new();
