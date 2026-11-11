@@ -8,6 +8,7 @@ use crate::pipeline::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -94,15 +95,15 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 
 impl Options {
-    fn parse(argv: Vec<String>) -> io::Result<Self> {
-        let mut args = VecDeque::from(argv);
+    fn parse(argv: &[String]) -> io::Result<Self> {
+        let mut args: VecDeque<_> = argv.iter().map(|arg| Cow::Borrowed(arg.as_str())).collect();
         let Some(command) = args.pop_front() else {
             return Ok(Self {
                 help: true,
                 ..Self::default()
             });
         };
-        if matches!(command.as_str(), "-h" | "--help") {
+        if matches!(command.as_ref(), "-h" | "--help") {
             return Ok(Self {
                 help: true,
                 ..Self::default()
@@ -110,7 +111,7 @@ impl Options {
         }
         let command = COMMANDS
             .iter()
-            .find(|(name, alias)| command == *name || command == *alias)
+            .find(|(name, alias)| command.as_ref() == *name || command.as_ref() == *alias)
             .map(|(name, _)| *name)
             .ok_or_else(|| invalid(format!("invalid choice: {command}")))?;
         let mut options = Self {
@@ -126,38 +127,42 @@ impl Options {
                 positional = true;
                 continue;
             }
-            if positional || !arg.starts_with('-') || arg == "-" {
+            if positional || !looks_like_option(&arg) {
                 if matches!(command, "watch" | "config") && options.action.is_empty() {
-                    options.action = match (command, arg.as_str()) {
+                    options.action = match (command, arg.as_ref()) {
                         ("watch", "rm") => "remove".into(),
                         ("watch", "ls") => "list".into(),
                         ("watch", "st") => "status".into(),
-                        _ => arg,
+                        _ => arg.into_owned(),
                     };
                 } else {
                     after_action = true;
-                    options.paths.push(arg);
+                    options.paths.push(arg.into_owned());
                 }
                 continue;
             }
             if !arg.starts_with("--") && arg.len() > 2 && arg.as_bytes()[1].is_ascii() {
                 if b"pPocr".contains(&arg.as_bytes()[1]) {
                     if arg.as_bytes()[2] != b'=' {
-                        arg.insert(2, '=');
+                        arg.to_mut().insert(2, '=');
                     }
                 } else if b"jvRdfFash".contains(&arg.as_bytes()[1]) {
-                    args.push_front(format!("-{}", &arg[2..]));
-                    arg.truncate(2);
+                    args.push_front(Cow::Owned(format!("-{}", &arg[2..])));
+                    arg = Cow::Owned(arg[..2].to_owned());
                 }
             }
             after_action |= !options.action.is_empty();
             let (flag, inline) = arg
                 .split_once('=')
-                .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+                .map_or((arg.as_ref(), None), |(flag, value)| (flag, Some(value)));
             let mut take = || {
                 inline
                     .map(str::to_owned)
-                    .or_else(|| args.pop_front())
+                    .or_else(|| {
+                        args.pop_front()
+                            .filter(|value| !looks_like_option(value))
+                            .map(Cow::into_owned)
+                    })
                     .ok_or_else(|| invalid(format!("{flag} expects a value")))
             };
             let archives = matches!(command, "extract" | "scan");
@@ -167,6 +172,9 @@ impl Options {
             let passwords = archives || command == "passwords";
             match flag {
                 "-h" | "--help" => {
+                    if inline.is_some() {
+                        return Err(invalid(format!("{flag} does not take a value")));
+                    }
                     options.help = true;
                     return Ok(options);
                 }
@@ -184,7 +192,7 @@ impl Options {
                     options.flatten = Some(false)
                 }
                 "-r" | "--recur" if command == "extract" => {
-                    let value = take()?;
+                    let value = take()?.trim().to_owned();
                     Recursion::parse(&value)?;
                     options.depth = Some(value);
                     continue;
@@ -258,6 +266,22 @@ impl Options {
     }
 }
 
+fn looks_like_option(arg: &str) -> bool {
+    let Some(value) = arg.strip_prefix('-') else {
+        return false;
+    };
+    // Numeric negative values can be passed as separate arguments, including passwords.
+    !value.is_empty()
+        && !value.bytes().all(|byte| byte.is_ascii_digit())
+        && !value.split_once('.').is_some_and(|(integer, fraction)| {
+            !fraction.is_empty()
+                && integer
+                    .bytes()
+                    .chain(fraction.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+        })
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -299,6 +323,23 @@ fn help(options: &Options, language: Language, session: &dyn Session) -> io::Res
     } else if options.command == "config" && options.action.is_empty() {
         entry("show", "cli.config.show_help");
         entry("validate", "cli.config.validate_help");
+    } else if options.command == "watch" {
+        match options.action.as_str() {
+            "add" => {
+                entry("paths", "cli.watch.paths");
+                entry("-o/--out-dir OUTPUT_DIR", "cli.watch.output_dir");
+                entry("-s/--start", "cli.watch.start_after_add");
+                entry("-R/--recursive", "cli.recursive_scan");
+                entry("-d/--deep-detect", "cli.watch.deep_detect");
+            }
+            "remove" => entry("paths", "cli.watch.paths"),
+            "start" => {
+                entry("--once", "cli.watch.once");
+                entry("--no-tray", "cli.watch.no_tray");
+            }
+            "startup" => entry("action", "cli.watch.startup_action"),
+            _ => {}
+        }
     } else if matches!(options.command, "scan" | "extract") {
         entry("paths", &format!("cli.{}.paths", options.command));
         entry("-R/--recursive", "cli.recursive_scan");
@@ -320,6 +361,11 @@ fn help(options: &Options, language: Language, session: &dyn Session) -> io::Res
     }
     if !matches!(options.command, "" | "version") {
         entry("-j/--json", "cli.json");
+    }
+    if matches!(options.command, "scan" | "extract" | "watch") {
+        entry("-v/--verbose", "cli.verbose");
+        entry("--no-pause", "cli.no_pause");
+        entry("--pause", "cli.pause");
     }
     entry("-h/--help", "cli.help");
     session.write(Stream::Out, help.as_bytes())
@@ -384,8 +430,11 @@ pub(super) fn run(
             _ => 1,
         });
     }
-    let language = config::load_language(cwd);
-    let options = match Options::parse(args) {
+    let generation = config::generation(cwd);
+    let language = generation
+        .as_ref()
+        .map_or(Language::Zh, |config| config.language());
+    let options = match Options::parse(&args) {
         Ok(options) => options,
         Err(error) => {
             line(session, Stream::Err, &format!("sunpack: error: {error}"))?;
@@ -396,9 +445,31 @@ pub(super) fn run(
         help(&options, language, session)?;
         return Ok(0);
     }
+    if options.json && options.prompt_passwords {
+        let mut result = CommandResult::new(options.command);
+        result.inputs = json!({"argv": args});
+        result
+            .errors
+            .push(language.text("cli.json_password_prompt_unavailable").into());
+        write_json(session, &result)?;
+        return Ok(2);
+    }
+    drop(args);
     let execution = match options.command {
-        "scan" | "extract" => archives(host, cwd, &options, session, language, &cancel),
-        "passwords" => show_passwords(host, cwd, &options, session, language),
+        "scan" | "extract" => generation.and_then(|config| {
+            archives(
+                host,
+                cwd,
+                &options,
+                session,
+                language,
+                &cancel,
+                config.normalized()?,
+            )
+        }),
+        "passwords" => generation.and_then(|config| {
+            show_passwords(host, cwd, &options, session, language, config.normalized()?)
+        }),
         "config" => show_config(cwd, &options, session, language),
         "version" => show_version(cwd, session),
         "doctor" => doctor(cwd, session, options.json, language),
@@ -433,7 +504,7 @@ pub(super) fn run(
         for log in &result.logs {
             line(session, Stream::Out, log)?;
         }
-        if options.pause {
+        if options.pause && code != 130 && (options.command != "extract" || code != 0) {
             let _ = session.read_line(language.text("cli.pause_prompt"))?;
         }
     }
@@ -488,11 +559,6 @@ fn cli_passwords(
         .collect();
     }
     if options.prompt_passwords {
-        if options.json {
-            return Err(invalid(
-                language.text("cli.json_password_prompt_unavailable"),
-            ));
-        }
         result.extend(prompt_passwords(session, language)?);
     }
     dedupe(&mut result);
@@ -531,31 +597,42 @@ fn path_key(path: &Path) -> String {
     crate::watch_store::watch_path_key(&path.to_string_lossy())
 }
 
-fn common_root(paths: &[PathBuf]) -> PathBuf {
-    let mut root = paths
-        .first()
-        .and_then(|path| path.parent())
-        .unwrap_or(Path::new(""))
-        .to_owned();
-    for path in paths.iter().skip(1) {
-        while !crate::watch_store::is_path_under(&path_key(path), &path_key(&root)) {
-            if !root.pop() {
-                return root;
-            }
-        }
-    }
-    root
+fn password_failure(archive: &ArchiveResult) -> bool {
+    archive
+        .failure
+        .as_ref()
+        .is_some_and(|failure| is_password_failure(failure.kind))
 }
 
-fn password_failure(archive: &ArchiveResult) -> bool {
-    archive.failure.as_ref().is_some_and(|failure| {
-        matches!(
-            failure.kind,
-            FailureKind::PasswordRequired
-                | FailureKind::WrongPassword
-                | FailureKind::PasswordInconclusive
-        )
-    })
+fn is_password_failure(kind: FailureKind) -> bool {
+    matches!(
+        kind,
+        FailureKind::PasswordRequired
+            | FailureKind::WrongPassword
+            | FailureKind::PasswordInconclusive
+    )
+}
+
+fn failure_message(failure: &crate::pipeline::Failure, language: Language) -> &str {
+    if is_password_failure(failure.kind) {
+        language.text("failure.password_not_in_list")
+    } else {
+        &failure.message
+    }
+}
+
+#[derive(Serialize)]
+struct FailureReport<'a> {
+    kind: FailureKind,
+    message: &'a str,
+    details: FailureDetails<'a>,
+}
+
+#[derive(Serialize)]
+struct FailureDetails<'a> {
+    path: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    promoted_nested_input: Option<bool>,
 }
 
 #[derive(Default)]
@@ -564,6 +641,8 @@ struct ArchiveSummary {
     partial: usize,
     failed: usize,
     processed: usize,
+    nested: usize,
+    depth: usize,
     recovered: Vec<Value>,
     errors: Vec<String>,
 }
@@ -584,22 +663,15 @@ impl ArchiveSummary {
             processed: groups.len(),
             ..Self::default()
         };
-        for entries in groups.values() {
+        for ((_, depth), entries) in &groups {
+            summary.depth = summary.depth.max(*depth);
+            summary.nested += usize::from(*depth > 1);
             let failure = entries
                 .iter()
                 .find_map(|entry| (!entry.partial).then_some(entry.failure.as_ref()).flatten());
             if let Some(failure) = failure {
                 summary.failed += 1;
-                let message = if matches!(
-                    failure.kind,
-                    FailureKind::PasswordRequired
-                        | FailureKind::WrongPassword
-                        | FailureKind::PasswordInconclusive
-                ) {
-                    language.text("failure.password_not_in_list")
-                } else {
-                    failure.message.as_str()
-                };
+                let message = failure_message(failure, language);
                 summary
                     .errors
                     .push(format!("{}: {message}", entries[0].path.display()));
@@ -609,11 +681,7 @@ impl ArchiveSummary {
                     .iter()
                     .filter_map(|entry| entry.output.clone())
                     .collect::<Vec<_>>();
-                let output = if outputs.len() == 1 {
-                    outputs.first().cloned().unwrap_or_default()
-                } else {
-                    common_root(&outputs)
-                };
+                let output = crate::pipeline::common_ancestor(&outputs).unwrap_or_default();
                 let complete = entries
                     .iter()
                     .filter(|entry| entry.failure.is_none() || entry.partial)
@@ -726,6 +794,30 @@ impl Observer for Progress<'_> {
     }
 }
 
+fn archive_request_error(
+    error: io::Error,
+    inputs: &[PathBuf],
+    command: &'static str,
+    language: Language,
+) -> io::Result<(i32, CommandResult)> {
+    let Some(conflict) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::pipeline::BusyConflict>())
+    else {
+        return Err(error);
+    };
+    let (status, key) = if conflict.origin == crate::pipeline::Origin::Watch {
+        ("watch_busy", "cli.watch_busy")
+    } else {
+        ("busy", "cli.archive_busy")
+    };
+    let mut result = CommandResult::new(command);
+    result.inputs = json!({"paths":inputs});
+    result.summary = json!({"status":status,"conflicts":conflict.paths});
+    result.errors.push(language.text(key).into());
+    Ok((1, result))
+}
+
 fn archives(
     host: &Host,
     cwd: &Path,
@@ -733,9 +825,14 @@ fn archives(
     session: &dyn Session,
     language: Language,
     cancel: &Cancellation,
+    mut settings: Config,
 ) -> io::Result<(i32, CommandResult)> {
     let inputs = targets(cwd, options)?;
-    let mut settings = config::load(cwd)?;
+    let engine = host.engine(cwd)?;
+    let reservation = match engine.reserve_foreground(&inputs, cancel) {
+        Ok(reservation) => reservation,
+        Err(error) => return archive_request_error(error, &inputs, options.command, language),
+    };
     let mut overrides = serde_json::Map::new();
     if let Some(value) = &options.depth {
         settings.recursive_extract = Recursion::parse(value)?;
@@ -770,6 +867,11 @@ fn archives(
     } else {
         Vec::new()
     };
+    if cancel.cancelled() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let common_root = (!scan && (output.is_some() || options.verbose || options.json))
+        .then(|| crate::pipeline::common_output_base(&inputs).unwrap_or_else(|| cwd.to_owned()));
     if !options.json {
         if !scan {
             let message = if inputs.len() == 1 {
@@ -784,6 +886,22 @@ fn archives(
                 )
             };
             line(session, Stream::Out, &message)?;
+            if let Some(common_root) = common_root.as_ref().filter(|_| options.verbose) {
+                if inputs.len() > 1 {
+                    for path in &inputs {
+                        let detail = language.translate(
+                            "cli.detail_item_path",
+                            &[("path", &path.to_string_lossy())],
+                        );
+                        line(session, Stream::Out, &detail)?;
+                    }
+                }
+                let detail = language.translate(
+                    "cli.extract.common_root",
+                    &[("root", &common_root.to_string_lossy())],
+                );
+                line(session, Stream::Out, &detail)?;
+            }
         }
         if session.interactive() {
             line(session, Stream::Out, language.text("interrupt.hint"))?;
@@ -799,7 +917,6 @@ fn archives(
     };
     let max_depth = depth(settings.recursive_extract);
     let settings = Arc::new(settings);
-    let engine = host.engine(cwd)?;
     if !host.watch.is_running() {
         windows::configure_priority(&engine, settings.runtime.process_mode);
     }
@@ -810,6 +927,7 @@ fn archives(
     let mut all_errors = BTreeMap::new();
     let mut cleanup = BTreeMap::new();
     let mut checkpoints = Vec::new();
+    let mut promoted_sources = Vec::new();
     let began = Instant::now();
     loop {
         let mut request = Request::new(
@@ -817,6 +935,7 @@ fn archives(
             if scan { Mode::Scan } else { Mode::Extract },
         );
         request.output_root = output.clone();
+        request.output_base = common_root.clone();
         request.max_depth = max_depth;
         request.recursive = options.recursive;
         request.direct = options.direct;
@@ -827,28 +946,10 @@ fn archives(
         request.config = Arc::clone(&settings);
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
-        let current = match engine.run_with(request, &progress) {
+        request.promoted_sources = std::mem::take(&mut promoted_sources);
+        let current = match engine.run_reserved(request, &progress, &reservation) {
             Ok(outcome) => outcome,
-            Err(error) => {
-                if let Some(conflict) = error
-                    .get_ref()
-                    .and_then(|inner| inner.downcast_ref::<crate::pipeline::BusyConflict>())
-                {
-                    let watch_busy = conflict.origin == crate::pipeline::Origin::Watch;
-                    let status = if watch_busy { "watch_busy" } else { "busy" };
-                    let key = if watch_busy {
-                        "cli.watch_busy"
-                    } else {
-                        "cli.archive_busy"
-                    };
-                    let mut result = CommandResult::new(options.command);
-                    result.inputs = json!({"paths":inputs});
-                    result.summary = json!({"status":status,"conflicts":conflict.paths});
-                    result.errors.push(language.text(key).to_owned());
-                    return Ok((1, result));
-                }
-                return Err(error);
-            }
+            Err(error) => return archive_request_error(error, &inputs, options.command, language),
         };
         if cancel.cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
@@ -856,30 +957,52 @@ fn archives(
         if scan {
             return report_scan(current, inputs, options, session, language);
         }
-        let counts = ArchiveSummary::collect(&current.archives, language);
-        let scan_errors = current
-            .errors
-            .iter()
-            .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-            .count();
-        let input_errors = current
-            .errors
-            .iter()
-            .filter(|error| error.kind == InputErrorKind::InvalidInput)
-            .count();
-        result.tasks.push(json!({
-            "success_count": counts.success, "failed_count": counts.failed,
-            "input_error_count": input_errors, "scan_error_count": scan_errors,
-            "processed_count": counts.processed, "partial_success_count": counts.partial,
-            "recovered_outputs": counts.recovered, "wrong_password_failure": current.archives.iter().any(password_failure),
-            "failures": current.archives.iter().filter_map(|entry| entry.failure.as_ref()).collect::<Vec<_>>(),
-        }));
+        if options.json {
+            let counts = ArchiveSummary::collect(&current.archives, language);
+            let scan_errors = current
+                .errors
+                .iter()
+                .filter(|error| error.kind == InputErrorKind::FilesystemScan)
+                .count();
+            let input_errors = current
+                .errors
+                .iter()
+                .filter(|error| error.kind == InputErrorKind::InvalidInput)
+                .count();
+            let failures = current
+                .archives
+                .iter()
+                .filter_map(|archive| {
+                    let failure = archive.failure.as_ref()?;
+                    Some(FailureReport {
+                        kind: failure.kind,
+                        message: failure_message(failure, language),
+                        details: FailureDetails {
+                            path: &archive.path,
+                            promoted_nested_input: archive.promoted.then_some(true),
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            result.tasks.push(json!({
+                "success_count": counts.success, "failed_count": counts.failed,
+                "input_error_count": input_errors, "scan_error_count": scan_errors,
+                "processed_count": counts.processed, "partial_success_count": counts.partial,
+                "recovered_outputs": counts.recovered, "wrong_password_failure": current.archives.iter().any(password_failure),
+                "failures": failures,
+            }));
+        }
         checkpoints = current.checkpoints;
+        promoted_sources = current.promoted_sources;
         for receipt in current.cleanup_results {
             cleanup.insert(path_key(&receipt.path), receipt);
         }
         for archive in current.archives {
-            if !archive.partial && password_failure(&archive) && archive.path.exists() {
+            if !options.json
+                && !archive.partial
+                && password_failure(&archive)
+                && archive.path.exists()
+            {
                 candidate_paths.push(archive.path.clone());
             }
             all_archives.insert(
@@ -894,17 +1017,24 @@ fn archives(
         for error in current.errors {
             all_errors.insert((path_key(&error.path), error.kind as u8), error);
         }
-        if candidate_paths.is_empty()
-            || options.json
-            || !confirm(
-                session,
-                language,
-                language.text("cli.password_retry_prompt"),
-            )?
-        {
+        if candidate_paths.is_empty() {
+            break;
+        }
+        let retry = confirm(
+            session,
+            language,
+            language.text("cli.password_retry_prompt"),
+        )?;
+        if cancel.cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if !retry {
             break;
         }
         let additional = prompt_passwords(session, language)?;
+        if cancel.cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         if additional.is_empty() {
             line(
                 session,
@@ -919,19 +1049,6 @@ fn archives(
     }
     let counts = ArchiveSummary::collect(all_archives.values(), language);
     result.errors = counts.errors;
-    for item in all_archives.values() {
-        if item.failure.is_none() || item.partial {
-            if !options.json {
-                if let Some(output) = &item.output {
-                    line(
-                        session,
-                        Stream::Out,
-                        &format!("{} → {}", item.path.display(), output.display()),
-                    )?;
-                }
-            }
-        }
-    }
     let scan_errors = all_errors
         .values()
         .filter(|error| error.kind == InputErrorKind::FilesystemScan)
@@ -946,20 +1063,63 @@ fn archives(
             .filter(|error| error.kind != InputErrorKind::Cleanup)
             .map(|error| format!("{}: {}", error.path.display(), error.message)),
     );
-    result.inputs = json!({
-        "paths": inputs, "common_root": common_root(&inputs), "json": options.json, "verbose": options.verbose,
-        "direct_file": options.direct, "deep_detect": options.deep, "config_overrides": overrides,
-    });
-    result.summary = json!({
-        "success_count": counts.success, "failed_count": counts.failed, "scan_error_count": scan_errors,
-        "scan_failures": all_errors.values().filter(|error| error.kind == InputErrorKind::FilesystemScan).collect::<Vec<_>>(),
-        "input_error_count": input_errors, "processed_count": counts.processed,
-        "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
-        "password_retry_count": retries, "cleanup_results": cleanup.values().collect::<Vec<_>>(),
-    });
-    if !options.json {
+    if options.json {
+        result.inputs = json!({
+            "paths": inputs, "common_root": common_root, "json": options.json, "verbose": options.verbose,
+            "direct_file": options.direct, "deep_detect": options.deep, "config_overrides": overrides,
+        });
+        result.summary = json!({
+            "success_count": counts.success, "failed_count": counts.failed, "scan_error_count": scan_errors,
+            "scan_failures": all_errors.values().filter(|error| error.kind == InputErrorKind::FilesystemScan).collect::<Vec<_>>(),
+            "input_error_count": input_errors, "processed_count": counts.processed,
+            "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
+            "password_retry_count": retries, "cleanup_results": cleanup.values().collect::<Vec<_>>(),
+        });
+        result.items.push(password_item(
+            &user,
+            &clipboard,
+            &engine.recent_passwords(),
+            builtin.as_deref(),
+            !options.no_builtins,
+        ));
+    } else {
+        for item in all_archives
+            .values()
+            .filter(|item| item.failure.is_none() || item.partial)
+        {
+            let name = item
+                .path
+                .file_name()
+                .unwrap_or(item.path.as_os_str())
+                .to_string_lossy();
+            let status = if item.partial {
+                "report.status.partial"
+            } else {
+                "report.status.complete"
+            };
+            line(session, Stream::Out, &name)?;
+            let label = language.text(status);
+            let progress = if item.partial {
+                ""
+            } else {
+                " [####################] 100%"
+            };
+            line(session, Stream::Out, &format!("  [{label}]{progress}"))?;
+        }
         line(session, Stream::Out, &format!("\n{}", "-".repeat(54)))?;
-        let duration = format!("{:.2}s", began.elapsed().as_secs_f64());
+        let elapsed = began.elapsed().as_secs();
+        let seconds = (elapsed % 60).to_string();
+        let duration = if elapsed >= 60 {
+            language.translate(
+                "duration.minutes_seconds",
+                &[
+                    ("minutes", &(elapsed / 60).to_string()),
+                    ("seconds", &seconds),
+                ],
+            )
+        } else {
+            language.translate("duration.seconds", &[("seconds", &seconds)])
+        };
         line(
             session,
             Stream::Out,
@@ -979,11 +1139,34 @@ fn archives(
                 ],
             ),
         )?;
-        if let Some(output) = output.as_deref() {
+        if counts.nested != 0 {
             line(
                 session,
                 Stream::Out,
-                &language.translate("report.output", &[("output", &output.to_string_lossy())]),
+                &language.translate(
+                    "report.recursion",
+                    &[
+                        ("levels", &counts.depth.to_string()),
+                        ("count", &counts.nested.to_string()),
+                    ],
+                ),
+            )?;
+        }
+        let mut outputs = all_archives
+            .values()
+            .filter(|item| item.depth == 1 && (item.failure.is_none() || item.partial))
+            .filter_map(|item| item.output.as_deref())
+            .peekable();
+        if outputs.peek().is_some() {
+            let location = crate::pipeline::common_ancestor(outputs);
+            let display = location.as_deref().map_or_else(
+                || Cow::Borrowed(language.text("report.multiple_locations")),
+                Path::to_string_lossy,
+            );
+            line(
+                session,
+                Stream::Out,
+                &language.translate("report.output", &[("output", &display)]),
             )?;
         }
         for recovery in &counts.recovered {
@@ -1026,13 +1209,8 @@ fn archives(
                 ),
             )?;
         }
+        line(session, Stream::Out, &"-".repeat(54))?;
     }
-    result.items.push(password_item(
-        &user,
-        &clipboard,
-        builtin.as_deref(),
-        !options.no_builtins,
-    ));
     Ok((i32::from(!result.errors.is_empty()), result))
 }
 
@@ -1043,7 +1221,6 @@ fn report_scan(
     session: &dyn Session,
     language: Language,
 ) -> io::Result<(i32, CommandResult)> {
-    let failed = outcome.failed();
     let scan_errors = outcome
         .errors
         .iter()
@@ -1065,11 +1242,9 @@ fn report_scan(
             .then(a.format.cmp(&b.format))
     });
     let mut result = CommandResult::new("scan");
-    result.inputs = json!({"paths": inputs, "deep_detect": options.deep});
-    result.summary = json!({
-        "archive_count": rows.len(), "failed_count": failed,
-        "scan_error_count": scan_errors, "input_error_count": input_errors,
-    });
+    let mut failed = 0;
+    let mut archive_input_errors = 0;
+    let mut has_archive_errors = false;
     let mut start = 0;
     while start < rows.len() {
         let key = &rows[start].0;
@@ -1079,6 +1254,14 @@ fn report_scan(
                 .take_while(|(path, _)| path == key)
                 .count();
         let group = &rows[start..end];
+        if let Some(failure) = group.iter().find_map(|(_, entry)| entry.failure.as_ref()) {
+            has_archive_errors = true;
+            if failure.kind == FailureKind::InvalidInput {
+                archive_input_errors += 1;
+            } else {
+                failed += 1;
+            }
+        }
         if !options.json {
             line(session, Stream::Out, &group[0].1.path.to_string_lossy())?;
         }
@@ -1234,11 +1417,31 @@ fn report_scan(
         start = end;
     }
     for error in outcome.errors {
+        let text = format!("{}: {}", error.path.display(), error.message);
+        if !options.json && error.kind == InputErrorKind::FilesystemScan {
+            result
+                .errors
+                .push(language.translate("report.scan_error", &[("task", &text)]));
+        } else {
+            result.errors.push(text);
+        }
+    }
+    if !options.json && scan_errors != 0 {
         result
             .errors
-            .push(format!("{}: {}", error.path.display(), error.message));
+            .push(language.text("report.scan_incomplete").into());
     }
-    Ok((i32::from(failed != 0), result))
+    if options.json {
+        result.inputs = json!({"paths": inputs, "deep_detect": options.deep});
+        result.summary = json!({
+            "archive_count": rows.len(), "failed_count": failed,
+            "scan_error_count": scan_errors, "input_error_count": input_errors + archive_input_errors,
+        });
+    }
+    Ok((
+        i32::from(has_archive_errors || !result.errors.is_empty()),
+        result,
+    ))
 }
 
 fn report_volume_plan(
@@ -1343,20 +1546,37 @@ fn end_offset(entry: &ArchiveResult) -> String {
 fn password_item(
     user: &[String],
     clipboard: &[String],
+    recent: &[Arc<str>],
     snapshot: Option<&passwords::PasswordSnapshot>,
     use_builtin: bool,
 ) -> Value {
     let builtin = snapshot.map_or(&[][..], passwords::PasswordSnapshot::global);
-    let mut seen = HashSet::new();
-    let combined: Vec<_> = user
+    let configured = user
         .iter()
         .chain(clipboard)
         .map(String::as_str)
-        .chain(builtin.iter().map(AsRef::as_ref))
+        .chain(builtin.iter().map(AsRef::as_ref));
+    let mut eligible_recent = HashSet::new();
+    if !recent.is_empty() {
+        let mut wanted: HashSet<&str> = recent.iter().map(AsRef::as_ref).collect();
+        for value in configured.clone() {
+            if wanted.remove(value) {
+                eligible_recent.insert(value);
+                if wanted.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let combined: Vec<_> = recent
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|value| eligible_recent.contains(value))
+        .chain(configured)
         .filter(|value| seen.insert(*value))
         .collect();
-    let builtin: Vec<_> = builtin.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
-    json!({"user_passwords":user,"recent_passwords":[],"clipboard_passwords":clipboard,
+    json!({"user_passwords":user,"recent_passwords":recent,"clipboard_passwords":clipboard,
         "builtin_passwords":builtin,"use_builtin_passwords":use_builtin,"combined_passwords":combined})
 }
 
@@ -1366,8 +1586,8 @@ fn show_passwords(
     options: &Options,
     session: &dyn Session,
     language: Language,
+    settings: Config,
 ) -> io::Result<(i32, CommandResult)> {
-    let settings = config::load(cwd)?;
     let user = cli_passwords(cwd, options, session, language)?;
     let clipboard = if settings.passwords.clipboard_passwords_enabled {
         passwords::clipboard_passwords()
@@ -1379,7 +1599,13 @@ fn show_passwords(
     } else {
         Some(host.passwords(cwd)?.reload()?)
     };
-    let item = password_item(&user, &clipboard, snapshot.as_deref(), !options.no_builtins);
+    let item = password_item(
+        &user,
+        &clipboard,
+        &[],
+        snapshot.as_deref(),
+        !options.no_builtins,
+    );
     let count = |field: &str| item[field].as_array().map_or(0, Vec::len);
     let mut result = CommandResult::new("passwords");
     result.inputs = json!({"json":options.json,"use_builtin_passwords":!options.no_builtins});
@@ -1453,7 +1679,7 @@ fn show_config(
             result.errors.push(message);
             result
                 .items
-                .push(json!({"ok": false, "errors":[error.to_string()]}));
+                .push(json!({"ok": false, "errors":[error.to_string()], "warnings": []}));
             return Ok((2, result));
         }
         if !options.json {
@@ -1463,7 +1689,9 @@ fn show_config(
                 language.text("cli.config.valid_config"),
             )?;
         }
-        result.items.push(json!({"ok": true, "errors": []}));
+        result
+            .items
+            .push(json!({"ok": true, "errors": [], "warnings": []}));
     }
     Ok((0, result))
 }
@@ -1582,13 +1810,16 @@ fn watch_command(
         "add" => {
             let paths = targets(cwd, options)?;
             let output = options.output.as_deref();
-            if output.is_some() && paths.len() != 1 {
-                return Err(invalid(language.text("cli.watch.output_dir_single_path")));
-            }
             result.inputs = json!({
                 "action": "add", "paths": paths, "output_dir": output,
                 "deep_detect": options.deep.then_some(true),
             });
+            if output.is_some() && paths.len() != 1 {
+                result
+                    .errors
+                    .push(language.text("cli.watch.output_dir_single_path").into());
+                return Ok((2, result));
+            }
             result.summary =
                 host.watch
                     .add(cwd, &paths, output, options.deep, options.recursive)?;

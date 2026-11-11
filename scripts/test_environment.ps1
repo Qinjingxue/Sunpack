@@ -28,6 +28,16 @@ function Get-SunPackRuntimeBuildPath {
     return Join-Path (Split-Path -Parent (Get-WatchBrokerBuildPath -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile)) "sunpack-runtime.exe"
 }
 
+function Get-ArchiveFixtureToolRefreshReasons {
+    param([string]$RepoRoot, [ValidateSet("x64", "arm64")][string]$Arch)
+    $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
+    foreach ($name in @("7z.exe", "7z.dll")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $toolsRoot $name) -PathType Leaf)) {
+            "Required archive fixture generator is missing: $name"
+        }
+    }
+}
+
 function Get-NewestSourceWriteTime {
     param([Parameter(Mandatory = $true)][string[]]$Paths)
     $newest = [datetime]::MinValue
@@ -66,6 +76,8 @@ function Get-NativeArtifactRefreshReasons {
     )
     $nativeRoot = Join-Path $RepoRoot "native"
     $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
+    $buildSuffix = if ($BuildProfile -eq "ci") { "-ci" } else { "" }
+    $sevenZipOutputs = Join-Path $nativeRoot "sevenzip_bridge\build-$Arch$buildSuffix\Release"
     $sharedRustTime = Get-NewestSourceWriteTime -Paths @(
         (Join-Path $nativeRoot "Cargo.toml"), (Join-Path $nativeRoot "Cargo.lock"),
         (Join-Path $nativeRoot "sunpack_usn_core"),
@@ -73,6 +85,12 @@ function Get-NativeArtifactRefreshReasons {
     )
     $lz4Time = Get-NewestSourceWriteTime -Paths @(
         (Join-Path $nativeRoot "lz4_stream"), (Join-Path $nativeRoot "third_party\lz4")
+    )
+    $sevenZipTime = Get-NewestSourceWriteTime -Paths @(
+        (Join-Path $nativeRoot "sevenzip_bridge"), (Join-Path $nativeRoot "cmake"),
+        (Join-Path $nativeRoot "sunpack_enc"), (Join-Path $nativeRoot "Cargo.toml"),
+        (Join-Path $nativeRoot "Cargo.lock"), (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1"),
+        (Join-Path $RepoRoot "sunpack.manifest")
     )
     $components = @(
         @{ Name = "SunPack runtime"; Artifact = (Get-SunPackRuntimeBuildPath -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile); InputTime = @(
@@ -94,12 +112,14 @@ function Get-NativeArtifactRefreshReasons {
             $sharedRustTime,
             (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_watch_broker"))
         ) },
-        @{ Name = "7-Zip worker"; Artifact = (Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"); InputTime = @(
-            $lz4Time,
-            (Get-NewestSourceWriteTime -Paths @((Join-Path $nativeRoot "sevenzip_bridge"),
-                (Join-Path $nativeRoot "cmake"), (Join-Path $nativeRoot "sunpack_enc"),
-                (Join-Path $nativeRoot "Cargo.toml"), (Join-Path $nativeRoot "Cargo.lock"),
-                (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1")))
+        @{ Name = "SunPack launcher"; Artifact = (Join-Path $sevenZipOutputs "sunpack_launcher.exe"); InputTime = @(
+            $sevenZipTime
+        ) },
+        @{ Name = "7-Zip worker"; Artifact = (Join-Path $sevenZipOutputs "sunpack_sevenzip_worker.exe"); InputTime = @(
+            $lz4Time, $sevenZipTime
+        ) },
+        @{ Name = "7-Zip worker tool copy"; Artifact = (Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"); InputTime = @(
+            $lz4Time, $sevenZipTime
         ) },
         @{ Name = "Toast library"; Artifact = (Join-Path $toolsRoot "sunpack_toast.dll"); InputTime = @(
             (Get-NewestSourceWriteTime -Paths @((Join-Path $nativeRoot "toast_host"),

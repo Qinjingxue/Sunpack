@@ -54,7 +54,7 @@ pub(super) static MESSAGES: &[(&str, &str, &str)] = &[
     ("cli.config.valid_config", "[CONFIG] Configuration is valid", "[配置] 配置有效"),
     ("cli.config.validate_help", "Validate config, rules, and schemas", "校验配置、规则和架构"),
     ("cli.config.validation_error", "[CONFIG] {error}", "[配置] {error}"),
-    ("cli.deep_detect", "Scan all unresolved files for embedded archives, including nested rounds", "扫描所有未确认文件中的嵌入压缩包，含递归轮次"),
+    ("cli.deep_detect", "Scan all unresolved input files for embedded archives", "扫描输入中所有未确认文件内的嵌入压缩包"),
     ("cli.detail_item_path", "  - {path}", "  - {path}"),
     ("cli.doctor.check.config", "Config", "配置"),
     ("cli.doctor.check.native", "Native module", "Native 模块"),

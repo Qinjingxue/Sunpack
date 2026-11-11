@@ -9,6 +9,8 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[path = "support/display_events.rs"]
+mod display_events;
 #[path = "support/libarchive_writer.rs"]
 mod libarchive_writer;
 
@@ -28,6 +30,9 @@ enum Request {
     },
     Inventory {
         root: PathBuf,
+    },
+    DisplayEvents {
+        path: PathBuf,
     },
     Libarchive {
         root: PathBuf,
@@ -419,6 +424,7 @@ fn run(request: Request) -> io::Result<Value> {
             inventory(&root, &root, &mut entries)?;
             Ok(json!({"files": entries}))
         }
+        Request::DisplayEvents { path } => display_events::read(&path),
         Request::Assemble {
             output,
             paths,

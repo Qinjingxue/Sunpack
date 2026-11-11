@@ -48,6 +48,27 @@ struct SourceGeneration {
     generation: PersistedFileGeneration,
 }
 
+/// A generated input moved out of a recursive output tree for a later retry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PromotedSource(SourceGeneration);
+
+impl PromotedSource {
+    pub(super) fn capture(path: &Path) -> io::Result<Self> {
+        Ok(Self(SourceGeneration {
+            path: path.to_path_buf(),
+            generation: capture_file_generation(path)?.persisted(),
+        }))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0.path
+    }
+
+    pub(super) fn matches(&self, generation: &PhysicalFileGeneration) -> bool {
+        generation.persisted() == self.0.generation
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OwnedDirectory {
     path: PathBuf,

@@ -9,7 +9,6 @@ use crate::analysis_native::structure::{
 use crate::io::archive_state::{AnalysisFacts, ArchiveInput, OpenMode, VolumeCompleteness};
 use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::reader::FileIdentity;
-use crate::io::reader::ReaderStats;
 use crate::scan::embedded::{EmbeddedCandidate, NativeScanResult};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -101,10 +100,6 @@ impl NativeAnalysisConfig {
         }
         Self { modules: ordered }
     }
-
-    pub(crate) fn module_names(&self) -> impl Iterator<Item = &str> {
-        self.modules.iter().map(|module| module.name.as_str())
-    }
 }
 
 impl Default for NativeAnalysisConfig {
@@ -138,11 +133,10 @@ struct Segment {
     password_required: Option<bool>,
     zip_eocd_offset: Option<u64>,
     damage_flags: Vec<String>,
-    evidence: Vec<String>,
 }
 
 impl Segment {
-    fn new(start: u64, end: Option<u64>, damage_flags: Vec<String>, evidence: Vec<String>) -> Self {
+    fn new(start: u64, end: Option<u64>, damage_flags: Vec<String>) -> Self {
         Self {
             start,
             end,
@@ -150,23 +144,16 @@ impl Segment {
             password_required: None,
             zip_eocd_offset: None,
             damage_flags,
-            evidence,
         }
     }
 }
 
-// Structural facts stay typed until a caller asks for diagnostic output.
+// Keep only the evidence needed by format selection and segment planning.
 enum EvidenceDetails {
     Empty,
     Fields(DiagnosticFields),
-    Rar(Box<RarReportDetails>),
-    SevenZip(Box<SevenZipReportDetails>),
-    Combined(Box<CombinedEvidence>),
-}
-
-struct CombinedEvidence {
-    primary: usize,
-    details: Vec<EvidenceDetails>,
+    Rar(Box<RarObservation>),
+    SevenZip(Box<SevenZipObservation>),
 }
 
 impl From<DiagnosticFields> for EvidenceDetails {
@@ -176,45 +163,17 @@ impl From<DiagnosticFields> for EvidenceDetails {
 }
 
 impl EvidenceDetails {
-    fn primary(&self) -> &Self {
-        match self {
-            Self::Combined(combined) => combined.details[combined.primary].primary(),
-            primary => primary,
-        }
-    }
-
-    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
-        match self {
-            Self::Empty => Ok(DiagnosticFields::new()),
-            Self::Fields(value) => Ok(value.clone()),
-            Self::Rar(value) => value.to_diagnostic(),
-            Self::SevenZip(value) => value.to_diagnostic(),
-            Self::Combined(combined) => {
-                let candidates: Vec<_> = combined
-                    .details
-                    .iter()
-                    .map(Self::to_diagnostic)
-                    .collect::<io::Result<_>>()?;
-                let mut primary = candidates[combined.primary].clone();
-                primary.put("candidate_count", candidates.len())?;
-                primary.put("candidate_details", candidates)?;
-                Ok(primary)
-            }
-        }
-    }
-
     fn password_required(&self) -> std::io::Result<bool> {
         match self {
-            Self::Rar(value) => Ok(value.raw.password_required.unwrap_or(false)),
-            Self::SevenZip(value) => Ok(value.raw.password_required),
+            Self::Rar(value) => Ok(value.password_required.unwrap_or(false)),
+            Self::SevenZip(value) => Ok(value.password_required),
             Self::Fields(value) => truthy(value, "password_required"),
             Self::Empty => Ok(false),
-            Self::Combined(combined) => combined.details[combined.primary].password_required(),
         }
     }
 
     fn embedded_anchor(&self) -> std::io::Result<bool> {
-        match self.primary() {
+        match self {
             Self::Fields(value) if str_of(value, "source")? == "embedded_scan" => {
                 let kind = str_of(value, "candidate_kind")?;
                 Ok(!kind.is_empty() && kind != "logical_archive")
@@ -228,7 +187,6 @@ pub(crate) struct Evidence {
     pub(crate) format: String,
     pub(crate) status: &'static str,
     segments: Vec<Segment>,
-    pub(crate) warnings: Vec<String>,
     details: EvidenceDetails,
 }
 
@@ -246,7 +204,6 @@ impl Evidence {
             format: format.to_string(),
             status,
             segments,
-            warnings: Vec::new(),
             details: details.into(),
         }
     }
@@ -268,11 +225,6 @@ impl Evidence {
 
     fn not_found(format: &str) -> Self {
         Self::new(format, "not_found", Vec::new(), EvidenceDetails::Empty)
-    }
-
-    fn with_warnings(mut self, warnings: Vec<String>) -> Self {
-        self.warnings = warnings;
-        self
     }
 }
 
@@ -327,12 +279,8 @@ pub(crate) struct AnalysisSegment {
 pub(crate) struct AnalysisReport {
     pub(crate) format_hint: String,
     pub(crate) facts: AnalysisFacts,
-    pub(crate) status: &'static str,
     pub(crate) extractable_segments: Vec<AnalysisSegment>,
     pub(crate) password_segment: Option<AnalysisSegment>,
-    pub(crate) size: u64,
-    pub(crate) stats: ReaderStats,
-    pub(crate) evidences: Vec<Evidence>,
 }
 
 pub(crate) fn analyze_input(
@@ -425,7 +373,6 @@ impl AnalysisBinaryView {
                             details.put("failure_kind", "resource_unavailable")?;
                         }
                         Evidence::new(module.kind.format(), "error", Vec::new(), details)
-                            .with_warnings(vec![message])
                     }
                 });
             }
@@ -487,12 +434,8 @@ impl AnalysisBinaryView {
         Ok(AnalysisReport {
             format_hint: primary.map_or_else(String::new, |e| e.format.clone()),
             facts,
-            status: primary.map_or("not_found", |e| e.status),
             extractable_segments,
             password_segment,
-            size,
-            stats: self.reader.stats()?,
-            evidences,
         })
     }
 }
@@ -555,22 +498,15 @@ impl<'a> ReportContext<'a> {
             }
             exact_starts.insert(start);
 
-            let validation = item.validation;
             let mut details = DiagnosticFields::new();
             details.put("source", "embedded_scan")?;
-            details.put("candidate", item)?;
             details.put("boundary_kind", "exact")?;
             details.put("boundary_confidence", "high")?;
             details.put("integrity_confidence", "deferred")?;
             candidates.push(Evidence::new(
                 "rar",
                 "extractable",
-                vec![Segment::new(
-                    start,
-                    Some(end),
-                    Vec::new(),
-                    vec![format!("rar:{validation}")],
-                )],
+                vec![Segment::new(start, Some(end), Vec::new())],
                 details,
             ));
         }
@@ -634,10 +570,8 @@ impl<'a> ReportContext<'a> {
                 let boundary_kind = item.boundary_kind;
                 let exact = end.is_some() && boundary_kind == "exact" && item.extractable;
 
-                let validation = item.validation;
                 let mut details = DiagnosticFields::new();
                 details.put("source", "embedded_scan")?;
-                details.put("candidate", item)?;
                 details.put("boundary_kind", boundary_kind)?;
                 candidates.push(Evidence::new(
                     "tar",
@@ -650,7 +584,6 @@ impl<'a> ReportContext<'a> {
                         } else {
                             vec!["tar_boundary_unresolved".to_string()]
                         },
-                        vec![format!("tar:{validation}")],
                     )],
                     details,
                 ));
@@ -698,7 +631,6 @@ impl<'a> ReportContext<'a> {
                 start,
                 opt_u64_of(&result, "segment_end")?,
                 read_fault_damage_flags(&result)?,
-                str_list(&result, "evidence")?,
             );
             return Ok(Some(Evidence::new(
                 "tar",
@@ -712,14 +644,11 @@ impl<'a> ReportContext<'a> {
             if damage_flags.is_empty() {
                 damage_flags.push("tar_metadata_bad".to_string());
             }
-            let evidence = non_empty_or(str_list(&result, "evidence")?, "tar:header");
-            let mut details = result;
-            details.put("route_evidence_flags", damage_flags.clone())?;
             return Ok(Some(Evidence::new(
                 "tar",
                 "damaged",
-                vec![Segment::new(start, None, damage_flags, evidence)],
-                details,
+                vec![Segment::new(start, None, damage_flags)],
+                result,
             )));
         }
         Ok(None)
@@ -803,7 +732,6 @@ impl<'a> ReportContext<'a> {
                     start,
                     None,
                     vec!["central_directory_unavailable".to_string()],
-                    vec!["zip:validated_local_header".to_string()],
                 )],
                 details,
             ));
@@ -895,7 +823,6 @@ impl<'a> ReportContext<'a> {
                 let extractable =
                     end.is_some() && item.boundary_kind == "exact" && item.extractable;
                 complete &= extractable;
-                let validation = item.validation;
                 let mut segment = Segment::new(
                     item.offset,
                     end,
@@ -904,14 +831,12 @@ impl<'a> ReportContext<'a> {
                     } else {
                         vec!["stream_boundary_inferred".to_string()]
                     },
-                    vec![format!("{format}:{validation}")],
                 );
                 segment.extractable = extractable;
                 segments.push(segment);
             }
             let mut details = DiagnosticFields::new();
             details.put("source", "embedded_scan")?;
-            details.put("candidates", &embedded)?;
             details.put("boundary_confidence", if complete { "high" } else { "low" })?;
             return Ok(Evidence::new(
                 format,
@@ -933,7 +858,6 @@ impl<'a> ReportContext<'a> {
         let structure_complete = truthy(&result, "structure_validation_complete")?;
         let boundary_exact = truthy(&result, "boundary_exact")?;
         let trailing = trailing_bytes(&result)?;
-        let evidence = str_list(&result, "evidence")?;
         let plausible = truthy(&result, "plausible")?;
         if plausible
             && structure_complete
@@ -948,7 +872,7 @@ impl<'a> ReportContext<'a> {
             return Ok(Evidence::new(
                 format,
                 "extractable",
-                vec![Segment::new(0, Some(end), Vec::new(), evidence)],
+                vec![Segment::new(0, Some(end), Vec::new())],
                 result,
             ));
         }
@@ -959,20 +883,16 @@ impl<'a> ReportContext<'a> {
             }
 
             let end = opt_u64_of(&result, "segment_end")?;
-            let mut details = result;
-            details.put("route_evidence_flags", damage_flags.clone())?;
             return Ok(Evidence::new(
                 format,
                 "damaged",
-                vec![Segment::new(0, end, damage_flags, evidence)],
-                details,
+                vec![Segment::new(0, end, damage_flags)],
+                result,
             ));
         }
         if damage_flags.is_empty() {
             damage_flags.push("stream_unverified".to_string());
         }
-        let mut details = result;
-        details.put("route_evidence_flags", damage_flags.clone())?;
         Ok(Evidence::new(
             format,
             if damage_flags.iter().any(|flag| flag != "stream_unverified") {
@@ -980,8 +900,8 @@ impl<'a> ReportContext<'a> {
             } else {
                 "weak"
             },
-            vec![Segment::new(0, None, damage_flags, evidence)],
-            details,
+            vec![Segment::new(0, None, damage_flags)],
+            result,
         ))
     }
 
@@ -1043,34 +963,6 @@ fn append_native_field_flag(flags: &mut Vec<String>, fault: Option<&(ReadFault, 
     }
 }
 
-struct RarReportDetails {
-    raw: RarObservation,
-    damage_flags: Vec<String>,
-    boundary: &'static str,
-    integrity: &'static str,
-}
-
-impl RarReportDetails {
-    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
-        let raw = &self.raw;
-        let mut result = raw.to_diagnostic()?;
-        result.put("format", if raw.magic_matched { "rar" } else { "" })?;
-        result.put("detected_ext", if raw.magic_matched { ".rar" } else { "" })?;
-        result.put(
-            "validated_prefix",
-            raw.second_block_checked && raw.second_block_ok,
-        )?;
-        result.put(
-            "confidence",
-            if raw.header_crc_ok { "strong" } else { "none" },
-        )?;
-        result.put("boundary_confidence", self.boundary)?;
-        result.put("integrity_confidence", self.integrity)?;
-        result.put("damage_flags", &self.damage_flags)?;
-        Ok(result)
-    }
-}
-
 fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evidence> {
     let mut damage_flags = raw
         .damage_flags
@@ -1096,35 +988,12 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evide
         damage_flags.push("probably_truncated".into());
     }
     damage_flags = sorted_unique(damage_flags);
-    let boundary = if raw.end_block_found {
-        "high"
-    } else if raw.header_encrypted == Some(true) {
-        "none"
-    } else if !error.is_empty() {
-        "low"
-    } else if raw.second_block_checked && raw.second_block_ok {
-        "medium"
-    } else {
-        "unknown"
-    };
-    let integrity = if raw.header_crc_ok {
-        "high"
-    } else if raw.magic_matched {
-        "low"
-    } else {
-        "unknown"
-    };
     if !raw.magic_matched {
         return Ok(Evidence::new(
             "rar",
             "not_found",
             Vec::new(),
-            EvidenceDetails::Rar(Box::new(RarReportDetails {
-                raw,
-                damage_flags,
-                boundary,
-                integrity,
-            })),
+            EvidenceDetails::Rar(Box::new(raw)),
         ));
     }
     let taxonomy =
@@ -1150,7 +1019,7 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evide
     } else {
         ("weak", None)
     };
-    let mut segment_flags = damage_flags.clone();
+    let mut segment_flags = damage_flags;
     append_native_field_flag(&mut segment_flags, raw.read_fault.as_ref());
     if !error.is_empty() {
         segment_flags.push(error.into());
@@ -1162,34 +1031,12 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evide
         raw.password_required = Some(true);
         raw.header_encrypted = Some(true);
     }
-    let evidence = non_empty_or(
-        raw.evidence.iter().map(|s| s.to_string()).collect(),
-        "rar:signature",
-    );
-    let warnings = if status == "extractable" {
-        Vec::new()
-    } else {
-        vec![match taxonomy {
-            "probably_truncated" => "rar block chain is incomplete; archive is probably truncated",
-            "valid_encrypted_but_unwalkable" => {
-                "rar header is encrypted; password is required before exact boundary resolution"
-            }
-            _ => "rar archive structure does not prove an exact end for this segment",
-        }
-        .to_string()]
-    };
     Ok(Evidence::new(
         "rar",
         status,
-        vec![Segment::new(start, end, segment_flags, evidence)],
-        EvidenceDetails::Rar(Box::new(RarReportDetails {
-            raw,
-            damage_flags,
-            boundary,
-            integrity,
-        })),
-    )
-    .with_warnings(warnings))
+        vec![Segment::new(start, end, segment_flags)],
+        EvidenceDetails::Rar(Box::new(raw)),
+    ))
 }
 
 fn seven_zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence> {
@@ -1209,41 +1056,9 @@ fn seven_zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence
     Ok(Evidence::new(
         "7z",
         "extractable",
-        vec![Segment::new(
-            start,
-            Some(end),
-            Vec::new(),
-            vec![
-                format!("7z:{validation}"),
-                "embedded_scan:exact_boundary".to_string(),
-            ],
-        )],
+        vec![Segment::new(start, Some(end), Vec::new())],
         details,
     ))
-}
-
-struct SevenZipReportDetails {
-    raw: SevenZipObservation,
-    damage_flags: Vec<String>,
-    boundary: &'static str,
-    integrity: &'static str,
-}
-
-impl SevenZipReportDetails {
-    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
-        let raw = &self.raw;
-        let mut result = raw.to_diagnostic()?;
-        result.put("detected_ext", if raw.magic_matched { ".7z" } else { "" })?;
-        result.put(
-            "next_header_semantic_ok",
-            raw.next_header_crc_ok && raw.next_header_nid_valid,
-        )?;
-        result.put("confidence", if raw.plausible { "strong" } else { "none" })?;
-        result.put("boundary_confidence", self.boundary)?;
-        result.put("integrity_confidence", self.integrity)?;
-        result.put("damage_flags", &self.damage_flags)?;
-        Ok(result)
-    }
 }
 
 fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> std::io::Result<Evidence> {
@@ -1255,53 +1070,22 @@ fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> std::io::R
     if raw.read_fault.is_none() && !raw.error.is_empty() {
         damage_flags.push(raw.error.into());
     }
-    let detail_flags = damage_flags;
-    let mut damage_flags = detail_flags.clone();
     append_native_field_flag(&mut damage_flags, raw.read_fault.as_ref());
     if !raw.error.is_empty() {
         damage_flags.push(raw.error.into());
     }
     let unreliable = SEVEN_ZIP_BOUNDARY_ERRORS.contains(&raw.error);
-    let mut boundary = if unreliable {
-        "none"
-    } else if raw.segment_end != 0 {
-        if raw.strong_accept {
-            "high"
-        } else {
-            "medium"
-        }
-    } else {
-        "unknown"
-    };
-    let mut integrity = if raw.next_header_crc_checked {
-        if raw.next_header_crc_ok {
-            "high"
-        } else {
-            "low"
-        }
-    } else {
-        "unknown"
-    };
     if unreliable {
         damage_flags.push("boundary_unreliable".into());
     } else if raw.next_header_crc_checked && !raw.next_header_crc_ok {
         damage_flags.push("directory_integrity_bad_or_unknown".into());
-        boundary = "medium";
-        integrity = "low";
     }
-    let details = SevenZipReportDetails {
-        raw,
-        damage_flags: detail_flags,
-        boundary,
-        integrity,
-    };
-    let raw = &details.raw;
     if !raw.magic_matched {
         return Ok(Evidence::new(
             "7z",
             "not_found",
             Vec::new(),
-            EvidenceDetails::SevenZip(Box::new(details)),
+            EvidenceDetails::SevenZip(Box::new(raw)),
         ));
     }
     let status = if raw.strong_accept {
@@ -1323,22 +1107,12 @@ fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> std::io::R
             })
         })
     };
-    let evidence = non_empty_or(
-        raw.evidence.iter().map(|s| s.to_string()).collect(),
-        "7z:signature",
-    );
-    let warnings = if end.is_some_and(|end| end != 0) {
-        Vec::new()
-    } else {
-        vec!["7z archive structure does not prove an exact end for this segment".into()]
-    };
     Ok(Evidence::new(
         "7z",
         status,
-        vec![Segment::new(start, end, damage_flags, evidence)],
-        EvidenceDetails::SevenZip(Box::new(details)),
-    )
-    .with_warnings(warnings))
+        vec![Segment::new(start, end, damage_flags)],
+        EvidenceDetails::SevenZip(Box::new(raw)),
+    ))
 }
 
 fn zip_observation(raw: &mut DiagnosticFields) -> std::io::Result<()> {
@@ -1391,15 +1165,7 @@ fn zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence> {
         "integrity_confidence",
         if exact { "deferred" } else { "unknown" },
     )?;
-    let mut segment = Segment::new(
-        start,
-        bounded_end,
-        Vec::new(),
-        vec![
-            format!("zip:{validation}"),
-            "embedded_scan:validated_candidate".to_string(),
-        ],
-    );
+    let mut segment = Segment::new(start, bounded_end, Vec::new());
     segment.zip_eocd_offset = item
         .zip_eocd_offset
         .and_then(|offset| offset.checked_sub(start));
@@ -1428,16 +1194,6 @@ fn zip_from_native(
     let eocd_offset = u64_of(&native, "eocd_offset")?;
     let comment_length = u64_of(&native, "comment_length")?;
     let end_offset = (eocd_offset != 0).then(|| eocd_offset + 22 + comment_length);
-    let mut evidence = str_list(&native, "evidence")?;
-    if truthy(&native, "central_directory_present")? {
-        evidence.push("zip:central_directory".to_string());
-    }
-    if truthy(&native, "central_directory_walk_ok")? {
-        evidence.push("zip:central_directory_walk".to_string());
-    }
-    if truthy(&native, "local_header_links_ok")? {
-        evidence.push("zip:local_header_links".to_string());
-    }
     let plausible = truthy(&native, "plausible")?;
     let walk_ok =
         truthy(&native, "central_directory_walk_ok")? && truthy(&native, "local_header_links_ok")?;
@@ -1471,21 +1227,10 @@ fn zip_from_native(
         if plausible && walk_ok { "high" } else { "low" },
     )?;
     let segments = if !hits.is_empty() || plausible {
-        if evidence.is_empty() {
-            evidence.push(
-                if magic_matched {
-                    "zip:eocd"
-                } else {
-                    "zip:signature"
-                }
-                .to_string(),
-            );
-        }
         let mut segment = Segment::new(
             archive_offset,
             end_offset.map(|end| end.min(view_size)),
             damage_flags,
-            evidence,
         );
         segment.zip_eocd_offset = opt_u64_of(&native, "eocd_offset")?
             .and_then(|offset| offset.checked_sub(archive_offset));
@@ -1521,25 +1266,19 @@ fn zip_local_header_recovery(
     details.put("boundary_confidence", "low")?;
     details.put("integrity_confidence", "unknown")?;
     details.put("directory_confidence", "low")?;
-    Ok(Some(
-        Evidence::new(
-            "zip",
-            "damaged",
-            vec![Segment::new(
-                start,
-                None,
-                vec![
-                    "central_directory_unreliable".to_string(),
-                    "local_header_recovery".to_string(),
-                ],
-                vec!["zip:local_header".to_string()],
-            )],
-            details,
-        )
-        .with_warnings(vec![
-            "zip central directory is damaged; recovered candidate from local headers".to_string(),
-        ]),
-    ))
+    Ok(Some(Evidence::new(
+        "zip",
+        "damaged",
+        vec![Segment::new(
+            start,
+            None,
+            vec![
+                "central_directory_unreliable".to_string(),
+                "local_header_recovery".to_string(),
+            ],
+        )],
+        details,
+    )))
 }
 
 fn stream_observation(raw: DiagnosticFields, requested: &str) -> std::io::Result<DiagnosticFields> {
@@ -1656,16 +1395,12 @@ fn combine_candidates(
     }
     let mut seen = HashMap::new();
     let mut segments: Vec<Segment> = Vec::new();
-    let mut warnings = Vec::new();
-    let mut candidate_details = Vec::with_capacity(usable.len());
+    let mut details = EvidenceDetails::Empty;
     let status = usable[best].status;
-    for item in usable {
+    for (index, item) in usable.into_iter().enumerate() {
         let password_required = item.details.password_required()?;
-        candidate_details.push(item.details);
-        for warning in item.warnings {
-            if !warnings.contains(&warning) {
-                warnings.push(warning);
-            }
+        if index == best {
+            details = item.details;
         }
         for mut segment in item.segments {
             // Merging evidence must not promote a damaged peer or lose an
@@ -1698,11 +1433,7 @@ fn combine_candidates(
         format: format.to_string(),
         status,
         segments,
-        warnings,
-        details: EvidenceDetails::Combined(Box::new(CombinedEvidence {
-            primary: best,
-            details: candidate_details,
-        })),
+        details,
     })
 }
 
@@ -1742,11 +1473,7 @@ impl SegmentPlan {
         }
         candidates.sort_by_key(|&(evidence, segment)| {
             let segment = &evidences[evidence].segments[segment];
-            (
-                segment.start,
-                std::cmp::Reverse(segment.end.unwrap()),
-                evidence,
-            )
+            (segment.start, std::cmp::Reverse(segment.end.unwrap()))
         });
         crate::scan::embedded::retain_outer_ranges(&mut candidates, |&(evidence, segment)| {
             let segment = &evidences[evidence].segments[segment];
@@ -1782,9 +1509,9 @@ impl SegmentPlan {
             if !evidence.format.eq_ignore_ascii_case("7z") {
                 continue;
             }
-            let expected_end = match evidence.details.primary() {
-                EvidenceDetails::SevenZip(details) if details.raw.start_header_crc_ok => {
-                    let raw = &details.raw;
+            let expected_end = match &evidence.details {
+                EvidenceDetails::SevenZip(details) if details.start_header_crc_ok => {
+                    let raw = details;
                     raw.archive_offset
                         .saturating_add(32)
                         .saturating_add(raw.next_header_offset)
@@ -1814,16 +1541,12 @@ impl SegmentPlan {
 
 impl Evidence {
     fn structure_complete(&self, details: &DiagnosticFields) -> io::Result<bool> {
-        Ok(match self.details.primary() {
+        Ok(match &self.details {
             EvidenceDetails::Rar(value) => {
-                value.raw.end_block_found
-                    && value.raw.error.is_empty()
-                    && value.raw.read_fault.is_none()
+                value.end_block_found && value.error.is_empty() && value.read_fault.is_none()
             }
             EvidenceDetails::SevenZip(value) => {
-                value.raw.next_header_crc_ok
-                    && value.raw.next_header_nid_valid
-                    && value.raw.error.is_empty()
+                value.next_header_crc_ok && value.next_header_nid_valid && value.error.is_empty()
             }
             _ if self.format == "zip" => {
                 truthy(&details, "central_directory_walk_ok")?
@@ -1837,20 +1560,16 @@ impl Evidence {
     }
 
     fn analysis_facts(&self) -> io::Result<AnalysisFacts> {
-        let fields = match self.details.primary() {
+        let fields = match &self.details {
             EvidenceDetails::Fields(fields) => Some(fields),
             _ => None,
         };
-        let structure_complete = match self.details.primary() {
+        let structure_complete = match &self.details {
             EvidenceDetails::Rar(value) => {
-                value.raw.end_block_found
-                    && value.raw.error.is_empty()
-                    && value.raw.read_fault.is_none()
+                value.end_block_found && value.error.is_empty() && value.read_fault.is_none()
             }
             EvidenceDetails::SevenZip(value) => {
-                value.raw.next_header_crc_ok
-                    && value.raw.next_header_nid_valid
-                    && value.raw.error.is_empty()
+                value.next_header_crc_ok && value.next_header_nid_valid && value.error.is_empty()
             }
             _ => match fields {
                 Some(fields) => self.structure_complete(fields)?,
@@ -1874,36 +1593,6 @@ impl Evidence {
             structure_complete,
             ..Default::default()
         })
-    }
-
-    pub(crate) fn diagnostics(&self) -> io::Result<serde_json::Map<String, Value>> {
-        let evidence = self;
-        let mut details = self.details.to_diagnostic()?;
-        // Completion is independent of extraction feasibility and content CRC.
-        // Encrypted headers can authorize extraction with only partial structure.
-        let resource_unavailable = evidence.status == "error"
-            || str_of(&details, "error")? == "analysis_resource_limit"
-            || dict_item(&details, "read_error")?
-                .is_some_and(|fault| str_of(&fault, "code").is_ok_and(|code| code == "io_error"));
-        let complete = evidence.structure_complete(&details)?;
-        let invalid = !str_of(&details, "error")?.is_empty()
-            && !resource_unavailable
-            && !truthy(&details, "encrypted_header")?
-            && !truthy(&details, "header_encrypted")?
-            && evidence.status != "not_found";
-        details.put(
-            "analysis_state",
-            if resource_unavailable {
-                "resource_unavailable"
-            } else if invalid {
-                "invalid"
-            } else if complete {
-                "complete"
-            } else {
-                "partial"
-            },
-        )?;
-        Ok(details)
     }
 }
 
@@ -2091,13 +1780,6 @@ pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) -> u
 
 // ---- Diagnostic field access ----------------------------------------------
 
-fn dict_item<'a>(
-    fields: &'a DiagnosticFields,
-    key: &str,
-) -> io::Result<Option<&'a DiagnosticFields>> {
-    Ok(fields.get(key).and_then(Value::as_object))
-}
-
 fn value_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -2175,14 +1857,6 @@ fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
-fn non_empty_or(values: Vec<String>, default: &str) -> Vec<String> {
-    if values.is_empty() {
-        vec![default.to_string()]
-    } else {
-        values
-    }
-}
-
 #[cfg(test)]
 mod report_tests {
     use super::*;
@@ -2202,7 +1876,7 @@ mod report_tests {
             status,
             segments
                 .iter()
-                .map(|(start, end)| Segment::new(*start, *end, Vec::new(), Vec::new()))
+                .map(|(start, end)| Segment::new(*start, *end, Vec::new()))
                 .collect(),
             dict,
         )
@@ -2328,18 +2002,10 @@ mod report_tests {
         ];
         let combined = combine_candidates("rar", candidates, true).unwrap();
         assert_eq!(combined.status, "extractable");
-        assert_eq!(
-            str_of(&combined.details.to_diagnostic().unwrap(), "id").unwrap(),
-            "second"
-        );
-        assert_eq!(
-            i64_of(
-                &combined.details.to_diagnostic().unwrap(),
-                "candidate_count"
-            )
-            .unwrap(),
-            2
-        );
+        let EvidenceDetails::Fields(details) = &combined.details else {
+            panic!("combined evidence did not retain its primary details");
+        };
+        assert_eq!(str_of(details, "id").unwrap(), "second");
         let spans = combined
             .segments
             .iter()

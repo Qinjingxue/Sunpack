@@ -379,12 +379,8 @@ function Get-EnvironmentRefreshReasons {
         $reasons.Add($reason)
     }
 
-    $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
-
-    foreach ($name in @("7z.exe", "7z.dll")) {
-        if (-not (Test-Path -LiteralPath (Join-Path $toolsRoot $name) -PathType Leaf)) {
-            $reasons.Add("Required archive fixture generator is missing: $name")
-        }
+    foreach ($reason in @(Get-ArchiveFixtureToolRefreshReasons -RepoRoot $RepoRoot -Arch $Arch)) {
+        $reasons.Add($reason)
     }
     return $reasons
 }
@@ -421,7 +417,7 @@ function Ensure-AcceptanceEnvironment {
     Invoke-Native -FilePath "powershell" -Arguments @(
         "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1"),
-        "-Arch", $Arch, "-BuildProfile", $BuildProfile, "-SkipAcceptanceTestTools"
+        "-Arch", $Arch, "-BuildProfile", $BuildProfile
     )
 
     # Verify persistence immediately; a successful setup subprocess is not
@@ -532,10 +528,9 @@ try {
         "--workspace", "--profile", $BuildProfile, "--target", $target,
         "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
     )
-    Invoke-TestStep -Label "CLI and Watch boundary tests" -Command @(
+    Invoke-TestStep -Label "CLI and Watch acceptance tests" -Command @(
         $python, "-m", "pytest", "-q", "-rs", "-n", [string]$ParallelWorkers,
-        "--dist", "worksteal", "tests/blackbox", "tests/unit",
-        "tests/integration/test_config_upgrade.py", "tests/integration/test_installer_language.py"
+        "--dist", "worksteal", "tests/blackbox", "tests/unit", "tests/integration", "tests/real"
     )
 } finally {
     if ($watchServiceInstalled) {

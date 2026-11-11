@@ -1,4 +1,4 @@
-use super::checkpoint::{CheckpointKey, InputCheckpoint};
+use super::checkpoint::{CheckpointKey, InputCheckpoint, PromotedSource};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{AttemptCache, CandidateSet};
 use super::worker::{self, Process};
@@ -68,12 +68,48 @@ impl Engine {
         self.run_with(request, &notify)
     }
 
-    pub fn run_with(&self, mut request: Request, observer: &impl Observer) -> io::Result<Outcome> {
+    pub(crate) fn run_with(
+        &self,
+        request: Request,
+        observer: &impl Observer,
+    ) -> io::Result<Outcome> {
+        self.run_with_claim(request, observer, None)
+    }
+
+    pub(crate) fn reserve_foreground(
+        &self,
+        inputs: &[PathBuf],
+        cancel: &Cancellation,
+    ) -> io::Result<RequestClaimGuard<'_>> {
+        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        self.leases
+            .reserve_request(id, Origin::Foreground, inputs, cancel)
+    }
+
+    pub(crate) fn run_reserved(
+        &self,
+        request: Request,
+        observer: &impl Observer,
+        reservation: &RequestClaimGuard<'_>,
+    ) -> io::Result<Outcome> {
+        debug_assert!(std::ptr::eq(reservation.registry, self.leases.as_ref()));
+        self.run_with_claim(request, observer, Some(reservation))
+    }
+
+    fn run_with_claim(
+        &self,
+        mut request: Request,
+        observer: &impl Observer,
+        reservation: Option<&RequestClaimGuard<'_>>,
+    ) -> io::Result<Outcome> {
         if let Some(output) = request.output_root.take() {
             request.output_root = Some(std::path::absolute(output)?);
         }
-        let request_id = self.next_job.fetch_add(1, Ordering::Relaxed);
-        let _request_claim = if request.mode == Mode::Extract {
+        let request_id = reservation.map_or_else(
+            || self.next_job.fetch_add(1, Ordering::Relaxed),
+            |reservation| reservation.id,
+        );
+        let _request_claim = if reservation.is_none() && request.mode == Mode::Extract {
             Some(self.leases.reserve_request(
                 request_id,
                 request.origin,
@@ -88,11 +124,13 @@ impl Engine {
             request.password_snapshot.as_deref(),
             &self.password_attempts,
         );
-        let options = if request.deep {
-            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
-        } else {
-            discovery::scan_options(&request.config)?
-        };
+        let options = discovery::scan_options(&request.config)?;
+        let deep_options = request
+            .deep
+            .then(|| {
+                NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            })
+            .transpose()?;
         let analysis = NativeAnalysisConfig::new(
             request
                 .config
@@ -105,27 +143,39 @@ impl Engine {
             .output_root
             .as_ref()
             .filter(|_| request.origin == Origin::Foreground)
-            .and_then(|_| common_output_base(&request.inputs));
+            .and_then(|_| {
+                request
+                    .output_base
+                    .take()
+                    .or_else(|| common_output_base(&request.inputs))
+            });
         let mut checkpoints: HashMap<CheckpointKey, Vec<usize>> = HashMap::new();
         for (index, checkpoint) in request.checkpoints.iter().enumerate() {
             checkpoints.entry(checkpoint.key()).or_default().push(index);
         }
+        let promoted_sources = request
+            .promoted_sources
+            .iter()
+            .map(|source| (path_key(&source.path().to_string_lossy()), source))
+            .collect();
         let run = Run {
             engine: self,
             request: &request,
             request_id,
             candidates,
             options,
+            deep_options,
             analysis,
             observer,
             recursion: Mutex::new(HashMap::new()),
             output_indices: Mutex::new(HashMap::new()),
             output_base,
             checkpoints,
+            promoted_sources,
         };
         request.cancel.run(|| {
             request.cancel.check_io()?;
-            let discovered = discovery::discover(&request, &run.options, &run.candidates)?;
+            let discovered = discovery::discover(&request, run.options_at(1), &run.candidates)?;
             run.execute_batch(discovered, 1, None)
         })
     }
@@ -157,6 +207,10 @@ impl Engine {
     pub(crate) fn clear_idle_passwords(&self) {
         self.password_attempts.clear();
     }
+
+    pub(crate) fn recent_passwords(&self) -> Vec<Arc<str>> {
+        self.password_attempts.recent()
+    }
 }
 
 struct Run<'a, O> {
@@ -165,12 +219,14 @@ struct Run<'a, O> {
     request_id: u64,
     candidates: CandidateSet<'a>,
     options: NativeDirectoryScanOptions,
+    deep_options: Option<NativeDirectoryScanOptions>,
     analysis: NativeAnalysisConfig,
     observer: &'a O,
     recursion: Mutex<HashMap<usize, bool>>,
     output_indices: Mutex<HashMap<PathBuf, usize>>,
     output_base: Option<PathBuf>,
     checkpoints: HashMap<CheckpointKey, Vec<usize>>,
+    promoted_sources: HashMap<String, &'a PromotedSource>,
 }
 
 struct Executed {
@@ -180,6 +236,14 @@ struct Executed {
 }
 
 impl<O: Observer> Run<'_, O> {
+    fn options_at(&self, depth: usize) -> &NativeDirectoryScanOptions {
+        if depth == 1 {
+            self.deep_options.as_ref().unwrap_or(&self.options)
+        } else {
+            &self.options
+        }
+    }
+
     fn execute_batch(
         &self,
         batch: Discovered,
@@ -198,11 +262,8 @@ impl<O: Observer> Run<'_, O> {
             )?;
         }
         let mut outcome = Outcome {
-            archives: Vec::new(),
             errors: batch.errors,
-            checkpoints: Vec::new(),
-            cleanup_results: Vec::new(),
-            removed_promotion_dirs: Vec::new(),
+            ..Outcome::default()
         };
         let executed: Vec<_> = batch
             .tasks
@@ -220,6 +281,9 @@ impl<O: Observer> Run<'_, O> {
             outcome.checkpoints.append(&mut branch.checkpoints);
             outcome.cleanup_results.append(&mut branch.cleanup_results);
             outcome
+                .promoted_sources
+                .append(&mut branch.promoted_sources);
+            outcome
                 .removed_promotion_dirs
                 .append(&mut branch.removed_promotion_dirs);
         }
@@ -236,8 +300,14 @@ impl<O: Observer> Run<'_, O> {
         cancel.check_io()?;
         let mut lease = self.claim_task(&task)?;
         let mut outcome = Outcome::default();
-        self.plan_inputs(&mut task)?;
         let mut generations = self.capture_generations(&task);
+        let watch_root = depth == 1
+            && self.request.origin == Origin::Watch
+            && self.request.mode == Mode::Extract;
+        if watch_root && !self.should_process_watch(&task, &generations)? {
+            return Ok(outcome);
+        }
+        self.plan_inputs(&mut task)?;
         self.observer.claim_sources(
             Path::new(&task.entry().entry_path),
             &task.owned_paths,
@@ -326,7 +396,7 @@ impl<O: Observer> Run<'_, O> {
                 if let Some(mut replacement) = discovery::retry_volume(
                     &executed.result,
                     context,
-                    &self.options,
+                    self.options_at(depth),
                     &candidates,
                     self.request,
                 )? {
@@ -334,6 +404,9 @@ impl<O: Observer> Run<'_, O> {
                     drop(lease);
                     lease = self.claim_task(&replacement)?;
                     generations = self.capture_generations(&replacement);
+                    if watch_root && !self.should_process_watch(&replacement, &generations)? {
+                        return Ok(outcome);
+                    }
                     self.observer.claim_sources(
                         Path::new(&replacement.entry().entry_path),
                         &replacement.owned_paths,
@@ -363,11 +436,20 @@ impl<O: Observer> Run<'_, O> {
             } = executed;
             if self.request.mode == Mode::Scan {
                 result.volume_attempts = input.volume_attempts.take();
+                if result
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
+                {
+                    result.volume_completeness =
+                        Some(VolumeCompleteness::Missing.as_str().to_owned());
+                }
             }
             if result.failure.is_none() {
                 superseded_candidates.extend(attempted.into_iter().flatten());
             }
             let mut descendants = Outcome::default();
+            let mut ran_recursive_children = false;
             if let Some(inventory) = inventory.filter(|inventory| inventory.file_count() > 0) {
                 if depth <= self.request.max_depth && !cancel.cancelled() {
                     let nested = discovery::discover_output(
@@ -380,6 +462,7 @@ impl<O: Observer> Run<'_, O> {
                     if !nested.tasks.is_empty()
                         && self.allow_recursive(depth + 1, nested.tasks.len())
                     {
+                        ran_recursive_children = true;
                         descendants = self.execute_batch(nested, depth + 1, source_scope)?;
                     } else {
                         descendants.errors.extend(nested.errors);
@@ -387,7 +470,11 @@ impl<O: Observer> Run<'_, O> {
                 }
             }
             let children_complete = children_already_complete || subtree_complete(&descendants);
-            if result.failure.is_none() && children_complete && !cancel.cancelled() {
+            if ran_recursive_children
+                && result.failure.is_none()
+                && children_complete
+                && !cancel.cancelled()
+            {
                 if let Some(output) = result.output.as_deref() {
                     if remove_empty_or_promoted(output, &descendants.removed_promotion_dirs) {
                         self.observer.discard_output(&result, output)?;
@@ -421,6 +508,9 @@ impl<O: Observer> Run<'_, O> {
                 outcome.checkpoints.push(checkpoint);
             }
             outcome.checkpoints.append(&mut descendants.checkpoints);
+            outcome
+                .promoted_sources
+                .append(&mut descendants.promoted_sources);
             outcome
                 .removed_promotion_dirs
                 .append(&mut descendants.removed_promotion_dirs);
@@ -484,12 +574,32 @@ impl<O: Observer> Run<'_, O> {
             .all(|result| result.failure.is_none() && !result.partial)
             && subtree_complete(&children)
             && !cancel.cancelled();
-        if complete && self.request.mode == Mode::Extract {
-            let mut selected: Vec<_> = promotion_sources.iter().map(PathBuf::from).collect();
-            dedup_paths(&mut selected);
-            if let Some(first) = completed.first_mut() {
-                self.cleanup_sources(first, &selected, &generations, &mut outcome)?;
+        let admitted_promoted = promotion_sources.iter().filter_map(|path| {
+            if self.promoted_sources.is_empty() {
+                return None;
             }
+            let key = path_key(path);
+            let source = self.promoted_sources.get(&key)?;
+            source.matches(generations.get(&key)?).then_some(*source)
+        });
+        if complete && self.request.mode == Mode::Extract {
+            if watch_root {
+                self.observer.sources_processed(&completed, &generations)?;
+            }
+            let mode = if depth > 1 || admitted_promoted.count() > 0 {
+                CleanupMode::Delete
+            } else {
+                self.request.config.post_extract.archive_cleanup_mode
+            };
+            if mode != CleanupMode::Keep {
+                let mut selected: Vec<_> = promotion_sources.iter().map(PathBuf::from).collect();
+                dedup_paths(&mut selected);
+                if let Some(first) = completed.first_mut() {
+                    self.cleanup_sources(first, &selected, &generations, mode, &mut outcome)?;
+                }
+            }
+        } else {
+            outcome.promoted_sources.extend(admitted_promoted.cloned());
         }
         for result in &completed {
             self.observer.notify(Event::Finished {
@@ -576,6 +686,13 @@ impl<O: Observer> Run<'_, O> {
         })();
         match promoted {
             Ok((moves, success, error)) => {
+                if success {
+                    outcome.promoted_sources.extend(
+                        moves
+                            .iter()
+                            .filter_map(|(_, target)| PromotedSource::capture(target).ok()),
+                    );
+                }
                 for result in results {
                     if success {
                         result.promotion_original_path = Some(result.path.clone());
@@ -663,6 +780,36 @@ impl<O: Observer> Run<'_, O> {
                     .map(|generation| (path_key(path), generation))
             })
             .collect()
+    }
+
+    fn should_process_watch(
+        &self,
+        task: &Task,
+        generations: &HashMap<String, PhysicalFileGeneration>,
+    ) -> io::Result<bool> {
+        let data_paths: Vec<_> = task
+            .inputs
+            .iter()
+            .flat_map(|logical| {
+                let input = &logical.input;
+                let whole_file = input.parts.is_empty() && input.ranges.is_empty();
+                input
+                    .physical_extents()
+                    .map(|extent| extent.path.as_str())
+                    .chain(whole_file.then_some(input.entry_path.as_str()))
+            })
+            .collect();
+        if data_paths.iter().all(|path| {
+            !generations.contains_key(&path_key(path))
+                && Path::new(path).try_exists().is_ok_and(|exists| !exists)
+        }) {
+            return Ok(false);
+        }
+        self.observer.should_process_sources(
+            Path::new(&task.entry().entry_path),
+            &data_paths,
+            generations,
+        )
     }
 
     fn plan_inputs(&self, task: &mut Task) -> io::Result<()> {
@@ -768,7 +915,16 @@ impl<O: Observer> Run<'_, O> {
                 });
             }
             Err(error) => {
-                result.failure = Some(self.process_or_file_failure(error, false));
+                result.failure = Some(
+                    if input.mode.structured() && error.kind() == io::ErrorKind::NotFound {
+                        Failure {
+                            kind: FailureKind::MissingVolume,
+                            message: error.to_string(),
+                        }
+                    } else {
+                        self.process_or_file_failure(error, false)
+                    },
+                );
                 return Ok(Executed {
                     result,
                     inventory: None,
@@ -840,7 +996,9 @@ impl<O: Observer> Run<'_, O> {
             Ok(frame) => {
                 let value = &frame.summary;
                 let format = worker::string(value, "archive_type");
-                if !format.is_empty() {
+                if !format.is_empty()
+                    && (self.request.mode == Mode::Extract || result.format.is_empty())
+                {
                     result.format = format.to_owned();
                 }
                 result.encrypted = value
@@ -896,8 +1054,9 @@ impl<O: Observer> Run<'_, O> {
                         inventory = Some(stats);
                     }
                 } else if result.failure.is_none() {
-                    let mut failure = classify_worker_failure(value, plan.evidence);
-                    if failure.kind == FailureKind::WrongPassword && !plan.has_candidates() {
+                    let split = input.mode.structured() || input.physical_paths().nth(1).is_some();
+                    let mut failure = classify_worker_failure(value, plan.evidence, split);
+                    if failure.kind == FailureKind::WrongPassword && !plan.has_candidates {
                         failure = Failure::password_required();
                     }
                     if self.request.config.extraction.content_requirement
@@ -916,6 +1075,7 @@ impl<O: Observer> Run<'_, O> {
                                 result.recovered_complete_files = verified_files as u64;
                                 result.bytes = stats.total_size();
                                 result.output = Some(output.clone());
+                                inventory = Some(stats);
                             }
                         }
                     }
@@ -1084,35 +1244,18 @@ impl<O: Observer> Run<'_, O> {
         result: &mut ArchiveResult,
         paths: &[PathBuf],
         generations: &HashMap<String, PhysicalFileGeneration>,
+        cleanup: CleanupMode,
         outcome: &mut Outcome,
     ) -> io::Result<()> {
-        let mode = match self.request.config.post_extract.archive_cleanup_mode {
-            CleanupMode::Keep => "keep",
+        let mode = match cleanup {
+            CleanupMode::Keep => unreachable!("keep needs no source cleanup"),
             CleanupMode::Delete => "delete",
             CleanupMode::Recycle => "recycle",
         };
         let mut valid = Vec::new();
         for path in paths {
-            if self.request.config.post_extract.archive_cleanup_mode == CleanupMode::Keep {
-                outcome.cleanup_results.push(CleanupResult {
-                    path: path.clone(),
-                    mode,
-                    status: CleanupStatus::Kept,
-                    error_code: 0,
-                    message: String::new(),
-                });
-                continue;
-            }
             match capture_file_generation(path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    outcome.cleanup_results.push(CleanupResult {
-                        path: path.clone(),
-                        mode,
-                        status: CleanupStatus::Missing,
-                        error_code: 0,
-                        message: String::new(),
-                    });
-                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => record_cleanup(outcome, path, mode, Err(error)),
                 Ok(current) => {
                     let key = path_key(&path.to_string_lossy());
@@ -1121,14 +1264,6 @@ impl<O: Observer> Run<'_, O> {
                         .is_some_and(|before| before == &current)
                     {
                         valid.push(path);
-                    } else {
-                        outcome.cleanup_results.push(CleanupResult {
-                            path: path.clone(),
-                            mode,
-                            status: CleanupStatus::Kept,
-                            error_code: 0,
-                            message: "source generation changed".to_owned(),
-                        });
                     }
                 }
             }
@@ -1149,10 +1284,9 @@ impl<O: Observer> Run<'_, O> {
         result.source_paths = old;
         publish?;
         for path in valid {
-            let removed = match self.request.config.post_extract.archive_cleanup_mode {
-                CleanupMode::Delete => remove_owned_file(path).map(|()| CleanupStatus::Deleted),
-                CleanupMode::Recycle => super::cleanup::recycle(std::iter::once(path.as_path()))
-                    .map(|()| CleanupStatus::Recycled),
+            let removed = match cleanup {
+                CleanupMode::Delete => remove_owned_file(path),
+                CleanupMode::Recycle => super::cleanup::recycle(std::iter::once(path.as_path())),
                 CleanupMode::Keep => unreachable!("keep produced receipts without filesystem work"),
             };
             record_cleanup(outcome, path, mode, removed);
@@ -1168,36 +1302,24 @@ fn map_promoted_path(path: &mut PathBuf, moves: &[(PathBuf, PathBuf)]) {
     }
 }
 
-fn record_cleanup(
-    outcome: &mut Outcome,
-    path: &Path,
-    mode: &'static str,
-    removed: io::Result<CleanupStatus>,
-) {
-    let (status, error_code, message) = match removed {
-        Ok(status) => (status, 0, String::new()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            (CleanupStatus::Missing, 0, String::new())
-        }
-        Err(error) => {
-            let message = error.to_string();
-            outcome.errors.push(InputError {
-                path: path.to_path_buf(),
-                message: message.clone(),
-                kind: InputErrorKind::Cleanup,
-            });
-            (
-                CleanupStatus::Failed,
-                error.raw_os_error().unwrap_or(0),
-                message,
-            )
-        }
+fn record_cleanup(outcome: &mut Outcome, path: &Path, mode: &'static str, removed: io::Result<()>) {
+    let Err(error) = removed else {
+        return;
     };
+    if error.kind() == io::ErrorKind::NotFound {
+        return;
+    }
+    let message = error.to_string();
+    outcome.errors.push(InputError {
+        path: path.to_path_buf(),
+        message: message.clone(),
+        kind: InputErrorKind::Cleanup,
+    });
     outcome.cleanup_results.push(CleanupResult {
         path: path.to_path_buf(),
         mode,
-        status,
-        error_code,
+        status: CleanupStatus::Failed,
+        error_code: error.raw_os_error().unwrap_or(0),
         message,
     });
 }
@@ -1263,19 +1385,34 @@ fn flag(result: &Value, name: &str) -> bool {
     result.get(name).and_then(Value::as_bool) == Some(true)
 }
 
-fn classify_worker_failure(result: &Value, password_evidence: Option<&str>) -> Failure {
+fn classify_worker_failure(
+    result: &Value,
+    password_evidence: Option<&str>,
+    split: bool,
+) -> Failure {
     let native = worker::string(result, "native_status");
     let failure = worker::string(result, "failure_kind");
     let operation = worker::string(result, "operation_result_name");
+    let diagnostics = result.get("diagnostics").unwrap_or(&Value::Null);
+    let diagnostic_failure = worker::string(diagnostics, "failure_kind");
     let hresult = result
         .get("hresult")
-        .or_else(|| {
-            result
-                .get("diagnostics")
-                .and_then(|value| value.get("hresult"))
-        })
+        .or_else(|| diagnostics.get("hresult"))
         .and_then(Value::as_i64)
         .map(|value| value as u32);
+    let damaged_kind = |kind| {
+        matches!(
+            kind,
+            "corrupted_data" | "data_error" | "checksum_error" | "crc_error"
+        )
+    };
+    let payload_damage = flag(result, "checksum_error")
+        || flag(result, "damaged")
+        || native == "damaged"
+        || damaged_kind(failure)
+        || damaged_kind(diagnostic_failure);
+    let weak_password = password_evidence == Some("zipcrypto_header_byte")
+        || (password_evidence == Some("empty_password_direct") && flag(result, "encrypted"));
     let kind = if failure == "resource_unavailable"
         || matches!(hresult, Some(0x80070008 | 0x8007000e | 0x800705af))
     {
@@ -1286,12 +1423,12 @@ fn classify_worker_failure(result: &Value, password_evidence: Option<&str>) -> F
         FailureKind::PasswordInconclusive
     } else if flag(result, "password_candidates_all_rejected") {
         return Failure::password();
-    } else if matches!(operation, "wrong_password" | "data_error" | "crc_error")
-        && matches!(
-            password_evidence,
-            Some("zipcrypto_header_byte" | "empty_password_direct")
-        )
-        && flag(result, "encrypted")
+    } else if weak_password
+        && (matches!(operation, "wrong_password" | "data_error" | "crc_error")
+            || matches!(
+                failure,
+                "encrypted_or_wrong_password" | "data_error" | "checksum_error" | "crc_error"
+            ))
     {
         if flag(result, "password_crc_proven") {
             FailureKind::Damaged
@@ -1300,16 +1437,20 @@ fn classify_worker_failure(result: &Value, password_evidence: Option<&str>) -> F
         } else {
             FailureKind::PasswordInconclusive
         }
+    } else if split && payload_damage {
+        FailureKind::Damaged
     } else if flag(result, "wrong_password")
         || flag(result, "password_rejected")
         || native == "wrong_password"
+        || operation == "wrong_password"
+        || matches!(failure, "wrong_password" | "encrypted_or_wrong_password")
+        || matches!(
+            diagnostic_failure,
+            "wrong_password" | "encrypted_or_wrong_password"
+        )
     {
         return Failure::password();
-    } else if flag(result, "checksum_error")
-        || flag(result, "damaged")
-        || flag(result, "missing_volume_suspected")
-        || native == "damaged"
-    {
+    } else if payload_damage || flag(result, "missing_volume_suspected") {
         FailureKind::Damaged
     } else if flag(result, "unsupported_method") || native == "unsupported" {
         FailureKind::Unsupported
@@ -1409,25 +1550,38 @@ fn archive_name(input: &ArchiveInput) -> String {
     crate::output_names::output_name_component(&input.logical_name)
 }
 
-fn common_output_base(inputs: &[PathBuf]) -> Option<PathBuf> {
-    let mut absolute = inputs
-        .iter()
-        .filter_map(|path| std::path::absolute(path).ok());
-    let first = absolute.next()?;
-    let mut base = first.clone();
-    for path in absolute {
-        while relative_to(&path, &base).is_none() {
-            if !base.pop() || !base.is_absolute() {
-                return if first.is_dir() {
-                    Some(first)
-                } else {
-                    first.parent().map(Path::to_path_buf)
-                };
+pub(crate) fn common_output_base(inputs: &[PathBuf]) -> Option<PathBuf> {
+    let mut base = match common_ancestor(inputs) {
+        Some(base) => base,
+        None => {
+            let mut first = inputs
+                .iter()
+                .find_map(|path| std::path::absolute(path).ok())?;
+            if !first.is_dir() {
+                first.pop();
             }
+            return Some(first);
         }
-    }
+    };
     if base.is_file() {
         base.pop();
+    }
+    Some(base)
+}
+
+pub(crate) fn common_ancestor(
+    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+) -> Option<PathBuf> {
+    let mut paths = paths
+        .into_iter()
+        .filter_map(|path| std::path::absolute(path).ok());
+    let mut base = paths.next()?;
+    for path in paths {
+        while relative_to(&path, &base).is_none() {
+            if !base.pop() || !base.is_absolute() {
+                return None;
+            }
+        }
     }
     Some(base)
 }
@@ -1464,20 +1618,35 @@ fn output_candidate(preferred: &Path, actual: &Path) -> bool {
     let Some(name) = actual.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    let base = crate::path_keys::case_key(base);
+    let preferred = crate::path_keys::case_key(base);
     let name = crate::path_keys::case_key(name);
-    name.strip_prefix(&base)
-        .and_then(|suffix| suffix.strip_prefix(" ("))
-        .and_then(|suffix| suffix.strip_suffix(')'))
-        .is_some_and(|suffix| {
-            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-        })
+    let (base, start) = numbered_suffix(&preferred).unwrap_or((&preferred, 0));
+    numbered_suffix(&name).is_some_and(|(actual_base, index)| {
+        (actual_base == base && index > start)
+            || (actual_base.strip_suffix(' ') == Some(preferred.as_str()) && index > 0)
+    })
 }
 
 fn numbered(path: &Path, index: usize) -> PathBuf {
-    let mut name = path.file_name().unwrap_or(path.as_os_str()).to_os_string();
-    name.push(format!(" ({index})"));
+    let name = path.file_name().unwrap_or(path.as_os_str());
+    if let Some((base, index)) = name
+        .to_str()
+        .and_then(numbered_suffix)
+        .and_then(|(base, start)| start.checked_add(index).map(|index| (base, index)))
+    {
+        return path.with_file_name(format!("{base}({index})"));
+    }
+    let mut name = name.to_os_string();
+    name.push(format!("({index})"));
     path.with_file_name(name)
+}
+
+fn numbered_suffix(name: &str) -> Option<(&str, usize)> {
+    let (base, index) = name.strip_suffix(')')?.rsplit_once('(')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((base, index.parse().ok()?))
 }
 
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
@@ -1650,7 +1819,7 @@ impl ClaimedInput {
     }
 }
 
-struct RequestClaimGuard<'a> {
+pub(crate) struct RequestClaimGuard<'a> {
     registry: &'a Leases,
     id: u64,
 }

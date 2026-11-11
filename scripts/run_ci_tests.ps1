@@ -68,6 +68,7 @@ function Get-CiEnvironmentRefreshReasons {
         "Python test dependencies could not be imported"
     }
     Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -BuildProfile $BuildProfile
+    Get-ArchiveFixtureToolRefreshReasons -RepoRoot $RepoRoot -Arch $Arch
 }
 
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"

@@ -68,7 +68,7 @@ fn lz4_segment(offset: u64, end: Option<u64>, complete: bool, error: &str) -> Se
     } else {
         vec![error.to_owned()]
     };
-    let mut segment = Segment::new(offset, end, flags, vec!["lz4:frame_structure".to_owned()]);
+    let mut segment = Segment::new(offset, end, flags);
     segment.extractable = complete;
     segment
 }

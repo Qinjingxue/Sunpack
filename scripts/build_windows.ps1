@@ -622,7 +622,6 @@ $sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch
 $toastHostRoot = Join-Path $repoRoot "native\toast_host"
 $toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch)
 $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
-$sevenZipPath = Join-Path $toolsRoot "7z.exe"
 $sevenZipWorkerPath = Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"
 $toastHostPath = Join-Path $toolsRoot "sunpack_toast.dll"
 $launcherBuildPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_launcher.exe"
@@ -671,7 +670,6 @@ Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust wo
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
 Assert-PathExists -LiteralPath (Join-Path $sevenZipWrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
 Assert-PathExists -LiteralPath (Join-Path $toastHostRoot "CMakeLists.txt") -Description "toast CMake project"
-Assert-PathExists -LiteralPath $sevenZipPath -Description "Bundled 7-Zip executable"
 Assert-PathExists -LiteralPath $mitLicensePath -Description "SunPack MIT license file"
 Assert-PathExists -LiteralPath $sevenZipLicensePath -Description "7-Zip binary license file"
 Assert-PathExists -LiteralPath $sevenZipSourceLicensePath -Description "7-Zip source license file"
@@ -686,7 +684,6 @@ Assert-PathExists -LiteralPath $blowfishLicensePath -Description "RustCrypto Blo
 Assert-PathExists -LiteralPath $rc6LicensePath -Description "RustCrypto RC6 license file"
 Assert-PathExists -LiteralPath $thirdPartyNoticesPath -Description "Third-party notices file"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
-Assert-PeMachine -LiteralPath $sevenZipPath -BuildArch $buildArch -Description "Bundled 7-Zip executable"
 
 if ($Clean) {
     Write-Step "Cleaning native build outputs"

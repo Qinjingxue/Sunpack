@@ -16,7 +16,7 @@ class Package:
     tools: Path
     env: dict[str, str]
 
-    def run(self, *arguments, cwd=None, input=None):
+    def run(self, *arguments, cwd=None, input=None, timeout=60):
         return subprocess.run(
             [str(self.launcher), *map(str, arguments)],
             cwd=cwd or self.data,
@@ -25,13 +25,25 @@ class Package:
             encoding="utf-8",
             input=input,
             capture_output=True,
-            timeout=60,
+            timeout=timeout,
         )
 
-    def json(self, *arguments, cwd=None, code=0):
-        result = self.run(*arguments, "--json", cwd=cwd)
+    def json(self, *arguments, cwd=None, code=0, timeout=60):
+        result = self.run(*arguments, "--json", cwd=cwd, timeout=timeout)
         assert result.returncode == code, (result.stdout, result.stderr)
         return json.loads(result.stdout)
+
+    def configure(self, **overrides):
+        path = self.data / "sunpack_config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        for section, values in overrides.items():
+            if isinstance(values, dict) and isinstance(config.get(section), dict):
+                config[section].update(values)
+            else:
+                config[section] = values
+        pending = path.with_suffix(".tmp")
+        pending.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        pending.replace(path)
 
 
 @pytest.fixture

@@ -4,14 +4,16 @@ use crate::core::passwords::BuiltinStore;
 use crate::core::resources::{self, FileMutex};
 use crate::filesystem;
 use crate::io::config_changes::NativeConfigChanges;
+use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
-    Request,
+    PromotedSource, Request,
 };
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
 use crate::scan::scope::NativeDiscoveryScope;
 use crate::watch_store::{is_path_under, watch_path_key};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -493,17 +495,19 @@ impl Watch {
     }
 
     pub(super) fn cancel_batch(&self, id: &str) -> bool {
-        let slot = self.running.lock().unwrap();
-        let Some(run) = slot.as_ref() else {
+        let hub = self
+            .running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|run| !run.thread.is_finished())
+            .map(|run| Arc::clone(&run.hub));
+        let Some(hub) = hub else {
             return false;
         };
-        let batches = run.hub.batches.lock().unwrap();
-        if let Some(cancel) = batches.get(id) {
-            cancel.cancel();
-            true
-        } else {
-            false
-        }
+        let (send, receive) = mpsc::sync_channel(1);
+        hub.update(|signals| signals.cancel.push((id.to_owned(), send)));
+        receive.recv().unwrap_or(false)
     }
 }
 
@@ -592,16 +596,24 @@ struct Signals {
     clipboard: Option<Vec<String>>,
     volumes_changed: bool,
     rebuild: Vec<mpsc::SyncSender<io::Result<bool>>>,
-    completed: Vec<Completed>,
+    cancel: Vec<(String, mpsc::SyncSender<bool>)>,
+    completed: Vec<String>,
 }
 
 struct Hub {
     stopped: AtomicBool,
     signals: Mutex<Signals>,
     wake: std::sync::Condvar,
-    batches: Mutex<HashMap<String, Cancellation>>,
     claims: Mutex<HashMap<String, String>>,
+    seeds: Mutex<HashMap<String, Seed>>,
     pending_count: AtomicUsize,
+}
+
+type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
+
+struct Seed {
+    owners: u8,
+    processed: Option<Arc<SourceGenerations>>,
 }
 
 impl Hub {
@@ -610,9 +622,35 @@ impl Hub {
             stopped: AtomicBool::new(false),
             signals: Mutex::default(),
             wake: std::sync::Condvar::new(),
-            batches: Mutex::default(),
             claims: Mutex::default(),
+            seeds: Mutex::default(),
             pending_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn track_seed(&self, path: &str) {
+        let mut seeds = self.seeds.lock().unwrap();
+        if let Some(seed) = seeds.get_mut(path) {
+            seed.owners += 1;
+        } else {
+            seeds.insert(
+                path.to_owned(),
+                Seed {
+                    owners: 1,
+                    processed: None,
+                },
+            );
+        }
+    }
+
+    fn retire_seed(&self, path: &str) {
+        let mut seeds = self.seeds.lock().unwrap();
+        if let Some(seed) = seeds.get_mut(path) {
+            seed.owners -= 1;
+            if seed.owners == 0 {
+                seeds.remove(path);
+                crate::collections::trim_map(&mut seeds);
+            }
         }
     }
 
@@ -622,9 +660,6 @@ impl Hub {
             self.stopped.store(true, Ordering::Release);
         }
         self.wake.notify_one();
-        for cancel in self.batches.lock().unwrap().values() {
-            cancel.cancel();
-        }
     }
 
     fn update(&self, update: impl FnOnce(&mut Signals)) {
@@ -655,6 +690,7 @@ impl Hub {
                 && value.clipboard.is_none()
                 && !value.volumes_changed
                 && value.rebuild.is_empty()
+                && value.cancel.is_empty()
                 && value.once.is_empty()
                 && value.completed.is_empty()
         };
@@ -703,6 +739,7 @@ impl FileObserver {
                     match result {
                         Ok(names) => notify(names),
                         Err(_) => {
+                            stop.store(true, Ordering::Release);
                             notify(None);
                             break;
                         }
@@ -741,14 +778,14 @@ struct Active {
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
     touched: HashSet<String>,
-    thread: JoinHandle<()>,
+    cancel: Cancellation,
+    groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
+    thread: JoinHandle<Completed>,
 }
 
 struct Completed {
-    batch: String,
     cancelled: bool,
     result: io::Result<Outcome>,
-    groups: HashMap<String, Arc<SourceGroup>>,
     promoted: HashMap<String, WatchCandidateRow>,
 }
 
@@ -778,7 +815,7 @@ struct Scheduler {
     unpublished: HashSet<String>,
     due: BTreeMap<(Instant, String), ()>,
     active: HashMap<String, Active>,
-    active_paths: HashMap<String, String>,
+    active_paths: HashMap<String, (Arc<str>, usize)>,
     continuous: bool,
     tray_enabled: bool,
     tray: Option<super::tray::Tray>,
@@ -849,6 +886,7 @@ impl Scheduler {
         scheduler.recover_pending()?;
         scheduler.password_update()?;
         scheduler.checkpoint(None, true)?;
+        scheduler.retry_missing_volumes()?;
         scheduler
             .hub
             .pending_count
@@ -1061,23 +1099,6 @@ impl Scheduler {
                 root.scanned = false;
             }
         }
-        for (batch, active) in &self.active {
-            let changed = match (next.get(&active.root), self.roots.get(&active.root)) {
-                (Some((new, _)), Some((old, _))) => {
-                    new.path != old.path
-                        || new.output != old.output
-                        || new.recursive != old.recursive
-                        || new.deep != old.deep
-                }
-                _ => true,
-            };
-            if changed {
-                let batches = self.hub.batches.lock().unwrap();
-                if let Some(cancel) = batches.get(batch) {
-                    cancel.cancel();
-                }
-            }
-        }
         let removed: Vec<_> = self
             .pending
             .iter()
@@ -1086,6 +1107,7 @@ impl Scheduler {
             .collect();
         for key in removed {
             if let Some(pending) = self.pending.remove(&key) {
+                self.hub.retire_seed(&key);
                 self.due.remove(&(pending.due, key.clone()));
                 self.unpublished.remove(&key);
             }
@@ -1121,11 +1143,7 @@ impl Scheduler {
                 .get(id)
                 .and_then(|(root, _)| nearest_directory(&root.path))
                 .is_some_and(|path| {
-                    path == observer.path
-                        && observer
-                            .thread
-                            .as_ref()
-                            .is_some_and(|thread| !thread.is_finished())
+                    path == observer.path && !observer.stopping.load(Ordering::Acquire)
                 })
         });
         for (id, (root, scope)) in &self.roots {
@@ -1179,12 +1197,24 @@ impl Scheduler {
     }
 
     fn run(&mut self, once: bool) -> io::Result<i32> {
-        let result = self.run_inner(once);
+        let mut result = self.run_inner(once);
         self.hub.stop();
-        for (_, active) in self.active.drain() {
-            let _ = active.thread.join();
+        while let Some(batch) = self.active.keys().next().cloned() {
+            if result.is_ok() {
+                if let Err(error) = self.complete(&batch) {
+                    result = Err(error);
+                }
+            } else {
+                for active in self.active.values() {
+                    active.cancel.cancel();
+                }
+                for (_, active) in self.active.drain() {
+                    let _ = active.thread.join();
+                }
+            }
         }
         let signals = self.hub.wait(None);
+        drop(signals.cancel);
         for waiter in signals.reload_waiters {
             let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
         }
@@ -1194,6 +1224,9 @@ impl Scheduler {
         for waiter in signals.rebuild {
             let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
         }
+        *self.external.lock().unwrap() = None;
+        *self.hub.claims.lock().unwrap() = HashMap::new();
+        *self.hub.seeds.lock().unwrap() = HashMap::new();
         self.catalog.commit(true);
         self.catalog.close();
         self.journal.log(json!({"event":"watch_stopped"}));
@@ -1226,21 +1259,28 @@ impl Scheduler {
                 (a, b) => a.or(b),
             };
             let signals = self.hub.wait(deadline);
+            for (batch, waiter) in signals.cancel {
+                let _ = waiter.send(self.cancel_batch(&batch));
+            }
             for completed in signals.completed {
-                self.complete(completed)?;
+                self.complete(&completed)?;
             }
             for waiter in signals.rebuild {
                 let _ = waiter.send(self.journal.rebuild_log());
             }
             if let Some(clipboard) = signals.clipboard {
-                if self.passwords.merge_clipboard(
+                match self.passwords.merge_clipboard(
                     &clipboard,
                     self.settings.watch.clipboard_builtin_max_entries,
-                )? {
-                    self.password_update()?;
+                ) {
+                    Ok(true) => self.password_update()?,
+                    Ok(false) => {}
+                    Err(error) => self.journal.log(json!({
+                        "event":"watch_clipboard_password_save_failed", "error":error.to_string(),
+                    })),
                 }
             }
-            if signals.password_changed {
+            if signals.password_changed || !signals.reload_waiters.is_empty() {
                 self.password_update()?;
             }
             if signals.foreground_finished {
@@ -1302,6 +1342,7 @@ impl Scheduler {
                         self.unpublished.shrink_to_fit();
                         self.active.shrink_to_fit();
                         self.active_paths.shrink_to_fit();
+                        self.hub.seeds.lock().unwrap().shrink_to_fit();
                     });
                 }
             }
@@ -1550,14 +1591,27 @@ impl Scheduler {
             .collect();
         for id in removed {
             if let Some(pending) = self.pending.remove(&id) {
+                self.hub.retire_seed(&id);
                 self.due.remove(&(pending.due, id.clone()));
                 self.unpublished.remove(&id);
-                self.journal.commit(false, |_| {
-                    Ok(crate::watch_store::NativeWatchOperations::finish_pending(
-                        &pending.candidate.path,
-                        None,
-                    ))
-                })?;
+                let claimed = self.active_paths.contains_key(&id)
+                    || self.hub.claims.lock().unwrap().contains_key(&id);
+                if !claimed {
+                    self.journal.commit(false, |state| {
+                        use crate::watch_store::NativeWatchOperations;
+                        let path = &pending.candidate.path;
+                        let recoverable = state.pending(path).is_some_and(|record| {
+                            !record.active_outputs.is_empty()
+                                || record.committed_roots.iter().next().is_some()
+                                || record.promoted_destinations.iter().next().is_some()
+                        });
+                        Ok(if recoverable {
+                            NativeWatchOperations::empty()
+                        } else {
+                            NativeWatchOperations::finish_pending(path, None)
+                        })
+                    })?;
+                }
             }
         }
         self.catalog.forget_observation(path, true, true);
@@ -1578,8 +1632,19 @@ impl Scheduler {
             .pending
             .get(&id)
             .map(|entry| entry.candidate.observation.change_usn);
-        let baseline = pending_usn
+        let active_candidate = self.active_paths.get(&id).and_then(|(batch, index)| {
+            self.active
+                .get(batch.as_ref())
+                .map(|active| &active.inputs[*index])
+        });
+        let interrupted = blocked
+            .as_ref()
+            .filter(|entry| entry.status == "interrupted");
+        let baseline = interrupted
+            .map(|entry| entry.change_usn)
+            .or(pending_usn)
             .or_else(|| previous.as_ref().map(|value| value.change_usn))
+            .or_else(|| active_candidate.map(|input| input.observation.change_usn))
             .or_else(|| blocked.as_ref().map(|value| value.change_usn));
         let candidate = match watch_candidate_for_path(Path::new(&path), baseline) {
             Ok(Some(candidate)) => candidate,
@@ -1591,19 +1656,12 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        if !force {
-            if blocked.as_ref().is_some_and(|before| {
-                !quiet::content_changed(
-                    before.size.max(0) as u64,
-                    before.mtime,
-                    &before.file_id,
-                    before.change_usn,
-                    &candidate,
-                )
-            }) {
-                return Ok(());
-            }
-            if previous.as_ref().is_some_and(|before| {
+        if interrupted.is_some_and(|before| !entry_changed(before, &candidate)) {
+            return Ok(());
+        }
+        let unchanged = previous.as_ref().map_or_else(
+            || active_candidate.is_some_and(|before| !quiet::changed(before, &candidate)),
+            |before| {
                 !quiet::content_changed(
                     before.size,
                     before.mtime,
@@ -1611,27 +1669,49 @@ impl Scheduler {
                     before.change_usn,
                     &candidate,
                 )
-            }) {
+            },
+        );
+        if !force {
+            if blocked
+                .as_ref()
+                .is_some_and(|before| !entry_changed(before, &candidate))
+            {
+                return Ok(());
+            }
+            if unchanged {
+                if let Some(pending) = self.pending.get_mut(&id) {
+                    let boundary = candidate.observation.change_reasons_known
+                        && candidate.observation.change_reasons & quiet::CLOSE != 0;
+                    if boundary && baseline != Some(candidate.observation.change_usn) {
+                        let now = Instant::now();
+                        if now < pending.due {
+                            self.due.remove(&(pending.due, id.clone()));
+                            pending.due = now;
+                            self.due.insert((now, id), ());
+                        }
+                    }
+                    pending.candidate = candidate;
+                }
                 return Ok(());
             }
         }
-        let claim = self
+        let claim = self.hub.claims.lock().unwrap();
+        let batch = self
             .active_paths
             .get(&id)
-            .cloned()
-            .or_else(|| self.hub.claims.lock().unwrap().get(&id).cloned());
-        if let Some(batch) = &claim {
-            if let Some(active) = self.active.get_mut(batch) {
-                active.touched.insert(id.clone());
-            }
-            if baseline.is_some() {
-                if let Some(cancel) = self.hub.batches.lock().unwrap().get(batch) {
-                    cancel.cancel();
-                }
-            }
+            .map(|(batch, _)| batch.as_ref())
+            .or_else(|| claim.get(&id).map(String::as_str));
+        if let Some(active) = batch.and_then(|batch| self.active.get_mut(batch)) {
+            // Let the running request finish. A new generation of one source
+            // must never interrupt the other sources in its batch.
+            active.touched.insert(id.clone());
         }
+        drop(claim);
         let now = Instant::now();
         let prior = self.pending.remove(&id);
+        if prior.is_none() {
+            self.hub.track_seed(&id);
+        }
         let new_identity = prior.as_ref().map_or_else(
             || {
                 previous.as_ref().is_some_and(|old| {
@@ -1661,7 +1741,9 @@ impl Scheduler {
             candidate.observation.change_usn,
             boundary,
         );
-        let delay = if boundary {
+        let delay = if force && unchanged {
+            0.0
+        } else if boundary {
             quiet
                 .seconds
                 .min(self.settings.watch.boundary_confirmation_seconds)
@@ -1719,7 +1801,14 @@ impl Scheduler {
     }
 
     fn password_update(&mut self) -> io::Result<()> {
-        let snapshot = self.passwords.reload()?;
+        let snapshot = match self.passwords.reload() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.journal
+                    .log(json!({"event":"watch_password_reload_failed","error":error.to_string()}));
+                return Ok(());
+            }
+        };
         let signature = snapshot.signature().to_string();
         let state = self.journal.state();
         if state.password_source_signature() == signature {
@@ -1761,6 +1850,23 @@ impl Scheduler {
         self.journal
             .log(json!({"event":"password_source_changed","password_generation":generation}));
         Ok(())
+    }
+
+    fn retry_missing_volumes(&mut self) -> io::Result<()> {
+        for entry in self.journal.state().entry_items(Some("missing_volume")) {
+            let Some((root, _)) = self
+                .roots
+                .iter()
+                .find(|(_, (_, scope))| scope.contains(&entry.path))
+            else {
+                continue;
+            };
+            let id = watch_path_key(&entry.path);
+            if !self.pending.contains_key(&id) {
+                self.enqueue(&root.clone(), entry.path.clone(), true)?;
+            }
+        }
+        self.persist_candidates(BTreeMap::new(), true)
     }
 
     fn recover_pending(&mut self) -> io::Result<()> {
@@ -1812,6 +1918,29 @@ impl Scheduler {
                 }
             }
             if cleanup_failed {
+                continue;
+            }
+            let interrupted = self.journal.state().entry(&pending.path).filter(|entry| {
+                if entry.status != "interrupted" {
+                    return false;
+                }
+                match watch_candidate_for_path(source, Some(entry.change_usn)) {
+                    Ok(Some(current)) => !entry_changed(entry, &current),
+                    Ok(None) => false,
+                    Err(_) => {
+                        entry.file_id == pending.file_id
+                            && entry.size == pending.size
+                            && entry.change_usn == pending.change_usn
+                    }
+                }
+            });
+            if let Some(entry) = interrupted {
+                self.journal.commit(true, |_| {
+                    Ok(crate::watch_store::NativeWatchOperations::finish_pending(
+                        &pending.path,
+                        Some(entry),
+                    ))
+                })?;
                 continue;
             }
             for promoted in pending.promoted_destinations.iter() {
@@ -1905,6 +2034,7 @@ impl Scheduler {
             let current = match watch_candidate_for_path(path, Some(previous_usn)) {
                 Ok(Some(current)) => current,
                 Ok(None) => {
+                    self.hub.retire_seed(&id);
                     self.departed(&pending.candidate.path)?;
                     self.journal.commit(false, |_| {
                         Ok(crate::watch_store::NativeWatchOperations::finish_pending(
@@ -1915,6 +2045,7 @@ impl Scheduler {
                     continue;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.hub.retire_seed(&id);
                     self.journal.commit(false, |_| {
                         Ok(crate::watch_store::NativeWatchOperations::finish_pending(
                             &pending.candidate.path,
@@ -1956,6 +2087,7 @@ impl Scheduler {
                     continue;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.hub.retire_seed(&id);
                     self.journal.commit(false, |_| {
                         Ok(crate::watch_store::NativeWatchOperations::finish_pending(
                             &pending.candidate.path,
@@ -2032,6 +2164,12 @@ impl Scheduler {
             request
                 .checkpoints
                 .extend(self.checkpoints_for(&candidate.path)?);
+            if let Some(entry) = self.journal.state().entry(&candidate.path) {
+                if let Some(receipts) = entry.failure_payload.get("promoted_sources") {
+                    let sources = Vec::<PromotedSource>::deserialize(receipts)?;
+                    request.promoted_sources.extend(sources);
+                }
+            }
         }
         let engine = Arc::clone(&self.engine);
         let journal = Arc::clone(&self.journal);
@@ -2044,15 +2182,13 @@ impl Scheduler {
         let scope = scope.clone();
         let toast = self.toast.as_ref().map(|toast| toast.publisher());
         let language = self.settings.cli.language;
-        self.hub
-            .batches
-            .lock()
-            .unwrap()
-            .insert(batch.clone(), cancel.clone());
+        let groups = Arc::new(Mutex::new(HashMap::new()));
+        let worker_groups = Arc::clone(&groups);
+        let worker_cancel = cancel.clone();
         self.journal
             .log(json!({"event":"pipeline_request_started","owner":batch,
             "path":candidates.first().map(|entry| &entry.path),"count":candidates.len()}));
-        let thread = match thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("sunpack-watch-batch".into())
             .stack_size(512 * 1024)
             .spawn(move || {
@@ -2066,33 +2202,26 @@ impl Scheduler {
                     language,
                     began: Instant::now(),
                     hub: Arc::clone(&hub),
-                    groups: Mutex::default(),
+                    groups: worker_groups,
                     promoted: Mutex::default(),
                 };
                 let result = engine.run_with(request, &observer);
-                let cancelled = cancel.cancelled();
+                let cancelled = worker_cancel.cancelled();
                 observer.finished(result.as_ref().ok(), cancelled);
-                let groups = std::mem::take(&mut *observer.groups.lock().unwrap());
                 let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
-                hub.update(|signals| {
-                    signals.completed.push(Completed {
-                        batch: send_batch,
-                        cancelled,
-                        result,
-                        groups,
-                        promoted,
-                    })
-                });
-            }) {
-            Ok(thread) => thread,
-            Err(error) => {
-                self.hub.batches.lock().unwrap().remove(&batch);
-                return Err(error);
-            }
-        };
-        for candidate in &candidates {
-            self.active_paths
-                .insert(watch_path_key(&candidate.path), batch.clone());
+                hub.update(|signals| signals.completed.push(send_batch));
+                Completed {
+                    cancelled,
+                    result,
+                    promoted,
+                }
+            })?;
+        let batch_id: Arc<str> = Arc::from(batch.as_str());
+        for (index, candidate) in candidates.iter().enumerate() {
+            self.active_paths.insert(
+                watch_path_key(&candidate.path),
+                (Arc::clone(&batch_id), index),
+            );
         }
         self.active.insert(
             batch,
@@ -2101,6 +2230,8 @@ impl Scheduler {
                 passwords,
                 inputs: candidates,
                 touched: HashSet::new(),
+                cancel,
+                groups,
                 thread,
             },
         );
@@ -2118,37 +2249,117 @@ impl Scheduler {
             .collect()
     }
 
-    fn complete(&mut self, mut completed: Completed) -> io::Result<()> {
-        self.hub.batches.lock().unwrap().remove(&completed.batch);
+    fn cancel_batch(&mut self, batch: &str) -> bool {
+        let Some(active) = self.active.get(batch) else {
+            return false;
+        };
+        if active.thread.is_finished() || active.cancel.cancelled() {
+            return false;
+        }
+        let mut seen: HashSet<_> = active
+            .inputs
+            .iter()
+            .map(|input| key(Path::new(&input.path)))
+            .collect();
+        let siblings = active
+            .groups
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|path| seen.insert(path.clone()).then(|| path.clone()))
+            .collect::<Vec<_>>();
+        let siblings = siblings
+            .iter()
+            .filter_map(|path| {
+                let previous = self.catalog.observation(path);
+                watch_candidate_for_path(
+                    Path::new(path),
+                    previous.as_ref().map(|row| row.change_usn),
+                )
+                .ok()
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        let mut interrupted = crate::watch_store::NativeWatchOperations::empty();
+        for input in active.inputs.iter().chain(&siblings) {
+            if NativePresence::at(&input.path).is_absent() {
+                continue;
+            }
+            interrupted.put_entry(Arc::new(observed_entry(
+                input,
+                "interrupted",
+                self.journal.state().entry(&input.path).as_deref(),
+            )));
+            let id = watch_path_key(&input.path);
+            if let Some(pending) = self.pending.get(&id) {
+                if !quiet::changed(input, &pending.candidate) {
+                    let pending = self.pending.remove(&id).unwrap();
+                    self.hub.retire_seed(&id);
+                    self.due.remove(&(pending.due, id.clone()));
+                    self.unpublished.remove(&id);
+                }
+            }
+        }
+        if let Err(error) = self.journal.commit(true, |_| Ok(interrupted)) {
+            self.journal.log(json!({"event":"watch_cancel_persistence_failed","owner":batch,"error":error.to_string()}));
+        }
+        // Stop the workers even when the state volume failed the durable write.
+        active.cancel.cancel();
+        true
+    }
+
+    fn complete(&mut self, batch: &str) -> io::Result<()> {
+        let Some(active) = self.active.remove(batch) else {
+            return Ok(());
+        };
+        let mut completed = active
+            .thread
+            .join()
+            .map_err(|_| io::Error::other("Watch extraction thread failed"))?;
+        completed.cancelled |= active.cancel.cancelled();
         self.hub
             .claims
             .lock()
             .unwrap()
-            .retain(|_, owner| owner != &completed.batch);
-        let Some(active) = self.active.remove(&completed.batch) else {
-            return Ok(());
-        };
-        active
-            .thread
-            .join()
-            .map_err(|_| io::Error::other("Watch extraction thread failed"))?;
+            .retain(|_, owner| owner != batch);
+        let groups = std::mem::take(&mut *active.groups.lock().unwrap());
         for candidate in &active.inputs {
-            self.active_paths.remove(&watch_path_key(&candidate.path));
+            let id = watch_path_key(&candidate.path);
+            self.active_paths.remove(&id);
+            self.hub.retire_seed(&id);
         }
         let outcome = match completed.result {
             Ok(outcome) => outcome,
             Err(error) if completed.cancelled => {
-                self.journal.log(json!({"event":"pipeline_request_interrupted","owner":completed.batch,"error":error.to_string()}));
-                Outcome::default()
+                self.journal.log(json!({"event":"pipeline_request_interrupted","owner":batch,"error":error.to_string()}));
+                self.release_display_claims(batch, &groups);
+                self.arm_idle_cleanup();
+                return Ok(());
             }
             Err(error) => {
-                self.failed += 1;
+                let mut absent = crate::watch_store::NativeWatchOperations::empty();
+                let mut failed = false;
                 for candidate in &active.inputs {
+                    let id = watch_path_key(&candidate.path);
+                    if self.pending.contains_key(&id) || active.touched.contains(&id) {
+                        continue;
+                    }
+                    if NativePresence::at(&candidate.path).is_absent() {
+                        absent.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                            &candidate.path,
+                            None,
+                        ));
+                        continue;
+                    }
+                    failed = true;
                     self.journal
                         .log(json!({"event":"failed_terminal","path":candidate.path,
-                        "owner":completed.batch,"error":error.to_string()}));
+                        "owner":batch,"error":error.to_string()}));
                 }
-                self.release_display_claims(&completed.batch, &completed.groups);
+                self.failed += usize::from(failed);
+                self.journal.commit(true, |_| Ok(absent))?;
+                self.release_display_claims(batch, &groups);
+                self.arm_idle_cleanup();
                 return Ok(());
             }
         };
@@ -2167,6 +2378,11 @@ impl Scheduler {
             .collect::<HashMap<_, _>>();
         let mut operations = crate::watch_store::NativeWatchOperations::empty();
         let current_passwords = self.passwords.snapshot();
+        let promoted_sources = outcome
+            .promoted_sources
+            .iter()
+            .map(|source| (key(source.path()), source))
+            .collect::<HashMap<_, _>>();
         let mut retry = Vec::new();
         let mut published = HashSet::new();
         for archive in outcome
@@ -2181,13 +2397,20 @@ impl Scheduler {
             let Some(candidate) = completed.promoted.remove(&id) else {
                 continue;
             };
+            if self.active_paths.contains_key(&id) {
+                continue;
+            }
+            let regroup = failure.kind == FailureKind::MissingVolume;
             if let Some(pending) = self.pending.get(&id) {
                 if quiet::changed(&candidate, &pending.candidate) {
                     continue;
                 }
-                let pending = self.pending.remove(&id).unwrap();
-                self.due.remove(&(pending.due, id.clone()));
-                self.unpublished.remove(&id);
+                if !regroup {
+                    let pending = self.pending.remove(&id).unwrap();
+                    self.hub.retire_seed(&id);
+                    self.due.remove(&(pending.due, id.clone()));
+                    self.unpublished.remove(&id);
+                }
             }
             let group = SourceGroup {
                 path: archive.path.clone(),
@@ -2218,17 +2441,24 @@ impl Scheduler {
                 payload.insert("source_input_root".into(), json!(scope.root));
             }
             payload.insert("promoted_nested_input".into(), Value::Bool(true));
-            if payload
+            record_promoted_sources(payload, &candidate.path, Some(&group), &promoted_sources);
+            let password_updated = payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|previous| previous != current_passwords.scope_signature(directory))
-            {
+                .is_some_and(|previous| previous != current_passwords.scope_signature(directory));
+            if regroup && self.pending.contains_key(&id) {
+                // Other promoted volumes may already have arrived before this
+                // blocker was published. Keep the durable queued generation.
+                operations.put_entry(entry);
+            } else {
+                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                    &candidate.path,
+                    Some(entry),
+                ));
+            }
+            if (regroup && !self.pending.contains_key(&id)) || password_updated {
                 retry.push(candidate.path.clone());
             }
-            operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                &candidate.path,
-                Some(entry),
-            ));
             for checkpoint in &outcome.checkpoints {
                 if checkpoint.source_paths().any(|source| {
                     archive
@@ -2243,14 +2473,16 @@ impl Scheduler {
                     ));
                 }
             }
-            self.failed += 1;
+            // Count an unresolved volume failure when the top-level regroup
+            // finishes. A successful regroup can satisfy this initial result.
+            self.failed += usize::from(!regroup);
         }
         for candidate in active.inputs {
             let id = watch_path_key(&candidate.path);
             if self.pending.contains_key(&id) || active.touched.contains(&id) {
                 continue;
             }
-            let group = completed.groups.get(&id);
+            let group = groups.get(&id);
             let canonical = group.map_or(candidate.path.as_str(), |group| {
                 group.path.to_str().unwrap_or(&candidate.path)
             });
@@ -2266,20 +2498,64 @@ impl Scheduler {
                 .get(&id)
                 .map(|error| error.as_str())
                 .or_else(|| failure.map(|failure| failure.message.as_str()));
+            let retryable = failure.is_some_and(|failure| {
+                matches!(
+                    failure.kind,
+                    FailureKind::MissingVolume
+                        | FailureKind::PasswordRequired
+                        | FailureKind::WrongPassword
+                        | FailureKind::PasswordInconclusive
+                )
+            });
+            let stale = error.is_some()
+                && (NativePresence::at(canonical).is_absent()
+                    || (!retryable
+                        && group.is_some_and(|group| {
+                            group.multipart
+                                && group.members.iter().any(|path| {
+                                    match filesystem::watch_file_is_ready(path) {
+                                        Ok(ready) => !ready,
+                                        Err(error) => error.kind() == io::ErrorKind::NotFound,
+                                    }
+                                })
+                        })));
+            if stale {
+                // A sibling can trigger discovery while the selected head is
+                // being renamed or consumed by a different request. Its old
+                // name no longer represents a live extraction failure.
+                let entry = (canonical != candidate.path)
+                    .then(|| self.journal.state().entry(&candidate.path))
+                    .flatten();
+                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                    &candidate.path,
+                    entry,
+                ));
+                continue;
+            }
             let record = if completed.cancelled {
                 // Only the cancelled generation is retired. A generation
                 // queued while the batch was in flight is left in the WAL.
-                None
+                self.journal
+                    .state()
+                    .entry(&candidate.path)
+                    .filter(|entry| entry.status == "interrupted")
             } else {
                 error.map(|error| {
-                    make_entry(
+                    let mut entry = make_entry(
                         &candidate,
                         error,
                         failure.map(|failure| failure.kind),
                         self.journal.state().entry(&candidate.path).as_deref(),
                         &active.passwords,
                         group.map(Arc::as_ref),
-                    )
+                    );
+                    record_promoted_sources(
+                        &mut Arc::make_mut(&mut entry).failure_payload,
+                        &candidate.path,
+                        group.map(Arc::as_ref),
+                        &promoted_sources,
+                    );
+                    entry
                 })
             };
             if let Some(record) = &record {
@@ -2309,18 +2585,17 @@ impl Scheduler {
                     .flatten()
                     .filter_map(|item| item.output.as_deref())
                     .collect::<HashSet<_>>();
-                self.journal.log(
-                    json!({"event":event,"path":canonical,"owner":completed.batch,
-                    "error":error,"output_dirs":outputs,"retire_group":true}),
-                );
+                self.journal
+                    .log(json!({"event":event,"path":canonical,"owner":batch,
+                    "error":error,"output_dirs":outputs,"retire_group":true}));
             }
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
                 &candidate.path,
-                record,
+                record.filter(|entry| entry.status != "failed_terminal"),
             ));
         }
         self.journal.commit(true, |_| Ok(operations))?;
-        self.release_display_claims(&completed.batch, &completed.groups);
+        self.release_display_claims(batch, &groups);
         for path in retry {
             self.enqueue(&active.root, path, true)?;
         }
@@ -2348,6 +2623,32 @@ impl Scheduler {
     }
 }
 
+fn record_promoted_sources(
+    payload: &mut serde_json::Map<String, Value>,
+    path: &str,
+    group: Option<&SourceGroup>,
+    receipts: &HashMap<String, &PromotedSource>,
+) {
+    if receipts.is_empty() {
+        return;
+    }
+    let sources = match group {
+        Some(group) => group
+            .members
+            .iter()
+            .filter_map(|path| receipts.get(&watch_path_key(path)).copied())
+            .collect::<Vec<_>>(),
+        None => receipts
+            .get(&watch_path_key(path))
+            .copied()
+            .into_iter()
+            .collect(),
+    };
+    if !sources.is_empty() {
+        payload.insert("promoted_sources".into(), json!(sources));
+    }
+}
+
 fn make_entry(
     candidate: &WatchCandidateRow,
     error: &str,
@@ -2365,10 +2666,6 @@ fn make_entry(
         Some(FailureKind::MissingVolume) => ("suspended_missing_volume", vec!["missing_volume"]),
         _ => ("failed_terminal", Vec::new()),
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
     let mut payload = json!({"blockers":blockers});
     if let Some(group) = group {
         payload["source_group"] = json!(group);
@@ -2382,20 +2679,46 @@ fn make_entry(
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default();
-    Arc::new(crate::watch_store::EntryRecord {
+    let mut entry = observed_entry(candidate, status, previous);
+    entry.last_error = error.to_owned();
+    entry.failure_kind = kind;
+    entry.failure_stage = "extraction".to_owned();
+    entry.failure_payload = payload.as_object().unwrap().clone();
+    Arc::new(entry)
+}
+
+fn observed_entry(
+    candidate: &WatchCandidateRow,
+    status: &str,
+    previous: Option<&crate::watch_store::EntryRecord>,
+) -> crate::watch_store::EntryRecord {
+    crate::watch_store::EntryRecord {
         path: candidate.path.clone(),
         size: candidate.size.min(i64::MAX as u64) as i64,
         mtime: candidate.mtime,
         file_id: candidate.observation.file_id.clone(),
         change_usn: candidate.observation.change_usn,
         status: status.to_owned(),
-        last_error: error.to_owned(),
+        last_error: String::new(),
         attempt_count: previous.map_or(1, |record| record.attempt_count.saturating_add(1)),
-        failure_kind: kind,
-        failure_stage: "extraction".to_owned(),
-        failure_payload: payload.as_object().unwrap().clone(),
-        last_attempt_at: now,
-    })
+        failure_kind: String::new(),
+        failure_stage: String::new(),
+        failure_payload: serde_json::Map::new(),
+        last_attempt_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64(),
+    }
+}
+
+fn entry_changed(entry: &crate::watch_store::EntryRecord, candidate: &WatchCandidateRow) -> bool {
+    quiet::content_changed(
+        entry.size.max(0) as u64,
+        entry.mtime,
+        &entry.file_id,
+        entry.change_usn,
+        candidate,
+    )
 }
 
 struct WatchObserver {
@@ -2408,7 +2731,7 @@ struct WatchObserver {
     language: crate::core::i18n::Language,
     began: Instant,
     hub: Arc<Hub>,
-    groups: Mutex<HashMap<String, Arc<SourceGroup>>>,
+    groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
     promoted: Mutex<HashMap<String, WatchCandidateRow>>,
 }
 
@@ -2451,6 +2774,65 @@ impl WatchObserver {
 }
 
 impl Observer for WatchObserver {
+    fn should_process_sources(
+        &self,
+        _path: &Path,
+        data_paths: &[&str],
+        generations: &SourceGenerations,
+    ) -> io::Result<bool> {
+        if data_paths.len() < 2 {
+            return Ok(true);
+        }
+        let paths = data_paths
+            .iter()
+            .map(|path| watch_path_key(path))
+            .collect::<HashSet<_>>();
+        let seeds = self.hub.seeds.lock().unwrap();
+        let covered = paths
+            .iter()
+            .filter_map(|path| seeds.get(path).and_then(|seed| seed.processed.as_deref()))
+            .any(|processed| {
+                processed.len() == paths.len()
+                    && paths.iter().all(|path| {
+                        processed
+                            .get(path)
+                            .is_some_and(|previous| generations.get(path) == Some(previous))
+                    })
+            });
+        Ok(!covered)
+    }
+
+    fn sources_processed(
+        &self,
+        archives: &[ArchiveResult],
+        generations: &SourceGenerations,
+    ) -> io::Result<()> {
+        if generations.len() < 2 {
+            return Ok(());
+        }
+        let processed = archives
+            .iter()
+            .flat_map(|archive| &archive.source_paths)
+            .filter_map(|source| {
+                let path = key(source);
+                generations
+                    .get(&path)
+                    .map(|generation| (path, generation.clone()))
+            })
+            .collect::<SourceGenerations>();
+        if processed.len() < 2 {
+            return Ok(());
+        }
+        let processed = Arc::new(processed);
+        let mut seeds = self.hub.seeds.lock().unwrap();
+        for path in processed.keys() {
+            if let Some(seed) = seeds.get_mut(path) {
+                seed.processed = Some(Arc::clone(&processed));
+            }
+        }
+        Ok(())
+    }
+
     fn before_promotion(
         &self,
         archive: &ArchiveResult,

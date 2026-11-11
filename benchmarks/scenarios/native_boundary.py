@@ -142,17 +142,27 @@ def main(argv=None):
                     for i in range(args.ordinary_files):
                         (ordinary / f"ordinary-{i}.txt").write_bytes(b"ordinary file\n")
                 if args.mode == "watch":
-                    app.run("watch", "add", "-d", "-r", args.recursive, "-o", workspace.outputs, inputs, *password_args)
+                    config_path = app.data / "sunpack_config.json"
+                    config = json.loads(config_path.read_text(encoding="utf-8"))
+                    config["recursive_extract"] = args.recursive
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                    (app.data / "builtin_passwords.json").write_text(
+                        json.dumps({"passwords": [{"value": value} for value in args.password]}),
+                        encoding="utf-8",
+                    )
+                    app.run("watch", "add", "-R", "-d", "-o", workspace.outputs, inputs)
                 for run in range(args.runs):
                     if args.cold or args.mode == "watch":
                         app.shutdown()
                     if args.mode in ("scan", "memory", "watch"):
                         output = workspace.outputs / f"round-{run}"
-                        command = ("scan", "-d", inputs, *password_args) if args.mode == "scan" else (
+                        command = ("scan", "-R", "-d", inputs, *password_args) if args.mode == "scan" else (
                             ("watch", "start", "--once", "--no-tray") if args.mode == "watch" else
-                            ("extract", "-d", "-r", args.recursive, "-c", "k", "--no-flatten", "--no-pause", "-o", output, inputs, *password_args)
+                            ("extract", "-R", "-d", "-r", args.recursive, "-c", "k", "--no-flatten", "--no-pause", "-o", output, inputs, *password_args)
                         )
                         measurement = app.run(*command)
+                        if args.mode == "memory" and not measurement["response"]["summary"]["processed_count"]:
+                            raise RuntimeError("The extraction workload found no archive inputs.")
                         observed = workspace.outputs if args.mode == "watch" else output
                         rows.append({"case": "directory" if args.mode != "watch" else ("bootstrap" if run == 0 else "completed-state-restart"), "run": run, "output": output_summary(observed), **measurement})
                         if output.exists():

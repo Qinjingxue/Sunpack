@@ -643,12 +643,16 @@ function Build-SevenZipWorker {
     }
 
     $workerExe = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
+    $launcherExe = Join-Path $BuildDir "Release\sunpack_launcher.exe"
     Assert-PathExists -LiteralPath $workerExe -Description "Built 7z worker executable"
+    Assert-PathExists -LiteralPath $launcherExe -Description "Built SunPack launcher executable"
     Copy-Item -LiteralPath $workerExe -Destination (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -Force
 
     Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @(
         (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe")
     )
+    Set-DevelopmentArtifactBuildTime -Path $launcherExe -BuildStartedUtc $buildStartedUtc
+    Set-DevelopmentArtifactBuildTime -Path $workerExe -BuildStartedUtc $buildStartedUtc
     Set-DevelopmentArtifactBuildTime -Path (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -BuildStartedUtc $buildStartedUtc
 }
 
@@ -745,13 +749,13 @@ $env:Path = "$venvScripts;$env:Path"
 $env:PYTHONPATH = $repoRoot
 $env:VIRTUAL_ENV = $venvPath
 
-Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
-if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
-    Ensure-AcceptanceTestTools -RepoRoot $repoRoot -ToolsRoot $toolsRoot
-}
 if ($BootstrapOnly) {
     Write-Host "Bootstrap complete; native compilation is deferred to build_windows.ps1" -ForegroundColor Green
     return
+}
+Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
+if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
+    Ensure-AcceptanceTestTools -RepoRoot $repoRoot -ToolsRoot $toolsRoot
 }
 
 Write-Step "Building Rust runtime and native fixture tool"

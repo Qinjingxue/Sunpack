@@ -25,38 +25,6 @@ struct SevenZipObservation {
     read_fault: Option<(ReadFault, &'static str)>,
 }
 
-impl SevenZipObservation {
-    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
-        let mut result = DiagnosticFields::new();
-        result.put("format", "7z")?;
-        result.put("plausible", &self.plausible)?;
-        result.put("magic_matched", &self.magic_matched)?;
-        result.put("strong_accept", &self.strong_accept)?;
-        result.put("error", &self.error)?;
-        result.put("archive_offset", &self.archive_offset)?;
-        result.put("segment_end", &self.segment_end)?;
-        result.put("next_header_offset", &self.next_header_offset)?;
-        result.put("next_header_size", &self.next_header_size)?;
-        result.put("start_header_crc_ok", &self.start_header_crc_ok)?;
-        result.put("next_header_crc_checked", &self.next_header_crc_checked)?;
-        result.put("next_header_crc_ok", &self.next_header_crc_ok)?;
-        result.put("next_header_nid", &self.next_header_nid)?;
-        result.put("next_header_nid_valid", &self.next_header_nid_valid)?;
-        result.put("version_major", &self.version_major)?;
-        result.put("version_minor", &self.version_minor)?;
-        result.put("password_required", &self.password_required)?;
-        result.put("encrypted_header", &self.encrypted_header)?;
-        result.put("encrypted_payload", &self.encrypted_payload)?;
-        result.put("password_state", &self.password_state)?;
-        result.put("encryption_scan_complete", &self.encryption_scan_complete)?;
-        result.put("evidence", &self.evidence)?;
-        if let Some((fault, legacy)) = &self.read_fault {
-            set_view_read_fault(&mut result, fault, legacy)?;
-        }
-        Ok(result)
-    }
-}
-
 impl AnalysisBinaryView {
     fn probe_seven_zip_native(&self, start_offset: u64) -> std::io::Result<SevenZipObservation> {
         let mut result = SevenZipObservation {

@@ -389,7 +389,7 @@ enum Data {
     Normalized(Result<Config, Box<str>>),
 }
 
-struct Generation {
+pub(crate) struct Generation {
     stamp: [Option<[u64; 2]>; 3],
     sources: ConfigSources,
     language: Language,
@@ -397,7 +397,11 @@ struct Generation {
 }
 
 impl Generation {
-    fn normalized(&self) -> io::Result<Config> {
+    pub(crate) fn language(&self) -> Language {
+        self.language
+    }
+
+    pub(crate) fn normalized(&self) -> io::Result<Config> {
         let mut data = self.data.lock().unwrap_or_else(|error| error.into_inner());
         if let Data::Raw(raw) = &*data {
             *data = Data::Normalized(Config::parse(raw).map_err(|error| error.to_string().into()));
@@ -410,7 +414,7 @@ impl Generation {
     }
 }
 
-fn generation(cwd: &Path) -> io::Result<Arc<Generation>> {
+pub(crate) fn generation(cwd: &Path) -> io::Result<Arc<Generation>> {
     static CACHE: Mutex<Option<Arc<Generation>>> = Mutex::new(None);
     let layers = Layers::read(cwd)?;
     let stamp = layers.stamp();
@@ -461,7 +465,7 @@ pub fn load_snapshot(cwd: &Path) -> io::Result<Snapshot> {
 }
 
 pub fn load(cwd: &Path) -> io::Result<Config> {
-    Ok(load_snapshot(cwd)?.config)
+    generation(cwd)?.normalized()
 }
 
 fn field<'a>(value: &'a Value, path: &[&str]) -> &'a Value {

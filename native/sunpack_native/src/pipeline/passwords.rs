@@ -82,7 +82,7 @@ impl AttemptCache {
         state.rejections = 0;
     }
 
-    fn recent(&self) -> Vec<Arc<str>> {
+    pub(super) fn recent(&self) -> Vec<Arc<str>> {
         self.0.lock().unwrap().recent.iter().cloned().collect()
     }
 
@@ -261,6 +261,7 @@ impl<'a> CandidateSet<'a> {
         let mut pending = Vec::new();
         let mut evidence = None;
         let mut password_rejected = false;
+        let mut has_candidates = false;
         // The empty password has priority only when Rust has not already
         // established encryption. A backend proof may still be necessary.
         let mut empty_probe = !input.analysis.password_required;
@@ -280,6 +281,7 @@ impl<'a> CandidateSet<'a> {
                         .take(BATCH_SIZE - batch.len())
                         .cloned(),
                 );
+                has_candidates |= !batch.is_empty();
             }
             if batch.is_empty() {
                 break;
@@ -368,10 +370,10 @@ impl<'a> CandidateSet<'a> {
             batch.clear();
         }
         if pending.is_empty() {
-            if password_rejected {
+            if password_rejected && has_candidates {
                 return Ok(Err(Failure::password()));
             }
-            if input.analysis.password_required {
+            if password_rejected || input.analysis.password_required {
                 return Ok(Err(Failure::password_required()));
             }
             pending.push(Arc::from(""));
@@ -385,6 +387,7 @@ impl<'a> CandidateSet<'a> {
             encrypted: input.analysis.password_required.then_some(true),
             verified: false,
             evidence,
+            has_candidates,
             cache_key: key,
         };
         Ok(Ok(plan))
@@ -397,6 +400,7 @@ pub(super) struct PasswordPlan {
     pub encrypted: Option<bool>,
     pub verified: bool,
     pub evidence: Option<&'static str>,
+    pub has_candidates: bool,
     cache_key: Option<Key>,
 }
 
@@ -408,17 +412,20 @@ impl PasswordPlan {
             encrypted: Some(false),
             verified: false,
             evidence: None,
+            has_candidates: false,
             cache_key: None,
         }
     }
 
     fn verified(password: Arc<str>) -> Self {
+        let has_candidates = !password.is_empty();
         Self {
             selected: Some(password),
             candidates: Vec::new(),
             encrypted: Some(true),
             verified: true,
             evidence: None,
+            has_candidates,
             cache_key: None,
         }
     }
@@ -428,13 +435,6 @@ impl PasswordPlan {
             .and_then(|index| self.candidates.get(index))
             .or(self.selected.as_ref())
             .map(Arc::as_ref)
-    }
-
-    pub(super) fn has_candidates(&self) -> bool {
-        self.selected
-            .as_ref()
-            .is_some_and(|password| !password.is_empty())
-            || self.candidates.iter().any(|password| !password.is_empty())
     }
 
     pub(super) fn remember_confirmation(&self, index: Option<usize>, cache: &AttemptCache) {

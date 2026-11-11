@@ -8,14 +8,18 @@ mod passwords;
 mod worker;
 
 use crate::core::{config::Config, passwords::PasswordSnapshot};
+use crate::io::reader::PhysicalFileGeneration;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) use crate::io::cancellation::Cancellation;
 pub use checkpoint::InputCheckpoint;
+pub(crate) use checkpoint::PromotedSource;
 pub use coordinator::Engine;
+pub(crate) use coordinator::{common_ancestor, common_output_base};
 pub(crate) use discovery::scan_options;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +57,7 @@ pub struct Request {
     pub mode: Mode,
     pub origin: Origin,
     pub output_root: Option<PathBuf>,
+    pub(crate) output_base: Option<PathBuf>,
     pub max_depth: usize,
     pub recursive: bool,
     pub direct: bool,
@@ -61,6 +66,7 @@ pub struct Request {
     pub password_snapshot: Option<Arc<PasswordSnapshot>>,
     pub config: Arc<Config>,
     pub checkpoints: Vec<InputCheckpoint>,
+    pub(crate) promoted_sources: Vec<PromotedSource>,
     pub(crate) cancel: Cancellation,
     pub(crate) discovery_scope: Option<crate::scan::scope::NativeDiscoveryScope>,
     pub(crate) watch_catalog: Option<Arc<crate::scan::directory::NativeWatchCatalog>>,
@@ -73,6 +79,7 @@ impl Request {
             mode,
             origin: Origin::Foreground,
             output_root: None,
+            output_base: None,
             max_depth: 0,
             recursive: false,
             direct: false,
@@ -81,6 +88,7 @@ impl Request {
             password_snapshot: None,
             config: Arc::new(Config::default()),
             checkpoints: Vec::new(),
+            promoted_sources: Vec::new(),
             cancel: Cancellation::new(),
             discovery_scope: None,
             watch_catalog: None,
@@ -190,6 +198,8 @@ pub struct Outcome {
     pub checkpoints: Vec<InputCheckpoint>,
     pub cleanup_results: Vec<CleanupResult>,
     #[serde(skip)]
+    pub(crate) promoted_sources: Vec<PromotedSource>,
+    #[serde(skip)]
     pub(crate) removed_promotion_dirs: Vec<String>,
 }
 
@@ -231,10 +241,27 @@ pub enum Event {
 
 /// Publication callbacks form the durable boundary for Watch. A failed callback
 /// stops the corresponding filesystem operation and propagates to the request.
-pub trait Observer: Sync {
+pub(crate) trait Observer: Sync {
     fn notify(&self, event: Event);
 
     fn claim_sources(&self, _path: &Path, _members: &[String], _depth: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn should_process_sources(
+        &self,
+        _path: &Path,
+        _data_paths: &[&str],
+        _generations: &HashMap<String, PhysicalFileGeneration>,
+    ) -> io::Result<bool> {
+        Ok(true)
+    }
+
+    fn sources_processed(
+        &self,
+        _archives: &[ArchiveResult],
+        _generations: &HashMap<String, PhysicalFileGeneration>,
+    ) -> io::Result<()> {
         Ok(())
     }
 

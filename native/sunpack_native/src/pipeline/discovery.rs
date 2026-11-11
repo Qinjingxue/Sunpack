@@ -1,5 +1,5 @@
 use super::passwords::CandidateSet;
-use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Request};
+use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Origin, Request};
 use crate::core::config::{Config, ScanFilterKind};
 use crate::io::archive_state::{
     ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
@@ -233,6 +233,27 @@ pub(super) fn discover(
     }
     table.dedupe();
     result.project(&mut table, candidates, &verified, request, false)?;
+    if request.origin == Origin::Watch {
+        let admitted = |path: &str| {
+            seen.contains(&path_key(path)) || scopes.iter().any(|scope| scope.contains(path))
+        };
+        let ready = |path: &str| {
+            admitted(path) || crate::filesystem::watch_file_is_ready(path).unwrap_or(false)
+        };
+        // A late launcher-only SFX companion can resolve a complete family,
+        // but none of its data volumes belong to this batch. Related data
+        // must also have closed before even a provisional blocker is published.
+        result.tasks.retain(|task| {
+            task.inputs.iter().any(|logical| {
+                logical.failure.is_some() || logical.input.physical_paths().any(&admitted)
+            }) && task.inputs.iter().all(|logical| {
+                ready(&logical.input.entry_path)
+                    && logical.input.physical_extents().all(|extent| {
+                        extent.path == logical.input.entry_path || ready(&extent.path)
+                    })
+            })
+        });
+    }
     if request.direct {
         let covered: HashSet<_> = result
             .tasks
@@ -455,11 +476,7 @@ impl Discovered {
                 .map(|(operation, path, detail)| InputError {
                     path: PathBuf::from(path),
                     message: format!("{operation}: {detail}"),
-                    kind: if operation == "metadata" {
-                        InputErrorKind::InvalidInput
-                    } else {
-                        InputErrorKind::FilesystemScan
-                    },
+                    kind: InputErrorKind::FilesystemScan,
                 }),
         );
     }
@@ -493,11 +510,12 @@ impl Discovered {
             }
         }
         let embedded = request.config.embedded_scan;
+        let force = request.deep && !recursive;
         let mut batch = table.prepare_embedded(
             &mut routes,
             recursive,
-            request.deep,
-            embedded.enabled || request.deep,
+            force,
+            embedded.enabled || force,
             embedded.recursive_candidate_ratio,
         );
         if batch.len() == 0 {

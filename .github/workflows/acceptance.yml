@@ -52,10 +52,16 @@ jobs:
           profile: ci
           source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
 
+      - name: Cache real archive generators
+        uses: actions/cache@v4
+        with:
+          path: .sunpack_test_tools
+          key: acceptance-tools-v1-${{ runner.os }}-x64-${{ hashFiles('scripts/setup_windows_dev.ps1') }}
+
       - name: Prepare acceptance environment
         shell: pwsh
         run: |
-          .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4 -SkipAcceptanceTestTools
+          .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4
 
       - name: Save native build cache after successful compilation
         if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
@@ -208,5 +214,5 @@ jobs:
         shell: pwsh
         run: |
           $env:SUNPACK_GUI_TEST_BINARY = (Resolve-Path .cache/gui-x64/Release/sunpack_gui_tests.exe).Path
-          & .\.venv\Scripts\python.exe -m pytest -q tests/blackbox/test_runtime_commands.py::test_gui_password_edits_are_visible_to_running_runtime tests/gui/test_integration.py::test_gui_template_texts_exist_in_both_languages
+          & .\.venv\Scripts\python.exe -m pytest -q tests/blackbox/test_runtime_commands.py::test_gui_password_edits_are_visible_to_running_runtime tests/gui/test_integration.py
           if ($LASTEXITCODE -ne 0) { throw 'GUI and runtime boundary tests failed' }

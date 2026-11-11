@@ -30,50 +30,6 @@ struct RarObservation {
     read_fault: Option<(ReadFault, &'static str)>,
 }
 
-impl RarObservation {
-    fn to_diagnostic(&self) -> std::io::Result<DiagnosticFields> {
-        let mut result = DiagnosticFields::new();
-        result.put("format", "rar")?;
-        result.put("plausible", &self.plausible)?;
-        result.put("magic_matched", &self.magic_matched)?;
-        result.put("strong_accept", &self.strong_accept)?;
-        result.put("error", &self.error)?;
-        result.put("archive_offset", &self.archive_offset)?;
-        result.put("segment_end", &self.segment_end)?;
-        result.put("version", &self.version)?;
-        result.put("blocks_checked", &self.blocks_checked)?;
-        result.put("end_block_found", &self.end_block_found)?;
-        result.put("end_block_flags", &self.end_block_flags)?;
-        result.put("first_header_offset", &self.first_header_offset)?;
-        result.put("first_header_size", &self.first_header_size)?;
-        result.put("first_header_type", &self.first_header_type)?;
-        result.put("header_crc_checked", &self.header_crc_checked)?;
-        result.put("header_crc_ok", &self.header_crc_ok)?;
-        result.put("second_block_checked", &self.second_block_checked)?;
-        result.put("second_block_ok", &self.second_block_ok)?;
-        result.put("second_block_type", &self.second_block_type)?;
-        result.put("second_block_size", &self.second_block_size)?;
-        result.put("block_walk_ok", &self.block_walk_ok)?;
-        result.put("evidence", &self.evidence)?;
-        if !self.damage_flags.is_empty() {
-            result.put("damage_flags", &self.damage_flags)?;
-        }
-        if let Some(value) = self.damaged_header_type {
-            result.put("damaged_header_type", value)?;
-        }
-        if let Some(value) = self.header_encrypted {
-            result.put("header_encrypted", value)?;
-        }
-        if let Some(value) = self.password_required {
-            result.put("password_required", value)?;
-        }
-        if let Some((fault, legacy)) = &self.read_fault {
-            set_view_read_fault(&mut result, fault, legacy)?;
-        }
-        Ok(result)
-    }
-}
-
 impl AnalysisBinaryView {
     fn probe_rar_native(&self, start_offset: u64) -> std::io::Result<RarObservation> {
         let mut result = RarObservation {

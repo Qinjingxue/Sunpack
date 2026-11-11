@@ -201,10 +201,10 @@ jobs:
           profile: release
           source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest', 'sunpack.ico', 'sunpack_advanced_config.json') }}
 
-      - name: Bootstrap Python and external tools
+      - name: Prepare CMake and test dependencies
         shell: pwsh
         run: |
-          .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools -BootstrapOnly
+          .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -BootstrapOnly
           if ($LASTEXITCODE -ne 0) { throw 'Windows bootstrap failed' }
           # Reuse the pinned CMake/Python executables in later workflow steps.
           $venvScripts = Join-Path $PWD '.venv\Scripts'
@@ -310,8 +310,6 @@ jobs:
 
       - name: Verify Core UI manager
         shell: pwsh
-        env:
-          sunpack_TEST_7Z: ${{ github.workspace }}/${{ matrix.arch == 'arm64' && 'tools-arm64' || 'tools' }}/7z.exe
         run: |
           .\scripts\build_gui.ps1 -Arch ${{ matrix.arch }} -TestsOnly
 

@@ -1,7 +1,18 @@
 import json
 import subprocess
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 
 import pytest
+
+
+def _zip_bytes(entries):
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
 
 
 def _two_payload_carrier(package, workspace, carrier):
@@ -76,3 +87,135 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_restart(package,
     assert _only_output(output, "first.txt", first) == first_path
     second_path = _only_output(output, "second.txt", second)
     assert first_path.relative_to(output).parts[0] == second_path.relative_to(output).parts[0]
+
+
+def test_deep_discovery_restores_nested_filters_and_consumes_only_generated_archives(package, tmp_path):
+    settings = package.data / "sunpack_config.json"
+    config = json.loads(settings.read_text(encoding="utf-8"))
+    config["recursive_authorization"] = {"enabled": False}
+    config["filesystem"] = {
+        "scan_filters_enabled": True,
+        "scan_filters": [{
+            "name": "blacklist",
+            "enabled": True,
+            "extensions": [{"value": extension, "regex": False} for extension in ("bin", "apk")],
+        }],
+    }
+    settings.write_text(json.dumps(config), encoding="utf-8")
+
+    apk = _zip_bytes({"resource.txt": b"APK payload"})
+    inner = _zip_bytes({"payload.txt": b"nested payload"})
+    carrier = tmp_path / "carrier.bin"
+    carrier.write_bytes(b"carrier prefix" * 20 + _zip_bytes({
+        "client.apk": apk,
+        "wrapper/inner.zip": inner,
+    }) + b"carrier suffix")
+    empty = tmp_path / "empty(1).zip"
+    empty.write_bytes(_zip_bytes({}))
+    output = tmp_path / "out"
+    (output / "empty(1)").mkdir(parents=True)
+
+    report = package.json("extract", "-d", "-r", "*", "-c", "k", "-o", output, carrier, empty)
+    assert report["summary"]["success_count"] == 3
+    assert report["summary"]["failed_count"] == 0
+    assert (output / "empty(2)").is_dir()
+    _only_output(output, "payload.txt", b"nested payload")
+    _only_output(output, "client.apk", apk)
+    assert not list(output.rglob("inner.zip"))
+    assert not list(output.rglob("resource.txt"))
+    assert carrier.is_file()
+    assert empty.is_file()
+
+
+def test_password_retry_deletes_promoted_nested_archive_under_keep_mode(package, tmp_path):
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    payload = fixtures / "secret.txt"
+    payload.write_bytes(b"nested secret")
+    inner = fixtures / "locked.7z"
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", "-pfixture-key",
+         str(inner), payload.name],
+        cwd=fixtures, check=True, capture_output=True,
+    )
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    outer = nested_dir / "outer.zip"
+    outer.write_bytes(_zip_bytes({"wrapper/locked.7z": inner.read_bytes()}))
+    sibling = tmp_path / "plain.zip"
+    sibling.write_bytes(_zip_bytes({"plain.txt": b"plain payload"}))
+    output = tmp_path / "out"
+
+    def wait_for_retry_prompt(stream):
+        marker = "Enter new passwords and retry extraction?"
+        tail = ""
+        while character := stream.read(1):
+            tail = (tail + character)[-len(marker):]
+            if tail == marker:
+                return True
+        return False
+
+    command = [str(package.launcher), "extract", "-r", "*", "-c", "k", "-o", str(output),
+               "--no-builtin-pw", "--no-pause", "-p", "wrong", str(outer), str(sibling)]
+    with ThreadPoolExecutor(max_workers=1) as executor, subprocess.Popen(
+        command, cwd=package.data, env=package.env, encoding="utf-8",
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ) as process:
+        try:
+            prompt = executor.submit(wait_for_retry_prompt, process.stdout)
+            assert prompt.result(timeout=60)
+            busy = package.json("scan", outer, code=1)
+            assert busy["summary"]["status"] == "busy"
+            stdout, stderr = process.communicate("y\nstill-wrong\n\ny\nfixture-key\n\n", timeout=60)
+            assert process.returncode == 0, (stdout, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+    assert _only_output(output, "secret.txt", b"nested secret").parent == output / "nested" / "locked"
+    _only_output(output, "plain.txt", b"plain payload")
+    assert outer.is_file()
+    assert not (nested_dir / inner.name).exists()
+
+
+def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp_path):
+    settings = package.data / "sunpack_config.json"
+    config = json.loads(settings.read_text(encoding="utf-8"))
+    config["extraction"] = {"content_requirement": "allow_partial"}
+    config["recursive_authorization"] = {"enabled": False}
+    settings.write_text(json.dumps(config), encoding="utf-8")
+
+    carrier = tmp_path / "damaged.zip"
+    with zipfile.ZipFile(carrier, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("nested.zip", _zip_bytes({"recovered.txt": b"verified payload"}))
+        archive.writestr("damaged.txt", b"will fail verification")
+        bad = archive.getinfo("damaged.txt")
+    content = bytearray(carrier.read_bytes())
+    content[bad.header_offset + 30 + len(bad.filename)] ^= 1
+    carrier.write_bytes(content)
+
+    output = tmp_path / "out"
+    report = package.json("extract", "--direct-file", "-r", "*", "-c", "d", "-o", output, carrier)
+    assert report["summary"]["success_count"] == 1
+    assert report["summary"]["partial_success_count"] == 1
+    _only_output(output, "recovered.txt", b"verified payload")
+    assert carrier.is_file()
+    assert not list(output.rglob("nested.zip"))
+
+
+def test_scan_keeps_missing_target_in_filesystem_errors(package, tmp_path):
+    archive = tmp_path / "good.wrapped"
+    archive.write_bytes(_zip_bytes({"payload.txt": b"valid archive"}))
+    plain = tmp_path / "plain.txt"
+    plain.write_bytes(b"ordinary text")
+    missing = tmp_path / "missing.zip"
+
+    report = package.json("scan", archive, plain, missing, code=1)
+    assert report["summary"] == {
+        "archive_count": 1,
+        "failed_count": 0,
+        "input_error_count": 0,
+        "scan_error_count": 1,
+    }
+    assert len(report["errors"]) == 1
+    assert missing.name in report["errors"][0]

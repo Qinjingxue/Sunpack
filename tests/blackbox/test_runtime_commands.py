@@ -28,6 +28,26 @@ def test_config_reload_and_literal_password_sources(package, tmp_path):
     assert not after["summary"]["changed"]
 
 
+def test_cli_password_values_and_noninteractive_prompt_contract(package):
+    missing = package.run("passwords", "--json", "--password", "--no-bpw")
+    assert missing.returncode == 2 and not missing.stdout
+    assert "--password" in missing.stderr
+
+    report = package.json("passwords", "--no-bpw", "--password=--no-bpw", "-p", "-42")
+    assert report["items"][0]["user_passwords"] == ["--no-bpw", "-42"]
+    assert not report["items"][0]["use_builtin_passwords"]
+
+    prompt = package.json("passwords", "--ask-pw", code=2)
+    assert prompt["inputs"]["argv"] == ["passwords", "--ask-pw", "--json"]
+    assert prompt["errors"] == ["interactive password input is unavailable in JSON mode"]
+
+
+def test_watch_action_help_lists_available_options(package):
+    help_text = package.run("watch", "add", "--help")
+    assert help_text.returncode == 0
+    assert all(option in help_text.stdout for option in ("paths", "--out-dir", "--start", "--deep-detect"))
+
+
 @pytest.mark.requires_watch_broker
 def test_watch_once_consumes_archive_and_persists_completion(package, tmp_path):
     if "SUNPACK_WATCH_BROKER_PIPE_NAME" not in package.env:

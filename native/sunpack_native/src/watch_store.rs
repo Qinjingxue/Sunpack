@@ -529,6 +529,12 @@ impl NativeWatchOperations {
         }
     }
 
+    pub(crate) fn put_entry(&mut self, entry: Arc<EntryRecord>) {
+        Arc::make_mut(&mut self.operations)
+            .0
+            .push(Operation::PutEntry(path_key(&entry.path), entry));
+    }
+
     pub(crate) fn finish_pending(path: &str, entry: Option<Arc<EntryRecord>>) -> Self {
         let key = path_key(path);
         let retry = match entry {

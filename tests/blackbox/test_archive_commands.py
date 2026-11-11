@@ -90,37 +90,54 @@ def test_extracts_disguised_enc_and_compressed_tar_in_one_request(package, tmp_p
     report = package.json("extract", "-d", "-r", "*", "-c", "k", "-p", "sunpack-test",
                           "-o", output, inputs)
     assert report["summary"]["failed_count"] == 0, report
+    assert "sunpack-test" in report["items"][0]["recent_passwords"]
     assert next(output.rglob("bundle.txt")).read_bytes() == content
     expected = (vectors / "large.expected").read_bytes()
     assert any(path.read_bytes() == expected for path in output.rglob("*")
                if path.is_file() and path.stat().st_size == len(expected))
 
 
-def test_missing_split_volume_blocks_source_cleanup(package, tmp_path):
-    inputs = tmp_path / "volumes"
+def test_mixed_archive_batch_recovers_complete_inputs_and_preserves_missing_volumes(package, tmp_path):
+    inputs = tmp_path / "incoming"
     inputs.mkdir()
     payload = tmp_path / "payload.txt"
     content = random.Random(35).randbytes(4500)
     payload.write_bytes(content)
-    subprocess.run(
-        [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v1k",
-         str(inputs / "series.7z"), str(payload)],
-        check=True, capture_output=True,
-    )
-    parts = sorted(inputs.glob("series.7z.*"))
-    assert len(parts) >= 3
-    removed = parts[1].read_bytes()
-    parts[1].unlink()
-    before = {path: path.read_bytes() for path in inputs.iterdir()}
-    output = tmp_path / "output"
-    blocked = package.run("extract", "-c", "d", "-o", output, parts[0], "--json", "--no-pause")
-    assert blocked.returncode != 0, blocked.stdout
-    assert {path: path.read_bytes() for path in inputs.iterdir()} == before
-    parts[1].write_bytes(removed)
 
-    report = package.json("extract", "-c", "k", "-o", output, parts[0])
+    def make_disguised_volumes(name):
+        subprocess.run(
+            [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v1k", "-mhe=on", "-psplit-key",
+             str(inputs / f"{name}.7z"), str(payload)],
+            check=True, capture_output=True,
+        )
+        return [part.rename(inputs / f"{name}{part.suffix}.wrapped")
+                for part in sorted(inputs.glob(f"{name}.7z.*"))]
+
+    available = make_disguised_volumes("available")
+    missing = make_disguised_volumes("missing")
+    assert len(available) == len(missing) >= 3
+    removed = missing[1].read_bytes()
+    missing[1].unlink()
+    before = {path: path.read_bytes() for path in inputs.iterdir()}
+    carrier = inputs / "carrier.wrapped"
+    inner = _zip({"nested.txt": b"nested carrier payload"})
+    carrier.write_bytes(b"carrier prefix\0" + _zip({"inner.opaque": inner}) + b"carrier trailer\0")
+
+    output = tmp_path / "output"
+    report = package.json("extract", "-d", "-r", "*", "-c", "d", "-p", "split-key", "-o", output, inputs, code=1)
+    assert report["summary"]["success_count"] == 3
+    assert report["summary"]["failed_count"] == 1
+    assert report["summary"]["cleanup_results"] == []
+    assert next(output.rglob("nested.txt")).read_bytes() == b"nested carrier payload"
+    assert [path.read_bytes() for path in output.rglob("payload.txt")] == [content]
+    assert {path: path.read_bytes() for path in inputs.iterdir()} == {
+        path: data for path, data in before.items() if path in missing
+    }
+    missing[1].write_bytes(removed)
+
+    report = package.json("extract", "-c", "k", "-p", "split-key", "-o", output, missing[0])
     assert report["summary"]["success_count"] == 1
-    assert next(output.rglob("payload.txt")).read_bytes() == content
+    assert [path.read_bytes() for path in output.rglob("payload.txt")] == [content, content]
 
 
 def test_concurrent_launcher_requests_reserve_distinct_outputs(package, tmp_path):
@@ -143,6 +160,18 @@ def test_concurrent_launcher_requests_reserve_distinct_outputs(package, tmp_path
 
     assert all(report["summary"]["success_count"] == 1 for report in reports)
     assert sorted(path.read_bytes() for path in output.rglob("payload.txt")) == [b"first", b"second"]
+
+
+def test_text_extract_reports_progress_and_actual_output_directory(package, tmp_path):
+    source = tmp_path / "payload.zip"
+    source.write_bytes(_zip({"hello.txt": b"hello"}))
+    output = tmp_path / "requested-root"
+    result = package.run("extract", "-o", output, source)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "[Complete] [####################] 100%" in result.stdout
+    assert "\x1b" not in result.stdout
+    actual = next(output.rglob("hello.txt")).parent
+    assert f"Output: {actual}\n" in result.stdout
 
 
 def test_partial_content_policy_uses_verified_members_and_retains_source(package, tmp_path):
