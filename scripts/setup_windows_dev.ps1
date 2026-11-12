@@ -794,5 +794,6 @@ Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -Sour
 Write-Host ""
 Write-Host "Local development environment is ready" -ForegroundColor Green
 Write-Host "Runtime: $runtimePath"
+Write-Host "CLI: $(Join-Path $sevenZipWrapperBuildDir 'Release\sunpack_launcher.exe')"
 Write-Host "Test virtual env: $venvPath"
 Write-Host "Activate: $venvPath\\Scripts\\Activate.ps1"

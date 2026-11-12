@@ -205,6 +205,20 @@ impl InputCheckpoint {
 
     }
 
+    pub(super) fn output_slot_for(&self, input: &ArchiveInput, container: &Path) -> bool {
+        // Dependency generations and retry facts decide whether the result can
+        // be reused, not whether the same logical segment keeps its old slot.
+        let start = self.input.parts.first().map(|part| part.extent.start)
+            .or_else(|| self.input.ranges.first().map(|range| range.start)).unwrap_or(0);
+        self.schema_version == SCHEMA_VERSION
+            && self.has_output()
+            && self.container() == Some(container)
+            && self.output.strip_prefix(container).is_ok_and(|relative| !relative.as_os_str().is_empty())
+            && path_key(&self.input.entry.to_string_lossy()) == path_key(&input.entry_path)
+            && self.input.format == input.format_hint
+            && start == input.physical_extents().next().map_or(0, |extent| extent.start)
+    }
+
     pub(super) fn container(&self) -> Option<&Path> {
         self.container
             .as_ref()

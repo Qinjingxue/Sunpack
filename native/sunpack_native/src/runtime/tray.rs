@@ -354,7 +354,9 @@ fn open_manager(cwd: &Path) -> io::Result<()> {
             OsString::from("--data-dir"),
             data.clone().into_os_string(),
             OsString::from("--cli"),
-            std::env::current_exe()?.into_os_string(),
+            resources::launcher_path(cwd)?.into_os_string(),
+            OsString::from("--app-root"),
+            root.into_os_string(),
         ];
         (manager, args)
     };

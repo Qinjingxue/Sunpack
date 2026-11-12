@@ -119,6 +119,7 @@ Options parse_options(const std::vector<std::wstring>& args) {
         if(args[i]==L"--data-dir" && i+1<args.size()) { result.data_dir=resolve_path(args[++i]); custom=true; }
         else if(args[i]==L"--cli" && i+1<args.size()) result.cli.executable=resolve_path(args[++i]);
         else if(args[i]==L"--cli-prefix" && i+1<args.size()) result.cli.prefix.push_back(args[++i]);
+        else if(args[i]==L"--app-root" && i+1<args.size()) result.cli.app_root=resolve_path(args[++i]);
         else throw std::runtime_error("guiArguments");
     }
     if(result.data_dir.empty()) {
@@ -130,6 +131,7 @@ Options parse_options(const std::vector<std::wstring>& args) {
     result.allow_cli=!custom || !result.cli.executable.empty();
     if(result.cli.executable.empty()) result.cli.executable=exe/"bin"/"sunpack.exe";
     result.cli.cwd=result.data_dir;
+    if(result.cli.app_root.empty()) result.cli.app_root=exe;
     return result;
 }
 Application::Application(Options options):options_(std::move(options)) {}

@@ -11,6 +11,32 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void development_entrypoint_contract() {
+    namespace fs = std::filesystem;
+    wchar_t temporary[MAX_PATH];
+    require(GetTempPathW(MAX_PATH, temporary) != 0, "temporary directory");
+    const auto root = fs::path(temporary) / (L"SunPack-launch-layout-" + std::to_wstring(GetCurrentProcessId()));
+    fs::create_directories(root / L"native");
+    std::ofstream(root / L"native" / L"Cargo.toml") << "[workspace]";
+    std::ofstream(root / L"sunpack_advanced_config.json") << "{}";
+    for (const auto* arch : {L"x64", L"arm64"}) {
+        for (const auto* profile : {L"ci", L"release"}) {
+            const auto build = std::wstring(L"build-") + arch + (std::wstring(profile) == L"ci" ? L"-ci" : L"");
+            const auto executable = root / L"native" / L"sevenzip_bridge" / build / L"Release" / L"sunpack_launcher.exe";
+            const auto context = install_context(executable.wstring());
+            const auto target = std::wstring(arch) == L"arm64" ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
+            const auto expected = root / L".cache" / L"rust-target" / arch / target / profile / L"sunpack-runtime.exe";
+            require(context.directory == root.wstring() && context.runtime == expected.wstring(), "native source layout");
+        }
+    }
+    const auto installed = root / L"package";
+    fs::create_directories(installed / L"bin");
+    std::ofstream(installed / L"sunpack-runtime.exe") << "runtime";
+    const auto context = install_context((installed / L"bin" / L"sunpack.exe").wstring());
+    require(context.directory == installed.wstring() && context.runtime == (installed / L"sunpack-runtime.exe").wstring(), "packaged layout unchanged");
+    fs::remove_all(root);
+}
+
 void key(HANDLE input, wchar_t value) {
     INPUT_RECORD record{};
     record.EventType = KEY_EVENT;
@@ -39,6 +65,7 @@ void expect_resize(HANDLE pipe, SHORT columns, SHORT rows) {
 
 int main() {
     try {
+        development_entrypoint_contract();
         require(supports_cancellation({L"scan"}) && supports_cancellation({L"s"}) &&
                 supports_cancellation({L"extract"}) && supports_cancellation({L"e"}) &&
                 !supports_cancellation({L"watch", L"status"}) && !supports_cancellation({}),

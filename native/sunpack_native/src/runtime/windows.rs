@@ -516,13 +516,7 @@ pub(super) fn startup_command() -> io::Result<String> {
 
 pub(super) fn launch_watch_request(cwd: &Path, args: &[String]) -> io::Result<i32> {
     use std::os::windows::process::CommandExt;
-    let exe = std::env::current_exe()?;
-    let installed = exe.with_file_name("bin").join("sunpack.exe");
-    let launcher = if installed.is_file() {
-        installed
-    } else {
-        exe.with_file_name("sunpack.exe")
-    };
+    let launcher = crate::core::resources::launcher_path(cwd)?;
     let status = std::process::Command::new(launcher)
         .current_dir(cwd)
         .args(args)

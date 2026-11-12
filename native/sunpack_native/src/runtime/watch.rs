@@ -95,6 +95,19 @@ pub(super) fn diagnostic_roots(cwd: &Path) -> io::Result<Vec<PathBuf>> {
     read_roots(&roots_path(cwd)?).map(|roots| roots.into_iter().map(|root| root.path).collect())
 }
 
+fn configuration_changes(
+    files: &HashMap<String, (bool, bool)>,
+    names: Option<&[String]>,
+) -> (bool, bool) {
+    let Some(names) = names else {
+        // Overflow/invalidated subscriptions cannot identify a single source.
+        return (true, files.values().any(|(_, passwords)| *passwords));
+    };
+    names.iter().filter_map(|name| files.get(&name.to_lowercase()))
+        .fold((false, false), |(reload, passwords), (config, password)|
+            (reload || *config, passwords || *password))
+}
+
 fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -103,7 +116,7 @@ fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
     };
     let mut roots: Vec<Root> = Vec::new();
     let mut positions = HashMap::new();
-    let cwd = path.parent().unwrap();
+    let cwd = std::env::current_dir()?;
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -114,7 +127,7 @@ fn read_roots(path: &Path) -> io::Result<Vec<Root>> {
         if input.is_empty() {
             continue;
         }
-        let input = cli::resolve(cwd, input)?;
+        let input = cli::resolve(&cwd, input)?;
         let output = fields
             .next()
             .filter(|output| !output.is_empty())
@@ -1512,7 +1525,7 @@ impl Scheduler {
         passwords: &Path,
         hub: &Arc<Hub>,
     ) -> io::Result<Vec<FileObserver>> {
-        let mut targets: HashMap<PathBuf, HashMap<String, bool>> = HashMap::new();
+        let mut targets: HashMap<PathBuf, HashMap<String, (bool, bool)>> = HashMap::new();
         let paths = config::watch_paths(cwd, &snapshot.sources);
         for path in paths.iter().map(PathBuf::as_path).chain([roots, passwords])
         {
@@ -1526,35 +1539,20 @@ impl Scheduler {
             else {
                 continue;
             };
-            let password = targets.entry(parent.to_owned()).or_default().entry(
+            let target = targets.entry(parent.to_owned()).or_default().entry(
                 name.as_os_str().to_string_lossy().to_lowercase(),
             ).or_default();
-            *password |= path == passwords;
+            // A missing parent is watched through its nearest ancestor. Its
+            // arrival can replace configuration and password sources together.
+            target.0 |= path != passwords || parent.join(name.as_os_str()) != path;
+            target.1 |= path == passwords;
         }
         targets
             .into_iter()
             .map(|(dir, files)| {
                 let hub = Arc::clone(hub);
                 FileObserver::start(&dir, false, move |names| {
-                    let mut reload = false;
-                    let mut passwords = false;
-                    let mut affected = |name: &str| match files.get(&name.to_lowercase()) {
-                        Some(true) => {
-                            passwords = true;
-                            reload = true;
-                        }
-                        Some(false) => reload = true,
-                        None => {}
-                    };
-                    if let Some(names) = names {
-                        for name in &names {
-                            affected(name);
-                        }
-                    } else {
-                        for name in files.keys() {
-                            affected(name);
-                        }
-                    }
+                    let (reload, passwords) = configuration_changes(&files, names.as_deref());
                     if reload || passwords {
                         hub.update(|signals| {
                             signals.reload |= reload;
@@ -1600,11 +1598,17 @@ impl Scheduler {
         if self.options.is_some() && !self.roots.is_empty() && self.settings.watch.toast_enabled {
             if self.toast.is_none() {
                 let diagnostic = state_dir(&self.cwd).map(|dir| dir.join("toast-diagnostic.log"));
+                let journal = Arc::downgrade(&self.journal);
                 match diagnostic.and_then(|path| {
                     super::toast::Toast::start(
                         &self.cwd,
                         path,
                         self.settings.watch.toast_report_retention_days,
+                        move |event, error| {
+                            if let Some(journal) = journal.upgrade() {
+                                journal.log(json!({"event":event, "error":error.to_string()}));
+                            }
+                        },
                     )
                 }) {
                     Ok(toast) => self.toast = Some(toast),
@@ -2329,11 +2333,11 @@ impl Scheduler {
             );
             if !affected.is_empty() { self.retire_owned_outputs(Some(&affected))?; }
             if rebuild {
-                // Keep the conservative baseline when the catalog itself is
-                // missing or belongs to another root object. A trusted
-                // inventory can still reconcile arrivals after a USN reset.
+                // Only startup without a trusted persisted cursor establishes
+                // a conservative baseline. During a running session the in-memory
+                // inventory must publish arrivals even if persistence has failed.
                 let options = self.scan_options(root.deep)?;
-                let scan = if root.scanned && cached.is_some() {
+                let scan = if !startup || cached.is_some() {
                     options.catalog_refresh(&self.catalog, &scope, None)
                 } else {
                     options.catalog_update(&self.catalog, &scope, None)
@@ -2517,6 +2521,9 @@ impl Scheduler {
             );
         }
         self.catalog.commit(false);
+        if let Some(error) = self.catalog.error() {
+            self.journal.log(json!({"event":"catalog_persistence_failed","error":error}));
+        }
         Ok(())
     }
 
@@ -4851,6 +4858,21 @@ impl Observer for WatchObserver {
         Ok(())
     }
 
+    fn reuse_output(&self, archive: &ArchiveResult, path: &Path) -> io::Result<()> {
+        let Some(owner) = self.owner(archive) else {
+            return Err(io::Error::other("Watch output has no durable input owner"));
+        };
+        // The retained carrier already owns this child namespace. The existing
+        // start operation republishes its identity without exclusive mkdir.
+        self.journal.commit(true, |state| {
+            state.output_operation(&owner, archive.path.to_string_lossy().into_owned(),
+                path.to_string_lossy().into_owned(), None, None)?
+                .ok_or_else(|| io::Error::other("Watch input owner was retired before output"))
+        })?;
+        self.outputs.lock().unwrap().insert(key(path), owner);
+        Ok(())
+    }
+
     fn before_flatten(&self, root: &Path, work: &Path, leaf: &Path) -> io::Result<()> {
         let owner = self.owner_for_path(root).unwrap_or_default();
         prepare_flatten(&self.journal, &owner, root, work, leaf)?;
@@ -5180,6 +5202,35 @@ fn spawn_error_dialog(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_notifications_do_not_reload_unrelated_configuration() {
+        let files = HashMap::from([
+            ("builtin_passwords.json".into(), (false, true)),
+            ("sunpack_config.json".into(), (true, false)),
+            // Both sources can live below a missing directory watched through
+            // its ancestor: its appearance must rearm all affected sources.
+            ("new-directory".into(), (true, true)),
+        ]);
+        let names = |name: &str| vec![name.to_owned()];
+        assert_eq!(configuration_changes(&files, Some(&names("BUILTIN_PASSWORDS.JSON"))), (false, true));
+        assert_eq!(configuration_changes(&files, Some(&names("sunpack_config.json"))), (true, false));
+        assert_eq!(configuration_changes(&files, Some(&names("unrelated.tmp"))), (false, false));
+        assert_eq!(configuration_changes(&files, Some(&names("new-directory"))), (true, true));
+        assert_eq!(configuration_changes(&files, None), (true, true));
+    }
+
+    #[test]
+    fn relative_roots_use_process_directory_not_roots_file_directory() {
+        let marker = crate::test_support::temp_file("relative_watch_roots", b"");
+        fs::write(&marker, "relative-input | child-output | false | true | false\n").unwrap();
+        let roots = read_roots(&marker).unwrap();
+        let input = std::env::current_dir().unwrap().join("relative-input");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, input);
+        assert_eq!(roots[0].output.as_ref().unwrap(), &input.join("child-output"));
+        fs::remove_file(marker).unwrap();
+    }
+
     #[test]
     fn admission_owned_reconciliation_uses_only_changed_paths() {
         let scope = super::NativeDiscoveryScope::new(r"C:\watched".into(), None, Vec::new());

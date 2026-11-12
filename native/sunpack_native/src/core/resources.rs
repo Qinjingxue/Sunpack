@@ -39,6 +39,36 @@ fn development_root(cwd: &Path) -> Option<PathBuf> {
         })
 }
 
+/// Resolve the native CLI entry point without mistaking a source build for a package.
+pub(crate) fn launcher_path(cwd: &Path) -> io::Result<PathBuf> {
+    let exe = env::current_exe()?;
+    let root = package_root().or_else(|| development_root(cwd))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SunPack application root was not found"))?;
+    let path = if package_root().is_some() {
+        let installed = root.join("bin/sunpack.exe");
+        if installed.is_file() { installed } else { root.join("sunpack.exe") }
+    } else {
+        development_launcher(&root, &exe)?
+    };
+    if !path.is_file() {
+        return Err(io::Error::new(io::ErrorKind::NotFound,
+            format!("SunPack native launcher was not built: {}", path.display())));
+    }
+    Ok(path)
+}
+
+fn development_launcher(root: &Path, exe: &Path) -> io::Result<PathBuf> {
+    let profile = exe.parent().and_then(Path::file_name).and_then(|name| name.to_str());
+    let suffix = match profile {
+        Some("ci") => "-ci",
+        Some("release") => "",
+        _ => return Err(io::Error::new(io::ErrorKind::NotFound,
+            "Build the native launcher and runtime with setup_windows_dev.ps1 (ci or release)")),
+    };
+    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+    Ok(root.join(format!("native/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")))
+}
+
 pub(crate) fn resource_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::with_capacity(2);
     if let Some(root) = package_root().or_else(|| development_root(cwd)) {
@@ -132,5 +162,21 @@ impl Drop for FileMutex {
             ReleaseMutex(self.0);
             CloseHandle(self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_tests {
+    use super::*;
+
+    #[test]
+    fn source_launcher_uses_the_runtime_build_profile_without_package_staging() {
+        let root = Path::new("checkout");
+        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+        for (profile, suffix) in [("ci", "-ci"), ("release", "")] {
+            let exe = root.join(".cache/rust-target").join(arch).join("target").join(profile).join("sunpack-runtime.exe");
+            assert_eq!(development_launcher(root, &exe).unwrap(), root.join(format!("native/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")));
+        }
+        assert!(development_launcher(root, &root.join("debug/sunpack-runtime.exe")).is_err());
     }
 }

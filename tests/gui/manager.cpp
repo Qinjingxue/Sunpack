@@ -18,6 +18,23 @@ struct Fixture {
     Fixture() { GUID id{}; CoCreateGuid(&id); wchar_t token[40]; StringFromGUID2(id,token,40); dir=fs::temp_directory_path()/token; fs::create_directory(dir); }
     ~Fixture() { std::error_code ec; fs::remove_all(dir,ec); }
 };
+void native_context_menu_entrypoint(Fixture& fixture) {
+    const auto app = fixture.dir / "checkout";
+    fs::create_directories(app / "scripts");
+    // Intercept only this test's script dispatch, never touch shell registration.
+    atomic_write(app / "scripts" / "register_context_menu.ps1",
+        "param([Parameter(Mandatory=$true)][string]$AppPath)\nSet-Content -LiteralPath (Join-Path $PSScriptRoot 'enabled.txt') -Value $AppPath -Encoding UTF8");
+    atomic_write(app / "scripts" / "unregister_context_menu.ps1",
+        "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'disabled.txt') -Value 'ok' -Encoding UTF8");
+    CliCommand cli{app / "native" / "sunpack_launcher.exe", fixture.dir, {}, app};
+    Handle stop(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    set_context_menu_enabled(cli, true, stop);
+    const auto enabled = read_file(app / "scripts" / "enabled.txt");
+    assert(enabled.find(utf8(cli.executable.wstring())) != std::string::npos);
+    set_context_menu_enabled(cli, false, stop);
+    assert(fs::is_regular_file(app / "scripts" / "disabled.txt"));
+}
+
 void require_save(const Json& result) {
     if(result["error"]!="") throw std::runtime_error(result["error"].get<std::string>());
 }
@@ -493,7 +510,7 @@ int wmain(int argc,wchar_t** argv) {
         time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
         std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
     }
-    try { Fixture f; projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; native_context_menu_entrypoint(f); projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));

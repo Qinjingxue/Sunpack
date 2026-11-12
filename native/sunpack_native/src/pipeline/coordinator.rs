@@ -388,6 +388,11 @@ struct Run<'a, O> {
     cleanup_tasks: Mutex<Vec<PendingCleanup>>,
 }
 
+enum RetryOutput<'a> {
+    Recreate(&'a Path),
+    Existing(&'a Path),
+}
+
 struct PendingCleanup {
     paths: Vec<PathBuf>,
     task: super::scheduling::Join<Outcome>,
@@ -1243,6 +1248,15 @@ impl<'run, O: Observer> Run<'run, O> {
             } else {
                 None
             };
+            // A retry can invalidate the old result without invalidating its
+            // output slot. Main keeps those slots only inside a carrier whose
+            // unchanged siblings already justified retaining the root.
+            let retry_slots: Vec<_> = task.inputs.iter().zip(&retained)
+                .map(|(logical, checkpoint)| {
+                    checkpoint.is_none().then(|| carrier.as_deref()
+                        .and_then(|root| this.retry_slot_for(&logical.input, root))).flatten()
+                })
+                .collect();
             let mut completed = Vec::with_capacity(task.inputs.len());
             let mut outputs_committed = true;
             let mut carrier_children_complete = true;
@@ -1251,8 +1265,8 @@ impl<'run, O: Observer> Run<'run, O> {
             let retry = task.retry.filter(|_| task.inputs.len() == 1);
             let mut promotion_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
-            for ((logical, checkpoint), &id) in
-                task.inputs.into_iter().zip(retained.drain(..)).zip(&ids)
+            for (((logical, checkpoint), retry_slot), &id) in
+                task.inputs.into_iter().zip(retained.drain(..)).zip(retry_slots).zip(&ids)
             {
                 if multi {
                     this.observer.notify(Event::Started {
@@ -1314,13 +1328,23 @@ impl<'run, O: Observer> Run<'run, O> {
                         inventory,
                     }
                 } else {
+                    let retry_output = if let Some(previous) = retry_slot {
+                        stage("preflight", cancel).await?;
+                        let result = previous.result(depth);
+                        let cleared = this.discard_failed_output(&result, previous.output(), &mut outcome)?;
+                        // Main records cleanup errors but still executes this
+                        // selected input in its fixed slot. Never turn the old
+                        // result into a receipt for the changed dependencies.
+                        Some(if cleared { RetryOutput::Recreate(previous.output()) }
+                             else { RetryOutput::Existing(previous.output()) })
+                    } else { None };
                     this.execute_input(
                         logical,
                         id,
                         task.source,
                         depth,
                         carrier.as_deref(),
-                        None,
+                        retry_output,
                         &candidates,
                         &mut shell,
                         &mut outcome,
@@ -1391,7 +1415,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                     replacement.source,
                                     depth,
                                     None,
-                                    retry_output.as_deref(),
+                                    retry_output.as_deref().map(RetryOutput::Recreate),
                                     &candidates,
                                     &mut shell,
                                     &mut outcome,
@@ -2001,6 +2025,20 @@ impl<'run, O: Observer> Run<'run, O> {
             })
     }
 
+    fn retry_slot_for(&self, input: &ArchiveInput, carrier: &Path) -> Option<&InputCheckpoint> {
+        self.checkpoints.get(&CheckpointKey::for_input(input))?
+            .iter().find_map(|&index| {
+                let checkpoint = &self.request.checkpoints[index];
+                if !checkpoint.output_slot_for(input, carrier) { return None; }
+                // The root was retained through an unchanged sibling above.
+                // Claim only this logical child, never delete the carrier root.
+                self.output_names.registry.lock().unwrap().retain(
+                    checkpoint.output(), self.output_names.owner,
+                    Path::new(&input.entry_path), Some(carrier),
+                ).then_some(checkpoint)
+            })
+    }
+
     async fn claim_task(&self, task: &Task) -> io::Result<Lease> {
         let keys = task
             .owned_paths
@@ -2117,7 +2155,7 @@ impl<'run, O: Observer> Run<'run, O> {
         source: DiscoverySource,
         depth: usize,
         carrier: Option<&Path>,
-        retry_output: Option<&Path>,
+        retry_output: Option<RetryOutput<'_>>,
         candidates: &CandidateSet,
         shell: &mut ShellUpdates<'_>,
         outcome: &mut Outcome,
@@ -2185,12 +2223,24 @@ impl<'run, O: Observer> Run<'run, O> {
                 || self.preferred_output(&input, depth),
                 |root| root.join(archive_name(&input)),
             );
-            let reserved = if let Some(path) = retry_output {
-                // Hold the original claim across replacement and recreate
-                // main's fixed out_dir, rather than a numbered sibling.
-                self.recreate_reserved_output(path, &result)?
-            } else {
-                self.reserve_output(preferred, &result, carrier)?
+            let reserved = match retry_output {
+                Some(RetryOutput::Recreate(path)) => self.recreate_reserved_output(path, &result)?,
+                Some(RetryOutput::Existing(path)) => {
+                    // This was a retained, claimed child slot whose cleanup
+                    // failed. Match main's mkdir(exist_ok=True) and start the
+                    // current attempt rather than accepting the old receipt.
+                    match self.observer.reuse_output(&result, path) {
+                        Ok(()) => {
+                            self.created_outputs.lock().unwrap().register(path, &result);
+                            Ok(path.to_owned())
+                        }
+                        Err(error) if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) => {
+                            Err(file_failure(error))
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => self.reserve_output(preferred, &result, carrier)?,
             };
             match reserved {
                 Ok(path) => {
@@ -4105,6 +4155,86 @@ mod tests {
             fs::remove_dir_all(container).unwrap();
             fs::remove_file(source).unwrap();
           }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn changed_carrier_inputs_keep_their_slots_not_their_old_results() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Exercise selection, ownership and both physical cleanup outcomes.
+        // The worker-level changed-volume case is covered by the Watch blackbox.
+        for previously_failed in [false, true] {
+            for cleanup_locked in [false, true] {
+                let source = crate::test_support::temp_file("changed_carrier_slot", &[0; 16]);
+                let container = source.with_extension("output");
+                let sibling = container.join("sibling");
+                let slot = container.join("segment(2)");
+                fs::create_dir_all(&sibling).unwrap();
+                fs::create_dir(&slot).unwrap();
+                fs::write(sibling.join("keep"), b"unchanged").unwrap();
+                fs::write(slot.join("old"), b"previous attempt").unwrap();
+                let sibling_before = capture_file_generation(&sibling.join("keep")).unwrap().persisted();
+                let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(),
+                    container.file_name().unwrap().to_string_lossy().into_owned());
+                let inputs: Vec<_> = archive_input_slices(&input, &[
+                    ("zip", 0, Some(4)), ("zip", 4, Some(8)),
+                ]).unwrap().0.into_iter().map(Option::unwrap).collect();
+                let changed = archive_input_slices(&input, &[("zip", 4, Some(12))])
+                    .unwrap().0.remove(0).unwrap();
+                let generations = HashMap::from([
+                    (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
+                ]);
+                let mut request = Request::new(vec![source.clone()], Mode::Extract);
+                for (index, logical) in inputs.iter().enumerate() {
+                    let mut result = receipt(logical, DiscoverySource::Embedded, 1);
+                    result.output = Some(if index == 0 { sibling.clone() } else { slot.clone() });
+                    result.files = 1;
+                    if index == 1 && previously_failed {
+                        result.failure = Some(Failure::new(FailureKind::MissingVolume, "old failure"));
+                        result.recovered_complete_files = 1;
+                        result.partial = true;
+                    }
+                    request.checkpoints.push(InputCheckpoint::create(&source, logical, &result,
+                        &generations, Some(&container), true, 0).unwrap());
+                }
+                let engine = Engine::new(PathBuf::from("unused-worker"));
+                let observer = |_: Event| {};
+                let mut run = test_run(&engine, &request, &observer);
+                for (index, checkpoint) in request.checkpoints.iter().enumerate() {
+                    Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+                }
+                let kept = run.checkpoint_for(&inputs[0], &generations, &container, 1, &run.candidates).unwrap();
+                assert_eq!(kept.retained_container(), Some(container.as_path()));
+                assert!(run.checkpoint_for(&changed, &generations, &container, 1, &run.candidates).is_none());
+                let previous = run.retry_slot_for(&changed, &container).unwrap();
+                assert_eq!(previous.output(), slot);
+                assert!(run.retry_slot_for(&changed, &source.with_extension("unrelated")).is_none());
+                assert!(!previous.output_slot_for(&changed, &slot), "carrier root is never a child retry slot");
+                let held = cleanup_locked.then(|| fs::OpenOptions::new().read(true).share_mode(3)
+                    .open(slot.join("old")).unwrap());
+                let mut outcome = Outcome::default();
+                let cleared = run.discard_failed_output(&previous.result(1), &slot, &mut outcome).unwrap();
+                assert_eq!(cleared, !cleanup_locked);
+                // Current extraction uses current facts, not the old partial
+                // marker or old success, even when best-effort cleanup failed.
+                let current = receipt(&changed, DiscoverySource::Embedded, 1);
+                if cleared {
+                    assert_eq!(run.recreate_reserved_output(&slot, &current).unwrap().unwrap(), slot);
+                } else {
+                    observer.reuse_output(&current, &slot).unwrap();
+                }
+                fs::write(slot.join("new"), b"current attempt").unwrap();
+                assert_eq!(slot.join("old").exists(), cleanup_locked);
+                assert_eq!(fs::read_dir(&container).unwrap().count(), 2);
+                assert_eq!(capture_file_generation(&sibling.join("keep")).unwrap().persisted(), sibling_before);
+                assert_eq!(fs::read(sibling.join("keep")).unwrap(), b"unchanged");
+                drop(held);
+                drop(run);
+                release_reader_resources_under_roots(vec![container.to_string_lossy().into_owned()]).unwrap();
+                fs::remove_dir_all(container).unwrap();
+                fs::remove_file(source).unwrap();
+            }
         }
     }
 

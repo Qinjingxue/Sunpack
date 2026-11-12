@@ -10,6 +10,7 @@
 #include <cwchar>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -92,21 +93,42 @@ std::string runtime_binary_stamp(const std::wstring& path) {
     return value.str();
 }
 
+bool file_exists(const std::wstring& path);
+
 struct InstallContext {
     std::wstring directory;
     std::string runtime_id;
+    std::wstring runtime;
 };
 
-InstallContext install_context() {
-    const std::wstring executable = current_executable_path();
-    std::wstring directory = executable;
-    const auto slash = directory.find_last_of(L"\\/");
-    directory.resize(slash == std::wstring::npos ? 0 : slash);
-    const auto parent_slash = directory.find_last_of(L"\\/");
-    if (parent_slash != std::wstring::npos && directory.substr(parent_slash + 1) == L"bin") {
-        directory.resize(parent_slash);
+InstallContext install_context(const std::wstring& executable) {
+    namespace fs = std::filesystem;
+    fs::path directory = fs::path(executable).parent_path();
+    if (directory.filename() == L"bin") directory = directory.parent_path();
+    fs::path runtime = directory / L"sunpack-runtime.exe";
+    // Official source builds keep the launcher and Rust artifacts in their
+    // native build directories. Do not stage a fake package beside the runtime.
+    if (!file_exists(runtime.wstring()) && fs::path(executable).stem() == L"sunpack_launcher") {
+        const auto build = directory.parent_path();
+        const auto root = build.parent_path().parent_path().parent_path();
+        const auto name = build.filename().wstring();
+        const bool ci = name.size() >= 3 && name.compare(name.size() - 3, 3, L"-ci") == 0;
+        const auto arch = ci ? name.substr(0, name.size() - 3) : name;
+        if ((arch == L"build-x64" || arch == L"build-arm64") &&
+            file_exists((root / L"native" / L"Cargo.toml").wstring()) &&
+            file_exists((root / L"sunpack_advanced_config.json").wstring())) {
+            const auto target = arch == L"build-arm64"
+                ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
+            const auto platform = arch == L"build-arm64" ? L"arm64" : L"x64";
+            runtime = root / L".cache" / L"rust-target" / platform / target / (ci ? L"ci" : L"release") / L"sunpack-runtime.exe";
+            directory = root;
+        }
     }
-    return {directory, "v2-" + fnv1a_hex(utf8(executable))};
+    return {directory.wstring(), "v2-" + fnv1a_hex(utf8(executable)), runtime.wstring()};
+}
+
+InstallContext install_context() {
+    return install_context(current_executable_path());
 }
 
 bool file_exists(const std::wstring& path) {
@@ -305,7 +327,7 @@ bool parse_state(const InstallContext& context, std::wstring& pipe_name,
         !std::getline(stream, build_id) || !std::getline(stream, pid_text) ||
         !std::getline(stream, binary_stamp) || token_text.size() != 64 ||
         build_id.size() != 16 || pid_text.empty() ||
-        binary_stamp != runtime_binary_stamp(context.directory + L"\\sunpack-runtime.exe")) return false;
+        binary_stamp != runtime_binary_stamp(context.runtime)) return false;
     try {
         runtime_build_id = build_id;
         pipe_name = wide_utf8(pipe_text);
@@ -652,7 +674,7 @@ std::wstring quote_argument(const std::wstring& value) {
 bool spawn_runtime(const InstallContext& context, const std::vector<std::wstring>& arguments, bool detached,
                    DWORD* exit_code = nullptr, DWORD* spawn_error = nullptr,
                    HANDLE* detached_process = nullptr) {
-    const std::wstring runtime = context.directory + L"\\sunpack-runtime.exe";
+    const std::wstring runtime = context.runtime;
     std::wstring command = quote_argument(runtime);
     for (const auto& argument : arguments) command += L" " + quote_argument(argument);
     command += L" " + quote_argument(wide_utf8(std::string(kRuntimeIdentityArgumentPrefix) + context.runtime_id));

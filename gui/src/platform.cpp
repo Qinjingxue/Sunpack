@@ -233,9 +233,7 @@ bool context_menu_enabled() {
     return false;
 }
 void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop) {
-    // Source launches bind the venv CLI and use the checkout as their data directory.
-    const bool source = cli.prefix.size() == 2 && cli.prefix[0] == L"-m" && cli.prefix[1] == L"sunpack";
-    const auto app = source ? cli.cwd : executable_path().parent_path();
+    const auto& app = cli.app_root;
     const auto script = app / "scripts" / (enabled ? "register_context_menu.ps1" : "unregister_context_menu.ps1");
     std::error_code ec;
     if (!fs::is_regular_file(script, ec)) throw std::runtime_error("contextMenuScriptMissing");
@@ -245,8 +243,8 @@ void set_context_menu_enabled(const CliCommand& cli, bool enabled, HANDLE stop) 
     const auto powershell = fs::path(system_directory) / L"WindowsPowerShell\\v1.0\\powershell.exe";
     std::vector<std::wstring> args{
         L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass", L"-File", script.wstring()};
-    if (source && enabled) {
-        args.push_back(L"-PythonPath");
+    if (enabled) {
+        args.push_back(L"-AppPath");
         args.push_back(cli.executable.wstring());
     }
     auto result = run_cli({powershell, app, {}}, args, stop);

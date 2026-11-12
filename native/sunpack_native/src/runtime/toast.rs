@@ -14,6 +14,30 @@ use std::{fs, io};
 
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(800);
 
+// A failed snapshot is consumed. Recreate only when a later snapshot arrives;
+// component initialization failure is terminal, matching the host's lifecycle.
+fn show_snapshot<P>(
+    presenter: &mut Option<P>,
+    create: impl FnOnce() -> io::Result<P>,
+    show: impl FnOnce(&P) -> io::Result<()>,
+    report_error: &mut impl FnMut(&'static str, io::Error),
+) -> bool {
+    if presenter.is_none() {
+        match create() {
+            Ok(current) => *presenter = Some(current),
+            Err(error) => {
+                report_error("toast_unavailable", error);
+                return false;
+            }
+        }
+    }
+    if let Err(error) = show(presenter.as_ref().unwrap()) {
+        report_error("toast_error", error);
+        presenter.take();
+    }
+    true
+}
+
 pub(super) struct Snapshot {
     batch: String,
     kind: u8,
@@ -37,8 +61,15 @@ impl Snapshot {
         let count = finished + group.active_roots;
         let disk = totals.disk != 0;
         let memory = totals.memory != 0;
-        let progress = (totals.unknown == 0 && total != 0 && !disk && !memory && !group.stopping)
-            .then(|| (completed as f64 / total as f64).min(1.0));
+        let progress = if disk || memory || group.stopping {
+            None
+        } else if group.active_roots == 0 && total == 0 {
+            Some(1.0)
+        } else if totals.unknown == 0 && total != 0 {
+            Some((completed as f64 / total as f64).min(1.0))
+        } else {
+            None
+        };
         let (title, status) = if group.stopping {
             (
                 "interrupt.stopping_title",
@@ -85,13 +116,21 @@ impl Snapshot {
         };
         let value = if group.stopping {
             String::new()
-        } else if total != 0 && totals.unknown == 0 {
+        } else if disk || memory {
+            language.text(if disk && memory {
+                "report.status.resources_paused"
+            } else if memory {
+                "report.status.memory_paused"
+            } else {
+                "report.status.disk_paused"
+            }).to_owned()
+        } else if let Some(progress) = progress {
             language.translate(
                 "toast.progress.value",
                 &[
                     (
                         "percent",
-                        &(completed.saturating_mul(100) / total).to_string(),
+                        &((progress * 100.0) as u64).to_string(),
                     ),
                     ("completed_bytes", &format_bytes(completed)),
                     ("total_bytes", &format_bytes(total)),
@@ -149,7 +188,7 @@ impl Snapshot {
         let language = group.language;
         let summary = &group.summary;
         let succeeded = summary.succeeded;
-        let failed = summary.failed;
+        let failed = summary.failed + usize::from(summary.rollback_failed);
         let (mut kind, suffix) = match (succeeded, failed) {
             (_, 0) => (2, "success"),
             (0, _) => (3, "failure"),
@@ -184,7 +223,7 @@ impl Snapshot {
             } else {
                 "interrupt.cleaned"
             });
-            if succeeded == 0 && failed == 0 {
+            if succeeded == 0 && summary.failed == 0 {
                 title = language.text("interrupt.finished").to_owned();
                 body = interrupted.to_owned();
                 kind = if summary.rollback_failed { 3 } else { 2 };
@@ -199,9 +238,6 @@ impl Snapshot {
                 "toast.final.cleanup_warning",
                 &[("count", &summary.cleanup_failed.to_string())],
             ));
-        }
-        if kind == 2 && (summary.rollback_failed || summary.cleanup_failed != 0) {
-            kind = if succeeded == 0 { 3 } else { 4 };
         }
         let action = summary.output.as_ref().map(|path| {
             (
@@ -803,6 +839,9 @@ pub(super) struct Activity {
 impl Publisher {
     fn register(&self, request: Arc<str>, language: Language) -> Activity {
         let mut state = self.shared.state.lock().unwrap();
+        if state.stopping {
+            return Activity { publisher: self.clone(), request };
+        }
         if state.settle(Instant::now()) {
             self.shared.changed.notify_one();
         }
@@ -1244,7 +1283,12 @@ pub(super) struct Toast {
 }
 
 impl Toast {
-    pub(super) fn start(cwd: &Path, diagnostic: PathBuf, retention: u64) -> io::Result<Self> {
+    pub(super) fn start(
+        cwd: &Path,
+        diagnostic: PathBuf,
+        retention: u64,
+        report_error: impl Fn(&'static str, &io::Error) + Send + 'static,
+    ) -> io::Result<Self> {
         let cwd = cwd.to_owned();
         let reports = Arc::new(Reports {
             cancellation: Cancellation::new(),
@@ -1276,6 +1320,7 @@ impl Toast {
                         return;
                     }
                 };
+                let mut presenter = Some(presenter);
                 let _ = send.send(Ok(()));
                 let mut sequence = 0u64;
                 let mut last_update: Option<Instant> = None;
@@ -1329,7 +1374,10 @@ impl Toast {
                         }
                     };
                     if matches!(display, Display::Clear) {
-                        let _ = presenter.clear();
+                        let error = presenter.as_ref().and_then(|current| current.clear().err());
+                        if error.is_some() { presenter.take(); }
+                        drop(state);
+                        if let Some(error) = error { report_error("toast_error", &error); }
                         continue;
                     }
                     drop(state);
@@ -1358,19 +1406,34 @@ impl Toast {
                     let payload = snapshot.encode();
                     // Stop and native publication share this short gate. Report
                     // IO never holds it, so disable cannot wait on the writer.
+                    let mut available = true;
+                    let mut failure = None;
                     let show = || {
                         sequence = sequence.wrapping_add(1);
-                        let _ = presenter.show(&payload, sequence);
+                        available = show_snapshot(
+                            &mut presenter,
+                            || library.presenter(&diagnostic),
+                            |presenter| presenter.show(&payload, sequence),
+                            &mut |event, error| failure = Some((event, error)),
+                        );
                     };
                     let shown = match completion.as_ref() {
                         Some(completed) => presenter_shared.present_completed(completed, show),
                         None => presenter_shared.present(show),
                     };
+                    if let Some((event, error)) = failure {
+                        report_error(event, &error);
+                    }
                     if !shown {
                         if let Some(path) = published_report {
                             let _ = fs::remove_file(path);
                         }
                         continue;
+                    }
+                    if !available {
+                        presenter_shared.state.lock().unwrap().stopping = true;
+                        presenter_reports.cancellation.cancel();
+                        break;
                     }
                     last_update = Some(Instant::now());
                 }
@@ -1469,6 +1532,81 @@ mod tests {
     fn current(publisher: &Publisher) -> Snapshot {
         let state = publisher.shared.state.lock().unwrap();
         Snapshot::progress(state.groups.front().unwrap())
+    }
+
+    #[test]
+    fn failed_native_snapshot_is_consumed_and_next_snapshot_recreates_presenter() {
+        use std::cell::{Cell, RefCell};
+        struct Presenter<'a>(&'a Cell<usize>);
+        impl Drop for Presenter<'_> {
+            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+        }
+        let drops = Cell::new(0);
+        let created = Cell::new(0);
+        let events = RefCell::new(Vec::new());
+        let mut log = |event, _: io::Error| events.borrow_mut().push(event);
+        let mut presenter = Some(Presenter(&drops));
+        assert!(show_snapshot(&mut presenter,
+            || panic!("existing presenter must be reused"),
+            |_| Err(io::Error::other("native Show failure")), &mut log));
+        assert!(presenter.is_none());
+        assert_eq!(drops.get(), 1);
+        assert_eq!(events.borrow().as_slice(), ["toast_error"]);
+        // No eager retry or replay: only this next snapshot creates a presenter.
+        assert!(show_snapshot(&mut presenter,
+            || { created.set(created.get() + 1); Ok(Presenter(&drops)) },
+            |_| Ok(()), &mut log));
+        assert_eq!(created.get(), 1);
+        assert!(presenter.is_some());
+        presenter.take();
+        assert!(!show_snapshot(&mut presenter,
+            || Err(io::Error::other("component initialization failure")),
+            |_| panic!("unavailable component cannot show"), &mut log));
+        assert_eq!(events.borrow().as_slice(), ["toast_error", "toast_unavailable"]);
+    }
+
+    #[test]
+    fn terminal_progress_and_rollback_failure_keep_main_presentation() {
+        let mut group = Group::new("presentation", Language::En);
+        group.summary.succeeded = 1;
+        let snapshot = Snapshot::progress(&group);
+        assert_eq!(snapshot.progress, Some(1.0));
+        assert_eq!(snapshot.value, "100% · 0 B / 0 B");
+        group.active_roots = 1;
+        assert_eq!(Snapshot::progress(&group).progress, None);
+        group.totals.planned = 100;
+        group.totals.written = 50;
+        for (disk, memory, key) in [
+            (0, 1, "report.status.memory_paused"),
+            (1, 0, "report.status.disk_paused"),
+            (1, 1, "report.status.resources_paused"),
+        ] {
+            group.totals.disk = disk;
+            group.totals.memory = memory;
+            let snapshot = Snapshot::progress(&group);
+            assert_eq!(snapshot.progress, None);
+            assert_eq!(snapshot.value, Language::En.text(key));
+        }
+        let mut completed = Completed {
+            generation: 0, id: Arc::from("presentation"), language: Language::En,
+            elapsed: Duration::ZERO, report: Arc::default(),
+            summary: Summary { succeeded: 1, interrupted: 1, rollback_failed: true,
+                ..Summary::default() },
+        };
+        let snapshot = Snapshot::completed(&completed, None);
+        assert_eq!(snapshot.kind, 4);
+        assert_eq!(snapshot.title, Language::En.text("toast.final.mixed.title"));
+        let duration = Language::En.translate("duration.seconds", &[("seconds", "0")]);
+        assert!(snapshot.body.starts_with(&Language::En.translate("toast.final.mixed.body",
+            &[("succeeded", "1"), ("failed", "1"), ("duration", &duration)])));
+        // Ordinary source cleanup is only a warning, not a rollback failure.
+        completed.summary.interrupted = 0;
+        completed.summary.rollback_failed = false;
+        completed.summary.cleanup_failed = 1;
+        let snapshot = Snapshot::completed(&completed, None);
+        assert_eq!(snapshot.kind, 2);
+        assert_eq!(snapshot.title, Language::En.text("toast.final.success.title"));
+        assert!(snapshot.body.contains("Paths with cleanup errors: 1."));
     }
 
     #[test]

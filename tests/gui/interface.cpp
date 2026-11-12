@@ -715,6 +715,12 @@ int fake_cli(int argc,wchar_t** argv) {
 }
 
 int wmain(int argc,wchar_t** argv) {
+    const auto source_root=fs::temp_directory_path()/L"SunPack source root";
+    const auto native_cli=source_root/L"native"/L"sunpack_launcher.exe";
+    const auto native_options=parse_options({L"--data-dir",source_root.wstring(),
+        L"--cli",native_cli.wstring(),L"--app-root",source_root.wstring()});
+    assert(native_options.allow_cli && native_options.cli.prefix.empty());
+    assert(native_options.cli.app_root==source_root && native_options.cli.executable==native_cli);
     _set_error_mode(_OUT_TO_STDERR);
     _set_abort_behavior(0,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
     const std::wstring mode=argc>1?argv[1]:L"--acceptance";

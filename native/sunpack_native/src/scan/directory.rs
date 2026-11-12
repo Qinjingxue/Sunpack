@@ -1726,6 +1726,10 @@ impl NativeWatchCatalog {
             );
         })();
     }
+    pub(crate) fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+
     pub(crate) fn commit(&self, idle: bool) {
         (|| {
             if idle {

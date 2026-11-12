@@ -1095,7 +1095,7 @@ impl NativeWatchState {
                     owned_paths = paths;
                 }
             } else if keep.is_none() {
-                std::fs::create_dir_all(path)?;
+                std::fs::create_dir_all(path).map_err(crate::pipeline::OutputCreateError::wrap)?;
             }
             if refresh && path.is_dir() {
                 let (volume, identity, _) = crate::filesystem::watch_path_identity(&output)?;
