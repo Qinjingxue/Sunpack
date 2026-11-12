@@ -1,7 +1,7 @@
 use super::checkpoint::{CheckpointKey, InputCheckpoint, PromotedSource};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{AttemptCache, CandidateSet};
-use super::scheduling::{Scheduler, Spawner};
+use super::scheduling::{stage, Scheduler, Spawner};
 use super::shell_updates::{ShellNotifier, ShellUpdates};
 use super::worker::{self, Process};
 use super::{
@@ -39,10 +39,18 @@ use std::future::poll_fn;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::task::{Poll, Waker};
 
-pub struct Engine {
+#[derive(Clone)]
+pub struct Engine(Arc<EngineState>);
+
+impl std::ops::Deref for Engine {
+    type Target = EngineState;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+pub struct EngineState {
     worker_path: PathBuf,
     worker: Mutex<WorkerOwner>,
     mode_changes: Mutex<()>,
@@ -51,7 +59,7 @@ pub struct Engine {
     password_attempts: AttemptCache,
     scheduler: OnceLock<Arc<Scheduler>>,
     shell: ShellNotifier,
-    output_names: Mutex<OutputNames>,
+    output_names: Arc<Mutex<OutputNames>>,
 }
 
 struct WorkerOwner {
@@ -61,7 +69,7 @@ struct WorkerOwner {
 
 impl Engine {
     pub fn new(worker: PathBuf) -> Self {
-        Self {
+        Self(Arc::new(EngineState {
             worker_path: worker,
             worker: Mutex::new(WorkerOwner {
                 process: None,
@@ -73,11 +81,11 @@ impl Engine {
             password_attempts: AttemptCache::default(),
             scheduler: OnceLock::new(),
             shell: ShellNotifier::default(),
-            output_names: Mutex::default(),
-        }
+            output_names: Arc::default(),
+        }))
     }
 
-    pub fn run(&self, request: Request, notify: impl Fn(Event) + Sync) -> io::Result<Outcome> {
+    pub fn run(&self, request: Request, notify: impl Fn(Event) + Send + Sync) -> io::Result<Outcome> {
         self.run_with(request, &notify)
     }
 
@@ -93,7 +101,7 @@ impl Engine {
         &self,
         inputs: &[PathBuf],
         cancel: &Cancellation,
-    ) -> io::Result<RequestClaimGuard<'_>> {
+    ) -> io::Result<RequestClaimGuard> {
         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
         self.leases
             .reserve_request(id, Origin::Foreground, inputs, cancel)
@@ -103,9 +111,9 @@ impl Engine {
         &self,
         request: Request,
         observer: &impl Observer,
-        reservation: &RequestClaimGuard<'_>,
+        reservation: &RequestClaimGuard,
     ) -> io::Result<Outcome> {
-        debug_assert!(std::ptr::eq(reservation.registry, self.leases.as_ref()));
+        debug_assert!(Arc::ptr_eq(&reservation.registry, &self.leases));
         self.run_with_claim(request, observer, Some(reservation))
     }
 
@@ -113,8 +121,11 @@ impl Engine {
         &self,
         mut request: Request,
         observer: &impl Observer,
-        reservation: Option<&RequestClaimGuard<'_>>,
+        reservation: Option<&RequestClaimGuard>,
     ) -> io::Result<Outcome> {
+        // main enters its shared pipeline service (including the handshake)
+        // before admitting discovery or preflight work.
+        super::scheduling::block_on(self.worker(&request.config.performance.worker, &request.cancel))?;
         if let Some(output) = request.output_root.take() {
             request.output_root = Some(std::path::absolute(output)?);
         }
@@ -132,10 +143,65 @@ impl Engine {
         } else {
             None
         };
+        let run = self.prepare(request, ObserverRef::Borrowed(observer), request_id)?;
+        let request = &run.request;
+        let scheduler = self.scheduler.get_or_init(Scheduler::new);
+        let execute = || {
+            scheduler.run(request_id, request.origin, &request.cancel, |spawner| {
+                Box::pin(run.execute_request(request_id, spawner))
+            })
+        };
+        let executed = if request.mode == Mode::Extract
+            && request.config.recursive_extract == Recursion::Prompt
+        {
+            run.recursion.serve(
+                &request.cancel,
+                |depth, pending| observer.allow_recursive(depth, pending),
+                execute,
+            )
+        } else {
+            execute()
+        };
+        executed
+    }
+
+    pub(crate) fn submit<O: Observer + 'static, T: Send + 'static>(
+        &self, request: Request, observer: Arc<O>,
+        complete: impl FnOnce(io::Result<Outcome>) -> T + Send + 'static,
+    ) -> super::scheduling::Join<T> {
+        let request_id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let engine = self.clone();
+        self.scheduler.get_or_init(Scheduler::new).submit(
+            request_id, request.origin, &request.cancel.clone(), move |spawner| {
+                Box::pin(async move {
+                    let result = async {
+                    engine.worker(&request.config.performance.worker, &request.cancel).await?;
+                    stage("request_admission", &request.cancel).await?;
+                    let mut request = request;
+                    if let Some(output) = request.output_root.take() {
+                        request.output_root = Some(std::path::absolute(output)?);
+                    }
+                    let _claim = if request.mode == Mode::Extract {
+                        Some(engine.leases.reserve_request_async(request_id, request.origin,
+                            &request.inputs, &request.cancel).await?)
+                    } else { None };
+                    stage("discovery", &request.cancel).await?;
+                    let run = engine.prepare(request, ObserverRef::Owned(observer), request_id)?;
+                    run.execute_request(request_id, spawner).await
+                    }.await;
+                    stage("report", &Cancellation::new()).await.expect("completion is not cancellable");
+                    complete(result)
+                })
+            })
+    }
+
+    fn prepare<'a, O: Observer>(
+        &self, mut request: Request, observer: ObserverRef<'a, O>, request_id: u64,
+    ) -> io::Result<Arc<Run<'a, O>>> {
         let resolve_aliases = request.inputs.len() > 1 && self.leases.has_aliases(request_id);
         let candidates = CandidateSet::new(
             std::mem::take(&mut request.passwords),
-            request.password_snapshot.as_deref(),
+            request.password_snapshot.clone(),
             &self.password_attempts,
             request.password_scope.as_deref(),
         );
@@ -168,12 +234,13 @@ impl Engine {
         }
         let promoted_sources = request
             .promoted_sources
-            .iter()
-            .map(|source| (path_key(&source.path().to_string_lossy()), source))
+            .iter().enumerate()
+            .map(|(index, source)| (path_key(&source.path().to_string_lossy()), index))
             .collect();
-        let run = Run {
-            engine: self,
-            request: &request,
+        let request = Arc::new(request);
+        Ok(Arc::new(Run {
+            engine: self.clone(),
+            request: Arc::clone(&request),
             resolve_aliases,
             candidates,
             options,
@@ -181,88 +248,26 @@ impl Engine {
             analysis,
             observer,
             recursion: RecursivePrompts::default(),
-            output_names: OutputReservationGuard { registry: &self.output_names, owner: request_id },
+            output_names: OutputReservationGuard { registry: Arc::clone(&self.output_names), owner: request_id },
             created_outputs: Mutex::default(),
             output_base,
             checkpoints,
             promoted_sources,
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
-        };
-        let scheduler = self.scheduler.get_or_init(Scheduler::new);
-        let discovered = scheduler.run(request_id, request.origin, &request.cancel, |_| {
-            Box::pin(async {
-                request.cancel.check_io()?;
-                let mut discovered =
-                    discovery::discover(&request, run.options_at(1)?, &run.candidates)?;
-                if run.resolve_aliases {
-                    dedup_resolved_plans(&mut discovered.tasks);
-                }
-                Ok::<_, io::Error>(discovered)
-            })
-        })?;
-        // Watch can wait for a different request's ownership here. The caller
-        // owns that wait, so the other request retains access to host slots.
-        if request.mode == Mode::Extract {
-            self.leases.extend_request(
-                request_id,
-                request.origin,
-                discovered
-                    .tasks
-                    .iter()
-                    .flat_map(|task| task.owned_paths.iter().map(String::as_str)),
-                &request.cancel,
-            )?;
-        }
-        let execute = || {
-            scheduler.run(request_id, request.origin, &request.cancel, |spawner| {
-                Box::pin(run.execute_batch(discovered, 1, None, None, spawner))
-            })
-        };
-        let mut executed = if request.mode == Mode::Extract
-            && request.config.recursive_extract == Recursion::Prompt
-        {
-            run.recursion.serve(
-                &request.cancel,
-                |depth, pending| observer.allow_recursive(depth, pending),
-                execute,
-            )
-        } else {
-            execute()
-        };
-        // Scheduler completion joins every writer, even on cancellation. Never
-        // roll back a tree while a native job or recursive branch can write it.
-        if request.cancel.cancelled() {
-            let mut discarded = Outcome::default();
-            run.created_outputs.lock().unwrap().rollback(
-                observer, executed.as_mut().unwrap_or(&mut discarded),
-            )?;
-        }
-        let mut outcome = executed?;
-        outcome.errors.extend(
-            run.scan_errors
-                .into_inner()
-                .unwrap()
-                .into_messages()
-                .into_iter()
-                .map(|error| {
-                    let count = directory_error_count(&error);
-                    let (operation, path, detail) = error;
-                    InputError {
-                        path: PathBuf::from(path),
-                        message: detail,
-                        kind: InputErrorKind::FilesystemScan,
-                        scan_operation: Some(operation),
-                        scan_count: (count != 1).then_some(count),
-                    }
-                }),
-        );
-        Ok(outcome)
+        }))
     }
 
     async fn worker(&self, config: &WorkerConfig, cancel: &Cancellation) -> io::Result<Arc<Process>> {
         loop {
             cancel.check_io()?;
-            let process = {
+            let current = self.worker.lock().unwrap().process.as_ref()
+                .filter(|worker| worker.alive()).cloned();
+            let process = if let Some(process) = current {
+                process
+            } else {
+                // Replacements after an abandoned handshake resume on the
+                // control driver too. Only creation/reaping uses a stage slot.
+                stage("worker_start", cancel).await?;
                 let mut owner = self.worker.lock().unwrap();
                 if let Some(worker) = owner.process.as_ref().filter(|worker| worker.alive()) {
                     Arc::clone(worker)
@@ -273,7 +278,11 @@ impl Engine {
                 }
             };
             match process.ready(cancel).await {
-                Ok(()) => return Ok(process),
+                Ok(()) => {
+                    self.scheduler.get_or_init(Scheduler::new)
+                        .configure_capacity(process.thread_capacity());
+                    return Ok(process);
+                }
                 // A new borrower may arrive while an abandoned generation is
                 // reaping. Await that cleanup, then retry instead of inheriting
                 // another request's cancellation. Genuine failures still return.
@@ -311,21 +320,33 @@ impl Engine {
     }
 }
 
+enum ObserverRef<'a, O> {
+    Borrowed(&'a O),
+    Owned(Arc<O>),
+}
+
+impl<O> std::ops::Deref for ObserverRef<'_, O> {
+    type Target = O;
+    fn deref(&self) -> &O {
+        match self { Self::Borrowed(value) => value, Self::Owned(value) => value }
+    }
+}
+
 struct Run<'a, O> {
-    engine: &'a Engine,
-    request: &'a Request,
+    engine: Engine,
+    request: Arc<Request>,
     resolve_aliases: bool,
-    candidates: CandidateSet<'a>,
+    candidates: CandidateSet,
     options: OnceLock<io::Result<NativeDirectoryScanOptions>>,
     deep_options: Option<NativeDirectoryScanOptions>,
     analysis: NativeAnalysisConfig,
-    observer: &'a O,
+    observer: ObserverRef<'a, O>,
     recursion: RecursivePrompts,
-    output_names: OutputReservationGuard<'a>,
+    output_names: OutputReservationGuard,
     created_outputs: Mutex<CreatedOutputs>,
     output_base: Option<PathBuf>,
     checkpoints: HashMap<CheckpointKey, Vec<usize>>,
-    promoted_sources: HashMap<String, &'a PromotedSource>,
+    promoted_sources: HashMap<String, usize>,
     scan_errors: Mutex<DirectoryReadErrors>,
 }
 
@@ -395,7 +416,8 @@ impl RecursivePrompts {
         })
     }
 
-    async fn allow(&self, depth: usize, pending: usize, cancel: &Cancellation) -> bool {
+    async fn allow(&self, depth: usize, pending: usize, cancel: &Cancellation,
+        inline: Option<&(dyn Fn(usize, usize) -> bool + Sync)>) -> bool {
         if cancel.cancelled() {
             return false;
         }
@@ -409,9 +431,14 @@ impl RecursivePrompts {
             }
         };
         if first {
-            let request = Some((depth, pending, Arc::clone(&decision)));
-            if self.requests.get().expect("prompt service is running").send(request).is_err() {
-                decision.complete(false);
+            if let Some(prompt) = inline {
+                let allowed = stage("report", cancel).await.is_ok() && prompt(depth, pending);
+                decision.complete(allowed);
+            } else {
+                let request = Some((depth, pending, Arc::clone(&decision)));
+                if self.requests.get().expect("prompt service is running").send(request).is_err() {
+                    decision.complete(false);
+                }
             }
         }
         let mut waiter = None;
@@ -506,12 +533,12 @@ struct OutputClaim {
     path: PathBuf,
 }
 
-struct OutputReservationGuard<'a> {
-    registry: &'a Mutex<OutputNames>,
+struct OutputReservationGuard {
+    registry: Arc<Mutex<OutputNames>>,
     owner: u64,
 }
 
-impl Drop for OutputReservationGuard<'_> {
+impl Drop for OutputReservationGuard {
     fn drop(&mut self) {
         self.registry.lock().unwrap().release(self.owner);
     }
@@ -867,6 +894,54 @@ struct Executed {
 }
 
 impl<'run, O: Observer> Run<'run, O> {
+    async fn execute_request(self: &Arc<Self>, request_id: u64, spawner: Spawner<'run>) -> io::Result<Outcome> {
+        let decisions = Arc::clone(&self.recursion.decisions);
+        let _cancellation = self.request.cancel.subscribe(move || {
+            let decisions: Vec<_> = decisions.lock().unwrap().values().cloned().collect();
+            for decision in decisions { decision.complete(false); }
+        });
+        stage("discovery", &self.request.cancel).await?;
+        let mut discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
+        if self.resolve_aliases { dedup_resolved_plans(&mut discovered.tasks); }
+        if self.request.mode == Mode::Extract {
+            self.engine.leases.extend_request(request_id, self.request.origin,
+                discovered.tasks.iter().flat_map(|task| task.owned_paths.iter().map(String::as_str)),
+                &self.request.cancel).await?;
+        }
+        let executed = self.execute_batch(discovered, 1, None, None, spawner).await;
+        self.finish(executed).await
+    }
+
+    async fn finish(&self, mut executed: io::Result<Outcome>) -> io::Result<Outcome> {
+        // Scheduler completion joins every writer, even on cancellation. Never
+        // roll back a tree while a native job or recursive branch can write it.
+        if self.request.cancel.cancelled() {
+            stage("cancel_cleanup", &Cancellation::new()).await?;
+            let mut discarded = Outcome::default();
+            self.created_outputs.lock().unwrap().rollback(
+                &*self.observer, executed.as_mut().unwrap_or(&mut discarded),
+            )?;
+        }
+        let mut outcome = executed?;
+        outcome.errors.extend(
+            std::mem::replace(&mut *self.scan_errors.lock().unwrap(), DirectoryReadErrors::report())
+                .into_messages()
+                .into_iter()
+                .map(|error| {
+                    let count = directory_error_count(&error);
+                    let (operation, path, detail) = error;
+                    InputError {
+                        path: PathBuf::from(path),
+                        message: detail,
+                        kind: InputErrorKind::FilesystemScan,
+                        scan_operation: Some(operation),
+                        scan_count: (count != 1).then_some(count),
+                    }
+                }),
+        );
+        Ok(outcome)
+    }
+
     fn filtered_options(&self) -> io::Result<&NativeDirectoryScanOptions> {
         // Deep discovery does not use configured filters. Compile them only
         // when a recursive output actually enters ordinary discovery, sharing
@@ -884,13 +959,13 @@ impl<'run, O: Observer> Run<'run, O> {
         self.filtered_options()
     }
 
-    async fn execute_batch<'a>(
-        &'a self,
+    async fn execute_batch(
+        self: &Arc<Self>,
         batch: Discovered,
         depth: usize,
         inherited_scope: Option<Arc<Path>>,
         parent: Option<(TaskId, &ArchiveResult)>,
-        spawner: Spawner<'a>,
+        spawner: Spawner<'run>,
     ) -> io::Result<Outcome> {
         let mut outcome = Outcome {
             errors: batch.errors,
@@ -899,22 +974,26 @@ impl<'run, O: Observer> Run<'run, O> {
         };
         let children = spawner.clone();
         let parent_id = parent.map(|(id, _)| id);
+        let owner = Arc::clone(self);
         let executed = spawner.bounded_map(batch.tasks, move |task| {
-            let id = self.queue_task(task.entry(), depth, parent_id, None);
-            let cancelled = receipt(task.entry(), task.source, depth);
-            let branch = self.execute_task(
-                task,
-                id,
-                depth,
-                inherited_scope.clone(),
-                children.clone(),
-            );
+            let owner = Arc::clone(&owner);
+            let this = Arc::clone(&owner);
+            let children = children.clone();
+            let scope = inherited_scope.clone();
             Box::pin(async move {
-                let result = branch.await;
-                let result = if depth == 1 { self.finish_root(id, &cancelled.path, result).await } else { result };
+                // Reporting is part of the same admitted preflight stage.
+                let cancelled = receipt(task.entry(), task.source, depth);
+                let ready = stage("report", &Cancellation::new()).await;
+                let id = owner.queue_task(task.entry(), depth, parent_id, None);
+                let result = match ready {
+                    Ok(()) => owner.execute_task(task, id, depth, scope, children).await,
+                    Err(error) => Err(error),
+                };
+                let result = if depth == 1 { this.finish_root(id, &cancelled.path, result).await } else { result };
                 (id, cancelled, result)
             })
         }).await;
+        stage("report", &Cancellation::new()).await?;
         let mut first_error = None;
         for (id, mut cancelled, branch) in executed {
             let mut branch = match branch {
@@ -955,6 +1034,7 @@ impl<'run, O: Observer> Run<'run, O> {
 
     async fn finish_root(&self, id: TaskId, path: &Path, result: io::Result<Outcome>) -> io::Result<Outcome> {
         if result.as_ref().is_ok_and(Outcome::settled) {
+            stage("report", &Cancellation::new()).await?;
             self.observer.root_finished(id, path, result.unwrap()).await
         } else { result }
     }
@@ -985,35 +1065,39 @@ impl<'run, O: Observer> Run<'run, O> {
         true
     }
 
-    fn execute_task<'a>(
-        &'a self,
+    fn execute_task(
+        self: &Arc<Self>,
         mut task: Task,
         task_id: TaskId,
         depth: usize,
         inherited_scope: Option<Arc<Path>>,
-        spawner: Spawner<'a>,
-    ) -> super::scheduling::Task<'a, io::Result<Outcome>> {
+        spawner: Spawner<'run>,
+    ) -> super::scheduling::Task<'run, io::Result<Outcome>> {
+        let owner = Arc::clone(self);
         Box::pin(async move {
-            let cancel = &self.request.cancel;
+            let this = &owner;
+            let cancel = &this.request.cancel;
             cancel.check_io()?;
-            let mut lease = self.claim_task(&task).await?;
+            stage("preflight", cancel).await?;
+            let mut lease = this.claim_task(&task).await?;
+            stage("preflight", cancel).await?;
             let mut outcome = Outcome::default();
-            let mut shell = self.engine.shell.branch();
-            let mut generations = self.capture_generations(&task);
+            let mut shell = this.engine.shell.branch();
+            let mut generations = this.capture_generations(&task);
             let watch_root = depth == 1
-                && self.request.origin == Origin::Watch
-                && self.request.mode == Mode::Extract;
-            if watch_root && !self.should_process_watch(&task, &generations)? {
-                self.observer.notify(Event::Skipped { id: task_id });
+                && this.request.origin == Origin::Watch
+                && this.request.mode == Mode::Extract;
+            if watch_root && !this.should_process_watch(&task, &generations)? {
+                this.observer.notify(Event::Skipped { id: task_id });
                 return Ok(outcome);
             }
-            self.observer.notify(Event::Started {
+            this.observer.notify(Event::Started {
                 id: task_id,
                 path: PathBuf::from(&task.entry().entry_path),
                 depth,
             });
-            self.plan_inputs(&mut task)?;
-            self.observer.claim_sources(
+            this.plan_inputs(&mut task)?;
+            this.observer.claim_sources(
                 Path::new(&task.entry().entry_path),
                 &task.owned_paths,
                 depth,
@@ -1021,13 +1105,13 @@ impl<'run, O: Observer> Run<'run, O> {
             let owner_path = PathBuf::from(&task.entry().entry_path);
             let root_scope = owner_path.parent();
             let source_scope = inherited_scope.as_deref().or(root_scope);
-            let candidates = self.candidates.with_scope(source_scope);
-            let preferred_carrier = self.preferred_output(task.entry(), depth);
+            let candidates = this.candidates.with_scope(source_scope);
+            let preferred_carrier = this.preferred_output(task.entry(), depth);
             let mut retained: Vec<_> = task
                 .inputs
                 .iter()
                 .map(|logical| {
-                    self.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth, &candidates)
+                    this.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth, &candidates)
                 })
                 .collect();
             let multi = task.inputs.len() > 1;
@@ -1039,7 +1123,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 .map(|(index, logical)| {
                     if multi {
                         let extent = logical.input.physical_extents().next();
-                        self.queue_task(
+                        this.queue_task(
                             &logical.input,
                             depth,
                             Some(task_id),
@@ -1055,7 +1139,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 })
                 .collect();
-            let carrier = if self.request.mode == Mode::Extract && multi {
+            let carrier = if this.request.mode == Mode::Extract && multi {
                 let existing = retained
                     .iter()
                     .flatten()
@@ -1066,7 +1150,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     None if task.inputs.iter().zip(&retained)
                         .any(|(input, checkpoint)| checkpoint.is_none() && input.failure.is_none()) => {
                         let receipt = receipt(&task.inputs[0].input, task.source, depth);
-                        match self.reserve_output(preferred_carrier, &receipt, None)? {
+                        match this.reserve_output(preferred_carrier, &receipt, None)? {
                             Ok(path) => {
                                 shell.output(&path);
                                 Some(path)
@@ -1095,7 +1179,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 task.inputs.into_iter().zip(retained.drain(..)).zip(&ids)
             {
                 if multi {
-                    self.observer.notify(Event::Started {
+                    this.observer.notify(Event::Started {
                         id,
                         path: PathBuf::from(&logical.input.entry_path),
                         depth,
@@ -1109,7 +1193,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         .map(path_key)
                         .collect::<Vec<_>>()
                 });
-                let remaining_depth = self
+                let remaining_depth = this
                     .request
                     .max_depth
                     .saturating_sub(depth.saturating_sub(1));
@@ -1125,12 +1209,12 @@ impl<'run, O: Observer> Run<'run, O> {
                         result.output = None;
                     }
                     if result.partial
-                        && self.request.config.extraction.content_requirement
+                        && this.request.config.extraction.content_requirement
                             == ContentRequirement::Complete
                     {
                         let output = checkpoint.output();
                         shell.parent(output);
-                        self.discard_failed_output(&result, output, &mut outcome)?;
+                        this.discard_failed_output(&result, output, &mut outcome)?;
                         result.output = None;
                         result.partial = false;
                         result.files = 0;
@@ -1151,7 +1235,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         inventory,
                     }
                 } else {
-                    self.execute_input(
+                    this.execute_input(
                         logical,
                         id,
                         task.source,
@@ -1166,36 +1250,38 @@ impl<'run, O: Observer> Run<'run, O> {
                 if let Some(context) = retry.as_deref().filter(|_| {
                     !cancel.cancelled()
                         && !multi
-                        && (before_worker || self.request.mode == Mode::Extract)
+                        && (before_worker || this.request.mode == Mode::Extract)
                         && executed
                             .result
                             .failure
                             .as_ref()
                             .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
                 }) {
+                    stage("missing_volume", cancel).await?;
                     if let Some(mut replacement) = discovery::retry_volume(
                         &executed.result,
                         context,
-                        self.options_at(depth)?,
+                        this.options_at(depth)?,
                         &candidates,
-                        self.request,
+                        &this.request,
                     )? {
                         // Main replaces the whole single-input extraction only
                         // after resolving a usable physical family. Until then,
                         // its damaged payload remains available for recovery.
                         if let Some(output) = executed.result.output.as_deref() {
-                            self.discard_failed_output(&executed.result, output, &mut outcome)?;
+                            this.discard_failed_output(&executed.result, output, &mut outcome)?;
                             executed.result.output = None;
                         }
-                        self.observer.after_output(&executed.result)?;
+                        this.observer.after_output(&executed.result)?;
                         drop(lease);
-                        lease = self.claim_task(&replacement).await?;
-                        generations = self.capture_generations(&replacement);
-                        if watch_root && !self.should_process_watch(&replacement, &generations)? {
-                            self.observer.notify(Event::Skipped { id: task_id });
+                        lease = this.claim_task(&replacement).await?;
+                        stage("preflight", cancel).await?;
+                        generations = this.capture_generations(&replacement);
+                        if watch_root && !this.should_process_watch(&replacement, &generations)? {
+                            this.observer.notify(Event::Skipped { id: task_id });
                             return Ok(outcome);
                         }
-                        self.observer.claim_sources(
+                        this.observer.claim_sources(
                             Path::new(&replacement.entry().entry_path),
                             &replacement.owned_paths,
                             depth,
@@ -1213,7 +1299,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             .into_iter()
                             .next()
                             .expect("volume retry has one logical input");
-                        executed = self
+                        executed = this
                             .execute_input(
                                 logical,
                                 id,
@@ -1232,7 +1318,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     inventory,
                     mut input,
                 } = executed;
-                if self.request.mode == Mode::Scan {
+                if this.request.mode == Mode::Scan {
                     result.volume_attempts = input.volume_attempts.take();
                     if result
                         .failure
@@ -1250,7 +1336,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 // input_finished does. Physical root completion still waits
                 // for every recursive subtree and the final source cleanup.
                 if multi {
-                    self.observer.notify(Event::Finished {
+                    this.observer.notify(Event::Finished {
                         id,
                         path: result.path.clone(),
                         depth,
@@ -1265,7 +1351,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut recursive = Vec::new();
             let mut descendants = Vec::with_capacity(count);
             for (index, (result, inventory, input, id, children_already_complete, remaining_depth)) in parent_outputs.into_iter().enumerate() {
-                if inventory.is_some() && depth <= self.request.max_depth && !cancel.cancelled() {
+                if inventory.is_some() && depth <= this.request.max_depth && !cancel.cancelled() {
                     recursive.push((index, result, inventory, input, id, children_already_complete, remaining_depth));
                 } else {
                     descendants.push((index, Ok((result, input, children_already_complete, remaining_depth, Outcome::default(), false))));
@@ -1273,25 +1359,28 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             let recursive_spawner = spawner.clone();
             let scope: Option<Arc<Path>> = source_scope.map(Arc::from);
+            let descendant_owner = Arc::clone(this);
             let descend = move |(index, result, inventory, input, id, children_already_complete, remaining_depth): (usize, ArchiveResult, Option<NativeOutputInventory>, ArchiveInput, TaskId, bool, usize)| -> super::scheduling::Task<'_, _> {
+                let descendant_owner = Arc::clone(&descendant_owner);
                 let spawner = recursive_spawner.clone();
                 let scope = scope.clone();
                 Box::pin(async move {
+                    let this = &descendant_owner;
                     let branch = async {
-                        let candidates = self.candidates.with_scope(scope.as_deref());
+                        let candidates = this.candidates.with_scope(scope.as_deref());
                         let mut descendants = Outcome::default();
                         let mut ran_recursive_children = false;
                         if let Some(inventory) = inventory {
                             let (nested, scanned) =
-                                self.discover_children(inventory, depth, &candidates).await?;
+                                this.discover_children(inventory, depth, &candidates).await?;
                             ran_recursive_children = scanned;
                             if scanned {
-                                descendants = self.execute_batch(
+                                descendants = this.execute_batch(
                                     nested, depth + 1, scope.clone(), Some((id, &result)), spawner,
                                 ).await?;
                             } else {
                                 descendants.errors.extend(nested.errors);
-                                descendants.scan_incomplete = self.record_scan_errors(nested.scan_errors);
+                                descendants.scan_incomplete = this.record_scan_errors(nested.scan_errors);
                             }
                         }
                         Ok::<_, io::Error>((result, input, children_already_complete, remaining_depth, descendants, ran_recursive_children))
@@ -1312,6 +1401,7 @@ impl<'run, O: Observer> Run<'run, O> {
             descendants.sort_unstable_by_key(|(index, _)| *index);
             for (_, descendant) in descendants {
                 let (mut result, input, children_already_complete, remaining_depth, mut descendants, ran_recursive_children) = descendant?;
+                stage("output_state", &Cancellation::new()).await?;
                 let children_complete = children_already_complete
                     || (!cancel.cancelled() && subtree_complete(&descendants));
                 if ran_recursive_children
@@ -1321,7 +1411,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 {
                     if let Some(output) = result.output.as_deref() {
                         if remove_empty_or_promoted(output, &descendants.removed_promotion_dirs) {
-                            self.observer.discard_output(&result, output)?;
+                            this.observer.discard_output(&result, output)?;
                             result.output = None;
                         }
                     }
@@ -1331,15 +1421,16 @@ impl<'run, O: Observer> Run<'run, O> {
                 if !multi
                     && !result.retained
                     && result.failure.is_none()
-                    && self.request.config.post_extract.flatten_single_directory
+                    && this.request.config.post_extract.flatten_single_directory
                     && children_complete
                     && !cancel.cancelled()
                 {
+                    stage("postprocess", cancel).await?;
                     flatten_result(
-                        self.observer, &mut result, &mut descendants, Some(&self.created_outputs),
+                        &*this.observer, &mut result, &mut descendants, Some(&this.created_outputs),
                     )?;
                 }
-                let mut checkpoint = if self.request.mode == Mode::Extract {
+                let mut checkpoint = if this.request.mode == Mode::Extract {
                     InputCheckpoint::create(
                         &owner_path,
                         &input,
@@ -1360,12 +1451,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 let commit_completed = !cancel.cancelled();
                 outputs_committed &= commit_completed || result.retained || result.output.is_none();
                 if commit_completed || result.retained {
-                    self.observer.commit_output(&result, checkpoint.as_ref())?;
+                    this.observer.commit_output(&result, checkpoint.as_ref())?;
                     // Cancellation after this durable commit must not roll it
                     // back. Match main's commit/check then retire ordering.
                     if commit_completed && !multi {
                         if let Some(output) = result.output.as_deref() {
-                            self.created_outputs.lock().unwrap().commit_if_unowned(output);
+                            this.created_outputs.lock().unwrap().commit_if_unowned(output);
                         }
                     }
                 }
@@ -1406,11 +1497,11 @@ impl<'run, O: Observer> Run<'run, O> {
                         .expect("carrier has a retained output");
                     let first = &mut completed[index];
                     let segment = first.output.replace(root.clone());
-                    let published = self.observer.commit_output(first, None);
+                    let published = this.observer.commit_output(first, None);
                     first.output = segment;
                     published?;
                 }
-                let mut created = self.created_outputs.lock().unwrap();
+                let mut created = this.created_outputs.lock().unwrap();
                 if let Some(root) = carrier.as_deref() {
                     created.commit_if_unowned(root);
                 }
@@ -1437,7 +1528,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 if completed.iter().all(|entry| entry.output.is_none()) {
                     if remove_empty_or_promoted(root, &outcome.removed_promotion_dirs) {
                         if let Some(result) = completed.first() {
-                            self.observer.discard_output(result, root)?;
+                            this.observer.discard_output(result, root)?;
                         }
                     }
                 }
@@ -1454,8 +1545,8 @@ impl<'run, O: Observer> Run<'run, O> {
                     })
                 })
             {
-                let destination = self.promotion_directory(source_scope.unwrap_or(Path::new(".")));
-                self.promote_blocked(
+                let destination = this.promotion_directory(source_scope.unwrap_or(Path::new(".")));
+                this.promote_blocked(
                     &promotion_sources,
                     &destination,
                     &generations,
@@ -1478,18 +1569,20 @@ impl<'run, O: Observer> Run<'run, O> {
             let admitted_promoted: Vec<_> = promotion_sources
                 .iter()
                 .filter_map(|path| {
-                    self.admitted_promotion(path, &generations, watch_root)
+                    this.admitted_promotion(path, &generations, watch_root)
                         .map(|source| (path, source))
                 })
                 .collect();
-            if sources_complete && self.request.mode == Mode::Extract {
+            if sources_complete && this.request.mode == Mode::Extract
+                && stage("source_cleanup", cancel).await.is_ok()
+            {
                 if watch_root && complete {
-                    self.observer.sources_processed(&completed, &generations)?;
+                    this.observer.sources_processed(&completed, &generations)?;
                 }
                 let mode = if depth > 1 {
                     CleanupMode::Delete
                 } else {
-                    self.request.config.post_extract.archive_cleanup_mode
+                    this.request.config.post_extract.archive_cleanup_mode
                 };
                 if let Some(first) = completed.first_mut() {
                     if admitted_promoted.is_empty() || mode == CleanupMode::Delete {
@@ -1497,7 +1590,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             let mut selected: Vec<_> =
                                 promotion_sources.iter().map(PathBuf::from).collect();
                             dedup_paths(&mut selected);
-                            self.cleanup_sources(
+                            this.cleanup_sources(
                                 first,
                                 &selected,
                                 &generations,
@@ -1521,7 +1614,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 .map(PathBuf::from)
                                 .collect();
                             dedup_paths(&mut originals);
-                            self.cleanup_sources(
+                            this.cleanup_sources(
                                 first,
                                 &originals,
                                 &generations,
@@ -1530,7 +1623,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 &mut shell,
                             )?;
                         }
-                        self.cleanup_sources(
+                        this.cleanup_sources(
                             first,
                             &generated,
                             &generations,
@@ -1546,7 +1639,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     .extend(admitted_promoted.into_iter().map(|(_, source)| source));
             }
             if let Some(result) = completed.first() {
-                self.observer.notify(Event::Finished {
+                this.observer.notify(Event::Finished {
                     id: task_id,
                     path: if multi {
                         owner_path
@@ -1570,8 +1663,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 .append(&mut children.cleanup_results);
             outcome.uncommitted = !outputs_committed || children.uncommitted;
             drop(lease);
-            if depth == 1 && self.request.mode == Mode::Extract && !cancel.cancelled() {
-                outcome.archives = self
+            if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
+                outcome.archives = this
                     .observer
                     .scope_finished(task_id, std::mem::take(&mut outcome.archives))
                     .await?;
@@ -1609,6 +1702,7 @@ impl<'run, O: Observer> Run<'run, O> {
             bool,
             Option<String>,
         )> = async {
+            stage("promotion_plan", &self.request.cancel).await?;
             for source in sources {
                 let before = generations.get(&path_key(source)).ok_or_else(|| {
                     io::Error::other("promotion source has no admitted generation")
@@ -1631,6 +1725,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     .leases
                     .acquire(keys, &self.request.cancel)
                     .await?;
+                stage("promotion", &self.request.cancel).await?;
                 let _promotion = Promotion::begin(sources.to_vec())?;
                 let (residual, removed, _, error, collision) = plan.execute(|| {
                     self.observer
@@ -1731,8 +1826,9 @@ impl<'run, O: Observer> Run<'run, O> {
         let generation = generations.get(&key)?;
         self.promoted_sources
             .get(&key)
+            .map(|&index| &self.request.promoted_sources[index])
             .filter(|source| source.matches(generation))
-            .map(|source| (*source).clone())
+            .cloned()
             .or_else(|| {
                 watch_root
                     .then(|| self.observer.promoted_source(path))
@@ -1747,7 +1843,7 @@ impl<'run, O: Observer> Run<'run, O> {
         generations: &HashMap<String, PhysicalFileGeneration>,
         preferred_carrier: &Path,
         depth: usize,
-        candidates: &CandidateSet<'_>,
+        candidates: &CandidateSet,
     ) -> Option<&InputCheckpoint> {
         if self.request.mode != Mode::Extract {
             return None;
@@ -1909,7 +2005,7 @@ impl<'run, O: Observer> Run<'run, O> {
         source: DiscoverySource,
         depth: usize,
         carrier: Option<&Path>,
-        candidates: &CandidateSet<'_>,
+        candidates: &CandidateSet,
         shell: &mut ShellUpdates<'_>,
         outcome: &mut Outcome,
     ) -> io::Result<Executed> {
@@ -1932,6 +2028,7 @@ impl<'run, O: Observer> Run<'run, O> {
             result.failure = Some(Failure::new(FailureKind::Cancelled, "Operation interrupted"));
             return Ok(Executed { result, inventory: None, input });
         }
+        stage("preflight", &self.request.cancel).await?;
         let plan = match candidates.plan(&input, password, &self.request.cancel) {
             Ok(Ok(plan)) => plan,
             Ok(Err(failure)) => {
@@ -2019,6 +2116,7 @@ impl<'run, O: Observer> Run<'run, O> {
         self.observer.notify(Event::Waiting { id });
         let native = match self.engine.worker(&self.request.config.performance.worker, &self.request.cancel).await {
             Ok(worker) => {
+                stage("extract_prepare", &self.request.cancel).await?;
                 worker
                     .submit(
                         &job_id,
@@ -2047,6 +2145,7 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             Err(error) => Err(error),
         };
+        stage("complete_extract", &self.request.cancel).await?;
         self.observer.notify(Event::Finalizing { id });
         let mut inventory = None;
         match native {
@@ -2199,12 +2298,13 @@ impl<'run, O: Observer> Run<'run, O> {
         &self,
         inventory: NativeOutputInventory,
         depth: usize,
-        candidates: &CandidateSet<'_>,
+        candidates: &CandidateSet,
     ) -> io::Result<(Discovered, bool)> {
         let mut nested = Discovered::default();
         if depth > self.request.max_depth || self.request.cancel.cancelled() {
             return Ok((nested, false));
         }
+        stage("nested_scan", &self.request.cancel).await?;
         let output = discovery::OutputDiscovery::prepare(inventory, self.filtered_options()?)?;
         nested.scan_errors.extend(output.scan_errors());
         // Main asks once per depth when the filtered output has files, even if
@@ -2213,7 +2313,8 @@ impl<'run, O: Observer> Run<'run, O> {
         // One logical output root is pending; its archive count is not known yet.
         let scan = output.has_files() && self.allow_recursive(depth + 1, 1).await;
         if scan {
-            if let Err(error) = output.discover(candidates, self.request, &mut nested) {
+            stage("discovery", &self.request.cancel).await?;
+            if let Err(error) = output.discover(candidates, &self.request, &mut nested) {
                 if !is_cancellation(&error) {
                     return Err(error);
                 }
@@ -2227,7 +2328,10 @@ impl<'run, O: Observer> Run<'run, O> {
         if self.request.config.recursive_extract != Recursion::Prompt {
             return true;
         }
-        self.recursion.allow(depth, pending, &self.request.cancel).await
+        let prompt = |depth, pending| self.observer.allow_recursive(depth, pending);
+        let inline = matches!(self.observer, ObserverRef::Owned(_))
+            .then_some(&prompt as &(dyn Fn(usize, usize) -> bool + Sync));
+        self.recursion.allow(depth, pending, &self.request.cancel, inline).await
     }
 
     fn preferred_output(&self, input: &ArchiveInput, depth: usize) -> PathBuf {
@@ -2260,7 +2364,7 @@ impl<'run, O: Observer> Run<'run, O> {
         // Serialize only the name claim and durable publication, not workers.
         let input = carrier.or_else(|| (result.depth > 1).then_some(result.path.as_path()));
         let reserved = self.output_names.registry.lock().unwrap().reserve(
-            preferred, result, self.observer, self.output_names.owner, input,
+            preferred, result, &*self.observer, self.output_names.owner, input,
         )?;
         if let Ok(path) = &reserved {
             self.created_outputs.lock().unwrap().register(path, result);
@@ -2932,7 +3036,6 @@ impl Drop for Promotion {
 #[derive(Default)]
 struct Leases {
     state: Mutex<LeaseState>,
-    changed: Condvar,
 }
 
 #[derive(Default)]
@@ -3063,17 +3166,19 @@ impl ClaimedInput {
     }
 }
 
-pub(crate) struct RequestClaimGuard<'a> {
-    registry: &'a Leases,
+pub(crate) struct RequestClaimGuard {
+    registry: Arc<Leases>,
     id: u64,
 }
 
-impl Drop for RequestClaimGuard<'_> {
+impl Drop for RequestClaimGuard {
     fn drop(&mut self) {
         let mut state = self.registry.state.lock().unwrap();
         state.requests.remove(&self.id);
         crate::collections::trim_map(&mut state.requests);
-        self.registry.changed.notify_all();
+        let waiters = std::mem::take(&mut state.waiters);
+        drop(state);
+        for waker in waiters.into_values() { waker.wake(); }
     }
 }
 
@@ -3093,21 +3198,21 @@ impl Leases {
     }
 
     fn reserve_request(
-        self: &Arc<Self>,
-        id: u64,
-        origin: Origin,
-        paths: &[PathBuf],
-        cancel: &Cancellation,
-    ) -> io::Result<RequestClaimGuard<'_>> {
-        let inputs = paths
-            .iter()
-            .map(|path| ClaimedInput::new(path))
-            .collect::<io::Result<Vec<_>>>()?;
-        self.admit_request(id, origin, inputs, cancel)?;
-        Ok(RequestClaimGuard { registry: self, id })
+        self: &Arc<Self>, id: u64, origin: Origin, paths: &[PathBuf], cancel: &Cancellation,
+    ) -> io::Result<RequestClaimGuard> {
+        super::scheduling::block_on(self.reserve_request_async(id, origin, paths, cancel))
     }
 
-    fn extend_request<'a>(
+    async fn reserve_request_async(
+        self: &Arc<Self>, id: u64, origin: Origin, paths: &[PathBuf], cancel: &Cancellation,
+    ) -> io::Result<RequestClaimGuard> {
+        let inputs = paths.iter().map(|path| ClaimedInput::new(path))
+            .collect::<io::Result<Vec<_>>>()?;
+        self.admit_request(id, origin, inputs, cancel).await?;
+        Ok(RequestClaimGuard { registry: Arc::clone(self), id })
+    }
+
+    async fn extend_request<'a>(
         self: &Arc<Self>,
         id: u64,
         origin: Origin,
@@ -3130,52 +3235,51 @@ impl Leases {
             .into_iter()
             .map(|path| ClaimedInput::new(Path::new(path)))
             .collect::<io::Result<Vec<_>>>()?;
-        self.admit_request(id, origin, inputs, cancel)
+        self.admit_request(id, origin, inputs, cancel).await
     }
 
-    fn admit_request(
-        self: &Arc<Self>,
-        id: u64,
-        origin: Origin,
-        inputs: Vec<ClaimedInput>,
-        cancel: &Cancellation,
+    async fn admit_request(
+        self: &Arc<Self>, id: u64, origin: Origin, inputs: Vec<ClaimedInput>, cancel: &Cancellation,
     ) -> io::Result<()> {
-        let wake = Arc::clone(self);
-        let _subscription = cancel.subscribe(move || {
-            let _state = wake.state.lock().unwrap();
-            wake.changed.notify_all();
-        });
-        let mut state = self.state.lock().unwrap();
-        // Expanded ownership is requested before jobs start. Drop this
-        // request's old subset before waiting so two Watch requests holding
-        // different members cannot deadlock on the same complete group.
-        let previous = state.requests.remove(&id);
-        if previous.is_some() {
-            self.changed.notify_all();
-        }
-        let mut claim = previous.unwrap_or_else(|| RequestClaim::new(origin));
-        for input in inputs {
-            claim.add(input);
-        }
-        loop {
-            cancel.check_io()?;
-            match state
-                .requests
-                .values()
-                .find(|current| claim.overlaps(current))
-            {
-                None => break,
-                Some(current) if origin == Origin::Foreground => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        current.conflict(),
-                    ));
-                }
-                Some(_) => state = self.changed.wait(state).unwrap(),
+        let mut claim = {
+            let mut state = self.state.lock().unwrap();
+            let previous = state.requests.remove(&id);
+            if previous.is_some() {
+                for waker in std::mem::take(&mut state.waiters).into_values() { waker.wake(); }
             }
-        }
-        state.requests.insert(id, claim);
-        Ok(())
+            previous.unwrap_or_else(|| RequestClaim::new(origin))
+        };
+        for input in inputs { claim.add(input); }
+        let mut claim = Some(claim);
+        let mut waiting = LeaseWait { owner: self, id: None };
+        let mut subscription = None;
+        poll_fn(|cx| {
+            let mut state = self.state.lock().unwrap();
+            if let Err(error) = cancel.check_io() { return Poll::Ready(Err(error)); }
+            match state.requests.values().find(|current| claim.as_ref().unwrap().overlaps(current)) {
+                None => {
+                    state.requests.insert(id, claim.take().unwrap());
+                    return Poll::Ready(Ok(()));
+                }
+                Some(current) if origin == Origin::Foreground =>
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::WouldBlock, current.conflict()))),
+                Some(_) => {}
+            }
+            let waiter = *waiting.id.get_or_insert_with(|| {
+                state.next_waiter += 1;
+                state.next_waiter
+            });
+            state.waiters.insert(waiter, cx.waker().clone());
+            drop(state);
+            if subscription.is_none() {
+                let owner = Arc::clone(self);
+                subscription = cancel.subscribe(move || {
+                    let wake = owner.state.lock().unwrap().waiters.remove(&waiter);
+                    if let Some(wake) = wake { wake.wake(); }
+                });
+            }
+            Poll::Pending
+        }).await
     }
 
     async fn acquire(
@@ -3315,6 +3419,34 @@ mod tests {
             assert_eq!(failure.retryable(), retry, "{worker}");
             assert_eq!(failure.terminal.is_some(), !retry, "{worker}");
         }
+    }
+
+    #[test]
+    fn requests_wait_for_startup_even_when_discovery_would_be_empty() {
+        use std::time::Duration;
+        let timeout = Duration::from_secs(10);
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let (entered, started) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let process = Process::with_test_start(move || {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            Err(io::Error::new(io::ErrorKind::NotFound, "startup gate failure"))
+        });
+        started.recv_timeout(timeout).unwrap();
+        engine.worker.lock().unwrap().process = Some(process);
+        let observer = Arc::new(|_: Event| panic!("discovery preceded the startup handshake"));
+        let first = engine.submit(Request::new(Vec::new(), Mode::Scan), Arc::clone(&observer), |result| result);
+        let second = engine.submit(Request::new(Vec::new(), Mode::Scan), observer, |result| result);
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        release.send(()).unwrap();
+        for handle in [first, second] {
+            let error = handle.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        }
+        let missing = Engine::new(PathBuf::from("sunpack-missing-worker-for-startup-test.exe"));
+        assert!(missing.run(Request::new(Vec::new(), Mode::Scan), |_| {}).is_err());
     }
 
     #[test]
@@ -3505,11 +3637,11 @@ mod tests {
         let during_ack = second_done.recv_timeout(timeout);
         let high = change(&engine, ProcessMode::High);
         ack(&initial, "background");
-        assert!(background.join().unwrap());
+        assert!(background.join().unwrap().unwrap());
         assert_eq!(writing.recv_timeout(timeout).unwrap(), command("high"));
         release.send(()).unwrap();
         ack(&initial, "high");
-        assert!(high.join().unwrap());
+        assert!(high.join().unwrap().unwrap());
         first.join().unwrap();
         second.join().unwrap();
         assert!(during_write.expect("mode write held the worker ownership mutex"));
@@ -3539,7 +3671,7 @@ mod tests {
         replacement_release.send(()).unwrap();
         ack(&initial, "normal"); // An obsolete ACK cannot rewrite the new owner's state.
         ack(&replacement, "background");
-        assert!(final_change.join().unwrap());
+        assert!(final_change.join().unwrap().unwrap());
         let (borrowed, received) = borrow_on_scheduler(&scheduler, &engine, &replacement, 3);
         assert!(received.recv_timeout(timeout).unwrap());
         borrowed.join().unwrap();
@@ -3602,24 +3734,24 @@ mod tests {
         engine: &'a Engine,
         request: &'a Request,
         observer: &'a O,
-    ) -> Run<'a, O> {
-        Run {
-            engine,
-            request,
+    ) -> Arc<Run<'a, O>> {
+        Arc::new(Run {
+            engine: engine.clone(),
+            request: Arc::new(request.clone()),
             resolve_aliases: false,
             candidates: CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None),
             options: OnceLock::new(),
             deep_options: None,
             analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
-            observer,
+            observer: ObserverRef::Borrowed(observer),
             recursion: RecursivePrompts::default(),
-            output_names: OutputReservationGuard { registry: &engine.output_names, owner: 1 },
+            output_names: OutputReservationGuard { registry: Arc::clone(&engine.output_names), owner: 1 },
             created_outputs: Mutex::default(),
             output_base: None,
             checkpoints: HashMap::new(),
             promoted_sources: HashMap::new(),
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
-        }
+        })
     }
 
     fn output_manifest(files: &[(&str, &[u8])]) -> crate::scan::directory::NativeWorkerManifest {
@@ -3717,7 +3849,7 @@ mod tests {
             };
             let mut run = test_run(&engine, &request, &observer);
             for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                run.checkpoints.entry(checkpoint.key()).or_default().push(index);
+                Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
             }
             let task = Task {
                 primary: None,
@@ -3769,10 +3901,10 @@ mod tests {
             let observer = |_: Event| {};
             let mut run = test_run(engine, request, &observer);
             for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                run.checkpoints.entry(checkpoint.key()).or_default().push(index);
+                Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
             }
-            run.promoted_sources = request.promoted_sources.iter().map(|source| {
-                (path_key(&source.path().to_string_lossy()), source)
+            Arc::get_mut(&mut run).unwrap().promoted_sources = request.promoted_sources.iter().enumerate().map(|(index, source)| {
+                (path_key(&source.path().to_string_lossy()), index)
             }).collect();
             let task = Task {
                 primary: None,
@@ -3837,9 +3969,13 @@ mod tests {
                         if index == 1 { partial_kind } else { blocked }, "accepted partial",
                     ));
                 }
-                request.checkpoints.push(InputCheckpoint::create(
+                let mut checkpoint = InputCheckpoint::create(
                     &source, input, &result, &generations, Some(&container), true, 0,
-                ).unwrap());
+                ).unwrap();
+                checkpoint.set_password_signature(|| CandidateSet::new(
+                    Arc::from([]), None, &AttemptCache::default(), None,
+                ).signature(&input.entry_path));
+                request.checkpoints.push(checkpoint);
             }
             let engine = Engine::new(PathBuf::from("unused-worker"));
             let outcome = execute(&engine, &request, &inputs, blocked, depth);
@@ -3867,8 +4003,9 @@ mod tests {
             let generations = HashMap::from([
                 (path_key(&inputs[0].entry_path), capture_file_generation(&current).unwrap()),
             ]);
-            assert_eq!(outcome.checkpoints.len(), request.checkpoints.len());
-            for (index, checkpoint) in outcome.checkpoints.iter().enumerate() {
+            assert_eq!(outcome.checkpoints.iter().filter(|checkpoint| checkpoint.has_output()).count(),
+                request.checkpoints.len());
+            for (index, checkpoint) in outcome.checkpoints.iter().filter(|checkpoint| checkpoint.has_output()).enumerate() {
                 assert_eq!(checkpoint.entry(), current);
                 assert_eq!(checkpoint.carrier(), current);
                 assert_eq!(checkpoint.container(), Some(container.as_path()));
@@ -3879,7 +4016,7 @@ mod tests {
                 request.checkpoints = outcome.checkpoints;
                 request.promoted_sources = outcome.promoted_sources;
                 let retry = execute(&engine, &request, &inputs, blocked, 1);
-                assert_eq!(retry.checkpoints.len(), 2);
+                assert_eq!(retry.checkpoints.iter().filter(|checkpoint| checkpoint.has_output()).count(), 2);
                 assert!(retry.archives[..2].iter().all(|result| result.retained));
                 assert_eq!(retry.archives[1].failure.as_ref().unwrap().kind, partial_kind);
                 assert!(retry.archives[1].partial);
@@ -3923,7 +4060,7 @@ mod tests {
             config.embedded_scan.recursive_candidate_ratio = 0.3;
             let observer = |_: Event| {};
             let mut run = test_run(&engine, &request, &observer);
-            run.candidates = CandidateSet::new(
+            Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
                 Arc::from([Arc::from("secret")]), None, &engine.password_attempts, None,
             );
             let manifest = output_manifest(&[("encrypted.bin", &rar), ("carrier.bin", &carrier)]);
@@ -4132,7 +4269,7 @@ mod tests {
                             let finished = &finished;
                             Box::pin(async move {
                                 let results = spawner.bounded_map(vec![(); 8], move |_| {
-                                    Box::pin(prompts.allow(2, 1, cancel))
+                                    Box::pin(prompts.allow(2, 1, cancel, None))
                                 }).await;
                                 finished.send(()).unwrap();
                                 results
@@ -4367,10 +4504,10 @@ mod tests {
         // owners, owned recursion, foreign input and continued output refusal.
         for descendant_first in [false, true] {
           for shared_request in [false, true] {
-            let registry = Mutex::new(OutputNames::default());
+            let registry = Arc::new(Mutex::new(OutputNames::default()));
             let owner = if shared_request { 1 } else { 2 };
-            let first = OutputReservationGuard { registry: &registry, owner: 1 };
-            let second = OutputReservationGuard { registry: &registry, owner };
+            let first = OutputReservationGuard { registry: Arc::clone(&registry), owner: 1 };
+            let second = OutputReservationGuard { registry: Arc::clone(&registry), owner };
             let mut names = registry.lock().unwrap();
             let preferred = root.join("a");
             let descendant = preferred.join("sub").join("b");

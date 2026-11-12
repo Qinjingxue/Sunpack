@@ -1118,7 +1118,7 @@ impl Reports {
                             && inputs.as_ref().unwrap().get(&key)
                             .is_some_and(|input| input.failed && !input.retryable())
                         {
-                            spool.append(&archive.path, &super::failure::message(failure, language), failure)?;
+                            spool.append(&archive.path, &super::failure::message(failure, language).into_owned(), failure)?;
                         }
                     }
                     for error in outcome

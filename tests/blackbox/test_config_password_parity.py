@@ -136,6 +136,7 @@ def test_deep_extract_defers_bad_filters_until_recursive_output_scan(package, tm
     assert "regex" not in failed.stdout + failed.stderr
     with zipfile.ZipFile(source / "valid.zip", "w") as payload:
         payload.writestr("member.txt", "payload")
-    recursive = package.run("extract", "-d", "-r", "1", source, "--json")
+    # Main counts the initial extraction as round 1; round 2 admits nested scans.
+    recursive = package.run("extract", "-d", "-r", "2", source, "--json")
     assert recursive.returncode != 0
     assert "regex" in recursive.stdout + recursive.stderr

@@ -78,8 +78,10 @@ def test_cli_password_values_and_noninteractive_prompt_contract(package):
     result = package.run("passwords", "--ask-pw", "--no-bpw", input="  secret  \rquietQpassword\n\n")
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "['  secret  ', 'quietQpassword']" in result.stdout
-    invalid = package.run("passwords", "--ask-pw", input="truncated\x00suffix\n\n")
-    assert invalid.returncode == 2 and "NUL" in invalid.stderr
+    # Main preserves text-source candidates; NUL validation belongs to builtin JSON.
+    nul = package.run("passwords", "--ask-pw", input="truncated\x00suffix\n\n")
+    assert nul.returncode == 0, nul.stderr
+    assert "truncated\x00suffix" in nul.stdout
 
 
 def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
@@ -306,7 +308,8 @@ def test_continuous_watch_retries_promoted_nested_input_after_password_edit(pack
     package.json("watch", "add", watched, "-o", output, "--deep-detect")
     started = package.json("watch", "start", "--no-tray")["summary"]
     assert started["started"] and started["running"]
-    assert package.json("watch", "reload")["summary"]["reloaded"]
+    # Main reports false when reload has no semantic configuration change.
+    assert package.json("watch", "reload")["summary"]["reloaded"] is False
     same_root = package.json("watch", "add", watched, "--deep-detect")["summary"]
     assert same_root["apply"]["applied"] is False
     assert same_root["apply"]["generation"] == started["generation"]

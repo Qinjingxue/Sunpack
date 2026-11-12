@@ -98,6 +98,7 @@ struct State {
     jobs: HashMap<String, Job>,
     parked: VecDeque<(String, Arc<Mailbox>)>,
     ready: bool,
+    thread_capacity: usize,
     startup_mode: Option<ProcessMode>,
     startup_command: Option<ProcessMode>,
     ready_waiters: HashMap<u64, Option<Waker>>,
@@ -338,6 +339,10 @@ impl Process {
             .name("sunpack-worker-stdout".into())
             .spawn(move || run_process(spawn, &owner_child, &owner))?;
         Ok(Self { owner: Some(owner), child, shared })
+    }
+
+    pub(super) fn thread_capacity(&self) -> usize {
+        self.shared.state.lock().unwrap().thread_capacity.max(1)
     }
 
     pub(super) async fn ready(&self, cancellation: &Cancellation) -> io::Result<()> {
@@ -797,6 +802,8 @@ impl Shared {
             return;
         }
         if kind == "worker_ready" {
+            state.thread_capacity = usize::try_from(number(&frame.summary, "thread_capacity"))
+                .unwrap_or(usize::MAX).max(1);
             if frame.summary.get("process_mode_applied").and_then(Value::as_bool) == Some(true) {
                 state.applied_mode = parse_mode(string(&frame.summary, "process_mode"));
             }
@@ -1263,6 +1270,7 @@ mod tests {
         }
         process.test_event(json!({
             "type": "worker_ready", "process_mode": "normal", "process_mode_applied": true,
+            "thread_capacity": 7,
         }));
         let mode_write = writing.recv_timeout(timeout).unwrap();
         assert_eq!(mode_write, encode_worker_frame(&json!({
@@ -1275,6 +1283,7 @@ mod tests {
         process.test_event(json!({"type":"process_mode_ack", "mode":"high", "applied":false}));
         second.join().unwrap().unwrap();
         third.join().unwrap().unwrap();
+        assert_eq!(process.thread_capacity(), 7);
         assert!(!control.join().unwrap().unwrap());
         assert!(process.shared.state.lock().unwrap().ready_waiters.is_empty());
         assert!(process.shared.state.lock().unwrap().startup_command.is_none());

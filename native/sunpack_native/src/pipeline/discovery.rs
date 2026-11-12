@@ -139,7 +139,7 @@ pub(crate) fn scan_options(config: &Config) -> io::Result<NativeDirectoryScanOpt
 pub(super) fn discover(
     request: &Request,
     options: &NativeDirectoryScanOptions,
-    candidates: &CandidateSet<'_>,
+    candidates: &CandidateSet,
 ) -> io::Result<Discovered> {
     let mut result = Discovered::default();
     let mut seen = HashSet::new();
@@ -425,7 +425,7 @@ impl OutputDiscovery {
 
     pub(super) fn discover(
         self,
-        candidates: &CandidateSet<'_>,
+        candidates: &CandidateSet,
         request: &Request,
         result: &mut Discovered,
     ) -> io::Result<()> {
@@ -506,7 +506,7 @@ pub(super) fn retry_volume(
     original: &super::ArchiveResult,
     context: &RetryScope,
     options: &NativeDirectoryScanOptions,
-    candidates: &CandidateSet<'_>,
+    candidates: &CandidateSet,
     request: &Request,
 ) -> io::Result<Option<Task>> {
     request.cancel.check_io()?;
@@ -573,7 +573,7 @@ fn directory_table(
     filtered: &NativeDirectorySnapshot,
     raw: &NativeDirectorySnapshot,
     targets: Option<FileTargets>,
-    candidates: &CandidateSet<'_>,
+    candidates: &CandidateSet,
     verified: &mut VerifiedPasswords,
     request: &Request,
 ) -> io::Result<NativeCandidateTable> {
@@ -643,7 +643,7 @@ impl Discovered {
     fn project(
         &mut self,
         table: &mut NativeCandidateTable,
-        candidates: &CandidateSet<'_>,
+        candidates: &CandidateSet,
         verified: &VerifiedPasswords,
         request: &Request,
         recursive: bool,
@@ -820,7 +820,7 @@ fn project_segments(
     mut task: Task,
     scan: &NativeScanResult,
     mut resolutions: HashMap<u64, RarInputResolution>,
-    candidates: &CandidateSet<'_>,
+    candidates: &CandidateSet,
 ) -> io::Result<Option<Task>> {
     let path = task.entry().entry_path.clone();
     let name = task.entry().logical_name.clone();

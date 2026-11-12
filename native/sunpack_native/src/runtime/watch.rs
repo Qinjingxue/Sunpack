@@ -1216,7 +1216,7 @@ struct Active {
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
     claimed: Arc<Mutex<ClaimedSources>>,
     toast: Option<super::toast::Activity>,
-    thread: JoinHandle<Completed>,
+    request: crate::pipeline::RequestHandle<Completed>,
 }
 
 struct BatchCompletion {
@@ -1228,12 +1228,6 @@ impl Drop for BatchCompletion {
     fn drop(&mut self) {
         self.hub.batch_completed(self.batch.take().unwrap());
     }
-}
-
-#[derive(Default)]
-struct RootReport {
-    path: PathBuf,
-    outcome: Outcome,
 }
 
 struct RootReportCompletion {
@@ -3254,8 +3248,8 @@ fn recovery_output_matches(
 impl Scheduler {
     fn admission_available(&self) -> usize {
         if self.options.is_none() { return 0; }
-        // Match main's bounded request window. One caller thread owns each
-        // batch, so the same window bounds parked OS threads. Keep batching:
+        // Match main's bounded request window. Suspended batches share the
+        // pipeline driver rather than retaining caller threads. Keep batching:
         // a slow sibling must not reserve a slot for every completed input.
         crate::pipeline::MAX_PENDING_JOBS.max(rayon::current_num_threads())
             .saturating_sub(self.active.len())
@@ -3557,65 +3551,57 @@ impl Scheduler {
         self.journal
             .log(json!({"event":"pipeline_request_started","owner":batch,
             "path":candidates.first().map(|entry| &entry.path),"count":candidates.len()}));
-        let thread = thread::Builder::new()
-            .name("sunpack-watch-batch".into())
-            .stack_size(512 * 1024)
-            .spawn(move || {
-                let _completion = BatchCompletion { hub: Arc::clone(&hub), batch: Some(send_batch) };
-                let observer = WatchObserver {
-                    journal,
-                    owners,
-                    output_scopes,
-                    outputs: Mutex::new(outputs),
-                    batch: worker_batch,
-                    toast: worker_toast,
-                    hub: Arc::clone(&hub),
-                    groups: worker_groups,
-                    claimed: worker_claimed,
-                    promoted: Mutex::default(),
-                    reporting: super::cli::reporting::Reports::default(),
-                };
-                let result = if let Some(toast) = &observer.toast {
-                    observer.reporting.serve(|_| {}, |id, report| {
-                        toast.record_root(id, &report.path, &report.outcome);
-                        Ok(())
-                    }, || engine.run_with(request, &observer))
-                } else {
-                    engine.run_with(request, &observer)
-                };
-                let cancelled = worker_cancel.cancelled();
-                if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
-                    let outputs = observer.outputs.lock().unwrap();
-                    let groups = observer.groups.lock().unwrap();
-                    if result.is_err() {
-                        let claimed = observer.claimed.lock().unwrap();
-                        let mut reported = HashSet::new();
-                        for (source_key, source) in &observer.owners {
-                            if claimed.finished.contains(source_key) { continue; }
-                            let source = groups.get(source_key).map_or(Path::new(source), |group| group.path.as_path());
-                            if reported.insert(key(source)) {
-                                toast.record(source, &result, cancelled,
-                                    |path| completion_owner(path, &outputs, &groups));
-                            }
+        let observer = Arc::new(WatchObserver {
+            journal,
+            owners,
+            output_scopes,
+            outputs: Mutex::new(outputs),
+            batch: worker_batch,
+            toast: worker_toast,
+            hub: Arc::clone(&hub),
+            groups: worker_groups,
+            claimed: worker_claimed,
+            promoted: Mutex::default(),
+        });
+        let request_handle = engine.submit(request, Arc::clone(&observer), move |result| {
+            let cancelled = worker_cancel.cancelled();
+            if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
+                let outputs = observer.outputs.lock().unwrap();
+                let groups = observer.groups.lock().unwrap();
+                if result.is_err() {
+                    let claimed = observer.claimed.lock().unwrap();
+                    let mut reported = HashSet::new();
+                    for (source_key, source) in &observer.owners {
+                        if claimed.finished.contains(source_key) { continue; }
+                        let source = groups.get(source_key).map_or(Path::new(source), |group| group.path.as_path());
+                        if reported.insert(key(source)) {
+                            toast.record(source, &result, cancelled,
+                                |path| completion_owner(path, &outputs, &groups));
                         }
-                    } else {
-                        toast.record(
-                            path.as_path(),
-                            &result,
-                            cancelled,
-                            |path| completion_owner(path, &outputs, &groups),
-                        );
                     }
+                } else {
+                    toast.record(
+                        path.as_path(),
+                        &result,
+                        cancelled,
+                        |path| completion_owner(path, &outputs, &groups),
+                    );
                 }
-                let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
-                let outputs = std::mem::take(&mut *observer.outputs.lock().unwrap());
-                Completed {
-                    cancelled,
-                    result,
-                    promoted,
-                    outputs,
-                }
-            })?;
+            }
+            let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
+            let outputs = std::mem::take(&mut *observer.outputs.lock().unwrap());
+            Completed {
+                cancelled,
+                result,
+                promoted,
+                outputs,
+            }
+        });
+        // Like main's task completion callback, notify only after all owned
+        // children have joined. A root panic must not make Watch block in join
+        // while another child still needs its durable completion reply.
+        let completion = BatchCompletion { hub, batch: Some(send_batch) };
+        request_handle.on_ready(move || drop(completion));
         for (index, candidate) in candidates.iter().enumerate() {
             self.active_paths.insert(
                 watch_path_key(&candidate.path),
@@ -3634,7 +3620,7 @@ impl Scheduler {
                 groups,
                 claimed,
                 toast,
-                thread,
+                request: request_handle,
             },
         );
         Ok(())
@@ -3663,7 +3649,7 @@ impl Scheduler {
         let Some(active) = self.active.get(batch) else {
             return false;
         };
-        if active.thread.is_finished() || active.cancel.cancelled() {
+        if active.request.is_finished() || active.cancel.cancelled() {
             return false;
         }
         let mut claimed = active.claimed.lock().unwrap();
@@ -3709,7 +3695,7 @@ impl Scheduler {
         if let Some(active) = self.active.remove(batch) {
             // Its completion notification guarantees the join cannot depend
             // on another scheduler turn. Preserve all durable recovery intent.
-            let _ = active.thread.join();
+            let _ = active.request.join();
         }
     }
 
@@ -3749,8 +3735,8 @@ impl Scheduler {
 
     fn complete(&mut self, batch: &str) -> io::Result<()> {
         let Some(active) = self.active.remove(batch) else { return Ok(()); };
-        let mut completed = active.thread.join()
-            .map_err(|_| io::Error::other("Watch extraction thread failed"))?;
+        let mut completed = active.request.join()
+            .map_err(|_| io::Error::other("Watch extraction request failed"))?;
         completed.cancelled |= active.cancel.cancelled();
         let groups = std::mem::take(&mut *active.groups.lock().unwrap());
         self.apply_completion(batch, CompletionContext {
@@ -4399,7 +4385,6 @@ struct WatchObserver {
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
     claimed: Arc<Mutex<ClaimedSources>>,
     promoted: Mutex<HashMap<String, Option<WatchCandidateRow>>>,
-    reporting: super::cli::reporting::Reports<RootReport>,
 }
 
 impl WatchObserver {
@@ -4460,10 +4445,11 @@ impl Observer for WatchObserver {
         let outcome = reply.wait().await?;
         if let Some(toast) = &self.toast {
             let mut completion = RootReportCompletion { activity: toast.clone(), id, failed: true };
-            match self.reporting.finish(id, RootReport { path: path.to_owned(), outcome }).await {
-                Ok(_) => completion.failed = false,
-                Err(error) => eprintln!("SunPack toast failure report service: {error}"),
-            }
+            // Match main's broker-backed failure report: synchronous report
+            // writes use the shared stage pool, not one thread per batch.
+            crate::pipeline::stage("watch_failure_report", &Cancellation::new()).await?;
+            toast.record_root(id, path, &outcome);
+            completion.failed = false;
         }
         Ok(Outcome::default())
     }
@@ -5487,12 +5473,39 @@ mod tests {
         });
         hub.cancel();
         receive.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        let worker_hub = Arc::clone(&hub);
-        let failed = thread::spawn(move || {
-            let _completion = BatchCompletion { hub: worker_hub, batch: Some("panicking-batch".into()) };
+        // Exercise the actual owned-request boundary, not an OS-thread mock:
+        // a blocked final report must not block another request, and unwinding
+        // its callback must still wake Watch drain after cancellation.
+        struct Silent;
+        impl Observer for Silent { fn notify(&self, _: Event) {} }
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let cancelled_request = || {
+            let mut request = Request::new(Vec::new(), Mode::Extract);
+            request.origin = Origin::Watch;
+            request.cancel.cancel();
+            request
+        };
+        let completion = BatchCompletion { hub: Arc::clone(&hub), batch: Some("panicking-batch".into()) };
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let failed = engine.submit(cancelled_request(), Arc::new(Silent), move |result| {
+            assert!(crate::io::cancellation::is_cancellation(&result.unwrap_err()));
+            entered.send(()).unwrap();
+            released.recv().unwrap();
             panic!("a batch failed before returning its result");
         });
+        failed.on_ready(move || drop(completion));
+        entering.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(!failed.is_finished());
+        let (progress, progressed) = mpsc::channel();
+        let independent = engine.submit(cancelled_request(), Arc::new(Silent), move |_| {
+            progress.send(()).unwrap();
+        });
+        let responsive = progressed.recv_timeout(std::time::Duration::from_secs(5));
+        release.send(()).unwrap();
         assert!(failed.join().is_err());
+        independent.join().unwrap();
+        responsive.expect("a blocked completion report held the shared request driver");
         waiter.join().unwrap();
         let hub = Hub::new();
         hub.cancel();
@@ -5716,7 +5729,6 @@ mod tests {
             batch: Arc::from("batch"), toast: None, hub: Arc::clone(&hub),
             groups: Arc::new(Mutex::new(HashMap::from([(key(head), Arc::clone(&group)), (key(alias), group)]))),
             claimed: Arc::default(), promoted: Mutex::new(HashMap::from([(key(promoted), None)])),
-            reporting: super::super::cli::reporting::Reports::default(),
         };
         // Cancellation winning the mutex first must not turn an already
         // durable root into an interrupted root when its report comes back.
@@ -5860,7 +5872,6 @@ mod tests {
                 groups: Arc::default(),
                 claimed: Arc::default(),
                 promoted: Mutex::default(),
-                reporting: super::super::cli::reporting::Reports::default(),
             };
             assert_eq!(observer.owner_for_path(&output.join("nested.zip")).as_deref(), Some(owner));
             // A carrier's enclosing output need not be a logical receipt's

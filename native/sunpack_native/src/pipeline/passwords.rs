@@ -85,8 +85,8 @@ impl io::Write for KeyBytes {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
-#[derive(Default)]
-pub(super) struct AttemptCache(Mutex<AttemptCacheState>);
+#[derive(Clone, Default)]
+pub(super) struct AttemptCache(Arc<Mutex<AttemptCacheState>>);
 
 #[derive(Default)]
 struct AttemptCacheState {
@@ -187,34 +187,35 @@ impl AttemptCacheState {
     }
 }
 
-pub(super) struct CandidateSet<'a> {
+#[derive(Clone)]
+pub(super) struct CandidateSet {
     explicit: Arc<[Arc<str>]>,
-    snapshot: Option<&'a PasswordSnapshot>,
-    cache: &'a AttemptCache,
-    inherited_scope: Option<&'a Path>,
+    snapshot: Option<Arc<PasswordSnapshot>>,
+    cache: AttemptCache,
+    inherited_scope: Option<Arc<Path>>,
 }
 
-impl<'a> CandidateSet<'a> {
+impl CandidateSet {
     pub(super) fn new(
         explicit: Arc<[Arc<str>]>,
-        snapshot: Option<&'a PasswordSnapshot>,
-        cache: &'a AttemptCache,
-        inherited_scope: Option<&'a Path>,
+        snapshot: Option<Arc<PasswordSnapshot>>,
+        cache: &AttemptCache,
+        inherited_scope: Option<&Path>,
     ) -> Self {
         Self {
             explicit,
             snapshot,
-            cache,
-            inherited_scope,
+            cache: cache.clone(),
+            inherited_scope: inherited_scope.map(Arc::from),
         }
     }
 
-    pub(super) fn with_scope<'b>(&'b self, scope: Option<&'b Path>) -> CandidateSet<'b> {
+    pub(super) fn with_scope(&self, scope: Option<&Path>) -> CandidateSet {
         CandidateSet {
             explicit: Arc::clone(&self.explicit),
-            snapshot: self.snapshot,
-            cache: self.cache,
-            inherited_scope: self.inherited_scope.or(scope),
+            snapshot: self.snapshot.clone(),
+            cache: self.cache.clone(),
+            inherited_scope: self.inherited_scope.clone().or_else(|| scope.map(Arc::from)),
         }
     }
 
@@ -229,14 +230,14 @@ impl<'a> CandidateSet<'a> {
 
     fn configured<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
         let scope = self
-            .inherited_scope
+            .inherited_scope.as_deref()
             .unwrap_or_else(|| Path::new(path).parent().unwrap_or_else(|| Path::new(path)));
-        self.snapshot
+        self.snapshot.as_deref()
             .into_iter()
             .flat_map(move |snapshot| snapshot.scoped(scope).flatten())
             .chain(self.explicit.iter())
             .chain(
-                self.snapshot
+                self.snapshot.as_deref()
                     .into_iter()
                     .flat_map(|snapshot| snapshot.global().iter()),
             )

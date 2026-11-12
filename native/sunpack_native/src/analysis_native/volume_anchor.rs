@@ -30,6 +30,7 @@ const CHEAP_FAST_PROBE_THREADS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VolumeAnchorProbeDepth {
     Cheap,
+    #[cfg(test)]
     Deep,
 }
 
@@ -122,13 +123,6 @@ impl VolumeAnchor {
         self.extent_end()
             .saturating_sub(self.structure_offset.unwrap_or(0))
     }
-}
-
-pub(crate) fn probe_volume_anchor_paths(
-    paths: &[String],
-    path_passwords: Option<&[(String, String)]>,
-) -> Vec<VolumeAnchor> {
-    probe_volume_anchor_paths_with_depth(paths, path_passwords, VolumeAnchorProbeDepth::Deep)
 }
 
 pub(crate) fn probe_volume_anchor_paths_cheap(

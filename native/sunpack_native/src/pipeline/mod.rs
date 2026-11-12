@@ -23,7 +23,7 @@ pub(crate) use checkpoint::PromotedSource;
 pub use coordinator::Engine;
 pub(crate) use coordinator::{common_ancestor, common_output_base};
 pub(crate) use discovery::scan_options;
-pub(crate) use scheduling::MAX_PENDING_JOBS;
+pub(crate) use scheduling::{stage, Join as RequestHandle, MAX_PENDING_JOBS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -55,6 +55,7 @@ impl std::fmt::Display for BusyConflict {
 
 impl std::error::Error for BusyConflict {}
 
+#[derive(Clone)]
 pub struct Request {
     pub inputs: Vec<PathBuf>,
     pub mode: Mode,
@@ -489,7 +490,7 @@ pub enum Event {
 
 /// Publication callbacks form the durable boundary for Watch. A failed callback
 /// stops the corresponding filesystem operation and propagates to the request.
-pub(crate) trait Observer: Sync {
+pub(crate) trait Observer: Send + Sync {
     fn notify(&self, event: Event);
 
     fn worker_updates(&self) -> WorkerUpdates {
@@ -617,7 +618,7 @@ pub(crate) enum WorkerUpdates {
     None,
 }
 
-impl<F: Fn(Event) + Sync> Observer for F {
+impl<F: Fn(Event) + Send + Sync> Observer for F {
     fn notify(&self, event: Event) {
         self(event);
     }

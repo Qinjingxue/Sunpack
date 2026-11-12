@@ -978,10 +978,6 @@ impl NativeEventLog {
     pub(crate) fn error(&self) -> std::io::Result<Option<String>> {
         Ok(self.shared()?.state.lock().unwrap().error.clone())
     }
-    pub(crate) fn close(&mut self) {
-        let owner = self.owner.take();
-        (drop(owner));
-    }
 }
 impl NativeEventLog {
     pub(crate) fn reset(&self, rows: Vec<Value>) -> std::io::Result<()> {
