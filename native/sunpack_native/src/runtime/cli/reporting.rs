@@ -8,38 +8,38 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
 
 #[derive(Default)]
-pub(super) struct Reports {
-    state: Mutex<State>,
+pub(crate) struct Reports<T = Vec<ArchiveResult>> {
+    state: Mutex<State<T>>,
     ready: Condvar,
 }
 
 #[derive(Default)]
-struct State {
+struct State<T> {
     closed: bool,
     sequence: u64,
     // Keep creation, latest reset/phase, progress and resource state per task.
     // Sorting their sequence numbers preserves ordering without a progress backlog.
     events: HashMap<(TaskId, u8), (u64, Event)>,
-    reports: VecDeque<Report>,
+    reports: VecDeque<Report<T>>,
 }
 
-struct Report {
+struct Report<T> {
     id: TaskId,
-    archives: Vec<ArchiveResult>,
-    reply: Arc<Reply>,
+    archives: T,
+    reply: Arc<Reply<T>>,
 }
 
 #[derive(Default)]
-struct Reply(Mutex<ReplyState>);
+pub(crate) struct Reply<T>(Mutex<ReplyState<T>>);
 
 #[derive(Default)]
-struct ReplyState {
-    value: Option<io::Result<Vec<ArchiveResult>>>,
+struct ReplyState<T> {
+    value: Option<io::Result<T>>,
     waker: Option<Waker>,
 }
 
-impl Reply {
-    fn complete(&self, value: io::Result<Vec<ArchiveResult>>) {
+impl<T> Reply<T> {
+    pub(crate) fn complete(&self, value: io::Result<T>) {
         let mut state = self.0.lock().unwrap();
         state.value = Some(value);
         let waker = state.waker.take();
@@ -48,14 +48,24 @@ impl Reply {
             waker.wake();
         }
     }
+    pub(crate) async fn wait(&self) -> io::Result<T> {
+        poll_fn(|cx| {
+            let mut state = self.0.lock().unwrap();
+            match state.value.take() {
+                Some(value) => Poll::Ready(value),
+                None => { state.waker = Some(cx.waker().clone()); Poll::Pending }
+            }
+        }).await
+    }
+
 }
 
 fn unavailable() -> io::Error {
-    io::Error::other("CLI output service stopped")
+    io::Error::other("Output service stopped")
 }
 
-impl Reports {
-    pub(super) fn notify(&self, event: Event) {
+impl<T: Default + Send> Reports<T> {
+    pub(crate) fn notify(&self, event: Event) {
         let key = match &event {
             Event::Queued { id, .. } => (*id, 0),
             Event::Progress { id, .. } => (*id, 2),
@@ -84,11 +94,11 @@ impl Reports {
         }
     }
 
-    pub(super) async fn finish(
+    pub(crate) async fn finish(
         &self,
         id: TaskId,
-        archives: Vec<ArchiveResult>,
-    ) -> io::Result<Vec<ArchiveResult>> {
+        archives: T,
+    ) -> io::Result<T> {
         let reply = Arc::new(Reply::default());
         {
             let mut state = self.state.lock().unwrap();
@@ -100,24 +110,15 @@ impl Reports {
             state.reports.push_back(Report { id, archives, reply: Arc::clone(&reply) });
             self.ready.notify_one();
         }
-        poll_fn(|cx| {
-            let mut state = reply.0.lock().unwrap();
-            match state.value.take() {
-                Some(value) => Poll::Ready(value),
-                None => {
-                    state.waker = Some(cx.waker().clone());
-                    Poll::Pending
-                }
-            }
-        }).await
+        reply.wait().await
     }
 
-    pub(super) fn serve<T>(
+    pub(crate) fn serve<R>(
         &self,
         notify: impl Fn(Event) + Sync,
-        finish: impl Fn(TaskId, &[ArchiveResult]) -> io::Result<()> + Sync,
-        execute: impl FnOnce() -> T,
-    ) -> T {
+        finish: impl Fn(TaskId, &T) -> io::Result<()> + Sync,
+        execute: impl FnOnce() -> R,
+    ) -> R {
         self.state.lock().unwrap().closed = false;
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -167,17 +168,17 @@ impl Reports {
     }
 }
 
-struct Close<'a>(&'a Reports);
+struct Close<'a, T: Default + Send>(&'a Reports<T>);
 
-impl Drop for Close<'_> {
+impl<T: Default + Send> Drop for Close<'_, T> {
     fn drop(&mut self) {
         self.0.close();
     }
 }
 
-struct FailedReply(Arc<Reply>);
+pub(crate) struct FailedReply<T>(pub(crate) Arc<Reply<T>>);
 
-impl Drop for FailedReply {
+impl<T> Drop for FailedReply<T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.0.complete(Err(unavailable()));
@@ -227,7 +228,7 @@ mod tests {
         // A byte-buffer test cannot detect blocking the archive poll or copying
         // large result vectors. Hold the output callback while sibling reports
         // enqueue and verify both polls return before the output is released.
-        let reports = Reports::default();
+        let reports = Reports::<Vec<ArchiveResult>>::default();
         let (entered, waiting) = mpsc::channel();
         let (release, capacity) = mpsc::channel();
         let capacity = Mutex::new(capacity);
@@ -272,7 +273,7 @@ mod tests {
     #[test]
     fn output_errors_and_panics_settle_waiters_and_service_can_restart() {
         // A dead output thread must not leave a request parked indefinitely.
-        let reports = Reports::default();
+        let reports = Reports::<Vec<ArchiveResult>>::default();
         let error = reports.serve(
             |_| {}, |_, _| Err(io::Error::other("broken output")),
             || block_on(reports.finish(1, vec![archive("failed.zip")])),
@@ -293,7 +294,7 @@ mod tests {
 
         // Queue both before starting the service so notify deterministically
         // panics after the active report is dequeued, but before finish runs.
-        let reports = Reports::default();
+        let reports = Reports::<Vec<ArchiveResult>>::default();
         reports.notify(Event::Working { id: 4 });
         let mut pending = Box::pin(reports.finish(4, vec![archive("notify-panic.zip")]));
         let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
@@ -309,7 +310,7 @@ mod tests {
 
     #[test]
     fn merged_phases_preserve_panel_resets() {
-        let reports = Reports::default();
+        let reports = Reports::<Vec<ArchiveResult>>::default();
         reports.notify(Event::Progress {
             id: 1, path: "work.zip".into(), completed_bytes: 60, total_bytes: 100,
         });

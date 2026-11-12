@@ -681,6 +681,7 @@ struct Signals {
     volumes_changed: bool,
     rebuild: Vec<mpsc::SyncSender<io::Result<bool>>>,
     cancel: Vec<(String, mpsc::SyncSender<bool>)>,
+    roots: Vec<RootCompleted>,
     completed: Vec<String>,
 }
 
@@ -764,6 +765,11 @@ impl Hub {
         true
     }
 
+    fn root_completed(&self, root: RootCompleted) {
+        self.signals.lock().unwrap().roots.push(root);
+        self.wake.notify_one();
+    }
+
     fn batch_completed(&self, batch: String) {
         // Intake is stopped before drain, but in-flight completions still own
         // the wake that lets drain finish without polling or blocking joins.
@@ -775,6 +781,7 @@ impl Hub {
         let guard = self.signals.lock().unwrap();
         let mut guard = self.wake.wait_while(guard, |signals| {
             signals.completed.is_empty()
+                && signals.roots.is_empty()
                 && signals.cancel.is_empty()
                 && (cancellation_observed || !self.cancelled.load(Ordering::Acquire))
         }).unwrap();
@@ -812,6 +819,7 @@ impl Hub {
                 && value.cancel.is_empty()
                 && value.once.is_empty()
                 && value.completed.is_empty()
+                && value.roots.is_empty()
         };
         let mut guard = if let Some(deadline) = deadline {
             self.wake
@@ -1010,6 +1018,23 @@ struct Pending {
     recovery: Option<Arc<Recovery>>,
 }
 
+// Keep the durable blocker and a generation already queued for regroup under
+// one current root. In particular, a retired batch root must not overwrite the
+// route chosen after a configuration reload.
+fn handoff_promoted_blocker(
+    entry: &mut Arc<crate::watch_store::EntryRecord>,
+    root_id: &str,
+    root: &Root,
+    recovery: Recovery,
+    pending: Option<&mut Pending>,
+) {
+    Arc::make_mut(entry).failure_payload.insert("source_input_root".into(), json!(root.path));
+    if let Some(pending) = pending {
+        pending.root = root_id.to_owned();
+        pending.recovery = Some(Arc::new(recovery));
+    }
+}
+
 #[derive(Debug)]
 struct Recovery {
     scope: NativeDiscoveryScope,
@@ -1060,6 +1085,7 @@ fn scope_record(scope: &NativeDiscoveryScope) -> serde_json::Map<String, Value> 
 struct ClaimedSources {
     cancelled: bool,
     candidates: HashMap<String, Option<WatchCandidateRow>>,
+    finished: HashSet<String>,
 }
 
 impl ClaimedSources {
@@ -1102,6 +1128,42 @@ impl Drop for BatchCompletion {
     fn drop(&mut self) {
         self.hub.batch_completed(self.batch.take().unwrap());
     }
+}
+
+#[derive(Default)]
+struct RootReport {
+    path: PathBuf,
+    outcome: Outcome,
+}
+
+struct RootReportCompletion {
+    activity: super::toast::Activity,
+    id: crate::pipeline::TaskId,
+    failed: bool,
+}
+
+impl Drop for RootReportCompletion {
+    fn drop(&mut self) { self.activity.report_finished(self.id, self.failed); }
+}
+
+struct RootCompleted {
+    reply: Arc<super::cli::reporting::Reply<Outcome>>,
+    batch: String,
+    id: crate::pipeline::TaskId,
+    path: PathBuf,
+    groups: HashMap<String, Arc<SourceGroup>>,
+    completed: Completed,
+}
+
+struct CompletionContext {
+    root: String,
+    recovery: Option<Arc<Recovery>>,
+    passwords: Arc<crate::core::passwords::PasswordSnapshot>,
+    inputs: Vec<WatchCandidateRow>,
+    touched: HashSet<String>,
+    groups: HashMap<String, Arc<SourceGroup>>,
+    toast: Option<super::toast::Activity>,
+    task: Option<crate::pipeline::TaskId>,
 }
 
 struct Completed {
@@ -1554,6 +1616,9 @@ impl Scheduler {
             for (batch, waiter) in signals.cancel {
                 let _ = waiter.send(self.cancel_display_batch(&batch));
             }
+            for root in signals.roots {
+                if let Err(error) = self.complete_root(root) { result = Err(error); }
+            }
             for completed in signals.completed {
                 if result.is_err() {
                     self.abandon_completed(&completed);
@@ -1621,6 +1686,9 @@ impl Scheduler {
                 let _ = waiter.send(self.cancel_display_batch(&batch));
             }
             let mut completion_error = None;
+            for root in signals.roots {
+                if let Err(error) = self.complete_root(root) { completion_error = Some(error); }
+            }
             for completed in signals.completed {
                 if completion_error.is_some() {
                     self.abandon_completed(&completed);
@@ -2546,31 +2614,7 @@ impl Scheduler {
         &self,
         entry: &crate::watch_store::EntryRecord,
     ) -> Option<(String, Option<Arc<Recovery>>)> {
-        let payload = &entry.failure_payload;
-        if let Some(root) = payload.get("source_input_root").and_then(Value::as_str) {
-            let root = watch_path_key(root);
-            let (_, watched_scope) = self.roots.get(&root)?;
-            if let Some(scope) = payload.get("discovery_scope").and_then(Value::as_object) {
-                let password_scope = payload
-                    .get("password_scope_dir")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let recovery = Recovery::from_record(scope, password_scope)?;
-                if recovery.scope.contains(&entry.path)
-                    && (watch_path_key(&recovery.scope.root) != root
-                        || !watched_scope.contains(&entry.path)
-                        || self.catalog.is_owned(&entry.path)
-                        || payload.get("details").is_some_and(|details| {
-                            details["promoted_nested_input"].as_bool() == Some(true)
-                        }))
-                {
-                    return Some((root, Some(Arc::new(recovery))));
-                }
-            }
-        }
-        self.roots
-            .iter()
-            .find_map(|(id, (_, scope))| scope.contains(&entry.path).then(|| (id.clone(), None)))
+        route_blocker(entry, &self.roots, |path| self.catalog.is_owned(path))
     }
 
     fn recover_pending(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
@@ -3241,19 +3285,40 @@ impl Scheduler {
                     groups: worker_groups,
                     claimed: worker_claimed,
                     promoted: Mutex::default(),
+                    reporting: super::cli::reporting::Reports::default(),
                 };
-                let result = engine.run_with(request, &observer);
+                let result = if let Some(toast) = &observer.toast {
+                    observer.reporting.serve(|_| {}, |id, report| {
+                        toast.record_root(id, &report.path, &report.outcome);
+                        Ok(())
+                    }, || engine.run_with(request, &observer))
+                } else {
+                    engine.run_with(request, &observer)
+                };
                 let cancelled = worker_cancel.cancelled();
                 if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
                     let cleanup = output_cleanup_error(&result);
                     let outputs = observer.outputs.lock().unwrap();
                     let groups = observer.groups.lock().unwrap();
-                    toast.record(
-                        cleanup.map_or(path.as_path(), |error| error.path.as_path()),
-                        &result,
-                        cancelled && cleanup.is_none(),
-                        |path| completion_owner(path, &outputs, &groups),
-                    );
+                    if result.is_err() && cleanup.is_none() {
+                        let claimed = observer.claimed.lock().unwrap();
+                        let mut reported = HashSet::new();
+                        for (source_key, source) in &observer.owners {
+                            if claimed.finished.contains(source_key) { continue; }
+                            let source = groups.get(source_key).map_or(Path::new(source), |group| group.path.as_path());
+                            if reported.insert(key(source)) {
+                                toast.record(source, &result, cancelled,
+                                    |path| completion_owner(path, &outputs, &groups));
+                            }
+                        }
+                    } else {
+                        toast.record(
+                            cleanup.map_or(path.as_path(), |error| error.path.as_path()),
+                            &result,
+                            cancelled && cleanup.is_none(),
+                            |path| completion_owner(path, &outputs, &groups),
+                        );
+                    }
                 }
                 let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
                 let outputs = std::mem::take(&mut *observer.outputs.lock().unwrap());
@@ -3322,7 +3387,8 @@ impl Scheduler {
             .filter_map(|(_, candidate)| candidate.as_ref());
         let mut interrupted = crate::watch_store::NativeWatchOperations::empty();
         for input in active.inputs.iter().chain(siblings) {
-            if NativePresence::at(&input.path).is_absent() {
+            if claimed.finished.contains(&watch_path_key(&input.path))
+                || NativePresence::at(&input.path).is_absent() {
                 continue;
             }
             let id = watch_path_key(&input.path);
@@ -3360,15 +3426,51 @@ impl Scheduler {
         }
     }
 
-    fn complete(&mut self, batch: &str) -> io::Result<()> {
-        let Some(active) = self.active.remove(batch) else {
+    fn complete_root(&mut self, root: RootCompleted) -> io::Result<()> {
+        let _reply = super::cli::reporting::FailedReply(Arc::clone(&root.reply));
+        let Some(active) = self.active.get_mut(&root.batch) else {
+            root.reply.complete(Err(io::Error::other("Watch request already retired")));
             return Ok(());
         };
-        let mut completed = active
-            .thread
-            .join()
+        let members: HashSet<_> = root.groups.keys().cloned()
+            .chain(std::iter::once(key(&root.path))).collect();
+        let mut inputs = Vec::new();
+        let mut touched = HashSet::new();
+        let mut remaining = Vec::new();
+        for input in std::mem::take(&mut active.inputs) {
+            let id = watch_path_key(&input.path);
+            if members.contains(&id) {
+                if active.touched.remove(&id) { touched.insert(id); }
+                inputs.push(input);
+            } else { remaining.push(input); }
+        }
+        active.inputs = remaining;
+        for (index, input) in active.inputs.iter().enumerate() {
+            if let Some((_, slot)) = self.active_paths.get_mut(&watch_path_key(&input.path)) { *slot = index; }
+        }
+        let context = CompletionContext {
+            root: active.root.clone(), recovery: active.recovery.clone(), passwords: Arc::clone(&active.passwords),
+            inputs, touched, groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
+        };
+        let result = self.apply_completion(&root.batch, context, root.completed);
+        let error = result.as_ref().err().map(|error| io::Error::new(error.kind(), error.to_string()));
+        root.reply.complete(result);
+        error.map_or(Ok(()), Err)
+    }
+
+    fn complete(&mut self, batch: &str) -> io::Result<()> {
+        let Some(active) = self.active.remove(batch) else { return Ok(()); };
+        let mut completed = active.thread.join()
             .map_err(|_| io::Error::other("Watch extraction thread failed"))?;
         completed.cancelled |= active.cancel.cancelled();
+        let groups = std::mem::take(&mut *active.groups.lock().unwrap());
+        self.apply_completion(batch, CompletionContext {
+            root: active.root, recovery: active.recovery, passwords: active.passwords,
+            inputs: active.inputs, touched: active.touched, groups, toast: active.toast, task: None,
+        }, completed).map(|_| ())
+    }
+
+    fn apply_completion(&mut self, batch: &str, active: CompletionContext, mut completed: Completed) -> io::Result<Outcome> {
         let mut unfinished = HashSet::new();
         if completed.cancelled {
             let state = self.journal.state();
@@ -3387,8 +3489,8 @@ impl Scheduler {
                 };
             }
         }
-        let groups = std::mem::take(&mut *active.groups.lock().unwrap());
-        if let Some(toast) = &active.toast {
+        let groups = active.groups;
+        if let Some(toast) = active.toast.as_ref().filter(|_| active.task.is_none()) {
             toast.finish(
                 &completed.result,
                 completed.cancelled,
@@ -3419,7 +3521,7 @@ impl Scheduler {
                 self.journal.log(json!({"event":"pipeline_request_interrupted","owner":batch,"error":error.to_string()}));
                 self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
-                return Ok(());
+                return Ok(Outcome::default());
             }
             Err(error) => {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
@@ -3461,7 +3563,7 @@ impl Scheduler {
                 }
                 self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
-                return Ok(());
+                return Ok(Outcome::default());
             }
         };
         let input_failures = outcome.input_failures();
@@ -3567,33 +3669,37 @@ impl Scheduler {
             );
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
             payload.insert("details".into(), json!({"promoted_nested_input":true}));
-            if let Some((root, scope)) = self.roots.get(&active.root) {
+            if let Some((_, scope)) = self.roots.get(&active.root) {
                 payload.insert("source_input_root".into(), json!(scope.root));
-                // Publish the moved name before handing it off. In a one-shot
-                // run or a fast completion there may be no event to add it yet.
-                if regroup {
-                    for path in &group.members {
-                        if scope.contains(path) && !self.catalog.is_owned(path) {
-                            self.scan_options(root.deep).catalog_update(
-                                &self.catalog,
-                                scope,
-                                Some(path),
-                            )?;
-                        }
+            }
+            let Some((route_root, _)) = self.blocker_route(&entry) else {
+                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                    &candidate.path, None,
+                ));
+                continue;
+            };
+            let (root, scope) = &self.roots[&route_root];
+            // Root reload can transfer ownership to a different current root.
+            // Publish and persist under that route, never the retired batch root.
+            if regroup {
+                for path in &group.members {
+                    if scope.contains(path) && !self.catalog.is_owned(path) {
+                        self.scan_options(root.deep).catalog_update(
+                            &self.catalog, scope, Some(path),
+                        )?;
                     }
                 }
             }
+            let payload = &entry.failure_payload;
             let password_updated = payload
                 .get("password_signature")
                 .and_then(Value::as_str)
                 .is_some_and(|previous| previous != current_passwords.scope_signature(&recovery.password_scope));
             let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
-            if let Some(pending) = pending {
-                // Other promoted volumes may already have arrived before this
-                // blocker was published. Keep the queued generation and hand
-                // it the promotion's discovery and password boundaries.
-                pending.recovery = Some(Arc::new(recovery));
-                pending.root.clone_from(&active.root);
+            let handed_off = pending.is_some();
+            handoff_promoted_blocker(&mut entry, &route_root, root,
+                recovery, pending);
+            if handed_off {
                 self.unpublished.insert(id.clone());
                 operations.put_entry(entry);
             } else {
@@ -3695,6 +3801,12 @@ impl Scheduler {
                     entry
                 })
             };
+            if retryable && record.as_ref().is_some_and(|entry| self.blocker_route(entry).is_none()) {
+                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                    &candidate.path, None,
+                ));
+                continue;
+            }
             if let Some(record) = &record {
                 let path = Path::new(&candidate.path);
                 let directory = active.recovery.as_ref().map_or_else(
@@ -3762,7 +3874,10 @@ impl Scheduler {
         }
         self.persist_candidates(BTreeMap::new(), false)?;
         self.arm_idle_cleanup();
-        Ok(())
+        if let (Some(toast), Some(task)) = (&active.toast, active.task) {
+            toast.root_finished(task, &outcome);
+        }
+        Ok(outcome)
     }
 
     fn arm_idle_cleanup(&mut self) {
@@ -3818,6 +3933,41 @@ fn promoted_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailu
     archive.promoted && !archive.partial && failures
         .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))
         .is_some_and(InputFailure::retryable)
+}
+
+// Completion and retry admission share the current Watch boundary. An old
+// request may finish after roots have changed, but cannot republish a blocker
+// that the current scheduler could never admit.
+fn route_blocker(
+    entry: &crate::watch_store::EntryRecord,
+    roots: &BTreeMap<String, (Root, NativeDiscoveryScope)>,
+    is_owned: impl Fn(&str) -> bool,
+) -> Option<(String, Option<Arc<Recovery>>)> {
+    let payload = &entry.failure_payload;
+    if let Some(root) = payload.get("source_input_root").and_then(Value::as_str) {
+        let root = watch_path_key(root);
+        let (_, watched_scope) = roots.get(&root)?;
+        if let Some(scope) = payload.get("discovery_scope").and_then(Value::as_object) {
+            let password_scope = payload
+                .get("password_scope_dir")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let recovery = Recovery::from_record(scope, password_scope)?;
+            if recovery.scope.contains(&entry.path)
+                && (watch_path_key(&recovery.scope.root) != root
+                    || !watched_scope.contains(&entry.path)
+                    || is_owned(&entry.path)
+                    || payload.get("details").is_some_and(|details| {
+                        details["promoted_nested_input"].as_bool() == Some(true)
+                    }))
+            {
+                return Some((root, Some(Arc::new(recovery))));
+            }
+        }
+    }
+    roots
+        .iter()
+        .find_map(|(id, (_, scope))| scope.contains(&entry.path).then(|| (id.clone(), None)))
 }
 
 fn completion_owner(
@@ -3979,6 +4129,7 @@ struct WatchObserver {
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
     claimed: Arc<Mutex<ClaimedSources>>,
     promoted: Mutex<HashMap<String, Option<WatchCandidateRow>>>,
+    reporting: super::cli::reporting::Reports<RootReport>,
 }
 
 impl WatchObserver {
@@ -3997,6 +4148,56 @@ impl WatchObserver {
 }
 
 impl Observer for WatchObserver {
+    async fn root_finished(&self, id: crate::pipeline::TaskId, path: &Path, outcome: Outcome) -> io::Result<Outcome> {
+        // Seal completion before report backpressure. Cancellation uses the
+        // same gate while writing interrupted entries, including all volumes.
+        {
+            let mut claimed = self.claimed.lock().unwrap();
+            let groups = self.groups.lock().unwrap();
+            claimed.finished.insert(key(path));
+            if let Some(group) = groups.get(&key(path)) {
+                claimed.finished.extend(group.members.iter().map(|path| watch_path_key(path)));
+            }
+        }
+        let (groups, outputs, promoted) = {
+        let mut shared_groups = self.groups.lock().unwrap();
+        let members: HashSet<_> = shared_groups.get(&key(path))
+            .map(|group| group.members.iter().map(|path| watch_path_key(path)).collect())
+            .unwrap_or_else(|| HashSet::from([key(path)]));
+        let groups = members.iter().filter_map(|key| shared_groups.remove(key).map(|group| (key.clone(), group))).collect();
+        drop(shared_groups);
+        let mut shared_outputs = self.outputs.lock().unwrap();
+        let output_keys: Vec<_> = shared_outputs.iter().filter(|(_, owner)| members.contains(&watch_path_key(owner)))
+            .map(|(key, _)| key.clone()).collect();
+        let outputs = output_keys.into_iter().filter_map(|key| shared_outputs.remove(&key).map(|owner| (key, owner))).collect();
+        drop(shared_outputs);
+        let mut shared_promoted = self.promoted.lock().unwrap();
+        let mut promoted = HashMap::new();
+        for archive in outcome.archives.iter().filter(|archive| archive.promoted) {
+            for path in archive.source_paths.iter().chain(std::iter::once(&archive.path)) {
+                let key = key(path);
+                if let Some(candidate) = shared_promoted.remove(&key) { promoted.insert(key, candidate); }
+            }
+        }
+        drop(shared_promoted);
+        (groups, outputs, promoted)
+        };
+        let reply = Arc::new(super::cli::reporting::Reply::default());
+        self.hub.root_completed(RootCompleted {
+            reply: Arc::clone(&reply), batch: self.batch.to_string(), id, path: path.to_owned(), groups,
+            completed: Completed { cancelled: false, result: Ok(outcome), promoted, outputs },
+        });
+        let outcome = reply.wait().await?;
+        if let Some(toast) = &self.toast {
+            let mut completion = RootReportCompletion { activity: toast.clone(), id, failed: true };
+            match self.reporting.finish(id, RootReport { path: path.to_owned(), outcome }).await {
+                Ok(_) => completion.failed = false,
+                Err(error) => eprintln!("SunPack toast failure report service: {error}"),
+            }
+        }
+        Ok(Outcome::default())
+    }
+
     fn worker_updates(&self) -> crate::pipeline::WorkerUpdates {
         if self.toast.is_some() {
             crate::pipeline::WorkerUpdates::All
@@ -4526,6 +4727,118 @@ mod tests {
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
 
     #[test]
+    fn completion_blockers_follow_reloaded_roots_without_losing_recovery_routes() {
+        let root = Root { path: r"C:\watch".into(), output: None,
+            recursive: true, deep: false, scanned: false };
+        let id = key(&root.path);
+        let recursive = NativeDiscoveryScope::new(r"C:\watch".into(), None, Vec::new());
+        let shallow = NativeDiscoveryScope::new(r"C:\watch".into(), Some(0), Vec::new());
+        let candidate = WatchCandidateRow {
+            path: r"C:\watch\sub\archive.part1.rar".into(), size: 42, mtime: 1.0,
+            observation: crate::filesystem::WatchFileObservation {
+                file_id: String::new(), change_usn: 0, change_reasons: 0,
+                change_reasons_without_close: 0, change_reasons_known: false,
+                change_reason_error: String::new(),
+            },
+        };
+        // Both kinds can return from a request admitted before root reload.
+        for status in ["failed_password", "suspended_missing_volume"] {
+            let mut entry = observed_entry(&candidate, status, None);
+            let roots = BTreeMap::from([(id.clone(), (root.clone(), recursive.clone()))]);
+            assert!(route_blocker(&entry, &roots, |_| false).is_some());
+            assert!(route_blocker(&entry, &BTreeMap::new(), |_| false).is_none());
+            let roots = BTreeMap::from([(id.clone(), (root.clone(), shallow.clone()))]);
+            assert!(route_blocker(&entry, &roots, |_| false).is_none());
+            // A different current root may legitimately own the old input.
+            let sub = Root { path: r"C:\watch\sub".into(), ..root.clone() };
+            let roots = BTreeMap::from([(key(&sub.path), (sub,
+                NativeDiscoveryScope::new(r"C:\watch\sub".into(), None, Vec::new())))]);
+            assert!(route_blocker(&entry, &roots, |_| false).is_some());
+
+            // Promoted recovery is intentionally allowed outside the ordinary
+            // scan scope, but only while its original input root still exists.
+            entry.path = r"D:\output\inner.zip".into();
+            entry.failure_payload.insert("source_input_root".into(), json!(root.path));
+            entry.failure_payload.insert("discovery_scope".into(), Value::Object(scope_record(
+                &NativeDiscoveryScope::new(r"D:\output".into(), Some(0), Vec::new()))));
+            entry.failure_payload.insert("password_scope_dir".into(), json!(r"C:\watch"));
+            let roots = BTreeMap::from([(id.clone(), (root.clone(), shallow.clone()))]);
+            assert!(route_blocker(&entry, &roots, |_| true).unwrap().1.is_some());
+            assert!(route_blocker(&entry, &BTreeMap::new(), |_| true).is_none());
+        }
+    }
+
+    #[test]
+    fn promoted_regroup_handoff_persists_the_new_current_root() {
+        let marker = crate::test_support::temp_file("watch_rerouted_promotion", b"");
+        let directory = marker.with_extension("state");
+        let root = Root { path: r"C:\watch".into(), output: None,
+            recursive: true, deep: false, scanned: false };
+        let root_id = key(&root.path);
+        let roots = BTreeMap::from([(root_id.clone(), (root.clone(),
+            NativeDiscoveryScope::new(r"C:\watch".into(), None, Vec::new())))]);
+        let candidate = WatchCandidateRow {
+            path: r"C:\watch\old\inner.part1.rar".into(), size: 42, mtime: 1.0,
+            observation: crate::filesystem::WatchFileObservation {
+                file_id: "promoted-generation".into(), change_usn: 9, change_reasons: 0,
+                change_reasons_without_close: 0, change_reasons_known: false,
+                change_reason_error: String::new(),
+            },
+        };
+        let recovery = Recovery {
+            scope: NativeDiscoveryScope::new(r"C:\watch\old".into(), Some(0), Vec::new()),
+            password_scope: r"C:\passwords".into(),
+        };
+        let mut entry = Arc::new(observed_entry(&candidate, "suspended_missing_volume", None));
+        let payload = &mut Arc::make_mut(&mut entry).failure_payload;
+        payload.insert("discovery_scope".into(), Value::Object(scope_record(&recovery.scope)));
+        payload.insert("password_scope_dir".into(), json!(recovery.password_scope));
+        payload.insert("details".into(), json!({"promoted_nested_input":true}));
+        let mut pending = Pending {
+            root: watch_path_key(r"C:\watch\old"), candidate,
+            quiet: quiet::Quiet::default(), due: Instant::now(), force: true, recovery: None,
+        };
+        let due = pending.due;
+        // Old A was removed; current B covers the promoted file. This is the
+        // exact fallback route that completion must hand to an existing queue.
+        let (route, _) = route_blocker(&entry, &roots, |_| false).unwrap();
+        handoff_promoted_blocker(&mut entry, &route, &roots[&route].0,
+            recovery, Some(&mut pending));
+        assert_eq!(pending.root, root_id);
+        assert_eq!(pending.due, due);
+        assert_eq!(pending.candidate.observation.change_usn, 9);
+        let (current, _) = &roots[&pending.root];
+        let recovery = pending.recovery.as_ref().unwrap();
+        {
+            let journal = journal::Journal::open(&directory).unwrap();
+            journal.commit(true, |state| {
+                let candidate = &pending.candidate;
+                let (mut operations, _) = state.pending_operations([(
+                    PendingObservation(candidate.path.clone(), candidate.size as i64,
+                        candidate.mtime, candidate.observation.file_id.clone(),
+                        candidate.observation.change_usn),
+                    current.path.to_string_lossy().into_owned(), Some(scope_record(&recovery.scope)),
+                )], pending.force, &recovery.password_scope.to_string_lossy(), true, true, None)?;
+                operations.put_entry(Arc::clone(&entry));
+                Ok(operations)
+            }).unwrap();
+        }
+        {
+            let journal = journal::Journal::open(&directory).unwrap();
+            let record = journal.state().pending(&pending.candidate.path).unwrap();
+            assert_eq!(watch_path_key(&record.source_input_root), root_id);
+            assert_eq!(record.change_usn, 9);
+            assert_eq!(record.password_scope_dir, r"C:\passwords");
+            let entry = journal.state().entry(&pending.candidate.path).unwrap();
+            let (route, recovery) = route_blocker(&entry, &roots, |_| true).unwrap();
+            assert_eq!(route, root_id);
+            assert!(recovery.unwrap().scope.contains(&pending.candidate.path));
+        }
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
     fn scan_diagnostics_do_not_override_watch_completion() {
         use crate::pipeline::{InputError, InputErrorKind};
         let root = Path::new(r"C:\watch\outer.zip");
@@ -4852,6 +5165,93 @@ mod tests {
     }
 
     #[test]
+    fn root_completion_wakes_watch_and_drain_before_batch_exit() {
+        // A batch completion test cannot detect a root-only wake being ignored
+        // while another native task is still running.
+        fn root() -> RootCompleted {
+            RootCompleted { reply: Arc::default(), batch: "batch".into(), id: 1, path: "a.zip".into(), groups: HashMap::new(),
+                completed: Completed { cancelled: false, result: Ok(Outcome::default()),
+                    promoted: HashMap::new(), outputs: BTreeMap::new() } }
+        }
+        let hub = Arc::new(Hub::new());
+        let waiting = Arc::clone(&hub);
+        let (send, receive) = mpsc::channel();
+        let thread = thread::spawn(move || { send.send(waiting.wait(None)).unwrap(); });
+        hub.root_completed(root());
+        let signals = receive.recv_timeout(std::time::Duration::from_secs(5)).expect("root did not wake Watch");
+        assert_eq!(signals.roots.len(), 1);
+        assert!(signals.completed.is_empty());
+        thread.join().unwrap();
+        hub.stop();
+        hub.root_completed(root());
+        hub.batch_completed("batch".into());
+        let signals = hub.wait_drain(true);
+        assert_eq!(signals.roots.len(), 1);
+        assert_eq!(signals.completed, ["batch"]);
+    }
+
+    #[test]
+    fn settled_root_handoff_moves_receipts_and_all_volume_owners_without_waiting_for_siblings() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct NoWake;
+        impl Wake for NoWake { fn wake(self: Arc<Self>) {} }
+        let marker = crate::test_support::temp_file("root_handoff", b"");
+        let directory = marker.with_extension("journal");
+        let head = Path::new(r"C:\watch\a.001");
+        let alias = Path::new(r"C:\watch\a.002");
+        let other = Path::new(r"C:\watch\b.zip");
+        let output = Path::new(r"C:\watch\a");
+        let other_output = Path::new(r"C:\watch\b");
+        let promoted = Path::new(r"C:\watch\nested.zip");
+        let group = Arc::new(SourceGroup { path: head.into(), name: "a".into(), multipart: true,
+            members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
+        let hub = Arc::new(Hub::new());
+        let observer = WatchObserver {
+            journal: Arc::new(journal::Journal::open(&directory).unwrap()),
+            owners: HashMap::from([(key(alias), alias.to_string_lossy().into_owned())]),
+            output_scopes: Arc::from([]),
+            outputs: Mutex::new(BTreeMap::from([(key(output), alias.to_string_lossy().into_owned()),
+                (key(other_output), other.to_string_lossy().into_owned())])),
+            batch: Arc::from("batch"), toast: None, hub: Arc::clone(&hub),
+            groups: Arc::new(Mutex::new(HashMap::from([(key(head), Arc::clone(&group)), (key(alias), group)]))),
+            claimed: Arc::default(), promoted: Mutex::new(HashMap::from([(key(promoted), None)])),
+            reporting: super::super::cli::reporting::Reports::default(),
+        };
+        // Cancellation winning the mutex first must not turn an already
+        // durable root into an interrupted root when its report comes back.
+        observer.claimed.lock().unwrap().cancelled = true;
+        let mut outcome = Outcome::default();
+        outcome.archives.push(completion_archive(head.to_str().unwrap(), 1, None));
+        let mut child = completion_archive(promoted.to_str().unwrap(), 2, Some(FailureKind::WrongPassword));
+        child.promoted = true;
+        outcome.archives.push(child);
+        let allocation = outcome.archives.as_ptr();
+        let mut future = Box::pin(observer.root_finished(1, head, outcome));
+        let waker = Waker::from(Arc::new(NoWake));
+        assert!(future.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        let signals = hub.wait(None);
+        let root = signals.roots.into_iter().next().unwrap();
+        assert_eq!(root.completed.result.as_ref().unwrap().archives.as_ptr(), allocation);
+        assert_eq!(root.groups.len(), 2);
+        assert_eq!(root.completed.outputs.len(), 1);
+        assert_eq!(root.completed.promoted.len(), 1);
+        assert!(observer.groups.lock().unwrap().is_empty());
+        assert_eq!(observer.outputs.lock().unwrap().len(), 1);
+        assert!(observer.claimed.lock().unwrap().finished.contains(&key(alias)));
+        assert!(observer.claimed.lock().unwrap().finished.contains(&key(head)));
+        root.reply.complete(root.completed.result);
+        let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) else {
+            panic!("disabled notifications must not enqueue a report wait");
+        };
+        assert!(result.unwrap().archives.is_empty());
+        drop(future);
+        drop(observer);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
     fn cancelling_claimed_volumes_preserves_a_replaced_sibling_generation() {
         let head = crate::test_support::temp_file("cancel_head", b"first volume");
         let sibling = crate::test_support::temp_file("cancel_sibling", b"old volume");
@@ -4960,6 +5360,7 @@ mod tests {
                 groups: Arc::default(),
                 claimed: Arc::default(),
                 promoted: Mutex::default(),
+                reporting: super::super::cli::reporting::Reports::default(),
             };
             assert_eq!(observer.owner_for_path(&output.join("nested.zip")).as_deref(), Some(owner));
             // A carrier's enclosing output need not be a logical receipt's

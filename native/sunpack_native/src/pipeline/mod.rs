@@ -360,9 +360,16 @@ pub struct Outcome {
     pub(crate) removed_promotion_dirs: Vec<String>,
     #[serde(skip)]
     scan_incomplete: bool,
+    #[serde(skip)]
+    uncommitted: bool,
 }
 
 impl Outcome {
+    fn settled(&self) -> bool {
+        !self.uncommitted && !self.archives.iter().any(|archive| archive.failure.as_ref()
+            .is_some_and(|failure| failure.kind == FailureKind::Cancelled))
+    }
+
     pub(crate) fn input_failures(&self) -> HashMap<String, InputFailure<'_>> {
         let mut inputs: HashMap<String, InputFailure<'_>> = HashMap::new();
         for archive in &self.archives {
@@ -467,6 +474,14 @@ pub(crate) trait Observer: Sync {
 
     fn worker_updates(&self) -> WorkerUpdates {
         WorkerUpdates::All
+    }
+
+    // The default keeps the caller's aggregate result. Watch transfers a
+    // settled root to its ordinary completion queue without cloning receipts.
+    fn root_finished(
+        &self, _id: TaskId, _path: &Path, outcome: Outcome,
+    ) -> impl std::future::Future<Output = io::Result<Outcome>> + Send {
+        async { Ok(outcome) }
     }
 
     fn archive_branch(&self, _parent: &ArchiveResult, _child: &ArchiveResult) {}

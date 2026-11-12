@@ -836,7 +836,11 @@ impl<'run, O: Observer> Run<'run, O> {
                 inherited_scope.clone(),
                 children.clone(),
             );
-            Box::pin(async move { (id, cancelled, branch.await) })
+            Box::pin(async move {
+                let result = branch.await;
+                let result = if depth == 1 { self.finish_root(id, &cancelled.path, result).await } else { result };
+                (id, cancelled, result)
+            })
         }).await;
         let mut first_error = None;
         for (id, mut cancelled, branch) in executed {
@@ -863,6 +867,7 @@ impl<'run, O: Observer> Run<'run, O> {
             outcome.archives.append(&mut branch.archives);
             outcome.errors.append(&mut branch.errors);
             outcome.scan_incomplete |= branch.scan_incomplete;
+            outcome.uncommitted |= branch.uncommitted;
             outcome.checkpoints.append(&mut branch.checkpoints);
             outcome.cleanup_results.append(&mut branch.cleanup_results);
             outcome
@@ -873,6 +878,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 .append(&mut branch.removed_promotion_dirs);
         }
         first_error.map_or(Ok(outcome), Err)
+    }
+
+    async fn finish_root(&self, id: TaskId, path: &Path, result: io::Result<Outcome>) -> io::Result<Outcome> {
+        if result.as_ref().is_ok_and(Outcome::settled) {
+            self.observer.root_finished(id, path, result.unwrap()).await
+        } else { result }
     }
 
     fn queue_task(
@@ -1000,6 +1011,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 None
             };
             let mut completed = Vec::with_capacity(task.inputs.len());
+            let mut outputs_committed = true;
             let mut children = Outcome::default();
             let retry = task.retry.filter(|_| task.inputs.len() == 1);
             let mut promotion_sources = task.owned_paths;
@@ -1215,11 +1227,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 // A cancelled newly created root remains uncommitted until
                 // request-level rollback has joined all recursive writers.
                 let commit_completed = !cancel.cancelled();
+                outputs_committed &= commit_completed || result.retained || result.output.is_none();
                 if commit_completed || result.retained {
                     self.observer.commit_output(&result, checkpoint.as_ref())?;
                     // Cancellation after this durable commit must not roll it
                     // back. Match main's commit/check then retire ordering.
-                    if commit_completed && !multi && result.failure.is_none() {
+                    if commit_completed && !multi && (result.failure.is_none() || result.partial) {
                         if let Some(output) = result.output.as_deref() {
                             self.created_outputs.lock().unwrap().commit_if_unowned(output);
                         }
@@ -1238,6 +1251,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 children.archives.append(&mut descendants.archives);
                 children.errors.append(&mut descendants.errors);
                 children.scan_incomplete |= descendants.scan_incomplete;
+                children.uncommitted |= descendants.uncommitted;
                 children
                     .cleanup_results
                     .append(&mut descendants.cleanup_results);
@@ -1251,8 +1265,9 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 completed.push(result);
             }
-            if multi && !cancel.cancelled()
-                && completed.iter().all(|result| result.failure.is_none())
+            if multi && outputs_committed && children.settled()
+                && completed.iter().all(|result| !result.failure.as_ref()
+                    .is_some_and(|failure| failure.kind == FailureKind::Cancelled))
             {
                 if let Some(root) = carrier.as_ref().filter(|_| {
                     completed.iter().any(|result| result.output.is_some())
@@ -1260,7 +1275,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     // The segments have separate receipts. Retire the carrier
                     // registration too, before its ancestors can commit and
                     // source cleanup can consume the archive.
-                    let first = completed.first_mut().expect("carrier has logical inputs");
+                    let first = completed.iter_mut().find(|result| result.output.is_some()
+                        && (result.failure.is_none() || result.partial))
+                        .expect("carrier has an accepted output");
                     let segment = first.output.replace(root.clone());
                     let published = self.observer.commit_output(first, None);
                     first.output = segment;
@@ -1321,11 +1338,14 @@ impl<'run, O: Observer> Run<'run, O> {
                 )
                 .await?;
             }
-            let complete = completed
+            // Cleanup belongs to this physical source family, not its output
+            // descendants. A failed/partial inner archive must keep its own
+            // source, but does not revoke a fully extracted outer source.
+            let sources_complete = completed
                 .iter()
                 .all(|result| result.failure.is_none() && !result.partial)
-                && subtree_complete(&children)
                 && !cancel.cancelled();
+            let complete = sources_complete && subtree_complete(&children);
             // A Watch request may have been admitted before another batch moved
             // these members. The source leases now cover the actual resolved family.
             let admitted_promoted: Vec<_> = promotion_sources
@@ -1335,8 +1355,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         .map(|source| (path, source))
                 })
                 .collect();
-            if complete && self.request.mode == Mode::Extract {
-                if watch_root {
+            if sources_complete && self.request.mode == Mode::Extract {
+                if watch_root && complete {
                     self.observer.sources_processed(&completed, &generations)?;
                 }
                 let mode = if depth > 1 {
@@ -1421,6 +1441,7 @@ impl<'run, O: Observer> Run<'run, O> {
             outcome
                 .cleanup_results
                 .append(&mut children.cleanup_results);
+            outcome.uncommitted = !outputs_committed || children.uncommitted;
             drop(lease);
             if depth == 1 && self.request.mode == Mode::Extract && !cancel.cancelled() {
                 outcome.archives = self
@@ -4213,6 +4234,57 @@ mod tests {
         assert!(!observer.0.lock().unwrap().contains(&sibling));
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn retained_parent_does_not_publish_new_child_before_its_commit_boundary() {
+        struct Roots(std::sync::atomic::AtomicUsize);
+        impl Observer for Roots {
+            fn notify(&self, _: Event) {}
+            async fn root_finished(&self, _: TaskId, _: &Path, _: Outcome) -> io::Result<Outcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Outcome::default())
+            }
+        }
+        // Exercise the production root handoff and filesystem rollback at the
+        // post-worker/pre-commit boundary. Retained parents are not rollback
+        // owners, so a new child must independently prove durable completion.
+        for partial in [false, true] {
+            let source = crate::test_support::temp_file("retained_root_cancel", b"archive");
+            let parent = source.with_extension("retained");
+            let child = parent.join("child");
+            fs::create_dir_all(&child).unwrap();
+            fs::write(parent.join("old.txt"), b"old retained data").unwrap();
+            fs::write(child.join("new.txt"), b"new extraction").unwrap();
+            let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "parent".into());
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(Vec::new(), Mode::Extract);
+            let observer = Roots(std::sync::atomic::AtomicUsize::new(0));
+            let run = test_run(&engine, &request, &observer);
+            let mut outer = receipt(&input, DiscoverySource::Direct, 1);
+            outer.retained = true;
+            outer.output = Some(parent.clone());
+            let mut nested = receipt(&input, DiscoverySource::Direct, 2);
+            nested.output = Some(child.clone());
+            nested.partial = partial;
+            if partial { nested.failure = Some(Failure::new(FailureKind::Damaged, "accepted files")); }
+            run.created_outputs.lock().unwrap().register(&child, &nested);
+            let mut outcome = Outcome::default();
+            outcome.archives = vec![outer, nested];
+            outcome.uncommitted = true; // cancellation preceded the child's durable commit
+            request.cancel.cancel();
+            let mut outcome = Scheduler::new().run(1, Origin::Foreground, &Cancellation::new(), |_| {
+                Box::pin(run.finish_root(1, &source, Ok(outcome)))
+            }).unwrap();
+            assert_eq!(observer.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            run.created_outputs.lock().unwrap().rollback(&observer, &mut outcome).unwrap();
+            assert!(parent.join("old.txt").is_file());
+            assert!(!child.exists());
+            assert_eq!(outcome.archives[1].failure.as_ref().unwrap().kind, FailureKind::Cancelled);
+            assert!(!outcome.settled());
+            fs::remove_dir_all(parent).unwrap();
+            fs::remove_file(source).unwrap();
+        }
     }
 
     #[test]

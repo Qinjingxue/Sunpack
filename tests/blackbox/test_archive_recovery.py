@@ -248,6 +248,42 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
     assert not list(output.rglob("nested.zip"))
 
 
+
+@pytest.mark.parametrize("requirement,cleanup", [("complete", "d"), ("allow_partial", "d"), ("complete", "k")])
+def test_nested_failure_does_not_revoke_outer_source_cleanup(package, tmp_path, requirement, cleanup):
+    # Existing recovery tests retain a damaged *outer* source. This inverse
+    # boundary catches coupling its successful extraction to a failed child,
+    # while checking that cleanup still retains that child's physical source.
+    inner = BytesIO()
+    with zipfile.ZipFile(inner, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("good.txt", b"verified inner member")
+        archive.writestr("bad.txt", b"damaged inner member")
+        bad = archive.getinfo("bad.txt")
+    damaged = bytearray(inner.getvalue())
+    damaged[bad.header_offset + 30 + len(bad.filename)] ^= 1
+    source = tmp_path / "outer.zip"
+    source.write_bytes(_zip_bytes({"inner.zip": damaged, "outer.txt": b"outer success"}))
+    package.configure(
+        extraction={"content_requirement": requirement},
+        recursive_authorization={"enabled": False},
+        post_extract={"flatten_single_directory": False},
+    )
+    output = tmp_path / "out"
+    report = package.json(
+        "extract", "--direct-file", "-r", "*", "-c", cleanup, "-o", output, source,
+        code=0 if requirement == "allow_partial" else 1,
+    )
+    assert report["summary"]["success_count"] == 1, report
+    assert report["summary"]["partial_success_count"] == (requirement == "allow_partial"), report
+    assert report["summary"]["failed_count"] == (requirement == "complete"), report
+    assert source.exists() == (cleanup == "k")
+    _only_output(output, "outer.txt", b"outer success")
+    _only_output(output, "inner.zip", damaged)
+    if requirement == "allow_partial":
+        _only_output(output, "good.txt", b"verified inner member")
+    else:
+        assert not list(output.rglob("good.txt"))
+
 def test_scan_bounds_filesystem_diagnostics_across_targets_and_subtrees(package, tmp_path):
     archive = tmp_path / "good.wrapped"
     archive.write_bytes(_zip_bytes({"payload.txt": b"valid archive"}))

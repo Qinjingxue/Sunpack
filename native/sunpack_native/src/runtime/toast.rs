@@ -320,6 +320,7 @@ struct Summary {
     failed: usize,
     interrupted: usize,
     rollback_failed: bool,
+    report_failed: bool,
     cleanup_failed: usize,
     output: Option<PathBuf>,
 }
@@ -341,9 +342,13 @@ struct RequestProgress {
     roots: HashMap<TaskId, PathBuf>,
     task_roots: HashMap<TaskId, TaskId>,
     visible_roots: HashSet<TaskId>,
+    settled: HashSet<String>,
+    settled_tasks: HashSet<TaskId>,
+    pending_reports: HashSet<TaskId>,
     name: Option<(TaskId, String)>,
     visible: bool,
     done_bytes: u128,
+    root_done_bytes: HashMap<TaskId, u128>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -455,6 +460,7 @@ impl Group {
                     self.totals.remove(task, finished);
                     if finished && task.visible {
                         request.done_bytes += u128::from(task.planned);
+                        *request.root_done_bytes.entry(request.task_roots[&id]).or_default() += u128::from(task.planned);
                     }
                     if tasks.capacity() > 256 {
                         crate::collections::trim_map(tasks);
@@ -534,7 +540,7 @@ impl Group {
         if !accepted {
             self.totals.done_bytes -= request.done_bytes;
         }
-        self.active_roots -= request.visible_roots.len();
+        self.active_roots -= request.visible_roots.difference(&request.settled_tasks).count();
         if self.requests.capacity() > 256 {
             crate::collections::trim_map(&mut self.requests);
         }
@@ -552,19 +558,26 @@ impl Group {
     }
 
     fn pending(&self) -> bool {
-        self.active_roots != 0 || (self.stopping && !self.requests.is_empty())
+        self.active_roots != 0 || self.requests.values().any(|request| !request.pending_reports.is_empty())
+            || (self.stopping && !self.requests.is_empty())
     }
 }
 
 impl State {
     fn retire_front(&mut self) {
-        let group = self.groups.pop_front().unwrap();
+        let mut group = self.groups.pop_front().unwrap();
         if !group.requests.is_empty() {
             // Invisible scans neither postpone completion nor lose their
             // activity when the completed batch is retired.
             if self.groups.is_empty() {
                 let request = group.requests.keys().next().unwrap();
                 self.groups.push_back(Group::new(request, group.language));
+            }
+            for request in group.requests.values_mut() {
+                if request.visible_roots.iter().all(|id| request.settled_tasks.contains(id)) {
+                    request.visible = false;
+                    request.name = None;
+                }
             }
             self.groups.front_mut().unwrap().requests.extend(group.requests);
         }
@@ -621,7 +634,7 @@ impl Summary {
     ) -> Self {
         if cancelled {
             return Self {
-                interrupted: started.map_or(1, |roots| roots.len().max(1)),
+                interrupted: started.map_or(1, HashSet::len),
                 rollback_failed: output_cleanup_failed,
                 ..Self::default()
             };
@@ -631,33 +644,47 @@ impl Summary {
         }
         let mut summary = Self::default();
         match result {
-            Ok(outcome) => {
-                let roots = completion_roots(outcome, owner);
-                for (root, completion) in &roots {
-                    if started.is_some_and(|started| !started.contains(root)) {
-                        continue;
-                    }
-                    if completion.terminal {
-                        summary.failed += 1;
-                    } else if !completion.retry && completion.accepted {
-                        summary.succeeded += 1;
-                    }
-                }
-                if summary.succeeded != 0 {
-                    let mut outputs = outcome.archives.iter().filter(|archive| {
-                        let root = archive_owner(archive, owner);
-                        roots.get(&root).is_some_and(|completion| completion.accepted
-                            && !completion.terminal && !completion.retry)
-                            && started.is_none_or(|started| started.contains(&root))
-                    }).filter_map(|archive| archive.output.as_deref());
-                    summary.output = crate::pipeline::common_ancestor(outputs.clone())
-                        .or_else(|| outputs.next().map(Path::to_owned));
-                }
-                summary.cleanup_failed = outcome.cleanup_results.iter()
-                    .filter(|result| result.status == CleanupStatus::Failed).count();
-            }
-            Err(_) => summary.failed = started.map_or(1, |roots| roots.len().max(1)),
+            Ok(outcome) => return Self::for_outcome(outcome, output_cleanup_failed, visible, owner, started),
+            Err(_) => summary.failed = started.map_or(1, HashSet::len),
         }
+        summary.cleanup_failed += usize::from(output_cleanup_failed);
+        summary
+    }
+
+    fn for_outcome(
+        outcome: &Outcome,
+        output_cleanup_failed: bool,
+        visible: bool,
+        owner: &impl Fn(&Path) -> Option<String>,
+        started: Option<&HashSet<String>>,
+    ) -> Self {
+        if !visible { return Self::default(); }
+        let mut summary = Self::default();
+
+        let roots = completion_roots(outcome, owner);
+        for (root, completion) in &roots {
+            if started.is_some_and(|started| !started.contains(root)) {
+                continue;
+            }
+            if completion.terminal {
+                summary.failed += 1;
+            } else if !completion.retry && completion.accepted {
+                summary.succeeded += 1;
+            }
+        }
+        if summary.succeeded != 0 {
+            let mut outputs = outcome.archives.iter().filter(|archive| {
+                let root = archive_owner(archive, owner);
+                roots.get(&root).is_some_and(|completion| completion.accepted
+                    && !completion.terminal && !completion.retry)
+                    && started.is_none_or(|started| started.contains(&root))
+            }).filter_map(|archive| archive.output.as_deref());
+            summary.output = crate::pipeline::common_ancestor(outputs.clone())
+                .or_else(|| outputs.next().map(Path::to_owned));
+        }
+        summary.cleanup_failed = outcome.cleanup_results.iter()
+            .filter(|result| result.status == CleanupStatus::Failed
+                && started.is_none_or(|started| started.contains(&result_owner(&result.path, owner)))).count();
         summary.cleanup_failed += usize::from(output_cleanup_failed);
         summary
     }
@@ -667,6 +694,7 @@ impl Summary {
         self.failed += other.failed;
         self.interrupted += other.interrupted;
         self.rollback_failed |= other.rollback_failed;
+        self.report_failed |= other.report_failed;
         self.cleanup_failed += other.cleanup_failed;
         if let Some(output) = other.output {
             self.output = match self.output.take() {
@@ -832,6 +860,61 @@ impl Activity {
         }
     }
 
+    pub(super) fn record_root(&self, id: TaskId, path: &Path, outcome: &Outcome) {
+        let (group_id, language, report) = {
+            let state = self.publisher.shared.state.lock().unwrap();
+            if state.stopping { return; }
+            let Some(group) = state.groups.iter().find(|group| group.requests.contains_key(&self.request))
+                else { return; };
+            if !group.requests[&self.request].visible_roots.contains(&id) { return; }
+            (Arc::clone(&group.id), group.language, Arc::clone(&group.report))
+        };
+        let key = crate::path_keys::path_key(&path.to_string_lossy());
+        if let Err(error) = self.publisher.reports.append_data(&group_id, language, &report,
+            path, Ok(outcome), &|_| Some(key.clone()), None)
+        {
+            if !self.publisher.reports.cancellation.cancelled() {
+                eprintln!("SunPack toast failure report: {error}");
+            }
+        }
+    }
+
+    pub(super) fn root_finished(&self, id: TaskId, outcome: &Outcome) {
+        let mut state = self.publisher.shared.state.lock().unwrap();
+        if state.stopping { return; }
+        let Some(group) = state.groups.iter_mut()
+            .find(|group| group.requests.contains_key(&self.request)) else { return; };
+        let request = group.requests.get_mut(&self.request).unwrap();
+        let Some(path) = request.roots.get(&id) else { return; };
+        let key = crate::path_keys::path_key(&path.to_string_lossy());
+        if !request.settled.insert(key.clone()) { return; }
+        request.done_bytes -= request.root_done_bytes.remove(&id).unwrap_or(0);
+        let visible = request.visible_roots.contains(&id);
+        request.settled_tasks.insert(id);
+        if visible { group.active_roots -= 1; }
+        let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
+        if summary.failed != 0 || summary.cleanup_failed != 0 { request.pending_reports.insert(id); }
+        group.summary.merge(summary);
+        group.generation = group.generation.wrapping_add(1);
+        state.dirty = true;
+        self.publisher.shared.changed.notify_one();
+    }
+
+    pub(super) fn report_finished(&self, id: TaskId, failed: bool) {
+        let mut state = self.publisher.shared.state.lock().unwrap();
+        if state.stopping { return; }
+        if let Some(group) = state.groups.iter_mut()
+            .find(|group| group.requests.contains_key(&self.request))
+        {
+            if group.requests.get_mut(&self.request).unwrap().pending_reports.remove(&id) {
+                group.summary.report_failed |= failed;
+            }
+        }
+        state.settle(Instant::now());
+        state.dirty = true;
+        self.publisher.shared.changed.notify_one();
+    }
+
     pub(super) fn finish(
         &self,
         result: &io::Result<Outcome>,
@@ -839,7 +922,7 @@ impl Activity {
         output_cleanup_failed: bool,
         owner: impl Fn(&Path) -> Option<String>,
     ) {
-        let (visible, started) = {
+        let (visible, started, settled) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping {
                 return;
@@ -849,11 +932,12 @@ impl Activity {
             else {
                 return;
             };
-            (request.visible, if cancelled { request.roots.values().cloned().collect() } else { request.started.clone() })
+            (request.visible, if cancelled { request.roots.values().cloned().collect() } else { request.started.clone() }, request.settled.clone())
         };
         // Receipt projection can be large. It must not hold the presentation
         // gate or prevent disable from cancelling an active report writer.
-        let started = started.iter().map(|path| result_owner(path, &owner)).collect();
+        let started = started.iter().map(|path| result_owner(path, &owner))
+            .filter(|root| !settled.contains(root)).collect();
         let summary = Summary::for_result(result, cancelled, output_cleanup_failed, visible,
             &owner, Some(&started));
         let mut state = self.publisher.shared.state.lock().unwrap();
@@ -878,7 +962,14 @@ impl Activity {
         ignore_request_error: bool,
         owner: impl Fn(&Path) -> Option<String>,
     ) {
-        let (id, language, report, started) = {
+        self.record_data(path, result.as_ref(), ignore_request_error, owner);
+    }
+
+    pub(super) fn record_data(
+        &self, path: &Path, result: Result<&Outcome, &io::Error>, ignore_request_error: bool,
+        owner: impl Fn(&Path) -> Option<String>,
+    ) {
+        let (id, language, report, started, settled) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping || ignore_request_error {
                 return;
@@ -892,10 +983,12 @@ impl Activity {
                 return;
             }
             (Arc::clone(&group.id), group.language, Arc::clone(&group.report),
-                group.requests[&self.request].started.clone())
+                group.requests[&self.request].started.clone(), group.requests[&self.request].settled.clone())
         };
-        let started = started.iter().map(|path| result_owner(path, &owner)).collect();
-        if let Err(error) = self.publisher.reports.append(&id, language, &report, path, result,
+        let started = started.iter().map(|path| result_owner(path, &owner))
+            .filter(|root| result.is_ok() || !settled.contains(root)).collect::<HashSet<_>>();
+        if result.is_err() && !started.contains(&result_owner(path, &owner)) { return; }
+        if let Err(error) = self.publisher.reports.append_data(&id, language, &report, path, result,
             &owner, Some(&started)) {
             if !self.publisher.reports.cancellation.cancelled() {
                 eprintln!("SunPack toast failure report: {error}");
@@ -978,12 +1071,23 @@ impl Reports {
         owner: &impl Fn(&Path) -> Option<String>,
         started: Option<&HashSet<String>>,
     ) -> io::Result<()> {
+        self.append_data(id, language, report, path, result.as_ref(), owner, started)
+    }
+
+    fn append_data(
+        &self, id: &str, language: Language, report: &Mutex<ReportDraft>, path: &Path,
+        result: Result<&Outcome, &io::Error>, owner: &impl Fn(&Path) -> Option<String>,
+        started: Option<&HashSet<String>>,
+    ) -> io::Result<()> {
         self.cancellation.check_io()?;
-        let inputs = result.as_ref().ok().map(Outcome::input_failures);
-        let roots = result.as_ref().ok().map(|outcome| completion_roots(outcome, owner));
+        let inputs = result.ok().map(Outcome::input_failures);
+        let roots = result.ok().map(|outcome| completion_roots(outcome, owner));
         let terminal = |root: &str| started.is_none_or(|started| started.contains(root))
             && roots.as_ref().is_some_and(|roots| roots.get(root).is_some_and(|root| root.terminal));
-        if roots.as_ref().is_some_and(|roots| !roots.keys().any(|root| terminal(root))) {
+        let cleanup = result.ok().is_some_and(|outcome| outcome.cleanup_results.iter().any(|cleanup|
+            cleanup.status == CleanupStatus::Failed
+                && started.is_none_or(|started| started.contains(&result_owner(&cleanup.path, owner)))));
+        if !cleanup && roots.as_ref().is_some_and(|roots| !roots.keys().any(|root| terminal(root))) {
             return Ok(());
         }
         let mut draft = report.lock().unwrap();
@@ -1030,7 +1134,8 @@ impl Reports {
                     for cleanup in outcome
                         .cleanup_results
                         .iter()
-                        .filter(|cleanup| cleanup.status == CleanupStatus::Failed)
+                        .filter(|cleanup| cleanup.status == CleanupStatus::Failed
+                            && started.is_none_or(|started| started.contains(&result_owner(&cleanup.path, owner))))
                     {
                         spool.append(&cleanup.path, &cleanup.message, cleanup)?;
                     }
@@ -1045,6 +1150,7 @@ impl Reports {
     }
 
     fn publish(&self, completed: &Completed, shared: &Shared) -> io::Result<Option<PathBuf>> {
+        if completed.summary.report_failed { return Ok(None); }
         let draft = completed.report.lock().unwrap();
         self.cancellation.check_io()?;
         if draft.poisoned || draft.failures == 0 {
@@ -1531,6 +1637,99 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn failed_report_service_releases_completion_gate_without_publishing_partial_report() {
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let activity = publisher.register(Arc::from("42"), Language::En);
+        activity.event(queued(1, "a.zip", None, 0));
+        progress(&activity, 1, "a.zip", 1, 2);
+        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: false });
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive("a.zip", Some(FailureKind::Damaged)));
+        activity.root_finished(1, &outcome);
+        assert!(publisher.shared.state.lock().unwrap().groups.front().unwrap().pending());
+        activity.report_finished(1, true);
+        assert!(!publisher.shared.state.lock().unwrap().groups.front().unwrap().pending());
+        activity.finish(&Ok(Outcome::default()), false, false, |_| Some("a.zip".into()));
+        finish_debounce(&publisher);
+        let completed = take_completed(&publisher);
+        assert!(completed.summary.report_failed);
+        assert!(publisher.reports.publish(&completed, &publisher.shared).unwrap().is_none());
+    }
+
+    #[test]
+    fn later_root_uses_its_own_name_after_an_earlier_completion_is_published() {
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let activity = publisher.register(Arc::from("41"), Language::En);
+        activity.event(queued(1, "a.zip", None, 0));
+        activity.event(queued(2, "b.zip", None, 0));
+        progress(&activity, 1, "a.zip", 1, 2);
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive("a.zip", None));
+        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: true });
+        activity.root_finished(1, &outcome);
+        activity.report_finished(1, false);
+        finish_debounce(&publisher);
+        take_completed(&publisher);
+        progress(&activity, 2, "b.zip", 1, 2);
+        assert_eq!(current(&publisher).label, "b.zip");
+    }
+
+    #[test]
+    fn settled_roots_survive_sibling_cancel_or_request_error_without_duplicate_reports() {
+        // Unlike projection-only tests, this exercises real incremental root
+        // publication followed by both batch termination paths.
+        for cancelled in [false, true] {
+            let directory = TestDirectory::new();
+            let publisher = publisher(directory.0.clone());
+            let activity = publisher.register(Arc::from("40"), Language::En);
+            for (id, path) in [(1, "a.zip"), (2, "b.zip"), (3, "c.zip")] {
+                activity.event(queued(id, path, None, 0));
+                progress(&activity, id, path, 1, 2);
+            }
+            activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: true });
+            assert_eq!(current(&publisher).status, "0/3 finished");
+            let mut done = Outcome::default();
+            done.archives.push(archive("a.zip", None));
+            done.archives.push(archive("a/nested.zip", None));
+            done.cleanup_results.push(crate::pipeline::CleanupResult {
+                path: "a.zip".into(), mode: "delete", status: CleanupStatus::Failed,
+                error_code: 5, message: "source busy".into(),
+            });
+            activity.root_finished(1, &done);
+            activity.record_root(1, Path::new("a.zip"), &done);
+            activity.report_finished(1, false);
+            assert_eq!(current(&publisher).status, "1/3 finished");
+            let mut failed = Outcome::default();
+            failed.archives.push(archive("c.zip", Some(FailureKind::Damaged)));
+            activity.event(Event::Finished { id: 3, path: "c.zip".into(), depth: 1, success: false });
+            activity.root_finished(3, &failed);
+            activity.record_root(3, Path::new("c.zip"), &failed);
+            activity.report_finished(3, false);
+            assert_eq!(current(&publisher).status, "2/3 finished");
+            let owner = |path: &Path| {
+                let path = path.to_string_lossy();
+                Some(if path.starts_with("a") { "a.zip" } else if path.starts_with("c") {
+                    "c.zip"
+                } else { "b.zip" }.to_owned())
+            };
+            let result = if cancelled { Ok(Outcome::default()) } else { Err(io::Error::other("sibling failed")) };
+            activity.record(Path::new("b.zip"), &result, cancelled, &owner);
+            activity.finish(&result, cancelled, false, &owner);
+            let state = publisher.shared.state.lock().unwrap();
+            let group = state.groups.front().unwrap();
+            assert_eq!(group.summary.succeeded, 1);
+            assert_eq!(group.summary.failed, if cancelled { 1 } else { 2 });
+            assert_eq!(group.summary.interrupted, usize::from(cancelled));
+            assert_eq!(group.summary.cleanup_failed, 1);
+            // Root C and A's cleanup were written before publishing their
+            // completion. Final projection must not append either again.
+            assert_eq!(group.report.lock().unwrap().failures, if cancelled { 2 } else { 3 });
         }
     }
 

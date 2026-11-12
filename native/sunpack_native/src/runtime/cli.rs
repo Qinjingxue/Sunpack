@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod live;
-mod reporting;
+pub(super) mod reporting;
 
 pub(super) struct Host {
     engine: OnceLock<Arc<Engine>>,
@@ -117,18 +117,27 @@ const COMMANDS: &[(&str, &str)] = &[
 impl Options {
     fn parse(argv: &[String]) -> io::Result<Self> {
         let mut args: VecDeque<_> = argv.iter().map(|arg| Cow::Borrowed(arg.as_str())).collect();
-        let Some(command) = args.pop_front() else {
-            return Ok(Self {
-                help: true,
-                ..Self::default()
-            });
+        let mut unrecognized = None;
+        let command = loop {
+            let Some(arg) = args.pop_front() else {
+                if let Some(arg) = unrecognized { return Err(invalid(format!("unrecognized argument: {arg}"))); }
+                return Ok(Self { help: true, ..Self::default() });
+            };
+            if arg == "--" {
+                break args.pop_front().ok_or_else(|| invalid("a command is required"))?;
+            }
+            if !looks_like_option(&arg) { break arg; }
+            if arg.starts_with("-h") && !arg.starts_with("--") {
+                validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), "", "")?;
+                return Ok(Self { help: true, ..Self::default() });
+            }
+            let (flag, inline) = arg.split_once('=').map_or((arg.as_ref(), None), |(f, v)| (f, Some(v)));
+            if flag == "-h" || (flag.starts_with("--") && "--help".starts_with(flag)) {
+                if inline.is_some() { return Err(invalid(format!("{flag} does not take a value"))); }
+                return Ok(Self { help: true, ..Self::default() });
+            }
+            unrecognized.get_or_insert_with(|| arg.into_owned());
         };
-        if matches!(command.as_ref(), "-h" | "--help") {
-            return Ok(Self {
-                help: true,
-                ..Self::default()
-            });
-        }
         let command = COMMANDS
             .iter()
             .find(|(name, alias)| command.as_ref() == *name || command.as_ref() == *alias)
@@ -141,27 +150,50 @@ impl Options {
         let mut positional = false;
         let mut supplied = false;
         let mut after_action = false;
+        let mut paths_closed = false;
+        // argparse reports unknown arguments only after processing actions;
+        // a later help action may exit successfully first.
         while let Some(mut arg) = args.pop_front() {
             supplied = true;
             if arg == "--" && !positional {
+                if paths_closed { unrecognized.get_or_insert_with(|| "--".to_owned()); }
                 after_action |= !options.action.is_empty();
                 positional = true;
                 continue;
             }
             if positional || !looks_like_option(&arg) {
                 if matches!(command, "watch" | "config") && options.action.is_empty() {
-                    options.action = match (command, arg.as_ref()) {
+                    // argparse parses subcommands with their own defaults and option boundary.
+                    options.json = false;
+                    options.verbose = false;
+                    options.pause = false;
+                    options.no_pause = false;
+                    positional = false;
+                    let action = match (command, arg.as_ref()) {
                         ("watch", "rm") => "remove".into(),
                         ("watch", "ls") => "list".into(),
                         ("watch", "st") => "status".into(),
                         _ => arg.into_owned(),
                     };
+                    if !matches!((command, action.as_str()),
+                        ("watch", "add" | "remove" | "startup" | "start" | "status" | "stop" | "reload" | "list" | "rebuild-log")
+                        | ("config", "show" | "validate"))
+                    {
+                        return Err(invalid(format!("invalid action: {action}")));
+                    }
+                    options.action = action;
                 } else {
+                    if paths_closed {
+                        unrecognized.get_or_insert_with(|| arg.into_owned());
+                        continue;
+                    }
                     after_action = true;
                     options.paths.push(arg.into_owned());
                 }
                 continue;
             }
+            paths_closed |= !options.paths.is_empty();
+            validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), command, &options.action)?;
             if !arg.starts_with("--") && arg.len() > 2 && arg.as_bytes()[1].is_ascii() {
                 if b"pPocr".contains(&arg.as_bytes()[1]) {
                     if arg.as_bytes()[2] != b'=' {
@@ -176,6 +208,7 @@ impl Options {
             let (flag, inline) = arg
                 .split_once('=')
                 .map_or((arg.as_ref(), None), |(flag, value)| (flag, Some(value)));
+            let flag = resolve_long_option(flag, command, &options.action)?;
             let mut take = || {
                 inline
                     .map(str::to_owned)
@@ -201,15 +234,23 @@ impl Options {
                 }
                 "-j" | "--json" if command != "version" => options.json = true,
                 "-v" | "--verbose" if common => options.verbose = true,
-                "--pause" if common => options.pause = true,
-                "--no-pause" if common => options.no_pause = true,
+                "--pause" if common => {
+                    if options.no_pause { return Err(invalid("--pause and --no-pause are mutually exclusive")); }
+                    options.pause = true;
+                }
+                "--no-pause" if common => {
+                    if options.pause { return Err(invalid("--pause and --no-pause are mutually exclusive")); }
+                    options.no_pause = true;
+                }
                 "-R" | "--recursive" if archives || watch_add => options.recursive = true,
                 "-d" | "--deep-detect" if archives || watch_add => options.deep = true,
                 "--direct" | "--direct-file" if command == "extract" => options.direct = true,
-                "-f" | "--flatten" if command == "extract" && options.flatten != Some(false) => {
+                "-f" | "--flatten" if command == "extract" => {
+                    if options.flatten == Some(false) { return Err(invalid("--flatten and --no-flatten are mutually exclusive")); }
                     options.flatten = Some(true)
                 }
-                "-F" | "--no-flatten" if command == "extract" && options.flatten != Some(true) => {
+                "-F" | "--no-flatten" if command == "extract" => {
+                    if options.flatten == Some(true) { return Err(invalid("--flatten and --no-flatten are mutually exclusive")); }
                     options.flatten = Some(false)
                 }
                 "-r" | "--recur" if command == "extract" => {
@@ -244,7 +285,10 @@ impl Options {
                 "--scan-rule-stdin" if command == "config" && options.action == "validate" => {
                     options.rule_stdin = true
                 }
-                _ => return Err(invalid(format!("unrecognized argument: {arg}"))),
+                _ => {
+                    unrecognized.get_or_insert_with(|| arg.into_owned());
+                    continue;
+                }
             }
             if inline.is_some() {
                 return Err(invalid(format!("{flag} does not take a value")));
@@ -260,6 +304,9 @@ impl Options {
         };
         if options.help {
             return Ok(options);
+        }
+        if let Some(arg) = unrecognized {
+            return Err(invalid(format!("unrecognized argument: {arg}")));
         }
         if options.no_pause && options.pause {
             return Err(invalid("--pause and --no-pause are mutually exclusive"));
@@ -293,12 +340,79 @@ impl Options {
     }
 }
 
+// argparse validates the arity of an entire short-option cluster before
+// executing any of its actions, including help. Unknown suffixes are deferred.
+fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: &str) -> io::Result<()> {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 2 { return Ok(()); }
+    let archives = matches!(command, "extract" | "scan");
+    let common = archives || command == "watch";
+    let passwords = archives || command == "passwords";
+    let watch_add = command == "watch" && action == "add";
+    for index in 1..arg.len() {
+        let flag = arg.as_bytes()[index];
+        let takes_value = match flag {
+            b'h' => false,
+            b'j' if !command.is_empty() && command != "version" => false,
+            b'v' if common => false,
+            b'R' | b'd' if archives || watch_add => false,
+            b'f' | b'F' if command == "extract" => false,
+            b'a' if passwords => false,
+            b's' if watch_add => false,
+            b'r' | b'c' if command == "extract" => true,
+            b'o' if command == "extract" || watch_add => true,
+            b'p' | b'P' if passwords => true,
+            _ => break,
+        };
+        let tail = &arg[index + 1..]; // recognized option letters are ASCII
+        if takes_value {
+            if tail.is_empty() && next.is_none_or(looks_like_option) {
+                return Err(invalid(format!("-{} expects a value", char::from(flag))));
+            }
+            break;
+        }
+        if tail.starts_with('=') || tail.starts_with('-') {
+            return Err(invalid(format!("-{} does not take a value", char::from(flag))));
+        }
+    }
+    Ok(())
+}
+
+// Resolve only the active argparse parser's long options. Distinct aliases
+// still count as separate matches, even when they set the same destination.
+fn resolve_long_option<'a>(flag: &'a str, command: &str, action: &str) -> io::Result<&'a str> {
+    if !flag.starts_with("--") { return Ok(flag); }
+    let archives = matches!(command, "extract" | "scan");
+    let common = archives || command == "watch";
+    let passwords = archives || command == "passwords";
+    let watch_add = command == "watch" && action == "add";
+    let watch_start = command == "watch" && action == "start";
+    let flags = [
+        ("--help", true), ("--json", command != "version"),
+        ("--verbose", common), ("--pause", common), ("--no-pause", common),
+        ("--recursive", archives || watch_add), ("--deep-detect", archives || watch_add),
+        ("--direct", command == "extract"), ("--direct-file", command == "extract"),
+        ("--flatten", command == "extract"), ("--no-flatten", command == "extract"),
+        ("--recur", command == "extract"), ("--cleanup", command == "extract"),
+        ("--out-dir", command == "extract" || watch_add),
+        ("--password", passwords), ("--pw-file", passwords), ("--ask-pw", passwords),
+        ("--no-builtin-pw", passwords), ("--no-bpw", passwords),
+        ("--once", watch_start), ("--no-tray", watch_start), ("--start", watch_add),
+        ("--scan-rule-stdin", command == "config" && action == "validate"),
+    ];
+    if flags.iter().any(|&(name, enabled)| enabled && name == flag) { return Ok(flag); }
+    let mut matches = flags.iter().filter(|&&(name, enabled)| enabled && name.starts_with(flag));
+    let Some(&(name, _)) = matches.next() else { return Ok(flag); };
+    if matches.next().is_some() { return Err(invalid(format!("ambiguous option: {flag}"))); }
+    Ok(name)
+}
+
 fn looks_like_option(arg: &str) -> bool {
     let Some(value) = arg.strip_prefix('-') else {
         return false;
     };
     // Numeric negative values can be passed as separate arguments, including passwords.
     !value.is_empty()
+        && !arg.contains(' ')
         && !value.bytes().all(|byte| byte.is_ascii_digit())
         && !value.split_once('.').is_some_and(|(integer, fraction)| {
             !fraction.is_empty()
@@ -2390,4 +2504,72 @@ fn watch_command(
         _ => unreachable!(),
     }
     Ok((code, result))
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    // One parser-level regression covers resolution, value consumption and
+    // subparser boundaries; no worker/filesystem is needed for these failures.
+    #[test]
+    fn argparse_option_resolution_and_boundaries() {
+        let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+        let value = parse(&["extract", "--no-builtin-p", "--pass=-secret", "--out=dest", "file.zip"]).unwrap();
+        assert!(value.no_builtins);
+        assert_eq!(value.passwords[0].as_ref(), "-secret");
+        assert_eq!(value.output.as_deref(), Some("dest"));
+        assert_eq!(value.paths, ["file.zip"]);
+        assert!(parse(&["extract", "--direct", "file.zip"]).unwrap().direct);
+        for args in [
+            vec!["extract", "--dire", "file.zip"], // aliases do not collapse ambiguity
+            vec!["extract", "--recu", "file.zip"],
+            vec!["extract", "--no-b", "file.zip"],
+            vec!["watch", "--on", "start"], // action-only flag at parent scope
+            vec!["extract", "--json=true", "file.zip"],
+            vec!["extract", "--pass", "--json", "file.zip"],
+            vec!["extract", "a.zip", "-v", "b.zip"],
+            vec!["extract", "a.zip", "-v", "--", "b.zip"],
+        ] { assert!(parse(&args).is_err(), "{args:?}"); }
+        let value = parse(&["extract", "-vpsecret", "-p", "-.5", "-p", "-with space", "--", "--no-b"]).unwrap();
+        assert!(value.verbose);
+        assert_eq!(value.passwords.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), ["secret", "-.5", "-with space"]);
+        assert_eq!(value.paths, ["--no-b"]);
+        assert_eq!(parse(&["extract", "a.zip", "--", "-b.zip"]).unwrap().paths, ["a.zip", "-b.zip"]);
+        let value = parse(&["watch", "--json", "--", "start", "--on"]).unwrap();
+        assert!(value.once);
+        assert!(!value.json); // child parser defaults replace parent flags in main
+        assert!(parse(&["watch", "start", "--js"]).unwrap().json);
+        assert!(parse(&["config", "validate", "--scan-rule"]).unwrap().rule_stdin);
+        assert_eq!(parse(&["--", "extract", "file.zip"]).unwrap().paths, ["file.zip"]);
+        assert!(parse(&["--he"]).unwrap().help);
+        assert!(parse(&["extract", "--he"]).unwrap().help);
+        for args in [
+            vec!["extract", "a.zip", "-v", "b.zip", "--help"],
+            vec!["extract", "--unknown", "--help"],
+            vec!["--unknown", "--help"],
+            vec!["-hx"],
+            vec!["extract", "-hx"],
+            vec!["extract", "-hp", "secret"],
+            vec!["extract", "-hvpsecret"],
+            vec!["extract", "-hFf"],
+            vec!["--unknown", "extract", "--help"],
+            vec!["watch", "--once", "start", "--help"],
+            vec!["watch", "start", "--unknown", "--help"],
+            vec!["watch", "--help", "invalid"],
+        ] { assert!(parse(&args).unwrap().help, "{args:?}"); }
+        for args in [
+            vec!["extract", "--pass", "--help"],
+            vec!["extract", "-hp", "--help"],
+            vec!["extract", "-hvp", "--help"],
+            vec!["extract", "-hj=true"],
+            vec!["-h=foo"],
+            vec!["extract", "--dire", "--help"],
+            vec!["extract", "--json=true", "--help"],
+            vec!["extract", "--pause", "--no-pause", "--help"],
+            vec!["extract", "-f", "-F", "--help"],
+            vec!["watch", "invalid", "--help"],
+            vec!["config", "invalid", "--help"],
+        ] { assert!(parse(&args).is_err(), "{args:?}"); }
+    }
 }
