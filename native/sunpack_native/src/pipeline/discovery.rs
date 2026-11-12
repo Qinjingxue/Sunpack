@@ -121,7 +121,12 @@ pub(crate) fn scan_options(config: &Config) -> io::Result<NativeDirectoryScanOpt
                 ScanFilterKind::Whitelist(rule) => whitelist.push(rule.compiled()),
                 ScanFilterKind::SizeRange(range) => sizes.push(bounds(range)),
                 ScanFilterKind::MtimeRange(range) => mtimes.push(bounds(range)),
-                ScanFilterKind::Unknown(_) => {}
+                ScanFilterKind::Unknown(name) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unknown filesystem scan filter: {name}"),
+                    ));
+                }
             }
         }
     }
@@ -547,6 +552,13 @@ pub(super) fn retry_volume(
             && input.mode.structured()
             && (original.format.is_empty() || input.format_hint == original.format)
             && required.is_subset(&input.physical_paths().map(path_key).collect())
+            // A live refresh may discover a new volume before the Watch
+            // scheduler has admitted it. Let its close event retry the group.
+            && (request.origin != Origin::Watch
+                || input.physical_paths().all(|path| {
+                    required.contains(&path_key(path))
+                        || crate::filesystem::watch_file_is_ready(path).unwrap_or(false)
+                }))
         {
             return Ok(Some(task));
         }

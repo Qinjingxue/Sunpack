@@ -571,7 +571,9 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     const bool stdin_tty = GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_mode) != 0;
     const bool terminal_resize = stdout_tty && stdin_tty;
     append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u) |
-                     (terminal_resize ? 8u : 0u) | 16u);  // WriteConsoleW or redirected UTF-8, independent of VT.
+                     (terminal_resize ? 8u : 0u) | 16u | (!terminal_size.empty() ? 32u : 0u));
+    // Bit 16 advertises WriteConsoleW or redirected UTF-8, independent of VT.
+    // Bit 32 marks the final field as terminal metadata rather than a user argument.
     append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
     append_u32(wire, static_cast<std::uint32_t>(arguments.size() + !terminal_size.empty()));
     if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, cwd.data(), cwd.size())) {
@@ -700,9 +702,6 @@ void write_stream(DWORD handle_id, const std::string& text) {
     }
 }
 
-// Keep the pause prompt in sync with cli.press_enter in the Python catalog.
-constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
-constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";
 constexpr wchar_t kPersistentUnavailableEn[] = L"SunPack persistent process is unavailable";
 constexpr wchar_t kPersistentUnavailableZh[] = L"SunPack 持久进程不可用";
 constexpr wchar_t kRuntimeLaunchFailedEn[] = L"sunpack runtime failed to launch (Win32 error {error})";
@@ -745,19 +744,8 @@ int wmain(int argc, wchar_t** argv) {
     }
     const bool shutdown_request = argc >= 2 && wcscmp(argv[1], L"--persistent-shutdown") == 0;
     const bool shutdown = shutdown_request;
-    bool pause = false;
-    std::vector<std::wstring> request_arguments;
     const int first_request_argument = shutdown ? 2 : 1;
-    for (int index = first_request_argument; index < argc; ++index) {
-        if (wcscmp(argv[index], L"--pause") == 0) {
-            pause = true;
-        } else {
-            request_arguments.emplace_back(argv[index]);
-        }
-    }
-    if (pause && std::find(request_arguments.begin(), request_arguments.end(), L"--no-pause") == request_arguments.end()) {
-        request_arguments.emplace_back(L"--no-pause");
-    }
+    const std::vector<std::wstring> request_arguments(argv + first_request_argument, argv + argc);
     int code = 1;
     RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd);
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
@@ -810,19 +798,13 @@ int wmain(int argc, wchar_t** argv) {
     const bool ok = outcome == RequestOutcome::Completed;
     if (!ok) code = shutdown ? 0 : 1;
     std::string language;
-    if (pause || (!ok && !shutdown)) {
+    if (!ok && !shutdown) {
         language = cli_language_from_config(launcher_cwd);
     }
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");
     } else if (outcome == RequestOutcome::DeliveryUncertain && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
-    }
-    if (pause && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
-        write_stream(STD_OUTPUT_HANDLE, localized(language, kPressEnterEn, kPressEnterZh));
-        wchar_t buffer[2]{};
-        DWORD read = 0;
-        ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 1, &read, nullptr);
     }
     return code;
 }

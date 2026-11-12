@@ -274,7 +274,7 @@ impl<'a> CandidateSet<'a> {
                 Some(password)
                     if (!needs_password && password.is_empty())
                         || self
-                            .for_path(&input.entry_path)
+                            .configured(&input.entry_path)
                             .any(|candidate| candidate == &password) =>
                 {
                     self.cache.remember_recent(password.clone());

@@ -7,7 +7,12 @@ use std::path::Path;
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
 fn check(name: &str, status: &str, detail: impl Into<String>) -> Value {
-    json!({"name":name,"status":status,"detail":detail.into()})
+    let mut row = json!({"name":name,"status":status});
+    let detail = detail.into();
+    if !detail.is_empty() {
+        row["detail"] = json!(detail);
+    }
+    row
 }
 
 fn checked(name: &str, result: io::Result<String>) -> Value {
@@ -18,7 +23,10 @@ fn checked(name: &str, result: io::Result<String>) -> Value {
 }
 
 pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
-    let settings = config::load_snapshot(cwd);
+    let settings = config::reload_snapshot(cwd).and_then(|snapshot| {
+        crate::pipeline::scan_options(&snapshot.config)?;
+        Ok(snapshot)
+    });
     let mut checks = vec![
         checked(
             "config",

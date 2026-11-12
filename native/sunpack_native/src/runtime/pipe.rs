@@ -24,10 +24,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE,
+};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const MAX_FIELD: usize = 16 * 1024 * 1024;
+const TERMINAL_SIZE_FIELD: u32 = 32;
 const RESIZE: u32 = u32::MAX - 1;
 const CANCEL: u32 = u32::MAX;
 
@@ -289,15 +292,16 @@ impl Read for Reader<'_> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        self.peer.transfer(&self.event, None, |pipe, overlapped| unsafe {
-            ReadFile(
-                pipe,
-                buffer.as_mut_ptr(),
-                buffer.len().min(u32::MAX as usize) as u32,
-                null_mut(),
-                overlapped,
-            )
-        })
+        self.peer
+            .transfer(&self.event, None, |pipe, overlapped| unsafe {
+                ReadFile(
+                    pipe,
+                    buffer.as_mut_ptr(),
+                    buffer.len().min(u32::MAX as usize) as u32,
+                    null_mut(),
+                    overlapped,
+                )
+            })
     }
 }
 
@@ -392,15 +396,17 @@ impl Header {
         }
         let mut argv = Vec::new();
         let mut terminal_size = 80 | 24 << 16;
-        for _ in 0..argc {
+        for index in 0..argc {
             let size = read_u32(input)? as usize;
             let arg = read_text(input, size)?;
-            if let Some(value) = arg.strip_prefix("--_sunpack-terminal-size=") {
-                if let Some(size) = value.split_once('x').and_then(|(width, height)| {
-                    encode_terminal_size(width.parse().ok()?, height.parse().ok()?)
-                }) {
-                    terminal_size = size;
-                }
+            if flags & TERMINAL_SIZE_FIELD != 0 && index + 1 == argc {
+                terminal_size = arg
+                    .strip_prefix("--_sunpack-terminal-size=")
+                    .and_then(|value| value.split_once('x'))
+                    .and_then(|(width, height)| {
+                        encode_terminal_size(width.parse().ok()?, height.parse().ok()?)
+                    })
+                    .ok_or(io::ErrorKind::InvalidData)?;
             } else {
                 argv.push(arg);
             }
@@ -455,14 +461,22 @@ impl<'a> PromptReply<'a> {
             // if an answer already occupies the single response slot.
             let _ = wake.try_send(Vec::new());
         });
-        Ok(Some(Self { slot, sender, receive, _cancellation: cancellation }))
+        Ok(Some(Self {
+            slot,
+            sender,
+            receive,
+            _cancellation: cancellation,
+        }))
     }
 }
 
 impl Drop for PromptReply<'_> {
     fn drop(&mut self) {
         let mut slot = self.slot.lock().unwrap();
-        if slot.as_ref().is_some_and(|sender| Arc::ptr_eq(sender, &self.sender)) {
+        if slot
+            .as_ref()
+            .is_some_and(|sender| Arc::ptr_eq(sender, &self.sender))
+        {
             slot.take();
         }
     }
@@ -648,6 +662,10 @@ impl Session for Connection<'_> {
 
     fn interactive(&self) -> bool {
         self.flags & 2 != 0
+    }
+
+    fn input_is_terminal(&self) -> bool {
+        self.flags & 4 != 0
     }
 
     fn unicode(&self) -> bool {
@@ -940,10 +958,15 @@ mod prompt_tests {
         first_cancel.cancel();
         assert!(first.receive.recv().unwrap().is_empty());
         drop(first);
-        assert!(slot.lock().unwrap().as_ref().is_some_and(|sender| {
-            Arc::ptr_eq(sender, &second.sender)
-        }));
-        assert!(matches!(second.receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|sender| { Arc::ptr_eq(sender, &second.sender) }));
+        assert!(matches!(
+            second.receive.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(in_flight.send(b"late answer".to_vec()).is_err());
         second.sender.send(b"yes".to_vec()).unwrap();
         // A full response channel must not block cancellation.
@@ -1004,9 +1027,17 @@ mod output_cancellation_tests {
             hex(&windows::random_bytes::<16>().unwrap()),
         );
         let security = windows::PipeSecurity::current_user().unwrap();
-        let accept = Accept::arm(&windows::wide(OsStr::new(&name)), &security.attributes(), true)
+        let accept = Accept::arm(
+            &windows::wide(OsStr::new(&name)),
+            &security.attributes(),
+            true,
+        )
+        .unwrap();
+        let mut client = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(name)
             .unwrap();
-        let mut client = OpenOptions::new().read(true).write(true).open(name).unwrap();
         let handles = [accept.event.raw()];
         assert_eq!(
             unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, INFINITE) },

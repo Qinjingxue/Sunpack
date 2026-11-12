@@ -72,10 +72,14 @@ def test_cli_password_values_and_noninteractive_prompt_contract(package):
     prompt = package.json("passwords", "--ask-pw", code=2)
     assert prompt["inputs"]["argv"] == ["passwords", "--ask-pw", "--json"]
     assert prompt["errors"] == ["interactive password input is unavailable in JSON mode"]
+    rejected = package.run("passwords", "--json", "--ask-pw", "--password", "do-not-report")
+    assert rejected.returncode == 2 and "do-not-report" not in rejected.stdout
 
     result = package.run("passwords", "--ask-pw", "--no-bpw", input="  secret  \rquietQpassword\n\n")
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "['  secret  ', 'quietQpassword']" in result.stdout
+    invalid = package.run("passwords", "--ask-pw", input="truncated\x00suffix\n\n")
+    assert invalid.returncode == 2 and "NUL" in invalid.stderr
 
 
 def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
@@ -100,6 +104,37 @@ def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
     path.unlink()
     assert package.json("passwords")["items"][0]["builtin_passwords"] == []
     assert not path.exists()
+
+
+def test_launcher_preserves_flag_like_operands_and_validates_pause_flags(package, tmp_path):
+    archive = tmp_path / "--pause"
+    flag_like = tmp_path / "--_sunpack-terminal-size=80x24"
+    for source in (archive, flag_like):
+        with zipfile.ZipFile(source, "w") as payload:
+            payload.writestr("member.txt", "payload")
+    report = package.run("scan", "--json", "--", archive.name, flag_like.name, cwd=tmp_path)
+    assert report.returncode == 0, (report.stdout, report.stderr)
+    assert json.loads(report.stdout)["summary"]["archive_count"] == 2
+
+    conflict = package.run("scan", archive, "--pause", "--no-pause")
+    assert conflict.returncode == 2
+    assert "mutually exclusive" in conflict.stderr
+
+
+def test_version_uses_package_metadata_only(package, tmp_path):
+    assert package.run("version").stdout.strip() == "test"
+    package.launcher.parent.parent.joinpath("VERSION.txt").unlink()
+    (tmp_path / "VERSION.txt").write_text("version=unrelated\n", encoding="utf-8")
+    missing = package.run("version", cwd=tmp_path)
+    assert missing.returncode == 3 and not missing.stdout
+
+
+def test_drive_relative_path_uses_request_directory(package, tmp_path):
+    archive = tmp_path / "relative.zip"
+    with zipfile.ZipFile(archive, "w") as payload:
+        payload.writestr("member.txt", "payload")
+    report = package.json("scan", f"{tmp_path.drive.lower()}{archive.name}", cwd=tmp_path)
+    assert [Path(item["main_path"]) for item in report["items"]] == [archive]
 
 
 def test_concurrent_cold_start_clients_share_one_runtime(package):

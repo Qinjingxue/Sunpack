@@ -65,8 +65,13 @@ pub(crate) fn resolved_path_key(path: &std::path::Path) -> String {
     for ancestor in path.ancestors() {
         if let Ok(canonical) = std::fs::canonicalize(ancestor) {
             if let Ok(relative) = path.strip_prefix(ancestor) {
+                let resolved = if relative.as_os_str().is_empty() {
+                    canonical
+                } else {
+                    canonical.join(relative)
+                };
                 return path_key(&normalize_windows_extended_prefix(
-                    canonical.join(relative).to_string_lossy().into_owned(),
+                    resolved.to_string_lossy().into_owned(),
                 ));
             }
         }

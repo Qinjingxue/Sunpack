@@ -1,3 +1,4 @@
+use crate::io::atomic_file::rename_no_replace;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -172,12 +173,6 @@ pub(crate) struct WatchCandidateRow {
     pub(crate) size: u64,
     pub(crate) mtime: f64,
     pub(crate) observation: WatchFileObservation,
-}
-
-#[cfg(windows)]
-#[link(name = "Kernel32")]
-extern "system" {
-    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
 }
 
 pub(crate) fn flatten_single_branch_directories(
@@ -472,52 +467,6 @@ fn rename_root_to_visible_work(root: &Path, stats: &mut FlattenStats) -> Option<
 
 fn is_name_collision(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists || matches!(error.raw_os_error(), Some(80 | 183))
-}
-
-#[cfg(windows)]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::{Component, Prefix};
-
-    let wide_path = |path: &Path| -> io::Result<Vec<u16>> {
-        // Win32 directory moves can fail before reaching MAX_PATH when the
-        // path leaves insufficient space for a child component.
-        if path.as_os_str().len() < 248 {
-            return Ok(path.as_os_str().encode_wide().chain([0]).collect());
-        }
-        let path = std::path::absolute(path)?;
-        let (prefix, skip) = match path.components().next() {
-            Some(Component::Prefix(prefix)) => match prefix.kind() {
-                Prefix::Disk(_) => (r"\\?\", 0),
-                Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
-                _ => ("", 0),
-            },
-            _ => ("", 0),
-        };
-        Ok(prefix
-            .encode_utf16()
-            .chain(path.as_os_str().encode_wide().skip(skip))
-            .chain([0])
-            .collect())
-    };
-
-    let source_wide = wide_path(source)?;
-    let destination_wide = wide_path(destination)?;
-    if unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), 0) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    if destination.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination already exists",
-        ));
-    }
-    fs::rename(source, destination)
 }
 
 fn remove_empty_flatten_wrappers(work: &Path, leaf_relative: &Path) -> Result<usize, String> {

@@ -238,15 +238,16 @@ impl Process {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .env("SUNPACK_NATIVE_PROCESS_MODE", mode_name(mode))
-            .env(
-                "SUNPACK_VOLUME_SPACE_POLL_MS",
-                config.space_poll_interval_ms.to_string(),
-            )
-            .env(
+            .env("SUNPACK_NATIVE_PROCESS_MODE", mode_name(mode));
+        if let Some(interval) = config.space_poll_interval_ms {
+            command.env("SUNPACK_VOLUME_SPACE_POLL_MS", interval.to_string());
+        }
+        if let Some(interval) = config.space_status_report_interval_ms {
+            command.env(
                 "SUNPACK_VOLUME_SPACE_STATUS_REPORT_MS",
-                config.space_status_report_interval_ms.to_string(),
+                interval.to_string(),
             );
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

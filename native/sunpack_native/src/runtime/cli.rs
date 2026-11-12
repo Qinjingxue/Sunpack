@@ -2,6 +2,7 @@ use super::{watch, windows, Session, Stream};
 use crate::core::config::{self, CleanupMode, Config, Recursion};
 use crate::core::i18n::Language;
 use crate::core::{passwords, resources};
+use crate::io::cancellation::is_cancellation;
 use crate::pipeline::{
     ArchiveResult, Cancellation, CleanupStatus, Engine, Event, FailureKind, InputError,
     InputErrorKind, Mode, Observer, Outcome, Request, TaskId,
@@ -11,7 +12,7 @@ use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,7 @@ impl Host {
         Self {
             engine: OnceLock::new(),
             passwords: Mutex::default(),
-            idle: Mutex::new(Duration::from_secs(30)),
+            idle: Mutex::new(Duration::from_secs_f64(config::default_idle_seconds())),
             watch: watch::Watch::new(Arc::new(wake)),
         }
     }
@@ -44,8 +45,10 @@ impl Host {
     }
 
     pub(super) fn configure_idle(&self, settings: &Config) {
-        if let Ok(idle) =
-            Duration::try_from_secs_f64(settings.performance.persistent_server_idle_seconds)
+        if let Some(idle) = settings
+            .performance
+            .persistent_server_idle_seconds
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
         {
             *self.idle.lock().unwrap() = idle;
         }
@@ -141,6 +144,7 @@ impl Options {
         while let Some(mut arg) = args.pop_front() {
             supplied = true;
             if arg == "--" && !positional {
+                after_action |= !options.action.is_empty();
                 positional = true;
                 continue;
             }
@@ -193,7 +197,7 @@ impl Options {
                         return Err(invalid(format!("{flag} does not take a value")));
                     }
                     options.help = true;
-                    return Ok(options);
+                    break;
                 }
                 "-j" | "--json" if command != "version" => options.json = true,
                 "-v" | "--verbose" if common => options.verbose = true,
@@ -246,9 +250,6 @@ impl Options {
                 return Err(invalid(format!("{flag} does not take a value")));
             }
         }
-        if options.no_pause && options.pause {
-            return Err(invalid("--pause and --no-pause are mutually exclusive"));
-        }
         let wants_paths = match (command, options.action.as_str()) {
             ("extract" | "scan", "") => true,
             ("watch", "add" | "remove" | "startup") => true,
@@ -257,6 +258,12 @@ impl Options {
             | ("passwords" | "doctor" | "version", "") => false,
             _ => return Err(invalid(format!("invalid action: {}", options.action))),
         };
+        if options.help {
+            return Ok(options);
+        }
+        if options.no_pause && options.pause {
+            return Err(invalid("--pause and --no-pause are mutually exclusive"));
+        }
         if wants_paths && options.paths.is_empty() {
             if !supplied || (command == "watch" && !after_action) {
                 options.help = true;
@@ -270,6 +277,9 @@ impl Options {
             )));
         }
         if matches!(command, "watch" | "config") && options.action.is_empty() {
+            if supplied {
+                return Err(invalid("the following argument is required: action"));
+            }
             options.help = true;
         }
         if options.action == "startup"
@@ -461,7 +471,9 @@ pub(super) fn run(
     if options.json && options.prompt_passwords {
         let language = config::load_language(cwd);
         let mut result = CommandResult::new(options.command);
-        result.inputs = json!({"argv": args});
+        if options.passwords.is_empty() {
+            result.inputs = json!({"argv": args});
+        }
         result
             .errors
             .push(language.text("cli.json_password_prompt_unavailable").into());
@@ -480,27 +492,26 @@ pub(super) fn run(
             .normalized(true)
             .and_then(|config| show_passwords(host, cwd, &options, session, language, config)),
         "config" => show_config(cwd, &options, session, language),
-        "version" => show_version(cwd, session),
+        "version" => show_version(session),
         "doctor" => doctor(cwd, session, options.json, language),
         "watch" => watch_command(host, cwd, &options, session, language, &cancel),
         _ => unreachable!(),
     };
     let (code, result) = match execution {
         Ok(value) => value,
-        Err(_) if cancel.cancelled() => {
-            let mut result = CommandResult::new(options.command);
-            result
-                .errors
-                .push(language.text("interrupt.finished").to_owned());
-            result.summary = json!({"interrupted": true});
-            (130, result)
+        Err(error) if is_cancellation(&error) => {
+            interrupted(&options, session, language, None, Vec::new())?
         }
         Err(error) => {
             let mut result = CommandResult::new(options.command);
+            let (code, message) = match options.command {
+                "version" => (3, "cli.runtime_failure"),
+                "watch" => (1, "cli.operation_failed"),
+                _ => (2, "cli.operation_failed"),
+            };
             result
                 .errors
-                .push(language.translate("cli.operation_failed", &[("error", &error.to_string())]));
-            let code = if options.command == "watch" { 1 } else { 2 };
+                .push(language.translate(message, &[("error", &error.to_string())]));
             (code, result)
         }
     };
@@ -513,21 +524,59 @@ pub(super) fn run(
         for log in &result.logs {
             line(session, Stream::Out, log)?;
         }
-        if options.pause && code != 130 && (options.command != "extract" || code != 0) {
-            let _ = session.read_line(language.text("cli.pause_prompt"))?;
+        if options.pause
+            && session.input_is_terminal()
+            && code != 130
+            && (options.command != "extract" || code != 0)
+        {
+            let _ = session.read_line(language.text("cli.press_enter"))?;
         }
     }
     Ok(code)
 }
 
+fn interrupted(
+    options: &Options,
+    session: &dyn Session,
+    language: Language,
+    inputs: Option<&[PathBuf]>,
+    cleanup_errors: Vec<String>,
+) -> io::Result<(i32, CommandResult)> {
+    let clean = cleanup_errors.is_empty();
+    line(session, Stream::Err, language.text("interrupt.finished"))?;
+    let message = if clean {
+        "interrupt.cleaned"
+    } else {
+        "interrupt.cleanup_failed"
+    };
+    line(session, Stream::Err, language.text(message))?;
+    let mut result = CommandResult::new(options.command);
+    if let Some(paths) = inputs {
+        result.inputs = json!({"paths": paths});
+    }
+    result.summary = json!({"interrupted": true, "cleanup_complete": clean});
+    result.errors = cleanup_errors;
+    Ok((130, result))
+}
+
 pub(super) fn resolve(cwd: &Path, value: &str) -> io::Result<PathBuf> {
     let path = Path::new(value);
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
+    if path.is_absolute() {
+        return std::path::absolute(path);
+    }
+    let mut components = path.components();
+    let relative = match (components.next(), cwd.components().next()) {
+        (Some(Component::Prefix(target)), Some(Component::Prefix(base)))
+            if matches!((target.kind(), base.kind()),
+                (Prefix::Disk(target), Prefix::Disk(base) | Prefix::VerbatimDisk(base))
+                    if target.eq_ignore_ascii_case(&base)) =>
+        {
+            // A same-drive relative path uses the requesting client's directory.
+            components.as_path()
+        }
+        _ => path,
     };
-    std::path::absolute(joined)
+    std::path::absolute(cwd.join(relative))
 }
 
 fn targets(cwd: &Path, options: &Options) -> io::Result<Vec<PathBuf>> {
@@ -545,6 +594,9 @@ fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec
         let value = value.trim_end_matches(['\r', '\n']);
         if value.is_empty() {
             break;
+        }
+        if value.as_bytes().contains(&0) {
+            return Err(invalid("passwords must not contain NUL characters"));
         }
         passwords.push(Arc::from(value));
     }
@@ -1216,7 +1268,7 @@ fn archives(
     };
     let clipboard = cli_clipboard(&settings);
     if cancel.cancelled() {
-        return Err(io::ErrorKind::Interrupted.into());
+        return interrupted(options, session, language, Some(&inputs), Vec::new());
     }
     let common_root = (!scan && (output.is_some() || options.verbose || options.json))
         .then(|| crate::pipeline::common_output_base(&inputs).unwrap_or_else(|| cwd.to_owned()));
@@ -1306,7 +1358,15 @@ fn archives(
         };
         cleared?;
         if cancel.cancelled() {
-            return Err(io::ErrorKind::Interrupted.into());
+            let errors = current
+                .cleanup_results
+                .into_iter()
+                .filter(|receipt| {
+                    receipt.mode == "rollback" && receipt.status == CleanupStatus::Failed
+                })
+                .map(|receipt| format!("{}: {}", receipt.path.display(), receipt.message))
+                .collect();
+            return interrupted(options, session, language, Some(&inputs), errors);
         }
         if scan {
             return report_scan(current, inputs, options, session, language);
@@ -1409,14 +1469,14 @@ fn archives(
             language.text("cli.password_retry_prompt"),
         )?;
         if cancel.cancelled() {
-            return Err(io::ErrorKind::Interrupted.into());
+            return interrupted(options, session, language, Some(&inputs), Vec::new());
         }
         if !retry {
             break;
         }
         let additional = prompt_passwords(session, language)?;
         if cancel.cancelled() {
-            return Err(io::ErrorKind::Interrupted.into());
+            return interrupted(options, session, language, Some(&inputs), Vec::new());
         }
         if additional.is_empty() {
             line(
@@ -2056,7 +2116,13 @@ fn show_config(
     }
     let (path, payload) = config::load_raw(cwd)?;
     result.summary = json!({"config_path": path, "changed": false});
-    if let Err(error) = Config::parse(&payload) {
+    let validation = Config::parse(&payload).and_then(|settings| {
+        if options.action == "validate" {
+            crate::pipeline::scan_options(&settings)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = validation {
         if options.action == "show" {
             return Err(error);
         }
@@ -2091,10 +2157,9 @@ fn show_config(
     Ok((0, result))
 }
 
-fn show_version(cwd: &Path, session: &dyn Session) -> io::Result<(i32, CommandResult)> {
+fn show_version(session: &dyn Session) -> io::Result<(i32, CommandResult)> {
     let path = std::env::current_exe()?.with_file_name("VERSION.txt");
-    let text = std::fs::read_to_string(path)
-        .or_else(|_| std::fs::read_to_string(cwd.join("VERSION.txt")))?;
+    let text = std::fs::read_to_string(path)?;
     let version = text
         .lines()
         .find_map(|line| line.strip_prefix("version="))

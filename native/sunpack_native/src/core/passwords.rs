@@ -333,13 +333,25 @@ impl BuiltinStore {
 
     pub fn open(cwd: &Path) -> io::Result<Self> {
         let path = resources::writable_data_dir(cwd)?.join(FILENAME);
-        if !path.is_file() {
+        let absent = || {
+            fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        };
+        if absent() {
             let _lock = FileMutex::lock(&path, "SunPack.EditableFile")?;
-            if !path.is_file() {
+            if absent() {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                publish(&path, |file| file.write_all(DEFAULT_DOCUMENT.as_bytes()))?;
+                let result = publish(&path, atomic_file::rename_no_replace, |file| {
+                    file.write_all(DEFAULT_DOCUMENT.as_bytes())
+                });
+                if let Err(error) = result {
+                    // An editor that does not use the SunPack mutex can still
+                    // publish between the absence check and the atomic rename.
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
             }
         }
         let store = Self {
@@ -470,7 +482,7 @@ impl BuiltinStore {
                 (end, end, ", \"clipboard_history\": ")
             }
         };
-        publish(&self.path, |file| {
+        publish(&self.path, atomic_file::replace, |file| {
             file.write_all(original[..start].as_bytes())?;
             file.write_all(prefix.as_bytes())?;
             serde_json::to_writer(&mut *file, updated).map_err(invalid_json)?;
@@ -480,7 +492,11 @@ impl BuiltinStore {
     }
 }
 
-fn publish(path: &Path, write: impl FnOnce(&mut fs::File) -> io::Result<()>) -> io::Result<()> {
+fn publish(
+    path: &Path,
+    commit: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     static TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let (temp, mut file) = loop {
         let serial = TEMP_ID.fetch_add(1, Ordering::Relaxed);
@@ -493,7 +509,7 @@ fn publish(path: &Path, write: impl FnOnce(&mut fs::File) -> io::Result<()>) -> 
     };
     let result = write(&mut file).and_then(|()| file.sync_all());
     drop(file);
-    let result = result.and_then(|()| atomic_file::replace(&temp, path));
+    let result = result.and_then(|()| commit(&temp, path));
     if result.is_err() {
         let _ = fs::remove_file(temp);
     }
@@ -573,8 +589,21 @@ fn clipboard_text() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Document, IndexBuilder, PasswordSnapshot};
+    use super::{atomic_file, fs, io, publish, Document, IndexBuilder, PasswordSnapshot, Write};
     use std::path::Path;
+
+    #[test]
+    fn default_password_publication_preserves_concurrent_edit() {
+        let path = crate::test_support::temp_file("builtin_password_creation", b"");
+        fs::remove_file(&path).unwrap();
+        let result = publish(&path, atomic_file::rename_no_replace, |file| {
+            file.write_all(b"default")?;
+            fs::write(&path, b"user edit")
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"user edit");
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn persisted_password_signatures_survive_runtime_migration() {

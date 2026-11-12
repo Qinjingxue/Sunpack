@@ -228,6 +228,10 @@ impl InputCheckpoint {
             .as_ref()
             .map(|container| container.path.as_path())
     }
+    pub(crate) fn retained_container(&self) -> Option<&Path> {
+        let container = self.container.as_ref()?;
+        (container.valid() && self.output.valid()).then_some(container.path.as_path())
+    }
     pub(super) fn children_complete(&self, remaining_depth: usize) -> bool {
         self.children_complete && self.remaining_depth >= remaining_depth
     }
@@ -240,10 +244,18 @@ impl InputCheckpoint {
     }
 
     pub(super) fn relocate(&mut self, source: &Path, destination: &Path) -> bool {
+        let relocate = |path: &Path| {
+            let relative = path.strip_prefix(source).ok()?;
+            Some(if relative.as_os_str().is_empty() {
+                destination.to_path_buf()
+            } else {
+                destination.join(relative)
+            })
+        };
         let mut changed = false;
         let mut mapped = |path: &mut PathBuf| {
-            if let Ok(relative) = path.strip_prefix(source) {
-                *path = destination.join(relative);
+            if let Some(target) = relocate(path) {
+                *path = target;
                 changed = true;
             }
         };
@@ -263,8 +275,8 @@ impl InputCheckpoint {
             .map(|part| &mut part.extent)
             .chain(&mut self.input.ranges)
         {
-            if let Ok(relative) = Path::new(&extent.path).strip_prefix(source) {
-                extent.path = destination.join(relative).to_string_lossy().into_owned();
+            if let Some(target) = relocate(Path::new(&extent.path)) {
+                extent.path = target.to_string_lossy().into_owned();
                 changed = true;
             }
         }
@@ -497,7 +509,15 @@ mod tests {
         generations.insert(key, capture_file_generation(&source).unwrap());
         assert!(!partial.valid_for(&input, &generations));
         assert!(!complete.valid_for(&alternatives, &generations));
+        // Promotion moves the source file itself, not only a containing
+        // directory. Its rebased generation must reopen the new file path.
+        let promoted = source.with_extension("promoted");
+        fs::rename(&source, &promoted).unwrap();
+        let mut complete = complete;
+        complete.promoted(&[(source, promoted.clone())]).unwrap();
+        assert_eq!(complete.entry(), promoted);
+        assert_eq!(Path::new(&complete.input.parts[0].extent.path), promoted);
         fs::remove_dir(output).unwrap();
-        fs::remove_file(source).unwrap();
+        fs::remove_file(promoted).unwrap();
     }
 }

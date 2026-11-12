@@ -139,13 +139,15 @@ impl Engine {
             &self.password_attempts,
             request.password_scope.as_deref(),
         );
-        let options = discovery::scan_options(&request.config)?;
-        let deep_options = request
-            .deep
-            .then(|| {
-                NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            })
-            .transpose()?;
+        let unfiltered = || {
+            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+        let recursive_output = request.mode == Mode::Extract && request.max_depth != 0;
+        let (options, deep_options) = match (request.deep, recursive_output) {
+            (true, false) => (unfiltered()?, None),
+            (true, _) => (discovery::scan_options(&request.config)?, Some(unfiltered()?)),
+            (false, _) => (discovery::scan_options(&request.config)?, None),
+        };
         let analysis = NativeAnalysisConfig::new(
             request
                 .config
@@ -755,7 +757,8 @@ impl CreatedOutputs {
         }
         let discarded = |path: &Path| {
             let key = output_key(path);
-            crate::path_keys::path_ancestors(&key).any(|ancestor| roots.contains(ancestor))
+            let removed = crate::path_keys::path_ancestors(&key).any(|ancestor| roots.contains(ancestor));
+            removed
         };
         for archive in &mut outcome.archives {
             if archive.output.as_deref().is_some_and(&discarded) {
@@ -1183,7 +1186,10 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                     }
                 }
-                if !result.retained
+                // A carrier's segments are independent output trees. Their
+                // containers must keep the original layout for continuation.
+                if !multi
+                    && !result.retained
                     && result.failure.is_none()
                     && self.request.config.post_extract.flatten_single_directory
                     && children_complete
@@ -1248,6 +1254,18 @@ impl<'run, O: Observer> Run<'run, O> {
             if multi && !cancel.cancelled()
                 && completed.iter().all(|result| result.failure.is_none())
             {
+                if let Some(root) = carrier.as_ref().filter(|_| {
+                    completed.iter().any(|result| result.output.is_some())
+                }) {
+                    // The segments have separate receipts. Retire the carrier
+                    // registration too, before its ancestors can commit and
+                    // source cleanup can consume the archive.
+                    let first = completed.first_mut().expect("carrier has logical inputs");
+                    let segment = first.output.replace(root.clone());
+                    let published = self.observer.commit_output(first, None);
+                    first.output = segment;
+                    published?;
+                }
                 let mut created = self.created_outputs.lock().unwrap();
                 if let Some(root) = carrier.as_deref() {
                     created.commit_if_unowned(root);
@@ -1316,21 +1334,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let admitted_promoted: Vec<_> = promotion_sources
                 .iter()
                 .filter_map(|path| {
-                    if !watch_root && self.promoted_sources.is_empty() {
-                        return None;
-                    }
-                    let key = path_key(path);
-                    let generation = generations.get(&key)?;
-                    self.promoted_sources
-                        .get(&key)
-                        .filter(|source| source.matches(generation))
-                        .map(|source| (*source).clone())
-                        .or_else(|| {
-                            watch_root
-                                .then(|| self.observer.promoted_source(path))
-                                .flatten()
-                                .filter(|source| source.matches(generation))
-                        })
+                    self.admitted_promotion(path, &generations, watch_root)
                         .map(|source| (path, source))
                 })
                 .collect();
@@ -1569,6 +1573,29 @@ impl<'run, O: Observer> Run<'run, O> {
         Ok(())
     }
 
+    fn admitted_promotion(
+        &self,
+        path: &str,
+        generations: &HashMap<String, PhysicalFileGeneration>,
+        watch_root: bool,
+    ) -> Option<PromotedSource> {
+        if !watch_root && self.promoted_sources.is_empty() {
+            return None;
+        }
+        let key = path_key(path);
+        let generation = generations.get(&key)?;
+        self.promoted_sources
+            .get(&key)
+            .filter(|source| source.matches(generation))
+            .map(|source| (*source).clone())
+            .or_else(|| {
+                watch_root
+                    .then(|| self.observer.promoted_source(path))
+                    .flatten()
+                    .filter(|source| source.matches(generation))
+            })
+    }
+
     fn checkpoint_for(
         &self,
         input: &ArchiveInput,
@@ -1586,7 +1613,17 @@ impl<'run, O: Observer> Run<'run, O> {
             .find_map(|&index| {
                 let checkpoint = &self.request.checkpoints[index];
                 let destination_matches = match checkpoint.container() {
-                    Some(container) => output_candidate(preferred_carrier, container),
+                    Some(container) => {
+                        output_candidate(preferred_carrier, container)
+                            || (depth == 1
+                                && self
+                                    .admitted_promotion(
+                                        &input.entry_path,
+                                        generations,
+                                        self.request.origin == Origin::Watch,
+                                    )
+                                    .is_some())
+                    }
                     None => output_candidate(&preferred, checkpoint.output()),
                 };
                 if !destination_matches || !checkpoint.valid_for(input, generations) {
@@ -2042,19 +2079,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     if let Some(relative) = relative_to(parent, base) {
                         root.push(relative);
                     } else {
-                        let key = parent.to_string_lossy();
-                        let safe: String = key
-                            .trim_matches(['\\', '/'])
-                            .chars()
-                            .map(|ch| {
-                                if ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-                                    ch
-                                } else {
-                                    '_'
-                                }
-                            })
-                            .collect();
-                        root.push(if safe.is_empty() { "input" } else { &safe });
+                        root.push(mirrored_parent_component(parent));
                     }
                 }
             }
@@ -2505,6 +2530,36 @@ fn subtree_complete(outcome: &Outcome) -> bool {
 
 fn archive_name(input: &ArchiveInput) -> String {
     crate::output_names::output_name_component(&input.logical_name)
+}
+
+fn mirrored_parent_component(parent: &Path) -> String {
+    let mut components = parent.components();
+    let (prefix, tail) = match components.next() {
+        Some(std::path::Component::Prefix(prefix)) => {
+            (prefix.as_os_str().to_string_lossy(), components.as_path())
+        }
+        _ => (std::borrow::Cow::Borrowed(""), parent),
+    };
+    let tail = tail.to_string_lossy();
+    let joined = format!(
+        "{}_{}",
+        prefix.trim_end_matches(':'),
+        tail.trim_matches(['\\', '/'])
+    );
+    let value = joined.trim_matches('_');
+    if value.is_empty() {
+        return "input".into();
+    }
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn common_output_base(inputs: &[PathBuf]) -> Option<PathBuf> {
@@ -3043,7 +3098,7 @@ mod tests {
             let task = thread::spawn(move || {
                 scheduler.run(id, Origin::Watch, &cancel, |_| {
                     Box::pin(async {
-                        let config = WorkerConfig { space_poll_interval_ms: 1000, space_status_report_interval_ms: 1000 };
+                        let config = WorkerConfig { space_poll_interval_ms: Some(1000), space_status_report_interval_ms: Some(1000) };
                         let mut worker = Box::pin(engine.worker(&config, &cancel));
                         let mut pending = Some(pending);
                         poll_fn(|cx| {
@@ -3172,8 +3227,8 @@ mod tests {
                     Box::pin(async move {
                         let process = engine
                             .worker(&WorkerConfig {
-                                space_poll_interval_ms: 1000,
-                                space_status_report_interval_ms: 1000,
+                                space_poll_interval_ms: Some(1000),
+                                space_status_report_interval_ms: Some(1000),
                             }, &Cancellation::new())
                             .await
                             .unwrap();
@@ -3327,8 +3382,8 @@ mod tests {
         let root = source.with_extension("output");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("encrypted.bin"), &rar).unwrap();
-        // The manifest head is sufficient for cheap preparation, but this
-        // departed carrier makes a full embedded scan observable as an error.
+        // A carrier can disappear after its worker manifest was produced.
+        // A missing input is a retired proposal, even after consent.
         let carrier = [0; 1024];
         for answer in [false, true] {
             let engine = Engine::new(PathBuf::from("unused-worker"));
@@ -3364,8 +3419,7 @@ mod tests {
             if answer {
                 assert_eq!(engine.recent_passwords().as_slice(), [Arc::<str>::from("secret")]);
                 assert!(!nested.tasks.is_empty(), "approved archive was not discovered");
-                assert!(nested.scan_errors.into_messages().iter()
-                    .any(|(operation, _, _)| operation == "embedded_scan"));
+                assert!(nested.scan_errors.is_empty(), "departed carrier reported as unreadable");
             } else {
                 assert!(engine.recent_passwords().is_empty());
                 assert!(nested.tasks.is_empty());
@@ -3628,6 +3682,66 @@ mod tests {
             assert_eq!(run.process_or_file_failure(request.cancel.check_io().unwrap_err(), false).kind,
                 FailureKind::Cancelled);
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn watch_volume_retry_waits_for_a_late_writer_to_close() {
+        use std::io::Write;
+        let next_header = [1, 0, 0];
+        let mut start_header = [0_u8; 20];
+        start_header[..8].copy_from_slice(&45_u64.to_le_bytes());
+        start_header[8..16].copy_from_slice(&(next_header.len() as u64).to_le_bytes());
+        start_header[16..].copy_from_slice(&crc32fast::hash(&next_header).to_le_bytes());
+        let mut head = b"\x37\x7A\xBC\xAF\x27\x1C\x00\x04".to_vec();
+        head.extend(crc32fast::hash(&start_header).to_le_bytes());
+        head.extend(start_header);
+        head.resize(64, 0);
+        let marker = crate::test_support::temp_file("late_volume", b"");
+        let root = marker.with_extension("volumes");
+        fs::create_dir(&root).unwrap();
+        let first = root.join("split.7z.001");
+        fs::write(&first, head).unwrap();
+
+        let mut request = Request::new(vec![first.clone()], Mode::Extract);
+        request.origin = Origin::Watch;
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let candidates = CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None);
+        let options = discovery::scan_options(&request.config).unwrap();
+        let discovered = discovery::discover(&request, &options, &candidates).unwrap();
+        let [task] = discovered.tasks.as_slice() else {
+            panic!("expected an incomplete volume group");
+        };
+        let context = task.retry.as_deref().unwrap();
+        let original = receipt(task.entry(), task.source, 1);
+
+        let last = root.join("split.7z.002");
+        let mut writer = fs::File::create(&last).unwrap();
+        writer.write_all(&[0; 13]).unwrap();
+        writer.write_all(&next_header).unwrap();
+        assert!(discovery::retry_volume(&original, context, &options, &candidates, &request)
+            .unwrap().is_none());
+        drop(writer);
+        assert!(discovery::retry_volume(&original, context, &options, &candidates, &request)
+            .unwrap().is_some());
+
+        drop(discovered);
+        release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mirrored_output_names_keep_the_drive_or_share() {
+        assert_eq!(
+            mirrored_parent_component(Path::new(r"D:\Data\file set")),
+            "D_Data_file_set"
+        );
+        assert_eq!(
+            mirrored_parent_component(Path::new(r"\\server\share\folder")),
+            "__server_share_folder"
+        );
     }
 
     #[test]

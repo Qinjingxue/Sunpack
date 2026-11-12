@@ -25,6 +25,14 @@ pub(crate) fn read_password_file(
         }
     }
     while reader.read_line(&mut line)? != 0 {
+        // Some worker backends consume NUL-terminated passwords. Passing this
+        // line through could authenticate its prefix and report a false match.
+        if line.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "passwords must not contain NUL characters",
+            ));
+        }
         for value in line
             .split([
                 '\n', '\r', '\u{000b}', '\u{000c}', '\u{001c}', '\u{001d}', '\u{001e}', '\u{0085}',

@@ -109,6 +109,7 @@ function Invoke-TestStep {
         [Parameter(Mandatory = $true)]
         [string]$Label,
         [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
         [string[]]$Command,
         [int]$TimeoutSeconds = $StepTimeoutSeconds,
         [switch]$QuietOutput,

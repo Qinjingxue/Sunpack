@@ -2,6 +2,7 @@ use std::io;
 mod win {
     use std::ffi::c_void;
     use std::io;
+    use std::path::Path;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
@@ -13,6 +14,40 @@ mod win {
             exclude: *const c_void,
             reserved: *const c_void,
         ) -> i32;
+    }
+
+    pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::path::{Component, Prefix};
+
+        let wide_path = |path: &Path| -> io::Result<Vec<u16>> {
+            // Win32 directory moves can fail before reaching MAX_PATH when the
+            // path leaves insufficient space for a child component.
+            if path.as_os_str().len() < 248 {
+                return Ok(path.as_os_str().encode_wide().chain([0]).collect());
+            }
+            let path = std::path::absolute(path)?;
+            let (prefix, skip) = match path.components().next() {
+                Some(Component::Prefix(prefix)) => match prefix.kind() {
+                    Prefix::Disk(_) => (r"\\?\", 0),
+                    Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+                    _ => ("", 0),
+                },
+                _ => ("", 0),
+            };
+            Ok(prefix
+                .encode_utf16()
+                .chain(path.as_os_str().encode_wide().skip(skip))
+                .chain([0])
+                .collect())
+        };
+
+        let source = wide_path(source)?;
+        let destination = wide_path(destination)?;
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
     pub(crate) fn replace_with_cancel(
         from: &std::path::Path,
@@ -70,7 +105,7 @@ pub(crate) fn sharing_conflict(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32 | 33))
 }
 
-pub(crate) use win::replace_with_cancel;
+pub(crate) use win::{rename_no_replace, replace_with_cancel};
 
 // Existing transaction callers finish publication once started. Opt into
 // cancellable retries only where the owner can discard its temporary file.

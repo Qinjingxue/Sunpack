@@ -1638,17 +1638,17 @@ impl NativeWatchCatalog {
         &self,
 
         scope: &crate::scan::scope::NativeDiscoveryScope,
+        identity: &str,
     ) -> Option<(String, u64, i64)> {
         (|| {
-            let stamp = self.stamp(scope)?;
             let store = self.store.lock().unwrap();
             let saved = store
                 .as_ref()?
                 .stamps
                 .get(&crate::path_keys::path_key(&scope.root))?;
-            (saved.identity == stamp.identity
-                && saved.depth == stamp.depth
-                && saved.excluded == stamp.excluded)
+            (saved.identity == identity
+                && saved.depth == scope.max_depth
+                && saved.excluded == Self::catalog_exclusions(scope))
                 .then(|| saved.cursor.clone())
                 .flatten()
         })()
@@ -1753,15 +1753,18 @@ impl NativeWatchCatalog {
         &self,
 
         scope: &crate::scan::scope::NativeDiscoveryScope,
+        identity: String,
         volume: String,
         journal: u64,
         next_usn: i64,
     ) {
         (|| {
-            let Some(mut stamp) = self.stamp(scope) else {
-                return;
+            let stamp = super::catalog_store::Stamp {
+                identity,
+                depth: scope.max_depth,
+                excluded: Self::catalog_exclusions(scope),
+                cursor: Some((volume, journal, next_usn)),
             };
-            stamp.cursor = Some((volume, journal, next_usn));
             let tables = self.catalogs.lock().unwrap();
             self.persist(
                 &tables,
@@ -1892,19 +1895,10 @@ impl NativeWatchCatalog {
 }
 
 impl NativeWatchCatalog {
-    fn stamp(
-        &self,
-        scope: &crate::scan::scope::NativeDiscoveryScope,
-    ) -> Option<super::catalog_store::Stamp> {
-        let (volume, id, _) = crate::filesystem::watch_path_identity(&scope.root).ok()?;
+    fn catalog_exclusions(scope: &crate::scan::scope::NativeDiscoveryScope) -> Vec<String> {
         let mut excluded = scope.excluded_subtrees();
-        excluded.sort();
-        Some(super::catalog_store::Stamp {
-            identity: format!("{volume}|{id}"),
-            depth: scope.max_depth,
-            excluded,
-            cursor: None,
-        })
+        excluded.sort_unstable();
+        excluded
     }
     fn persist(
         &self,

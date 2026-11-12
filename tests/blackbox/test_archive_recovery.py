@@ -47,6 +47,24 @@ def _only_output(output, name, content):
     return paths[0]
 
 
+def test_carrier_keeps_each_segments_directory_tree(package, tmp_path):
+    package.configure(post_extract={"flatten_single_directory": True})
+    carrier = tmp_path / "carrier.bin"
+    carrier.write_bytes(
+        b"prefix" + _zip_bytes({"wrapper/one.txt": b"first"})
+        + b"between" + _zip_bytes({"wrapper/two.txt": b"second"}) + b"suffix"
+    )
+    output = tmp_path / "out"
+
+    package.json("extract", "-d", "-r", "1", "-o", output, carrier)
+
+    first = _only_output(output, "one.txt", b"first")
+    second = _only_output(output, "two.txt", b"second")
+    assert first.parent.name == second.parent.name == "wrapper"
+    assert first.parent.parent != second.parent.parent
+    assert first.parent.parent.parent == second.parent.parent.parent == output / "carrier"
+
+
 def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, tmp_path):
     carrier = tmp_path / "wrapped.data"
     output = tmp_path / "out"
@@ -65,14 +83,27 @@ def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, 
 
 
 @pytest.mark.requires_watch_broker
-def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(package, tmp_path):
+@pytest.mark.parametrize("nested", [False, True], ids=["root-carrier", "promoted-carrier"])
+def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(package, tmp_path, nested):
     if "SUNPACK_WATCH_BROKER_PIPE_NAME" not in package.env:
         pytest.skip("The isolated Watch Broker service is required")
     watched = tmp_path / "watched"
     watched.mkdir()
-    carrier = watched / "wrapped.data"
+    carrier = watched / "wrapped.jpg"
     output = tmp_path / "out"
-    first, second = _two_payload_carrier(package, tmp_path, carrier)
+    fixture = tmp_path / carrier.name if nested else carrier
+    first, second = _two_payload_carrier(package, tmp_path, fixture)
+    if nested:
+        # The successful receipt is under an outer output. Promotion changes
+        # both the source owner and the preferred output of the retry.
+        (watched / "outer.zip").write_bytes(_zip_bytes({
+            carrier.name: fixture.read_bytes(),
+            "note.txt": b"outer archive",
+        }))
+        package.configure(
+            recursive_authorization={"enabled": False},
+            post_extract={"archive_cleanup_mode": "k", "flatten_single_directory": False},
+        )
     passwords = package.data / "builtin_passwords.json"
     passwords.write_text(json.dumps({"passwords": [{"value": "first-key"}]}), encoding="utf-8")
     package.json("watch", "add", "-d", "-o", output, watched)
@@ -97,7 +128,10 @@ def test_watch_password_retry_recovers_the_failed_sibling_after_hard_crash(packa
     package.json("watch", "start", "--once", "--no-tray")
     assert _only_output(output, "first.txt", first) == first_path
     second_path = _only_output(output, "second.txt", second)
-    assert first_path.relative_to(output).parts[0] == second_path.relative_to(output).parts[0]
+    assert first_path.parent.parent == second_path.parent.parent
+    if nested:
+        assert not carrier.exists()
+        assert (watched / "outer.zip").is_file()
 
 
 def test_deep_discovery_restores_nested_filters_and_consumes_only_generated_archives(package, tmp_path):

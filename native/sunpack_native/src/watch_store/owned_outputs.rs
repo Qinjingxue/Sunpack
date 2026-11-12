@@ -123,6 +123,9 @@ impl NativeWatchState {
         let mut identities = HashMap::new();
         let mut availability = HashMap::new();
         let mut operations = Vec::new();
+        if paths.is_none() {
+            normalize_legacy_aliases(&mut records, &mut operations);
+        }
         // Upgrade old single-path snapshots before building the no-history
         // baseline. Never discover an alias from a replaced directory.
         let legacy = records.iter().filter(|(_, record)| !record["aliases"].is_array())
@@ -249,7 +252,7 @@ impl NativeWatchState {
         let data = self.lock();
         let mut keys = std::collections::BTreeSet::new();
         for path in paths {
-            let key = format!("owned|{}", path_key(path));
+            let key = format!("owned|{}", path_key(path).trim_end_matches('\\'));
             let Some(record) = data.runtime.get(&key).filter(|record| record_matches(record, identity)) else {
                 continue;
             };
@@ -304,6 +307,36 @@ fn same_registration(left: &Value, right: &Value) -> bool {
         } else {
             left["path"] == right["path"]
         }
+}
+
+fn normalize_legacy_aliases(records: &mut BTreeMap<String, Value>, operations: &mut Vec<Operation>) {
+    // An earlier resolver appended a separator to the canonical name of an
+    // existing directory. Event ancestor keys never contain that separator.
+    let old = records.iter().filter(|(key, record)| {
+        key.ends_with('\\') || record_paths(record).any(|path| path.ends_with(['\\', '/']))
+    }).map(|(key, record)| (key.clone(), record.clone())).collect::<Vec<_>>();
+    for (key, mut record) in old {
+        let normalized = key.trim_end_matches('\\');
+        if normalized != key {
+            records.remove(&key);
+            operations.push(Operation::Runtime(key.clone(), None));
+            if records.contains_key(normalized) {
+                continue; // A newer registration already owns the canonical key.
+            }
+        }
+        if let Some(path) = record["path"].as_str() {
+            record["path"] = Value::from(path.trim_end_matches(['\\', '/']));
+        }
+        if let Some(aliases) = record.get_mut("aliases").and_then(Value::as_array_mut) {
+            for alias in aliases {
+                if let Some(path) = alias.as_str() {
+                    *alias = Value::from(path.trim_end_matches(['\\', '/']));
+                }
+            }
+        }
+        records.insert(normalized.to_owned(), record.clone());
+        operations.push(Operation::Runtime(normalized.to_owned(), Some(record)));
+    }
 }
 
 fn owned_records(paths: &[String], identities: &Value) -> Vec<(String, Value)> {
@@ -517,10 +550,16 @@ mod tests {
         let output = alias.join("output");
         let identity = output_identity(output.to_str().unwrap()).unwrap().unwrap();
         let scopes = [NativeDiscoveryScope::new(real.to_string_lossy().into_owned(), None, Vec::new())];
-        for main_snapshot in [false, true] {
+        for layout in ["literal-only", "python-aliases", "legacy-resolver"] {
             let state = NativeWatchState::new();
-            put_owned(&state, &output, &identity);
-            if main_snapshot {
+            if layout == "legacy-resolver" {
+                let names = [output.to_string_lossy().into_owned(), format!("{}\\", physical.display())];
+                state.apply(&NativeWatchOperations::owned_outputs(&names, &[&identity]));
+                assert!(state.owned_root(physical.to_str().unwrap()).is_none());
+            } else {
+                put_owned(&state, &output, &identity);
+            }
+            if layout == "python-aliases" {
                 let record = state.runtime_record(&format!("owned|{}", path_key(output.to_str().unwrap()))).unwrap();
                 state.lock().runtime.insert(format!("owned|{}", path_key(physical.to_str().unwrap())), record);
             }

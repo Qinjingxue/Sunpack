@@ -1876,7 +1876,12 @@ mod tests {
         // but the unfinished sibling remains an independently disposable root.
         assert_eq!(pending.active_outputs.values()
             .filter(|output| !pending.committed_roots.contains(output)).collect::<Vec<_>>(), vec![&second]);
-        assert!(resumed.output_operation(&owner, task.clone(), first.clone(), Some(false), None).unwrap().is_none());
+        // Rollback may still discard the committed child after its active
+        // reservation is retired. It must preserve the enclosing carrier.
+        let rollback = resumed.output_operation(&owner, task.clone(), first.clone(), Some(false), None)
+            .unwrap().unwrap();
+        resumed.apply(&rollback);
+        assert!(resumed.pending(&owner).unwrap().committed_roots.contains(&container));
         append(4, vec![OutputChange::Finish {
             task: task.clone(), output: second.clone(), keep: false, identity: None,
         }, OutputChange::Relocate {

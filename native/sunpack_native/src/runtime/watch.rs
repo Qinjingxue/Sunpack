@@ -49,12 +49,6 @@ impl Root {
             (nested != own && is_path_under(&nested, &own))
                 .then(|| entry.path.to_string_lossy().into_owned())
         }));
-        exclude.extend(entries.iter().filter_map(|entry| {
-            let output = entry.output.as_ref()?;
-            let target = key(output);
-            (target != own && is_path_under(&target, &own))
-                .then(|| output.to_string_lossy().into_owned())
-        }));
         NativeDiscoveryScope::new(
             self.path.to_string_lossy().into_owned(),
             (!self.recursive).then_some(0),
@@ -327,6 +321,7 @@ impl Watch {
                     Scheduler::open(cwd, engine, worker_hub, !once, tray, external)
                 }) {
                     Ok(mut scheduler) => {
+                        *last_error.lock().unwrap() = None;
                         let _ = ready.send(Ok(()));
                         scheduler.run(once)
                     }
@@ -479,8 +474,10 @@ impl Watch {
                     continue;
                 }
                 if running
-                    && filesystem::watch_filesystem_type(&root.to_string_lossy())
-                        .is_ok_and(|name| !name.eq_ignore_ascii_case("NTFS"))
+                    && nearest_directory(root).is_some_and(|directory| {
+                        filesystem::watch_filesystem_type(&directory.to_string_lossy())
+                            .is_ok_and(|name| !name.eq_ignore_ascii_case("NTFS"))
+                    })
                 {
                     rejected.push(root.clone());
                     continue;
@@ -1214,7 +1211,7 @@ impl Scheduler {
         if !scheduler.continuous && scheduler.settings.watch.clipboard_monitor_enabled {
             scheduler.merge_clipboard(&crate::core::passwords::clipboard_passwords())?;
         }
-        scheduler.password_update()?;
+        scheduler.password_update(true)?;
         scheduler.checkpoint(&HashMap::new(), true, true)?;
         scheduler.retry_missing_volumes(None)?;
         scheduler
@@ -1374,28 +1371,45 @@ impl Scheduler {
     }
 
     fn reconcile_roots(&mut self) -> io::Result<()> {
-        let mut entries = read_roots(&self.root_file)?;
-        validate_outputs(&entries)?;
-        let mut rejected = Vec::new();
-        entries.retain(|entry| {
-            let text = entry.path.to_string_lossy();
-            match filesystem::watch_filesystem_type(&text) {
-                Ok(fs) if !fs.eq_ignore_ascii_case("NTFS") => {
-                    rejected.push(key(&entry.path));
-                    self.journal.log(
-                        json!({"event":"watch_root_rejected","path":entry.path,"filesystem":fs}),
-                    );
-                    false
-                }
-                _ => true, // A missing drive can return later.
-            }
-        });
-        if !rejected.is_empty() {
+        let (entries, rejected) = {
+            // Read, classify, and prune the same root policy. GUI and CLI
+            // writers share this lock; pruning an older snapshot can remove a
+            // root that has since moved back onto a supported filesystem.
             let _guard = FileMutex::lock(&self.root_file, ROOTS_LOCK)?;
-            let mut latest = read_roots(&self.root_file)?;
-            latest.retain(|root| !rejected.contains(&key(&root.path)));
-            write_roots(&self.root_file, &latest)?;
+            let mut entries = read_roots(&self.root_file)?;
+            let mut filesystems = HashMap::new();
+            let mut rejected = Vec::new();
+            entries.retain(|entry| {
+                let Some(directory) = nearest_directory(&entry.path) else {
+                    return true;
+                };
+                let filesystem = filesystems.entry(directory.to_owned()).or_insert_with(|| {
+                    filesystem::watch_filesystem_type(&directory.to_string_lossy()).ok()
+                });
+                if let Some(filesystem) = filesystem.as_ref().filter(|name| !name.eq_ignore_ascii_case("NTFS")) {
+                    rejected.push((entry.path.clone(), filesystem.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            if !rejected.is_empty() {
+                write_roots(&self.root_file, &entries)?;
+            }
+            (entries, rejected)
+        };
+        if !rejected.is_empty() {
+            let paths = rejected.iter().map(|(path, filesystem)| {
+                format!("{} ({filesystem})", path.display())
+            }).collect::<Vec<_>>().join("\n");
+            let message = self.settings.cli.language.translate("watch.non_ntfs_removed", &[("paths", &paths)]);
+            self.journal.log(json!({
+                "event":"watch_non_ntfs_roots_removed",
+                "roots":rejected.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+                "message":message,
+            }));
         }
+        validate_outputs(&entries)?;
         let new_directories: HashSet<_> = entries
             .iter()
             .filter(|root| !self.roots.contains_key(&key(&root.path)))
@@ -1494,7 +1508,7 @@ impl Scheduler {
     }
 
     fn reload(&mut self) -> io::Result<()> {
-        let snapshot = config::load_snapshot(&self.cwd)?;
+        let snapshot = config::reload_snapshot(&self.cwd)?;
         let options = crate::pipeline::scan_options(&snapshot.config)?;
         let config_observers =
             Self::observe_config(&self.cwd, &snapshot, &self.root_file, self.passwords.path(), &self.hub)?;
@@ -1621,7 +1635,7 @@ impl Scheduler {
                 self.merge_clipboard(&clipboard)?;
             }
             if signals.password_changed || !signals.reload_waiters.is_empty() {
-                self.password_update()?;
+                self.password_update(false)?;
             }
             if signals.foreground_finished {
                 self.arm_idle_cleanup();
@@ -1744,8 +1758,11 @@ impl Scheduler {
             if self.available_roots.insert(id.clone()) && !startup {
                 reopened.insert(id.clone());
             }
+            // Use the same directory generation to validate and publish this
+            // cursor. A rename may replace its path while recovery is running.
+            let identity = output_identity(&scope.root).ok();
             let current = filesystem::watch_volume_cursor(&scope.root);
-            let cached = self.catalog.cursor(&scope);
+            let cached = identity.as_deref().and_then(|identity| self.catalog.cursor(&scope, identity));
             if let (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end))) =
                 (&current, &cached)
             {
@@ -1769,7 +1786,7 @@ impl Scheduler {
                     entry.2.push(scope.clone());
                 }
             }
-            probes.push((id, root, scope, current, cached));
+            probes.push((id, root, scope, identity, current, cached));
         }
         if !reopened.is_empty() {
             // Old snapshots can have only an outside literal name while its
@@ -1798,7 +1815,7 @@ impl Scheduler {
         let mut admitted = HashSet::new();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
-        for (id, root, scope, current, cached) in probes {
+        for (id, root, scope, identity, current, cached) in probes {
             let range = match (&current, &cached) {
                 (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end)))
                     if volume == old_volume
@@ -1813,13 +1830,21 @@ impl Scheduler {
             let mut errors = Vec::new();
             let rebuild = !root.scanned || range.is_none_or(|(_, entries)| entries.is_err());
             if rebuild {
-                // An untrusted history cannot distinguish old files from new
-                // arrivals. Rebuild only the baseline; an unscanned root still
-                // admits its initial inventory below.
-                let scan = self.scan_options(root.deep)
-                    .catalog_update(&self.catalog, &scope, None);
+                // Keep the conservative baseline when the catalog itself is
+                // missing or belongs to another root object. A trusted
+                // inventory can still reconcile arrivals after a USN reset.
+                let options = self.scan_options(root.deep);
+                let scan = if root.scanned && cached.is_some() {
+                    options.catalog_refresh(&self.catalog, &scope, None)
+                } else {
+                    options.catalog_update(&self.catalog, &scope, None)
+                        .map(|errors| (errors, Vec::new()))
+                };
                 match scan {
-                    Ok(failures) => errors = failures,
+                    Ok((failures, arrivals)) => {
+                        errors = failures;
+                        paths = arrivals;
+                    }
                     Err(error) => {
                         self.journal.log(json!({"event":"filesystem_scan_failed","path":root.path,"error":error.to_string()}));
                         if let Ok((volume, _, _)) = current {
@@ -1891,7 +1916,7 @@ impl Scheduler {
             }
             if !root.scanned {
                 paths.extend(self.catalog.candidate_paths(&scope, None));
-                if errors.is_empty() && current.is_ok() {
+                if errors.is_empty() && current.is_ok() && identity.is_some() {
                     marks.push(id.clone());
                 }
             }
@@ -1901,7 +1926,7 @@ impl Scheduler {
                     let peers = self.catalog.bucket_paths(&scope, &path);
                     self.enqueue(&id, path.clone(), false)?;
                     for peer in peers.into_iter().filter(|peer| peer != &path) {
-                        if self.journal.state().entry(&peer).is_some_and(|entry| {
+                        if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
                             entry
                                 .failure_payload
                                 .get("blockers")
@@ -1911,22 +1936,27 @@ impl Scheduler {
                                 })
                         }) {
                             let key = watch_path_key(&peer);
-                            if admitted.insert(key) {
-                                self.enqueue(&id, peer, true)?;
+                            if let Some((root, recovery)) = self.blocker_route(&entry) {
+                                if admitted.insert(key) {
+                                    self.enqueue_with_recovery(&root, peer, true, recovery)?;
+                                }
                             }
                         }
                     }
                 }
             }
-            match current {
-                Ok((volume, journal, mut end)) if errors.is_empty() => {
+            match (current, identity) {
+                (Ok((volume, journal, mut end)), Some(identity)) if errors.is_empty() => {
                     if let Some((current_end, Ok(_))) = range {
                         end = *current_end;
                     }
-                    cursors.push((scope, volume, journal, end));
+                    let changed = cached.as_ref().is_none_or(|(old_volume, old_journal, old_end)| {
+                        (old_volume, *old_journal, *old_end) != (&volume, journal, end)
+                    });
+                    cursors.push((changed.then_some((scope, identity)), volume, journal, end));
                 }
-                Ok((volume, _, _)) => { failures.insert(volume); }
-                Err(error) => self.journal.log(json!({"event":"usn_cursor_unavailable","root":root.path,"error":error.to_string()})),
+                (Ok((volume, _, _)), _) => { failures.insert(volume); }
+                (Err(error), _) => self.journal.log(json!({"event":"usn_cursor_unavailable","root":root.path,"error":error.to_string()})),
             }
         }
         let mut operations = BTreeMap::new();
@@ -1951,11 +1981,9 @@ impl Scheduler {
         // Commit the admissions and cursor together. A recovered cursor never
         // implies ownership of an input whose pending work was still in RAM.
         self.persist_candidates(operations, true)?;
-        if !cursors.is_empty() {
-            for (scope, volume, journal, end) in cursors {
-                if !failures.contains(&volume) {
-                    self.catalog.set_cursor(&scope, volume, journal, end);
-                }
+        for (changed, volume, journal, end) in cursors {
+            if let Some((scope, identity)) = changed.filter(|_| !failures.contains(&volume)) {
+                self.catalog.set_cursor(&scope, identity, volume, journal, end);
             }
         }
         if !marks.is_empty() {
@@ -2332,7 +2360,7 @@ impl Scheduler {
         cursors: BTreeMap<String, crate::watch_store::Cursor>,
         durable: bool,
     ) -> io::Result<()> {
-        self.persist_candidates_and_retire(cursors, durable, None)
+        self.persist_candidates_and_retire(cursors, durable, None, None)
     }
 
     fn persist_candidates_and_retire(
@@ -2340,8 +2368,9 @@ impl Scheduler {
         cursors: BTreeMap<String, crate::watch_store::Cursor>,
         durable: bool,
         retire: Option<&str>,
+        handoff: Option<crate::watch_store::NativeWatchOperations>,
     ) -> io::Result<()> {
-        if self.unpublished.is_empty() && cursors.is_empty() && retire.is_none() {
+        if self.unpublished.is_empty() && cursors.is_empty() && retire.is_none() && handoff.is_none() {
             return Ok(());
         }
         let keys = std::mem::take(&mut self.unpublished);
@@ -2396,6 +2425,9 @@ impl Scheduler {
                 )?;
                 operations.extend(recovery);
             }
+            if let Some(handoff) = handoff {
+                operations.extend(handoff);
+            }
             if let Some(owner) = retire {
                 operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
                     owner,
@@ -2412,7 +2444,7 @@ impl Scheduler {
             clipboard,
             self.settings.watch.clipboard_builtin_max_entries,
         ) {
-            Ok(true) => self.password_update()?,
+            Ok(true) => self.password_update(false)?,
             Ok(false) => {}
             Err(error) => self.journal.log(json!({
                 "event":"watch_clipboard_password_save_failed", "error":error.to_string(),
@@ -2421,7 +2453,7 @@ impl Scheduler {
         Ok(())
     }
 
-    fn password_update(&mut self) -> io::Result<()> {
+    fn password_update(&mut self, startup: bool) -> io::Result<()> {
         let snapshot = match self.passwords.reload() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2430,18 +2462,24 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        let signature = snapshot.signature().to_string();
+        let signature = snapshot.signature();
         let state = self.journal.state();
-        if state.password_source_signature() == signature {
+        let changed = !password_signature_matches(&state.password_source_signature(), signature);
+        if changed || startup {
+            // A prior runtime can publish the password generation before
+            // scheduling every affected blocker. Reconcile entries once when
+            // taking ownership, even if the global generation is current.
+            self.retry_password_failures(&snapshot, None)?;
+            self.persist_candidates(BTreeMap::new(), !changed)?;
+        }
+        if !changed {
             return Ok(());
         }
-        let generation = state.password_generation().saturating_add(1);
-        self.retry_password_failures(&snapshot, None)?;
-        self.persist_candidates(BTreeMap::new(), false)?;
+        let generation = self.journal.state().password_generation().saturating_add(1);
         self.journal.commit(true, |_| {
             Ok(
                 crate::watch_store::NativeWatchOperations::password_generation(
-                    generation, signature,
+                    generation, signature.to_owned(),
                 ),
             )
         })?;
@@ -2471,7 +2509,7 @@ impl Scheduler {
                 .failure_payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|before| before == snapshot.scope_signature(directory))
+                .is_some_and(|before| password_signature_matches(before, &snapshot.scope_signature(directory)))
             {
                 continue;
             }
@@ -2515,7 +2553,10 @@ impl Scheduler {
                 if recovery.scope.contains(&entry.path)
                     && (watch_path_key(&recovery.scope.root) != root
                         || !watched_scope.contains(&entry.path)
-                        || self.catalog.is_owned(&entry.path))
+                        || self.catalog.is_owned(&entry.path)
+                        || payload.get("details").is_some_and(|details| {
+                            details["promoted_nested_input"].as_bool() == Some(true)
+                        }))
                 {
                     return Some((root, Some(Arc::new(recovery))));
                 }
@@ -2602,10 +2643,22 @@ impl Scheduler {
                     .get("retry_output_dir")?
                     .as_str()
             });
+            let checkpoints = input_checkpoints(state, &pending.path).collect::<io::Result<Vec<_>>>()?;
+            // An older runtime can leave a carrier active after committing
+            // one of its segments. Only an identity-verified receipt protects
+            // that carrier; its uncommitted sibling outputs stay disposable.
+            let retained_containers = checkpoints.iter()
+                .filter_map(crate::pipeline::InputCheckpoint::retained_container)
+                .map(key)
+                .collect::<HashSet<_>>();
             let mut revisit = BTreeMap::new();
             let mut cleanup_failed = false;
             for (task, output) in pending.active_outputs.iter() {
-                if pending.committed_roots.contains(output) || borrowed == Some(output.as_str()) {
+                if pending.committed_roots.contains(output)
+                    || borrowed == Some(output.as_str())
+                    || (!retained_containers.is_empty()
+                        && retained_containers.contains(&watch_path_key(output)))
+                {
                     continue;
                 }
                 match recovery_output_matches(state, &pending, output) {
@@ -2682,10 +2735,7 @@ impl Scheduler {
             if unavailable {
                 continue;
             }
-            let has_checkpoint = source.is_file()
-                && !input_checkpoints(state, &pending.path)
-                    .collect::<io::Result<Vec<_>>>()?
-                    .is_empty();
+            let has_checkpoint = source.is_file() && !checkpoints.is_empty();
             if (missing_output && !promoted_present) || has_checkpoint {
                 if !source.is_file() {
                     self.journal.log(
@@ -2778,10 +2828,27 @@ impl Scheduler {
                     rebase = false;
                 }
             }
+            // Promotion can be durable while the old batch's completion is
+            // still pending. Preserve its already-rebased logical receipts
+            // under the new owner in the same transaction as the requeue.
+            let mut handoff = crate::watch_store::NativeWatchOperations::empty();
+            for checkpoint in &checkpoints {
+                let path = checkpoint.entry().to_string_lossy();
+                if pending.promoted_destinations.contains(&path)
+                    && self.pending.contains_key(&watch_path_key(&path))
+                {
+                    handoff.extend(crate::watch_store::NativeWatchOperations::checkpoint(
+                        &path,
+                        &checkpoint.output().to_string_lossy(),
+                        Some(serde_json::to_value(checkpoint)?),
+                    ));
+                }
+            }
             self.persist_candidates_and_retire(
                 BTreeMap::new(),
                 true,
                 rebase.then_some(pending.path.as_str()),
+                (handoff.__len__() != 0).then_some(handoff),
             )?;
         }
         self.persist_candidates(BTreeMap::new(), true)?;
@@ -2823,6 +2890,27 @@ fn has_covered_parent(path: &str, covered: &HashSet<String>) -> bool {
 fn output_identity(path: &str) -> io::Result<String> {
     let (volume, identity, _) = filesystem::watch_path_identity(path)?;
     Ok(format!("{volume}|{identity}"))
+}
+
+fn password_signature_matches(previous: &str, current: &str) -> bool {
+    if previous == current {
+        return true;
+    }
+    if previous.len() != 32 {
+        return false;
+    }
+    // Python Watch combined the built-in digest with a digest of its explicit
+    // request password list. Persistent Watch has no explicit CLI passwords.
+    static EMPTY_LIST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let empty_list = EMPTY_LIST.get_or_init(|| {
+        let mut hash = crate::fast_hash_core::Hash128::new();
+        hash.update(b"[]");
+        hash.hexdigest()
+    });
+    let mut hash = crate::fast_hash_core::Hash128::new();
+    hash.update(empty_list.as_bytes());
+    hash.update(current.as_bytes());
+    previous == hash.hexdigest()
 }
 
 fn recovery_output_matches(
@@ -3053,7 +3141,23 @@ impl Scheduler {
         request.origin = Origin::Watch;
         request.cancel = cancel.clone();
         request.config = Arc::clone(&self.settings);
-        let nested_recovery = recovery.as_ref().is_some_and(|recovery| {
+        // A missing-volume promotion visible to ordinary Watch discovery can
+        // join peers anywhere in the current watched scope. Its saved local
+        // scope still bounds recovery if the destination is outside it.
+        let catalog_recovery = recovery.is_some()
+            && candidates.iter().all(|candidate| {
+                if !scope.contains(&candidate.path) || self.catalog.is_owned(&candidate.path) {
+                    return false;
+                }
+                let (entry, promoted) = self
+                    .journal
+                    .state()
+                    .observation_state(&watch_path_key(&candidate.path));
+                promoted.is_some()
+                    && entry.is_some_and(|entry| entry.status == "suspended_missing_volume")
+            });
+        let local_recovery = recovery.as_ref().filter(|_| !catalog_recovery);
+        let nested_recovery = local_recovery.is_some_and(|recovery| {
             watch_path_key(&recovery.scope.root) != watch_path_key(&scope.root)
         });
         if !nested_recovery {
@@ -3064,9 +3168,11 @@ impl Scheduler {
         let passwords = self.passwords.snapshot();
         request.password_snapshot = Some(Arc::clone(&passwords));
         if let Some(recovery) = &recovery {
-            request.discovery_scope = Some(recovery.scope.clone());
             request.password_scope = (!recovery.password_scope.as_os_str().is_empty())
                 .then(|| recovery.password_scope.clone());
+        }
+        if let Some(recovery) = local_recovery {
+            request.discovery_scope = Some(recovery.scope.clone());
         } else {
             request.discovery_scope = Some(scope.clone());
             request.watch_catalog = Some(Arc::clone(&self.catalog));
@@ -3267,7 +3373,7 @@ impl Scheduler {
                     self.journal
                         .log(json!({"event":"watch_cancel_output_pending","owner":batch,
                         "path":input.path,"output_dir":output}));
-                }
+                };
             }
         }
         if let Some(toast) = &active.toast {
@@ -3306,6 +3412,7 @@ impl Scheduler {
             Err(error) => {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
                 let mut failed = false;
+                let revalidate = crate::password::context::is_input_changed(&error);
                 for candidate in &active.inputs {
                     let id = watch_path_key(&candidate.path);
                     if self.pending.contains_key(&id) || active.touched.contains(&id) {
@@ -3318,6 +3425,18 @@ impl Scheduler {
                         ));
                         continue;
                     }
+                    if revalidate {
+                        // Retired proof material cannot establish failure for
+                        // a still-present source. Re-admit it through the
+                        // current catalog and ordinary ownership checks.
+                        self.enqueue_with_recovery(
+                            &active.root,
+                            candidate.path.clone(),
+                            true,
+                            active.recovery.clone(),
+                        )?;
+                        continue;
+                    }
                     failed = true;
                     self.journal
                         .log(json!({"event":"failed_terminal","path":candidate.path,
@@ -3325,6 +3444,9 @@ impl Scheduler {
                 }
                 self.failed += usize::from(failed);
                 self.journal.commit(true, |_| Ok(absent))?;
+                if revalidate {
+                    self.persist_candidates(BTreeMap::new(), true)?;
+                }
                 self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
                 return Ok(());
@@ -3411,6 +3533,17 @@ impl Scheduler {
                     .collect(),
                 multipart: archive.source_paths.len() > 1,
             };
+            let directory = archive.path.parent().unwrap_or(Path::new(""));
+            // A promoted family now lives beside the admitted source. Seal
+            // its new discovery boundary while retaining the password scope
+            // inherited from that source.
+            let recovery = Recovery {
+                scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), Some(0), Vec::new()),
+                password_scope: active.recovery.as_ref().map_or_else(
+                    || directory.to_path_buf(),
+                    |recovery| recovery.password_dir(&archive.path).to_path_buf(),
+                ),
+            };
             let mut entry = make_entry(
                 &candidate,
                 &failure.message,
@@ -3418,23 +3551,38 @@ impl Scheduler {
                 self.journal.state().entry(&candidate.path).as_deref(),
                 &active.passwords,
                 Some(&group),
-                active.recovery.as_deref(),
-            );
-            let directory = active.recovery.as_ref().map_or_else(
-                || archive.path.parent().unwrap_or(Path::new("")),
-                |recovery| recovery.password_dir(&archive.path),
+                Some(&recovery),
             );
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
-            if let Some((_, scope)) = self.roots.get(&active.root) {
+            payload.insert("details".into(), json!({"promoted_nested_input":true}));
+            if let Some((root, scope)) = self.roots.get(&active.root) {
                 payload.insert("source_input_root".into(), json!(scope.root));
+                // Publish the moved name before handing it off. In a one-shot
+                // run or a fast completion there may be no event to add it yet.
+                if regroup {
+                    for path in &group.members {
+                        if scope.contains(path) && !self.catalog.is_owned(path) {
+                            self.scan_options(root.deep).catalog_update(
+                                &self.catalog,
+                                scope,
+                                Some(path),
+                            )?;
+                        }
+                    }
+                }
             }
             let password_updated = payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|previous| previous != current_passwords.scope_signature(directory));
-            if regroup && self.pending.contains_key(&id) {
+                .is_some_and(|previous| previous != current_passwords.scope_signature(&recovery.password_scope));
+            let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
+            if let Some(pending) = pending {
                 // Other promoted volumes may already have arrived before this
-                // blocker was published. Keep the durable queued generation.
+                // blocker was published. Keep the queued generation and hand
+                // it the promotion's discovery and password boundaries.
+                pending.recovery = Some(Arc::new(recovery));
+                pending.root.clone_from(&active.root);
+                self.unpublished.insert(id.clone());
                 operations.put_entry(entry);
             } else {
                 operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
@@ -3608,7 +3756,11 @@ impl Scheduler {
         })?;
         self.release_display_claims(batch, &groups);
         for path in retry {
-            self.enqueue_with_recovery(&active.root, path, true, active.recovery.clone())?;
+            if let Some((root, recovery)) = self.journal.state().entry(&path)
+                .and_then(|entry| self.blocker_route(&entry))
+            {
+                self.enqueue_with_recovery(&root, path, true, recovery)?;
+            }
         }
         self.persist_candidates(BTreeMap::new(), false)?;
         self.arm_idle_cleanup();
@@ -4280,6 +4432,17 @@ mod tests {
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
 
     #[test]
+    fn unchanged_python_password_blockers_keep_their_generation() {
+        // WatchScheduler._password_signature_for_scope in the Python runtime
+        // wraps this built-in scope signature with the empty user-password list.
+        let current = "a55be77812b08557859dab8291a7ac45";
+        let legacy = "1dc1efb66b9a5c864c8abd4d5e769223";
+        assert!(password_signature_matches(legacy, current));
+        assert!(password_signature_matches(current, current));
+        assert!(!password_signature_matches(legacy, "7fa575ff785f4d5a6e3e7afaa5e05bcb"));
+    }
+
+    #[test]
     fn admission_round_is_bounded_ordered_and_leaves_backlog_untouched() {
         let now = Instant::now();
         let old = now - std::time::Duration::from_secs(1);
@@ -4575,12 +4738,10 @@ mod tests {
             prepare_flatten(&journal, owner, &root, &work, &leaf).unwrap();
             assert_eq!(journal.state().runtime_keys("owned|").len(), 4);
             fs::rename(&root, &work).unwrap();
-            // Simulate a collision after the first rename. The task can finish
-            // with a committed output and durable receipts at the work path.
-            journal.commit(true, |state| {
-                let mut operations = state.output_operation(
-                    owner, owner.to_owned(), work.to_str().unwrap().to_owned(), Some(true), None,
-                )?.unwrap();
+            // On a publish collision the receipts can point into work, while
+            // the active output is still tracked at root by the flatten intent.
+            journal.commit(true, |_| {
+                let mut operations = NativeWatchOperations::empty();
                 for (source, output) in [(&owner_file, &work), (&nested, &nested_output)] {
                     let value = json!({
                         "schema_version":1,"carrier":source,

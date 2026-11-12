@@ -184,9 +184,9 @@ def test_once_drains_admitted_work_without_waiting_for_a_busy_pending_file(packa
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
-@pytest.mark.parametrize("inside", [False, True], ids=["outside-alias", "inside-alias"])
-def test_junction_outputs_exclude_both_names_after_restart_but_admit_replacement(
-    package, tmp_path, origin, inside,
+@pytest.mark.parametrize("layout", ["outside-alias", "inside-alias", "direct"])
+def test_owned_outputs_are_excluded_after_restart_but_admit_replacement(
+    package, tmp_path, origin, layout,
 ):
     """Real extraction covers both registration routes and physical admission.
 
@@ -197,11 +197,14 @@ def test_junction_outputs_exclude_both_names_after_restart_but_admit_replacement
     watched = tmp_path / "watched"
     real = watched / "physical"
     real.mkdir(parents=True)
-    alias = (watched if inside else tmp_path) / "junction"
-    subprocess.run(
-        ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(real)],
-        check=True, capture_output=True,
-    )
+    if layout == "direct":
+        alias = real
+    else:
+        alias = (watched if layout == "inside-alias" else tmp_path) / "junction"
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(real)],
+            check=True, capture_output=True,
+        )
     inner = tmp_path / "inner.zip"
     _zip(inner, "generated.txt", b"must stay inside the nested archive")
     source = tmp_path / "outer.zip"
@@ -237,4 +240,5 @@ def test_junction_outputs_exclude_both_names_after_restart_but_admit_replacement
         assert not list(real.rglob("generated.txt"))
     finally:
         package.run("watch", "stop")
-        alias.rmdir()
+        if alias != real:
+            alias.rmdir()

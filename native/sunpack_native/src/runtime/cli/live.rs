@@ -474,6 +474,9 @@ mod tests {
         fn interactive(&self) -> bool {
             true
         }
+        fn input_is_terminal(&self) -> bool {
+            true
+        }
         fn unicode(&self) -> bool {
             true
         }

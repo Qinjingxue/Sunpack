@@ -1,6 +1,7 @@
 use super::{i18n::Language, resources};
 use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
 use crate::scan::path_filter::{NativePathRule, RuleEntry};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::{
     collections::VecDeque,
@@ -138,14 +139,14 @@ pub struct PathRule(NativePathRule);
 
 #[derive(Clone, Copy)]
 pub struct PerformanceConfig {
-    pub persistent_server_idle_seconds: f64,
+    pub persistent_server_idle_seconds: Option<f64>,
     pub worker: WorkerConfig,
 }
 
 #[derive(Clone, Copy)]
 pub struct WorkerConfig {
-    pub space_poll_interval_ms: u64,
-    pub space_status_report_interval_ms: u64,
+    pub space_poll_interval_ms: Option<u64>,
+    pub space_status_report_interval_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -199,6 +200,12 @@ fn defaults() -> &'static Value {
     DEFAULT.get_or_init(|| serde_json::from_str(DEFAULTS).expect("valid built-in configuration"))
 }
 
+pub(crate) fn default_idle_seconds() -> f64 {
+    defaults()["performance"]["persistent_server_idle_seconds"]
+        .as_f64()
+        .expect("valid built-in idle timeout")
+}
+
 // Include absent candidates: a deletion must not unsubscribe its recreation,
 // and a new higher-priority config must supersede the current source.
 pub(crate) fn watch_paths(cwd: &Path, sources: &ConfigSources) -> Vec<PathBuf> {
@@ -225,13 +232,13 @@ fn resolve_sources(cwd: &Path) -> ConfigSources {
         roots
             .iter()
             .map(|root| root.join(name))
-            .find(|path| path.is_file())
+            .find(|path| path.exists())
     };
     let simple = if resources::package_root().is_some() {
         resources::program_data_dir()
             .ok()
             .map(|root| root.join(SIMPLE))
-            .filter(|path| path.is_file())
+            .filter(|path| path.exists())
     } else {
         search(SIMPLE)
     };
@@ -439,6 +446,10 @@ impl ConfigRead {
 }
 
 pub(crate) fn generation(cwd: &Path) -> ConfigRead {
+    read_generation(cwd, false)
+}
+
+fn read_generation(cwd: &Path, refresh: bool) -> ConfigRead {
     static CACHE: Mutex<VecDeque<Arc<Generation>>> = Mutex::new(VecDeque::new());
     let sources = resolve_sources(cwd);
     let previous = {
@@ -452,7 +463,7 @@ pub(crate) fn generation(cwd: &Path) -> ConfigRead {
     let stamp = sources.stamp().ok();
     if let Some(hit) = previous
         .as_ref()
-        .filter(|hit| stamp.is_some() && hit.stamp == stamp)
+        .filter(|hit| !refresh && stamp.is_some() && hit.stamp == stamp)
     {
         return ConfigRead {
             observed: Ok(Arc::clone(hit)),
@@ -478,7 +489,7 @@ pub(crate) fn generation(cwd: &Path) -> ConfigRead {
             .iter()
             .position(|entry| entry.snapshot.sources == current.snapshot.sources);
         if let Some(hit) = index.map(|index| &cache[index]) {
-            if current.stamp.is_some() && hit.stamp == current.stamp {
+            if !refresh && current.stamp.is_some() && hit.stamp == current.stamp {
                 return Ok(Arc::clone(hit));
             }
             if !previous
@@ -513,7 +524,17 @@ fn raw_language(raw: &Value) -> Language {
 }
 
 pub fn load_snapshot(cwd: &Path) -> io::Result<Snapshot> {
-    let generation = generation(cwd).observed?;
+    snapshot(generation(cwd))
+}
+
+pub(crate) fn reload_snapshot(cwd: &Path) -> io::Result<Snapshot> {
+    // File notifications are authoritative even on filesystems whose metadata
+    // cannot distinguish two same-size writes within one timestamp tick.
+    snapshot(read_generation(cwd, true))
+}
+
+fn snapshot(read: ConfigRead) -> io::Result<Snapshot> {
+    let generation = read.observed?;
     Ok(Snapshot {
         config: generation.snapshot.config.clone(),
         sources: generation.snapshot.sources.clone(),
@@ -525,9 +546,6 @@ pub fn load(cwd: &Path) -> io::Result<Config> {
 }
 
 fn field<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
-    fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
-        path.iter().try_fold(value, |value, &key| value.get(key))
-    }
     let strict_nested = matches!(
         path,
         [
@@ -540,6 +558,10 @@ fn field<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
         .filter(|value| strict_nested || !value.is_null())
         .or_else(|| at(defaults(), path))
         .unwrap_or(&Value::Null)
+}
+
+fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |value, &key| value.get(key))
 }
 
 fn bool_field(value: &Value, path: &[&str]) -> io::Result<bool> {
@@ -568,18 +590,26 @@ fn selection_field(value: &Value, path: &[&str], default: &str) -> io::Result<St
 }
 
 fn number_field(value: &Value, path: &[&str]) -> io::Result<f64> {
-    let value = field(value, path);
+    number_value(field(value, path))
+        .ok_or_else(|| invalid(format!("{} must be a number", path.join("."))))
+}
+
+fn number_value(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str()?.trim().parse().ok())
         .or_else(|| value.as_bool().map(|value| f64::from(u8::from(value))))
         .filter(|value| value.is_finite())
-        .ok_or_else(|| invalid(format!("{} must be a number", path.join("."))))
 }
 
 fn integer_field(value: &Value, path: &[&str], min: u64) -> io::Result<u64> {
-    let value = field(value, path);
-    let parsed = value
+    integer_value(field(value, path))
+        .map(|n| n.max(min))
+        .ok_or_else(|| invalid(format!("{} must be an integer", path.join("."))))
+}
+
+fn integer_value(value: &Value) -> Option<u64> {
+    value
         .as_i64()
         .map(|n| n.max(0) as u64)
         .or_else(|| value.as_u64())
@@ -592,10 +622,7 @@ fn integer_field(value: &Value, path: &[&str], min: u64) -> io::Result<u64> {
                 .ok()
                 .map(|n| n.max(0) as u64)
         })
-        .or_else(|| value.as_f64().map(|n| n.max(0.0) as u64));
-    parsed
-        .map(|n| n.max(min))
-        .ok_or_else(|| invalid(format!("{} must be an integer", path.join("."))))
+        .or_else(|| value.as_f64().map(|n| n.max(0.0) as u64))
 }
 
 fn check_section(value: &Value, section: &str, strict: bool) -> io::Result<()> {
@@ -767,22 +794,25 @@ impl Config {
                 scan_filters,
             },
             performance: PerformanceConfig {
-                persistent_server_idle_seconds: number_field(
+                persistent_server_idle_seconds: at(
                     value,
                     &["performance", "persistent_server_idle_seconds"],
-                )?
-                .max(0.0),
+                )
+                .and_then(number_value)
+                .map(|seconds| seconds.max(0.0)),
                 worker: WorkerConfig {
-                    space_poll_interval_ms: integer_field(
+                    space_poll_interval_ms: at(
                         value,
                         &["performance", "worker", "space_poll_interval_ms"],
-                        1,
-                    )?,
-                    space_status_report_interval_ms: integer_field(
+                    )
+                    .and_then(integer_value)
+                    .filter(|&interval| interval >= 50),
+                    space_status_report_interval_ms: at(
                         value,
                         &["performance", "worker", "space_status_report_interval_ms"],
-                        0,
-                    )?,
+                    )
+                    .and_then(integer_value)
+                    .filter(|&interval| interval >= 1000),
                 },
             },
             analysis: AnalysisConfig { modules },
@@ -897,7 +927,7 @@ impl PathRule {
             let Some(value) = object.get(key) else {
                 return Ok(Vec::new());
             };
-            serde_json::from_value(value.clone())
+            Vec::deserialize(value)
                 .map_err(|error| invalid(format!("{key} must be a list of rule objects: {error}")))
         };
         NativePathRule::compile(

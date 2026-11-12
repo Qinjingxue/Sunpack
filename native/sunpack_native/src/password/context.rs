@@ -243,10 +243,27 @@ pub(crate) fn verify_prepared(
     result
 }
 
+#[derive(Debug)]
+struct InputChanged;
+
+impl std::fmt::Display for InputChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "password verification input changed; Rust archive analysis must be refreshed",
+        )
+    }
+}
+
+impl std::error::Error for InputChanged {}
+
 fn input_changed() -> std::io::Error {
-    std::io::Error::other(
-        "password verification input changed; Rust archive analysis must be refreshed",
-    )
+    std::io::Error::other(InputChanged)
+}
+
+pub(crate) fn is_input_changed(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<InputChanged>())
 }
 
 pub(crate) fn clear() {
@@ -284,6 +301,39 @@ fn retain(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn replaced_password_snapshot_returns_typed_retirement() {
+        let path = crate::test_support::temp_file("retired_password_snapshot", b"old");
+        let reader = ManagedReader::open(&path).unwrap();
+        let old = InputKey::file("rar", &reader).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let borrower = std::thread::spawn(move || {
+            verify_prepared(old, &[], move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(PreparedStatus::new("damaged", "obsolete verdict"))
+            })
+        });
+        entered_rx.recv().unwrap();
+        std::fs::write(&path, b"new physical generation").unwrap();
+        let current = ManagedReader::open(&path).unwrap();
+        let key = InputKey::file("rar", &current).unwrap();
+        let new = verify_prepared(key, &[], || {
+            Err(PreparedStatus::new("not_required", "current verdict"))
+        });
+        release_tx.send(()).unwrap();
+        let error = borrower.join().unwrap().unwrap_err();
+        assert!(is_input_changed(&error));
+        assert!(!is_input_changed(&std::io::Error::other(error.to_string())));
+        assert_eq!(new.unwrap().status, "not_required");
+
+        let canonical = current.file_identity().unwrap().path.to_path_buf();
+        release_under_roots(&[canonical]);
+        drop((reader, current));
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn cancelled_initializer_does_not_publish_damage_to_shared_password_input() {
