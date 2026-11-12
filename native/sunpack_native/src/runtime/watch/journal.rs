@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 
 const CHECKPOINT_RECORDS: u64 = 8192;
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+const JOURNAL_HARD_BYTES: u64 = 256 * 1024 * 1024;
 
 struct Frontier {
     seq: u64,
@@ -22,6 +23,7 @@ struct Frontier {
     records: u64,
     bytes: u64,
     fault: Option<String>,
+    checkpoint_error: Option<String>,
 }
 
 impl Frontier {
@@ -30,11 +32,22 @@ impl Frontier {
     }
 }
 
+enum CheckpointResult {
+    Published,
+    SnapshotFailed(io::Error),
+}
+
+struct Checkpoint {
+    job: JoinHandle<io::Result<CheckpointResult>>,
+    records: u64,
+    bytes: u64,
+}
+
 pub(super) struct Journal {
     state: NativeWatchState,
     log: NativeEventLog,
     frontier: Mutex<Frontier>,
-    checkpoint: Mutex<Option<JoinHandle<io::Result<()>>>>,
+    checkpoint: Mutex<Option<Checkpoint>>,
     snapshot: PathBuf,
     stream_id: String,
     _stream: NativeJournalStream,
@@ -64,6 +77,7 @@ impl Journal {
             records: 0,
             bytes: 0,
             fault: None,
+            checkpoint_error: None,
         };
         let mut tail = None;
         for (start, path) in segments(dir)? {
@@ -133,7 +147,7 @@ impl Journal {
         durable: bool,
         prepare: impl FnOnce(&NativeWatchState) -> io::Result<NativeWatchOperations>,
     ) -> io::Result<()> {
-        let (ticket, segment) = {
+        let ticket = {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
             let operations = prepare(&self.state)?;
@@ -158,7 +172,7 @@ impl Journal {
             self.state.apply(&operations);
             frontier.seq = seq;
             frontier.records += 1;
-            (ticket, segment)
+            ticket
         };
         // Other batches can enqueue their mutations during this disk wait.
         // The existing writer combines ready durability barriers.
@@ -172,9 +186,9 @@ impl Journal {
             frontier.fault.get_or_insert_with(|| error.to_string());
             return Err(error);
         }
-        if frontier.segment == segment {
-            frontier.bytes += ticket.bytes_written();
-        }
+        // Count all uncheckpointed WAL, including a segment sealed while
+        // this caller was awaiting its append. A failed snapshot retires none.
+        frontier.bytes = frontier.bytes.saturating_add(ticket.bytes_written());
         ensure_healthy(&frontier)?;
         let needs_checkpoint = frontier.needs_checkpoint();
         drop(frontier);
@@ -209,11 +223,11 @@ impl Journal {
 
     pub(super) fn compact(&self) -> io::Result<()> {
         let mut active = self.checkpoint.lock().unwrap();
-        if active.as_ref().is_some_and(|job| !job.is_finished()) {
+        if active.as_ref().is_some_and(|checkpoint| !checkpoint.job.is_finished()) {
             return Ok(());
         }
-        join_checkpoint(active.take())?;
-        let (checkpoint, seal, segment) = {
+        self.harvest_checkpoint(active.take())?;
+        let (checkpoint, seal, boundary, records, bytes) = {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
             if !frontier.needs_checkpoint() {
@@ -230,61 +244,103 @@ impl Journal {
             )?;
             let checkpoint = self.state.capture(frontier.seq);
             frontier.segment = frontier.seq + 1;
-            frontier.records = 0;
-            frontier.bytes = 0;
-            (checkpoint, seal, segment)
+            (checkpoint, seal, frontier.seq, frontier.records, frontier.bytes)
         };
         let snapshot = self.snapshot.clone();
         // The append stream already seals the captured prefix in sequence.
         // Leave serialization and disk I/O off the Watch and extraction paths.
-        *active = Some(
-            thread::Builder::new()
-                .name("sunpack-watch-checkpoint".into())
-                .stack_size(512 * 1024)
-                .spawn(move || {
-                    seal.wait()?;
-                    let dir = snapshot.parent().unwrap();
-                    let temp = dir.join("state.snapshot.tmp");
+        let job = thread::Builder::new()
+            .name("sunpack-watch-checkpoint".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                // A failed WAL seal is a persistence fault, not a snapshot
+                // retry: never hide it behind the recoverable publication path.
+                seal.wait()?;
+                let dir = snapshot.parent().unwrap();
+                let temp = dir.join("state.snapshot.tmp");
+                let publication = (|| {
                     drop(File::create(&temp)?);
                     checkpoint.write(temp.to_string_lossy().into_owned())?;
-                    crate::io::atomic_file::replace(&temp, &snapshot)?;
-                    for (_, path) in segments(dir)?
-                        .into_iter()
-                        .take_while(|(start, _)| *start <= segment)
-                    {
+                    crate::io::atomic_file::replace_once(&temp, &snapshot)
+                })();
+                let _ = fs::remove_file(&temp);
+                if let Err(error) = publication {
+                    return Ok(CheckpointResult::SnapshotFailed(error));
+                }
+                // Publication is durable. A directory enumeration/deletion
+                // failure leaves redundant WAL but cannot invalidate the state.
+                if let Ok(paths) = segments(dir) {
+                    for (_, path) in paths.into_iter().take_while(|(start, _)| *start <= boundary) {
                         let _ = fs::remove_file(path);
                     }
-                    Ok(())
-                })?,
-        );
+                }
+                Ok(CheckpointResult::Published)
+            });
+        match job {
+            Ok(job) => *active = Some(Checkpoint { job, records, bytes }),
+            Err(error) => self.record_checkpoint_error(error)?,
+        }
         Ok(())
     }
 
     fn wait_for_checkpoint(&self) -> io::Result<()> {
         let mut active = self.checkpoint.lock().unwrap();
-        join_checkpoint(active.take())
+        self.harvest_checkpoint(active.take())
+    }
+
+    fn harvest_checkpoint(&self, checkpoint: Option<Checkpoint>) -> io::Result<()> {
+        let Some(checkpoint) = checkpoint else { return Ok(()); };
+        match join_checkpoint(checkpoint.job) {
+            Ok(CheckpointResult::Published) => {
+                let mut frontier = self.frontier.lock().unwrap();
+                frontier.records = frontier.records.saturating_sub(checkpoint.records);
+                // A late append acknowledgement may conservatively retain a
+                // few already checkpointed bytes. Never undercount live WAL.
+                frontier.bytes = frontier.bytes.saturating_sub(checkpoint.bytes);
+                frontier.checkpoint_error = None;
+                ensure_healthy(&frontier)
+            }
+            Ok(CheckpointResult::SnapshotFailed(error)) => self.record_checkpoint_error(error),
+            Err(error) => {
+                self.frontier.lock().unwrap().fault.get_or_insert_with(|| error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn record_checkpoint_error(&self, error: io::Error) -> io::Result<()> {
+        let mut frontier = self.frontier.lock().unwrap();
+        frontier.checkpoint_error = Some(error.to_string());
+        let result = ensure_healthy(&frontier);
+        drop(frontier);
+        self.log(serde_json::json!({"event":"watch_checkpoint_failed","error":error.to_string()}));
+        result
     }
 }
 
 impl Drop for Journal {
     fn drop(&mut self) {
         if let Ok(active) = self.checkpoint.get_mut() {
-            let _ = join_checkpoint(active.take());
+            if let Some(checkpoint) = active.take() {
+                let _ = join_checkpoint(checkpoint.job);
+            }
         }
     }
 }
 
-fn join_checkpoint(active: Option<JoinHandle<io::Result<()>>>) -> io::Result<()> {
-    if let Some(job) = active {
-        job.join()
-            .map_err(|_| io::Error::other("Watch checkpoint thread failed"))??;
-    }
-    Ok(())
+fn join_checkpoint(job: JoinHandle<io::Result<CheckpointResult>>) -> io::Result<CheckpointResult> {
+    job.join().map_err(|_| io::Error::other("Watch checkpoint thread failed"))?
 }
 
 fn ensure_healthy(frontier: &Frontier) -> io::Result<()> {
     if let Some(error) = &frontier.fault {
         Err(io::Error::other(error.clone()))
+    } else if frontier.bytes >= JOURNAL_HARD_BYTES {
+        match &frontier.checkpoint_error {
+            Some(error) => Err(io::Error::other(format!(
+                "Watch state checkpoint failed at the journal safety limit: {error}"))),
+            None => Ok(()),
+        }
     } else {
         Ok(())
     }
@@ -317,6 +373,92 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercises the durable writer and replay, not just error classification:
+    // an unavailable snapshot must not lose the sealed WAL or stop appends.
+    #[test]
+    fn snapshot_failure_keeps_wal_live_until_retry_or_safety_limit() {
+        let marker = crate::test_support::temp_file("snapshot_retry", b"");
+        let dir = marker.with_extension("state");
+        let journal = Journal::open(&dir).unwrap();
+        let temp = dir.join("state.snapshot.tmp");
+        fs::create_dir(&temp).unwrap(); // Fail only snapshot creation, not WAL.
+        journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(1, "one".into()))).unwrap();
+        journal.wait_for_checkpoint().unwrap();
+        assert!(journal.frontier.lock().unwrap().checkpoint_error.is_some());
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
+        journal.flush().unwrap();
+        assert_eq!(journal.state().password_generation(), 2);
+        assert!(journal.frontier.lock().unwrap().records >= CHECKPOINT_RECORDS);
+        assert!(!segments(&dir).unwrap().is_empty());
+        drop(journal);
+        let journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.state().password_generation(), 2);
+        fs::remove_dir(&temp).unwrap();
+        journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+        // Retry without another append: its current segment starts *after*
+        // the snapshot boundary and must not be retired if a writer opens it.
+        journal.compact().unwrap();
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(3, "three".into()))).unwrap();
+        journal.flush().unwrap();
+        assert!(journal.frontier.lock().unwrap().checkpoint_error.is_none());
+        drop(journal);
+        let journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.state().password_generation(), 3);
+        {
+            let mut frontier = journal.frontier.lock().unwrap();
+            frontier.bytes = JOURNAL_HARD_BYTES - 1;
+            frontier.checkpoint_error = Some("snapshot unavailable".into());
+            assert!(ensure_healthy(&frontier).is_ok());
+            frontier.bytes += 1;
+            assert!(ensure_healthy(&frontier).is_err());
+            frontier.bytes = 0;
+            frontier.checkpoint_error = None;
+        }
+        // Snapshot failures are recoverable; a WAL seal error still poisons
+        // persistence and must prevent further mutations.
+        let failed = Checkpoint { records: 0, bytes: 0,
+            job: thread::spawn(|| Err(io::Error::other("WAL seal failed"))) };
+        assert!(journal.harvest_checkpoint(Some(failed)).is_err());
+        assert!(journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(4, "four".into()))).is_err());
+        drop(journal);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn snapshot_sharing_conflict_does_not_hold_flush_or_shutdown() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let marker = crate::test_support::temp_file("snapshot_sharing", b"");
+        let dir = marker.with_extension("state");
+        let journal = Arc::new(Journal::open(&dir).unwrap());
+        journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(1, "one".into()))).unwrap();
+        journal.flush().unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately no SHARE_DELETE.
+        let reader = OpenOptions::new().read(true).share_mode(3)
+            .open(dir.join("state.snapshot")).unwrap();
+        journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
+        let worker_journal = Arc::clone(&journal);
+        let (send, receive) = mpsc::channel();
+        let worker = thread::spawn(move || { send.send(worker_journal.flush()).unwrap(); });
+        let result = receive.recv_timeout(Duration::from_secs(5));
+        // Always release before joining, including when the old infinite retry
+        // implementation is tested, so a failed assertion cannot hang tests.
+        drop(reader);
+        worker.join().unwrap();
+        assert!(result.expect("flush waited for an external snapshot handle").is_ok());
+        journal.flush().unwrap();
+        drop(journal);
+        let journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.state().password_generation(), 2);
+        drop(journal);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
 
     #[test]
     fn observer_filter_waits_for_output_publication_without_advancing_the_journal() {

@@ -702,6 +702,8 @@ void write_stream(DWORD handle_id, const std::string& text) {
     }
 }
 
+constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
+constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";
 constexpr wchar_t kPersistentUnavailableEn[] = L"SunPack persistent process is unavailable";
 constexpr wchar_t kPersistentUnavailableZh[] = L"SunPack 持久进程不可用";
 constexpr wchar_t kRuntimeLaunchFailedEn[] = L"sunpack runtime failed to launch (Win32 error {error})";
@@ -745,7 +747,34 @@ int wmain(int argc, wchar_t** argv) {
     const bool shutdown_request = argc >= 2 && wcscmp(argv[1], L"--persistent-shutdown") == 0;
     const bool shutdown = shutdown_request;
     const int first_request_argument = shutdown ? 2 : 1;
-    const std::vector<std::wstring> request_arguments(argv + first_request_argument, argv + argc);
+    // Keep the packaged entry point responsible for pausing, including parse
+    // errors and runtime startup failures. Only options before `--` count;
+    // literal path operands must remain untouched.
+    bool pause = false;
+    bool no_pause = false;
+    for (int index = first_request_argument; index < argc; ++index) {
+        if (wcscmp(argv[index], L"--") == 0) break;
+        pause |= wcscmp(argv[index], L"--pause") == 0;
+        no_pause |= wcscmp(argv[index], L"--no-pause") == 0;
+    }
+    std::vector<std::wstring> request_arguments;
+    bool options = true;
+    bool server_pause_disabled = false;
+    for (int index = first_request_argument; index < argc; ++index) {
+        if (options && wcscmp(argv[index], L"--") == 0) {
+            if (pause && !no_pause) {
+                request_arguments.emplace_back(L"--no-pause");
+                server_pause_disabled = true;
+            }
+            options = false;
+        }
+        if (options && pause && !no_pause && wcscmp(argv[index], L"--pause") == 0) continue;
+        request_arguments.emplace_back(argv[index]);
+    }
+    // Preserve mutually exclusive option diagnostics instead of hiding the
+    // conflict. The runtime never pauses for a usage error.
+    pause &= !no_pause;
+    if (pause && !server_pause_disabled) request_arguments.emplace_back(L"--no-pause");
     int code = 1;
     RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd);
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
@@ -798,13 +827,19 @@ int wmain(int argc, wchar_t** argv) {
     const bool ok = outcome == RequestOutcome::Completed;
     if (!ok) code = shutdown ? 0 : 1;
     std::string language;
-    if (!ok && !shutdown) {
+    if (pause || (!ok && !shutdown)) {
         language = cli_language_from_config(launcher_cwd);
     }
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");
     } else if (outcome == RequestOutcome::DeliveryUncertain && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
+    }
+    if (pause && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
+        write_stream(STD_OUTPUT_HANDLE, localized(language, kPressEnterEn, kPressEnterZh));
+        wchar_t buffer[2]{};
+        DWORD read = 0;
+        ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 1, &read, nullptr);
     }
     return code;
 }

@@ -1,7 +1,7 @@
 //! Canonical physical layout shared by discovery, analysis, and execution.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ impl OpenMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct InputExtent {
     pub path: String,
     pub start: u64,
@@ -205,8 +205,28 @@ pub(crate) struct VolumeAttemptPlan {
     pub tail_totals: Box<[TailTotal]>,
 }
 
+// These indexes are invocation-local: domains share Arc-backed choice lists,
+// so large unnamed volume pools are indexed once, not scanned for every slot.
+type DomainKey = *const Vec<usize>;
+type DomainMembers = HashMap<DomainKey, HashSet<usize>>;
+type ExtentKey<'a> = (&'a str, u64, Option<u64>);
+
+enum ExtentCandidates {
+    Exact(usize),
+    // Record-high ends in domain order. A later shorter/equal extent can never
+    // be the first admissible source, so it need not occupy the index.
+    Trimmed(Vec<(u64, usize)>),
+}
+
+
 impl VolumeAttemptPlan {
     fn selected_parts(&self, selection: &VolumeSelection) -> io::Result<Box<[InputPart]>> {
+        self.selected_parts_indexed(selection, &mut DomainMembers::new())
+    }
+
+    fn selected_parts_indexed(
+        &self, selection: &VolumeSelection, domains: &mut DomainMembers,
+    ) -> io::Result<Box<[InputPart]>> {
         let layout = self
             .layouts
             .get(selection.layout)
@@ -227,11 +247,15 @@ impl VolumeAttemptPlan {
             } else {
                 slot.domain
             };
-            if !seen.insert(source) || !self.domains[domain].choices.contains(&source) {
+            let choices = &self.domains[domain].choices;
+            let members = domains.entry(Arc::as_ptr(choices))
+                .or_insert_with(|| choices.iter().copied().collect());
+            if !seen.insert(source) || !members.contains(&source) {
                 return Err(invalid("worker selected an unplanned volume"));
             }
             parts.push(InputPart {
-                extent: self.sources[source].clone(),
+                extent: self.sources.get(source)
+                    .ok_or_else(|| invalid("unknown volume source"))?.clone(),
                 volume_number: Some(slot.number),
                 canonical_name: slot.canonical_name.clone(),
             });
@@ -269,6 +293,8 @@ impl VolumeAttemptPlan {
         if parts.is_empty() {
             return false;
         }
+        let mut members = DomainMembers::new();
+        let mut domains: HashMap<(DomainKey, bool), HashMap<ExtentKey<'_>, ExtentCandidates>> = HashMap::new();
         for (index, layout) in self.layouts.iter().enumerate() {
             if parts.len() != layout.slots.len()
                 && (layout.minimum_slots == 0
@@ -291,23 +317,40 @@ impl VolumeAttemptPlan {
                 };
                 let trimmed_head = position == 0
                     && (self.head_size_from_total.is_some() || !self.tail_totals.is_empty());
-                let candidate = self.domains[domain]
-                    .choices
-                    .iter()
-                    .copied()
-                    .find(|&source| {
-                        let extent = &self.sources[source];
-                        if trimmed_head {
-                            extent.path == part.extent.path
-                                && extent.start == part.extent.start
-                                && extent
-                                    .end
-                                    .zip(part.extent.end)
-                                    .is_some_and(|(full, end)| end <= full)
-                        } else {
-                            *extent == part.extent
+                let choices = &self.domains[domain].choices;
+                let extents = domains.entry((Arc::as_ptr(choices), trimmed_head))
+                    .or_insert_with(|| {
+                        let mut extents = HashMap::with_capacity(choices.len());
+                        for &source in choices.iter() {
+                            let extent = &self.sources[source];
+                            let key = (extent.path.as_str(), extent.start,
+                                if trimmed_head { None } else { extent.end });
+                            if trimmed_head {
+                                if let Some(end) = extent.end {
+                                    let candidates = extents.entry(key)
+                                        .or_insert_with(|| ExtentCandidates::Trimmed(Vec::new()));
+                                    if let ExtentCandidates::Trimmed(ends) = candidates {
+                                        if ends.last().map_or(true, |&(previous, _)| end > previous) {
+                                            ends.push((end, source));
+                                        }
+                                    }
+                                }
+                            } else {
+                                extents.entry(key).or_insert(ExtentCandidates::Exact(source));
+                            }
                         }
+                        extents
                     });
+                let key = (part.extent.path.as_str(), part.extent.start,
+                    if trimmed_head { None } else { part.extent.end });
+                let candidate = extents.get(&key).and_then(|candidates| match candidates {
+                    ExtentCandidates::Exact(source) => Some(*source),
+                    ExtentCandidates::Trimmed(ends) => {
+                        let end = part.extent.end?;
+                        ends.get(ends.partition_point(|&(full, _)| full < end))
+                            .map(|&(_, source)| source)
+                    }
+                });
                 let Some(source) = candidate else {
                     break;
                 };
@@ -315,10 +358,10 @@ impl VolumeAttemptPlan {
             }
             if sources.len() == parts.len()
                 && self
-                    .selected_parts(&VolumeSelection {
+                    .selected_parts_indexed(&VolumeSelection {
                         layout: index,
                         sources,
-                    })
+                    }, &mut members)
                     .is_ok_and(|selected| selected.as_ref() == parts)
             {
                 return true;
@@ -501,4 +544,104 @@ fn project_input_slice(
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trimmed_head_admission_keeps_first_sufficient_duplicate_extent() {
+        // A shorter duplicate must not hide a later sufficient carrier. Keep
+        // first-match order too: a later match cannot bypass source uniqueness.
+        let mut plan = VolumeAttemptPlan {
+            sources: [None, Some(4), Some(12), Some(8), Some(20), Some(10)]
+                .into_iter().enumerate().map(|(i, end)| InputExtent {
+                    path: if i == 5 { "tail" } else { "carrier" }.into(),
+                    start: 0, end,
+                }).collect(),
+            layouts: Box::new([VolumeLayout {
+                slots: Box::new([
+                    VolumeSlot { number: 1, canonical_name: String::new(), domain: 0 },
+                    VolumeSlot { number: 2, canonical_name: String::new(), domain: 1 },
+                ]),
+                minimum_slots: 0,
+            }]),
+            domains: Box::new([
+                VolumeDomain { choices: Arc::new(vec![0, 1, 2, 3, 4]) },
+                VolumeDomain { choices: Arc::new(vec![5]) },
+            ]),
+            head_size_from_total: Some(20), minimum_size: None, tail_totals: Box::new([]),
+        };
+        let mut parts = plan.selected_parts(&VolumeSelection {
+            layout: 0, sources: vec![4, 5],
+        }).unwrap();
+        for end in [1, 4, 5, 8, 12, 13, 20, 21] {
+            plan.head_size_from_total = Some(end + 10);
+            parts[0].extent.end = Some(end);
+            assert_eq!(plan.admits_parts(&parts), end <= 20, "head end {end}");
+        }
+        parts[0].extent.end = None;
+        assert!(!plan.admits_parts(&parts));
+
+        // Source 2 is the first sufficient head, but is already the tail.
+        // Source 4 also fits; choosing it instead would change old behavior.
+        plan.domains[1].choices = Arc::new(vec![2]);
+        plan.head_size_from_total = Some(22);
+        parts[0].extent.end = Some(10);
+        parts[1].extent = plan.sources[2].clone();
+        assert!(!plan.admits_parts(&parts));
+    }
+
+    #[test]
+    fn shared_volume_domains_are_indexed_once_and_validate_checkpoint_geometry() {
+        // Same shared-pool shape used by attempts.rs for unnumbered interior
+        // gaps. Both worker selection and checkpoint admission must stay valid
+        // without re-scanning the pool for every slot.
+        let count = 256;
+        let choices = Arc::new((0..count).collect::<Vec<_>>());
+        let mut plan = VolumeAttemptPlan {
+            sources: (0..count).map(|i| InputExtent {
+                path: format!("part-{i}"), start: 0, end: Some(10),
+            }).collect(),
+            layouts: Box::new([VolumeLayout {
+                slots: (0..count).map(|i| VolumeSlot {
+                    number: i as u32 + 1, canonical_name: String::new(), domain: i,
+                }).collect(),
+                minimum_slots: 0,
+            }]),
+            // Distinct domain records can still share the same choices Arc.
+            domains: (0..count).map(|_| VolumeDomain { choices: Arc::clone(&choices) }).collect(),
+            head_size_from_total: None, minimum_size: None, tail_totals: Box::new([]),
+        };
+        let mut indexes = DomainMembers::new();
+        let mut selection = VolumeSelection { layout: 0, sources: (0..count).rev().collect() };
+        let parts = plan.selected_parts_indexed(&selection, &mut indexes).unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes.values().map(HashSet::len).sum::<usize>(), count);
+        assert!(plan.admits_parts(&parts));
+        selection.sources[1] = selection.sources[0];
+        assert!(plan.selected_parts(&selection).is_err());
+        selection.sources[1] = count;
+        assert!(plan.selected_parts(&selection).is_err());
+        let mut wrong = parts.clone();
+        wrong[1].extent.start = 1;
+        assert!(!plan.admits_parts(&wrong));
+        wrong = parts.clone();
+        wrong[1].canonical_name = "unplanned".into();
+        assert!(!plan.admits_parts(&wrong));
+
+        // Variable counts use the final slot's domain, and a trimmed head is
+        // matched by physical start before the exact total-size formula runs.
+        plan.layouts[0].minimum_slots = 2;
+        plan.head_size_from_total = Some(15);
+        let trimmed = plan.selected_parts(&VolumeSelection {
+            layout: 0, sources: vec![0, count - 1],
+        }).unwrap();
+        assert_eq!(trimmed[0].extent.end, Some(5));
+        assert!(plan.admits_parts(&trimmed));
+        let mut wrong = trimmed;
+        wrong[0].extent.end = Some(6);
+        assert!(!plan.admits_parts(&wrong));
+    }
 }

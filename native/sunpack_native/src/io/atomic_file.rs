@@ -49,10 +49,11 @@ mod win {
         }
         Ok(())
     }
-    pub(crate) fn replace_with_cancel(
+    fn replace_inner(
         from: &std::path::Path,
         to: &std::path::Path,
         cancellation: &super::super::cancellation::Cancellation,
+        retry_sharing: bool,
     ) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -91,7 +92,7 @@ mod win {
             } else {
                 replace_error
             };
-            if !super::sharing_conflict(&error) {
+            if !retry_sharing || !super::sharing_conflict(&error) {
                 return Err(error);
             }
             cancellation.check_io()?;
@@ -100,12 +101,24 @@ mod win {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+    pub(crate) fn replace_with_cancel(
+        from: &Path, to: &Path, cancellation: &super::super::cancellation::Cancellation,
+    ) -> io::Result<()> {
+        replace_inner(from, to, cancellation, true)
+    }
+
+    // Snapshot owners can retain their WAL and retry on the next mutation.
+    // Do not wait for an unrelated process to release a sharing handle.
+    pub(crate) fn replace_once(from: &Path, to: &Path) -> io::Result<()> {
+        replace_inner(from, to, &super::super::cancellation::Cancellation::default(), false)
+    }
+
 }
 pub(crate) fn sharing_conflict(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32 | 33))
 }
 
-pub(crate) use win::{rename_no_replace, replace_with_cancel};
+pub(crate) use win::{rename_no_replace, replace_once, replace_with_cancel};
 
 // Existing transaction callers finish publication once started. Opt into
 // cancellable retries only where the owner can discard its temporary file.

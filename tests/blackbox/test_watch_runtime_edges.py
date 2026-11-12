@@ -108,7 +108,6 @@ def test_cold_watch_once_collects_the_clipboard_before_dispatch(package, tmp_pat
         check=True, capture_output=True,
     )
     package.configure(watch={"clipboard_monitor_enabled": True, "clipboard_builtin_max_entries": 2})
-    package.json("watch", "add", watched, "-o", output)
     # Keep the STA owner alive while Watch reads the real clipboard, then
     # restore all formats captured before the test changed it.
     script = r"""
@@ -123,6 +122,15 @@ if ($null -ne $previous) {
 }
 try {
     [System.Windows.Forms.Clipboard]::SetText("discarded`nretained`nclipboard-only-key")
+    # With no roots, even once must not import the current clipboard.
+    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch start --once --no-tray --json
+    if ($LASTEXITCODE -ne 0) { throw "empty-root once failed" }
+    $passwords = Get-Content -Raw $env:SUNPACK_CLIPBOARD_TEST_PASSWORDS | ConvertFrom-Json
+    if (@($passwords.clipboard_history).Count -gt 0 -and $null -ne $passwords.clipboard_history) {
+        throw "empty-root once imported clipboard passwords"
+    }
+    & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch add $env:SUNPACK_CLIPBOARD_TEST_ROOT -o $env:SUNPACK_CLIPBOARD_TEST_OUTPUT --json
+    if ($LASTEXITCODE -ne 0) { throw "watch add failed" }
     & $env:SUNPACK_CLIPBOARD_TEST_LAUNCHER watch start --once --no-tray --json
     $result = $LASTEXITCODE
 } finally {
@@ -137,7 +145,10 @@ exit $result
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
         cwd=package.data,
-        env={**package.env, "SUNPACK_CLIPBOARD_TEST_LAUNCHER": str(package.launcher)},
+        env={**package.env, "SUNPACK_CLIPBOARD_TEST_LAUNCHER": str(package.launcher),
+             "SUNPACK_CLIPBOARD_TEST_ROOT": str(watched),
+             "SUNPACK_CLIPBOARD_TEST_OUTPUT": str(output),
+             "SUNPACK_CLIPBOARD_TEST_PASSWORDS": str(package.data / "builtin_passwords.json")},
         text=True, encoding="utf-8", capture_output=True, timeout=60,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)

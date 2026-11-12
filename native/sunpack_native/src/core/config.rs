@@ -16,7 +16,7 @@ const OVERRIDES: &str = "SUNPACK_CONFIG_OVERRIDES";
 const DEFAULTS: &str = include_str!("../../../../sunpack_advanced_config.json");
 const CONFIG_CACHE_LIMIT: usize = 64;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Config {
     pub cli: CliConfig,
     pub runtime: RuntimeConfig,
@@ -32,7 +32,7 @@ pub struct Config {
     pub analysis: AnalysisConfig,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct CliConfig {
     pub language: Language,
 }
@@ -44,7 +44,7 @@ pub enum ProcessMode {
     High,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct RuntimeConfig {
     pub process_mode: ProcessMode,
 }
@@ -61,7 +61,7 @@ pub struct WatchConfig {
     pub event_log_retention_days: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct PasswordConfig {
     pub clipboard_passwords_enabled: bool,
 }
@@ -73,7 +73,7 @@ pub enum Recursion {
     Fixed(usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct AuthorizationConfig {
     pub enabled: bool,
     pub byte_ratio_exponent: f64,
@@ -81,7 +81,7 @@ pub struct AuthorizationConfig {
     pub minimum_authorization_score: f64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct EmbeddedConfig {
     pub enabled: bool,
     pub recursive_candidate_ratio: f64,
@@ -93,7 +93,7 @@ pub enum ContentRequirement {
     AllowPartial,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct ExtractionConfig {
     pub content_requirement: ContentRequirement,
 }
@@ -105,13 +105,13 @@ pub enum CleanupMode {
     Keep,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct PostExtractConfig {
     pub archive_cleanup_mode: CleanupMode,
     pub flatten_single_directory: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct FilesystemConfig {
     pub scan_filters_enabled: bool,
     pub scan_filters: Arc<[ScanFilter]>,
@@ -119,13 +119,13 @@ pub struct FilesystemConfig {
 
 pub type NumericBounds = [Option<u64>; 5];
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ScanFilter {
     pub enabled: bool,
     pub kind: ScanFilterKind,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum ScanFilterKind {
     Blacklist(PathRule),
     Whitelist(PathRule),
@@ -135,26 +135,33 @@ pub enum ScanFilterKind {
 }
 
 #[derive(Clone)]
-pub struct PathRule(NativePathRule);
+pub struct PathRule {
+    raw: Arc<Value>,
+    compiled: Option<NativePathRule>,
+}
 
-#[derive(Clone, Copy)]
+impl PartialEq for PathRule {
+    fn eq(&self, other: &Self) -> bool { self.raw == other.raw }
+}
+
+#[derive(Clone, Copy, PartialEq)]
 pub struct PerformanceConfig {
     pub persistent_server_idle_seconds: Option<f64>,
     pub worker: WorkerConfig,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct WorkerConfig {
     pub space_poll_interval_ms: Option<u64>,
     pub space_status_report_interval_ms: Option<u64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct AnalysisConfig {
     pub modules: Arc<[AnalysisModule]>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct AnalysisModule {
     pub name: Box<str>,
     pub enabled: bool,
@@ -649,6 +656,19 @@ fn check_section(value: &Value, section: &str, strict: bool) -> io::Result<()> {
 }
 
 impl Config {
+    /// Explicit validation includes disabled expressions; runtime parsing does not.
+    pub fn validate_scan_filters(value: &Value) -> io::Result<()> {
+        let filters = field(value, &["filesystem", "scan_filters"]).as_array()
+            .ok_or_else(|| invalid("filesystem.scan_filters must be a list"))?;
+        for (index, filter) in filters.iter().enumerate() {
+            ScanFilter::parse(index, filter, true)?;
+            if matches!(filter["name"].as_str().map(str::trim), Some("blacklist" | "whitelist")) {
+                PathRule::parse(filter)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn parse(value: &Value) -> io::Result<Self> {
         for section in ["runtime", "watch", "passwords", "extraction"] {
             check_section(value, section, false)?;
@@ -737,10 +757,11 @@ impl Config {
         let filters = field(value, &["filesystem", "scan_filters"])
             .as_array()
             .ok_or_else(|| invalid("filesystem.scan_filters must be a list"))?;
+        let scan_filters_enabled = bool_field(value, &["filesystem", "scan_filters_enabled"])?;
         let scan_filters = filters
             .iter()
             .enumerate()
-            .map(|(index, filter)| ScanFilter::parse(index, filter))
+            .map(|(index, filter)| ScanFilter::parse(index, filter, scan_filters_enabled))
             .collect::<io::Result<Arc<[_]>>>()?;
         let modules = field(value, &["analysis", "modules"])
             .as_array()
@@ -790,7 +811,7 @@ impl Config {
                 )?,
             },
             filesystem: FilesystemConfig {
-                scan_filters_enabled: bool_field(value, &["filesystem", "scan_filters_enabled"])?,
+                scan_filters_enabled,
                 scan_filters,
             },
             performance: PerformanceConfig {
@@ -845,16 +866,46 @@ impl Recursion {
         match value.trim() {
             "*" => Ok(Self::Infinite),
             "?" => Ok(Self::Prompt),
-            count => count
-                .parse::<usize>()
-                .ok()
-                .filter(|&n| n > 0)
+            count => positive_decimal(count)
                 .map(Self::Fixed)
                 .ok_or_else(|| {
                     invalid("recursive_extract must be \"*\", \"?\", or a positive integer")
                 }),
         }
     }
+}
+
+// Python int accepts Unicode decimal digits and single underscores between
+// digits. Use the existing Unicode property database, not a second hand-kept
+// digit table. Saturation preserves the effective "deeper than any task" limit.
+fn positive_decimal(value: &str) -> Option<usize> {
+    use regex_syntax::hir::{Class, HirKind};
+    static DECIMAL_RANGES: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let mut result = 0usize;
+    let mut digit_before = false;
+    for character in value.chars() {
+        if character == '_' {
+            if !digit_before { return None; }
+            digit_before = false;
+            continue;
+        }
+        let digit = if character.is_ascii_digit() {
+            character as u32 - '0' as u32
+        } else {
+            let ranges = DECIMAL_RANGES.get_or_init(|| {
+                let hir = regex_syntax::Parser::new().parse(r"\p{Nd}").expect("Unicode decimal class");
+                let HirKind::Class(Class::Unicode(class)) = hir.kind() else { unreachable!() };
+                class.iter().map(|range| (range.start() as u32, range.end() as u32)).collect()
+            });
+            let code = character as u32;
+            let &(start, _) = ranges.iter().find(|&&(start, end)| start <= code && code <= end)?;
+            (code - start) % 10
+        };
+        result = result.saturating_mul(10).saturating_add(digit as usize);
+        digit_before = true;
+    }
+    (digit_before && result > 0).then_some(result)
 }
 
 impl ProcessMode {
@@ -908,6 +959,10 @@ fn check_keys(value: &Map<String, Value>, allowed: &[&str], label: &str) -> io::
 
 impl PathRule {
     pub fn parse(value: &Value) -> io::Result<Self> {
+        Self::parse_for_runtime(value, true)
+    }
+
+    fn parse_for_runtime(value: &Value, compile: bool) -> io::Result<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid("path rule must be an object"))?;
@@ -927,25 +982,39 @@ impl PathRule {
             let Some(value) = object.get(key) else {
                 return Ok(Vec::new());
             };
-            Vec::deserialize(value)
-                .map_err(|error| invalid(format!("{key} must be a list of rule objects: {error}")))
+            let entries: Vec<RuleEntry> = Vec::deserialize(value)
+                .map_err(|error| invalid(format!("{key} must be a list of rule objects: {error}")))?;
+            if let Some(index) = entries.iter().position(|entry| entry.value.is_empty()) {
+                return Err(invalid(format!("{key}[{index}] requires a nonempty value string")));
+            }
+            Ok(entries)
         };
-        NativePathRule::compile(
-            parse("paths")?,
-            parse("files")?,
-            parse("extensions")?,
-            parse("full_names")?,
-        )
-        .map(Self)
+        // Disabled rules still undergo structural validation. Retain their raw
+        // form for reload equality and explicit config validation, but do not
+        // compile expressions that cannot participate in this runtime scan.
+        let (paths, files, extensions, full_names) =
+            (parse("paths")?, parse("files")?, parse("extensions")?, parse("full_names")?);
+        let compiled = if compile {
+            Some(NativePathRule::compile(paths, files, extensions, full_names)?)
+        } else {
+            None
+        };
+        let mut raw = object.clone();
+        raw.remove("name");
+        raw.remove("enabled");
+        for key in ["paths", "files", "extensions", "full_names"] {
+            raw.entry(key.to_owned()).or_insert_with(|| Value::Array(Vec::new()));
+        }
+        Ok(Self { raw: Arc::new(Value::Object(raw)), compiled })
     }
 
     pub(crate) fn compiled(&self) -> NativePathRule {
-        self.0.clone()
+        self.compiled.as_ref().expect("enabled runtime rule is compiled").clone()
     }
 }
 
 impl ScanFilter {
-    fn parse(index: usize, value: &Value) -> io::Result<Self> {
+    fn parse(index: usize, value: &Value, globally_enabled: bool) -> io::Result<Self> {
         let object = value.as_object().ok_or_else(|| {
             invalid(format!(
                 "filesystem.scan_filters[{index}] must be an object"
@@ -970,12 +1039,12 @@ impl ScanFilter {
         };
         let kind = match name {
             "blacklist" => {
-                ScanFilterKind::Blacklist(PathRule::parse(value).map_err(|error| {
+                ScanFilterKind::Blacklist(PathRule::parse_for_runtime(value, enabled && globally_enabled).map_err(|error| {
                     invalid(format!("filesystem.scan_filters[{index}]: {error}"))
                 })?)
             }
             "whitelist" => {
-                ScanFilterKind::Whitelist(PathRule::parse(value).map_err(|error| {
+                ScanFilterKind::Whitelist(PathRule::parse_for_runtime(value, enabled && globally_enabled).map_err(|error| {
                     invalid(format!("filesystem.scan_filters[{index}]: {error}"))
                 })?)
             }
@@ -1096,4 +1165,63 @@ fn utc_minute(value: &str) -> Option<i128> {
         - 1
         - 719_162;
     Some(i128::from(days * 86_400 + hour * 3600 + minute * 60) * 1_000_000_000)
+}
+
+#[cfg(test)]
+mod filter_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn normalized_configuration_equality_ignores_syntax_but_not_runtime_changes() {
+        let before = Config::parse(&serde_json::json!({})).unwrap();
+        let same = Config::parse(&serde_json::json!({"runtime":{"process_mode":"NORMAL"}})).unwrap();
+        assert!(before == same);
+        let changed = Config::parse(&serde_json::json!({"runtime":{"process_mode":"background"}})).unwrap();
+        assert!(before != changed);
+        let omitted_rules = PathRule::parse(&serde_json::json!({"name":"blacklist","enabled":true})).unwrap();
+        let empty_rules = PathRule::parse(&serde_json::json!({"paths":[],"files":[],"extensions":[],"full_names":[]})).unwrap();
+        assert!(omitted_rules == empty_rules);
+    }
+
+    #[test]
+    fn disabled_rules_validate_shape_without_compiling_expressions() {
+        let mut raw = defaults().clone();
+        raw["filesystem"]["scan_filters"] = serde_json::json!([{
+            "name": "blacklist", "enabled": false,
+            "full_names": [{"value": "[", "regex": true}]
+        }]);
+        assert!(Config::parse(&raw).is_ok());
+        assert!(Config::validate_scan_filters(&raw).is_err());
+        raw["filesystem"]["scan_filters"][0]["name"] = Value::String(" blacklist ".into());
+        assert!(Config::parse(&raw).is_ok());
+        assert!(Config::validate_scan_filters(&raw).is_err());
+        raw["filesystem"]["scan_filters"][0]["full_names"][0]["value"] = Value::String(String::new());
+        assert!(Config::parse(&raw).is_err());
+        raw["filesystem"]["scan_filters"][0]["full_names"][0]["value"] = Value::String("[".into());
+        raw["filesystem"]["scan_filters"][0]["enabled"] = Value::Bool(true);
+        assert!(Config::parse(&raw).is_err());
+        raw["filesystem"]["scan_filters_enabled"] = Value::Bool(false);
+        assert!(Config::parse(&raw).is_ok());
+        raw["filesystem"]["scan_filters"][0]["full_names"][0]["regex"] = Value::String("bad".into());
+        assert!(Config::parse(&raw).is_err());
+        let a = PathRule::parse_for_runtime(&serde_json::json!({"name":"blacklist"}), false).unwrap();
+        let b = PathRule::parse_for_runtime(&serde_json::json!({"name":"whitelist", "paths":[]}), false).unwrap();
+        assert!(a == b);
+    }
+}
+
+#[cfg(test)]
+mod recursion_lexical_tests {
+    use super::*;
+
+    #[test]
+    fn python_positive_decimal_recursion_contract() {
+        for (input, expected) in [("1_0", 10), ("١", 1), ("+１２", 12), (" १_२ ", 12), ("𝟙𝟘", 10)] {
+            assert!(matches!(Recursion::parse(input), Ok(Recursion::Fixed(value)) if value == expected));
+        }
+        for input in ["", "_1", "1_", "1__0", "0", "-1", "²", "1.0", "+_1"] {
+            assert!(Recursion::parse(input).is_err(), "{input}");
+        }
+        assert!(matches!(Recursion::parse(&"9".repeat(100)), Ok(Recursion::Fixed(usize::MAX))));
+    }
 }

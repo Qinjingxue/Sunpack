@@ -26,8 +26,71 @@ pub(super) struct Process {
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
+    stderr: Mutex<StderrHistory>,
     changed: Condvar,
     shutting_down: AtomicBool,
+}
+
+// Match main's diagnostic tail without allowing an unterminated native line
+// to grow memory. UTF-8 needs at most four bytes per retained character.
+const STDERR_TAIL_CHARS: usize = 4000;
+const STDERR_TAIL_LINES: usize = 40;
+const STDERR_TAIL_BYTES: usize = STDERR_TAIL_CHARS * 4;
+
+#[derive(Default)]
+struct StderrHistory { bytes: VecDeque<u8> }
+
+impl StderrHistory {
+    fn append(&mut self, bytes: &[u8]) {
+        let bytes = &bytes[bytes.len().saturating_sub(STDERR_TAIL_BYTES)..];
+        let remove = (self.bytes.len() + bytes.len()).saturating_sub(STDERR_TAIL_BYTES);
+        self.bytes.drain(..remove);
+        self.bytes.extend(bytes.iter().copied());
+    }
+
+    fn take(&mut self) -> String {
+        let bytes: Vec<_> = self.bytes.drain(..).collect();
+        let text = String::from_utf8_lossy(&bytes);
+        let start = text.char_indices().rev().nth(STDERR_TAIL_CHARS - 1)
+            .map_or(0, |(offset, _)| offset);
+        let lines: Vec<_> = text[start..].split_inclusive('\n').collect();
+        lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].concat()
+    }
+}
+
+fn pump_stderr(mut pipe: impl Read, shared: &Shared) {
+    let mut block = [0; 4096];
+    let mut pending = Vec::with_capacity(block.len() + 3);
+    loop {
+        let count = match pipe.read(&mut block) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        pending.extend_from_slice(&block[..count]);
+        let mut consumed = 0;
+        // Preserve incomplete UTF-8 across pipe reads. Result publication must
+        // not turn a split character into two replacement characters.
+        while consumed < pending.len() {
+            match std::str::from_utf8(&pending[consumed..]) {
+                Ok(_) => {
+                    shared.stderr.lock().unwrap().append(&pending[consumed..]);
+                    consumed = pending.len();
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    shared.stderr.lock().unwrap().append(&pending[consumed..valid_end]);
+                    consumed = valid_end;
+                    let Some(invalid) = error.error_len() else { break; };
+                    shared.stderr.lock().unwrap().append("�".as_bytes());
+                    consumed += invalid;
+                }
+            }
+        }
+        pending.drain(..consumed);
+    }
+    if !pending.is_empty() { shared.stderr.lock().unwrap().append("�".as_bytes()); }
 }
 
 #[derive(Default)]
@@ -193,6 +256,7 @@ impl Episode {
 #[derive(Default)]
 struct Mailbox {
     updates: Mutex<Updates>,
+    stderr: Mutex<StderrHistory>,
     interest: WorkerUpdates,
 }
 
@@ -237,7 +301,7 @@ impl Process {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env("SUNPACK_NATIVE_PROCESS_MODE", mode_name(mode));
         if let Some(interval) = config.space_poll_interval_ms {
             command.env("SUNPACK_VOLUME_SPACE_POLL_MS", interval.to_string());
@@ -586,6 +650,7 @@ fn run_process(
     let _job = crate::core::process::KillOnCloseJob::attach(&spawned).ok();
     let input = spawned.stdin.take().expect("worker stdin is piped");
     let output = spawned.stdout.take().expect("worker stdout is piped");
+    let stderr = spawned.stderr.take();
     *child.lock().unwrap() = Some(spawned);
     let abandoned = shared.state.lock().unwrap().abort_startup.clone();
     if let Some(reason) = abandoned {
@@ -593,6 +658,21 @@ fn run_process(
         shared.fail(reason.message, reason.kind);
         return;
     }
+    let stderr_owner = match stderr {
+        Some(pipe) => {
+            let owner = Arc::clone(shared);
+            match thread::Builder::new().name("sunpack-worker-stderr".into())
+                .spawn(move || pump_stderr(pipe, &owner)) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    stop_child(child);
+                    shared.fail(error.to_string(), error.kind());
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
     let owner = Arc::clone(shared);
     let owner_child = Arc::clone(child);
     let writer = match thread::Builder::new()
@@ -606,6 +686,7 @@ fn run_process(
         Ok(writer) => writer,
         Err(error) => {
             stop_child(child);
+            if let Some(owner) = stderr_owner { let _ = owner.join(); }
             shared.fail(error.to_string(), error.kind());
             return;
         }
@@ -632,6 +713,7 @@ fn run_process(
         if out_of_memory { io::ErrorKind::OutOfMemory } else { io::ErrorKind::BrokenPipe },
     );
     let _ = writer.join();
+    if let Some(owner) = stderr_owner { let _ = owner.join(); }
 }
 
 impl Shared {
@@ -757,7 +839,7 @@ impl Shared {
         let job_id = string(&frame.summary, "job_id").to_owned();
         if kind == "native_event" && string(&frame.summary, "event") == "job_finished" {
             if let Some(mut job) = state.jobs.remove(&job_id) {
-                let result = job.result.take().unwrap_or_else(|| {
+                let mut result = job.result.take().unwrap_or_else(|| {
                     Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "native job finished without a result",
@@ -777,6 +859,10 @@ impl Shared {
                         state.grant_retry();
                     }
                 } else {
+                    if let Ok(frame) = &mut result {
+                        let stderr = job.mailbox.stderr.lock().unwrap().take();
+                        if !stderr.is_empty() { frame.summary["stderr_tail"] = Value::String(stderr); }
+                    }
                     state.completion_epoch += 1;
                     if state.grant_retry() {
                         state.claimed_epoch = state.completion_epoch;
@@ -823,6 +909,8 @@ impl Shared {
             "progress" | "native_memory" => {}
             _ => match job.accumulator.accept(frame) {
                 Ok(Some(frame)) if string(&frame.summary, "type") == "result" => {
+                    let stderr = self.stderr.lock().unwrap().take();
+                    job.mailbox.stderr.lock().unwrap().append(stderr.as_bytes());
                     job.result = Some(Ok(frame))
                 }
                 Ok(_) => {}
@@ -1472,6 +1560,52 @@ mod tests {
             .expect("EOF left an idle writer asleep");
         writer.join().unwrap();
         assert_eq!(Arc::strong_count(&idle), 1);
+    }
+
+    #[test]
+    fn structured_results_keep_bounded_stderr_and_drain_between_jobs() {
+        let shared = Shared::default();
+        // A result may drain stderr between reads of one UTF-8 character.
+        // Like main's incremental decoder, retain the unfinished character
+        // privately until the next read, without emitting replacements.
+        struct SplitCharacter<'a> { shared: &'a Shared, read: usize }
+        impl Read for SplitCharacter<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let bytes: &[u8] = match self.read {
+                    0 => b"before\xe5\xaf",
+                    1 => {
+                        assert_eq!(self.shared.stderr.lock().unwrap().take(), "before");
+                        b"\x86"
+                    },
+                    _ => return Ok(0),
+                };
+                self.read += 1;
+                output[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+        pump_stderr(SplitCharacter { shared: &shared, read: 0 }, &shared);
+        assert_eq!(shared.stderr.lock().unwrap().take(), "密");
+        let first = register(&shared, "first");
+        // Read arbitrary blocks, including split UTF-8, through the same pump
+        // as the child pipe. A long native line must never grow without bound.
+        let text = "密".repeat(STDERR_TAIL_CHARS + 100);
+        pump_stderr(io::Cursor::new(text.as_bytes()), &shared);
+        assert!(shared.stderr.lock().unwrap().bytes.len() <= STDERR_TAIL_BYTES);
+        finish(&shared, "first", false);
+        let frame = first.updates.lock().unwrap().result.take().unwrap().unwrap();
+        assert_eq!(frame.summary["stderr_tail"].as_str().unwrap(), "密".repeat(STDERR_TAIL_CHARS));
+        let second = register(&shared, "second");
+        let lines = (0..60).map(|n| format!("line{n}\n")).collect::<String>();
+        pump_stderr(io::Cursor::new(lines), &shared);
+        finish(&shared, "second", false);
+        let frame = second.updates.lock().unwrap().result.take().unwrap().unwrap();
+        let text = frame.summary["stderr_tail"].as_str().unwrap();
+        assert_eq!(text.lines().count(), STDERR_TAIL_LINES);
+        assert!(text.starts_with("line20\n") && text.ends_with("line59\n"));
+        let third = register(&shared, "third");
+        finish(&shared, "third", false);
+        assert!(third.updates.lock().unwrap().result.take().unwrap().unwrap().summary.get("stderr_tail").is_none());
     }
 
     fn dispatch(shared: &Shared, summary: Value) {

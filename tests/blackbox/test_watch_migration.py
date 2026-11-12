@@ -63,7 +63,7 @@ def test_watch_catalog_loss_rebuilds_baseline_without_replaying_existing_sources
 
     package.json("watch", "add", watched, "-o", output)
     blocked = package.run("watch", "start", "--once", "--no-tray", "--json")
-    assert blocked.returncode == 1, (blocked.stdout, blocked.stderr)
+    assert blocked.returncode == 0, (blocked.stdout, blocked.stderr)
     assert not list(output.rglob(payload.name))
     retained_outputs = list(output.rglob("retained.txt"))
     assert len(retained_outputs) == 1
@@ -308,7 +308,27 @@ def test_invalid_password_edit_keeps_watch_running_with_last_valid_passwords(pac
     malformed = table.with_suffix(".tmp")
     malformed.write_text('{"passwords":[', encoding="utf-8")
     malformed.replace(table)
-    assert package.json("watch", "reload")["summary"]["reloaded"]
+    assert not package.json("watch", "reload")["summary"]["reloaded"]
     encrypted.replace(watched / encrypted.name)
     _wait_for(lambda: any(output.rglob(payload.name)), "Watch stopped after a malformed password edit")
     assert [path.read_bytes() for path in output.rglob(payload.name)] == [payload.read_bytes()]
+
+
+def test_watch_reload_noop_and_invalid_configuration_keep_main_contract(package, tmp_path):
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    package.json("watch", "add", watched)
+    package.json("watch", "start", "--no-tray")
+    assert not package.json("watch", "reload")["summary"]["reloaded"]
+    config = package.data / "sunpack_config.json"
+    raw = json.loads(config.read_text(encoding="utf-8"))
+    config.write_text(json.dumps(raw, indent=4, sort_keys=True), encoding="utf-8")
+    assert not package.json("watch", "reload")["summary"]["reloaded"]
+    try:
+        config.write_text('{"watch":', encoding="utf-8")
+        reply = package.json("watch", "reload")
+        assert reply["summary"]["running"]
+        assert not reply["summary"]["reloaded"]
+    finally:
+        config.write_text(json.dumps(raw), encoding="utf-8")
+    assert package.json("watch", "status")["summary"]["running"]

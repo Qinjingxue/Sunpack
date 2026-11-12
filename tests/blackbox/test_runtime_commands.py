@@ -378,3 +378,17 @@ def test_gui_password_edits_are_visible_to_running_runtime(package):
     )
     assert result.returncode == 0
     assert package.json("passwords")["items"][0]["builtin_passwords"] == [" GUI # 中文 "]
+
+
+def test_main_cli_contracts_preserve_parent_flags_and_reject_abbreviations(package, tmp_path):
+    for args in [("watch", "--json", "status"), ("config", "-j", "show")]:
+        result = package.run(*args)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["command"] == args[0]
+    for args in [("extract", "missing.zip", "--cle", "d"),
+                 ("scan", "missing.zip", "--recurs"), ("--hel",)]:
+        result = package.run(*args)
+        assert result.returncode == 2
+        assert "unrecognized" in result.stderr
+    empty = package.json("passwords", "--no-bpw", "--pw-file=", "-p", "explicit")
+    assert empty["items"][0]["user_passwords"] == ["explicit"]

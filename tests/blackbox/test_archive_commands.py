@@ -287,3 +287,23 @@ def test_partial_content_policy_uses_verified_members_and_retains_source(package
     assert result.returncode != 0
     assert source.is_file()
     assert not list(rejected_output.rglob("good.txt"))
+
+
+def test_json_recursive_prompt_and_empty_output_keep_main_contract(package, tmp_path):
+    inputs = tmp_path / "inputs"
+    work = tmp_path / "work"
+    inputs.mkdir()
+    work.mkdir()
+    for answer, name in [("yes\n", "allowed"), ("no\n", "denied")]:
+        source = inputs / f"{name}.zip"
+        source.write_bytes(_zip({"inner.zip": _zip({"payload.txt": b"nested"})}))
+        result = package.run("extract", source, "-F", "-c", "k", "-r", "?",
+                             "--out-dir=", "--json", input=answer, cwd=work)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        report = json.loads(result.stdout)
+        assert report["command"] == "extract"
+        output = inputs / name
+        assert output.is_dir()
+        assert bool(list(output.rglob("payload.txt"))) == (name == "allowed")
+        assert source.exists()
+        assert not (work / name).exists()

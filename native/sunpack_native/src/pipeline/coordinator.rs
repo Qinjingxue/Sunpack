@@ -33,7 +33,7 @@ use crate::scan::directory::{
 };
 use crate::scan::worker_event::WorkerFrame;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::poll_fn;
 use std::io;
@@ -307,6 +307,7 @@ impl Engine {
 
     pub(crate) fn clear_idle_passwords(&self) {
         self.password_attempts.clear();
+        self.output_names.lock().unwrap().clear_history();
     }
 
     pub(crate) fn recent_passwords(&self) -> Vec<Arc<str>> {
@@ -467,10 +468,40 @@ impl Drop for CancelPromptPanic<'_> {
 /// generated tree may enter it. Independent siblings must never overlap.
 #[derive(Default)]
 struct OutputNames {
-    indices: HashMap<String, usize>,
-    hints: HashMap<u64, HashSet<String>>,
+    indices: HashMap<String, OutputHistory>,
+    history_order: VecDeque<String>,
+    slots: HashMap<String, HashMap<String, usize>>,
     claimed: BTreeMap<String, OutputClaim>,
     owners: HashMap<u64, Vec<String>>,
+}
+
+const OUTPUT_HISTORY_LIMIT: usize = 256;
+
+struct OutputHistory {
+    next: usize,
+    available: BTreeSet<usize>,
+    observed: HashSet<String>,
+}
+
+impl OutputHistory {
+    fn take(&mut self) -> usize {
+        if self.available.first().is_some_and(|index| *index < self.next) {
+            return self.available.pop_first().unwrap();
+        }
+        let index = self.next;
+        self.next += 1;
+        self.available.remove(&index);
+        index
+    }
+
+    fn release(&mut self, index: usize) {
+        if self.available.len() >= OUTPUT_HISTORY_LIMIT {
+            self.next = self.next.min(index).min(*self.available.first().unwrap());
+            self.available.clear();
+        } else {
+            self.available.insert(index);
+        }
+    }
 }
 
 struct OutputClaim {
@@ -502,22 +533,59 @@ impl OutputNames {
     }
 
     fn release(&mut self, owner: u64) {
-        for key in self.hints.remove(&owner).into_iter().flatten() {
-            self.indices.remove(&key);
-        }
         for key in self.owners.remove(&owner).into_iter().flatten() {
             self.claimed.remove(&key);
-            for ancestor in crate::path_keys::path_ancestors(&key) {
-                self.indices.remove(ancestor);
+            // A candidate ancestor can have been blocked by this descendant.
+            // Return each observed slot to its bounded family and recheck the
+            // actual directory before reusing it on the next request.
+            for candidate in crate::path_keys::path_ancestors(&key) {
+                if let Some(slots) = self.slots.remove(candidate) {
+                    for (family, index) in slots {
+                        if let Some(history) = self.indices.get_mut(&family) {
+                            history.observed.remove(candidate);
+                            history.release(index);
+                        }
+                    }
+                }
             }
         }
-        if self.owners.is_empty() {
-            self.indices.clear();
-            self.claimed.clear();
-        }
         crate::collections::trim_map(&mut self.owners);
+        crate::collections::trim_map(&mut self.slots);
+    }
+
+    fn clear_history(&mut self) {
+        self.indices.clear();
+        self.history_order.clear();
+        self.slots.clear();
         crate::collections::trim_map(&mut self.indices);
-        crate::collections::trim_map(&mut self.hints);
+        crate::collections::trim_map(&mut self.slots);
+    }
+
+    fn next_index(&mut self, family: &str) -> usize {
+        if self.indices.contains_key(family) {
+            self.history_order.retain(|key| key != family);
+        } else {
+            if self.indices.len() == OUTPUT_HISTORY_LIMIT {
+                let old = self.history_order.pop_front().unwrap();
+                let history = self.indices.remove(&old).unwrap();
+                for path in history.observed {
+                    if let Some(slots) = self.slots.get_mut(&path) {
+                        slots.remove(&old);
+                        if slots.is_empty() { self.slots.remove(&path); }
+                    }
+                }
+            }
+            self.indices.insert(family.to_owned(), OutputHistory { next: 1, available: BTreeSet::new(), observed: HashSet::new() });
+        }
+        self.history_order.push_back(family.to_owned());
+        self.indices.get_mut(family).unwrap().take()
+    }
+
+    fn observe_slot(&mut self, path: &str, family: &str, index: usize) {
+        if index != 0 {
+            self.slots.entry(path.to_owned()).or_default().insert(family.to_owned(), index);
+            self.indices.get_mut(family).unwrap().observed.insert(path.to_owned());
+        }
     }
 
     fn has_under(&self, key: &str) -> bool {
@@ -592,46 +660,46 @@ impl OutputNames {
             preferred = replacement.join(relative);
         }
         let preferred_key = output_key(&preferred);
-        let mut index = *self.indices.get(&preferred_key).unwrap_or(&0);
+        // Always recheck the preferred unnumbered name, as main does. The
+        // history only accelerates numbered alternatives across requests.
+        let mut index = 0;
         loop {
             let path = if index == 0 { preferred.clone() } else { numbered(&preferred, index) };
-            if self.has_under(&output_key(&path)) {
-                index += 1;
+            let candidate_key = output_key(&path);
+            if self.has_under(&candidate_key) {
+                self.observe_slot(&candidate_key, &preferred_key, index);
+                index = self.next_index(&preferred_key);
                 continue;
             }
             let exists = match path.try_exists() {
                 Ok(exists) => exists,
-                Err(error) => return Ok(Err(file_failure(error))),
+                Err(error) => {
+                    if index != 0 { self.indices.get_mut(&preferred_key).unwrap().release(index); }
+                    return Ok(Err(file_failure(error)));
+                }
             };
             if !exists {
-                match observer.register_output(result, &path) {
-                    Ok(()) => {}
-                    Err(error) if !error.get_ref().is_some_and(|inner| {
+                if let Err(error) = observer.register_output(result, &path) {
+                    let creation_error = error.get_ref().is_some_and(|inner| {
                         inner.is::<super::OutputCreateError>()
-                    }) => return Err(error),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        if fs::symlink_metadata(&path).is_ok() {
-                            index += 1;
-                            continue;
-                        }
-                        return Ok(Err(file_failure(error)));
+                    });
+                    if creation_error && error.kind() == io::ErrorKind::AlreadyExists
+                        && fs::symlink_metadata(&path).is_ok()
+                    {
+                        index = self.next_index(&preferred_key);
+                        continue;
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
-                        return Ok(Err(file_failure(error)));
+                    if index != 0 {
+                        self.indices.get_mut(&preferred_key).unwrap().release(index);
                     }
-                    Err(error) if error.get_ref().is_some_and(|inner| {
-                        inner.is::<super::OutputCreateError>()
-                    }) => return Ok(Err(file_failure(error))),
-                    Err(error) => return Err(error),
+                    if !creation_error { return Err(error); }
+                    return Ok(Err(file_failure(error)));
                 }
-                if index != 0 {
-                    self.indices.insert(preferred_key.clone(), index + 1);
-                    self.hints.entry(owner).or_default().insert(preferred_key);
-                }
+                self.observe_slot(&candidate_key, &preferred_key, index);
                 self.claim(&path, owner, &result.path);
                 return Ok(Ok(path));
             }
-            index += 1;
+            index = self.next_index(&preferred_key);
         }
     }
 }
@@ -2346,6 +2414,7 @@ fn worker_evidence(
             (!text.is_empty()).then(|| text.to_owned())
         })
     };
+    let stderr_tail = field("stderr_tail");
     let stage = field("failure_stage");
     let native_kind = field("failure_kind");
     let missing_volume_name = field("missing_volume_name");
@@ -2366,7 +2435,8 @@ fn worker_evidence(
         read_error,
     });
     let recovery = recovery.filter(|preview| !preview.files.is_empty());
-    (stage.is_some()
+    (stderr_tail.is_some()
+        || stage.is_some()
         || native_kind.is_some()
         || missing_volume_name.is_some()
         || missing_volume_evidence.is_some()
@@ -2374,6 +2444,7 @@ fn worker_evidence(
         || recovery.is_some())
     .then(|| {
         Box::new(FailureEvidence {
+            stderr_tail,
             stage,
             native_kind,
             missing_volume_name,
@@ -2711,9 +2782,9 @@ fn dedup_resolved_plans(tasks: &mut Vec<Task>) {
     tasks.retain_mut(|task| {
         task.inputs.retain(|logical| {
             let input = &logical.input;
-            if input.volume_attempts.is_some() || logical.failure.is_some() {
-                return true;
-            }
+            // Main claims every physical plan, including unresolved volume
+            // candidates and preflight failures. Leases only serialize aliases;
+            // they do not prevent the second alias from executing afterwards.
             let mut extents: Box<[Extent]> = input
                 .physical_extents()
                 .map(|extent| (resolved(&extent.path), extent.start, extent.end))
@@ -3100,6 +3171,15 @@ impl Drop for Lease<'_> {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn worker_stderr_survives_failure_evidence_serialization() {
+        let evidence = worker_evidence(&json!({"stderr_tail":"native detail\n"}), None).unwrap();
+        let encoded = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(encoded["stderr_tail"], "native detail\n");
+        let decoded: FailureEvidence = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.stderr_tail.as_deref(), Some("native detail\n"));
+    }
 
     #[test]
     fn password_evidence_controls_retry_without_reclassifying_weak_crc_damage() {
@@ -3954,6 +4034,50 @@ mod tests {
     }
 
     #[test]
+    fn alias_dedup_covers_candidate_and_preflight_failure_plans() {
+        use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan};
+        let path = crate::test_support::temp_file("dedup_unresolved", b"physical archive");
+        let alias = path.parent().unwrap().join(".").join(path.file_name().unwrap());
+        let make = |path: &Path, candidate: bool, blocked: bool| {
+            let mut input = ArchiveInput::file(path.to_string_lossy().into_owned(),
+                "7z".into(), "archive".into());
+            if candidate {
+                input.volume_attempts = Some(Box::new(VolumeAttemptPlan {
+                    sources: Box::new([InputExtent {
+                        path: input.entry_path.clone(), start: 0, end: None,
+                    }]),
+                    layouts: Box::new([]), domains: Box::new([]),
+                    head_size_from_total: None, minimum_size: None, tail_totals: Box::new([]),
+                }));
+            }
+            Task {
+                owned_paths: vec![input.entry_path.clone()],
+                inputs: vec![LogicalInput { input, password: None,
+                    failure: blocked.then(|| Failure::new(FailureKind::MissingVolume, "missing")) }],
+                source: DiscoverySource::Direct, retry: None,
+            }
+        };
+        for (candidate, blocked) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut tasks = vec![make(&path, candidate, blocked), make(&alias, candidate, blocked)];
+            dedup_resolved_plans(&mut tasks);
+            assert_eq!(tasks.len(), 1, "candidate={candidate}, blocked={blocked}");
+        }
+        let mut first = make(&path, false, true);
+        first.inputs[0].input.mode = OpenMode::FileRange;
+        first.inputs[0].input.parts = Box::new([InputPart::range(InputExtent {
+            path: path.to_string_lossy().into_owned(), start: 0, end: Some(4),
+        })]);
+        let mut different = make(&alias, false, true);
+        different.inputs[0].input = first.inputs[0].input.clone();
+        different.inputs[0].input.parts[0].extent.start = 4;
+        different.inputs[0].input.parts[0].extent.end = Some(8);
+        let mut tasks = vec![first, different];
+        dedup_resolved_plans(&mut tasks);
+        assert_eq!(tasks.len(), 2, "distinct physical ranges must remain separate");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn conflicting_output_ancestor_preserves_alias_spelling() {
         for spelling in ["physical", "junction-alias"] {
             let path = PathBuf::from(spelling).join("branch").join("archive");
@@ -4021,8 +4145,8 @@ mod tests {
             assert_eq!(names.reserve(root.join("denied"), &result, &ObserverWithFailure, owner, None)
                 .unwrap().unwrap_err().kind, FailureKind::FilesystemError);
             assert!(names.reserve(root.join("journal"), &result, &ObserverWithFailure, owner, None).is_err());
-            // A long-lived owner must not retain numbering hints belonging
-            // to many short-lived requests with different output families.
+            // Released owners leave bounded family history, not ownership.
+            // More families evict history without affecting live claims.
             for short_owner in 10..42 {
                 let family = root.join(format!("family-{short_owner}"));
                 fs::create_dir(&family).unwrap();
@@ -4030,18 +4154,75 @@ mod tests {
                     .unwrap().unwrap();
                 assert!(names.indices.contains_key(&output_key(&family)));
                 names.release(short_owner);
-                assert!(!names.indices.contains_key(&output_key(&family)));
-                assert!(!names.hints.contains_key(&short_owner));
+                assert!(names.indices.len() <= OUTPUT_HISTORY_LIMIT);
+                assert!(!names.owners.contains_key(&short_owner));
             }
             names.release(3);
             drop(names);
             drop(second);
             drop(first);
             assert!(registry.lock().unwrap().claimed.is_empty());
+            registry.lock().unwrap().clear_history();
             assert!(registry.lock().unwrap().indices.is_empty());
             fs::remove_dir_all(&root).unwrap();
           }
         }
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn output_history_survives_requests_rechecks_released_slots_and_stays_bounded() {
+        struct Create;
+        impl Observer for Create {
+            fn notify(&self, _: Event) {}
+            fn register_output(&self, _: &ArchiveResult, path: &Path) -> io::Result<()> {
+                crate::scan::scope::create_output_root_exclusive(path)
+                    .map_err(super::super::OutputCreateError::wrap)
+            }
+        }
+        let source = crate::test_support::temp_file("output_history", b"input");
+        let root = source.with_extension("output");
+        fs::create_dir(&root).unwrap();
+        let preferred = root.join("archive");
+        fs::create_dir(&preferred).unwrap();
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        let result = receipt(&input, DiscoverySource::Direct, 1);
+        let mut names = OutputNames::default();
+        let family = output_key(&preferred);
+        for owner in 1..=32 {
+            let output = names.reserve(preferred.clone(), &result, &Create, owner, None).unwrap().unwrap();
+            assert_eq!(output, numbered(&preferred, owner as usize));
+            names.release(owner);
+            let history = &names.indices[&family];
+            assert_eq!(history.next, owner as usize + 1);
+            assert_eq!(history.available.first(), Some(&(owner as usize)));
+        }
+        // Released reservations remain reusable if their actual output is
+        // removed, rather than blindly allocating ever increasing numbers.
+        fs::remove_dir(numbered(&preferred, 32)).unwrap();
+        assert_eq!(names.reserve(preferred.clone(), &result, &Create, 33, None).unwrap().unwrap(), numbered(&preferred, 32));
+        names.release(33);
+        fs::remove_dir(&preferred).unwrap();
+        assert_eq!(names.reserve(preferred.clone(), &result, &Create, 34, None).unwrap().unwrap(), preferred);
+        names.release(34);
+        struct Fail;
+        impl Observer for Fail {
+            fn notify(&self, _: Event) {}
+            fn register_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
+                Err(super::super::OutputCreateError::wrap(io::ErrorKind::PermissionDenied.into()))
+            }
+        }
+        assert!(names.reserve(preferred.clone(), &result, &Fail, 35, None).unwrap().is_err());
+        assert_eq!(names.reserve(preferred.clone(), &result, &Create, 36, None).unwrap().unwrap(), numbered(&preferred, 33));
+        names.release(36);
+        for index in 0..(OUTPUT_HISTORY_LIMIT + 1) { names.next_index(&format!("family-{index}")); }
+        assert_eq!(names.indices.len(), OUTPUT_HISTORY_LIMIT);
+        assert_eq!(names.history_order.len(), OUTPUT_HISTORY_LIMIT);
+        assert!(!names.indices.contains_key(&family));
+        assert!(names.slots.values().all(|slots| !slots.contains_key(&family)));
+        names.clear_history();
+        assert!(names.indices.is_empty() && names.slots.is_empty());
+        fs::remove_dir_all(root).unwrap();
         fs::remove_file(source).unwrap();
     }
 

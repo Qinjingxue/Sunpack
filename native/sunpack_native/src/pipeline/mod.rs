@@ -159,6 +159,8 @@ impl Failure {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FailureEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

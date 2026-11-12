@@ -132,7 +132,7 @@ impl Options {
                 return Ok(Self { help: true, ..Self::default() });
             }
             let (flag, inline) = arg.split_once('=').map_or((arg.as_ref(), None), |(f, v)| (f, Some(v)));
-            if flag == "-h" || (flag.starts_with("--") && "--help".starts_with(flag)) {
+            if flag == "-h" || flag == "--help" {
                 if inline.is_some() { return Err(invalid(format!("{flag} does not take a value"))); }
                 return Ok(Self { help: true, ..Self::default() });
             }
@@ -151,6 +151,7 @@ impl Options {
         let mut supplied = false;
         let mut after_action = false;
         let mut paths_closed = false;
+        let mut inherited_pause = false;
         // argparse reports unknown arguments only after processing actions;
         // a later help action may exit successfully first.
         while let Some(mut arg) = args.pop_front() {
@@ -163,9 +164,10 @@ impl Options {
             }
             if positional || !looks_like_option(&arg) {
                 if matches!(command, "watch" | "config") && options.action.is_empty() {
-                    // argparse parses subcommands with their own defaults and option boundary.
-                    options.json = false;
-                    options.verbose = false;
+                    // main restores explicitly supplied common flags after argparse's
+                    // subparser defaults. Preserve their parsed values, not raw argv
+                    // text (which may be a password or a path after `--`).
+                    inherited_pause |= options.pause;
                     options.pause = false;
                     options.no_pause = false;
                     positional = false;
@@ -208,7 +210,6 @@ impl Options {
             let (flag, inline) = arg
                 .split_once('=')
                 .map_or((arg.as_ref(), None), |(flag, value)| (flag, Some(value)));
-            let flag = resolve_long_option(flag, command, &options.action)?;
             let mut take = || {
                 inline
                     .map(str::to_owned)
@@ -266,7 +267,9 @@ impl Options {
                     continue;
                 }
                 "-o" | "--out-dir" if command == "extract" || watch_add => {
-                    options.output = Some(take()?);
+                    // Extract treats an empty destination as absent; watch must
+                    // retain explicit presence for its single-root validation.
+                    options.output = Some(take()?).filter(|value| command != "extract" || !value.is_empty());
                     continue;
                 }
                 "-p" | "--password" if passwords => {
@@ -274,7 +277,7 @@ impl Options {
                     continue;
                 }
                 "-P" | "--pw-file" if passwords => {
-                    options.password_file = Some(take()?);
+                    options.password_file = Some(take()?).filter(|value| !value.is_empty());
                     continue;
                 }
                 "-a" | "--ask-pw" if passwords => options.prompt_passwords = true,
@@ -336,6 +339,7 @@ impl Options {
         {
             return Err(invalid("startup expects enable, disable, or status"));
         }
+        options.pause |= inherited_pause;
         Ok(options)
     }
 }
@@ -375,35 +379,6 @@ fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: 
         }
     }
     Ok(())
-}
-
-// Resolve only the active argparse parser's long options. Distinct aliases
-// still count as separate matches, even when they set the same destination.
-fn resolve_long_option<'a>(flag: &'a str, command: &str, action: &str) -> io::Result<&'a str> {
-    if !flag.starts_with("--") { return Ok(flag); }
-    let archives = matches!(command, "extract" | "scan");
-    let common = archives || command == "watch";
-    let passwords = archives || command == "passwords";
-    let watch_add = command == "watch" && action == "add";
-    let watch_start = command == "watch" && action == "start";
-    let flags = [
-        ("--help", true), ("--json", command != "version"),
-        ("--verbose", common), ("--pause", common), ("--no-pause", common),
-        ("--recursive", archives || watch_add), ("--deep-detect", archives || watch_add),
-        ("--direct", command == "extract"), ("--direct-file", command == "extract"),
-        ("--flatten", command == "extract"), ("--no-flatten", command == "extract"),
-        ("--recur", command == "extract"), ("--cleanup", command == "extract"),
-        ("--out-dir", command == "extract" || watch_add),
-        ("--password", passwords), ("--pw-file", passwords), ("--ask-pw", passwords),
-        ("--no-builtin-pw", passwords), ("--no-bpw", passwords),
-        ("--once", watch_start), ("--no-tray", watch_start), ("--start", watch_add),
-        ("--scan-rule-stdin", command == "config" && action == "validate"),
-    ];
-    if flags.iter().any(|&(name, enabled)| enabled && name == flag) { return Ok(flag); }
-    let mut matches = flags.iter().filter(|&&(name, enabled)| enabled && name.starts_with(flag));
-    let Some(&(name, _)) = matches.next() else { return Ok(flag); };
-    if matches.next().is_some() { return Err(invalid(format!("ambiguous option: {flag}"))); }
-    Ok(name)
 }
 
 fn looks_like_option(arg: &str) -> bool {
@@ -753,14 +728,19 @@ fn cli_clipboard(settings: &Config) -> Vec<Arc<str>> {
 }
 
 fn confirm(session: &dyn Session, language: Language, prompt: &str) -> io::Result<bool> {
-    while let Some(answer) = session.read_line(prompt)? {
+    confirm_on(session, language, prompt, Stream::Out)
+}
+
+fn confirm_on(session: &dyn Session, language: Language, prompt: &str, stream: Stream) -> io::Result<bool> {
+    loop {
+        session.write(stream, prompt.as_bytes())?;
+        let Some(answer) = session.read_line("")? else { return Ok(false); };
         match answer.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => return Ok(true),
             "n" | "no" | "" => return Ok(false),
-            _ => line(session, Stream::Out, language.text("cli.answer_yes_no"))?,
+            _ => line(session, stream, language.text("cli.answer_yes_no"))?,
         }
     }
-    Ok(false)
 }
 
 pub(super) fn depth(value: Recursion) -> usize {
@@ -1063,9 +1043,6 @@ impl Observer for Progress<'_> {
         if !self.prompt {
             return true;
         }
-        if !self.visible {
-            return false;
-        }
         let prompt = self.language.translate(
             "recursion.prompt",
             &[
@@ -1080,7 +1057,8 @@ impl Observer for Progress<'_> {
             }
             display.prompting = true;
         }
-        let confirmed = confirm(self.session, self.language, &prompt).unwrap_or(false);
+        let confirmed = confirm_on(self.session, self.language, &prompt,
+            if self.visible { Stream::Out } else { Stream::Err }).unwrap_or(false);
         let mut display = self.display.lock().unwrap();
         display.prompting = false;
         if !display.deferred.is_empty() {
@@ -2223,6 +2201,7 @@ fn show_config(
     result.summary = json!({"config_path": path, "changed": false});
     let validation = Config::parse(&payload).and_then(|settings| {
         if options.action == "validate" {
+            Config::validate_scan_filters(&payload)?;
             crate::pipeline::scan_options(&settings)?;
         }
         Ok(())
@@ -2515,14 +2494,39 @@ mod option_tests {
     #[test]
     fn argparse_option_resolution_and_boundaries() {
         let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
-        let value = parse(&["extract", "--no-builtin-p", "--pass=-secret", "--out=dest", "file.zip"]).unwrap();
+        let value = parse(&["extract", "--no-builtin-pw", "--password=-secret", "--out-dir=dest", "file.zip"]).unwrap();
         assert!(value.no_builtins);
         assert_eq!(value.passwords[0].as_ref(), "-secret");
         assert_eq!(value.output.as_deref(), Some("dest"));
         assert_eq!(value.paths, ["file.zip"]);
         assert!(parse(&["extract", "--direct", "file.zip"]).unwrap().direct);
         for args in [
-            vec!["extract", "--dire", "file.zip"], // aliases do not collapse ambiguity
+            vec!["extract", "a.zip", "--cle", "d"],
+            vec!["scan", "a.zip", "--recurs"],
+            vec!["--hel"],
+        ] { assert!(parse(&args).is_err(), "{args:?}"); }
+        assert!(parse(&["watch", "--json", "status"]).unwrap().json);
+        assert!(parse(&["watch", "--verbose", "status"]).unwrap().verbose);
+        assert!(parse(&["config", "-j", "show"]).unwrap().json);
+        assert!(!parse(&["extract", "--", "--json"]).unwrap().json);
+        let value = parse(&["extract", "--pw-file=", "--out-dir=", "a.zip"]).unwrap();
+        assert!(value.password_file.is_none());
+        assert!(value.output.is_none());
+        // Watch checks whether --out-dir was supplied, including an empty
+        // value, before accepting multiple roots. Do not apply extract's
+        // empty-output normalization to this command.
+        for args in [
+            vec!["watch", "add", "A", "B", "--out-dir="],
+            vec!["watch", "add", "A", "B", "--out-dir", ""],
+        ] {
+            let value = parse(&args).unwrap();
+            assert_eq!(value.output.as_deref(), Some(""));
+            assert_eq!(value.paths, ["A", "B"]);
+        }
+        assert!(parse(&["watch", "add", "A", "B"]).unwrap().output.is_none());
+
+        for args in [
+            vec!["extract", "--dire", "file.zip"], // prefixes are not declared options
             vec!["extract", "--recu", "file.zip"],
             vec!["extract", "--no-b", "file.zip"],
             vec!["watch", "--on", "start"], // action-only flag at parent scope
@@ -2536,17 +2540,18 @@ mod option_tests {
         assert_eq!(value.passwords.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), ["secret", "-.5", "-with space"]);
         assert_eq!(value.paths, ["--no-b"]);
         assert_eq!(parse(&["extract", "a.zip", "--", "-b.zip"]).unwrap().paths, ["a.zip", "-b.zip"]);
-        let value = parse(&["watch", "--json", "--", "start", "--on"]).unwrap();
+        let value = parse(&["watch", "--json", "--", "start", "--once"]).unwrap();
         assert!(value.once);
-        assert!(!value.json); // child parser defaults replace parent flags in main
-        assert!(parse(&["watch", "start", "--js"]).unwrap().json);
-        assert!(parse(&["config", "validate", "--scan-rule"]).unwrap().rule_stdin);
+        assert!(value.json); // main restores explicitly supplied parent flags
+        assert!(parse(&["watch", "start", "--json"]).unwrap().json);
+        assert!(parse(&["config", "validate", "--scan-rule-stdin"]).unwrap().rule_stdin);
         assert_eq!(parse(&["--", "extract", "file.zip"]).unwrap().paths, ["file.zip"]);
-        assert!(parse(&["--he"]).unwrap().help);
-        assert!(parse(&["extract", "--he"]).unwrap().help);
+        assert!(parse(&["--he"]).is_err());
+        assert!(parse(&["extract", "--he"]).is_err());
         for args in [
             vec!["extract", "a.zip", "-v", "b.zip", "--help"],
             vec!["extract", "--unknown", "--help"],
+            vec!["extract", "--dire", "--help"],
             vec!["--unknown", "--help"],
             vec!["-hx"],
             vec!["extract", "-hx"],
@@ -2559,17 +2564,63 @@ mod option_tests {
             vec!["watch", "--help", "invalid"],
         ] { assert!(parse(&args).unwrap().help, "{args:?}"); }
         for args in [
-            vec!["extract", "--pass", "--help"],
+            vec!["extract", "--password", "--help"],
             vec!["extract", "-hp", "--help"],
             vec!["extract", "-hvp", "--help"],
             vec!["extract", "-hj=true"],
             vec!["-h=foo"],
-            vec!["extract", "--dire", "--help"],
             vec!["extract", "--json=true", "--help"],
             vec!["extract", "--pause", "--no-pause", "--help"],
             vec!["extract", "-f", "-F", "--help"],
             vec!["watch", "invalid", "--help"],
             vec!["config", "invalid", "--help"],
         ] { assert!(parse(&args).is_err(), "{args:?}"); }
+    }
+}
+
+#[cfg(test)]
+mod recursive_prompt_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Input {
+        answers: Mutex<VecDeque<String>>,
+        stdout: Mutex<Vec<u8>>,
+        stderr: Mutex<Vec<u8>>,
+    }
+    impl Session for Input {
+        fn write(&self, stream: Stream, bytes: &[u8]) -> io::Result<()> {
+            match stream {
+                Stream::Out => self.stdout.lock().unwrap().extend_from_slice(bytes),
+                Stream::Err => self.stderr.lock().unwrap().extend_from_slice(bytes),
+            }
+            Ok(())
+        }
+        fn read_line(&self, prompt: &str) -> io::Result<Option<String>> {
+            self.write(Stream::Out, prompt.as_bytes())?;
+            Ok(self.answers.lock().unwrap().pop_front())
+        }
+        fn interactive(&self) -> bool { false }
+        fn input_is_terminal(&self) -> bool { false }
+        fn unicode(&self) -> bool { true }
+        fn terminal_size(&self) -> (usize, usize) { (80, 25) }
+    }
+
+    #[test]
+    fn json_recursion_reads_authorization_without_polluting_stdout() {
+        let input = Input::default();
+        input.answers.lock().unwrap().extend(["invalid".into(), "yes".into(), "n".into()]);
+        let watch = watch::Watch::new(Arc::new(|| {}));
+        let cancel = Cancellation::default();
+        let progress = Progress {
+            session: &input, watch: &watch, cancel: &cancel, language: Language::En,
+            display: Mutex::default(), reporting: reporting::Reports::default(),
+            branches: Mutex::default(), prompt: true, visible: false, verbose: false,
+        };
+        assert!(progress.allow_recursive(2, 1));
+        assert!(!progress.allow_recursive(3, 1));
+        assert!(input.answers.lock().unwrap().is_empty());
+        assert!(input.stdout.lock().unwrap().is_empty());
+        assert!(!input.stderr.lock().unwrap().is_empty());
     }
 }
