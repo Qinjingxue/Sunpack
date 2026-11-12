@@ -761,18 +761,12 @@ fn password_failure(archive: &ArchiveResult) -> bool {
         .is_some_and(|failure| failure.is_password_retry())
 }
 
-fn failure_message(failure: &crate::pipeline::Failure, language: Language) -> &str {
-    if failure.is_password_retry() {
-        language.text("failure.password_not_in_list")
-    } else {
-        &failure.message
-    }
-}
+use super::failure::message as failure_message;
 
 #[derive(Serialize)]
 struct FailureReport<'a> {
     kind: FailureKind,
-    message: &'a str,
+    message: std::borrow::Cow<'a, str>,
     details: FailureDetails<'a>,
 }
 
@@ -1261,7 +1255,7 @@ impl<'a> ScopeReport<'a> {
                     writer,
                     prefix,
                     "  ",
-                    failure_message(failure, self.language),
+                    &failure_message(failure, self.language),
                 )?;
             }
         }
@@ -1483,7 +1477,7 @@ fn archives(
                 })
                 .chain(invalid_inputs.map(|error| FailureReport {
                     kind: FailureKind::InvalidInput,
-                    message: &error.message,
+                    message: (&error.message).into(),
                     details: FailureDetails {
                         path: &error.path,
                         promoted_nested_input: None,
@@ -1816,7 +1810,7 @@ fn report_scan(
             let show_parts =
                 plan.is_none() && (entry.source_paths.len() > 1 || completeness.is_some());
             if let Some(failure) = &entry.failure {
-                let text = format!("{}: {}", entry.path.display(), failure.message);
+                let text = format!("{}: {}", entry.path.display(), failure_message(failure, language));
                 if options.json {
                     result.errors.push(text);
                 } else if !(password_failure(entry) && entry.password.is_none())
@@ -1824,7 +1818,7 @@ fn report_scan(
                         && entry.volume_completeness.as_deref() == Some("missing"))
                 {
                     let error =
-                        language.translate("cli.scan.error", &[("error", &failure.message)]);
+                        language.translate("cli.scan.error", &[("error", &failure_message(failure, language))]);
                     let text = if embedded {
                         format!(
                             "{}: [{}, {}): {error}",
@@ -1877,7 +1871,7 @@ fn report_scan(
                     }
                 }
                 if let Some(failure) = &entry.failure {
-                    obj.insert("error".into(), json!(failure.message));
+                    obj.insert("error".into(), json!(failure_message(failure, language)));
                     obj.insert("error_kind".into(), json!(failure.kind));
                 }
                 result.items.push(item);

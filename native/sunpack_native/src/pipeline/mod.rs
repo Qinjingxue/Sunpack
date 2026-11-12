@@ -161,6 +161,8 @@ impl Failure {
 pub struct FailureEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_read_fault: Option<ArchiveReadFault>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +175,40 @@ pub struct FailureEvidence {
     pub read: Option<FailureRead>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryPreview>,
+}
+
+/// Field-level Rust preflight diagnostics, distinct from worker physical reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveReadFault {
+    pub code: String,
+    pub operation: String,
+    pub field: String,
+    pub location: String,
+    pub offset: u64,
+    pub requested: usize,
+    pub actual: usize,
+    pub source_len: u64,
+    pub volume_number: Option<u32>,
+    pub possible_missing_volume: bool,
+    pub missing_volume_hint: bool,
+    pub io_kind: String,
+    pub os_error: Option<i32>,
+    pub detail: String,
+}
+
+impl From<&crate::io::read_fault::ReadFault> for ArchiveReadFault {
+    fn from(fault: &crate::io::read_fault::ReadFault) -> Self {
+        Self {
+            code: fault.code.into(), operation: fault.operation.into(),
+            field: fault.field.into(), location: fault.location.as_str().into(),
+            offset: fault.offset, requested: fault.requested, actual: fault.actual,
+            source_len: fault.source_len, volume_number: fault.volume_number,
+            possible_missing_volume: fault.possible_missing_volume(),
+            missing_volume_hint: fault.missing_volume_hint,
+            io_kind: format!("{:?}", fault.io_kind), os_error: fault.os_error,
+            detail: fault.detail.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

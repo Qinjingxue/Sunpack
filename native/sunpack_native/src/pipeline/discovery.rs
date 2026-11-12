@@ -944,7 +944,13 @@ pub(super) fn discovery_failure(reason: &str) -> Option<Failure> {
         "embedded_scan_io_error" => (FailureKind::FilesystemError, "Unable to read archive input"),
         _ => return None,
     };
-    Some(Failure::new(kind, message))
+    let mut failure = Failure::new(kind, message);
+    failure.evidence = Some(Box::new(super::FailureEvidence {
+        stage: Some("discovery".into()),
+        native_kind: Some(reason.to_owned()),
+        ..Default::default()
+    }));
+    Some(failure)
 }
 
 fn merge_shared_inputs(tasks: &mut Vec<Task>) {

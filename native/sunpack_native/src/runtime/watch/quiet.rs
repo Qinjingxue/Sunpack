@@ -30,6 +30,17 @@ impl Quiet {
         }
     }
 
+    pub(super) fn content_deadline(
+        &mut self, now: Instant, observed_at: f64, boundary: bool, reset: bool,
+        retry_unchanged: bool,
+    ) -> Instant {
+        self.observe(observed_at, boundary, reset, true);
+        // CLOSE ends the handle epoch, not the download. Content observations
+        // keep the learned quiet window; metadata-only CLOSE acceleration and
+        // admission boundary confirmation are handled separately by Watch.
+        after(now, if retry_unchanged { 0.0 } else { self.seconds })
+    }
+
     pub(super) fn observe(&mut self, now: f64, boundary: bool, reset: bool, learn: bool) {
         if reset {
             *self = Self::default();
@@ -148,4 +159,27 @@ pub(super) fn duration(seconds: f64) -> std::time::Duration {
 
 pub(super) fn after(now: Instant, seconds: f64) -> Instant {
     now.checked_add(duration(seconds)).unwrap_or(now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_close_preserves_learned_quiet_and_unchanged_retry_is_immediate() {
+        let mut quiet = Quiet::default();
+        let now = Instant::now();
+        for at in [0.0, 1.0, 2.0] {
+            quiet.content_deadline(now, at, false, false, false);
+        }
+        let learned = quiet.seconds;
+        assert!(learned > 1.0);
+        let due = quiet.content_deadline(now, 3.0, true, false, false);
+        assert_eq!(due, after(now, learned));
+        assert!(due > after(now, 0.8)); // the next write precedes admission
+        assert!(quiet.last.is_none()); // CLOSE still ends cadence learning
+        assert_eq!(quiet.content_deadline(now, 4.0, true, false, true), now);
+        assert_eq!(quiet.content_deadline(now, 5.0, true, true, false), now);
+        assert_eq!(quiet.seconds, 0.0); // a replaced/truncated file starts anew
+    }
 }

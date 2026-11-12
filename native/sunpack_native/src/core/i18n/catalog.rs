@@ -5,6 +5,7 @@ pub(super) static MESSAGES: &[(&str, &str, &str)] = &[
     ("archive.field.7z.next_header.offset_size", "7z next-header offset and size", "7z Next Header 偏移和长度字段"),
     ("archive.field.7z.signature", "7z signature", "7z 文件标记"),
     ("archive.field.7z.start_header", "7z start header", "7z 起始头"),
+    ("archive.field.enc.password_proof", "ENC password proof", "ENC 密码验证字段"),
     ("archive.field.pe.coff_header", "PE COFF header", "PE COFF 文件头"),
     ("archive.field.pe.dos_header", "PE DOS header", "PE DOS 文件头"),
     ("archive.field.pe.overlay.sample", "PE overlay sample", "PE 附加数据样本"),

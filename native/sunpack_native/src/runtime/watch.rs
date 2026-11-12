@@ -674,6 +674,7 @@ struct Running {
 #[derive(Default)]
 struct Signals {
     changed_roots: HashMap<String, HashSet<PathBuf>>,
+    topology_roots: HashSet<String>,
     reload: bool,
     reload_waiters: Vec<mpsc::SyncSender<io::Result<bool>>>,
     once: Vec<mpsc::SyncSender<io::Result<()>>>,
@@ -685,6 +686,18 @@ struct Signals {
     cancel: Vec<(String, mpsc::SyncSender<bool>)>,
     roots: Vec<RootCompleted>,
     completed: Vec<String>,
+}
+
+impl Signals {
+    fn root_changed(&mut self, id: &str, paths: Option<Vec<PathBuf>>) {
+        // Overflow/failure has no path list and invalidates the subscription;
+        // named content events need catalog work, not parent identity probes.
+        if paths.is_none() {
+            self.topology_roots.insert(id.to_owned());
+        }
+        self.changed_roots.entry(id.to_owned()).or_default()
+            .extend(paths.into_iter().flatten());
+    }
 }
 
 struct Hub {
@@ -928,8 +941,7 @@ impl RootObserver {
             }
             if paths.as_ref().is_none_or(|paths| !paths.is_empty()) {
                 hub.update(|signals| {
-                    signals.changed_roots.entry(id.clone()).or_default()
-                        .extend(paths.into_iter().flatten());
+                    signals.root_changed(&id, paths);
                 });
             }
         })?;
@@ -1005,6 +1017,7 @@ impl ParentObserver {
             let affected = affected_parent_roots(&watched_members.lock().unwrap(), changed.as_deref());
             if !affected.is_empty() {
                 hub.update(|signals| for root in affected {
+                    signals.topology_roots.insert(root.clone());
                     signals.changed_roots.entry(root).or_default();
                 });
             }
@@ -1537,13 +1550,8 @@ impl Scheduler {
                 "message":message,
             }));
             let title = self.settings.cli.language.text("watch.error_title").to_owned();
-            let journal = Arc::clone(&self.journal);
-            // Detached like main's daemon dialog: readiness and shutdown never
-            // wait for a user to dismiss this notice.
-            if let Err(error) = thread::Builder::new().name("sunpack-watch-error".into()).spawn(move || {
-                if let Err(error) = windows::show_error(&title, &message) {
-                    journal.log(json!({"event":"watch_error_dialog_failed","error":error.to_string()}));
-                }
+            if let Err(error) = spawn_error_dialog(&self.journal, move || {
+                windows::show_error(&title, &message)
             }) {
                 self.journal.log(json!({"event":"watch_error_dialog_failed","error":error.to_string()}));
             }
@@ -1628,13 +1636,20 @@ impl Scheduler {
         Ok(self.root_progress.checkpoint)
     }
 
-    fn rearm_root_observers(&mut self, changed: Option<&HashMap<String, HashSet<PathBuf>>>) {
-        // Share one nonrecursive sentinel per physical parent. Reconcile all
-        // memberships before rearming individual roots, including missing
-        // roots whose nearest existing ancestor may have changed.
-        let desired = parent_memberships(self.roots.values().map(|(root, _)| root));
-        self.parent_observers.retain(|id, _| desired.contains_key(id));
-        for (id, (directory, members)) in desired {
+    fn rearm_root_observers(&mut self, changed: Option<&HashSet<String>>) {
+        // Ordinary content notifications never invalidate these subscriptions.
+        // Resolve only topology-invalidated roots; preserve other memberships.
+        let desired = parent_memberships(self.roots.iter()
+            .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
+            .map(|(_, (root, _))| root));
+        for parent in self.parent_observers.values() {
+            parent.members.lock().unwrap().retain(|id, _|
+                self.roots.contains_key(id) && changed.is_some_and(|changed| !changed.contains(id)));
+        }
+        for (id, (directory, mut members)) in desired {
+            if let Some(parent) = self.parent_observers.get(&id) {
+                members.extend(parent.members.lock().unwrap().clone());
+            }
             if self.parent_observers.get(&id).is_some_and(|parent| !parent.observer.matches(&directory)) {
                 self.parent_observers.remove(&id);
             }
@@ -1647,9 +1662,10 @@ impl Scheduler {
                 }
             }
         }
+        self.parent_observers.retain(|_, parent| !parent.members.lock().unwrap().is_empty());
         self.root_observers.retain(|id, _| self.roots.contains_key(id));
         for (id, (root, scope)) in self.roots.iter()
-            .filter(|(id, _)| changed.is_none_or(|changed| changed.contains_key(*id)))
+            .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
         {
             let (replaced, errors) = self.root_observers.entry(id.clone()).or_default()
                 .rearm(root, scope, &self.hub, &self.journal);
@@ -1741,6 +1757,13 @@ impl Scheduler {
 
     fn run(&mut self, once: bool) -> io::Result<i32> {
         let mut result = self.run_inner(once);
+        // Like main's stop checkpoint, cover the final notification burst
+        // before closing the catalog. Do not admit additional requests.
+        if result.is_ok() {
+            if let Err(error) = self.checkpoint(&HashMap::new(), true, false) {
+                result = Err(error);
+            }
+        }
         self.hub.stop();
         let mut cancellation_observed = false;
         let mut failure_observed = false;
@@ -1883,10 +1906,17 @@ impl Scheduler {
                 || !signals.once.is_empty()
             {
                 let all_roots = signals.volumes_changed || !signals.once.is_empty();
-                self.rearm_root_observers((!all_roots).then_some(&signals.changed_roots));
-                let result = self
-                    .checkpoint(&signals.changed_roots, all_roots, false)
-                    .and_then(|_| {
+                if all_roots || !signals.topology_roots.is_empty() {
+                    self.rearm_root_observers((!all_roots).then_some(&signals.topology_roots));
+                }
+                let recovery = all_roots || !signals.topology_roots.is_empty()
+                    || signals.changed_roots.values().any(|paths| paths.is_empty()
+                        || paths.iter().any(|path| !path.is_file()));
+                let result = (if recovery {
+                    self.checkpoint(&signals.changed_roots, all_roots, false)
+                } else {
+                    self.observe_file_changes(&signals.changed_roots)
+                }).and_then(|_| {
                         if signals.once.is_empty() {
                             Ok(())
                         } else {
@@ -1945,6 +1975,33 @@ impl Scheduler {
         })
     }
 
+    fn observe_file_changes(&mut self, changed: &HashMap<String, HashSet<PathBuf>>) -> io::Result<()> {
+        // Match main's ordinary file-event path: enqueue in memory without
+        // refreshing the durable inventory or advancing its USN stamp. The
+        // captured burst is reconciled once at admission/recovery instead.
+        for (id, paths) in changed {
+            let Some((_, scope)) = self.roots.get(id) else { continue };
+            let scope = scope.clone();
+            for path in paths {
+                let path = path.to_string_lossy();
+                if !scope.contains(&path) || self.catalog.is_owned(&path) { continue; }
+                let peers = self.catalog.bucket_paths(&scope, &path);
+                self.enqueue(id, path.to_string(), false)?;
+                for peer in peers.into_iter().filter(|peer| peer.as_str() != path.as_ref()) {
+                    if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
+                        entry.failure_payload.get("blockers").and_then(Value::as_array)
+                            .is_some_and(|blockers| blockers.iter().any(|value| value == "missing_volume"))
+                    }) {
+                        if let Some((root, recovery)) = self.blocker_route(&entry) {
+                            self.enqueue_with_recovery(&root, peer, true, recovery)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn checkpoint(
         &mut self,
         changed: &HashMap<String, HashSet<PathBuf>>,
@@ -1985,10 +2042,7 @@ impl Scheduler {
                 (&current, &cached)
             {
                 if volume == old_volume && journal == old_journal && (1..=*end).contains(old_end) {
-                    let start = self
-                        .journal
-                        .state()
-                        .watch_cursor(volume)
+                    let start = self.journal.state().watch_cursor(volume)
                         .filter(|cursor| {
                             cursor.journal_id == i128::from(*journal)
                                 && (1..=i128::from(*end)).contains(&cursor.next_usn)
@@ -2196,8 +2250,8 @@ impl Scheduler {
         operations.retain(|volume, cursor| {
             self.journal.state().watch_cursor(volume).as_ref() != Some(cursor)
         });
-        // Commit the admissions and cursor together. A recovered cursor never
-        // implies ownership of an input whose pending work was still in RAM.
+        // Recovery/admission owns the durable cursor, never ordinary file
+        // notifications. Publish candidates and cursor in one transaction.
         self.persist_candidates(operations, true)?;
         for (changed, volume, journal, end) in cursors {
             if let Some((scope, identity)) = changed.filter(|_| !failures.contains(&volume)) {
@@ -2535,7 +2589,9 @@ impl Scheduler {
                 .as_ref()
                 .map_or_else(quiet::Quiet::default, quiet::Quiet::saved)
         };
-        quiet.observe(windows::monotonic_seconds(), boundary, new_identity, true);
+        let due = quiet.content_deadline(
+            now, windows::monotonic_seconds(), boundary, new_identity, force && unchanged,
+        );
         if recovery.is_none() {
             self.catalog.remember_observation(
                 &candidate.path,
@@ -2546,16 +2602,6 @@ impl Scheduler {
                 boundary,
             );
         }
-        let delay = if force && unchanged {
-            0.0
-        } else if boundary {
-            quiet
-                .seconds
-                .min(self.settings.watch.boundary_confirmation_seconds)
-        } else {
-            quiet.seconds
-        };
-        let due = quiet::after(now, delay);
         self.due.insert((due, id.clone()), ());
         self.unpublished.insert(id.clone());
         self.pending.insert(
@@ -2591,7 +2637,7 @@ impl Scheduler {
         if self.unpublished.is_empty() && cursors.is_empty() && retire.is_none() && handoff.is_none() {
             return Ok(());
         }
-        let keys = std::mem::take(&mut self.unpublished);
+        let keys = self.unpublished.clone();
         self.journal.commit(durable, |state| {
             use crate::watch_store::PendingObservation;
             let mut ordinary = Vec::new();
@@ -2654,6 +2700,7 @@ impl Scheduler {
             }
             Ok(operations)
         })?;
+        self.unpublished.clear();
         Ok(())
     }
 
@@ -3151,19 +3198,14 @@ impl Scheduler {
         })
     }
 
-    fn dispatch_ready(&mut self) -> io::Result<()> {
-        let available = self.admission_available();
-        if available == 0 {
-            return Ok(());
-        }
-        let now = Instant::now();
+    fn prepare_ready(&mut self, now: Instant, available: usize) -> io::Result<Vec<(String, Pending)>> {
         let ready = {
             let claims = self.hub.claims.lock().unwrap();
             due_admissions(&self.due, now, available, |path| {
                 !self.active_paths.contains_key(path) && !claims.contains_key(path)
             })
         };
-        let mut groups = BTreeMap::new();
+        let mut prepared = Vec::new();
         for (due, id) in ready {
             if self.hub.stopped.load(Ordering::Acquire) {
                 break;
@@ -3241,6 +3283,30 @@ impl Scheduler {
                     continue;
                 }
             }
+            prepared.push((id, pending));
+        }
+        Ok(prepared)
+    }
+
+    fn dispatch_ready(&mut self) -> io::Result<()> {
+        let available = self.admission_available();
+        if available == 0 {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let prepared = self.prepare_ready(now, available)?;
+        if prepared.is_empty() { return Ok(()); }
+        // Readiness, not merely an expired deadline, is the admission
+        // boundary. Restore owners while checkpoint atomically publishes the
+        // burst; then re-probe because recovery may change generation/deadline.
+        for (id, pending) in prepared {
+            self.due.insert((pending.due, id.clone()), ());
+            self.pending.insert(id, pending);
+        }
+        self.checkpoint(&HashMap::new(), true, false)?;
+        let prepared = self.prepare_ready(now, available)?;
+        let mut groups = BTreeMap::new();
+        for (_, pending) in prepared {
             if pending.recovery.is_none() {
                 self.catalog.retire_observation(
                     &pending.candidate.path,
@@ -3265,7 +3331,6 @@ impl Scheduler {
                 .or_insert_with(|| (pending.recovery, Vec::new()));
             candidates.push(pending.candidate);
         }
-        self.persist_candidates(BTreeMap::new(), false)?;
         for ((root, _), (recovery, candidates)) in groups {
             if self.hub.stopped.load(Ordering::Acquire) {
                 // These candidates still have durable pending intent. A stop
@@ -4601,6 +4666,8 @@ impl Observer for WatchObserver {
                     &owner,
                     task,
                     output.clone(),
+                    // As in main, keeping damaged bytes on disk does not
+                    // authorize crash recovery to recurse through this output.
                     Some(archive.failure.is_none() || archive.partial),
                     None,
                 )?
@@ -4860,11 +4927,53 @@ fn identity_if_present(path: &str) -> io::Result<Option<String>> {
     }
 }
 
+// A dismissed/erroring notice may log to the live session, but an open modal
+// dialog must never retain that session's exclusive state lock across stop.
+fn spawn_error_dialog(
+    journal: &Arc<journal::Journal>,
+    show: impl FnOnce() -> io::Result<()> + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
+    let journal = Arc::downgrade(journal);
+    thread::Builder::new().name("sunpack-watch-error".into()).spawn(move || {
+        if let Err(error) = show() {
+            if let Some(journal) = journal.upgrade() {
+                journal.log(json!({"event":"watch_error_dialog_failed","error":error.to_string()}));
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::reader::{capture_directory_identity, capture_file_generation};
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
+
+    #[test]
+    fn open_error_dialog_does_not_retain_watch_state_across_restart() {
+        let marker = crate::test_support::temp_file("watch_dialog_restart", b"");
+        let directory = marker.with_extension("state");
+        let journal = Arc::new(journal::Journal::open(&directory).unwrap());
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (dismiss_tx, dismiss_rx) = mpsc::channel();
+        let dialog = spawn_error_dialog(&journal, move || {
+            opened_tx.send(()).unwrap();
+            dismiss_rx.recv().unwrap();
+            Err(io::Error::other("dialog unavailable"))
+        }).unwrap();
+        opened_rx.recv().unwrap();
+        let old = Arc::downgrade(&journal);
+        drop(journal); // scheduler has stopped, but the modal dialog is still open
+        let released = old.upgrade().is_none();
+        let restarted = journal::Journal::open(&directory);
+        // Release the simulated dialog even if reopening failed.
+        dismiss_tx.send(()).unwrap();
+        dialog.join().unwrap();
+        assert!(released);
+        drop(restarted.expect("an undismissed notice must not block watch start"));
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
 
     #[test]
     fn published_policy_keeps_full_scan_obligation_across_retirement_and_scan_failures() {
@@ -4899,6 +5008,21 @@ mod tests {
             crate::core::i18n::Language::Zh => crate::core::i18n::Language::En,
         };
         assert!(scheduler_configuration_changed(&previous, &next));
+    }
+
+    #[test]
+    fn content_batches_do_not_invalidate_topology_but_overflow_does() {
+        let mut signals = Signals::default();
+        for _ in 0..100 {
+            signals.root_changed("root-a", Some(vec![PathBuf::from("root-a/archive.zip")]));
+        }
+        assert!(signals.topology_roots.is_empty());
+        assert_eq!(signals.changed_roots.len(), 1);
+        // A content event batched after an overflow must not erase the rearm.
+        signals.root_changed("root-a", None);
+        signals.root_changed("root-a", Some(vec![PathBuf::from("root-a/archive.zip")]));
+        assert_eq!(signals.topology_roots, HashSet::from(["root-a".to_owned()]));
+        assert_eq!(signals.changed_roots["root-a"].len(), 1);
     }
 
     #[test]
@@ -5601,6 +5725,27 @@ mod tests {
             assert_eq!(observer.owner_for_path(&nested_output).as_deref(), Some(owner));
             assert!(journal.state().pending(owner).unwrap().active_outputs
                 .values().any(|path| key(Path::new(path)) == key(&nested_output)));
+
+            // main retains zero-verified-file payload on disk but retires its
+            // Watch registration with keep=false. It is not a committed tree
+            // for legacy crash recovery to recursively discover.
+            let failed_output = directory.join("failed-output");
+            let mut failed = completion_archive(owner, 1, Some(FailureKind::Damaged));
+            observer.register_output(&failed, &failed_output).unwrap();
+            fs::write(failed_output.join("unverified.zip"), b"damaged bytes").unwrap();
+            failed.output = Some(failed_output.clone());
+            observer.commit_output(&failed, None).unwrap();
+            assert!(failed_output.join("unverified.zip").is_file());
+            let pending = journal.state().pending(owner).unwrap();
+            assert!(!pending.active_outputs.values().any(|path| key(Path::new(path)) == key(&failed_output)));
+            assert!(!pending.committed_roots.contains(failed_output.to_str().unwrap()));
+        }
+        {
+            let journal = journal::Journal::open(&directory).unwrap();
+            let failed_output = directory.join("failed-output");
+            let pending = journal.state().pending(owner).unwrap();
+            assert!(!pending.committed_roots.contains(failed_output.to_str().unwrap()));
+            assert!(failed_output.join("unverified.zip").is_file());
         }
         fs::remove_dir_all(directory).unwrap();
         fs::remove_file(source).unwrap();

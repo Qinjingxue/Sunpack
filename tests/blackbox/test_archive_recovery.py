@@ -249,6 +249,44 @@ def test_partial_recovery_recurses_into_the_verified_nested_archive(package, tmp
 
 
 
+
+@pytest.mark.parametrize("requirement,nested", [("allow_partial", False), ("allow_partial", True), ("complete", False)])
+def test_failed_nonempty_output_is_retained_without_partial_success(package, tmp_path, requirement, nested):
+    # Unlike verified-member recovery, a lone CRC-failed member must remain a
+    # failure. Its damaged bytes are still useful; retaining them must neither
+    # recurse into their ZIP contents nor delete the failed archive source.
+    payload = _zip_bytes({"must-not-extract.txt": b"damaged member is not verified"})
+    data = BytesIO()
+    with zipfile.ZipFile(data, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("damaged.zip", payload)
+        member = archive.getinfo("damaged.zip")
+    damaged = bytearray(data.getvalue())
+    # Alter the stored CRC, leaving a valid nested archive as the failed payload.
+    damaged[member.header_offset + 14] ^= 1
+    central = damaged.index(b"PK\x01\x02", member.header_offset + 30 + len(member.filename) + len(payload))
+    damaged[central + 16] ^= 1
+    source = tmp_path / "source.zip"
+    source.write_bytes(_zip_bytes({"inner.zip": damaged}) if nested else damaged)
+    package.configure(
+        extraction={"content_requirement": requirement},
+        recursive_authorization={"enabled": False},
+        post_extract={"flatten_single_directory": False},
+    )
+    output = tmp_path / "out"
+    report = package.json("extract", "--direct-file", "-r", "*", "-c", "d", "-o", output, source, code=1)
+    assert report["summary"]["failed_count"] == 1, report
+    assert report["summary"]["partial_success_count"] == 0, report
+    assert report["summary"]["success_count"] == int(nested), report
+    assert source.exists() == (not nested)
+    if nested:
+        _only_output(output, "inner.zip", damaged)
+    if requirement == "allow_partial":
+        _only_output(output, "damaged.zip", payload)
+    else:
+        assert not list(output.rglob("damaged.zip"))
+    assert not list(output.rglob("must-not-extract.txt"))
+
+
 @pytest.mark.parametrize("requirement,cleanup", [("complete", "d"), ("allow_partial", "d"), ("complete", "k")])
 def test_nested_failure_does_not_revoke_outer_source_cleanup(package, tmp_path, requirement, cleanup):
     # Existing recovery tests retain a damaged *outer* source. This inverse

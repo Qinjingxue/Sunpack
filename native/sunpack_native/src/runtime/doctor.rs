@@ -23,16 +23,20 @@ fn checked(name: &str, result: io::Result<String>) -> Value {
 }
 
 pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
-    let settings = config::reload_snapshot(cwd).and_then(|snapshot| {
-        crate::pipeline::scan_options(&snapshot.config)?;
-        Ok(snapshot)
+    let settings = config::load_raw(cwd).and_then(|(path, payload)| {
+        let settings = config::Config::parse(&payload)?;
+        // Doctor validates all saved rules, just like config validate. Runtime
+        // parsing deliberately ignores invalid regexes in disabled rules.
+        config::Config::validate_scan_filters(&payload)?;
+        crate::pipeline::scan_options(&settings)?;
+        Ok((path, settings))
     });
     let mut checks = vec![
         checked(
             "config",
             settings
                 .as_ref()
-                .map(|snapshot| snapshot.sources.primary().display().to_string())
+                .map(|(path, _)| path.display().to_string())
                 .map_err(|error| io::Error::other(error.to_string())),
         ),
         checked(
@@ -88,7 +92,7 @@ pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
         });
     }
     checks.push(match settings {
-        Ok(settings) if settings.config.watch.toast_enabled => checked(
+        Ok((_, settings)) if settings.watch.toast_enabled => checked(
             "toast",
             windows::ToastLibrary::load(cwd)
                 .and_then(|library| library.self_test())

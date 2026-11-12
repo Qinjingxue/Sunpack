@@ -1081,6 +1081,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut completed = Vec::with_capacity(task.inputs.len());
             let mut outputs_committed = true;
             let mut children = Outcome::default();
+            let mut parent_outputs = Vec::with_capacity(count);
             let retry = task.retry.filter(|_| task.inputs.len() == 1);
             let mut promotion_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
@@ -1158,7 +1159,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 };
                 if let Some(context) = retry.as_deref().filter(|_| {
                     !cancel.cancelled()
-                        && executed.result.output.is_none()
+                        && !multi
                         && (before_worker || self.request.mode == Mode::Extract)
                         && executed
                             .result
@@ -1173,6 +1174,13 @@ impl<'run, O: Observer> Run<'run, O> {
                         &candidates,
                         self.request,
                     )? {
+                        // Main replaces the whole single-input extraction only
+                        // after resolving a usable physical family. Until then,
+                        // its damaged payload remains available for recovery.
+                        if let Some(output) = executed.result.output.as_deref() {
+                            self.discard_failed_output(&executed.result, output)?;
+                            executed.result.output = None;
+                        }
                         self.observer.after_output(&executed.result)?;
                         drop(lease);
                         lease = self.claim_task(&replacement).await?;
@@ -1231,27 +1239,72 @@ impl<'run, O: Observer> Run<'run, O> {
                 if result.failure.is_none() {
                     superseded_candidates.extend(attempted.into_iter().flatten());
                 }
-                let mut descendants = Outcome::default();
-                let mut ran_recursive_children = false;
-                if let Some(inventory) = inventory {
-                    let (nested, scanned) =
-                        self.discover_children(inventory, depth, &candidates).await?;
-                    ran_recursive_children = scanned;
-                    if scanned {
-                        descendants = self
-                            .execute_batch(
-                                nested,
-                                depth + 1,
-                                source_scope.map(Arc::from),
-                                Some((id, &result)),
-                                spawner.clone(),
-                            )
-                            .await?;
-                    } else {
-                        descendants.errors.extend(nested.errors);
-                        descendants.scan_incomplete = self.record_scan_errors(nested.scan_errors);
-                    }
+                // Segment progress ends with its own extraction, as main's
+                // input_finished does. Physical root completion still waits
+                // for every recursive subtree and the final source cleanup.
+                if multi {
+                    self.observer.notify(Event::Finished {
+                        id,
+                        path: result.path.clone(),
+                        depth,
+                        success: result.failure.is_none() || result.partial,
+                    });
                 }
+                parent_outputs.push((result, inventory, input, id, children_already_complete, remaining_depth));
+            }
+            // Finish every logical parent before prompting or descending into
+            // any segment. Independent output trees share the existing request
+            // consumer budget rather than serializing behind the first subtree.
+            let mut recursive = Vec::new();
+            let mut descendants = Vec::with_capacity(count);
+            for (index, (result, inventory, input, id, children_already_complete, remaining_depth)) in parent_outputs.into_iter().enumerate() {
+                if inventory.is_some() && depth <= self.request.max_depth && !cancel.cancelled() {
+                    recursive.push((index, result, inventory, input, id, children_already_complete, remaining_depth));
+                } else {
+                    descendants.push((index, Ok((result, input, children_already_complete, remaining_depth, Outcome::default(), false))));
+                }
+            }
+            let recursive_spawner = spawner.clone();
+            let scope: Option<Arc<Path>> = source_scope.map(Arc::from);
+            let descend = move |(index, result, inventory, input, id, children_already_complete, remaining_depth): (usize, ArchiveResult, Option<NativeOutputInventory>, ArchiveInput, TaskId, bool, usize)| -> super::scheduling::Task<'_, _> {
+                let spawner = recursive_spawner.clone();
+                let scope = scope.clone();
+                Box::pin(async move {
+                    let branch = async {
+                        let candidates = self.candidates.with_scope(scope.as_deref());
+                        let mut descendants = Outcome::default();
+                        let mut ran_recursive_children = false;
+                        if let Some(inventory) = inventory {
+                            let (nested, scanned) =
+                                self.discover_children(inventory, depth, &candidates).await?;
+                            ran_recursive_children = scanned;
+                            if scanned {
+                                descendants = self.execute_batch(
+                                    nested, depth + 1, scope.clone(), Some((id, &result)), spawner,
+                                ).await?;
+                            } else {
+                                descendants.errors.extend(nested.errors);
+                                descendants.scan_incomplete = self.record_scan_errors(nested.scan_errors);
+                            }
+                        }
+                        Ok::<_, io::Error>((result, input, children_already_complete, remaining_depth, descendants, ran_recursive_children))
+                    }.await;
+                    (index, branch)
+                })
+            };
+            // A normal single-output archive keeps its existing consumer. Only
+            // independently recursive carrier outputs need another batch; failed,
+            // already-complete and depth-limited segments consume no extra slots.
+            if recursive.len() == 1 {
+                descendants.push(descend(recursive.pop().unwrap()).await);
+            } else if !recursive.is_empty() {
+                descendants.extend(spawner.bounded_map(recursive, descend).await);
+            }
+            // Join every writer before committing or cleaning up, then restore
+            // logical segment order, including segments with no recursive work.
+            descendants.sort_unstable_by_key(|(index, _)| *index);
+            for (_, descendant) in descendants {
+                let (mut result, input, children_already_complete, remaining_depth, mut descendants, ran_recursive_children) = descendant?;
                 let children_complete = children_already_complete
                     || (!cancel.cancelled() && subtree_complete(&descendants));
                 if ran_recursive_children
@@ -1300,7 +1353,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     self.observer.commit_output(&result, checkpoint.as_ref())?;
                     // Cancellation after this durable commit must not roll it
                     // back. Match main's commit/check then retire ordering.
-                    if commit_completed && !multi && (result.failure.is_none() || result.partial) {
+                    if commit_completed && !multi {
                         if let Some(output) = result.output.as_deref() {
                             self.created_outputs.lock().unwrap().commit_if_unowned(output);
                         }
@@ -1323,14 +1376,6 @@ impl<'run, O: Observer> Run<'run, O> {
                 children
                     .cleanup_results
                     .append(&mut descendants.cleanup_results);
-                if multi {
-                    self.observer.notify(Event::Finished {
-                        id,
-                        path: result.path.clone(),
-                        depth,
-                        success: result.failure.is_none() || result.partial,
-                    });
-                }
                 completed.push(result);
             }
             if multi && outputs_committed && children.settled()
@@ -1343,9 +1388,13 @@ impl<'run, O: Observer> Run<'run, O> {
                     // The segments have separate receipts. Retire the carrier
                     // registration too, before its ancestors can commit and
                     // source cleanup can consume the archive.
-                    let first = completed.iter_mut().find(|result| result.output.is_some()
-                        && (result.failure.is_none() || result.partial))
-                        .expect("carrier has an accepted output");
+                    // An accepted segment keeps the shared container's Watch
+                    // receipt. A purely failed carrier retains bytes only.
+                    let accepted = completed.iter().position(|result|
+                        result.output.is_some() && (result.failure.is_none() || result.partial));
+                    let index = accepted.or_else(|| completed.iter().position(|result| result.output.is_some()))
+                        .expect("carrier has a retained output");
+                    let first = &mut completed[index];
                     let segment = first.output.replace(root.clone());
                     let published = self.observer.commit_output(first, None);
                     first.output = segment;
@@ -2068,14 +2117,19 @@ impl<'run, O: Observer> Run<'run, O> {
                     {
                         if let Some(output) = &output {
                             let verified_files = recoverable_file_count(&frame);
-                            if verified_files > 0 {
-                                let stats = scan_output_inventory_impl(&output_string);
-                                result.partial = true;
+                            let stats = scan_output_inventory_impl(&output_string);
+                            // Retaining damaged payload is not partial success:
+                            // main keeps nonempty failed output for manual recovery,
+                            // but only verified files authorize recursive processing.
+                            if verified_files > 0 || stats.file_count() > 0 {
+                                result.partial = verified_files > 0;
                                 result.files = stats.file_count() as u64;
                                 result.recovered_complete_files = verified_files as u64;
                                 result.bytes = stats.total_size();
                                 result.output = Some(output.clone());
-                                inventory = Some(stats);
+                                if result.partial {
+                                    inventory = Some(stats);
+                                }
                             }
                         }
                     }
@@ -2087,15 +2141,7 @@ impl<'run, O: Observer> Run<'run, O> {
         }
         if result.failure.is_some() && result.output.is_none() {
             if let Some(path) = output {
-                if let Err(error) = cleanup_owned_output(&path) {
-                    // Keep the durable guard on a failed deletion so Watch
-                    // can finish recovery rather than forgetting the directory.
-                    return Err(io::Error::other(super::OutputCleanupError { path, error }));
-                }
-                self.observer.discard_output(&result, &path)?;
-                // This worker has stopped and no recursive children were
-                // started for its failed output. Retire the empty receipt now.
-                self.created_outputs.lock().unwrap().commit(&path);
+                self.discard_failed_output(&result, &path)?;
             }
         }
         Ok(Executed {
@@ -2103,6 +2149,18 @@ impl<'run, O: Observer> Run<'run, O> {
             inventory,
             input,
         })
+    }
+
+    fn discard_failed_output(&self, result: &ArchiveResult, path: &Path) -> io::Result<()> {
+        cleanup_owned_output(path).map_err(|error| {
+            // Keep the durable guard on failed deletion so Watch can recover.
+            io::Error::other(super::OutputCleanupError { path: path.to_owned(), error })
+        })?;
+        self.observer.discard_output(result, path)?;
+        // No recursive children have started for this worker's failed output.
+        // Retire ownership only after both deletion and journal update succeed.
+        self.created_outputs.lock().unwrap().commit(path);
+        Ok(())
     }
 
     fn process_or_file_failure(&self, error: io::Error, worker: bool) -> Failure {
@@ -2451,6 +2509,7 @@ fn worker_evidence(
             missing_volume_evidence,
             read,
             recovery,
+            ..Default::default()
         })
     })
 }
@@ -3522,6 +3581,123 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn carrier_finishes_all_parents_before_recursive_prompt_or_cancellation() {
+        // A scheduler-only test cannot detect recursion left inside the logical
+        // segment loop. Use real retained outputs and the actual task boundary:
+        // both parent segments must be visited before either output asks to scan.
+        use std::sync::atomic::AtomicUsize;
+
+        struct ParentBarrier {
+            started: Mutex<Vec<TaskId>>,
+            finished: Mutex<Vec<TaskId>>,
+            cancel: Cancellation,
+            stop: bool,
+            parents: usize,
+            consumers: usize,
+            budget: Mutex<Option<(Arc<AtomicUsize>, usize)>>,
+        }
+        impl Observer for ParentBarrier {
+            fn notify(&self, event: Event) {
+                match event {
+                    Event::Started { id, .. } => self.started.lock().unwrap().push(id),
+                    Event::Finished { id, .. } => self.finished.lock().unwrap().push(id),
+                    _ => {}
+                }
+            }
+            fn allow_recursive(&self, depth: usize, _: usize) -> bool {
+                assert_eq!(depth, 2);
+                assert_eq!(self.started.lock().unwrap().len(), self.parents,
+                    "recursive prompt ran before all carrier parents finished");
+                let finished = self.finished.lock().unwrap();
+                assert_eq!(finished.len(), self.parents - 1,
+                    "segment completion waited for recursive discovery");
+                assert!(!finished.contains(&1000), "root finished before its subtrees");
+                let budget = self.budget.lock().unwrap();
+                let (remaining, initial) = budget.as_ref().unwrap();
+                assert_eq!(remaining.load(Ordering::Acquire), initial - self.consumers,
+                    "single-output or completed segments reserved recursive consumers");
+                if self.stop { self.cancel.cancel(); }
+                false
+            }
+        }
+        for (count, complete) in [(1, 0), (2, 0), (2, 1)] {
+          for stop in [false, true] {
+            let source = crate::test_support::temp_file("carrier_parent_barrier", &[0; 16]);
+            let container = source.with_extension("output");
+            fs::create_dir(&container).unwrap();
+            let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), container.file_name().unwrap().to_string_lossy().into_owned());
+            let (segments, _) = archive_input_slices(&input, &[
+                ("zip", 0, Some(8)), ("zip", 8, Some(16)),
+            ]).unwrap();
+            let inputs: Vec<_> = segments.into_iter().take(count).map(Option::unwrap).collect();
+            let generations = HashMap::from([
+                (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
+            ]);
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let mut request = Request::new(vec![source.clone()], Mode::Extract);
+            request.max_depth = 1;
+            Arc::make_mut(&mut request.config).recursive_extract = Recursion::Prompt;
+            Arc::make_mut(&mut request.config).post_extract.archive_cleanup_mode = CleanupMode::Keep;
+            for (index, input) in inputs.iter().enumerate() {
+                let output = container.join(format!("segment-{index}"));
+                fs::create_dir(&output).unwrap();
+                fs::write(output.join("payload"), b"keep").unwrap();
+                let mut result = receipt(input, DiscoverySource::Embedded, 1);
+                result.output = Some(output);
+                result.files = 1;
+                result.bytes = 4;
+                request.checkpoints.push(InputCheckpoint::create(
+                    &source, input, &result, &generations, Some(&container), index < complete, 1,
+                ).unwrap().unwrap());
+            }
+            let observer = ParentBarrier {
+                started: Mutex::new(Vec::new()), finished: Mutex::new(Vec::new()), cancel: request.cancel.clone(), stop,
+                parents: if count == 1 { 1 } else { count + 1 },
+                consumers: if count - complete > 1 { count - complete } else { 0 },
+                budget: Mutex::new(None),
+            };
+            let mut run = test_run(&engine, &request, &observer);
+            for (index, checkpoint) in request.checkpoints.iter().enumerate() {
+                run.checkpoints.entry(checkpoint.key()).or_default().push(index);
+            }
+            let task = Task {
+                inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
+                owned_paths: vec![source.to_string_lossy().into_owned()],
+                source: DiscoverySource::Embedded,
+                retry: None,
+            };
+            // One host slot also exercises parked recursive siblings without
+            // depending on the test machine's CPU count or worker subprocesses.
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+            let scheduler = pool.install(Scheduler::new);
+            let outcome = run.recursion.serve(&request.cancel,
+                |depth, pending| observer.allow_recursive(depth, pending),
+                || scheduler.run(1, Origin::Foreground, &request.cancel, |spawner| {
+                    let budget = spawner.consumer_budget();
+                    let initial = budget.load(Ordering::Acquire);
+                    *observer.budget.lock().unwrap() = Some((budget, initial));
+                    run.execute_task(task, 1000, 1, None, spawner)
+                }),
+            ).unwrap();
+            assert_eq!(observer.finished.lock().unwrap().last(), Some(&1000));
+            assert_eq!(outcome.archives.len(), count);
+            assert_eq!(outcome.archives.iter().map(|result| result.offset).collect::<Vec<_>>(),
+                (0..count).map(|index| (index * 8) as u64).collect::<Vec<_>>());
+            assert!(outcome.archives.iter().all(|result| result.retained));
+            assert_eq!(request.cancel.cancelled(), stop);
+            assert!(source.is_file(), "recursive cancellation consumed the carrier");
+            for index in 0..count {
+                assert_eq!(fs::read(container.join(format!("segment-{index}/payload"))).unwrap(), b"keep");
+            }
+            release_reader_resources_under_roots(vec![container.to_string_lossy().into_owned()]).unwrap();
+            fs::remove_dir_all(container).unwrap();
+            fs::remove_file(source).unwrap();
+          }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn nested_carrier_promotion_preserves_accepted_siblings_for_retry() {
         // Exercise the real task boundary and physical move, not just its
         // predicate: accepted siblings must keep their output and receipts
@@ -4002,7 +4178,15 @@ mod tests {
             panic!("expected an incomplete volume group");
         };
         let context = task.retry.as_deref().unwrap();
-        let original = receipt(task.entry(), task.source, 1);
+        let mut original = receipt(task.entry(), task.source, 1);
+        let output = root.join("damaged-output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("damaged.bin"), b"recoverable bytes").unwrap();
+        original.output = Some(output.clone());
+        original.failure = Some(Failure::new(FailureKind::MissingVolume, "missing"));
+        let observer = |_: Event| {};
+        let run = test_run(&engine, &request, &observer);
+        run.created_outputs.lock().unwrap().register(&output, &original);
 
         let last = root.join("split.7z.002");
         let mut writer = fs::File::create(&last).unwrap();
@@ -4010,9 +4194,13 @@ mod tests {
         writer.write_all(&next_header).unwrap();
         assert!(discovery::retry_volume(&original, context, &options, &candidates, &request)
             .unwrap().is_none());
+        assert!(output.join("damaged.bin").is_file());
         drop(writer);
         assert!(discovery::retry_volume(&original, context, &options, &candidates, &request)
             .unwrap().is_some());
+        run.discard_failed_output(&original, &output).unwrap();
+        assert!(!output.exists());
+        assert!(run.created_outputs.lock().unwrap().0.is_empty());
 
         drop(discovered);
         release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();

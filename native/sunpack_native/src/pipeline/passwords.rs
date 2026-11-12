@@ -429,7 +429,14 @@ impl<'a> CandidateSet<'a> {
                     } else {
                         FailureKind::Damaged
                     };
-                    return Ok(Err(Failure::new(kind, result.message)));
+                    let mut failure = Failure::new(kind, result.message);
+                    failure.evidence = Some(Box::new(super::FailureEvidence {
+                        stage: Some("password_preflight".into()),
+                        native_kind: Some(result.status.into()),
+                        archive_read_fault: result.read_fault.as_ref().map(Into::into),
+                        ..Default::default()
+                    }));
+                    return Ok(Err(failure));
                 }
                 _ => pending.extend(batch.iter().cloned()),
             }
@@ -576,6 +583,29 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_read_failure_retains_machine_readable_evidence() {
+        // Two passwords force the Rust probe, unlike single-candidate worker
+        // confirmation. This exercises the terminal planning projection.
+        let path = crate::test_support::temp_file("enc_read_fault_evidence", b"short");
+        let input = ArchiveInput::file(path.to_string_lossy().into_owned(), "enc".into(), "archive".into());
+        let cache = AttemptCache::default();
+        let candidates = CandidateSet::new(Arc::from(["first".into(), "second".into()]), None, &cache, None);
+        let failure = candidates.plan(&input, None, &Cancellation::new()).unwrap().err().unwrap();
+        assert_eq!(failure.kind, FailureKind::Damaged);
+        let json = serde_json::to_value(&failure).unwrap();
+        let evidence = &json["evidence"];
+        assert_eq!(evidence["stage"], "password_preflight");
+        let fault = &evidence["archive_read_fault"];
+        assert_eq!(fault["field"], "enc.password_proof");
+        assert_eq!(fault["offset"], 0);
+        assert_eq!(fault["requested"], 72);
+        assert_eq!(fault["actual"], 5);
+        assert_eq!(fault["possible_missing_volume"], false);
+        assert!(!failure.message.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn sole_enc_candidate_after_cached_rejections_uses_worker_confirmation() {
