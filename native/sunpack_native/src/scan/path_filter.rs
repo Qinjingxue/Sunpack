@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::io;
 use std::{borrow::Cow, cell::OnceCell, collections::HashSet, path::Path, sync::Arc};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuleEntry {
     pub(crate) value: String,

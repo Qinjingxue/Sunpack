@@ -684,9 +684,6 @@ fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec
         if value.is_empty() {
             break;
         }
-        if value.as_bytes().contains(&0) {
-            return Err(invalid("passwords must not contain NUL characters"));
-        }
         passwords.push(Arc::from(value));
     }
     Ok(passwords)
@@ -1073,6 +1070,10 @@ impl Observer for Progress<'_> {
 
     fn before_flatten(&self, output: &Path, work: &Path, leaf: &Path) -> io::Result<()> {
         self.watch.prepare_external_flatten(output, work, leaf)
+    }
+
+    fn after_flatten(&self, output: &Path) -> io::Result<()> {
+        self.watch.finish_external_flatten(output)
     }
 
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
@@ -2187,32 +2188,24 @@ fn show_config(
     if options.rule_stdin {
         let input = session.read_line("")?.ok_or(io::ErrorKind::UnexpectedEof)?;
         let rule = serde_json::from_str(&input)?;
-        config::PathRule::parse(&rule)?;
+        config::PathRule::parse(&rule)?.compile()?;
         result.summary = json!({"valid": true});
         return Ok((0, result));
     }
     let (path, payload) = config::load_raw(cwd)?;
     result.summary = json!({"config_path": path, "changed": false});
-    let validation = Config::parse(&payload).and_then(|settings| {
-        if options.action == "validate" {
-            Config::validate_scan_filters(&payload)?;
-            crate::pipeline::scan_options(&settings)?;
-        }
-        Ok(())
-    });
-    if let Err(error) = validation {
-        if options.action == "show" {
-            return Err(error);
-        }
-        let message = language.translate(
-            "cli.config.validation_error",
-            &[("error", &error.to_string())],
-        );
+    let errors = match Config::parse(&payload) {
+        Ok(settings) if options.action == "validate" => settings.validate_scan_filters(),
+        Ok(_) => Vec::new(),
+        Err(error) if options.action == "show" => return Err(error),
+        Err(error) => vec![error.to_string()],
+    };
+    if !errors.is_empty() {
         result.summary["valid"] = Value::Bool(false);
-        result.errors.push(message);
-        result
-            .items
-            .push(json!({"ok": false, "errors":[error.to_string()], "warnings": []}));
+        result.errors.extend(errors.iter().map(|error| language.translate(
+            "cli.config.validation_error", &[("error", error.as_str())],
+        )));
+        result.items.push(json!({"ok": false, "errors": errors, "warnings": []}));
         return Ok((2, result));
     }
     if options.action == "show" {

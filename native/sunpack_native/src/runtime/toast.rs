@@ -893,7 +893,7 @@ impl Activity {
         request.settled_tasks.insert(id);
         if visible { group.active_roots -= 1; }
         let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
-        if summary.failed != 0 || summary.cleanup_failed != 0 { request.pending_reports.insert(id); }
+        if summary.failed != 0 { request.pending_reports.insert(id); }
         group.summary.merge(summary);
         group.generation = group.generation.wrapping_add(1);
         state.dirty = true;
@@ -1085,10 +1085,7 @@ impl Reports {
         let roots = result.ok().map(|outcome| completion_roots(outcome, owner));
         let terminal = |root: &str| started.is_none_or(|started| started.contains(root))
             && roots.as_ref().is_some_and(|roots| roots.get(root).is_some_and(|root| root.terminal));
-        let cleanup = result.ok().is_some_and(|outcome| outcome.cleanup_results.iter().any(|cleanup|
-            cleanup.status == CleanupStatus::Failed
-                && started.is_none_or(|started| started.contains(&result_owner(&cleanup.path, owner)))));
-        if !cleanup && roots.as_ref().is_some_and(|roots| !roots.keys().any(|root| terminal(root))) {
+        if roots.as_ref().is_some_and(|roots| !roots.keys().any(|root| terminal(root))) {
             return Ok(());
         }
         let mut draft = report.lock().unwrap();
@@ -1132,14 +1129,7 @@ impl Reports {
                     {
                         spool.append(&error.path, &error.message, error)?;
                     }
-                    for cleanup in outcome
-                        .cleanup_results
-                        .iter()
-                        .filter(|cleanup| cleanup.status == CleanupStatus::Failed
-                            && started.is_none_or(|started| started.contains(&result_owner(&cleanup.path, owner))))
-                    {
-                        spool.append(&cleanup.path, &cleanup.message, cleanup)?;
-                    }
+
                 }
                 Err(error) => spool.append(path, &error.to_string(), &None::<String>)?,
             }
@@ -1705,6 +1695,12 @@ mod tests {
             activity.root_finished(1, &done);
             activity.record_root(1, Path::new("a.zip"), &done);
             activity.report_finished(1, false);
+            {
+                let state = publisher.shared.state.lock().unwrap();
+                let report = state.groups.front().unwrap().report.lock().unwrap();
+                assert_eq!(report.failures, 0);
+                assert!(report.path.as_ref().is_none_or(|path| !path.exists()));
+            }
             assert_eq!(current(&publisher).status, "1/3 finished");
             let mut failed = Outcome::default();
             failed.archives.push(archive("c.zip", Some(FailureKind::Damaged)));
@@ -1728,9 +1724,9 @@ mod tests {
             assert_eq!(group.summary.failed, if cancelled { 1 } else { 2 });
             assert_eq!(group.summary.interrupted, usize::from(cancelled));
             assert_eq!(group.summary.cleanup_failed, 1);
-            // Root C and A's cleanup were written before publishing their
-            // completion. Final projection must not append either again.
-            assert_eq!(group.report.lock().unwrap().failures, if cancelled { 2 } else { 3 });
+            // Only failed roots belong in the report; A's source cleanup
+            // remains a warning and must not add a failure entry.
+            assert_eq!(group.report.lock().unwrap().failures, if cancelled { 1 } else { 2 });
         }
     }
 

@@ -4,8 +4,7 @@
 use super::{ArchiveResult, DiscoverySource, Failure, FailureKind};
 use crate::io::archive_state::{AnalysisFacts, ArchiveInput, InputExtent, InputPart, OpenMode};
 use crate::io::reader::{
-    capture_directory_identity, capture_file_generation, DirectoryIdentity,
-    PersistedFileGeneration, PhysicalFileGeneration,
+    capture_file_generation, PersistedFileGeneration, PhysicalFileGeneration,
 };
 use crate::path_keys::path_key;
 use serde::{Deserialize, Serialize};
@@ -23,8 +22,8 @@ pub struct InputCheckpoint {
     carrier: PathBuf,
     input: LogicalLayout,
     sources: Box<[SourceGeneration]>,
-    output: OwnedDirectory,
-    container: Option<OwnedDirectory>,
+    output: PathBuf,
+    container: Option<PathBuf>,
     files: u64,
     bytes: u64,
     encrypted: Option<bool>,
@@ -32,24 +31,25 @@ pub struct InputCheckpoint {
     children_complete: bool,
     remaining_depth: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    partial: Option<PartialReceipt>,
+    failure: Option<FailureReceipt>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PartialReceipt {
+struct FailureReceipt {
+    partial: bool,
+    password_signature: Option<String>,
     failure: Failure,
     complete_files: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retry_facts: Option<RetryFacts>,
 }
 
-/// Fixed-layout retry evidence, not an analysis cache or an archive inventory.
-/// Unresolved volume plans cannot produce receipts; a successful selection
-/// drops its plan before checkpoint creation and needs no retry evidence.
+/// Retry dependencies only: no inventory, reader, or retained candidate plan.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RetryFacts {
     logical_name: String,
     analysis: AnalysisFacts,
+    plan_signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,25 +92,6 @@ impl PromotedSource {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct OwnedDirectory {
-    path: PathBuf,
-    identity: DirectoryIdentity,
-}
-
-impl OwnedDirectory {
-    fn capture(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            path: path.to_path_buf(),
-            identity: capture_directory_identity(path)?,
-        })
-    }
-
-    fn valid(&self) -> bool {
-        capture_directory_identity(&self.path).is_ok_and(|identity| identity == self.identity)
-    }
-}
-
 impl InputCheckpoint {
     pub fn entry(&self) -> &Path {
         &self.input.entry
@@ -119,7 +100,7 @@ impl InputCheckpoint {
         &self.carrier
     }
     pub fn output(&self) -> &Path {
-        &self.output.path
+        &self.output
     }
     pub fn source_paths(&self) -> impl Iterator<Item = &Path> {
         self.sources.iter().map(|source| source.path.as_path())
@@ -146,17 +127,14 @@ impl InputCheckpoint {
         container: Option<&Path>,
         children_complete: bool,
         remaining_depth: usize,
-    ) -> io::Result<Option<Self>> {
-        if input.volume_attempts.is_some() || (result.failure.is_some() && !result.partial) {
-            return Ok(None);
+    ) -> Option<Self> {
+        if result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::Cancelled) {
+            return None;
         }
-        let Some(output) = result.output.as_deref() else {
-            return Ok(None);
-        };
         let mut sources = Vec::with_capacity(result.source_paths.len());
         for path in &result.source_paths {
             let Some(generation) = generations.get(&path_key(&path.to_string_lossy())) else {
-                return Ok(None);
+                return None;
             };
             sources.push(SourceGeneration {
                 path: path.clone(),
@@ -164,9 +142,9 @@ impl InputCheckpoint {
             });
         }
         if sources.is_empty() {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(Self {
+        Some(Self {
             schema_version: SCHEMA_VERSION,
             carrier: carrier.to_path_buf(),
             input: LogicalLayout {
@@ -177,23 +155,26 @@ impl InputCheckpoint {
                 ranges: input.ranges.clone(),
             },
             sources: sources.into_boxed_slice(),
-            output: OwnedDirectory::capture(output)?,
-            container: container.map(OwnedDirectory::capture).transpose()?,
+            output: result.output.clone().unwrap_or_default(),
+            container: container.map(Path::to_path_buf),
             files: result.files,
             bytes: result.bytes,
             encrypted: result.encrypted,
             discovery_source: result.discovery_source,
             children_complete,
             remaining_depth,
-            partial: result.failure.as_ref().map(|failure| PartialReceipt {
+            failure: result.failure.as_ref().map(|failure| FailureReceipt {
+                partial: result.partial,
+                password_signature: None,
                 failure: failure.clone(),
                 complete_files: result.recovered_complete_files,
                 retry_facts: Some(RetryFacts {
                     logical_name: input.logical_name.clone(),
                     analysis: input.analysis.clone(),
+                    plan_signature: plan_signature(input),
                 }),
             }),
-        }))
+        })
     }
 
     pub(super) fn valid_for(
@@ -202,35 +183,37 @@ impl InputCheckpoint {
         generations: &HashMap<String, PhysicalFileGeneration>,
     ) -> bool {
         self.schema_version == SCHEMA_VERSION
-            && self.partial.as_ref().is_none_or(|partial| {
-                // A plan that admits an old winner is enough for complete
-                // output, but new alternatives must wake a partial retry.
-                // Legacy partial receipts have no retry-fact proof and must
-                // run once more; legacy complete receipts remain reusable.
-                input.volume_attempts.is_none()
-                    && partial.retry_facts.as_ref().is_some_and(|facts| {
+            && self.failure.as_ref().is_none_or(|partial| {
+                // Failed logical inputs wake only when retry dependencies
+                // change; successful outputs admit their proven volume winner.
+                partial.retry_facts.as_ref().is_some_and(|facts| {
                         facts.logical_name == input.logical_name
                             && facts.analysis == input.analysis
+                            && facts.plan_signature == plan_signature(input)
                     })
             })
-            && self.input.matches(input)
+            && (if self.failure.is_some() {
+                self.input.entry == Path::new(&input.entry_path)
+                    && self.input.mode == input.mode && self.input.format == input.format_hint
+                    && self.input.parts == input.parts && self.input.ranges == input.ranges
+            } else { self.input.matches(input) })
             && self.sources.iter().all(|source| {
                 generations
                     .get(&path_key(&source.path.to_string_lossy()))
                     .is_some_and(|generation| generation.persisted() == source.generation)
             })
-            && self.output.valid()
-            && self.container.as_ref().is_none_or(OwnedDirectory::valid)
+
     }
 
     pub(super) fn container(&self) -> Option<&Path> {
         self.container
             .as_ref()
-            .map(|container| container.path.as_path())
+            .map(|container| container.as_path())
     }
     pub(crate) fn retained_container(&self) -> Option<&Path> {
         let container = self.container.as_ref()?;
-        (container.valid() && self.output.valid()).then_some(container.path.as_path())
+        (self.has_output() && self.failure.as_ref().is_none_or(|receipt| receipt.complete_files > 0))
+            .then_some(container.as_path())
     }
     pub(super) fn children_complete(&self, remaining_depth: usize) -> bool {
         self.children_complete && self.remaining_depth >= remaining_depth
@@ -240,7 +223,7 @@ impl InputCheckpoint {
         input.mode = self.input.mode;
         input.parts = self.input.parts.clone();
         input.ranges = self.input.ranges.clone();
-        input.volume_attempts = None;
+        if self.failure.is_none() { input.volume_attempts = None; }
     }
 
     pub(super) fn relocate(&mut self, source: &Path, destination: &Path) -> bool {
@@ -259,11 +242,12 @@ impl InputCheckpoint {
                 changed = true;
             }
         };
+        let has_output = self.has_output();
         mapped(&mut self.carrier);
         mapped(&mut self.input.entry);
-        mapped(&mut self.output.path);
+        if has_output { mapped(&mut self.output); }
         if let Some(container) = &mut self.container {
-            mapped(&mut container.path);
+            mapped(container);
         }
         for generation in &mut self.sources {
             mapped(&mut generation.path);
@@ -283,29 +267,29 @@ impl InputCheckpoint {
         changed
     }
 
-    /// Flatten first moves the wrapper to work, then publishes the inner leaf.
-    /// The wrapper itself is the only directory whose identity changes.
-    pub(crate) fn rebase_flatten(
-        &mut self,
-        root: &Path,
-        work: &Path,
-        leaf: &Path,
-        wrapper: Option<&DirectoryIdentity>,
-        published: &DirectoryIdentity,
-    ) -> bool {
-        let mut changed = self.relocate(work, root);
-        // Live publication can already have written a receipt at its new path.
-        // An inner subtree may happen to have the old leaf's name as well.
-        if changed || !self.output.path.starts_with(leaf) || !self.output.valid() {
-            changed |= self.relocate(leaf, root);
+    /// Apply the same publication path mapping as the output transaction.
+    pub(crate) fn rebase_flatten(&mut self, root: &Path, work: &Path, leaf: &Path) -> bool {
+        let changed = self.relocate(work, root);
+        self.relocate(leaf, root) || changed
+    }
+
+    pub(crate) fn has_output(&self) -> bool { !self.output.as_os_str().is_empty() }
+
+    pub(crate) fn storage_key(&self) -> String {
+        if self.has_output() { return self.output.to_string_lossy().into_owned(); }
+        let key = self.key();
+        format!("input|{}|{:?}|{}|{}", key.entry, key.mode, key.format, key.start)
+    }
+
+    pub(super) fn set_password_signature(&mut self, signature: impl FnOnce() -> String) {
+        if let Some(receipt) = self.failure.as_mut().filter(|receipt| receipt.failure.is_password_retry()) {
+            receipt.password_signature = Some(signature());
         }
-        for directory in std::iter::once(&mut self.output).chain(self.container.iter_mut()) {
-            if directory.path == root && wrapper == Some(&directory.identity) {
-                directory.identity = published.clone();
-                changed = true;
-            }
-        }
-        changed
+    }
+
+    pub(super) fn password_unchanged(&self, signature: impl FnOnce() -> String) -> bool {
+        self.failure.as_ref().is_none_or(|receipt| !receipt.failure.is_password_retry()
+            || receipt.password_signature.as_ref().is_some_and(|saved| *saved == signature()))
     }
 
     pub(super) fn promoted(&mut self, moves: &[(PathBuf, PathBuf)]) -> io::Result<()> {
@@ -313,7 +297,7 @@ impl InputCheckpoint {
             let entry_moved = self.input.entry == *source;
             self.relocate(source, destination);
             if entry_moved {
-                if let Some(facts) = self.partial.as_mut().and_then(|partial| partial.retry_facts.as_mut()) {
+                if let Some(facts) = self.failure.as_mut().and_then(|partial| partial.retry_facts.as_mut()) {
                     // Collision aliases can change a disguised carrier's
                     // discovery name without changing its bytes or analysis.
                     // Preserve names supplied by relation semantics instead
@@ -332,7 +316,7 @@ impl InputCheckpoint {
     }
 
     pub(super) fn result(&self, depth: usize) -> ArchiveResult {
-        let failure = self.partial.as_ref().map(|receipt| receipt.failure.clone());
+        let failure = self.failure.as_ref().map(|receipt| receipt.failure.clone());
         let extent = self
             .input
             .parts
@@ -342,7 +326,7 @@ impl InputCheckpoint {
         ArchiveResult {
             path: self.input.entry.clone(),
             format: self.input.format.clone(),
-            output: Some(self.output.path.clone()),
+            output: self.has_output().then(|| self.output.clone()),
             volume_completeness: self.input.mode.structured().then(|| {
                 if failure
                     .as_ref()
@@ -369,16 +353,24 @@ impl InputCheckpoint {
             password: None,
             discovery_source: self.discovery_source,
             damage_flags: None,
-            partial: self.partial.is_some(),
+            partial: self.failure.as_ref().is_some_and(|receipt| receipt.partial),
             retained: true,
             recovered_complete_files: self
-                .partial
+                .failure
                 .as_ref()
                 .map_or(0, |receipt| receipt.complete_files),
             promoted: false,
             promotion_original_path: None,
         }
     }
+}
+
+fn plan_signature(input: &ArchiveInput) -> Option<String> {
+    input.volume_attempts.as_ref().map(|plan| {
+        let mut hash = crate::fast_hash_core::Hash128::new();
+        hash.update(&serde_json::to_vec(plan).expect("volume plan is serializable"));
+        hash.hexdigest()
+    })
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -472,15 +464,17 @@ mod tests {
                 sources: vec![SourceGeneration {
                     path: source.clone(), generation: capture_file_generation(&source).unwrap().persisted(),
                 }].into_boxed_slice(),
-                output: OwnedDirectory::capture(&output).unwrap(),
-                container: Some(OwnedDirectory::capture(&container).unwrap()),
+                output: output.clone(),
+                container: Some(container.clone()),
                 files: 1, bytes: 4, encrypted: None,
                 discovery_source: DiscoverySource::Embedded, children_complete: true,
                 remaining_depth: 0,
-                partial: Some(PartialReceipt {
+                failure: Some(FailureReceipt {
+                    partial: true, password_signature: None,
                     failure, complete_files: 1,
                     retry_facts: Some(RetryFacts {
                         logical_name: input.logical_name.clone(), analysis: input.analysis.clone(),
+                    plan_signature: plan_signature(&input),
                     }),
                 }),
             };
@@ -542,10 +536,10 @@ mod tests {
             sources: vec![SourceGeneration {
                 path: source.clone(), generation: generations[&key].persisted(),
             }].into_boxed_slice(),
-            output: OwnedDirectory::capture(&output).unwrap(),
+            output: output.clone(),
             container: None, files: 1, bytes: 7, encrypted: None,
             discovery_source: DiscoverySource::Direct, children_complete: true,
-            remaining_depth: 0, partial: None,
+            remaining_depth: 0, failure: None,
         };
         let mut result = complete.result(1);
         result.failure = Some(Failure::new(FailureKind::MissingVolume, "missing volume"));
@@ -553,7 +547,7 @@ mod tests {
         result.recovered_complete_files = 1;
         let partial = InputCheckpoint::create(
             &source, &input, &result, &generations, None, true, 0,
-        ).unwrap().unwrap();
+        ).unwrap();
         // Exercise the persisted representation, not just in-memory equality.
         let partial: InputCheckpoint = serde_json::from_slice(
             &serde_json::to_vec(&partial).unwrap(),
@@ -584,10 +578,10 @@ mod tests {
         assert!(!partial.valid_for(&alternatives, &generations));
         assert!(InputCheckpoint::create(
             &source, &alternatives, &result, &generations, None, true, 0,
-        ).unwrap().is_none());
+        ).is_some());
 
         let mut legacy = serde_json::to_value(&partial).unwrap();
-        legacy["partial"].as_object_mut().unwrap().remove("retry_facts");
+        legacy["failure"].as_object_mut().unwrap().remove("retry_facts");
         let legacy: InputCheckpoint = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.valid_for(&input, &generations));
         assert!(!legacy.valid_for(&alternatives, &generations));

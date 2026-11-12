@@ -25,10 +25,10 @@ fn checked(name: &str, result: io::Result<String>) -> Value {
 pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
     let settings = config::load_raw(cwd).and_then(|(path, payload)| {
         let settings = config::Config::parse(&payload)?;
-        // Doctor validates all saved rules, just like config validate. Runtime
-        // parsing deliberately ignores invalid regexes in disabled rules.
-        config::Config::validate_scan_filters(&payload)?;
-        crate::pipeline::scan_options(&settings)?;
+        let errors = settings.validate_scan_filters();
+        if !errors.is_empty() {
+            return Err(io::Error::other(errors.join("\n")));
+        }
         Ok((path, settings))
     });
     let mut checks = vec![

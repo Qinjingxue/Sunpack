@@ -142,12 +142,8 @@ impl Engine {
         let unfiltered = || {
             NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
-        let recursive_output = request.mode == Mode::Extract && request.max_depth != 0;
-        let (options, deep_options) = match (request.deep, recursive_output) {
-            (true, false) => (unfiltered()?, None),
-            (true, _) => (discovery::scan_options(&request.config)?, Some(unfiltered()?)),
-            (false, _) => (discovery::scan_options(&request.config)?, None),
-        };
+        let options = OnceLock::new();
+        let deep_options = request.deep.then(unfiltered).transpose()?;
         let analysis = NativeAnalysisConfig::new(
             request
                 .config
@@ -197,7 +193,7 @@ impl Engine {
             Box::pin(async {
                 request.cancel.check_io()?;
                 let mut discovered =
-                    discovery::discover(&request, run.options_at(1), &run.candidates)?;
+                    discovery::discover(&request, run.options_at(1)?, &run.candidates)?;
                 if run.resolve_aliases {
                     dedup_resolved_plans(&mut discovered.tasks);
                 }
@@ -320,7 +316,7 @@ struct Run<'a, O> {
     request: &'a Request,
     resolve_aliases: bool,
     candidates: CandidateSet<'a>,
-    options: NativeDirectoryScanOptions,
+    options: OnceLock<io::Result<NativeDirectoryScanOptions>>,
     deep_options: Option<NativeDirectoryScanOptions>,
     analysis: NativeAnalysisConfig,
     observer: &'a O,
@@ -838,7 +834,7 @@ impl CreatedOutputs {
                 archive.failure = Some(Failure::new(FailureKind::Cancelled, "Operation interrupted"));
             }
         }
-        outcome.checkpoints.retain(|checkpoint| !discarded(checkpoint.output()));
+        outcome.checkpoints.retain(|checkpoint| !checkpoint.has_output() || !discarded(checkpoint.output()));
         // Only retire recovery/WAL ownership for trees actually removed. A
         // journal failure is not a filesystem cleanup failure: propagate it,
         // but still finish independent notifications and outcome accounting.
@@ -871,12 +867,21 @@ struct Executed {
 }
 
 impl<'run, O: Observer> Run<'run, O> {
-    fn options_at(&self, depth: usize) -> &NativeDirectoryScanOptions {
+    fn filtered_options(&self) -> io::Result<&NativeDirectoryScanOptions> {
+        // Deep discovery does not use configured filters. Compile them only
+        // when a recursive output actually enters ordinary discovery, sharing
+        // the same result across concurrently completed archive outputs.
+        self.options.get_or_init(|| discovery::scan_options(&self.request.config))
+            .as_ref().map_err(|error| io::Error::new(error.kind(), error.to_string()))
+    }
+
+    fn options_at(&self, depth: usize) -> io::Result<&NativeDirectoryScanOptions> {
         if depth == 1 {
-            self.deep_options.as_ref().unwrap_or(&self.options)
-        } else {
-            &self.options
+            if let Some(options) = &self.deep_options {
+                return Ok(options);
+            }
         }
+        self.filtered_options()
     }
 
     async fn execute_batch<'a>(
@@ -1022,7 +1027,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 .inputs
                 .iter()
                 .map(|logical| {
-                    self.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth)
+                    self.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth, &candidates)
                 })
                 .collect();
             let multi = task.inputs.len() > 1;
@@ -1054,11 +1059,12 @@ impl<'run, O: Observer> Run<'run, O> {
                 let existing = retained
                     .iter()
                     .flatten()
-                    .find_map(|checkpoint| checkpoint.container())
+                    .find_map(|checkpoint| checkpoint.retained_container())
                     .map(Path::to_path_buf);
                 match existing {
                     Some(path) => Some(path),
-                    None if task.inputs.iter().any(|input| input.failure.is_none()) => {
+                    None if task.inputs.iter().zip(&retained)
+                        .any(|(input, checkpoint)| checkpoint.is_none() && input.failure.is_none()) => {
                         let receipt = receipt(&task.inputs[0].input, task.source, depth);
                         match self.reserve_output(preferred_carrier, &receipt, None)? {
                             Ok(path) => {
@@ -1113,26 +1119,25 @@ impl<'run, O: Observer> Run<'run, O> {
                     let mut input = logical.input;
                     checkpoint.restore_input(&mut input);
                     let mut result = checkpoint.result(depth);
+                    if multi && checkpoint.container() != carrier.as_deref() && result.failure.is_some() {
+                        // A purely failed old carrier is not a reusable output
+                        // root. Carry its logical failure, not its output slot.
+                        result.output = None;
+                    }
                     if result.partial
                         && self.request.config.extraction.content_requirement
                             == ContentRequirement::Complete
                     {
                         let output = checkpoint.output();
                         shell.parent(output);
-                        cleanup_owned_output(output).map_err(|error| {
-                            io::Error::other(super::OutputCleanupError {
-                                path: output.to_owned(),
-                                error,
-                            })
-                        })?;
-                        self.observer.discard_output(&result, output)?;
+                        self.discard_failed_output(&result, output, &mut outcome)?;
                         result.output = None;
                         result.partial = false;
                         result.files = 0;
                         result.bytes = 0;
                         result.recovered_complete_files = 0;
                     }
-                    let inventory = if children_already_complete {
+                    let inventory = if children_already_complete || (result.failure.is_some() && !result.partial) {
                         None
                     } else {
                         result
@@ -1154,6 +1159,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         carrier.as_deref(),
                         &candidates,
                         &mut shell,
+                        &mut outcome,
                     )
                     .await?
                 };
@@ -1170,7 +1176,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     if let Some(mut replacement) = discovery::retry_volume(
                         &executed.result,
                         context,
-                        self.options_at(depth),
+                        self.options_at(depth)?,
                         &candidates,
                         self.request,
                     )? {
@@ -1178,7 +1184,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         // after resolving a usable physical family. Until then,
                         // its damaged payload remains available for recovery.
                         if let Some(output) = executed.result.output.as_deref() {
-                            self.discard_failed_output(&executed.result, output)?;
+                            self.discard_failed_output(&executed.result, output, &mut outcome)?;
                             executed.result.output = None;
                         }
                         self.observer.after_output(&executed.result)?;
@@ -1216,6 +1222,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 None,
                                 &candidates,
                                 &mut shell,
+                                &mut outcome,
                             )
                             .await?;
                     }
@@ -1332,7 +1339,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         self.observer, &mut result, &mut descendants, Some(&self.created_outputs),
                     )?;
                 }
-                let checkpoint = if self.request.mode == Mode::Extract {
+                let mut checkpoint = if self.request.mode == Mode::Extract {
                     InputCheckpoint::create(
                         &owner_path,
                         &input,
@@ -1341,10 +1348,13 @@ impl<'run, O: Observer> Run<'run, O> {
                         carrier.as_deref(),
                         children_complete,
                         remaining_depth,
-                    )?
+                    )
                 } else {
                     None
                 };
+                if let Some(checkpoint) = &mut checkpoint {
+                    checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
+                }
                 // A cancelled newly created root remains uncommitted until
                 // request-level rollback has joined all recursive writers.
                 let commit_completed = !cancel.cancelled();
@@ -1737,6 +1747,7 @@ impl<'run, O: Observer> Run<'run, O> {
         generations: &HashMap<String, PhysicalFileGeneration>,
         preferred_carrier: &Path,
         depth: usize,
+        candidates: &CandidateSet<'_>,
     ) -> Option<&InputCheckpoint> {
         if self.request.mode != Mode::Extract {
             return None;
@@ -1747,6 +1758,11 @@ impl<'run, O: Observer> Run<'run, O> {
             .iter()
             .find_map(|&index| {
                 let checkpoint = &self.request.checkpoints[index];
+                if !checkpoint.valid_for(input, generations)
+                    || !checkpoint.password_unchanged(|| candidates.signature(&input.entry_path)) {
+                    return None;
+                }
+                if !checkpoint.has_output() { return Some(checkpoint); }
                 let destination_matches = match checkpoint.container() {
                     Some(container) => {
                         output_candidate(preferred_carrier, container)
@@ -1761,7 +1777,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     None => output_candidate(&preferred, checkpoint.output()),
                 };
-                if !destination_matches || !checkpoint.valid_for(input, generations) {
+                if !destination_matches {
                     return None;
                 }
                 let mut names = self.output_names.registry.lock().unwrap();
@@ -1895,6 +1911,7 @@ impl<'run, O: Observer> Run<'run, O> {
         carrier: Option<&Path>,
         candidates: &CandidateSet<'_>,
         shell: &mut ShellUpdates<'_>,
+        outcome: &mut Outcome,
     ) -> io::Result<Executed> {
         let LogicalInput {
             mut input,
@@ -1902,6 +1919,7 @@ impl<'run, O: Observer> Run<'run, O> {
             failure,
         } = logical;
         let mut result = receipt(&input, source, depth);
+        result.password = password.as_deref().map(str::to_owned);
         if let Some(failure) = failure {
             result.failure = Some(failure);
             return Ok(Executed {
@@ -2110,10 +2128,8 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     if self.request.config.extraction.content_requirement
                         == ContentRequirement::AllowPartial
-                        && matches!(
-                            failure.kind,
-                            FailureKind::Damaged | FailureKind::MissingVolume
-                        )
+                        && failure.kind != FailureKind::PasswordInconclusive
+                        && recoverable_content_failure(&frame)
                     {
                         if let Some(output) = &output {
                             let verified_files = recoverable_file_count(&frame);
@@ -2141,7 +2157,7 @@ impl<'run, O: Observer> Run<'run, O> {
         }
         if result.failure.is_some() && result.output.is_none() {
             if let Some(path) = output {
-                self.discard_failed_output(&result, &path)?;
+                self.discard_failed_output(&result, &path, outcome)?;
             }
         }
         Ok(Executed {
@@ -2151,11 +2167,15 @@ impl<'run, O: Observer> Run<'run, O> {
         })
     }
 
-    fn discard_failed_output(&self, result: &ArchiveResult, path: &Path) -> io::Result<()> {
-        cleanup_owned_output(path).map_err(|error| {
-            // Keep the durable guard on failed deletion so Watch can recover.
-            io::Error::other(super::OutputCleanupError { path: path.to_owned(), error })
-        })?;
+    fn discard_failed_output(
+        &self, result: &ArchiveResult, path: &Path, outcome: &mut Outcome,
+    ) -> io::Result<()> {
+        if let Err(error) = cleanup_owned_output(path) {
+            // Physical deletion is local to this failed archive. Keep its
+            // durable guard, but do not discard the other logical results.
+            record_cleanup(outcome, path, "delete", Err(error));
+            return Ok(());
+        }
         self.observer.discard_output(result, path)?;
         // No recursive children have started for this worker's failed output.
         // Retire ownership only after both deletion and journal update succeed.
@@ -2185,7 +2205,7 @@ impl<'run, O: Observer> Run<'run, O> {
         if depth > self.request.max_depth || self.request.cancel.cancelled() {
             return Ok((nested, false));
         }
-        let output = discovery::OutputDiscovery::prepare(inventory, &self.options)?;
+        let output = discovery::OutputDiscovery::prepare(inventory, self.filtered_options()?)?;
         nested.scan_errors.extend(output.scan_errors());
         // Main asks once per depth when the filtered output has files, even if
         // discovery will find no archives or nested authorization rejects them.
@@ -2355,6 +2375,8 @@ fn flatten_result(
         );
     }
     if let (Some(old), Some(new)) = (stats.source_dir, stats.output_dir) {
+        // Settle the durable pre-move receipts before publishing rebased ones.
+        observer.after_flatten(&new)?;
         // Successful flatten commonly keeps the root spelling unchanged while
         // moving its leaf's descendants. Rebase rollback receipts with the same
         // mapping as checkpoints, before any fallible durable publication.
@@ -2604,7 +2626,7 @@ fn classify_worker_failure(
     classified
 }
 
-fn recoverable_file_count(frame: &WorkerFrame) -> usize {
+fn recoverable_content_failure(frame: &WorkerFrame) -> bool {
     let kind = frame.summary["failure_kind"].as_str().unwrap_or_default();
     let stage = frame.summary["failure_stage"].as_str().unwrap_or_default();
     if matches!(
@@ -2625,6 +2647,13 @@ fn recoverable_file_count(frame: &WorkerFrame) -> usize {
             | "stream_truncated"
     ) || matches!(stage, "item_extract" | "archive_extract" | "archive_read"))
     {
+        return false;
+    }
+    true
+}
+
+fn recoverable_file_count(frame: &WorkerFrame) -> usize {
+    if !recoverable_content_failure(frame) {
         return 0;
     }
     if let Some(preview) = &frame.recovery {
@@ -3476,11 +3505,11 @@ mod tests {
         let during_ack = second_done.recv_timeout(timeout);
         let high = change(&engine, ProcessMode::High);
         ack(&initial, "background");
-        assert!(background.join().unwrap().unwrap());
+        assert!(background.join().unwrap());
         assert_eq!(writing.recv_timeout(timeout).unwrap(), command("high"));
         release.send(()).unwrap();
         ack(&initial, "high");
-        assert!(high.join().unwrap().unwrap());
+        assert!(high.join().unwrap());
         first.join().unwrap();
         second.join().unwrap();
         assert!(during_write.expect("mode write held the worker ownership mutex"));
@@ -3510,7 +3539,7 @@ mod tests {
         replacement_release.send(()).unwrap();
         ack(&initial, "normal"); // An obsolete ACK cannot rewrite the new owner's state.
         ack(&replacement, "background");
-        assert!(final_change.join().unwrap().unwrap());
+        assert!(final_change.join().unwrap());
         let (borrowed, received) = borrow_on_scheduler(&scheduler, &engine, &replacement, 3);
         assert!(received.recv_timeout(timeout).unwrap());
         borrowed.join().unwrap();
@@ -3539,6 +3568,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn preflight_damage_keeps_a_proven_password_in_scan_and_extract() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct NoWake;
+        impl Wake for NoWake { fn wake(self: Arc<Self>) {} }
+        for mode in [Mode::Scan, Mode::Extract] {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(vec![], mode);
+            let observer = |_: Event| {};
+            let run = test_run(&engine, &request, &observer);
+            let mut input = ArchiveInput::file("damaged.rar".into(), "rar".into(), "damaged".into());
+            input.analysis.password_required = true;
+            let logical = LogicalInput { input, password: Some(Arc::from("confirmed")),
+                failure: Some(Failure::new(FailureKind::Damaged, "missing ENDARC")) };
+            let mut shell = engine.shell.branch();
+            let mut outcome = Outcome::default();
+            let mut future = Box::pin(run.execute_input(logical, 1, DiscoverySource::Embedded,
+                1, None, &run.candidates, &mut shell, &mut outcome));
+            let waker = Waker::from(Arc::new(NoWake));
+            let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) else {
+                panic!("preflight failure started worker execution");
+            };
+            let result = result.unwrap().result;
+            assert_eq!(result.password.as_deref(), Some("confirmed"));
+            assert_eq!(result.failure.unwrap().kind, FailureKind::Damaged);
+            assert!(result.output.is_none());
+        }
+    }
+
     fn test_run<'a, O: Observer>(
         engine: &'a Engine,
         request: &'a Request,
@@ -3549,7 +3608,7 @@ mod tests {
             request,
             resolve_aliases: false,
             candidates: CandidateSet::new(Arc::from([]), None, &engine.password_attempts, None),
-            options: discovery::scan_options(&request.config).unwrap(),
+            options: OnceLock::new(),
             deep_options: None,
             analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
             observer,
@@ -3648,7 +3707,7 @@ mod tests {
                 result.bytes = 4;
                 request.checkpoints.push(InputCheckpoint::create(
                     &source, input, &result, &generations, Some(&container), index < complete, 1,
-                ).unwrap().unwrap());
+                ).unwrap());
             }
             let observer = ParentBarrier {
                 started: Mutex::new(Vec::new()), finished: Mutex::new(Vec::new()), cancel: request.cancel.clone(), stop,
@@ -3661,6 +3720,7 @@ mod tests {
                 run.checkpoints.entry(checkpoint.key()).or_default().push(index);
             }
             let task = Task {
+                primary: None,
                 inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
                 owned_paths: vec![source.to_string_lossy().into_owned()],
                 source: DiscoverySource::Embedded,
@@ -3715,6 +3775,7 @@ mod tests {
                 (path_key(&source.path().to_string_lossy()), source)
             }).collect();
             let task = Task {
+                primary: None,
                 inputs: inputs.iter().enumerate().map(|(index, input)| LogicalInput {
                     input: input.clone(),
                     password: None,
@@ -3778,7 +3839,7 @@ mod tests {
                 }
                 request.checkpoints.push(InputCheckpoint::create(
                     &source, input, &result, &generations, Some(&container), true, 0,
-                ).unwrap().unwrap());
+                ).unwrap());
             }
             let engine = Engine::new(PathBuf::from("unused-worker"));
             let outcome = execute(&engine, &request, &inputs, blocked, depth);
@@ -4122,6 +4183,7 @@ mod tests {
             let run = test_run(&engine, &request, &observer);
             let batch = Discovered {
                 tasks: vec![Task {
+                    primary: None,
                     inputs: vec![LogicalInput {
                         input: ArchiveInput::file("child.zip".into(), "zip".into(), "child".into()),
                         password: None,
@@ -4198,7 +4260,7 @@ mod tests {
         drop(writer);
         assert!(discovery::retry_volume(&original, context, &options, &candidates, &request)
             .unwrap().is_some());
-        run.discard_failed_output(&original, &output).unwrap();
+        run.discard_failed_output(&original, &output, &mut Outcome::default()).unwrap();
         assert!(!output.exists());
         assert!(run.created_outputs.lock().unwrap().0.is_empty());
 
@@ -4239,6 +4301,7 @@ mod tests {
                 }));
             }
             Task {
+                primary: None,
                 owned_paths: vec![input.entry_path.clone()],
                 inputs: vec![LogicalInput { input, password: None,
                     failure: blocked.then(|| Failure::new(FailureKind::MissingVolume, "missing")) }],
@@ -4415,6 +4478,95 @@ mod tests {
     }
 
     #[test]
+    fn completed_failures_are_carried_until_their_dependencies_change() {
+        let source = crate::test_support::temp_file("failure_receipts", b"archive");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        let mut generations = HashMap::from([(
+            path_key(&input.entry_path), capture_file_generation(&source).unwrap(),
+        )]);
+        let mut keys = Vec::new();
+        for kind in [None, Some(FailureKind::Damaged), Some(FailureKind::WrongPassword)] {
+            let mut result = receipt(&input, DiscoverySource::Direct, 1);
+            result.failure = kind.map(|kind| Failure::new(kind, "failed"));
+            // Successful receipts do not require opening any output directory.
+            if kind.is_none() { result.output = Some(source.with_extension("not-created")); }
+            let mut checkpoint = InputCheckpoint::create(
+                &source, &input, &result, &generations, None, true, 0,
+            ).unwrap();
+            checkpoint.set_password_signature(|| "before".into());
+            let checkpoint: InputCheckpoint = serde_json::from_slice(
+                &serde_json::to_vec(&checkpoint).unwrap(),
+            ).unwrap();
+            assert!(checkpoint.valid_for(&input, &generations));
+            assert!(checkpoint.password_unchanged(|| "before".into()));
+            assert_eq!(checkpoint.password_unchanged(|| "after".into()), kind != Some(FailureKind::WrongPassword));
+            let restored = checkpoint.result(1);
+            assert_eq!(restored.failure.as_ref().map(|failure| failure.kind), kind);
+            assert_eq!(restored.output, result.output);
+            assert!(!restored.partial);
+            keys.push(checkpoint);
+        }
+        fs::write(&source, b"changed generation").unwrap();
+        generations.insert(path_key(&input.entry_path), capture_file_generation(&source).unwrap());
+        assert!(keys.iter().all(|checkpoint| !checkpoint.valid_for(&input, &generations)));
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn partial_recovery_uses_native_content_stage_not_high_level_kind() {
+        for (kind, stage, expected) in [
+            ("unsupported_method", "item_extract", true),
+            ("data_error", "", true),
+            ("unsupported_method", "archive_open", false),
+            ("output_filesystem", "item_extract", false),
+            ("process_exit", "archive_extract", false),
+        ] {
+            let mut frame: WorkerFrame = serde_json::from_str(&serde_json::json!({
+                "failure_kind":kind, "failure_stage":stage,
+            }).to_string()).unwrap();
+            frame.recovery = Some(super::super::RecoveryPreview {
+                complete_files: 2, ..Default::default()
+            });
+            assert_eq!(recoverable_content_failure(&frame), expected);
+            assert_eq!(recoverable_file_count(&frame), if expected { 2 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn failed_output_cleanup_is_local_but_journal_failure_propagates() {
+        struct Journal { fail: bool }
+        impl Observer for Journal {
+            fn notify(&self, _: Event) {}
+            fn discard_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
+                if self.fail { Err(io::Error::other("journal unavailable")) } else { Ok(()) }
+            }
+        }
+        let source = crate::test_support::temp_file("discard_failure", b"archive");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        let mut failed = receipt(&input, DiscoverySource::Direct, 1);
+        failed.failure = Some(Failure::new(FailureKind::Damaged, "failed"));
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let request = Request::new(vec![source.clone()], Mode::Extract);
+        let observer = Journal { fail: false };
+        let run = test_run(&engine, &request, &observer);
+        let mut outcome = Outcome::default();
+        outcome.archives.push(receipt(&input, DiscoverySource::Direct, 1));
+        // Replaced non-directory output fails independently of ACL privileges.
+        run.created_outputs.lock().unwrap().register(&source, &failed);
+        run.discard_failed_output(&failed, &source, &mut outcome).unwrap();
+        assert_eq!(outcome.archives.len(), 1);
+        assert_eq!(outcome.cleanup_results.len(), 1);
+        assert!(run.created_outputs.lock().unwrap().0.contains_key(&output_key(&source)));
+        let output = source.with_extension("output");
+        fs::create_dir(&output).unwrap();
+        let observer = Journal { fail: true };
+        let run = test_run(&engine, &request, &observer);
+        assert_eq!(run.discard_failed_output(&failed, &output, &mut outcome)
+            .unwrap_err().to_string(), "journal unavailable");
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
     fn rollback_isolates_cleanup_failures_and_preserves_journal_errors() {
         struct Discards {
             fail: bool,
@@ -4449,7 +4601,7 @@ mod tests {
                 archive.bytes = 12;
                 outcome.checkpoints.push(InputCheckpoint::create(
                     &source, &input, &archive, &generations, None, true, 0,
-                ).unwrap().unwrap());
+                ).unwrap());
                 created.register(output, &archive);
                 outcome.archives.push(archive);
             }
@@ -4674,6 +4826,7 @@ mod tests {
         let parent = receipt(&input, DiscoverySource::Direct, 1);
         let batch = Discovered {
             tasks: vec![Task {
+                primary: None,
                 inputs: vec![LogicalInput { input, password: None, failure: None }],
                 owned_paths: Vec::new(),
                 source: DiscoverySource::Direct,

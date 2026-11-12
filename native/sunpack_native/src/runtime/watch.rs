@@ -7,7 +7,7 @@ use crate::io::config_changes::NativeConfigChanges;
 use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
-    OutputCleanupError, PromotedSource, Request, InputFailure,
+    PromotedSource, Request, InputFailure,
 };
 use crate::postprocess::{watch_candidate_for_path, WatchCandidateRow};
 use crate::scan::directory::{NativeDirectoryScanOptions, NativeWatchCatalog};
@@ -680,6 +680,7 @@ struct Signals {
     once: Vec<mpsc::SyncSender<io::Result<()>>>,
     password_changed: bool,
     foreground_finished: bool,
+    maintenance: bool,
     clipboard: Option<Vec<String>>,
     volumes_changed: bool,
     rebuild: Vec<mpsc::SyncSender<io::Result<bool>>>,
@@ -800,7 +801,14 @@ impl Hub {
                 && signals.cancel.is_empty()
                 && (cancellation_observed || !self.cancelled.load(Ordering::Acquire))
         }).unwrap();
-        std::mem::take(&mut *guard)
+        // Policy reload drains the old generation without consuming its next
+        // configuration/root notifications or callers waiting for a new tick.
+        Signals {
+            roots: std::mem::take(&mut guard.roots),
+            completed: std::mem::take(&mut guard.completed),
+            cancel: std::mem::take(&mut guard.cancel),
+            ..Signals::default()
+        }
     }
 
     fn update(&self, update: impl FnOnce(&mut Signals)) {
@@ -827,6 +835,7 @@ impl Hub {
                 && value.changed_roots.is_empty()
                 && !value.reload
                 && !value.password_changed
+                && !value.maintenance
                 && !value.foreground_finished
                 && value.clipboard.is_none()
                 && !value.volumes_changed
@@ -978,6 +987,15 @@ fn scheduler_configuration_changed(previous: &Config, next: &Config) -> bool {
     previous != &normalized
 }
 
+fn watch_scan_options(config: &Config, has_roots: bool) -> io::Result<Option<NativeDirectoryScanOptions>> {
+    if has_roots {
+        // Main compiles ordinary rules even when every configured root is deep.
+        crate::pipeline::scan_options(config).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 // Parent notifications are shared; root identities are still checked by each
 // root observer when the fanout reaches the scheduler.
 struct ParentObserver {
@@ -1081,9 +1099,28 @@ struct Pending {
     recovery: Option<Arc<Recovery>>,
 }
 
+// Claimed siblings cannot be admitted while the owner runs. Transfer their old
+// queued observations into its completion, but leave changes observed during
+// ownership queued for the next generation. Their seed ownership moves with them.
+fn consume_claimed_pending(
+    pending: &mut HashMap<String, Pending>,
+    due: &mut BTreeMap<(Instant, String), ()>,
+    unpublished: &mut HashSet<String>,
+    groups: &HashMap<String, Arc<SourceGroup>>,
+    touched: &HashSet<String>,
+    inputs: &mut Vec<WatchCandidateRow>,
+) {
+    for path in groups.keys().filter(|path| !touched.contains(*path)) {
+        if let Some(queued) = pending.remove(path) {
+            due.remove(&(queued.due, path.clone()));
+            unpublished.remove(path);
+            inputs.push(queued.candidate);
+        }
+    }
+}
+
 // Keep the durable blocker and a generation already queued for regroup under
-// one current root. In particular, a retired batch root must not overwrite the
-// route chosen after a configuration reload.
+// the admitting root, retaining the promoted subtree's recovery scope.
 fn handoff_promoted_blocker(
     entry: &mut Arc<crate::watch_store::EntryRecord>,
     root_id: &str,
@@ -1236,10 +1273,6 @@ struct Completed {
     outputs: BTreeMap<String, String>,
 }
 
-fn output_cleanup_error(result: &io::Result<Outcome>) -> Option<&OutputCleanupError> {
-    result.as_ref().err()?.get_ref()?.downcast_ref()
-}
-
 #[derive(serde::Serialize)]
 struct SourceGroup {
     path: PathBuf,
@@ -1257,7 +1290,7 @@ struct Scheduler {
     engine: Arc<Engine>,
     journal: Arc<journal::Journal>,
     catalog: Arc<NativeWatchCatalog>,
-    options: NativeDirectoryScanOptions,
+    options: Option<NativeDirectoryScanOptions>,
     deep_options: NativeDirectoryScanOptions,
     passwords: Arc<BuiltinStore>,
     hub: Arc<Hub>,
@@ -1296,11 +1329,18 @@ impl Scheduler {
         let dir = state_dir(&cwd)?;
         let journal = Arc::new(journal::Journal::open(&dir)?);
         journal.set_retention(snapshot.config.watch.event_log_retention_days)?;
+        let maintenance_hub = Arc::downgrade(&hub);
+        journal.set_maintenance(Arc::new(move || {
+            if let Some(hub) = maintenance_hub.upgrade() {
+                hub.update(|signals| signals.maintenance = true);
+            }
+        }));
         let catalog = Arc::new(NativeWatchCatalog::new(
             journal.state(),
             Some(dir.to_string_lossy().into_owned()),
         ));
-        let options = crate::pipeline::scan_options(&snapshot.config)?;
+        // With no scheduler roots main never compiles scan rules. Reconcile
+        // the root policy before activating its scan options below.
         let deep_options =
             NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
         let passwords = BuiltinStore::shared(&cwd)?;
@@ -1314,7 +1354,7 @@ impl Scheduler {
             engine,
             journal,
             catalog,
-            options,
+            options: None,
             deep_options,
             passwords,
             hub,
@@ -1338,6 +1378,7 @@ impl Scheduler {
             _lease: lease,
         };
         scheduler.reconcile_roots()?;
+        scheduler.activate_scan_options()?;
         scheduler.retire_missing_entries(None, true)?;
         scheduler.retire_stale_promoted(None, true)?;
         scheduler.reconcile_shell();
@@ -1429,11 +1470,17 @@ impl Scheduler {
         let show_tray = self.tray_enabled && self.settings.watch.tray_enabled;
         if show_tray && self.tray.is_none() {
             let hub = Arc::clone(&self.hub);
+            let journal = Arc::downgrade(&self.journal);
             let tray =
                 super::tray::Tray::start(&self.cwd, self.settings.cli.language, move |action| {
                     match action {
                         super::tray::Action::Reload => hub.queue_reload(None),
                         super::tray::Action::Stop => hub.stop(),
+                    }
+                }, move |message, error| {
+                    if let Some(journal) = journal.upgrade() {
+                        journal.log(json!({"event":"tray_callback_error", "error":error.to_string(),
+                            "error_type":format!("{:?}", error.kind()), "message":message}));
                     }
                 });
             match tray {
@@ -1447,7 +1494,7 @@ impl Scheduler {
         } else if let Some(tray) = &self.tray {
             tray.set_language(self.settings.cli.language);
         }
-        if !self.roots.is_empty() && self.settings.watch.toast_enabled {
+        if self.options.is_some() && !self.roots.is_empty() && self.settings.watch.toast_enabled {
             if self.toast.is_none() {
                 let diagnostic = state_dir(&self.cwd).map(|dir| dir.join("toast-diagnostic.log"));
                 match diagnostic.and_then(|path| {
@@ -1468,7 +1515,7 @@ impl Scheduler {
         } else {
             self.toast.take();
         }
-        if self.roots.is_empty() {
+        if self.roots.is_empty() || self.options.is_none() {
             self.monitor.take();
             return;
         }
@@ -1579,6 +1626,7 @@ impl Scheduler {
                 })
             });
         if policy_changed {
+            self.drain_active(&mut Ok(0))?;
             let reroute = self
                 .pending
                 .iter()
@@ -1682,7 +1730,6 @@ impl Scheduler {
         let snapshot = config::reload_snapshot(&self.cwd)?;
         let config_changed = *self.settings != snapshot.config;
         let scheduler_changed = scheduler_configuration_changed(&self.settings, &snapshot.config);
-        let options = config_changed.then(|| crate::pipeline::scan_options(&snapshot.config)).transpose()?;
         let observers_changed = self.config_sources != snapshot.sources
             || self.config_observers.iter().any(|observer| observer.stopping.load(Ordering::Acquire));
         // Keep the previous subscriptions alive until apply succeeds. A failed
@@ -1690,6 +1737,9 @@ impl Scheduler {
         let observers = observers_changed.then(|| Self::observe_config(
             &self.cwd, &snapshot, &self.root_file, self.passwords.path(), &self.hub,
         )).transpose()?;
+        if scheduler_changed {
+            self.drain_active(&mut Ok(0))?;
+        }
         let roots_changed = match self.reconcile_roots() {
             Ok(changed) => changed,
             Err(error) => {
@@ -1700,30 +1750,34 @@ impl Scheduler {
                 return Err(error);
             }
         };
-        let previous = options.map(|options| (
-            std::mem::replace(&mut self.settings, Arc::new(snapshot.config)),
-            std::mem::replace(&mut self.options, options),
-        ));
+        let previous = config_changed.then(||
+            std::mem::replace(&mut self.settings, Arc::new(snapshot.config)));
+
         let apply = (|| {
+            if config_changed || roots_changed {
+                self.activate_scan_options()?;
+            }
             if config_changed {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
             }
             self.checkpoint_reload(scheduler_changed || roots_changed)
         })();
         if let Err(error) = apply {
-            if let Some((settings, options)) = previous {
+            if let Some(settings) = previous {
                 self.settings = settings;
-                self.options = options;
             }
             // Root edits are durable and are never rolled back. Recover
             // ordinary settings against the latest root file, like main.
             let rollback: io::Result<()> = (|| {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
                 let latest_roots_changed = self.reconcile_roots()?;
+                self.activate_scan_options()?;
                 self.checkpoint_reload(scheduler_changed || roots_changed || latest_roots_changed)
             })();
             if let Err(rollback_error) = rollback {
                 self.journal.log(json!({"event":"config_reload_rollback_failed", "error":rollback_error.to_string()}));
+                // Keep the service listening for a corrected configuration;
+                // no scheduler may admit work until its options activate.
             }
             // Shell state/priority were never published, but durable root
             // changes can still require stopping their root-bound resources.
@@ -1755,16 +1809,22 @@ impl Scheduler {
         }
     }
 
-    fn run(&mut self, once: bool) -> io::Result<i32> {
-        let mut result = self.run_inner(once);
-        // Like main's stop checkpoint, cover the final notification burst
-        // before closing the catalog. Do not admit additional requests.
-        if result.is_ok() {
-            if let Err(error) = self.checkpoint(&HashMap::new(), true, false) {
-                result = Err(error);
+    // Both shutdown and semantic reload finish submitted work and its root
+    // completion/report chain under the old policy. No admission occurs here.
+    fn drain_active(&mut self, result: &mut io::Result<i32>) -> io::Result<()> {
+        // Match main's stop boundary: checkpoint while directory observers are
+        // armed, then join producers before draining submitted requests.
+        if !self.root_observers.is_empty() || !self.parent_observers.is_empty() || self.monitor.is_some() {
+            if result.is_ok() {
+                if let Err(error) = self.checkpoint(&HashMap::new(), true, false) { *result = Err(error); }
             }
+            self.root_observers.clear();
+            self.parent_observers.clear();
+            self.monitor.take();
+            // A stopped monitor's burst belongs to the retired scheduler. A
+            // newly enabled monitor reads the current clipboard on startup.
+            self.hub.signals.lock().unwrap().clipboard = None;
         }
-        self.hub.stop();
         let mut cancellation_observed = false;
         let mut failure_observed = false;
         while !self.active.is_empty() {
@@ -1787,25 +1847,27 @@ impl Scheduler {
                 let _ = waiter.send(self.cancel_display_batch(&batch));
             }
             for root in signals.roots {
-                if let Err(error) = self.complete_root(root) { result = Err(error); }
+                if let Err(error) = self.complete_root(root) { *result = Err(error); }
             }
             for completed in signals.completed {
                 if result.is_err() {
                     self.abandon_completed(&completed);
                 } else if let Err(error) = self.complete(&completed) {
-                    result = Err(error);
+                    *result = Err(error);
                 }
             }
-            for waiter in signals.reload_waiters {
-                let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
-            }
-            for waiter in signals.once {
-                let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
-            }
-            for waiter in signals.rebuild {
-                let _ = waiter.send(Err(io::ErrorKind::Interrupted.into()));
-            }
         }
+        // A failed completion may leave durable recovery intent. Do not resume
+        // admission with the partially retired in-memory request indexes.
+        if result.is_err() { self.hub.stop(); }
+        result.as_ref().map(|_| ()).map_err(|error|
+            io::Error::new(error.kind(), error.to_string()))
+    }
+
+    fn run(&mut self, once: bool) -> io::Result<i32> {
+        let mut result = self.run_inner(once);
+        self.hub.stop();
+        let _ = self.drain_active(&mut result);
         let signals = self.hub.wait(None);
         drop(signals.cancel);
         for waiter in signals.reload_waiters {
@@ -1906,7 +1968,7 @@ impl Scheduler {
                 || !signals.once.is_empty()
             {
                 let all_roots = signals.volumes_changed || !signals.once.is_empty();
-                if all_roots || !signals.topology_roots.is_empty() {
+                if self.options.is_some() && (all_roots || !signals.topology_roots.is_empty()) {
                     self.rearm_root_observers((!all_roots).then_some(&signals.topology_roots));
                 }
                 let recovery = all_roots || !signals.topology_roots.is_empty()
@@ -1960,12 +2022,23 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    fn scan_options(&self, deep: bool) -> &NativeDirectoryScanOptions {
-        if deep {
-            &self.deep_options
-        } else {
-            &self.options
+    fn activate_scan_options(&mut self) -> io::Result<()> {
+        self.options = None;
+        match watch_scan_options(&self.settings, !self.roots.is_empty()) {
+            Ok(options) => { self.options = options; Ok(()) }
+            Err(error) => {
+                self.root_observers.clear();
+                self.parent_observers.clear();
+                self.monitor.take();
+                Err(error)
+            }
         }
+    }
+
+    fn scan_options(&self, deep: bool) -> io::Result<&NativeDirectoryScanOptions> {
+        let options = self.options.as_ref()
+            .ok_or_else(|| io::Error::other("Watch scheduler is not active"))?;
+        Ok(if deep { &self.deep_options } else { options })
     }
 
     fn retire_owned_outputs(&self, paths: Option<&[String]>) -> io::Result<()> {
@@ -1976,6 +2049,7 @@ impl Scheduler {
     }
 
     fn observe_file_changes(&mut self, changed: &HashMap<String, HashSet<PathBuf>>) -> io::Result<()> {
+        if self.options.is_none() { return Ok(()); }
         // Match main's ordinary file-event path: enqueue in memory without
         // refreshing the durable inventory or advancing its USN stamp. The
         // captured burst is reconciled once at admission/recovery instead.
@@ -2008,6 +2082,7 @@ impl Scheduler {
         all_roots: bool,
         startup: bool,
     ) -> io::Result<()> {
+        if self.options.is_none() { return Ok(()); }
         let selected = self
             .roots
             .iter()
@@ -2105,7 +2180,7 @@ impl Scheduler {
                 // Keep the conservative baseline when the catalog itself is
                 // missing or belongs to another root object. A trusted
                 // inventory can still reconcile arrivals after a USN reset.
-                let options = self.scan_options(root.deep);
+                let options = self.scan_options(root.deep)?;
                 let scan = if root.scanned && cached.is_some() {
                     options.catalog_refresh(&self.catalog, &scope, None)
                 } else {
@@ -2169,7 +2244,7 @@ impl Scheduler {
                     let recursive_departure =
                         missing && self.catalog.path_is_directory(&scope, path).unwrap_or(true);
                     if !has_covered_parent(&path_id, &covered) {
-                        let (failed, mut arrivals) = self.scan_options(root.deep).catalog_refresh(
+                        let (failed, mut arrivals) = self.scan_options(root.deep)?.catalog_refresh(
                             &self.catalog,
                             &scope,
                             Some(path),
@@ -3083,7 +3158,7 @@ impl Scheduler {
                 {
                     handoff.extend(crate::watch_store::NativeWatchOperations::checkpoint(
                         &path,
-                        &checkpoint.output().to_string_lossy(),
+                        &checkpoint.storage_key(),
                         Some(serde_json::to_value(checkpoint)?),
                     ));
                 }
@@ -3178,6 +3253,7 @@ fn recovery_output_matches(
 
 impl Scheduler {
     fn admission_available(&self) -> usize {
+        if self.options.is_none() { return 0; }
         // Match main's bounded request window. One caller thread owns each
         // batch, so the same window bounds parked OS threads. Keep batching:
         // a slow sibling must not reserve a slot for every completed input.
@@ -3509,10 +3585,9 @@ impl Scheduler {
                 };
                 let cancelled = worker_cancel.cancelled();
                 if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
-                    let cleanup = output_cleanup_error(&result);
                     let outputs = observer.outputs.lock().unwrap();
                     let groups = observer.groups.lock().unwrap();
-                    if result.is_err() && cleanup.is_none() {
+                    if result.is_err() {
                         let claimed = observer.claimed.lock().unwrap();
                         let mut reported = HashSet::new();
                         for (source_key, source) in &observer.owners {
@@ -3525,9 +3600,9 @@ impl Scheduler {
                         }
                     } else {
                         toast.record(
-                            cleanup.map_or(path.as_path(), |error| error.path.as_path()),
+                            path.as_path(),
                             &result,
-                            cancelled && cleanup.is_none(),
+                            cancelled,
                             |path| completion_owner(path, &outputs, &groups),
                         );
                     }
@@ -3648,11 +3723,13 @@ impl Scheduler {
             .chain(std::iter::once(key(&root.path))).collect();
         let mut inputs = Vec::new();
         let mut touched = HashSet::new();
+        for member in &members {
+            if active.touched.remove(member) { touched.insert(member.clone()); }
+        }
         let mut remaining = Vec::new();
         for input in std::mem::take(&mut active.inputs) {
             let id = watch_path_key(&input.path);
             if members.contains(&id) {
-                if active.touched.remove(&id) { touched.insert(id); }
                 inputs.push(input);
             } else { remaining.push(input); }
         }
@@ -3682,7 +3759,11 @@ impl Scheduler {
         }, completed).map(|_| ())
     }
 
-    fn apply_completion(&mut self, batch: &str, active: CompletionContext, mut completed: Completed) -> io::Result<Outcome> {
+    fn apply_completion(&mut self, batch: &str, mut active: CompletionContext, mut completed: Completed) -> io::Result<Outcome> {
+        consume_claimed_pending(
+            &mut self.pending, &mut self.due, &mut self.unpublished,
+            &active.groups, &active.touched, &mut active.inputs,
+        );
         let mut unfinished = HashSet::new();
         if completed.cancelled {
             let state = self.journal.state();
@@ -3706,7 +3787,7 @@ impl Scheduler {
             toast.finish(
                 &completed.result,
                 completed.cancelled,
-                !unfinished.is_empty() || output_cleanup_error(&completed.result).is_some(),
+                !unfinished.is_empty(),
                 |path| completion_owner(path, &completed.outputs, &groups),
             );
         }
@@ -3878,22 +3959,13 @@ impl Scheduler {
             );
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
             payload.insert("details".into(), json!({"promoted_nested_input":true}));
-            if let Some((_, scope)) = self.roots.get(&active.root) {
-                payload.insert("source_input_root".into(), json!(scope.root));
-            }
-            let Some((route_root, _)) = self.blocker_route(&entry) else {
-                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                    &candidate.path, None,
-                ));
-                continue;
-            };
-            let (root, scope) = &self.roots[&route_root];
-            // Root reload can transfer ownership to a different current root.
-            // Publish and persist under that route, never the retired batch root.
+            let route_root = &active.root;
+            let (root, scope) = &self.roots[route_root];
+            payload.insert("source_input_root".into(), json!(scope.root));
             if regroup {
                 for path in &group.members {
                     if scope.contains(path) && !self.catalog.is_owned(path) {
-                        self.scan_options(root.deep).catalog_update(
+                        self.scan_options(root.deep)?.catalog_update(
                             &self.catalog, scope, Some(path),
                         )?;
                     }
@@ -3906,7 +3978,7 @@ impl Scheduler {
                 .is_some_and(|previous| previous != current_passwords.scope_signature(&recovery.password_scope));
             let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
             let handed_off = pending.is_some();
-            handoff_promoted_blocker(&mut entry, &route_root, root,
+            handoff_promoted_blocker(&mut entry, route_root, root,
                 recovery, pending);
             if handed_off {
                 self.unpublished.insert(id.clone());
@@ -3923,7 +3995,7 @@ impl Scheduler {
             for checkpoint in promoted_checkpoints(&outcome.checkpoints, &archive.source_paths) {
                 operations.extend(crate::watch_store::NativeWatchOperations::checkpoint(
                     &candidate.path,
-                    &checkpoint.output().to_string_lossy(),
+                    &checkpoint.storage_key(),
                     Some(serde_json::to_value(checkpoint)?),
                 ));
             }
@@ -4007,12 +4079,6 @@ impl Scheduler {
                     entry
                 })
             };
-            if retryable && record.as_ref().is_some_and(|entry| self.blocker_route(entry).is_none()) {
-                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                    &candidate.path, None,
-                ));
-                continue;
-            }
             if let Some(record) = &record {
                 let path = Path::new(&candidate.path);
                 let directory = active.recovery.as_ref().map_or_else(
@@ -4124,7 +4190,7 @@ fn promoted_checkpoints<'a>(
     let direct = |checkpoint: &crate::pipeline::InputCheckpoint| {
         checkpoint.source_paths().any(|source| sources.contains(&key(source)))
     };
-    let roots = checkpoints.iter().filter(|checkpoint| direct(checkpoint))
+    let roots = checkpoints.iter().filter(|checkpoint| checkpoint.has_output() && direct(checkpoint))
         .map(|checkpoint| (key(checkpoint.output()), String::new())).collect::<BTreeMap<_, _>>();
     // Descendant receipts still refer to inputs inside the retained segment,
     // not to its moved carrier. Hand off that subtree before retiring its old
@@ -4140,9 +4206,8 @@ fn promoted_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailu
         .is_some_and(InputFailure::retryable)
 }
 
-// Completion and retry admission share the current Watch boundary. An old
-// request may finish after roots have changed, but cannot republish a blocker
-// that the current scheduler could never admit.
+// Completion and persisted retry admission share the Watch boundary. Keep
+// nested recovery scopes even when their source is an owned output subtree.
 fn route_blocker(
     entry: &crate::watch_store::EntryRecord,
     roots: &BTreeMap<String, (Root, NativeDiscoveryScope)>,
@@ -4549,7 +4614,7 @@ impl Observer for WatchObserver {
         self.journal.commit(true, |_| {
             Ok(crate::watch_store::NativeWatchOperations::checkpoint(
                 &owner,
-                &checkpoint.output().to_string_lossy(),
+                &checkpoint.storage_key(),
                 Some(serde_json::to_value(checkpoint)?),
             ))
         })
@@ -4623,6 +4688,10 @@ impl Observer for WatchObserver {
         Ok(())
     }
 
+    fn after_flatten(&self, output: &Path) -> io::Result<()> {
+        finish_flatten(&self.journal, &output.to_string_lossy())
+    }
+
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
         let Some(output) = &archive.output else {
             return Ok(());
@@ -4652,7 +4721,7 @@ impl Observer for WatchObserver {
         checkpoint: Option<&crate::pipeline::InputCheckpoint>,
     ) -> io::Result<()> {
         let Some(output) = &archive.output else {
-            return Ok(());
+            return checkpoint.map_or(Ok(()), |checkpoint| self.checkpoint(checkpoint));
         };
         let Some(owner) = self.owner(archive) else {
             return Ok(());
@@ -4675,7 +4744,7 @@ impl Observer for WatchObserver {
             if let Some(checkpoint) = checkpoint {
                 operations.extend(crate::watch_store::NativeWatchOperations::checkpoint(
                     &owner,
-                    &output,
+                    &checkpoint.storage_key(),
                     Some(serde_json::to_value(checkpoint)?),
                 ));
             }
@@ -4713,13 +4782,10 @@ fn prepare_flatten(
         let new = output_identity(&leaf.to_string_lossy())?;
         let root_paths = crate::path_keys::output_path_aliases(root)?;
         let work_paths = crate::path_keys::output_path_aliases(work)?;
-        let wrapper = (!owner.is_empty())
-            .then(|| crate::io::reader::capture_directory_identity(root))
-            .transpose()?;
         let mut values = vec![
             json!({"op":"runtime","key":format!("flatten|{}",key(root)),
                 "value":{"owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,"new_identity":new,
-                    "checkpoint_wrapper_identity":wrapper,"root_paths":root_paths,"work_paths":work_paths}}),
+                    "root_paths":root_paths,"work_paths":work_paths}}),
         ];
         if !owner.is_empty() {
             values.push(json!({"op":"checkpoint_output","owner":owner,"output":root}));
@@ -4794,21 +4860,16 @@ fn finish_flatten(journal: &journal::Journal, root: &str) -> io::Result<()> {
             let mut checkpoints = input_checkpoints(state, owner).peekable();
             if checkpoints.peek().is_some() {
                 let root = Path::new(root);
-                let identity = crate::io::reader::capture_directory_identity(root)?;
-                let wrapper =
-                    serde_json::from_value(record["checkpoint_wrapper_identity"].clone()).ok();
                 let mut moved = Vec::new();
                 for checkpoint in checkpoints {
                     let mut checkpoint = checkpoint?;
-                    let before = checkpoint.output().to_string_lossy().into_owned();
+                    let before = checkpoint.storage_key();
                     if checkpoint.rebase_flatten(
                         root,
                         Path::new(work),
                         Path::new(leaf),
-                        wrapper.as_ref(),
-                        &identity,
                     ) {
-                        let after = checkpoint.output().to_string_lossy();
+                        let after = checkpoint.storage_key();
                         if watch_path_key(&before) != watch_path_key(&after) {
                             operations
                                 .extend(NativeWatchOperations::checkpoint(owner, &before, None));
@@ -4839,7 +4900,9 @@ fn restore_checkpoints(
     // Reusing a receipt deliberately skips register_output's exclusive create.
     // Restore its routing separately, before the engine discovers children.
     for checkpoint in &checkpoints {
-        outputs.insert(key(checkpoint.output()), owner.to_owned());
+        if checkpoint.has_output() {
+            outputs.insert(key(checkpoint.output()), owner.to_owned());
+        }
     }
     if let Some(pending) = state.pending(owner) {
         // The enclosing output can differ from an individual logical input's
@@ -4946,7 +5009,7 @@ fn spawn_error_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::reader::{capture_directory_identity, capture_file_generation};
+    use crate::io::reader::capture_file_generation;
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
 
     #[test]
@@ -5312,11 +5375,14 @@ mod tests {
                 "schema_version":1,"carrier":source,
                 "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
                 "sources":[{"path":source,"generation":capture_file_generation(source).unwrap().persisted()}],
-                "output":{"path":output,"identity":capture_directory_identity(output).unwrap()},
+                "output":output,
                 "container":null,"files":1,"bytes":4,"encrypted":false,"discovery_source":"direct",
                 "children_complete":false,"remaining_depth":2,
-                "partial":partial.then(|| json!({"failure":{"kind":"damaged","message":"accepted recovery"},
-                    "complete_files":1,"retry_facts":{"logical_name":"nested","analysis":input.analysis}})),
+                "failure":partial.then(|| json!({
+                    "partial":true,"password_signature":null,
+                    "failure":{"kind":"damaged","message":"accepted recovery"},
+                    "complete_files":1,"retry_facts":{"logical_name":"nested",
+                        "analysis":input.analysis,"plan_signature":null}})),
             })).unwrap()
         };
         let checkpoints = vec![receipt(&carrier, &segment, false), receipt(&nested, &child_output, true),
@@ -5332,7 +5398,7 @@ mod tests {
                 )?;
                 for checkpoint in &checkpoints {
                     operations.extend(NativeWatchOperations::checkpoint(owner_text,
-                        &checkpoint.output().to_string_lossy(), Some(serde_json::to_value(checkpoint)?)));
+                        &checkpoint.storage_key(), Some(serde_json::to_value(checkpoint)?)));
                 }
                 Ok(operations)
             }).unwrap();
@@ -5349,7 +5415,7 @@ mod tests {
                 operations.put_entry(Arc::new(blocker));
                 for checkpoint in promoted_checkpoints(&checkpoints, &[carrier.clone()]) {
                     operations.extend(NativeWatchOperations::checkpoint(carrier_text,
-                        &checkpoint.output().to_string_lossy(), Some(serde_json::to_value(checkpoint)?)));
+                        &checkpoint.storage_key(), Some(serde_json::to_value(checkpoint)?)));
                 }
                 operations.extend(NativeWatchOperations::finish_pending(owner_text, None));
                 Ok(operations)
@@ -5361,7 +5427,11 @@ mod tests {
             assert!(input_checkpoints(journal.state(), owner_text).next().is_none());
             let retained = input_checkpoints(journal.state(), carrier_text).collect::<io::Result<Vec<_>>>().unwrap();
             assert_eq!(retained.len(), 2);
-            assert!(retained.iter().any(|checkpoint| checkpoint.entry() == nested));
+            let nested_receipt = retained.iter().find(|checkpoint| checkpoint.entry() == nested).unwrap();
+            let nested_receipt = serde_json::to_value(nested_receipt).unwrap();
+            assert_eq!(nested_receipt["failure"]["failure"]["kind"], "damaged");
+            assert_eq!(nested_receipt["failure"]["partial"], true);
+            assert_eq!(nested_receipt["failure"]["complete_files"], 1);
             assert!(!retained.iter().any(|checkpoint| checkpoint.output() == unrelated));
         }
         fs::remove_dir_all(root).unwrap();
@@ -5427,6 +5497,55 @@ mod tests {
         let hub = Hub::new();
         hub.cancel();
         assert!(hub.wait_drain(false).completed.is_empty());
+    }
+
+    #[test]
+    fn empty_watch_defers_rules_until_first_root_activation() {
+        let mut raw: Value = serde_json::from_str(include_str!("../../../../sunpack_advanced_config.json")).unwrap();
+        raw["filesystem"]["scan_filters_enabled"] = json!(true);
+        raw["filesystem"]["scan_filters"] = json!([{
+            "name": "blacklist", "enabled": true,
+            "full_names": [{"value": "[", "regex": true}]
+        }]);
+        let config = Config::parse(&raw).unwrap();
+        assert!(watch_scan_options(&config, false).unwrap().is_none());
+        // Root activation compiles the same ordinary rules for normal and
+        // all-deep configurations; removing the last root disables compilation.
+        assert!(watch_scan_options(&config, true).is_err());
+        assert!(watch_scan_options(&config, false).unwrap().is_none());
+        raw["filesystem"]["scan_filters"][0]["full_names"][0]["value"] = json!("valid");
+        assert!(watch_scan_options(&Config::parse(&raw).unwrap(), true).unwrap().is_some());
+    }
+
+    #[test]
+    fn policy_drain_preserves_next_generation_notifications_without_applying_passwords() {
+        let hub = Hub::new();
+        let (reload, reload_result) = mpsc::sync_channel(1);
+        let (once, once_result) = mpsc::sync_channel(1);
+        hub.queue_reload(Some(reload));
+        assert!(hub.queue_once(once));
+        hub.update(|signals| {
+            signals.root_changed("old-root", Some(vec![PathBuf::from("archive.zip")]));
+            signals.password_changed = true;
+            signals.clipboard = Some(vec!["password".into()]);
+        });
+        hub.batch_completed("old-request".into());
+        let drained = hub.wait_drain(false);
+        assert_eq!(drained.completed, ["old-request"]);
+        assert!(!drained.password_changed);
+        assert!(drained.clipboard.is_none());
+        assert!(!hub.stopped.load(Ordering::Acquire));
+        let pending = hub.wait(None);
+        assert!(pending.reload);
+        assert!(pending.password_changed);
+        assert_eq!(pending.clipboard.unwrap(), ["password"]);
+        assert!(pending.changed_roots.contains_key("old-root"));
+        assert!(reload_result.try_recv().is_err());
+        assert!(once_result.try_recv().is_err());
+        pending.reload_waiters.into_iter().next().unwrap().send(Ok(true)).unwrap();
+        pending.once.into_iter().next().unwrap().send(Ok(())).unwrap();
+        assert!(reload_result.recv().unwrap().unwrap());
+        once_result.recv().unwrap().unwrap();
     }
 
     #[test]
@@ -5505,6 +5624,44 @@ mod tests {
         });
         receive.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
         stop.join().unwrap();
+    }
+
+    #[test]
+    fn physical_completion_consumes_old_siblings_but_preserves_changed_generations() {
+        let group = Arc::new(SourceGroup { path: "split.001".into(), name: "split".into(),
+            multipart: true, members: vec!["split.001".into(), "split.002".into(), "split.003".into()] });
+        let groups: HashMap<_, _> = group.members.iter()
+            .map(|path| (watch_path_key(path), Arc::clone(&group))).collect();
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        let mut due = BTreeMap::new();
+        let mut unpublished = HashSet::new();
+        for (index, path) in group.members.iter().enumerate().skip(1) {
+            let id = watch_path_key(path);
+            let deadline = now + std::time::Duration::from_secs(index as u64);
+            pending.insert(id.clone(), Pending { root: "root".into(),
+                candidate: WatchCandidateRow { path: path.clone(), size: 42, mtime: 1.0,
+                    observation: crate::filesystem::WatchFileObservation {
+                        file_id: String::new(), change_usn: index as i64, change_reasons: 0,
+                        change_reasons_without_close: 0, change_reasons_known: false,
+                        change_reason_error: String::new(),
+                    } },
+                quiet: quiet::Quiet::default(), due: deadline, force: false, recovery: None,
+            });
+            due.insert((deadline, id.clone()), ());
+            unpublished.insert(id);
+        }
+        let changed = watch_path_key("split.003");
+        let mut inputs = Vec::new();
+        consume_claimed_pending(&mut pending, &mut due, &mut unpublished, &groups,
+            &HashSet::from([changed.clone()]), &mut inputs);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].path, "split.002");
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&changed));
+        assert_eq!(unpublished, HashSet::from([changed.clone()]));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due.keys().next().unwrap().1, changed);
     }
 
     #[test]
@@ -5678,8 +5835,8 @@ mod tests {
                     "schema_version":1,"carrier":source,
                     "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
                     "sources":[{"path":source,"generation":capture_file_generation(&source)?.persisted()}],
-                    "output":{"path":output,"identity":capture_directory_identity(&output)?},
-                    "container":{"path":container,"identity":capture_directory_identity(&container)?},
+                    "output":output,
+                    "container":container,
                     "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",
                     "children_complete":false,"remaining_depth":2,
                 }))));
@@ -5818,8 +5975,8 @@ mod tests {
                         "schema_version":1,"carrier":source,
                         "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
                         "sources":[{"path":source,"generation":capture_file_generation(source)?.persisted()}],
-                        "output":{"path":output,"identity":capture_directory_identity(output)?},
-                        "container":{"path":work,"identity":capture_directory_identity(&work)?},
+                        "output":output,
+                        "container":work,
                         "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",
                         "children_complete":true,"remaining_depth":1,
                     });
@@ -5867,11 +6024,9 @@ mod tests {
                 .iter()
                 .any(|checkpoint| checkpoint.entry() == root.join("nested.zip")
                     && checkpoint.output() == root.join("nested")));
-            let identity =
-                serde_json::to_value(capture_directory_identity(&root).unwrap()).unwrap();
             for checkpoint in checkpoints {
                 let receipt = serde_json::to_value(checkpoint).unwrap();
-                assert_eq!(receipt["container"]["identity"], identity);
+                assert_eq!(receipt["container"], json!(root));
             }
         }
         fs::remove_dir(alias).unwrap();

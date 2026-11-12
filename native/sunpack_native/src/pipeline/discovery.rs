@@ -30,6 +30,8 @@ pub(super) struct LogicalInput {
 
 pub(super) struct Task {
     pub inputs: Vec<LogicalInput>,
+    // Physical ownership is independent of logical execution order.
+    pub primary: Option<Box<ArchiveInput>>,
     pub owned_paths: Vec<String>,
     pub source: DiscoverySource,
     pub retry: Option<Arc<RetryScope>>,
@@ -48,6 +50,7 @@ impl Task {
                 password: None,
                 failure,
             }],
+            primary: None,
             owned_paths,
             source,
             retry: None,
@@ -55,7 +58,7 @@ impl Task {
     }
 
     pub(super) fn entry(&self) -> &ArchiveInput {
-        &self.inputs[0].input
+        self.primary.as_deref().unwrap_or(&self.inputs[0].input)
     }
 }
 
@@ -117,8 +120,8 @@ pub(crate) fn scan_options(config: &Config) -> io::Result<NativeDirectoryScanOpt
             .filter(|filter| filter.enabled)
         {
             match &filter.kind {
-                ScanFilterKind::Blacklist(rule) => blacklist.push(rule.compiled()),
-                ScanFilterKind::Whitelist(rule) => whitelist.push(rule.compiled()),
+                ScanFilterKind::Blacklist(rule) => blacklist.push(rule.compile()?),
+                ScanFilterKind::Whitelist(rule) => whitelist.push(rule.compile()?),
                 ScanFilterKind::SizeRange(range) => sizes.push(bounds(range)),
                 ScanFilterKind::MtimeRange(range) => mtimes.push(bounds(range)),
                 ScanFilterKind::Unknown(name) => {
@@ -981,13 +984,24 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>) {
             }
             std::collections::btree_map::Entry::Occupied(mut slot) => {
                 let combined = slot.get_mut();
-                combined.source = DiscoverySource::Embedded;
+                if combined.primary.is_none() {
+                    combined.primary = Some(Box::new(combined.entry().clone()));
+                }
+                if task.source == DiscoverySource::Relations
+                    && combined.source != DiscoverySource::Relations
+                {
+                    combined.primary = Some(Box::new(task.entry().clone()));
+                    combined.source = DiscoverySource::Relations;
+                }
                 combined.inputs.extend(task.inputs);
                 combined.owned_paths.extend(task.owned_paths);
             }
         }
     }
     tasks.extend(combined.into_values().map(|mut task| {
+        if task.primary.is_some() {
+            task.source = DiscoverySource::Embedded;
+        }
         let mut seen = HashSet::new();
         task.owned_paths.retain(|path| seen.insert(path_key(path)));
         task.inputs.sort_by_cached_key(|logical| {
@@ -1029,4 +1043,36 @@ fn root(parents: &mut [usize], mut index: usize) -> usize {
         index = parents[index];
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_logical_order_does_not_replace_relation_primary() {
+        // The continuation sorts before the RAR head and also owns a ZIP.
+        // Input ordering must not rename the physical owner/container.
+        for relation_first in [false, true] {
+            let paths = vec!["sample.zzz".to_owned(), "sample.aaa.bin".to_owned()];
+            let relation = Task::single(
+                ArchiveInput::file(paths[0].clone(), "rar".into(), "sample".into()),
+                paths.clone(), DiscoverySource::Relations, None,
+            );
+            let embedded = Task::single(
+                ArchiveInput::file(paths[1].clone(), "zip".into(), "sample.aaa".into()),
+                vec![paths[1].clone()], DiscoverySource::Embedded, None,
+            );
+            let mut tasks = if relation_first { vec![relation, embedded] }
+                else { vec![embedded, relation] };
+            merge_shared_inputs(&mut tasks);
+            assert_eq!(tasks.len(), 1);
+            let task = &tasks[0];
+            assert_eq!(task.entry().entry_path, paths[0]);
+            assert_eq!(task.entry().logical_name, "sample");
+            assert_eq!(task.inputs[0].input.entry_path, paths[1]);
+            assert_eq!(task.source, DiscoverySource::Embedded);
+            assert_eq!(task.owned_paths.len(), 2);
+        }
+    }
 }

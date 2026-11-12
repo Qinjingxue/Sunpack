@@ -134,14 +134,9 @@ pub enum ScanFilterKind {
     Unknown(Box<str>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct PathRule {
-    raw: Arc<Value>,
-    compiled: Option<NativePathRule>,
-}
-
-impl PartialEq for PathRule {
-    fn eq(&self, other: &Self) -> bool { self.raw == other.raw }
+    entries: [Vec<RuleEntry>; 4],
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -656,17 +651,15 @@ fn check_section(value: &Value, section: &str, strict: bool) -> io::Result<()> {
 }
 
 impl Config {
-    /// Explicit validation includes disabled expressions; runtime parsing does not.
-    pub fn validate_scan_filters(value: &Value) -> io::Result<()> {
-        let filters = field(value, &["filesystem", "scan_filters"]).as_array()
-            .ok_or_else(|| invalid("filesystem.scan_filters must be a list"))?;
-        for (index, filter) in filters.iter().enumerate() {
-            ScanFilter::parse(index, filter, true)?;
-            if matches!(filter["name"].as_str().map(str::trim), Some("blacklist" | "whitelist")) {
-                PathRule::parse(filter)?;
-            }
-        }
-        Ok(())
+    /// Validate every saved path rule once, including disabled rules.
+    pub fn validate_scan_filters(&self) -> Vec<String> {
+        self.filesystem.scan_filters.iter().enumerate().filter_map(|(index, filter)| {
+            let rule = match &filter.kind {
+                ScanFilterKind::Blacklist(rule) | ScanFilterKind::Whitelist(rule) => rule,
+                _ => return None,
+            };
+            rule.compile().err().map(|error| format!("filesystem.scan_filters[{index}]: {error}"))
+        }).collect()
     }
 
     pub fn parse(value: &Value) -> io::Result<Self> {
@@ -761,7 +754,7 @@ impl Config {
         let scan_filters = filters
             .iter()
             .enumerate()
-            .map(|(index, filter)| ScanFilter::parse(index, filter, scan_filters_enabled))
+            .map(|(index, filter)| ScanFilter::parse(index, filter))
             .collect::<io::Result<Arc<[_]>>>()?;
         let modules = field(value, &["analysis", "modules"])
             .as_array()
@@ -959,10 +952,6 @@ fn check_keys(value: &Map<String, Value>, allowed: &[&str], label: &str) -> io::
 
 impl PathRule {
     pub fn parse(value: &Value) -> io::Result<Self> {
-        Self::parse_for_runtime(value, true)
-    }
-
-    fn parse_for_runtime(value: &Value, compile: bool) -> io::Result<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid("path rule must be an object"))?;
@@ -989,32 +978,17 @@ impl PathRule {
             }
             Ok(entries)
         };
-        // Disabled rules still undergo structural validation. Retain their raw
-        // form for reload equality and explicit config validation, but do not
-        // compile expressions that cannot participate in this runtime scan.
-        let (paths, files, extensions, full_names) =
-            (parse("paths")?, parse("files")?, parse("extensions")?, parse("full_names")?);
-        let compiled = if compile {
-            Some(NativePathRule::compile(paths, files, extensions, full_names)?)
-        } else {
-            None
-        };
-        let mut raw = object.clone();
-        raw.remove("name");
-        raw.remove("enabled");
-        for key in ["paths", "files", "extensions", "full_names"] {
-            raw.entry(key.to_owned()).or_insert_with(|| Value::Array(Vec::new()));
-        }
-        Ok(Self { raw: Arc::new(Value::Object(raw)), compiled })
+        Ok(Self { entries: [parse("paths")?, parse("files")?, parse("extensions")?, parse("full_names")?] })
     }
 
-    pub(crate) fn compiled(&self) -> NativePathRule {
-        self.compiled.as_ref().expect("enabled runtime rule is compiled").clone()
+    pub(crate) fn compile(&self) -> io::Result<NativePathRule> {
+        let [paths, files, extensions, full_names] = self.entries.clone();
+        NativePathRule::compile(paths, files, extensions, full_names)
     }
 }
 
 impl ScanFilter {
-    fn parse(index: usize, value: &Value, globally_enabled: bool) -> io::Result<Self> {
+    fn parse(index: usize, value: &Value) -> io::Result<Self> {
         let object = value.as_object().ok_or_else(|| {
             invalid(format!(
                 "filesystem.scan_filters[{index}] must be an object"
@@ -1039,12 +1013,12 @@ impl ScanFilter {
         };
         let kind = match name {
             "blacklist" => {
-                ScanFilterKind::Blacklist(PathRule::parse_for_runtime(value, enabled && globally_enabled).map_err(|error| {
+                ScanFilterKind::Blacklist(PathRule::parse(value).map_err(|error| {
                     invalid(format!("filesystem.scan_filters[{index}]: {error}"))
                 })?)
             }
             "whitelist" => {
-                ScanFilterKind::Whitelist(PathRule::parse_for_runtime(value, enabled && globally_enabled).map_err(|error| {
+                ScanFilterKind::Whitelist(PathRule::parse(value).map_err(|error| {
                     invalid(format!("filesystem.scan_filters[{index}]: {error}"))
                 })?)
             }
@@ -1173,10 +1147,13 @@ mod filter_runtime_tests {
 
     #[test]
     fn normalized_configuration_equality_ignores_syntax_but_not_runtime_changes() {
-        let before = Config::parse(&serde_json::json!({})).unwrap();
-        let same = Config::parse(&serde_json::json!({"runtime":{"process_mode":"NORMAL"}})).unwrap();
+        let mut raw = defaults().clone();
+        let before = Config::parse(&raw).unwrap();
+        raw["runtime"]["process_mode"] = Value::String("NORMAL".into());
+        let same = Config::parse(&raw).unwrap();
         assert!(before == same);
-        let changed = Config::parse(&serde_json::json!({"runtime":{"process_mode":"background"}})).unwrap();
+        raw["runtime"]["process_mode"] = Value::String("background".into());
+        let changed = Config::parse(&raw).unwrap();
         assert!(before != changed);
         let omitted_rules = PathRule::parse(&serde_json::json!({"name":"blacklist","enabled":true})).unwrap();
         let empty_rules = PathRule::parse(&serde_json::json!({"paths":[],"files":[],"extensions":[],"full_names":[]})).unwrap();
@@ -1191,21 +1168,25 @@ mod filter_runtime_tests {
             "full_names": [{"value": "[", "regex": true}]
         }]);
         assert!(Config::parse(&raw).is_ok());
-        assert!(Config::validate_scan_filters(&raw).is_err());
+        assert!(!Config::parse(&raw).unwrap().validate_scan_filters().is_empty());
         raw["filesystem"]["scan_filters"][0]["name"] = Value::String(" blacklist ".into());
         assert!(Config::parse(&raw).is_ok());
-        assert!(Config::validate_scan_filters(&raw).is_err());
+        assert!(!Config::parse(&raw).unwrap().validate_scan_filters().is_empty());
         raw["filesystem"]["scan_filters"][0]["full_names"][0]["value"] = Value::String(String::new());
         assert!(Config::parse(&raw).is_err());
         raw["filesystem"]["scan_filters"][0]["full_names"][0]["value"] = Value::String("[".into());
         raw["filesystem"]["scan_filters"][0]["enabled"] = Value::Bool(true);
-        assert!(Config::parse(&raw).is_err());
+        let config = Config::parse(&raw).unwrap();
+        assert!(crate::pipeline::scan_options(&config).is_err());
+        let second = raw["filesystem"]["scan_filters"][0].clone();
+        raw["filesystem"]["scan_filters"].as_array_mut().unwrap().push(second);
+        assert_eq!(Config::parse(&raw).unwrap().validate_scan_filters().len(), 2);
         raw["filesystem"]["scan_filters_enabled"] = Value::Bool(false);
-        assert!(Config::parse(&raw).is_ok());
+        assert!(crate::pipeline::scan_options(&Config::parse(&raw).unwrap()).is_ok());
         raw["filesystem"]["scan_filters"][0]["full_names"][0]["regex"] = Value::String("bad".into());
         assert!(Config::parse(&raw).is_err());
-        let a = PathRule::parse_for_runtime(&serde_json::json!({"name":"blacklist"}), false).unwrap();
-        let b = PathRule::parse_for_runtime(&serde_json::json!({"name":"whitelist", "paths":[]}), false).unwrap();
+        let a = PathRule::parse(&serde_json::json!({"name":"blacklist"})).unwrap();
+        let b = PathRule::parse(&serde_json::json!({"name":"whitelist", "paths":[]})).unwrap();
         assert!(a == b);
     }
 }

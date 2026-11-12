@@ -218,6 +218,15 @@ impl<'a> CandidateSet<'a> {
         }
     }
 
+    pub(super) fn signature(&self, path: &str) -> String {
+        let mut hash = crate::fast_hash_core::Hash128::new();
+        for password in self.configured(path) {
+            hash.update(&(password.len() as u64).to_le_bytes());
+            hash.update(password.as_bytes());
+        }
+        hash.hexdigest()
+    }
+
     fn configured<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
         let scope = self
             .inherited_scope

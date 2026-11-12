@@ -59,6 +59,7 @@ impl Tray {
         cwd: &Path,
         language: Language,
         notify: impl Fn(Action) + Send + 'static,
+        report_error: impl Fn(u32, &io::Error) + Send + 'static,
     ) -> io::Result<Self> {
         let stop = Arc::new(windows::Event::new(true)?);
         let event = stop.clone();
@@ -70,7 +71,7 @@ impl Tray {
             .name("sunpack-tray".into())
             .spawn(move || {
                 let mut ready = Some(ready);
-                let result = run_tray(cwd, language, Box::new(notify), &event, &mut ready);
+                let result = run_tray(cwd, language, Box::new(notify), Box::new(report_error), &event, &mut ready);
                 if let Some(ready) = ready {
                     let error = result.as_ref().err().map_or_else(
                         || io::Error::other("Tray exited before startup"),
@@ -122,6 +123,7 @@ struct Context {
     cwd: PathBuf,
     chinese: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
+    report_error: Box<dyn Fn(u32, &io::Error) + Send>,
     taskbar_created: u32,
     icon_registered: Cell<bool>,
 }
@@ -130,6 +132,7 @@ fn run_tray(
     cwd: PathBuf,
     chinese: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
+    report_error: Box<dyn Fn(u32, &io::Error) + Send>,
     stop: &windows::Event,
     ready: &mut Option<mpsc::SyncSender<io::Result<usize>>>,
 ) -> io::Result<()> {
@@ -145,6 +148,7 @@ fn run_tray(
         cwd,
         chinese,
         notify,
+        report_error,
         taskbar_created,
         icon_registered: Cell::new(false),
     };
@@ -395,7 +399,7 @@ unsafe extern "system" fn window_proc(
             _ => return unsafe { DefWindowProcW(window, message, wparam, lparam) },
         };
         if let Err(error) = result {
-            eprintln!("SunPack tray: {error}");
+            (context.report_error)(message, &error);
         }
         return 0;
     }

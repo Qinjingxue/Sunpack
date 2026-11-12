@@ -1,5 +1,4 @@
 import json
-import shutil
 import zipfile
 
 import pytest
@@ -59,8 +58,9 @@ def test_unknown_active_scan_filter_does_not_widen_discovery(package, tmp_path):
     with zipfile.ZipFile(archive, "w") as payload:
         payload.writestr("member.txt", "payload")
 
-    validation = package.json("config", "validate", code=2)
-    assert "unrecognized_filter" in str(validation["errors"])
+    # main's explicit validator compiles path rules only; unknown filters fail
+    # when actually selected by discovery, not during configuration inspection.
+    assert package.json("config", "validate")["items"][0]["ok"]
     result = package.run("extract", source, "--json")
     assert result.returncode != 0
     assert "unrecognized_filter" in result.stdout + result.stderr
@@ -86,12 +86,56 @@ def test_unreadable_simple_config_cannot_fall_back_to_advanced_config(package):
     assert package.json("config", "validate", code=2)["errors"]
 
 
-def test_password_file_cannot_authenticate_a_truncated_candidate(package, repo_root, tmp_path):
-    encrypted = tmp_path / "cipher.enc"
-    shutil.copyfile(repo_root / "tests" / "data" / "enc_parallel" / "algorithm_0.enc", encrypted)
+def test_password_text_sources_preserve_nul_candidates(package, tmp_path):
     passwords = tmp_path / "passwords.txt"
-    passwords.write_bytes(b"sunpack-test\x00different\n")
+    passwords.write_bytes(b"before\nbad\x00candidate\nafter\n")
+    result = package.json("passwords", "--no-bpw", "-p", "good", "-P", passwords)
+    assert result["items"][0]["combined_passwords"] == [
+        "good", "before", "bad\x00candidate", "after",
+    ]
+    interactive = package.run("passwords", "--no-bpw", "-a", input="bad\x00candidate\n\n")
+    assert interactive.returncode == 0, interactive.stderr
+    assert "bad\x00candidate" in interactive.stdout
 
-    result = package.json("extract", "--no-bpw", "--pw-file", passwords, encrypted, code=2)
-    assert "NUL" in str(result["errors"])
-    assert not (tmp_path / "cipher").exists()
+
+def test_enabled_invalid_regex_only_blocks_filtered_scans_and_reports_all_rules(package, tmp_path):
+    package.configure(filesystem={"scan_filters": [
+        {"name": name, "enabled": enabled,
+         "full_names": [{"value": "[", "regex": True}]}
+        for name, enabled in [("blacklist", True), ("whitelist", False)]
+    ]})
+    assert package.json("config", "show")["items"]
+    assert package.json("passwords", "--no-bpw", "-p", "good")["items"][0]["combined_passwords"] == ["good"]
+    validation = package.json("config", "validate", code=2)
+    errors = validation["items"][0]["errors"]
+    assert len(errors) == 2
+    assert all(f"filesystem.scan_filters[{index}]" in error for index, error in enumerate(errors))
+    source = tmp_path / "source"
+    source.mkdir()
+    with zipfile.ZipFile(source / "input.zip", "w") as payload:
+        payload.writestr("member.txt", "payload")
+    assert package.json("scan", "-d", source)["summary"]["archive_count"] == 1
+    result = package.run("scan", source, "--json")
+    assert result.returncode != 0
+
+
+def test_deep_extract_defers_bad_filters_until_recursive_output_scan(package, tmp_path):
+    package.configure(filesystem={"scan_filters": [{
+        "name": "blacklist", "enabled": True,
+        "full_names": [{"value": "[", "regex": True}],
+    }]})
+    # Neither an empty initial scan nor a first-level failure reaches normal
+    # recursive discovery. Both must remain independent of scan-rule syntax.
+    source = tmp_path / "empty"
+    source.mkdir()
+    empty = package.json("extract", "-d", "-r", "1", source)
+    assert not empty["errors"]
+    broken = source / "broken.zip"
+    broken.write_bytes(b"PK\x03\x04broken")
+    failed = package.run("extract", "-d", "-r", "1", source, "--json")
+    assert "regex" not in failed.stdout + failed.stderr
+    with zipfile.ZipFile(source / "valid.zip", "w") as payload:
+        payload.writestr("member.txt", "payload")
+    recursive = package.run("extract", "-d", "-r", "1", source, "--json")
+    assert recursive.returncode != 0
+    assert "regex" in recursive.stdout + recursive.stderr

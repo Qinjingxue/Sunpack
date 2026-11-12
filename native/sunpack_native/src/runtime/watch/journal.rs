@@ -10,7 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 const CHECKPOINT_RECORDS: u64 = 8192;
@@ -24,6 +25,7 @@ struct Frontier {
     bytes: u64,
     fault: Option<String>,
     checkpoint_error: Option<String>,
+    retirement: Option<u64>,
 }
 
 impl Frontier {
@@ -33,7 +35,7 @@ impl Frontier {
 }
 
 enum CheckpointResult {
-    Published,
+    Published { retirement: Option<u64> },
     SnapshotFailed(io::Error),
 }
 
@@ -41,6 +43,7 @@ struct Checkpoint {
     job: JoinHandle<io::Result<CheckpointResult>>,
     records: u64,
     bytes: u64,
+    ready: Arc<AtomicBool>,
 }
 
 pub(super) struct Journal {
@@ -48,6 +51,7 @@ pub(super) struct Journal {
     log: NativeEventLog,
     frontier: Mutex<Frontier>,
     checkpoint: Mutex<Option<Checkpoint>>,
+    maintenance: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     snapshot: PathBuf,
     stream_id: String,
     _stream: NativeJournalStream,
@@ -78,8 +82,10 @@ impl Journal {
             bytes: 0,
             fault: None,
             checkpoint_error: None,
+            retirement: None,
         };
         let mut tail = None;
+        let mut retirement_boundary = checkpoint;
         for (start, path) in segments(dir)? {
             let replay = state.replay_segment(
                 path.to_string_lossy().into_owned(),
@@ -87,6 +93,7 @@ impl Journal {
                 frontier.seq + 1,
             )?;
             if replay.records != 0 {
+                retirement_boundary = retirement_boundary.min(start.saturating_sub(1));
                 frontier.seq = replay.applied_seq;
                 frontier.records += replay.records;
                 frontier.bytes += replay.bytes;
@@ -102,6 +109,9 @@ impl Journal {
                 frontier.segment = start;
             }
         }
+        if retire_segments(dir, retirement_boundary) {
+            frontier.retirement = Some(retirement_boundary);
+        }
         let stream_id = key(&snapshot);
         let stream = watch_journal_open(stream_id.clone())?;
         watch_journal_seed(&stream_id, frontier.seq)?;
@@ -113,11 +123,16 @@ impl Journal {
             log,
             frontier: Mutex::new(frontier),
             checkpoint: Mutex::default(),
+            maintenance: Mutex::default(),
             snapshot,
             stream_id,
             _stream: stream,
             _lock: lock,
         })
+    }
+
+    pub(super) fn set_maintenance(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        *self.maintenance.lock().unwrap() = Some(notify);
     }
 
     pub(super) fn state(&self) -> &NativeWatchState {
@@ -223,7 +238,7 @@ impl Journal {
 
     pub(super) fn compact(&self) -> io::Result<()> {
         let mut active = self.checkpoint.lock().unwrap();
-        if active.as_ref().is_some_and(|checkpoint| !checkpoint.job.is_finished()) {
+        if active.as_ref().is_some_and(|checkpoint| !checkpoint.ready.load(Ordering::Acquire) && !checkpoint.job.is_finished()) {
             return Ok(());
         }
         self.harvest_checkpoint(active.take())?;
@@ -231,6 +246,16 @@ impl Journal {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
             if !frontier.needs_checkpoint() {
+                if let Some(boundary) = frontier.retirement {
+                    let dir = self.snapshot.parent().unwrap().to_owned();
+                    let ready = Arc::new(AtomicBool::new(false));
+                    let job = thread::Builder::new().name("sunpack-watch-retirement".into())
+                        .stack_size(512 * 1024)
+                        .spawn(move || Ok(CheckpointResult::Published {
+                            retirement: retire_segments(&dir, boundary).then_some(boundary),
+                        }))?;
+                    *active = Some(Checkpoint { job, records: 0, bytes: 0, ready });
+                }
                 return Ok(());
             }
             let segment = frontier.segment;
@@ -247,6 +272,9 @@ impl Journal {
             (checkpoint, seal, frontier.seq, frontier.records, frontier.bytes)
         };
         let snapshot = self.snapshot.clone();
+        let notify = self.maintenance.lock().unwrap().clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&ready);
         // The append stream already seals the captured prefix in sequence.
         // Leave serialization and disk I/O off the Watch and extraction paths.
         let job = thread::Builder::new()
@@ -267,17 +295,17 @@ impl Journal {
                 if let Err(error) = publication {
                     return Ok(CheckpointResult::SnapshotFailed(error));
                 }
-                // Publication is durable. A directory enumeration/deletion
-                // failure leaves redundant WAL but cannot invalidate the state.
-                if let Ok(paths) = segments(dir) {
-                    for (_, path) in paths.into_iter().take_while(|(start, _)| *start <= boundary) {
-                        let _ = fs::remove_file(path);
-                    }
+                let retirement = retire_segments(dir, boundary).then_some(boundary);
+                // Make the result harvestable before waking idle maintenance:
+                // the callback can run before JoinHandle::is_finished flips.
+                completed.store(true, Ordering::Release);
+                if retirement.is_some() {
+                    if let Some(notify) = notify { notify(); }
                 }
-                Ok(CheckpointResult::Published)
+                Ok(CheckpointResult::Published { retirement })
             });
         match job {
-            Ok(job) => *active = Some(Checkpoint { job, records, bytes }),
+            Ok(job) => *active = Some(Checkpoint { job, records, bytes, ready }),
             Err(error) => self.record_checkpoint_error(error)?,
         }
         Ok(())
@@ -291,13 +319,14 @@ impl Journal {
     fn harvest_checkpoint(&self, checkpoint: Option<Checkpoint>) -> io::Result<()> {
         let Some(checkpoint) = checkpoint else { return Ok(()); };
         match join_checkpoint(checkpoint.job) {
-            Ok(CheckpointResult::Published) => {
+            Ok(CheckpointResult::Published { retirement }) => {
                 let mut frontier = self.frontier.lock().unwrap();
                 frontier.records = frontier.records.saturating_sub(checkpoint.records);
                 // A late append acknowledgement may conservatively retain a
                 // few already checkpointed bytes. Never undercount live WAL.
                 frontier.bytes = frontier.bytes.saturating_sub(checkpoint.bytes);
                 frontier.checkpoint_error = None;
+                frontier.retirement = retirement;
                 ensure_healthy(&frontier)
             }
             Ok(CheckpointResult::SnapshotFailed(error)) => self.record_checkpoint_error(error),
@@ -344,6 +373,19 @@ fn ensure_healthy(frontier: &Frontier) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+// A published snapshot covers this prefix. Failure only leaves redundant WAL;
+// retry on an existing idle maintenance or the next open, never on a timer.
+fn retire_segments(dir: &Path, boundary: u64) -> bool {
+    let Ok(paths) = segments(dir) else { return true; };
+    let mut pending = false;
+    for (_, path) in paths.into_iter().take_while(|(start, _)| *start <= boundary) {
+        if let Err(error) = fs::remove_file(path) {
+            pending |= error.kind() != io::ErrorKind::NotFound;
+        }
+    }
+    pending
 }
 
 fn segment_path(dir: &Path, start: u64) -> PathBuf {
@@ -418,10 +460,56 @@ mod tests {
         }
         // Snapshot failures are recoverable; a WAL seal error still poisons
         // persistence and must prevent further mutations.
-        let failed = Checkpoint { records: 0, bytes: 0,
+        let failed = Checkpoint { records: 0, bytes: 0, ready: Arc::new(AtomicBool::new(true)),
             job: thread::spawn(|| Err(io::Error::other("WAL seal failed"))) };
         assert!(journal.harvest_checkpoint(Some(failed)).is_err());
         assert!(journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(4, "four".into()))).is_err());
+        drop(journal);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn retirement_retries_without_republishing_or_polling_and_on_open() {
+        use std::sync::atomic::AtomicUsize;
+        let marker = crate::test_support::temp_file("retirement_retry", b"");
+        let dir = marker.with_extension("state");
+        let journal = Journal::open(&dir).unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notified = Arc::clone(&notifications);
+        journal.set_maintenance(Arc::new(move || { notified.fetch_add(1, Ordering::Relaxed); }));
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(1, "one".into()))).unwrap();
+        let wal = segment_path(&dir, 1);
+        let reader = OpenOptions::new().read(true).share_mode(3).open(&wal).unwrap();
+        journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+        journal.compact().unwrap();
+        journal.wait_for_checkpoint().unwrap();
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert_eq!(journal.frontier.lock().unwrap().retirement, Some(1));
+        let snapshot = fs::read(dir.join("state.snapshot")).unwrap();
+        // The idle retry cannot schedule another idle retry while still locked.
+        journal.compact().unwrap();
+        journal.wait_for_checkpoint().unwrap();
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        drop(reader);
+        journal.compact().unwrap();
+        journal.wait_for_checkpoint().unwrap();
+        assert!(!wal.exists());
+        assert!(journal.frontier.lock().unwrap().retirement.is_none());
+        assert_eq!(fs::read(dir.join("state.snapshot")).unwrap(), snapshot);
+        // Leave another covered segment locked through shutdown. Opening the
+        // store after the lock is gone must retire it without another append.
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
+        let wal = segment_path(&dir, 2);
+        let reader = OpenOptions::new().read(true).share_mode(3).open(&wal).unwrap();
+        journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+        journal.compact().unwrap();
+        journal.wait_for_checkpoint().unwrap();
+        drop(journal);
+        drop(reader);
+        let journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.state().password_generation(), 2);
+        assert!(!wal.exists());
         drop(journal);
         fs::remove_dir_all(dir).unwrap();
         fs::remove_file(marker).unwrap();

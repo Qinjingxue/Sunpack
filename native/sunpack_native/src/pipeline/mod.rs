@@ -310,24 +310,6 @@ impl std::error::Error for OutputCreateError {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct OutputCleanupError {
-    pub path: PathBuf,
-    pub error: io::Error,
-}
-
-impl std::fmt::Display for OutputCleanupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.path.display(), self.error)
-    }
-}
-
-impl std::error::Error for OutputCleanupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupStatus {
@@ -615,6 +597,10 @@ pub(crate) trait Observer: Sync {
     }
 
     fn before_flatten(&self, _output: &Path, _work: &Path, _leaf: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn after_flatten(&self, _output: &Path) -> io::Result<()> {
         Ok(())
     }
 
