@@ -2041,3 +2041,18 @@ fn update_catalog(
         Ok((errors, changed_paths))
     })()
 }
+
+#[cfg(test)]
+mod watch_cache_lifetime_tests {
+    #[test]
+    fn ordinary_commit_keeps_usn_identity_cache_until_idle_commit() {
+        let state = crate::watch_store::NativeWatchState::new();
+        let catalog = super::NativeWatchCatalog::new(&state, None);
+        catalog.recovery_ids.lock().unwrap().insert("volume".into(), Default::default());
+        catalog.commit(false);
+        catalog.commit(false);
+        assert_eq!(catalog.recovery_ids.lock().unwrap().len(), 1);
+        catalog.commit(true);
+        assert!(catalog.recovery_ids.lock().unwrap().is_empty());
+    }
+}

@@ -233,7 +233,10 @@ impl Journal {
         self.wait_for_checkpoint()?;
         self.compact()?;
         self.wait_for_checkpoint()?;
-        self.log.flush()
+        // Display history is best-effort, unlike the durable journal above.
+        // Its writer retains the fault and retries recovery on later writes.
+        let _ = self.log.flush();
+        Ok(())
     }
 
     pub(super) fn compact(&self) -> io::Result<()> {
@@ -616,6 +619,38 @@ mod tests {
         let journal = Journal::open(&dir).unwrap();
         assert_eq!(journal.state().password_generation(), 2);
         assert!(!wal.exists());
+        drop(journal);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn display_flush_failure_does_not_replace_durable_journal_result() {
+        let marker = crate::test_support::temp_file("display_flush", b"");
+        let dir = marker.with_extension("state");
+        let journal = Journal::open(&dir).unwrap();
+        journal.flush().unwrap();
+        // A directory at the manifest path causes a terminal display error,
+        // unlike a sharing handle that atomic publication waits to release.
+        // The WAL and snapshot paths remain writable.
+        let manifest = dir.join("events.json");
+        let saved = dir.join("events.saved");
+        fs::rename(&manifest, &saved).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        journal.log(serde_json::json!({"event":"service_reload_skipped","reason":"test"}));
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
+        assert!(journal.flush().is_ok());
+        assert!(journal.log.error().unwrap().is_some());
+        // A persistence fault must still fail the same public flush boundary.
+        journal.frontier.lock().unwrap().fault = Some("durability fault".into());
+        assert!(journal.flush().unwrap_err().to_string().contains("durability fault"));
+        journal.frontier.lock().unwrap().fault = None;
+        fs::remove_dir(&manifest).unwrap();
+        fs::rename(&saved, &manifest).unwrap();
+        journal.flush().unwrap();
+        drop(journal);
+        let journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.state().password_generation(), 2);
         drop(journal);
         fs::remove_dir_all(dir).unwrap();
         fs::remove_file(marker).unwrap();

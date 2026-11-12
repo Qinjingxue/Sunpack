@@ -59,6 +59,7 @@ struct Request {
     buffer: Box<[u32]>,
     pending: bool,
     recursive: bool,
+    filter: u32,
 }
 
 // The boxed OS buffers stay fixed; access and cancellation are serialized by
@@ -73,7 +74,7 @@ impl Request {
                 self.buffer.as_mut_ptr().cast(),
                 (self.buffer.len() * 4) as u32,
                 i32::from(self.recursive),
-                0x01 | 0x02 | 0x08 | 0x10,
+                self.filter,
                 std::ptr::null_mut(),
                 &mut *self.overlapped,
                 std::ptr::null_mut(),
@@ -143,7 +144,7 @@ pub(crate) struct NativeConfigChanges {
 }
 
 impl NativeConfigChanges {
-    pub(crate) fn observe(path: PathBuf, recursive: bool) -> io::Result<Self> {
+    pub(crate) fn observe(path: PathBuf, recursive: bool, filter: u32) -> io::Result<Self> {
         let stopped = event(false)?;
         let file = TrackedFile::open_passive_with(path, |options| {
             options
@@ -163,6 +164,7 @@ impl NativeConfigChanges {
             buffer: vec![0u32; 1024].into_boxed_slice(),
             pending: false,
             recursive,
+            filter,
         };
         request.arm()?;
         Ok(Self {

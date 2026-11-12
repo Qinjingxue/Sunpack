@@ -881,8 +881,6 @@ impl Recursion {
 // digits. Use the existing Unicode property database, not a second hand-kept
 // digit table. Saturation preserves the effective "deeper than any task" limit.
 fn positive_decimal(value: &str) -> Option<usize> {
-    use regex_syntax::hir::{Class, HirKind};
-    static DECIMAL_RANGES: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
     let value = value.strip_prefix('+').unwrap_or(value);
     let mut result = 0usize;
     let mut digit_before = false;
@@ -892,22 +890,26 @@ fn positive_decimal(value: &str) -> Option<usize> {
             digit_before = false;
             continue;
         }
-        let digit = if character.is_ascii_digit() {
-            character as u32 - '0' as u32
-        } else {
-            let ranges = DECIMAL_RANGES.get_or_init(|| {
-                let hir = regex_syntax::Parser::new().parse(r"\p{Nd}").expect("Unicode decimal class");
-                let HirKind::Class(Class::Unicode(class)) = hir.kind() else { unreachable!() };
-                class.iter().map(|range| (range.start() as u32, range.end() as u32)).collect()
-            });
-            let code = character as u32;
-            let &(start, _) = ranges.iter().find(|&&(start, end)| start <= code && code <= end)?;
-            (code - start) % 10
-        };
+        let digit = decimal_digit(character)?;
         result = result.saturating_mul(10).saturating_add(digit as usize);
         digit_before = true;
     }
     (digit_before && result > 0).then_some(result)
+}
+
+// Reuse the existing Unicode property database for Python decimal syntax.
+pub(crate) fn decimal_digit(character: char) -> Option<u32> {
+    use regex_syntax::hir::{Class, HirKind};
+    static DECIMAL_RANGES: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+    if character.is_ascii_digit() { return Some(character as u32 - '0' as u32); }
+    let ranges = DECIMAL_RANGES.get_or_init(|| {
+        let hir = regex_syntax::Parser::new().parse(r"\p{Nd}").expect("Unicode decimal class");
+        let HirKind::Class(Class::Unicode(class)) = hir.kind() else { unreachable!() };
+        class.iter().map(|range| (range.start() as u32, range.end() as u32)).collect()
+    });
+    let code = character as u32;
+    let &(start, _) = ranges.iter().find(|&&(start, end)| start <= code && code <= end)?;
+    Some((code - start) % 10)
 }
 
 impl ProcessMode {

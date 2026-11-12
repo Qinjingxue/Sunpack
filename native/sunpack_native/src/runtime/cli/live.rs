@@ -6,6 +6,7 @@ use crate::pipeline::{Event, ResourceWait, TaskId};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
@@ -18,6 +19,8 @@ enum Phase {
 }
 
 struct TaskRow {
+    path: PathBuf,
+    offset: Option<u64>,
     parent: Option<TaskId>,
     children: BTreeSet<TaskId>,
     label: String,
@@ -63,6 +66,7 @@ impl Panel {
                 ..
             } => {
                 let is_segment = segment.is_some();
+                let offset = segment.as_ref().map(|segment| segment.offset);
                 let label = if let Some(segment) = segment {
                     let label = language
                         .translate("cli.scan.segment", &[("index", &segment.index.to_string())]);
@@ -87,6 +91,7 @@ impl Panel {
                 self.tasks.insert(
                     id,
                     TaskRow {
+                        path, offset,
                         parent,
                         label,
                         children: BTreeSet::new(),
@@ -149,6 +154,22 @@ impl Panel {
             frame.rows.last().is_none_or(|row| row.id.is_some())
                 || frame.rows.iter().any(|row| row.id == Some(id))
         })
+    }
+
+    pub(super) fn scope_progress(&self, id: TaskId) -> HashMap<(PathBuf, Option<u64>), (u64, u64)> {
+        let mut progress = HashMap::new();
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            if let Some(row) = self.tasks.get(&id) {
+                pending.extend(row.children.iter().copied());
+                if !row.carrier {
+                    if let Some(value) = row.progress {
+                        progress.insert((row.path.clone(), row.offset), value);
+                    }
+                }
+            }
+        }
+        progress
     }
 
     pub(super) fn remove(&mut self, id: TaskId) {
@@ -328,6 +349,21 @@ pub(super) fn wait_status(state: ResourceWait, language: Language) -> (&'static 
     (language.text(status), hint)
 }
 
+pub(super) fn progress_text(progress: Option<(u64, u64)>, bar: bool) -> String {
+    let percent = progress.filter(|&(_, total)| total != 0)
+        .map(|(completed, total)| (completed as u128 * 100 / total as u128).min(100) as usize);
+    let mut text = String::new();
+    if bar {
+        let filled = percent.unwrap_or(0) / 5;
+        let _ = write!(text, " [{}{}]", "#".repeat(filled), "-".repeat(20 - filled));
+    }
+    match percent {
+        Some(percent) => { let _ = write!(text, " {percent:3}%"); }
+        None => text.push_str("  --%"),
+    }
+    text
+}
+
 fn row_text(
     task: &TaskRow,
     prefix: &str,
@@ -360,19 +396,8 @@ fn row_text(
         (language.text(status), String::new())
     };
     let mut state = format!("[{status}]");
-    if let Some((completed, total)) = task.progress {
-        let percent = ((completed as u128 * 100 / total as u128).min(100)) as usize;
-        if available >= display_width(&state) + 40 && hint.is_empty() {
-            let filled = percent / 5;
-            let _ = write!(
-                state,
-                " [{}{}]",
-                "#".repeat(filled),
-                "-".repeat(20 - filled)
-            );
-        }
-        let _ = write!(state, " {percent:3}%");
-    }
+    state.push_str(&progress_text(task.progress,
+        available >= display_width(&state) + 40 && hint.is_empty()));
     if display_width(&state) > available {
         line.push_str(&clipped(&state, available, unicode));
         return line;
@@ -558,7 +583,7 @@ mod tests {
         assert!(rows[1].starts_with("├─ Segment 1 (zip) [100, 150) [Disk full]  60%"));
         assert!(rows[2].starts_with("└─ Segment 2 (zip) [200, 250) [Waiting]"));
         assert!(rows[3].starts_with("   └─ nested.zip [Preparing]"));
-        assert_eq!(rows[4], "other.zip [Extracting]");
+        assert_eq!(rows[4], "other.zip [Extracting] [--------------------]  --%");
         assert!(String::from_utf8_lossy(&terminal.output.lock().unwrap())
             .contains("nested.zip [Preparing]"));
 

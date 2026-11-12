@@ -101,19 +101,58 @@ impl PathSet {
     }
 }
 
+/// Filesystem observations are prepared without the journal publication lock.
+/// Publication below compares the same indexed registrations and rechecks live
+/// recovery ownership, so a newer mkdir/flatten reservation cannot be retired.
+pub(crate) struct OwnedRetirement {
+    observed: BTreeMap<String, Option<Value>>,
+    operations: Vec<Operation>,
+    replaced: HashSet<String>,
+}
+
+impl OwnedRetirement {
+    pub(crate) fn operations(self, state: &NativeWatchState) -> NativeWatchOperations {
+        let data = state.lock();
+        let unchanged = |key: &str| self.observed.get(key)
+            .is_some_and(|before| before.as_ref() == data.runtime.get(key));
+        // Legacy alias normalization is one publication, not independent edits.
+        if self.operations.iter().any(|op| matches!(op, Operation::Runtime(_, Some(_))))
+            && !self.observed.keys().all(|key| unchanged(key))
+        {
+            return NativeWatchOperations::empty();
+        }
+        let mut recovery = None;
+        let operations = self.operations.into_iter().filter(|op| {
+            let Operation::Runtime(key, value) = op else { unreachable!() };
+            if !unchanged(key) { return false; }
+            if value.is_none() && !self.replaced.contains(key) {
+                if let Some(Some(record)) = self.observed.get(key) {
+                    let roots = recovery.get_or_insert_with(|| data.recovery_output_roots());
+                    if record_paths(record).filter(|path| {
+                        data.runtime.get(&format!("owned|{}", path_key(path)))
+                            .is_some_and(|current| same_registration(record, current))
+                    }).any(|path| roots.intersects(path)) { return false; }
+                }
+            }
+            true
+        }).collect();
+        NativeWatchOperations { operations: Arc::new(Operations(operations)) }
+    }
+}
+
 impl NativeWatchState {
-    /// Prepare under Journal::commit, so no concurrent registration, flatten or
-    /// recovery publication can be retired between its observation and apply.
-    /// None is startup/configuration reconciliation; event batches visit only
-    /// ancestor records and indexed descendants of their affected paths.
-    pub(crate) fn owned_retirement_operations(
+    /// None is startup/configuration reconciliation; ordinary checkpoints visit
+    /// only ancestor records and indexed descendants of actual changed paths.
+    pub(crate) fn prepare_owned_retirement(
         &self,
         scopes: &[NativeDiscoveryScope],
         paths: Option<&[String]>,
-    ) -> NativeWatchOperations {
+    ) -> OwnedRetirement {
         let mut records = self.lock().owned_records(paths, true);
+        let mut observed = records.iter().map(|(key, record)| (key.clone(), Some(record.clone())))
+            .collect::<BTreeMap<_, _>>();
         if records.is_empty() {
-            return NativeWatchOperations::empty();
+            return OwnedRetirement { observed, operations: Vec::new(), replaced: HashSet::new() };
         }
         // The common in-scope, unchanged output needs only its identity probe.
         // Build recovery ownership once, only for missing or out-of-scope roots.
@@ -125,6 +164,9 @@ impl NativeWatchState {
         let mut operations = Vec::new();
         if paths.is_none() {
             normalize_legacy_aliases(&mut records, &mut operations);
+            for key in records.keys() {
+                observed.entry(key.clone()).or_insert_with(|| self.runtime_record(key));
+            }
         }
         // Upgrade old single-path snapshots before building the no-history
         // baseline. Never discover an alias from a replaced directory.
@@ -154,7 +196,8 @@ impl NativeWatchState {
                 // Event reconciliation snapshots only an affected subtree.
                 // Its newly discovered real alias can already belong to a
                 // different registration outside that snapshot.
-                let existing = records.get(&key).cloned().or_else(|| self.runtime_record(&key));
+                let before = observed.entry(key.clone()).or_insert_with(|| self.runtime_record(&key));
+                let existing = records.get(&key).cloned().or_else(|| before.clone());
                 if existing.as_ref().is_some_and(|other| {
                     other["identities"] != record["identities"] || other["path"] != record["path"]
                 }) {
@@ -164,6 +207,12 @@ impl NativeWatchState {
                 operations.push(Operation::Runtime(key, Some(next)));
             }
         }
+        // Canonical-key moves are protected by the all-record comparison above,
+        // not by output recovery: the same registration is being re-indexed.
+        let mut replaced = operations.iter().filter_map(|operation| match operation {
+            Operation::Runtime(key, None) => Some(key.clone()),
+            _ => None,
+        }).collect::<HashSet<_>>();
         for (key, record) in &records {
             let retire = if let Some(path) = record["path"].as_str() {
                 let aliases = record_paths(record).filter(|alias| {
@@ -200,10 +249,23 @@ impl NativeWatchState {
                 true
             };
             if retire {
+                if record["path"].as_str().and_then(|path| identities.get(path))
+                    .is_some_and(|identity| identity.as_ref().is_ok_and(|identity|
+                        identity.as_ref().is_some_and(|identity| !record_matches(record, identity))))
+                {
+                    replaced.insert(key.clone());
+                }
                 operations.push(Operation::Runtime(key.clone(), None));
             }
         }
-        NativeWatchOperations { operations: Arc::new(Operations(operations)) }
+        OwnedRetirement { observed, operations, replaced }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owned_retirement_operations(
+        &self, scopes: &[NativeDiscoveryScope], paths: Option<&[String]>,
+    ) -> NativeWatchOperations {
+        self.prepare_owned_retirement(scopes, paths).operations(self)
     }
 
     /// Disposal may finish after its delete notification was already handled
@@ -441,6 +503,40 @@ mod tests {
         for path in [&active, &committed, &checkpoint, &flatten] {
             assert!(has_owned(&state, path));
         }
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn prepared_retirement_is_sparse_and_preserves_concurrent_registration_and_recovery() {
+        let marker = crate::test_support::temp_file("owned_retirement_publication", b"");
+        let base = marker.with_extension("outputs");
+        let state = NativeWatchState::new();
+        for index in 0..1000 {
+            put_owned(&state, &base.join(format!("output-{index}")), "old-generation");
+        }
+        let unrelated = base.join("new.zip").to_string_lossy().into_owned();
+        let prepared = state.prepare_owned_retirement(&[], Some(&[unrelated]));
+        assert!(prepared.observed.is_empty()); // no unrelated identity IO or JSON snapshot
+        let target = base.join("output-7");
+        let paths = [target.to_string_lossy().into_owned()];
+        let prepared = state.prepare_owned_retirement(&[], Some(&paths));
+        assert_eq!(prepared.observed.len(), 1);
+        // A concurrent output registration at the same key wins over stale IO.
+        put_owned(&state, &target, "new-generation");
+        state.apply(&prepared.operations(&state));
+        assert!(has_owned(&state, &target));
+        let prepared = state.prepare_owned_retirement(&[], Some(&paths));
+        let owner = base.join("source.zip").to_string_lossy().into_owned();
+        let mut pending = PendingRecord { path: owner.clone(), ..Default::default() };
+        pending.active_outputs.insert(owner.clone(), paths[0].clone());
+        state.lock().pending.insert(path_key(&owner), Arc::new(pending));
+        state.apply(&prepared.operations(&state));
+        assert!(has_owned(&state, &target));
+        // Once recovery releases this absent output, ordinary retirement works.
+        state.lock().pending.clear();
+        state.apply(&state.prepare_owned_retirement(&[], Some(&paths)).operations(&state));
+        assert!(!has_owned(&state, &target));
+        assert_eq!(state.runtime_keys("owned|").len(), 999);
         std::fs::remove_file(marker).unwrap();
     }
 

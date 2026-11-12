@@ -178,6 +178,14 @@ impl Failure {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FailureEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hresult: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_crc_proven_items: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_operation_result: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub missing_volume_suspected: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

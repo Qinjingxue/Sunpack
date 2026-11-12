@@ -991,12 +991,13 @@ impl Progress {
     }
 
     fn finish_scope(&self, id: TaskId, archives: &[ArchiveResult]) -> io::Result<()> {
-        let report = (!archives.is_empty()).then(|| ScopeReport::new(archives, self));
         let mut display = self.display.lock().unwrap();
         if self.cancel.cancelled() {
             return Ok(());
         }
         for event in self.reporting.take_events() { self.display_event(event, &mut display); }
+        let latest = display.panel.as_ref().map(|panel| panel.scope_progress(id)).unwrap_or_default();
+        let report = (!archives.is_empty()).then(|| ScopeReport::new(archives, self, latest));
         if let Some(panel) = &mut display.panel {
             panel.remove(id);
         }
@@ -1126,6 +1127,7 @@ fn tree_edge(unicode: bool, last: bool) -> (&'static str, &'static str) {
 }
 
 struct ScopeReport<'a> {
+    progress: HashMap<(PathBuf, Option<u64>), (u64, u64)>,
     archives: &'a [ArchiveResult],
     unicode: bool,
     language: Language,
@@ -1136,8 +1138,9 @@ struct ScopeReport<'a> {
 }
 
 impl<'a> ScopeReport<'a> {
-    fn new(archives: &'a [ArchiveResult], progress: &Progress) -> Self {
+    fn new(archives: &'a [ArchiveResult], progress: &Progress, latest: HashMap<(PathBuf, Option<u64>), (u64, u64)>) -> Self {
         let mut report = Self {
+            progress: latest,
             archives,
             unicode: progress.session.unicode(),
             language: progress.language,
@@ -1266,13 +1269,16 @@ impl<'a> ScopeReport<'a> {
         prefix: &mut String,
     ) -> io::Result<()> {
         let item = &self.archives[position];
-        let (status, progress) = if item.partial {
-            ("report.status.partial", "")
-        } else if item.failure.is_some() {
-            ("report.status.error", "")
-        } else {
-            ("report.status.complete", " [####################] 100%")
-        };
+        let status = if item.partial { "report.status.partial" }
+            else if item.failure.is_some() { "report.status.error" }
+            else { "report.status.complete" };
+        let last = if item.partial || item.failure.is_some() {
+            [&item.path].into_iter().chain(item.promotion_original_path.iter()).find_map(|path| {
+                self.progress.get(&(path.clone(), Some(item.offset)))
+                    .or_else(|| self.progress.get(&(path.clone(), None))).copied()
+            })
+        } else { Some((1, 1)) };
+        let progress = live::progress_text(last, true);
         writeln!(
             writer,
             "{prefix}  [{}]{progress}",
@@ -1808,6 +1814,9 @@ async fn archives(
                 Stream::Err,
                 &language.translate("report.postprocess_warning", &[("message", &message)]),
             )?;
+            for receipt in cleanup.values().filter(|receipt| receipt.status == CleanupStatus::Failed) {
+                line(session, Stream::Err, &format!("  {}: {}", receipt.path.display(), receipt.message))?;
+            }
         }
         line(session, Stream::Out, &"-".repeat(54))?;
     }
@@ -2734,6 +2743,43 @@ mod recursive_prompt_tests {
         assert!(matches!(received.try_recv().unwrap(), Event::Working { id: 7 }));
         assert!(received.try_recv().is_err());
         assert!(reports.take_events().is_empty());
+    }
+
+    #[test]
+    fn settled_failure_and_partial_trees_keep_the_last_known_progress() {
+        for (partial, known) in [(false, true), (true, true), (false, false)] {
+            let input = Arc::new(Input { interactive: true, ..Input::default() });
+            let progress = Progress {
+                session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+                cancel: Cancellation::new(), language: Language::En,
+                display: Mutex::default(), reporting: reporting::Reports::default(),
+                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+            };
+            progress.notify(Event::Queued { id: 7, parent: None, path: "embedded.bin".into(), depth: 1, segment: None });
+            if known {
+                progress.notify(Event::Progress { id: 7, path: "embedded.bin".into(), completed_bytes: 40, total_bytes: 100 });
+            }
+            progress.flush_events();
+            input.stdout.lock().unwrap().clear();
+            let archive = ArchiveResult {
+                path: "embedded.bin".into(), format: "zip".into(), output: None,
+                failure: Some(crate::pipeline::Failure::new(FailureKind::Damaged, "damage")),
+                files: 0, bytes: 0, encrypted: None, depth: 1, offset: 123,
+                end_offset: None, volume_completeness: None, volume_attempts: None,
+                source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
+                damage_flags: None, partial, retained: false, recovered_complete_files: 0,
+                promoted: false, promotion_original_path: None,
+            };
+            progress.finish_scope(7, &[archive]).unwrap();
+            let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
+            let status = Language::En.text(if partial { "report.status.partial" } else { "report.status.error" });
+            let expected = if known { " [########------------]  40%" } else { " [--------------------]  --%" };
+            assert!(text.contains(&format!("[{status}]{expected}")), "{text}");
+            assert!(!text.contains("100%"), "{text}");
+            input.stdout.lock().unwrap().clear();
+            progress.flush_events();
+            assert!(input.stdout.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

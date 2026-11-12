@@ -256,3 +256,100 @@ def test_owned_outputs_are_excluded_after_restart_but_admit_replacement(
         package.run("watch", "stop")
         if alias != real:
             alias.rmdir()
+
+
+def test_watch_retries_unobserved_candidate_after_acl_only_recovery(package, tmp_path):
+    # No data/rename event occurs after permission is restored. Validate real
+    # attributes denial and an idle, empty queue before the SECURITY-only repair;
+    # the unreadable path may be filtered before candidate_error is logged.
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    output = tmp_path / "out"
+    source = tmp_path / "restricted.zip"
+    _zip(source, "restored.txt", b"ACL-only arrival recovery")
+    idle_probe = tmp_path / "idle-probe.zip"
+    _zip(idle_probe, "probe.txt", b"idle reader barrier")
+    acl_script = tmp_path / "candidate-acl.ps1"
+    acl_script.write_text(r"""
+param([string]$Path, [string]$Saved, [switch]$Restore, [switch]$Directory)
+$ErrorActionPreference = 'Stop'
+$acl = Get-Acl -LiteralPath $Path
+if ($Restore) {
+    $acl.SetSecurityDescriptorSddlForm([IO.File]::ReadAllText($Saved), [Security.AccessControl.AccessControlSections]::Access)
+} else {
+    [IO.File]::WriteAllText($Saved, $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $rights = if ($Directory) { [Security.AccessControl.FileSystemRights]::ListDirectory } else { [Security.AccessControl.FileSystemRights]::ReadAttributes }
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, [Security.AccessControl.AccessControlType]::Deny)
+    $acl.AddAccessRule($rule)
+}
+Set-Acl -LiteralPath $Path -AclObject $acl
+if ($Restore) {
+    $actual = (Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+    if ($actual -ne [IO.File]::ReadAllText($Saved)) { throw "Original DACL was not restored" }
+}
+""", encoding="utf-8")
+    saved = tmp_path / "original-acl.txt"
+    saved_directory = tmp_path / "original-directory-acl.txt"
+
+    def acl(path, restore=False, directory=False):
+        command = ["powershell.exe", "-NoProfile", "-File", str(acl_script),
+                   "-Path", str(path), "-Saved", str(saved_directory if directory else saved)]
+        if directory:
+            command.append("-Directory")
+        if restore:
+            command.append("-Restore")
+        subprocess.run(command, check=True, capture_output=True, text=True)
+
+    package.configure(watch={"runtime_cache_cleanup_idle_seconds": 0.25})
+    package.json("watch", "add", watched, "-o", output)
+    package.json("watch", "start", "--no-tray")
+    events = package.data / ".sunpack_watch" / "events.json"
+    current = source
+    try:
+        acl(source)
+        acl(watched, directory=True)
+        target = watched / source.name
+        source.rename(target)
+        current = target
+        # Assert that this machine/token really reaches the required failure:
+        # FILE_READ_ATTRIBUTES alone may remain available through parent list.
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                                      ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        kernel.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel.CreateFileW(str(current), 0x80, 7, None, 3, 0, None)
+        error = ctypes.get_last_error()
+        if handle != ctypes.c_void_p(-1).value:
+            kernel.CloseHandle(ctypes.c_void_p(handle))
+            pytest.fail("ACL fixture did not deny FILE_READ_ATTRIBUTES")
+        assert error == 5, error
+        assert package.json("watch", "status")["summary"]["pending"] == 0
+        package.json("scan", idle_probe)
+        # Reader-cache release is an observable idle-maintenance barrier. An
+        # exclusive open cannot succeed while the runtime retains its reader.
+        deadline = time.monotonic() + 30
+        saw_cached_reader = False
+        while time.monotonic() < deadline:
+            handle = kernel.CreateFileW(str(idle_probe), 0x80000000, 0, None, 3, 0, None)
+            if handle != ctypes.c_void_p(-1).value:
+                kernel.CloseHandle(ctypes.c_void_p(handle))
+                break
+            assert ctypes.get_last_error() in (32, 33)
+            saw_cached_reader = True
+            time.sleep(0.01)
+        else:
+            pytest.fail("Watch idle maintenance did not release the foreground reader")
+        assert saw_cached_reader, "idle barrier did not observe a retained reader"
+        assert not list(output.rglob("restored.txt"))
+        acl(watched, restore=True, directory=True)
+        acl(current, restore=True)
+        _wait_for_output(output, "restored.txt", b"ACL-only arrival recovery")
+        assert len(list(output.rglob("restored.txt"))) == 1
+    finally:
+        if saved_directory.exists():
+            acl(watched, restore=True, directory=True)
+        if saved.exists():
+            acl(current, restore=True)
+        package.json("watch", "stop")

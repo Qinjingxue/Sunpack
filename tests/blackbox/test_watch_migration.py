@@ -352,7 +352,12 @@ def test_watch_configured_user_passwords_decrypt_and_retry_after_reload(package,
     _wait_for(lambda: any(output.rglob("first.txt")), "Configured Watch password was not used")
     events = package.data / ".sunpack_watch" / "events.json"
     def blocked():
-        display = native_fixture("display_events", path=str(events))
+        try:
+            display = native_fixture("display_events", path=str(events))
+        except subprocess.CalledProcessError:
+            # The writer can still be publishing the display manifest after
+            # the first output appears; business completion is separate.
+            return False
         # Password blockers remain live until the source change resolves them;
         # completed task rows, such as first.7z, belong to history.
         return any(

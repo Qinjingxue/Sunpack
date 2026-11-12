@@ -950,7 +950,16 @@ impl FileObserver {
         recursive: bool,
         notify: impl Fn(Option<Vec<String>>) + Send + 'static,
     ) -> io::Result<Self> {
-        let changes = Arc::new(NativeConfigChanges::observe(path.to_owned(), recursive)?);
+        Self::start_with_filter(path, recursive, 0x01 | 0x02 | 0x08 | 0x10, notify)
+    }
+
+    fn start_with_filter(
+        path: &Path,
+        recursive: bool,
+        filter: u32,
+        notify: impl Fn(Option<Vec<String>>) + Send + 'static,
+    ) -> io::Result<Self> {
+        let changes = Arc::new(NativeConfigChanges::observe(path.to_owned(), recursive, filter)?);
         let stopping = Arc::new(AtomicBool::new(false));
         let read = Arc::clone(&changes);
         let stop = Arc::clone(&stopping);
@@ -1017,7 +1026,10 @@ impl RootObserver {
         let recursive = root.recursive;
         let hub = Arc::clone(hub);
         let journal = Arc::clone(journal);
-        let observer = FileObserver::start(directory, recursive, move |names| {
+        // Match watchdog's business-root notifications, including ACL and
+        // attributes-only changes that can make an unreadable candidate usable.
+        let observer = FileObserver::start_with_filter(
+            directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, move |names| {
             let mut paths = names.map(|names| names.into_iter()
                 .map(|name| watched_dir.join(name))
                 .filter(|path| scope.contains(&path.to_string_lossy())).collect::<Vec<_>>());
@@ -1357,6 +1369,7 @@ struct Scheduler {
     roots: BTreeMap<String, (Root, NativeDiscoveryScope)>,
     available_roots: HashSet<String>,
     settings: Arc<Config>,
+    user_password_signature: String,
     engine: Arc<Engine>,
     journal: Arc<journal::Journal>,
     catalog: Arc<NativeWatchCatalog>,
@@ -1424,12 +1437,18 @@ impl Scheduler {
         let deep_options =
             NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
         let passwords = BuiltinStore::shared(&cwd)?;
-        let config_observers = Self::observe_config(&cwd, &snapshot, &root_file, passwords.path(), &hub)?;
+        // A one-shot scheduler never consumes configuration reload signals.
+        let config_observers = if continuous {
+            Self::observe_config(&cwd, &snapshot, &root_file, passwords.path(), &hub)?
+        } else {
+            Vec::new()
+        };
         let mut scheduler = Self {
             cwd,
             root_file,
             roots: BTreeMap::new(),
             available_roots: HashSet::new(),
+            user_password_signature: user_password_signature(&snapshot.config.user_passwords),
             settings: Arc::new(snapshot.config),
             engine,
             journal,
@@ -1841,8 +1860,10 @@ impl Scheduler {
                 return Err(error);
             }
         };
-        let previous = config_changed.then(||
-            std::mem::replace(&mut self.settings, Arc::new(snapshot.config)));
+        let previous = config_changed.then(|| {
+            self.user_password_signature = user_password_signature(&snapshot.config.user_passwords);
+            std::mem::replace(&mut self.settings, Arc::new(snapshot.config))
+        });
 
         let apply = (|| {
             if config_changed || roots_changed {
@@ -1852,11 +1873,17 @@ impl Scheduler {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
             }
             self.checkpoint_reload(scheduler_changed || roots_changed)?;
+            if scheduler_changed {
+                // main restarts its scheduler on semantic policy changes,
+                // including reconciliation of existing missing-volume blockers.
+                self.retry_missing_volumes(None)?;
+            }
             if config_changed { self.password_update(false)?; }
             Ok(())
         })();
         if let Err(error) = apply {
             if let Some(settings) = previous {
+                self.user_password_signature = user_password_signature(&settings.user_passwords);
                 self.settings = settings;
             }
             // Root edits are durable and are never rolled back. Recover
@@ -2001,7 +2028,8 @@ impl Scheduler {
             }
             if self.active.is_empty() && self.pending.is_empty() {
                 self.engine.run_stage("catalog_commit", Origin::Watch, || {
-                    self.catalog.commit(true);
+                    // A gap between bursts is not the idle-cache deadline.
+                    self.catalog.commit(false);
                     self.journal.compact()
                 })?;
             }
@@ -2109,6 +2137,7 @@ impl Scheduler {
                     windows::maintain_when_foreground_idle(&engine, || engine.run_stage("catalog_maintenance", Origin::Watch, || {
                         maintenance = self.checkpoint(&HashMap::new(), true, false);
                         if maintenance.is_err() { return; }
+                        self.catalog.commit(true);
                         let _ = crate::io::reader::clear_reader_resources();
                         self.engine.clear_idle_passwords();
                         self.journal.state().trim_idle_storage();
@@ -2148,9 +2177,8 @@ impl Scheduler {
 
     fn retire_owned_outputs(&self, paths: Option<&[String]>) -> io::Result<()> {
         let scopes = self.roots.values().map(|(_, scope)| scope.clone()).collect::<Vec<_>>();
-        self.journal.commit(true, |state| {
-            Ok(state.owned_retirement_operations(&scopes, paths))
-        })
+        let retirement = self.journal.state().prepare_owned_retirement(&scopes, paths);
+        self.journal.commit(true, |state| Ok(retirement.operations(state)))
     }
 
     fn observe_file_changes(&mut self, changed: &HashMap<String, HashSet<PathBuf>>) -> io::Result<()> {
@@ -2205,13 +2233,6 @@ impl Scheduler {
             .filter(|(id, _)| all_roots || changed.contains_key(*id))
             .map(|(id, (root, scope))| (id.clone(), root.clone(), scope.clone()))
             .collect::<Vec<_>>();
-        let affected = selected.iter().flat_map(|(id, root, _)| {
-            changed.get(id).filter(|paths| !paths.is_empty()).map_or_else(
-                || vec![root.path.to_string_lossy().into_owned()],
-                |paths| paths.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
-            )
-        }).collect::<Vec<String>>();
-        self.retire_owned_outputs(Some(&affected))?;
         let mut groups: HashMap<(String, u64), (i64, i64, Vec<NativeDiscoveryScope>)> =
             HashMap::new();
         let mut probes = Vec::new();
@@ -2294,6 +2315,14 @@ impl Scheduler {
             let mut paths = Vec::new();
             let mut errors = Vec::new();
             let rebuild = !root.scanned || range.is_none_or(|(_, entries)| entries.is_err());
+            // An admission checkpoint still covers every root's USN interval,
+            // but valid intervals reconcile only paths that actually changed.
+            // Root enumeration/topology recovery alone needs the whole subtree.
+            let affected = owned_checkpoint_paths(
+                &scope, changed.get(&id), range.and_then(|(_, paths)| paths.as_deref().ok()),
+                startup || rebuild || arrived,
+            );
+            if !affected.is_empty() { self.retire_owned_outputs(Some(&affected))?; }
             if rebuild {
                 // Keep the conservative baseline when the catalog itself is
                 // missing or belongs to another root object. A trusted
@@ -2928,7 +2957,7 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        let signature = password_source_signature(&self.settings.user_passwords, snapshot.signature());
+        let signature = password_source_signature(&self.user_password_signature, snapshot.signature());
         let state = self.journal.state();
         let changed = state.password_source_signature() != signature;
         if changed || startup {
@@ -2975,7 +3004,7 @@ impl Scheduler {
                 .failure_payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|before| before == password_source_signature(&self.settings.user_passwords, &snapshot.scope_signature(directory)))
+                .is_some_and(|before| before == password_source_signature(&self.user_password_signature, &snapshot.scope_signature(directory)))
             {
                 continue;
             }
@@ -3329,15 +3358,30 @@ fn has_covered_parent(path: &str, covered: &HashSet<String>) -> bool {
     }
 }
 
+fn owned_checkpoint_paths(
+    scope: &NativeDiscoveryScope,
+    named: Option<&HashSet<PathBuf>>,
+    recovered: Option<&[String]>,
+    reconcile_root: bool,
+) -> Vec<String> {
+    if reconcile_root { return vec![scope.root.clone()]; }
+    recovered.into_iter().flatten().filter(|path| scope.contains(path)).cloned()
+        .chain(named.into_iter().flatten().map(|path| path.to_string_lossy().into_owned()))
+        .collect()
+}
+
 fn output_identity(path: &str) -> io::Result<String> {
     let (volume, identity, _) = filesystem::watch_path_identity(path)?;
     Ok(format!("{volume}|{identity}"))
 }
 
-fn password_source_signature(user: &[String], builtin: &str) -> String {
+fn user_password_signature(user: &[String]) -> String {
     let mut hash = crate::fast_hash_core::Hash128::new();
     hash.update(serde_json::to_string(user).unwrap().as_bytes());
-    let user = hash.hexdigest();
+    hash.hexdigest()
+}
+
+fn password_source_signature(user: &str, builtin: &str) -> String {
     let mut hash = crate::fast_hash_core::Hash128::new();
     hash.update(user.as_bytes());
     hash.update(builtin.as_bytes());
@@ -4074,7 +4118,7 @@ impl Scheduler {
                 Some(input_failure),
                 self.journal.state().entry(&candidate.path).as_deref(),
                 &active.passwords,
-                &self.settings.user_passwords,
+                &self.user_password_signature,
                 Some(&group),
                 Some(&recovery),
             );
@@ -4096,7 +4140,7 @@ impl Scheduler {
             let password_updated = payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|previous| previous != password_source_signature(&self.settings.user_passwords, &current_passwords.scope_signature(&recovery.password_scope)));
+                .is_some_and(|previous| previous != password_source_signature(&self.user_password_signature, &current_passwords.scope_signature(&recovery.password_scope)));
             let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
             let handed_off = pending.is_some();
             handoff_promoted_blocker(&mut entry, route_root, root,
@@ -4187,7 +4231,7 @@ impl Scheduler {
                         input_failure,
                         self.journal.state().entry(&candidate.path).as_deref(),
                         &active.passwords,
-                &self.settings.user_passwords,
+                &self.user_password_signature,
                         group.map(Arc::as_ref),
                         active.recovery.as_deref(),
                     );
@@ -4211,7 +4255,7 @@ impl Scheduler {
                     .failure_payload
                     .get("password_signature")
                     .and_then(Value::as_str)
-                    .is_some_and(|before| before != password_source_signature(&self.settings.user_passwords, &current_passwords.scope_signature(directory)))
+                    .is_some_and(|before| before != password_source_signature(&self.user_password_signature, &current_passwords.scope_signature(directory)))
                 {
                     retry.push(candidate.path.clone());
                 }
@@ -4436,7 +4480,7 @@ fn make_entry(
     failure: Option<&InputFailure<'_>>,
     previous: Option<&crate::watch_store::EntryRecord>,
     passwords: &crate::core::passwords::PasswordSnapshot,
-    user_passwords: &[String],
+    user_signature: &str,
     group: Option<&SourceGroup>,
     recovery: Option<&Recovery>,
 ) -> Arc<crate::watch_store::EntryRecord> {
@@ -4463,7 +4507,7 @@ fn make_entry(
             |recovery| recovery.password_dir(path),
         );
         payload["password_scope_dir"] = json!(dir);
-        payload["password_signature"] = json!(password_source_signature(user_passwords, &passwords.scope_signature(dir)));
+        payload["password_signature"] = json!(password_source_signature(user_signature, &passwords.scope_signature(dir)));
     }
     let kind = serde_json::to_value(kind)
         .ok()
@@ -5131,6 +5175,17 @@ fn spawn_error_dialog(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admission_owned_reconciliation_uses_only_changed_paths() {
+        let scope = super::NativeDiscoveryScope::new(r"C:\watched".into(), None, Vec::new());
+        let changed = vec![r"C:\watched\new.zip".to_owned(), r"C:\outside\file.zip".to_owned()];
+        assert!(super::owned_checkpoint_paths(&scope, None, Some(&[]), false).is_empty());
+        assert_eq!(super::owned_checkpoint_paths(&scope, None, Some(&changed), false),
+            [r"C:\watched\new.zip"]);
+        assert_eq!(super::owned_checkpoint_paths(&scope, None, Some(&changed), true),
+            [r"C:\watched"]);
+    }
+
     use super::*;
     use crate::io::reader::capture_file_generation;
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
@@ -5444,11 +5499,11 @@ mod tests {
         };
         let passwords = crate::core::passwords::PasswordSnapshot::default();
         let entry = make_entry(&candidate, "carrier blocked", Some(carrier), None,
-            &passwords, &[], None, None);
+            &passwords, &user_password_signature(&[]), None, None);
         assert_eq!(entry.status, "suspended_missing_volume");
         assert_eq!(entry.failure_payload["blockers"], json!(["missing_volume", "password"]));
         assert_eq!(entry.failure_payload["password_signature"],
-            json!(password_source_signature(&[], &passwords.scope_signature(Path::new(promoted_path).parent().unwrap()))));
+            json!(password_source_signature(&user_password_signature(&[]), &passwords.scope_signature(Path::new(promoted_path).parent().unwrap()))));
         let retry_paths = outcome.archives.iter().filter(|archive| promoted_retry(archive, &failures))
             .map(|archive| key(&archive.path)).collect::<HashSet<_>>();
         assert_eq!(retry_paths.len(), 1, "one physical retry retains all logical receipts");
@@ -5564,11 +5619,11 @@ mod tests {
     #[test]
     fn configured_passwords_participate_in_watch_blocker_signatures() {
         let builtin = "a55be77812b08557859dab8291a7ac45";
-        assert_eq!(password_source_signature(&[], builtin), "1dc1efb66b9a5c864c8abd4d5e769223");
-        assert_ne!(password_source_signature(&["new password".into()], builtin),
-            password_source_signature(&[], builtin));
-        assert_ne!(password_source_signature(&["new password".into()], builtin),
-            password_source_signature(&["new password".into()], "changed builtin"));
+        assert_eq!(password_source_signature(&user_password_signature(&[]), builtin), "1dc1efb66b9a5c864c8abd4d5e769223");
+        assert_ne!(password_source_signature(&user_password_signature(&["new password".into()]), builtin),
+            password_source_signature(&user_password_signature(&[]), builtin));
+        assert_ne!(password_source_signature(&user_password_signature(&["new password".into()]), builtin),
+            password_source_signature(&user_password_signature(&["new password".into()]), "changed builtin"));
     }
 
     #[test]

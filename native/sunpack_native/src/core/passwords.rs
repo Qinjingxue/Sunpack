@@ -632,5 +632,16 @@ mod tests {
             snapshot.scope_signature(Path::new(r"C:\different")),
             "a55be77812b08557859dab8291a7ac45",
         );
+        // A scoped edit changes only receipts that inherit that bucket, not
+        // every password failure under an unrelated Watch root.
+        let mut changed = IndexBuilder::default();
+        Document::parse(&text.replace("\"value\":\"child\"", "\"value\":\"new child\""))
+            .unwrap().read_passwords(Some(&mut changed)).unwrap();
+        let changed = changed.finish(&snapshot);
+        assert_ne!(snapshot.scope_signature(Path::new(r"C:\Downloads\child\deep")),
+            changed.scope_signature(Path::new(r"C:\Downloads\child\deep")));
+        assert_eq!(snapshot.scope_signature(Path::new(r"C:\different")),
+            changed.scope_signature(Path::new(r"C:\different")));
+
     }
 }

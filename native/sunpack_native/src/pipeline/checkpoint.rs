@@ -267,10 +267,17 @@ impl InputCheckpoint {
         changed
     }
 
+    pub(super) fn relocate_flatten(&mut self, leaf: &Path, root: &Path) -> bool {
+        let wrapper = self.has_output() && leaf.starts_with(&self.output) && self.output.starts_with(root);
+        let changed = self.relocate(leaf, root);
+        if wrapper { self.output = root.to_path_buf(); }
+        changed || wrapper
+    }
+
     /// Apply the same publication path mapping as the output transaction.
     pub(crate) fn rebase_flatten(&mut self, root: &Path, work: &Path, leaf: &Path) -> bool {
         let changed = self.relocate(work, root);
-        self.relocate(leaf, root) || changed
+        self.relocate_flatten(leaf, root) || changed
     }
 
     pub(crate) fn has_output(&self) -> bool { !self.output.as_os_str().is_empty() }

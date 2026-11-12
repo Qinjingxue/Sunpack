@@ -7,7 +7,7 @@ use crate::password;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BATCH_SIZE: usize = 256;
 const MAX_SUCCESSES: usize = 1024;
@@ -181,7 +181,8 @@ impl AttemptCache {
 #[derive(Clone)]
 pub(super) struct CandidateSet {
     explicit: Arc<[Arc<str>]>,
-    snapshot: Option<Arc<PasswordSnapshot>>,
+    snapshot: Arc<PasswordSnapshot>,
+    explicit_signature: Arc<OnceLock<String>>,
     cache: AttemptCache,
     inherited_scope: Option<Arc<Path>>,
 }
@@ -195,7 +196,8 @@ impl CandidateSet {
     ) -> Self {
         Self {
             explicit,
-            snapshot,
+            snapshot: snapshot.unwrap_or_default(),
+            explicit_signature: Arc::new(OnceLock::new()),
             cache: cache.clone(),
             inherited_scope: inherited_scope.map(Arc::from),
         }
@@ -205,33 +207,41 @@ impl CandidateSet {
         CandidateSet {
             explicit: Arc::clone(&self.explicit),
             snapshot: self.snapshot.clone(),
+            explicit_signature: self.explicit_signature.clone(),
             cache: self.cache.clone(),
             inherited_scope: self.inherited_scope.clone().or_else(|| scope.map(Arc::from)),
         }
     }
 
     pub(super) fn signature(&self, path: &str) -> String {
+        // Only password-failure receipts ask for this. Pin the explicit digest
+        // once per request and share it with nested scopes; builtin snapshots
+        // already cache each bucket, so rechecking N failures never rehashes P
+        // password strings for every entry.
+        let explicit = self.explicit_signature.get_or_init(|| {
+            let mut hash = crate::fast_hash_core::Hash128::new();
+            hash.update(&(self.explicit.len() as u64).to_le_bytes());
+            for password in self.explicit.iter() {
+                hash.update(&(password.len() as u64).to_le_bytes());
+                hash.update(password.as_bytes());
+            }
+            hash.hexdigest()
+        });
         let mut hash = crate::fast_hash_core::Hash128::new();
-        for password in self.configured(path) {
-            hash.update(&(password.len() as u64).to_le_bytes());
-            hash.update(password.as_bytes());
-        }
+        hash.update(explicit.as_bytes());
+        hash.update(self.snapshot.scope_signature(self.scope(path)).as_bytes());
         hash.hexdigest()
     }
 
+    fn scope<'b>(&'b self, path: &'b str) -> &'b Path {
+        self.inherited_scope.as_deref()
+            .unwrap_or_else(|| Path::new(path).parent().unwrap_or_else(|| Path::new(path)))
+    }
+
     fn configured<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
-        let scope = self
-            .inherited_scope.as_deref()
-            .unwrap_or_else(|| Path::new(path).parent().unwrap_or_else(|| Path::new(path)));
-        self.snapshot.as_deref()
-            .into_iter()
-            .flat_map(move |snapshot| snapshot.scoped(scope).flatten())
+        self.snapshot.scoped(self.scope(path)).flatten()
             .chain(self.explicit.iter())
-            .chain(
-                self.snapshot.as_deref()
-                    .into_iter()
-                    .flat_map(|snapshot| snapshot.global().iter()),
-            )
+            .chain(self.snapshot.global().iter())
     }
 
     fn for_path<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
@@ -638,6 +648,33 @@ mod tests {
         cache.reject(left, &[Arc::from("wrong")]);
         assert!(cache.proof(&right).is_none());
         assert!(!cache.remove_rejected(&right, &mut vec![Arc::from("wrong")]));
+    }
+
+    #[test]
+    fn failure_signatures_share_lazy_explicit_digest_without_changing_candidates() {
+        let cache = AttemptCache::default();
+        let values = Arc::from([Arc::from(""), Arc::from("first"), Arc::from("second")]);
+        let candidates = CandidateSet::new(values, None, &cache, None);
+        let inherited = candidates.with_scope(Some(Path::new(r"C:\root")));
+        // Successful planning/display does not compute receipt fingerprints.
+        assert_eq!(candidates.for_embedded(r"C:\root\input.zip"),
+            [Arc::<str>::from(""), Arc::from("first"), Arc::from("second")]);
+        assert!(candidates.explicit_signature.get().is_none());
+        assert!(Arc::ptr_eq(&candidates.explicit_signature, &inherited.explicit_signature));
+        let signature = candidates.signature(r"C:\root\input.zip");
+        let digest = candidates.explicit_signature.get().unwrap().as_ptr();
+        for index in 0..256 {
+            assert_eq!(inherited.signature(&format!(r"C:\nested\{index}.zip")), signature);
+            assert_eq!(inherited.explicit_signature.get().unwrap().as_ptr(), digest);
+        }
+        let reordered = CandidateSet::new(
+            Arc::from([Arc::from(""), Arc::from("second"), Arc::from("first")]), None, &cache, None);
+        assert_ne!(signature, reordered.signature(r"C:\root\input.zip"));
+        let empty = CandidateSet::new(Arc::from([Arc::from("")]), None, &cache, None);
+        let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
+        assert_ne!(empty.signature("input.zip"), absent.signature("input.zip"));
+        let empty_snapshot = CandidateSet::new(Arc::from([]), Some(Arc::default()), &cache, None);
+        assert_eq!(absent.signature("input.zip"), empty_snapshot.signature("input.zip"));
     }
 
     #[test]

@@ -1214,7 +1214,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 })
                 .collect();
-            let carrier = if this.request.mode == Mode::Extract && multi {
+            let mut carrier = if this.request.mode == Mode::Extract && multi {
                 let existing = retained
                     .iter()
                     .flatten()
@@ -1245,6 +1245,7 @@ impl<'run, O: Observer> Run<'run, O> {
             };
             let mut completed = Vec::with_capacity(task.inputs.len());
             let mut outputs_committed = true;
+            let mut carrier_children_complete = true;
             let mut children = Outcome::default();
             let mut parent_outputs = Vec::with_capacity(count);
             let retry = task.retry.filter(|_| task.inputs.len() == 1);
@@ -1501,6 +1502,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 stage("output_state", &Cancellation::new()).await?;
                 let children_complete = children_already_complete
                     || (!cancel.cancelled() && subtree_complete(&descendants));
+                carrier_children_complete &= children_complete;
                 if ran_recursive_children
                     && result.failure.is_none()
                     && children_complete
@@ -1580,6 +1582,29 @@ impl<'run, O: Observer> Run<'run, O> {
                     .cleanup_results
                     .append(&mut descendants.cleanup_results);
                 completed.push(result);
+            }
+            // Only the final carrier namespace is flattened. Individual segment
+            // layouts remain intact while any input or recursive subtree may resume.
+            if multi && outputs_committed && carrier_children_complete
+                && completed.iter().all(|result| result.failure.is_none() && !result.retained)
+                && this.request.config.post_extract.flatten_single_directory
+                && !cancel.cancelled()
+            {
+                if let Some(root) = carrier.clone().filter(|_| completed.iter().any(|result| result.output.is_some())) {
+                    this.drain_cleanup(Some(&root), &mut children).await;
+                    stage("postprocess", cancel).await?;
+                    let child_count = children.archives.len();
+                    children.archives.append(&mut completed);
+                    children.checkpoints.append(&mut outcome.checkpoints);
+                    let input = ArchiveInput::file(owner_path.to_string_lossy().into_owned(), String::new(), String::new());
+                    let mut container = receipt(&input, task.source, depth);
+                    container.output = Some(root.clone());
+                    let flattened = flatten_result(&*this.observer, &mut container, &mut children, Some(&this.created_outputs));
+                    completed = children.archives.split_off(child_count);
+                    outcome.checkpoints.append(&mut children.checkpoints);
+                    carrier = container.output;
+                    flattened?;
+                }
             }
             if multi && outputs_committed && children.settled()
                 && completed.iter().all(|result| !result.failure.as_ref()
@@ -2340,7 +2365,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             }
                         }
                     }
-                    failure.evidence = worker_evidence(value, frame.recovery.take());
+                    failure.evidence = worker_evidence(value, frame.recovery.take(), plan.evidence);
                     result.failure = Some(failure);
                 }
             }
@@ -2594,13 +2619,16 @@ fn flatten_result(
             created.lock().unwrap().relocate(&old, &new);
         }
         for checkpoint in &mut children.checkpoints {
-            checkpoint.relocate(&old, &new);
+            checkpoint.relocate_flatten(&old, &new);
             observer.checkpoint(checkpoint)?;
         }
         for child in &mut children.archives {
             if let Some(path) = child.output.as_mut() {
                 if let Ok(suffix) = path.strip_prefix(&old) {
                     *path = new.join(suffix);
+                } else if old.starts_with(&*path) && path.starts_with(&new) {
+                    // A carrier segment may own a wrapper above the leaf.
+                    *path = new.clone();
                 }
             }
         }
@@ -2696,6 +2724,7 @@ fn flag(result: &Value, name: &str) -> bool {
 fn worker_evidence(
     result: &Value,
     recovery: Option<super::RecoveryPreview>,
+    password_evidence: Option<&str>,
 ) -> Option<Box<FailureEvidence>> {
     let diagnostics = &result["diagnostics"];
     let field = |name: &str| {
@@ -2704,6 +2733,20 @@ fn worker_evidence(
             (!text.is_empty()).then(|| text.to_owned())
         })
     };
+    let hresult = result.get("hresult").or_else(|| diagnostics.get("hresult")).and_then(Value::as_i64);
+    // Keep the scalar proof behind the classification, not passwords or the
+    // complete worker payload. Main exposes these in its failure details.
+    let weak_failure = weak_password_failure(result, password_evidence);
+    let (classification_evidence, password_crc_proven_items, backend_operation_result) =
+        if weak_failure && flag(result, "password_crc_proven") {
+            (Some("entry_crc_proven_before_failure".to_owned()),
+             Some(worker::number(result, "password_crc_proven_items")), None)
+        } else if weak_failure {
+            (Some(if password_evidence == Some("empty_password_direct") {
+                "empty_password_failed_without_crc_proof"
+            } else { "zipcrypto_failure_without_password_proof" }.to_owned()),
+             None, Some(worker::string(result, "operation_result_name").to_owned()))
+        } else { (None, None, None) };
     let stderr_tail = field("stderr_tail");
     let stage = field("failure_stage");
     let native_kind = field("failure_kind");
@@ -2727,7 +2770,7 @@ fn worker_evidence(
         read_error,
     });
     let recovery = recovery.filter(|preview| !preview.files.is_empty());
-    (missing_volume_suspected || stderr_tail.is_some()
+    (hresult.is_some() || classification_evidence.is_some() || missing_volume_suspected || stderr_tail.is_some()
         || stage.is_some()
         || native_kind.is_some()
         || missing_volume_name.is_some()
@@ -2736,6 +2779,7 @@ fn worker_evidence(
         || recovery.is_some())
     .then(|| {
         Box::new(FailureEvidence {
+            hresult, classification_evidence, password_crc_proven_items, backend_operation_result,
             missing_volume_suspected,
             stderr_tail,
             stage,
@@ -2747,6 +2791,14 @@ fn worker_evidence(
             ..Default::default()
         })
     })
+}
+
+fn weak_password_failure(result: &Value, evidence: Option<&str>) -> bool {
+    (evidence == Some("zipcrypto_header_byte")
+        || (evidence == Some("empty_password_direct") && flag(result, "encrypted")))
+        && (matches!(worker::string(result, "operation_result_name"), "wrong_password" | "data_error" | "crc_error")
+            || matches!(worker::string(result, "failure_kind"),
+                "encrypted_or_wrong_password" | "data_error" | "checksum_error" | "crc_error"))
 }
 
 fn classify_worker_failure(
@@ -2775,8 +2827,6 @@ fn classify_worker_failure(
         || native == "damaged"
         || damaged_kind(failure)
         || damaged_kind(diagnostic_failure);
-    let weak_password = password_evidence == Some("zipcrypto_header_byte")
-        || (password_evidence == Some("empty_password_direct") && flag(result, "encrypted"));
     let kind = if failure == "resource_unavailable"
         || matches!(hresult, Some(0x80070008 | 0x8007000e | 0x800705af))
     {
@@ -2787,12 +2837,7 @@ fn classify_worker_failure(
         FailureKind::PasswordInconclusive
     } else if flag(result, "password_candidates_all_rejected") {
         return Failure::password();
-    } else if weak_password
-        && (matches!(operation, "wrong_password" | "data_error" | "crc_error")
-            || matches!(
-                failure,
-                "encrypted_or_wrong_password" | "data_error" | "checksum_error" | "crc_error"
-            ))
+    } else if weak_password_failure(result, password_evidence)
     {
         if flag(result, "password_crc_proven") {
             FailureKind::Damaged
@@ -3076,10 +3121,11 @@ fn numbered(path: &Path, index: usize) -> PathBuf {
 
 fn numbered_suffix(name: &str) -> Option<(&str, usize)> {
     let (base, index) = name.strip_suffix(')')?.rsplit_once('(')?;
-    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    Some((base, index.parse().ok()?))
+    if index.is_empty() { return None; }
+    let index = index.chars().try_fold(0usize, |value, character| {
+        value.checked_mul(10)?.checked_add(crate::core::config::decimal_digit(character)? as usize)
+    })?;
+    Some((base, index))
 }
 
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
@@ -3502,8 +3548,36 @@ mod tests {
 
 
     #[test]
+    fn worker_failure_proof_survives_json_and_streamed_report() {
+        let cases = [
+            (json!({"failure_kind":"resource_unavailable", "diagnostics":{"hresult":-2147024882i64}}), None,
+                json!({"hresult":-2147024882i64})),
+            (json!({"failure_kind":"checksum_error", "operation_result_name":"crc_error",
+                "password_crc_proven":true, "password_crc_proven_items":2}), Some("zipcrypto_header_byte"),
+                json!({"classification_evidence":"entry_crc_proven_before_failure", "password_crc_proven_items":2})),
+            (json!({"failure_kind":"checksum_error", "operation_result_name":"crc_error"}), Some("zipcrypto_header_byte"),
+                json!({"classification_evidence":"zipcrypto_failure_without_password_proof", "backend_operation_result":"crc_error"})),
+            (json!({"failure_kind":"checksum_error", "operation_result_name":"crc_error", "encrypted":true}), Some("empty_password_direct"),
+                json!({"classification_evidence":"empty_password_failed_without_crc_proof", "backend_operation_result":"crc_error"})),
+        ];
+        for (worker, proof, expected) in cases {
+            let mut failure = classify_worker_failure(&worker, proof, false);
+            failure.evidence = worker_evidence(&worker, None, proof);
+            let mut report = Vec::new();
+            crate::failure_report::stream_json(&mut report, &failure, false, &Cancellation::new()).unwrap();
+            let value: Value = serde_json::from_slice(&report).unwrap();
+            for (key, expected) in expected.as_object().unwrap() {
+                assert_eq!(&value["evidence"][key], expected);
+            }
+            let restored: Failure = serde_json::from_value(value).unwrap();
+            assert_eq!(restored.kind, failure.kind);
+            assert_eq!(restored.is_password_retry(), failure.is_password_retry());
+        }
+    }
+
+    #[test]
     fn worker_stderr_survives_failure_evidence_serialization() {
-        let evidence = worker_evidence(&json!({"stderr_tail":"native detail\n"}), None).unwrap();
+        let evidence = worker_evidence(&json!({"stderr_tail":"native detail\n"}), None, None).unwrap();
         let encoded = serde_json::to_value(&evidence).unwrap();
         assert_eq!(encoded["stderr_tail"], "native detail\n");
         let decoded: FailureEvidence = serde_json::from_value(encoded).unwrap();
@@ -3535,7 +3609,7 @@ mod tests {
         ];
         for (worker, evidence, kind, retry) in cases {
             let mut failure = classify_worker_failure(&worker, evidence, true);
-            failure.evidence = worker_evidence(&worker, None);
+            failure.evidence = worker_evidence(&worker, None, evidence);
             assert_eq!(failure.kind, kind, "{worker}");
             let failure: Failure = serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
             assert_eq!(failure.is_password_retry(), retry, "{worker}");
@@ -4540,6 +4614,7 @@ mod tests {
                 }],
                 errors: Vec::new(),
                 scan_errors: DirectoryReadErrors::report(),
+                blocked_paths: HashSet::new(),
             };
             let error = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
                 Box::pin(run.execute_batch(batch, 2, None, None, spawner))
@@ -4936,7 +5011,7 @@ mod tests {
             let mut result = receipt(&input, DiscoverySource::Direct, 1);
             result.partial = partial;
             let mut failure = Failure::new(kind, "native cause");
-            failure.evidence = worker_evidence(&json!({"missing_volume_suspected": suspected}), None);
+            failure.evidence = worker_evidence(&json!({"missing_volume_suspected": suspected}), None, None);
             result.failure = Some(failure);
             project_possible_missing_volume(std::slice::from_mut(&mut result), split);
             let failure = result.failure.unwrap();
@@ -5313,6 +5388,7 @@ mod tests {
             }],
             errors: Vec::new(),
             scan_errors: DirectoryReadErrors::report(),
+            blocked_paths: HashSet::new(),
         };
         let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
             Box::pin(run.execute_batch(batch, 2, None, Some((1, &parent)), spawner))
@@ -5321,6 +5397,18 @@ mod tests {
         assert_eq!(outcome.archives[0].failure.as_ref().unwrap().kind, FailureKind::Cancelled);
         assert!(!subtree_complete(&outcome));
         assert!(!is_cancellation(&io::Error::other("journal failure")));
+    }
+
+    #[test]
+    fn numbered_outputs_share_unicode_decimal_syntax_with_recursion() {
+        for name in ["archive(１)", "archive(١)", "archive(𝟙)"] {
+            let path = Path::new(name);
+            assert_eq!(numbered(path, 1), PathBuf::from("archive(2)"));
+            assert!(output_candidate(path, Path::new("archive(2)")));
+        }
+        for name in ["archive(²)", "archive(+1)", "archive(1_0)"] {
+            assert_eq!(numbered(Path::new(name), 1), PathBuf::from(format!("{name}(1)")));
+        }
     }
 
     #[test]

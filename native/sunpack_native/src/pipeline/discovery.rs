@@ -66,6 +66,7 @@ pub(super) struct Discovered {
     pub tasks: Vec<Task>,
     pub errors: Vec<InputError>,
     pub scan_errors: DirectoryReadErrors,
+    pub(super) blocked_paths: HashSet<String>,
 }
 
 impl Default for Discovered {
@@ -74,6 +75,7 @@ impl Default for Discovered {
             tasks: Vec::new(),
             errors: Vec::new(),
             scan_errors: DirectoryReadErrors::report(),
+            blocked_paths: HashSet::new(),
         }
     }
 }
@@ -379,7 +381,10 @@ pub(super) fn discover(
             .collect();
         for path in files
             .into_iter()
-            .filter(|path| !covered.contains(&path_key(path)))
+            .filter(|path| {
+                let key = path_key(path);
+                !covered.contains(&key) && !result.blocked_paths.contains(&key)
+            })
         {
             let name = filesystem_logical_name(&path);
             result.tasks.push(Task::single(
@@ -692,6 +697,7 @@ impl Discovered {
                     if let Some(error) = row.error {
                         let (path, format) = table.summary(row.index)?;
                         if format.is_empty() {
+                            self.blocked_paths.insert(path_key(&path));
                             self.scan_errors.push_detail(
                                 Path::new(&path),
                                 "embedded_scan",
