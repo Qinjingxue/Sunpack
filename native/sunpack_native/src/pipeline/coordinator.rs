@@ -1306,13 +1306,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 && completed.iter().any(|result| result.failure.is_some() && !result.partial)
                 && completed.iter().any(|result| {
                     result.failure.as_ref().is_some_and(|failure| {
-                        matches!(
-                            failure.kind,
-                            FailureKind::PasswordRequired
-                                | FailureKind::WrongPassword
-                                | FailureKind::PasswordInconclusive
-                                | FailureKind::MissingVolume
-                        )
+                        failure.is_password_retry() || failure.kind == FailureKind::MissingVolume
                     })
                 })
             {
@@ -2446,14 +2440,17 @@ fn classify_worker_failure(
         FailureKind::Unknown
     };
     let message = worker::string(result, "message");
-    Failure::new(
+    let mut classified = Failure::new(
         kind,
         if message.is_empty() {
             format!("{kind:?}")
         } else {
             message.to_owned()
         },
-    )
+    );
+    classified.password_retry = kind == FailureKind::PasswordInconclusive
+        && failure == "password_or_volume_inconclusive";
+    classified
 }
 
 fn recoverable_file_count(frame: &WorkerFrame) -> usize {
@@ -3081,6 +3078,55 @@ impl Drop for Lease<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn password_evidence_controls_retry_without_reclassifying_weak_crc_damage() {
+        // A kind-only test cannot distinguish the two inconclusive outcomes.
+        // Exercise worker classification, retained evidence, serialization and
+        // the shared physical-input projection used by Watch and notifications.
+        let cases = [
+            (serde_json::json!({"failure_kind": "checksum_error", "operation_result_name": "crc_error"}),
+                Some("zipcrypto_header_byte"), FailureKind::PasswordInconclusive, false),
+            (serde_json::json!({"operation_result_name": "crc_error",
+                "diagnostics": {"failure_kind": "password_or_volume_inconclusive"}}),
+                Some("zipcrypto_header_byte"), FailureKind::PasswordInconclusive, false),
+            (serde_json::json!({"failure_kind": "password_or_volume_inconclusive"}),
+                Some("zipcrypto_header_byte"), FailureKind::PasswordInconclusive, true),
+            (serde_json::json!({"failure_kind": "checksum_error", "operation_result_name": "crc_error",
+                "password_crc_proven": true}),
+                Some("zipcrypto_header_byte"), FailureKind::Damaged, false),
+            (serde_json::json!({"failure_kind": "checksum_error", "encrypted": true}),
+                Some("empty_password_direct"), FailureKind::WrongPassword, true),
+            (serde_json::json!({"password_candidates_all_rejected": true}),
+                Some("zipcrypto_header_byte"), FailureKind::WrongPassword, true),
+            (serde_json::json!({"failure_kind": "checksum_error"}),
+                Some("strong_password_proof"), FailureKind::Damaged, false),
+        ];
+        for (worker, evidence, kind, retry) in cases {
+            let mut failure = classify_worker_failure(&worker, evidence, true);
+            failure.evidence = worker_evidence(&worker, None);
+            assert_eq!(failure.kind, kind, "{worker}");
+            let failure: Failure = serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
+            assert_eq!(failure.is_password_retry(), retry, "{worker}");
+            let outcome = Outcome {
+                archives: vec![ArchiveResult {
+                    path: "carrier.bin".into(), format: "zip".into(), output: None,
+                    failure: Some(failure), files: 0, bytes: 0, encrypted: Some(true),
+                    depth: 1, offset: 123, end_offset: None, volume_completeness: None,
+                    volume_attempts: None, source_paths: vec!["carrier.bin".into()],
+                    password: None, discovery_source: DiscoverySource::Direct,
+                    damage_flags: None, partial: false, retained: false,
+                    recovered_complete_files: 0, promoted: false, promotion_original_path: None,
+                }],
+                ..Outcome::default()
+            };
+            let failures = outcome.input_failures();
+            let failure = failures.values().next().unwrap();
+            assert_eq!(failure.retryable(), retry, "{worker}");
+            assert_eq!(failure.terminal.is_some(), !retry, "{worker}");
+        }
+    }
 
     #[test]
     fn cancelled_startup_is_shared_until_cleanup_then_live_borrowers_retry() {

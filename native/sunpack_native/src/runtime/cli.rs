@@ -664,20 +664,11 @@ fn password_failure(archive: &ArchiveResult) -> bool {
     archive
         .failure
         .as_ref()
-        .is_some_and(|failure| is_password_failure(failure.kind))
-}
-
-fn is_password_failure(kind: FailureKind) -> bool {
-    matches!(
-        kind,
-        FailureKind::PasswordRequired
-            | FailureKind::WrongPassword
-            | FailureKind::PasswordInconclusive
-    )
+        .is_some_and(|failure| failure.is_password_retry())
 }
 
 fn failure_message(failure: &crate::pipeline::Failure, language: Language) -> &str {
-    if is_password_failure(failure.kind) {
+    if failure.is_password_retry() {
         language.text("failure.password_not_in_list")
     } else {
         &failure.message
@@ -1173,7 +1164,7 @@ impl<'a> ScopeReport<'a> {
             .as_ref()
             .filter(|_| !item.partial || self.verbose)
         {
-            if !is_password_failure(failure.kind) {
+            if !failure.is_password_retry() {
                 Self::title(
                     writer,
                     prefix,

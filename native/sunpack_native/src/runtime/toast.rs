@@ -4,7 +4,7 @@ use crate::failure_report::{append_failure_report, publish_failure_report, Failu
 use crate::pipeline::{
     Cancellation, CleanupStatus, Event, FailureKind, InputErrorKind, Outcome, ResourceWait, TaskId,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -34,7 +34,7 @@ impl Snapshot {
         let completed = totals.done_bytes + totals.written;
         let total = totals.done_bytes + totals.planned;
         let finished = group.summary.completed();
-        let count = finished + group.active_requests;
+        let count = finished + group.active_roots;
         let disk = totals.disk != 0;
         let memory = totals.memory != 0;
         let progress = (totals.unknown == 0 && total != 0 && !disk && !memory && !group.stopping)
@@ -305,7 +305,7 @@ struct Group {
     visible: bool,
     stopping: bool,
     requests: HashMap<Arc<str>, RequestProgress>,
-    active_requests: usize,
+    active_roots: usize,
     finalize_at: Option<Instant>,
     finalizing: bool,
     generation: u64,
@@ -336,6 +336,11 @@ struct Completed {
 #[derive(Default)]
 struct RequestProgress {
     tasks: HashMap<TaskId, TaskProgress>,
+    paths: HashMap<TaskId, PathBuf>,
+    started: HashSet<PathBuf>,
+    roots: HashMap<TaskId, PathBuf>,
+    task_roots: HashMap<TaskId, TaskId>,
+    visible_roots: HashSet<TaskId>,
     name: Option<(TaskId, String)>,
     visible: bool,
     done_bytes: u128,
@@ -407,7 +412,7 @@ impl Group {
             visible: false,
             stopping: false,
             requests: HashMap::new(),
-            active_requests: 0,
+            active_roots: 0,
             finalize_at: None,
             finalizing: false,
             generation: 0,
@@ -425,19 +430,26 @@ impl Group {
         let id = match event {
             Event::Queued { id, parent, segment, path, .. } => {
                 if segment.is_some() {
+                    if let Some(parent) = parent { request.paths.remove(&parent); }
                     if let Some(task) = parent.and_then(|parent| tasks.remove(&parent)) {
                         self.totals.remove(task, false);
                     }
                 }
+                let root = parent.and_then(|parent| request.task_roots.get(&parent).copied())
+                    .unwrap_or(id);
+                request.task_roots.insert(id, root);
+                if parent.is_none() { request.roots.insert(id, path.clone()); }
                 if parent.is_none() && request.name.is_none() {
                     let name = path.file_name().unwrap_or(path.as_os_str())
                         .to_string_lossy().into_owned();
                     request.name = Some((id, name));
                 }
+                request.paths.insert(id, path);
                 tasks.entry(id).or_default();
                 return request.visible;
             }
             Event::Finished { id, .. } | Event::Skipped { id } => {
+                request.paths.remove(&id);
                 if let Some(task) = tasks.remove(&id) {
                     let finished = matches!(event, Event::Finished { .. });
                     self.totals.remove(task, finished);
@@ -477,9 +489,21 @@ impl Group {
             Event::Finalizing { .. } => task.wait = ResourceWait::default(),
             _ => unreachable!(),
         }
-        if task.visible && !request.visible {
-            request.visible = true;
-            self.active_requests += 1;
+        if task.visible && !before.visible {
+            if let Some(path) = request.paths.get(&id) {
+                request.started.insert(path.clone());
+            }
+        }
+        if task.visible && request.visible_roots.insert(request.task_roots[&id]) {
+            if !request.visible {
+                if let Some(path) = request.roots.get(&request.task_roots[&id]) {
+                    let name = path.file_name().unwrap_or(path.as_os_str())
+                        .to_string_lossy().into_owned();
+                    request.name = Some((request.task_roots[&id], name));
+                }
+                request.visible = true;
+            }
+            self.active_roots += 1;
             self.generation = self.generation.wrapping_add(1);
             self.finalize_at = None;
             if !self.visible {
@@ -510,7 +534,7 @@ impl Group {
         if !accepted {
             self.totals.done_bytes -= request.done_bytes;
         }
-        self.active_requests -= usize::from(request.visible);
+        self.active_roots -= request.visible_roots.len();
         if self.requests.capacity() > 256 {
             crate::collections::trim_map(&mut self.requests);
         }
@@ -528,7 +552,7 @@ impl Group {
     }
 
     fn pending(&self) -> bool {
-        self.active_requests != 0 || (self.stopping && !self.requests.is_empty())
+        self.active_roots != 0 || (self.stopping && !self.requests.is_empty())
     }
 }
 
@@ -592,10 +616,12 @@ impl Summary {
         cancelled: bool,
         output_cleanup_failed: bool,
         visible: bool,
+        owner: &impl Fn(&Path) -> Option<String>,
+        started: Option<&HashSet<String>>,
     ) -> Self {
         if cancelled {
             return Self {
-                interrupted: 1,
+                interrupted: started.map_or(1, |roots| roots.len().max(1)),
                 rollback_failed: output_cleanup_failed,
                 ..Self::default()
             };
@@ -606,29 +632,31 @@ impl Summary {
         let mut summary = Self::default();
         match result {
             Ok(outcome) => {
-                // Watch reports one terminal result per request, not one per
-                // nested archive. Physical inputs combine carrier causes;
-                // independent terminal inputs win over retry-only blockers.
-                let failures = outcome.input_failures();
-                if outcome.errors.iter().any(|error| error.kind == InputErrorKind::InvalidInput)
-                    || failures.values().any(|input| input.failed && !input.retryable())
-                {
-                    summary.failed = 1;
-                } else if failures.values().any(|input| input.retryable()) {
-                    return summary;
-                } else if outcome.archives.iter().any(|archive| {
-                    archive.failure.is_none() || archive.partial
-                }) {
-                    summary.succeeded = 1;
-                    let mut outputs = outcome.archives.iter()
-                        .filter_map(|archive| archive.output.as_deref());
+                let roots = completion_roots(outcome, owner);
+                for (root, completion) in &roots {
+                    if started.is_some_and(|started| !started.contains(root)) {
+                        continue;
+                    }
+                    if completion.terminal {
+                        summary.failed += 1;
+                    } else if !completion.retry && completion.accepted {
+                        summary.succeeded += 1;
+                    }
+                }
+                if summary.succeeded != 0 {
+                    let mut outputs = outcome.archives.iter().filter(|archive| {
+                        let root = archive_owner(archive, owner);
+                        roots.get(&root).is_some_and(|completion| completion.accepted
+                            && !completion.terminal && !completion.retry)
+                            && started.is_none_or(|started| started.contains(&root))
+                    }).filter_map(|archive| archive.output.as_deref());
                     summary.output = crate::pipeline::common_ancestor(outputs.clone())
                         .or_else(|| outputs.next().map(Path::to_owned));
                 }
                 summary.cleanup_failed = outcome.cleanup_results.iter()
                     .filter(|result| result.status == CleanupStatus::Failed).count();
             }
-            Err(_) => summary.failed = 1,
+            Err(_) => summary.failed = started.map_or(1, |roots| roots.len().max(1)),
         }
         summary.cleanup_failed += usize::from(output_cleanup_failed);
         summary
@@ -650,6 +678,46 @@ impl Summary {
             };
         }
     }
+}
+
+// A native batch can contain many independent top-level tasks. Keep carrier
+// retry evidence physical-input scoped, then project each input to its owner.
+#[derive(Default)]
+struct RootCompletion {
+    accepted: bool,
+    terminal: bool,
+    retry: bool,
+}
+
+fn result_owner(path: &Path, owner: &impl Fn(&Path) -> Option<String>) -> String {
+    owner(path).unwrap_or_else(|| crate::path_keys::path_key(&path.to_string_lossy()))
+}
+
+fn archive_owner(
+    archive: &crate::pipeline::ArchiveResult,
+    owner: &impl Fn(&Path) -> Option<String>,
+) -> String {
+    result_owner(archive.promotion_original_path.as_deref().unwrap_or(&archive.path), owner)
+}
+
+fn completion_roots(
+    outcome: &Outcome,
+    owner: &impl Fn(&Path) -> Option<String>,
+) -> HashMap<String, RootCompletion> {
+    let failures = outcome.input_failures();
+    let mut roots: HashMap<String, RootCompletion> = HashMap::new();
+    for archive in &outcome.archives {
+        let root = roots.entry(archive_owner(archive, owner)).or_default();
+        root.accepted |= archive.failure.is_none() || archive.partial;
+        if let Some(input) = failures.get(&crate::path_keys::path_key(&archive.path.to_string_lossy())) {
+            root.retry |= input.retryable();
+            root.terminal |= input.failed && !input.retryable();
+        }
+    }
+    for error in outcome.errors.iter().filter(|error| error.kind == InputErrorKind::InvalidInput) {
+        roots.entry(result_owner(&error.path, owner)).or_default().terminal = true;
+    }
+    roots
 }
 
 #[derive(Default)]
@@ -769,8 +837,9 @@ impl Activity {
         result: &io::Result<Outcome>,
         cancelled: bool,
         output_cleanup_failed: bool,
+        owner: impl Fn(&Path) -> Option<String>,
     ) {
-        let visible = {
+        let (visible, started) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping {
                 return;
@@ -780,11 +849,13 @@ impl Activity {
             else {
                 return;
             };
-            request.visible
+            (request.visible, if cancelled { request.roots.values().cloned().collect() } else { request.started.clone() })
         };
         // Receipt projection can be large. It must not hold the presentation
         // gate or prevent disable from cancelling an active report writer.
-        let summary = Summary::for_result(result, cancelled, output_cleanup_failed, visible);
+        let started = started.iter().map(|path| result_owner(path, &owner)).collect();
+        let summary = Summary::for_result(result, cancelled, output_cleanup_failed, visible,
+            &owner, Some(&started));
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping {
             return;
@@ -805,8 +876,9 @@ impl Activity {
         path: &Path,
         result: &io::Result<Outcome>,
         ignore_request_error: bool,
+        owner: impl Fn(&Path) -> Option<String>,
     ) {
-        let (id, language, report) = {
+        let (id, language, report, started) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping || ignore_request_error {
                 return;
@@ -819,9 +891,12 @@ impl Activity {
             if !group.requests[&self.request].visible {
                 return;
             }
-            (Arc::clone(&group.id), group.language, Arc::clone(&group.report))
+            (Arc::clone(&group.id), group.language, Arc::clone(&group.report),
+                group.requests[&self.request].started.clone())
         };
-        if let Err(error) = self.publisher.reports.append(&id, language, &report, path, result) {
+        let started = started.iter().map(|path| result_owner(path, &owner)).collect();
+        if let Err(error) = self.publisher.reports.append(&id, language, &report, path, result,
+            &owner, Some(&started)) {
             if !self.publisher.reports.cancellation.cancelled() {
                 eprintln!("SunPack toast failure report: {error}");
             }
@@ -900,15 +975,16 @@ impl Reports {
         report: &Mutex<ReportDraft>,
         path: &Path,
         result: &io::Result<Outcome>,
+        owner: &impl Fn(&Path) -> Option<String>,
+        started: Option<&HashSet<String>>,
     ) -> io::Result<()> {
         self.cancellation.check_io()?;
         let inputs = result.as_ref().ok().map(Outcome::input_failures);
-        if let Ok(outcome) = result {
-            if !inputs.as_ref().unwrap().values().any(|input| input.failed && !input.retryable())
-                && !outcome.errors.iter().any(|error| error.kind == InputErrorKind::InvalidInput)
-            {
-                return Ok(());
-            }
+        let roots = result.as_ref().ok().map(|outcome| completion_roots(outcome, owner));
+        let terminal = |root: &str| started.is_none_or(|started| started.contains(root))
+            && roots.as_ref().is_some_and(|roots| roots.get(root).is_some_and(|root| root.terminal));
+        if roots.as_ref().is_some_and(|roots| !roots.keys().any(|root| terminal(root))) {
+            return Ok(());
         }
         let mut draft = report.lock().unwrap();
         if draft.poisoned {
@@ -936,7 +1012,8 @@ impl Reports {
                             continue;
                         };
                         let key = crate::path_keys::path_key(&archive.path.to_string_lossy());
-                        if inputs.as_ref().unwrap().get(&key)
+                        if terminal(&archive_owner(archive, owner))
+                            && inputs.as_ref().unwrap().get(&key)
                             .is_some_and(|input| input.failed && !input.retryable())
                         {
                             spool.append(&archive.path, &failure.message, failure)?;
@@ -945,7 +1022,8 @@ impl Reports {
                     for error in outcome
                         .errors
                         .iter()
-                        .filter(|error| error.kind == InputErrorKind::InvalidInput)
+                        .filter(|error| error.kind == InputErrorKind::InvalidInput
+                            && terminal(&result_owner(&error.path, owner)))
                     {
                         spool.append(&error.path, &error.message, error)?;
                     }
@@ -1258,6 +1336,8 @@ mod tests {
     use super::*;
     use crate::pipeline::{ArchiveResult, CleanupResult, Segment};
 
+    fn one_root(_: &Path) -> Option<String> { Some("root".into()) }
+
     fn queued(id: TaskId, path: &str, parent: Option<TaskId>, index: usize) -> Event {
         Event::Queued {
             id,
@@ -1361,8 +1441,8 @@ mod tests {
             Language::En.text("interrupt.stopping_title")
         );
 
-        a.finish(&Err(io::Error::other("output deletion failed")), true, true);
-        b.finish(&Ok(Outcome::default()), true, false);
+        a.finish(&Err(io::Error::other("output deletion failed")), true, true, one_root);
+        b.finish(&Ok(Outcome::default()), true, false, one_root);
         assert!(publisher.stop_group(&initial.batch).is_empty());
         assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
         finish_debounce(&publisher);
@@ -1385,7 +1465,7 @@ mod tests {
             error_code: 5,
             message: "Access denied".to_owned(),
         });
-        later.finish(&Ok(outcome), false, false);
+        later.finish(&Ok(outcome), false, false, one_root);
         finish_debounce(&publisher);
         let completed = Snapshot::completed(&take_completed(&publisher), None);
         let state = publisher.shared.state.lock().unwrap();
@@ -1455,6 +1535,74 @@ mod tests {
     }
 
     #[test]
+    fn batched_top_level_tasks_keep_independent_completion_and_reports() {
+        // Covers batched scheduling, nested/carrier ownership, invisible
+        // failures, promotion and report admission in one production flow.
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let activity = publisher.register(Arc::from("30"), Language::En);
+        for (id, path) in [(1, "a.zip"), (2, "b.zip"), (3, "c.zip"), (4, "d.zip")] {
+            activity.event(queued(id, path, None, 0));
+            if id != 4 { progress(&activity, id, path, 1, 2); }
+        }
+        assert_eq!(current(&publisher).status, "0/3 finished");
+        assert_eq!(current(&publisher).label, "3 archives");
+        // A root can finish before later descendants are queued. Retain its
+        // scalar ancestry until the native request itself has completed.
+        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: true });
+        activity.event(queued(5, "a/nested.zip", Some(1), 1));
+        progress(&activity, 5, "a/nested.zip", 1, 2);
+        assert_eq!(current(&publisher).status, "0/3 finished");
+        let owner = |path: &Path| {
+            let path = path.to_string_lossy().to_ascii_lowercase();
+            if path.starts_with("a") { Some("a".into()) }
+            else if path.starts_with("b") { Some("b".into()) }
+            else if path.starts_with("c") { Some("c".into()) }
+            else if path.starts_with("d") { Some("d".into()) }
+            else { None }
+        };
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive("a.zip", None));
+        outcome.archives.push(archive("a/nested.zip", None));
+        outcome.archives.push(archive("b.zip", None));
+        let mut promoted = archive("promoted.zip", Some(FailureKind::WrongPassword));
+        promoted.promotion_original_path = Some("b/nested.zip".into());
+        outcome.archives.push(promoted);
+        outcome.archives.push(archive("c.zip", None));
+        outcome.archives.push(archive("c/nested.zip", Some(FailureKind::Damaged)));
+        outcome.archives.push(archive("d.zip", Some(FailureKind::Damaged)));
+        let result = Ok(outcome);
+        activity.record(Path::new("a.zip"), &result, false, &owner);
+        activity.finish(&result, false, false, &owner);
+        finish_debounce(&publisher);
+        let completed = take_completed(&publisher);
+        assert_eq!((completed.summary.succeeded, completed.summary.failed), (1, 1));
+        let draft = completed.report.lock().unwrap();
+        assert_eq!(draft.failures, 1);
+        let text = fs::read_to_string(draft.path.as_ref().unwrap()).unwrap();
+        assert!(text.contains("c/nested.zip"));
+        assert!(!text.contains("promoted.zip"));
+        assert!(!text.contains("d.zip"));
+
+        // No owner metadata: independent paths stay independent, while
+        // case-folded segments of one physical carrier remain one task.
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive("a.zip", None));
+        outcome.archives.push(archive("A.ZIP", None));
+        outcome.archives.push(archive("b.zip", None));
+        let summary = Summary::for_result(&Ok(outcome), false, false, true, &|_| None, None);
+        assert_eq!((summary.succeeded, summary.failed), (2, 0));
+
+        // Cancellation can precede receipts or Working events entirely.
+        let activity = publisher.register(Arc::from("31"), Language::En);
+        activity.event(queued(1, "a.zip", None, 0));
+        activity.event(queued(2, "b.zip", None, 0));
+        activity.finish(&Ok(Outcome::default()), true, false, &owner);
+        finish_debounce(&publisher);
+        assert_eq!(take_completed(&publisher).summary.interrupted, 2);
+    }
+
+    #[test]
     fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
         // Unlike aggregate-count tests this exercises report admission: a
         // retry or pre-extraction error must not create a diagnostic file.
@@ -1463,13 +1611,13 @@ mod tests {
         let invisible = publisher.register(Arc::from("01"), Language::En);
         invisible.event(queued(1, "invisible.zip", None, 0));
         let error = Err(io::Error::other("pre-extraction failure"));
-        invisible.record(Path::new("invisible.zip"), &error, false);
-        invisible.finish(&error, false, false);
+        invisible.record(Path::new("invisible.zip"), &error, false, one_root);
+        invisible.finish(&error, false, false, one_root);
         assert!(!directory.0.exists());
         assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
 
         for (index, kind) in [FailureKind::PasswordRequired, FailureKind::WrongPassword,
-            FailureKind::PasswordInconclusive, FailureKind::MissingVolume].into_iter().enumerate()
+            FailureKind::MissingVolume].into_iter().enumerate()
         {
             let activity = publisher.register(Arc::from(format!("1{index}")), Language::En);
             activity.event(queued(1, "retry.zip", None, 0));
@@ -1478,8 +1626,8 @@ mod tests {
             outcome.archives.push(archive("successful-sibling.zip", None));
             outcome.archives.push(archive("retry.zip", Some(kind)));
             let result = Ok(outcome);
-            activity.record(Path::new("retry.zip"), &result, false);
-            activity.finish(&result, false, false);
+            activity.record(Path::new("retry.zip"), &result, false, one_root);
+            activity.finish(&result, false, false, one_root);
             let mut state = publisher.shared.state.lock().unwrap();
             assert!(state.groups.is_empty());
             assert!(state.completed.is_empty());
@@ -1501,8 +1649,8 @@ mod tests {
             outcome.archives.push(partial);
             outcome.archives.push(archive("CARRIER.bin", Some(FailureKind::Damaged)));
             let result = Ok(outcome);
-            activity.record(Path::new("carrier.bin"), &result, false);
-            activity.finish(&result, false, false);
+            activity.record(Path::new("carrier.bin"), &result, false, one_root);
+            activity.finish(&result, false, false, one_root);
             assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
             assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
             assert!(!directory.0.exists());
@@ -1511,7 +1659,7 @@ mod tests {
             accepted.partial = true;
             let mut outcome = Outcome::default();
             outcome.archives.push(accepted);
-            let summary = Summary::for_result(&Ok(outcome), false, false, true);
+            let summary = Summary::for_result(&Ok(outcome), false, false, true, &one_root, None);
             assert_eq!((summary.succeeded, summary.failed), (1, 0));
         }
 
@@ -1535,8 +1683,8 @@ mod tests {
             scan_count: Some(7),
         });
         let result = Ok(outcome);
-        activity.record(Path::new("terminal.zip"), &result, false);
-        activity.finish(&result, false, false);
+        activity.record(Path::new("terminal.zip"), &result, false, one_root);
+        activity.finish(&result, false, false, one_root);
         finish_debounce(&publisher);
         let completed = take_completed(&publisher);
         assert_eq!((completed.summary.succeeded, completed.summary.failed), (0, 1));
@@ -1563,7 +1711,7 @@ mod tests {
         let a = publisher.register(Arc::from("01"), Language::En);
         a.event(queued(1, "outer.zip", None, 0));
         progress(&a, 1, "outer.zip", 2, 2);
-        a.finish(&success(), false, false);
+        a.finish(&success(), false, false, one_root);
         let first_deadline = publisher.shared.state.lock().unwrap()
             .groups.front().unwrap().finalize_at.unwrap();
         let b = publisher.register(Arc::from("02"), Language::En);
@@ -1577,7 +1725,7 @@ mod tests {
         progress(&b, 2, "next.zip", 1, 2);
         assert!(publisher.shared.state.lock().unwrap().groups.front().unwrap().finalize_at.is_none());
         assert_eq!(current(&publisher).status, "1/2 finished");
-        b.finish(&success(), false, false);
+        b.finish(&success(), false, false, one_root);
         finish_debounce(&publisher);
         {
             let completed = take_completed(&publisher);
@@ -1589,7 +1737,7 @@ mod tests {
         progress(&c, 3, "slow-scan.zip", 1, 2);
         assert_eq!(current(&publisher).label, "slow-scan.zip");
         assert_eq!(current(&publisher).status, "0/1 finished");
-        c.finish(&success(), false, false);
+        c.finish(&success(), false, false, one_root);
         finish_debounce(&publisher);
         assert_eq!(take_completed(&publisher).summary.succeeded, 1);
         assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
@@ -1604,15 +1752,15 @@ mod tests {
         let publisher = publisher(directory.0.clone());
         let draft = Arc::new(Mutex::new(ReportDraft::default()));
         let error = Err(io::Error::other("terminal failure"));
-        publisher.reports.append("81", Language::En, &draft, Path::new("a.zip"), &error).unwrap();
+        publisher.reports.append("81", Language::En, &draft, Path::new("a.zip"), &error, &one_root, None).unwrap();
         let path = draft.lock().unwrap().path.clone().unwrap();
         let original = fs::read(&path).unwrap();
         // Point the next append at a directory, an actual deterministic IO
         // failure on Windows and Unix, then restore the valid first record.
         draft.lock().unwrap().path = Some(directory.0.clone());
-        assert!(publisher.reports.append("81", Language::En, &draft, Path::new("b.zip"), &error).is_err());
+        assert!(publisher.reports.append("81", Language::En, &draft, Path::new("b.zip"), &error, &one_root, None).is_err());
         draft.lock().unwrap().path = Some(path.clone());
-        publisher.reports.append("81", Language::En, &draft, Path::new("c.zip"), &error).unwrap();
+        publisher.reports.append("81", Language::En, &draft, Path::new("c.zip"), &error, &one_root, None).unwrap();
         assert!(draft.lock().unwrap().poisoned);
         assert_eq!(fs::read(&path).unwrap(), original);
         let completed = Completed {
@@ -1634,7 +1782,7 @@ mod tests {
         let publisher = publisher(directory.0.clone());
         let draft = Arc::new(Mutex::new(ReportDraft::default()));
         let result = Err(io::Error::other("failure"));
-        publisher.reports.append("81", Language::En, &draft, Path::new("a.zip"), &result).unwrap();
+        publisher.reports.append("81", Language::En, &draft, Path::new("a.zip"), &result, &one_root, None).unwrap();
         let path = draft.lock().unwrap().path.clone().unwrap();
         let completed = Completed {
             generation: 0,
@@ -1652,7 +1800,7 @@ mod tests {
             drop(draft);
             assert!(worker.reports.cancellation.cancelled());
             assert!(worker.reports.append("81", Language::En, &completed.report,
-                Path::new("b.zip"), &result).is_err());
+                Path::new("b.zip"), &result, &one_root, None).is_err());
             assert!(worker.reports.publish(&completed, &worker.shared).is_err());
             assert!(!worker.shared.present(|| panic!("stale toast after disable")));
             drop(completed);
@@ -1687,8 +1835,8 @@ mod tests {
         first.event(queued(1, "first.zip", None, 0));
         progress(&first, 1, "first.zip", 1, 2);
         let failure = Err(io::Error::other("first failure"));
-        first.record(Path::new("first.zip"), &failure, false);
-        first.finish(&failure, false, false);
+        first.record(Path::new("first.zip"), &failure, false, one_root);
+        first.finish(&failure, false, false, one_root);
         finish_debounce(&publisher);
         let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
         let batch = Arc::clone(&completed.id);
@@ -1711,8 +1859,8 @@ mod tests {
         assert_eq!(current(&publisher).batch, batch.as_ref());
         assert_eq!(current(&publisher).status, "1/2 finished");
         let failure = Err(io::Error::other("second failure"));
-        next.record(Path::new("next.zip"), &failure, false);
-        next.finish(&failure, false, false);
+        next.record(Path::new("next.zip"), &failure, false, one_root);
+        next.finish(&failure, false, false, one_root);
         release.send(()).unwrap();
         thread.join().unwrap();
         assert!(!stale_report.exists());

@@ -134,14 +134,25 @@ pub struct Failure {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Box<FailureEvidence>>,
+    /// Explicit classification decision, independent of fallback diagnostics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) password_retry: bool,
 }
 
 impl Failure {
+    /// Weak ZipCrypto validation does not authorize a password retry. The
+    /// classifier separately marks the password-or-volume ambiguity.
+    pub(crate) fn is_password_retry(&self) -> bool {
+        matches!(self.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword)
+            || (self.kind == FailureKind::PasswordInconclusive && self.password_retry)
+    }
+
     pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
             evidence: None,
+            password_retry: false,
         }
     }
 }
@@ -361,8 +372,7 @@ impl Outcome {
             input.failed |= !archive.partial;
             match failure.kind {
                 FailureKind::MissingVolume => { input.missing.get_or_insert(failure); }
-                FailureKind::PasswordRequired | FailureKind::WrongPassword
-                    | FailureKind::PasswordInconclusive => { input.password.get_or_insert(failure); }
+                _ if failure.is_password_retry() => { input.password.get_or_insert(failure); }
                 _ if !archive.partial => { input.terminal.get_or_insert(failure); }
                 _ => {}
             }

@@ -3246,10 +3246,13 @@ impl Scheduler {
                 let cancelled = worker_cancel.cancelled();
                 if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
                     let cleanup = output_cleanup_error(&result);
+                    let outputs = observer.outputs.lock().unwrap();
+                    let groups = observer.groups.lock().unwrap();
                     toast.record(
                         cleanup.map_or(path.as_path(), |error| error.path.as_path()),
                         &result,
                         cancelled && cleanup.is_none(),
+                        |path| completion_owner(path, &outputs, &groups),
                     );
                 }
                 let promoted = std::mem::take(&mut *observer.promoted.lock().unwrap());
@@ -3384,14 +3387,15 @@ impl Scheduler {
                 };
             }
         }
+        let groups = std::mem::take(&mut *active.groups.lock().unwrap());
         if let Some(toast) = &active.toast {
             toast.finish(
                 &completed.result,
                 completed.cancelled,
                 !unfinished.is_empty() || output_cleanup_error(&completed.result).is_some(),
+                |path| completion_owner(path, &completed.outputs, &groups),
             );
         }
-        let groups = std::mem::take(&mut *active.groups.lock().unwrap());
         {
             let mut claims = self.hub.claims.lock().unwrap();
             for path in groups.keys().chain(completed.promoted.keys()) {
@@ -3486,17 +3490,16 @@ impl Scheduler {
                 "owner":batch,"cleanup":cleanup}),
             );
         }
-        let mut error_paths = HashMap::new();
-        for error in outcome.errors.iter()
-            .filter(|error| error.kind != crate::pipeline::InputErrorKind::Cleanup)
-        {
-            error_paths.entry(key(&error.path)).or_insert(&error.message);
-            if let Some(owner) = output_owner(&completed.outputs, &key(&error.path)) {
-                let owner = watch_path_key(owner);
-                let owner = groups.get(&owner).map(|group| key(&group.path)).unwrap_or(owner);
-                error_paths.entry(owner).or_insert(&error.message);
+        for error in &outcome.errors {
+            if error.kind == crate::pipeline::InputErrorKind::FilesystemScan {
+                // Discovery diagnostics do not change extraction completion.
+                // Preserve the diagnostic without turning an accepted archive
+                // or a retryable blocker into a terminal Watch failure.
+                self.journal.log(json!({"event":"filesystem_scan_failed",
+                    "path":error.path,"owner":batch,"error":error.message}));
             }
         }
+        let error_paths = completion_input_errors(&outcome.errors, &completed.outputs, &groups);
         let mut operations = crate::watch_store::NativeWatchOperations::empty();
         let current_passwords = self.passwords.snapshot();
         let mut retry = Vec::new();
@@ -3815,6 +3818,36 @@ fn promoted_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailu
     archive.promoted && !archive.partial && failures
         .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))
         .is_some_and(InputFailure::retryable)
+}
+
+fn completion_owner(
+    path: &Path,
+    outputs: &BTreeMap<String, String>,
+    groups: &HashMap<String, Arc<SourceGroup>>,
+) -> Option<String> {
+    let path = key(path);
+    if let Some(group) = groups.get(&path) {
+        return Some(key(&group.path));
+    }
+    let owner = watch_path_key(output_owner(outputs, &path)?);
+    Some(groups.get(&owner).map(|group| key(&group.path)).unwrap_or(owner))
+}
+
+fn completion_input_errors<'a>(
+    errors: &'a [crate::pipeline::InputError],
+    outputs: &BTreeMap<String, String>,
+    groups: &HashMap<String, Arc<SourceGroup>>,
+) -> HashMap<String, &'a String> {
+    let mut paths = HashMap::new();
+    for error in errors.iter().filter(|error| !matches!(error.kind,
+        crate::pipeline::InputErrorKind::Cleanup | crate::pipeline::InputErrorKind::FilesystemScan))
+    {
+        paths.entry(key(&error.path)).or_insert(&error.message);
+        if let Some(owner) = completion_owner(&error.path, outputs, groups) {
+            paths.entry(owner).or_insert(&error.message);
+        }
+    }
+    paths
 }
 
 fn completion_archives<'a>(
@@ -4491,6 +4524,35 @@ mod tests {
     use super::*;
     use crate::io::reader::{capture_directory_identity, capture_file_generation};
     use crate::watch_store::{NativeWatchOperations, PendingObservation};
+
+    #[test]
+    fn scan_diagnostics_do_not_override_watch_completion() {
+        use crate::pipeline::{InputError, InputErrorKind};
+        let root = Path::new(r"C:\watch\outer.zip");
+        let nested = Path::new(r"C:\watch\outer\unreadable");
+        let outputs = BTreeMap::from([
+            (key(Path::new(r"C:\watch\outer")), root.to_string_lossy().into_owned()),
+        ]);
+        let mut errors = vec![
+            InputError { path: nested.into(), message: "scan denied".into(),
+                kind: InputErrorKind::FilesystemScan,
+                scan_operation: Some("read_directory".into()), scan_count: Some(2) },
+            InputError { path: root.into(), message: "cleanup failed".into(),
+                kind: InputErrorKind::Cleanup, scan_operation: None, scan_count: None },
+        ];
+        // Neither diagnostic may override a successful archive or its retry
+        // cause, even when the diagnostic resolves to that archive's owner.
+        assert!(completion_input_errors(&errors, &outputs, &HashMap::new()).is_empty());
+        errors.push(InputError { path: nested.into(), message: "invalid input".into(),
+            kind: InputErrorKind::InvalidInput, scan_operation: None, scan_count: None });
+        let paths = completion_input_errors(&errors, &outputs, &HashMap::new());
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[&key(root)].as_str(), "invalid input");
+        assert_eq!(paths[&key(nested)].as_str(), "invalid input");
+        // The projection borrows; CLI and diagnostics retain the original data.
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors[0].scan_count, Some(2));
+    }
 
     fn completion_archive(path: &str, depth: usize, kind: Option<FailureKind>) -> ArchiveResult {
         ArchiveResult {
