@@ -1061,6 +1061,7 @@ impl FailureSpool<'_> {
 }
 
 impl Reports {
+    #[cfg(test)]
     fn append(
         &self,
         id: &str,

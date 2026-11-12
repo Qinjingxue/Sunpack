@@ -104,8 +104,9 @@ struct ScanJob {
 unsafe impl Send for IocpSlot {}
 
 pub(crate) struct IocpScanOutput {
+    #[cfg(test)]
     pub(crate) discarded_results: usize,
-    pub(crate) read_bytes: u64,
+    #[cfg(test)]
     pub(crate) read_operations: u64,
 }
 
@@ -177,7 +178,6 @@ fn last_error() -> io::Error {
 
 fn open_handles(path: &Path) -> io::Result<IocpHandles> {
     let resource = crate::io::resource_lifecycle::NativeResourceGuard::register(
-        "iocp_file_handle",
         [path.to_path_buf()],
     )?;
     let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -362,8 +362,9 @@ where
     cancellation.check_io()?;
     if file_size == 0 {
         return Ok(IocpScanOutput {
+            #[cfg(test)]
             discarded_results: 0,
-            read_bytes: 0,
+            #[cfg(test)]
             read_operations: 0,
         });
     }
@@ -372,16 +373,12 @@ where
     let worker_count = requested_worker_count
         .clamp(1, 8)
         .min(rayon::current_num_threads().clamp(1, 8));
-    let mut expected_read_bytes = 0u64;
     let mut expected_read_operations = 0u64;
     let mut expected_base = 0u64;
     while expected_base < file_size {
         let visible_end = expected_base
             .saturating_add(chunk_bytes as u64)
             .min(file_size);
-        let read_start = expected_base.saturating_sub(overlap as u64);
-        expected_read_bytes =
-            expected_read_bytes.saturating_add(visible_end.saturating_sub(read_start));
         expected_read_operations = expected_read_operations.saturating_add(1);
         expected_base = visible_end;
     }
@@ -421,6 +418,7 @@ where
             .collect::<Vec<_>>();
         let mut next_base = 0u64;
         let mut scan_jobs = 0usize;
+        #[cfg(test)]
         let mut discarded_results = 0;
         let mut initial_error = None;
         for _ in 0..read_slots {
@@ -463,7 +461,10 @@ where
                     Ok((buffer, hits)) => {
                         scan_jobs = scan_jobs.saturating_sub(1);
                         let hits = hits.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                        discarded_results += hits.discarded_results;
+                        #[cfg(test)]
+                        {
+                            discarded_results += hits.discarded_results;
+                        }
                         if let Err(error) = collect(hits.results) {
                             fatal_error = Some(error);
                             break;
@@ -544,7 +545,10 @@ where
                         job.leading_overlap,
                         job.read_start,
                     );
-                    discarded_results += hits.discarded_results;
+                    #[cfg(test)]
+                    {
+                        discarded_results += hits.discarded_results;
+                    }
                     if let Err(error) = collect(hits.results) {
                         fatal_error = Some(error);
                         break;
@@ -632,8 +636,9 @@ where
         }
 
         Ok(IocpScanOutput {
+            #[cfg(test)]
             discarded_results,
-            read_bytes: expected_read_bytes,
+            #[cfg(test)]
             read_operations: expected_read_operations,
         })
     });

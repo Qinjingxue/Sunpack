@@ -80,7 +80,7 @@ pub(crate) fn append_failure_report<T: Serialize>(
 ) -> io::Result<()> {
     cancellation.check_io()?;
     create_parent(path)?;
-    let mut file = TrackedFile::open_with(path, "failure_report", |options| {
+    let mut file = TrackedFile::open_with(path, |options| {
         options.write(true).create(true).truncate(false);
     })?;
     let original_len = file.seek(io::SeekFrom::End(0))?;
@@ -137,7 +137,7 @@ pub(crate) fn publish_failure_report<'a>(
     }
     create_parent(temporary)?;
     create_parent(output)?;
-    let file = TrackedFile::open_with(temporary, "failure_publish", |options| {
+    let file = TrackedFile::open_with(temporary, |options| {
         options.write(true).create_new(true);
     })?;
     let mut buffer = BufWriter::with_capacity(CHUNK_SIZE, file);
@@ -150,7 +150,7 @@ pub(crate) fn publish_failure_report<'a>(
             writer.write_all(part.as_bytes())?;
         }
         if let Some(path) = details {
-            let mut source = TrackedFile::open_reader(path, "failure_publish_source")?;
+            let mut source = TrackedFile::open_reader(path)?;
             let mut bytes = [0; CHUNK_SIZE];
             loop {
                 cancellation.check_io()?;

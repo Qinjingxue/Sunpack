@@ -237,6 +237,7 @@ pub(crate) struct NativeWorkerFrameDecoder {
     failure: Option<String>,
 }
 impl NativeWorkerFrameDecoder {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }

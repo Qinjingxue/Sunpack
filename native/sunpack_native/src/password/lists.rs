@@ -10,7 +10,7 @@ pub(crate) fn read_password_file(
     path: PathBuf,
     initial: Option<Vec<Arc<str>>>,
 ) -> io::Result<Vec<Arc<str>>> {
-    let file = TrackedFile::open_reader(path, "password_file")?;
+    let file = TrackedFile::open_reader(path)?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut line = String::new();
     let mut passwords = Vec::new();

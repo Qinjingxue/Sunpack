@@ -28,7 +28,7 @@ use windows_sys::Win32::{
 
 pub(crate) enum Notification {
     Clipboard(Vec<String>),
-    VolumeChanged { unit_mask: u32, arrived: bool },
+    VolumeChanged,
 }
 
 struct Context {
@@ -183,10 +183,7 @@ fn run_window(
                 context.clipboard_updated();
             }
             if context.observe_volumes {
-                (context.notify)(Notification::VolumeChanged {
-                    unit_mask: 0,
-                    arrived: true,
-                });
+                (context.notify)(Notification::VolumeChanged);
             }
             pump_until_stop(stop.as_raw_handle())
         })();
@@ -227,10 +224,7 @@ unsafe extern "system" fn window_proc(
                     {
                         let volume = unsafe { &*(lparam as *const DEV_BROADCAST_VOLUME) };
                         if volume.dbcv_unitmask != 0 {
-                            (context.notify)(Notification::VolumeChanged {
-                                unit_mask: volume.dbcv_unitmask,
-                                arrived: event == DBT_DEVICEARRIVAL,
-                            });
+                            (context.notify)(Notification::VolumeChanged);
                         }
                     }
                     return 1;

@@ -19,6 +19,7 @@ pub(crate) mod scratch;
 // IOCP forwards it without expanding compact records into absolute objects.
 pub(crate) struct ScanBatch<T> {
     pub(crate) results: T,
+    #[cfg(test)]
     pub(crate) discarded_results: usize,
 }
 
@@ -26,6 +27,7 @@ impl<T: Default> Default for ScanBatch<T> {
     fn default() -> Self {
         Self {
             results: T::default(),
+            #[cfg(test)]
             discarded_results: 0,
         }
     }

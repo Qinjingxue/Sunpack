@@ -184,14 +184,6 @@ fn filesystem_file_route(is_dir: bool, fact: Option<&CheapAnchor>) -> u8 {
     FILE_ROUTE_RESIDUAL
 }
 
-pub(crate) fn filesystem_route_name(route: u8) -> &'static str {
-    match route {
-        FILE_ROUTE_DETECTION => "detection",
-        FILE_ROUTE_RELATIONS => "relations",
-        _ => "residual",
-    }
-}
-
 pub(crate) fn filesystem_logical_name(path: &str) -> String {
     let filename = path
         .rsplit(|ch| ch == '/' || ch == '\\')
@@ -314,9 +306,6 @@ impl NativeOutputInventory {
     }
     pub(crate) fn total_size(&self) -> u64 {
         self.total_size
-    }
-    pub(crate) fn unreadable_count(&self) -> usize {
-        self.unreadable_count
     }
 
     pub(crate) fn build_directory_snapshots(
@@ -1419,9 +1408,6 @@ impl NativeWatchCatalog {
             recovery_ids: Mutex::new(HashMap::new()),
         }
     }
-    pub(crate) fn error(&self) -> Option<String> {
-        self.error.lock().unwrap().clone()
-    }
 
     pub(crate) fn candidate_paths(
         &self,
@@ -1588,50 +1574,6 @@ impl NativeWatchCatalog {
                 }
             }
         })();
-    }
-
-    pub(crate) fn memory_stats(&self) -> HashMap<&'static str, usize> {
-        (|| {
-            let tables = self.catalogs.lock().unwrap();
-            let mut stats = HashMap::from([
-                ("rows", 0),
-                ("observations", 0),
-                ("transient_rows", 0),
-                ("buckets", 0),
-                ("bucket_capacity", 0),
-                ("parents", 0),
-                ("row_bytes", std::mem::size_of::<CatalogRow>()),
-                (
-                    "observation_bytes",
-                    std::mem::size_of::<NativeWatchObservation>(),
-                ),
-            ]);
-            for table in tables.values() {
-                stats
-                    .entry("rows")
-                    .and_modify(|count| *count += table.rows.len());
-                stats.entry("observations").and_modify(|count| {
-                    *count += table
-                        .rows
-                        .values()
-                        .filter(|row| row.observation.is_some())
-                        .count()
-                });
-                stats
-                    .entry("transient_rows")
-                    .and_modify(|count| *count += table.rows.len() - table.persistent_len);
-                stats
-                    .entry("buckets")
-                    .and_modify(|count| *count += table.buckets.len());
-                stats
-                    .entry("bucket_capacity")
-                    .and_modify(|count| *count += table.buckets.capacity());
-                stats
-                    .entry("parents")
-                    .and_modify(|count| *count += table.parent_count());
-            }
-            stats
-        })()
     }
 
     pub(crate) fn cursor(

@@ -8,13 +8,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[derive(Clone)]
 pub(crate) struct NativeResourceRecord {
-    pub(crate) kind: &'static str,
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) promotion_blocking: bool,
-    // Keep diagnostics cheap while the registry lock is held. Formatting is
-    // only needed when a resource snapshot is requested.
-    pub(crate) thread: std::thread::ThreadId,
-    pub(crate) created_from: &'static std::panic::Location<'static>,
 }
 
 #[derive(Default)]
@@ -57,7 +52,6 @@ impl NativeReadScope {
     pub(crate) fn new(root: &Path) -> io::Result<Self> {
         let root = normalized_path(root.to_path_buf());
         let guard = NativeResourceGuard::register_normalized(
-            "directory_probe_batch",
             vec![root.clone()],
             true,
         )?;
@@ -89,7 +83,7 @@ impl NativeReadScope {
             });
         }
         drop(file);
-        TrackedFile::open_reader(path, "volume_anchor_cheap")
+        TrackedFile::open_reader(path)
     }
 }
 
@@ -168,10 +162,9 @@ fn open_shared_reader(path: &Path) -> io::Result<File> {
 }
 
 impl TrackedFile {
-    #[track_caller]
-    pub(crate) fn open(path: impl AsRef<Path>, kind: &'static str) -> io::Result<Self> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
-        let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
+        let resource = NativeResourceGuard::register([path.to_path_buf()])?;
         let file = File::open(path)?;
         Ok(Self {
             file,
@@ -179,35 +172,29 @@ impl TrackedFile {
         })
     }
 
-    #[track_caller]
     pub(crate) fn open_with<F>(
         path: impl AsRef<Path>,
-        kind: &'static str,
         configure: F,
     ) -> io::Result<Self>
     where
         F: FnOnce(&mut std::fs::OpenOptions),
     {
-        Self::open_with_promotion(path, kind, true, configure)
+        Self::open_with_promotion(path, true, configure)
     }
 
     // Passive directory observers own handles but cannot hold up file promotion.
-    #[track_caller]
     pub(crate) fn open_passive_with<F>(
         path: impl AsRef<Path>,
-        kind: &'static str,
         configure: F,
     ) -> io::Result<Self>
     where
         F: FnOnce(&mut std::fs::OpenOptions),
     {
-        Self::open_with_promotion(path, kind, false, configure)
+        Self::open_with_promotion(path, false, configure)
     }
 
-    #[track_caller]
     fn open_with_promotion<F>(
         path: impl AsRef<Path>,
-        kind: &'static str,
         promotion_blocking: bool,
         configure: F,
     ) -> io::Result<Self>
@@ -216,7 +203,6 @@ impl TrackedFile {
     {
         let path = path.as_ref();
         let resource = NativeResourceGuard::register_with_promotion(
-            kind,
             [path.to_path_buf()],
             promotion_blocking,
         )?;
@@ -229,10 +215,9 @@ impl TrackedFile {
         })
     }
 
-    #[track_caller]
-    pub(crate) fn open_reader(path: impl AsRef<Path>, kind: &'static str) -> io::Result<Self> {
+    pub(crate) fn open_reader(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
-        let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
+        let resource = NativeResourceGuard::register([path.to_path_buf()])?;
         let file = open_shared_reader(path)?;
         Ok(Self {
             file,
@@ -283,7 +268,7 @@ impl Seek for TrackedFile {
 }
 
 fn shared_utf8_text(path: PathBuf) -> io::Result<String> {
-    let mut file = TrackedFile::open_reader(path, "shared_text")?;
+    let mut file = TrackedFile::open_reader(path)?;
     let mut text = String::new();
     file.file.read_to_string(&mut text)?;
     if text.starts_with('\u{feff}') {
@@ -298,27 +283,21 @@ pub(crate) fn read_shared_utf8_text(path: PathBuf) -> std::io::Result<String> {
 }
 
 impl NativeResourceGuard {
-    #[track_caller]
     pub(crate) fn register(
-        kind: &'static str,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> io::Result<Self> {
-        Self::register_with_promotion(kind, paths, true)
+        Self::register_with_promotion(paths, true)
     }
 
-    #[track_caller]
     fn register_with_promotion(
-        kind: &'static str,
         paths: impl IntoIterator<Item = PathBuf>,
         promotion_blocking: bool,
     ) -> io::Result<Self> {
         let paths = paths.into_iter().map(normalized_path).collect::<Vec<_>>();
-        Self::register_normalized(kind, paths, promotion_blocking)
+        Self::register_normalized(paths, promotion_blocking)
     }
 
-    #[track_caller]
     fn register_normalized(
-        kind: &'static str,
         paths: Vec<PathBuf>,
         promotion_blocking: bool,
     ) -> io::Result<Self> {
@@ -339,15 +318,11 @@ impl NativeResourceGuard {
                 format!("native resource registration blocked by promotion: {paths:?}"),
             ));
         }
-        let caller = std::panic::Location::caller();
         registry.resources.insert(
             id,
             NativeResourceRecord {
-                kind,
                 paths,
                 promotion_blocking,
-                thread: std::thread::current().id(),
-                created_from: caller,
             },
         );
         Ok(Self { id })
@@ -454,24 +429,6 @@ pub(crate) fn native_end_promotion(token: u64) -> std::io::Result<()> {
         crate::collections::trim_map(&mut registry.promotions);
     }
     Ok(())
-}
-
-pub(crate) fn native_resource_snapshot(
-    roots: Vec<String>,
-) -> io::Result<Vec<(u64, NativeResourceRecord)>> {
-    let roots = roots
-        .into_iter()
-        .map(PathBuf::from)
-        .map(normalized_path)
-        .collect::<Vec<_>>();
-    let records = {
-        let registry = registry()
-            .registry
-            .lock()
-            .map_err(|_| std::io::Error::other("native resource registry poisoned"))?;
-        matching_resources(&registry, &roots, false)
-    };
-    Ok(records)
 }
 
 pub(crate) fn native_wait_for_resources(

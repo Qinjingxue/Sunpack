@@ -444,18 +444,7 @@ impl NativePathRule {
             rule: Arc::new(PathRule::compile(paths, files, extensions, full_names)?),
         })
     }
-    pub(crate) fn rejects(&self, path: &str, root: &str, is_dir: bool, whitelist: bool) -> bool {
-        let mut scratch = PathRuleScratch::default();
-        // Scalar events cannot reuse ancestor state; use the same matcher
-        // without allocating an immediately discarded path/prefix cache.
-        scratch.paths.one_shot = true;
-        self.rule.rejects(
-            &FilterPath::new(Path::new(path), Path::new(root)),
-            is_dir,
-            whitelist,
-            &mut scratch,
-        )
-    }
+
 }
 
 #[cfg(test)]

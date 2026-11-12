@@ -208,13 +208,10 @@ impl RawHit {
 #[derive(Default)]
 pub(crate) struct NativeScanResult {
     file_size: u64,
-    scan_read_bytes: u64,
-    scan_read_operations: u64,
     raw_hits: Vec<RawHit>,
     candidates: Vec<EmbeddedCandidate>,
-    logical_resolution_complete: bool,
+    #[cfg(test)]
     raw_hit_count: usize,
-    budget_exhausted: bool,
     zip_eocd_absent: bool,
 }
 
@@ -330,14 +327,6 @@ impl NativeScanResult {
         self.file_size
     }
 
-    pub(crate) fn signature_scan_complete(&self) -> bool {
-        !self.budget_exhausted
-    }
-
-    pub(crate) fn logical_resolution_complete(&self) -> bool {
-        self.logical_resolution_complete
-    }
-
     pub(crate) fn signature_hits(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
         self.raw_hits.iter().map(|hit| {
             (
@@ -376,7 +365,6 @@ pub(crate) fn scan_detected_lz4(path: &str, parallel_files: usize) -> io::Result
         return Ok(NativeScanResult {
             file_size,
             candidates: vec![item],
-            logical_resolution_complete: true,
             ..NativeScanResult::default()
         });
     }
@@ -467,12 +455,16 @@ fn scan_embedded_archives_native_with_iocp(
         iocp_buffers.clamp(2, 64) + iocp_workers.clamp(1, 8)
     };
     let mut builder = HitBuilder::new(file_size, chunk_bytes, matching_window)?;
+    #[cfg(test)]
     let mut raw_hit_count = 0;
     let mut collect = |batch: Option<hit_storage::Prepared>| -> io::Result<()> {
         let Some(batch) = batch else {
             return Ok(());
         };
-        raw_hit_count += batch.raw_count;
+        #[cfg(test)]
+        {
+            raw_hit_count += batch.raw_count;
+        }
         builder.push(batch)
     };
     let saw_zip_eocd = std::sync::atomic::AtomicBool::new(false);
@@ -485,10 +477,11 @@ fn scan_embedded_archives_native_with_iocp(
             results: (!batch.results.is_empty()).then(|| {
                 hit_storage::prepare(batch.results, base + sample.len() as u64 == file_size)
             }),
+            #[cfg(test)]
             discarded_results: batch.discarded_results,
         }
     };
-    let output = {
+    let _output = {
         #[cfg(windows)]
         {
             let path = reader.iocp_path().ok_or_else(|| {
@@ -506,8 +499,9 @@ fn scan_embedded_archives_native_with_iocp(
                 let hits = scan(data.as_slice(), 0, 0);
                 collect(hits.results)?;
                 iocp::IocpScanOutput {
+                    #[cfg(test)]
                     discarded_results: hits.discarded_results,
-                    read_bytes: data.len() as u64,
+                    #[cfg(test)]
                     read_operations: u64::from(file_size != 0),
                 }
             } else {
@@ -525,6 +519,7 @@ fn scan_embedded_archives_native_with_iocp(
                             // Keep encoded metadata off the IOCP channel's hot
                             // path; the box lives only until this completion.
                             results: batch.results.map(Box::new),
+                            #[cfg(test)]
                             discarded_results: batch.discarded_results,
                         }
                     },
@@ -552,7 +547,10 @@ fn scan_embedded_archives_native_with_iocp(
     cancellation.check_io()?;
     let raw_hits = storage.view(0);
     let xz_footer_hits = storage.view(1);
-    raw_hit_count += output.discarded_results;
+    #[cfg(test)]
+    {
+        raw_hit_count += _output.discarded_results;
+    }
 
     // Structural facts survive in the result; transient validation windows
     // share this reader's generation/request state, not the global block cache.
@@ -608,21 +606,14 @@ fn scan_embedded_archives_native_with_iocp(
         }));
     }
     let raw_hits = roots;
-    let logical_resolution_complete = candidates
-        .iter()
-        .filter(|candidate| candidate.candidate_kind == "logical_archive")
-        .all(|candidate| candidate.boundary_kind == "exact");
 
     cancellation.check_io()?;
     Ok(NativeScanResult {
         file_size,
-        scan_read_bytes: output.read_bytes,
-        scan_read_operations: output.read_operations,
         raw_hits,
         candidates,
-        logical_resolution_complete,
+        #[cfg(test)]
         raw_hit_count,
-        budget_exhausted: false,
         zip_eocd_absent: !saw_zip_eocd.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
@@ -846,6 +837,7 @@ fn new_hit_batch(base_offset: u64, carry_len: usize, len: usize) -> ScanBatch<Hi
             base_offset + len as u64,
             embedded_overlap(),
         ),
+        #[cfg(test)]
         discarded_results: 0,
     }
 }
@@ -1133,7 +1125,10 @@ fn record_raw_hit(
     // Count rejected fixed headers without retaining an object per hit. A
     // header crossing a chunk boundary remains eligible for the normal walk.
     if fixed_header_invalid(pattern, &sample[start..]) {
-        hits.discarded_results += 1;
+        #[cfg(test)]
+        {
+            hits.discarded_results += 1;
+        }
         return;
     }
     if kind == "tar" && start >= 257 {
@@ -1141,7 +1136,10 @@ fn record_raw_hit(
             .get(start - 257..start - 257 + 512)
             .is_some_and(|header| !crate::formats::tar::valid_header(header))
         {
-            hits.discarded_results += 1;
+            #[cfg(test)]
+            {
+                hits.discarded_results += 1;
+            }
             return;
         }
     }

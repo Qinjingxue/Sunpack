@@ -275,7 +275,6 @@ impl NativeRelationGroup {
             input,
             standalone: matches!(self, Self::Ordinary(..))
                 && anchor.is_some_and(|anchor| anchor.standalone),
-            carrier_path: data.carrier_path.to_owned(),
             owned_paths: data
                 .parts()
                 .chain(data.companions.iter().map(String::as_str))
@@ -396,7 +395,6 @@ impl NativeRelationGroup {
 pub(crate) struct RelationProjection {
     pub input: ArchiveInput,
     pub standalone: bool,
-    pub carrier_path: String,
     pub owned_paths: Vec<String>,
     pub failure_reason: Option<&'static str>,
 }
@@ -406,6 +404,7 @@ struct ParsedVolume {
     prefix: String,
     number: u32,
     style: &'static str,
+    #[cfg(test)]
     width: usize,
     family: &'static str,
     decorated: bool,
@@ -1379,6 +1378,7 @@ fn parse_volume_candidates_with_regexes(
                         prefix: captures.name("prefix")?.as_str().to_string(),
                         number: raw_number.saturating_add(1),
                         style: "zip_zero_numbered",
+                        #[cfg(test)]
                         width: captures.name("number")?.as_str().len(),
                         family: "zip",
                         decorated: captures
@@ -1407,6 +1407,7 @@ fn parse_volume_candidates_with_regexes(
                             prefix: format!("{}.{}", captures.name("prefix")?.as_str(), family),
                             number,
                             style: "numeric_suffix",
+                            #[cfg(test)]
                             width: raw_number.as_str().len(),
                             family,
                             decorated: captures
@@ -1431,6 +1432,7 @@ fn parse_volume_candidates_with_regexes(
                         } else {
                             "rar_part"
                         },
+                        #[cfg(test)]
                         width: captures.name("number")?.as_str().len(),
                         family: "rar",
                         decorated: false,
@@ -1447,6 +1449,7 @@ fn parse_volume_candidates_with_regexes(
                         prefix: captures.name("prefix")?.as_str().to_string(),
                         number: number.saturating_add(2),
                         style: "rar_oldstyle",
+                        #[cfg(test)]
                         width: captures.name("number")?.as_str().len(),
                         family: "rar",
                         decorated: captures
@@ -1473,6 +1476,7 @@ fn parse_volume_candidates_with_regexes(
                             prefix: captures.name("prefix")?.as_str().to_string(),
                             number,
                             style: "plain_numeric_suffix",
+                            #[cfg(test)]
                             width: raw_number.as_str().len(),
                             family: "generic",
                             decorated: false,
@@ -1498,6 +1502,7 @@ fn parse_zip_split_volume(filename: &str, regexes: &RelationRegexes) -> Option<P
         prefix: captures.name("prefix")?.as_str().to_string(),
         number,
         style: "zip_spanned",
+        #[cfg(test)]
         width: raw_number.len(),
         family: "zip",
         decorated: !tail.is_empty(),
@@ -1569,6 +1574,7 @@ fn parse_marker_numbered_volume(path: &str, regexes: &RelationRegexes) -> Option
         },
         number,
         style,
+        #[cfg(test)]
         width: raw_number.len(),
         family,
         decorated: !(tail.eq_ignore_ascii_case(".rar")
@@ -1712,6 +1718,7 @@ impl RelationRegexCache {
             .map_or(0, |regexes| regexes.initialized_count())
     }
 
+    #[cfg(test)]
     fn initialized_count(&self) -> usize {
         self.0
             .read()
@@ -1728,10 +1735,6 @@ fn regex_cache() -> &'static RelationRegexCache {
 
 pub(crate) fn clear_regex_caches() -> usize {
     regex_cache().clear()
-}
-
-pub(crate) fn regex_cache_entries() -> usize {
-    regex_cache().initialized_count()
 }
 
 #[derive(Default)]

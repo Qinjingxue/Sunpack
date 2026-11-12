@@ -1025,14 +1025,6 @@ pub(crate) fn gzip_header_from_slice(data: &[u8], start: usize) -> ValidationRes
     read_gzip_header(&mut input)
 }
 
-pub(crate) fn inspect_gzip_header(
-    reader: &ManagedReader,
-    start: u64,
-    limit: u64,
-) -> ValidationResult<GzipHeader> {
-    read_gzip_header(&mut ByteCursor::new(reader, start, limit.min(reader.len())))
-}
-
 fn gzip_header(cursor: &mut ByteCursor<'_>) -> ValidationResult<()> {
     read_gzip_header(cursor).map(|_| ())
 }

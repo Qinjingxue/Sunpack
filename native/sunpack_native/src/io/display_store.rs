@@ -98,7 +98,7 @@ fn files(folder: &Path, name: &str) -> (PathBuf, PathBuf) {
     )
 }
 fn open_sparse(path: &Path) -> io::Result<TrackedFile> {
-    let file = TrackedFile::open_with(path, "display_log", |o| {
+    let file = TrackedFile::open_with(path, |o| {
         o.read(true).write(true).create(true);
     })?;
     sparse(&file)?;
@@ -312,7 +312,7 @@ impl Store {
             path.file_name().unwrap().to_string_lossy()
         ));
         fs::create_dir_all(&folder)?;
-        let manifest = match TrackedFile::open_reader(&path, "display_manifest") {
+        let manifest = match TrackedFile::open_reader(&path) {
             Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))
                 .map_err(|e| invalid(&e.to_string()))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Manifest {
@@ -668,8 +668,8 @@ impl Store {
             self.path.file_name().unwrap().to_string_lossy()
         ));
         let _publication =
-            NativeResourceGuard::register("display_publish", [self.path.clone(), temp.clone()])?;
-        let mut file = TrackedFile::open_with(&temp, "display_publish", |o| {
+            NativeResourceGuard::register([self.path.clone(), temp.clone()])?;
+        let mut file = TrackedFile::open_with(&temp, |o| {
             o.write(true).create(true).truncate(true);
         })?;
         serde_json::to_writer(&mut file, &self.manifest).map_err(|e| invalid(&e.to_string()))?;

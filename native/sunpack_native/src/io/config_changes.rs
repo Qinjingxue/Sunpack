@@ -143,13 +143,9 @@ pub(crate) struct NativeConfigChanges {
 }
 
 impl NativeConfigChanges {
-    pub(crate) fn new(path: PathBuf) -> io::Result<Self> {
-        Self::observe(path, false)
-    }
-
     pub(crate) fn observe(path: PathBuf, recursive: bool) -> io::Result<Self> {
         let stopped = event(false)?;
-        let file = TrackedFile::open_passive_with(path, "config_directory", |options| {
+        let file = TrackedFile::open_passive_with(path, |options| {
             options
                 .access_mode(1)
                 .share_mode(7)

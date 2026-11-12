@@ -382,7 +382,5 @@ impl ScopeCatalog {
             self.parents.shrink_to_fit();
         }
     }
-    pub fn parent_count(&self) -> usize {
-        self.parents.len()
-    }
+
 }

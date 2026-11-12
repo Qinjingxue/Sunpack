@@ -6,7 +6,7 @@ use crate::relations::{
     NativeRelationGroup, RelationCache, RelationProjection,
 };
 use crate::scan::directory::{
-    filesystem_logical_name, filesystem_route_name, DirectorySnapshotTable,
+    filesystem_logical_name, DirectorySnapshotTable,
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
 };
 use crate::scan::embedded::{
@@ -24,23 +24,17 @@ use std::sync::Arc;
 pub(crate) enum CandidateProjection<'a> {
     File {
         path: &'a str,
-        size: Option<u64>,
-        route: &'static str,
         format_hint: &'a str,
-        reject_mask: u32,
         logical_name: String,
     },
     Relation {
         relation: RelationProjection,
-        needs_password: bool,
         failure_reason: Option<&'a str>,
     },
 }
 
 pub(crate) struct EmbeddedPageRow {
     pub(crate) index: usize,
-    pub(crate) status: u8,
-    pub(crate) reason: &'static str,
     pub(crate) scan: Option<Arc<NativeScanResult>>,
     pub(crate) error: Option<Arc<io::Error>>,
 }
@@ -317,11 +311,11 @@ impl NativeEmbeddedBatch {
     ) -> io::Result<Vec<EmbeddedPageRow>> {
         let mut projected = Vec::new();
         for (index, outcome) in outcomes {
-            let (status, reason, scan, error) = match outcome {
+            let (scan, error) = match outcome {
                 EmbeddedOutcome::Residual => {
                     unreachable!("residuals are filtered before projection")
                 }
-                EmbeddedOutcome::Failed(error) => (2, "embedded_scan_io_error", None, Some(error)),
+                EmbeddedOutcome::Failed(error) => (None, Some(error)),
                 EmbeddedOutcome::Scan(scan) => {
                     let path = table.rows[index].embedded_source().0;
                     let key = path_key(path);
@@ -351,18 +345,16 @@ impl NativeEmbeddedBatch {
                                 scan: retain_scan.then(|| Arc::clone(&scan)),
                             });
                         }
-                        (3, "embedded_volume_candidate", None, None)
+                        (None, None)
                     } else {
                         // A complete peer archive keeps its original ownership.
                         self.excluded.extend(table.path_keys(index)?);
-                        (1, "", Some(scan), None)
+                        (Some(scan), None)
                     }
                 }
             };
             projected.push(EmbeddedPageRow {
                 index,
-                status,
-                reason,
                 scan,
                 error,
             });
@@ -827,35 +819,6 @@ impl NativeCandidateTable {
         Self::default()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Keep relation facts native while the caller discovers directory passwords.
-    pub(crate) fn append_relations(
-        &mut self,
-
-        raw_snapshot: &NativeDirectorySnapshot,
-        filtered_snapshot: &NativeDirectorySnapshot,
-        path_passwords: Option<Vec<(String, String)>>,
-    ) -> std::io::Result<()> {
-        let groups = (|| {
-            build_native_candidate_groups_from_snapshot(
-                raw_snapshot,
-                filtered_snapshot,
-                path_passwords.as_deref(),
-                None,
-            )
-        })();
-        self.rows.extend(
-            groups
-                .into_iter()
-                .map(|group| Candidate::Relation(Box::new(group))),
-        );
-        self.relation_sources.push(raw_snapshot.share_rows());
-        Ok(())
-    }
-
     pub(crate) fn append_directory(
         &mut self,
 
@@ -1050,12 +1013,9 @@ impl NativeCandidateTable {
                 let fact = table.relation_anchors[*index].as_ref();
                 CandidateProjection::File {
                     path,
-                    size: table.sizes[*index],
-                    route: filesystem_route_name(table.file_routes[*index]),
                     format_hint: fact
                         .and_then(CheapAnchor::anchor)
                         .map_or("", |anchor| anchor.format.as_str()),
-                    reject_mask: fact.map_or(0, CheapAnchor::reject_mask),
                     logical_name: filesystem_logical_name(path),
                 }
             }
@@ -1063,7 +1023,6 @@ impl NativeCandidateTable {
                 let data = group.candidate_data();
                 CandidateProjection::Relation {
                     relation: group.project(),
-                    needs_password: data.needs_password,
                     failure_reason: data
                         .needs_password
                         .then(|| {

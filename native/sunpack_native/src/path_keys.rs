@@ -122,7 +122,3 @@ pub(crate) fn merge_roots<T>(
     }
     merged.into_iter().map(|(_, root)| root).collect()
 }
-
-pub(crate) fn merge_release_roots(paths: Vec<String>) -> Vec<String> {
-    merge_roots(paths, |path| path_key(path))
-}

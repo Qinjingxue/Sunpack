@@ -8,7 +8,7 @@ pub(crate) fn runtime_binary_build_id(path: &Path) -> io::Result<String> {
 }
 
 fn hash_runtime_binary(path: &Path) -> io::Result<u64> {
-    let file = TrackedFile::open_reader(path, "runtime_binary_build_id")?;
+    let file = TrackedFile::open_reader(path)?;
     let mut hash = Xxh64::new(0);
     hash_reader(file, |data| hash.update(data))?;
     Ok(hash.digest())

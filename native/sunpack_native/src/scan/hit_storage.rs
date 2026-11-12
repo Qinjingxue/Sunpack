@@ -1445,6 +1445,7 @@ pub(super) struct Prepared {
     start: u64,
     base: u64,
     parts: [Part; 2],
+    #[cfg(test)]
     pub(super) raw_count: usize,
     working_bytes: usize,
 }
@@ -1834,6 +1835,7 @@ pub(super) struct HitBuffer {
     tail: u64,
     horizon: u32,
     count: usize,
+    #[cfg(test)]
     raw_count: usize,
 }
 impl HitBuffer {
@@ -1848,6 +1850,7 @@ impl HitBuffer {
                 .max(start),
             horizon: (HIT_LOOKBEHIND + overlap as u64) as u32,
             count: 0,
+            #[cfg(test)]
             raw_count: 0,
         }
     }
@@ -1860,7 +1863,10 @@ impl HitBuffer {
         let hit = PackedHit::new(relative_offset as u32, hit.pattern);
         let t = tag(hit);
         self.count += 1;
-        self.raw_count += usize::from((t as usize) < 12);
+        #[cfg(test)]
+        {
+            self.raw_count += usize::from((t as usize) < 12);
+        }
         let part = &mut self.parts[usize::from(t as usize == PATTERNS.len())];
         let offset = self.base + relative(hit) as u64;
         if offset < self.start {
@@ -1895,6 +1901,7 @@ pub(super) fn prepare(batch: HitBuffer, last: bool) -> Prepared {
     let HitBuffer {
         base,
         start,
+        #[cfg(test)]
         raw_count,
         parts,
         ..
@@ -1912,6 +1919,7 @@ pub(super) fn prepare(batch: HitBuffer, last: bool) -> Prepared {
         start,
         base,
         parts,
+        #[cfg(test)]
         raw_count,
         working_bytes,
     }

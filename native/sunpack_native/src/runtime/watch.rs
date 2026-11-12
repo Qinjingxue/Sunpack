@@ -1484,7 +1484,7 @@ impl Scheduler {
                                 pending.drain(..pending.len() - clipboard_limit);
                             }
                         }
-                        crate::core::clipboard_monitor::Notification::VolumeChanged { .. } => {
+                        crate::core::clipboard_monitor::Notification::VolumeChanged => {
                             signals.volumes_changed = true
                         }
                     });

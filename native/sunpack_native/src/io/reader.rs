@@ -333,10 +333,6 @@ impl ManagedReader {
         }
     }
 
-    pub(crate) fn closed() -> Self {
-        Self::new(Arc::new(ClosedSource), ReaderConfig::default())
-    }
-
     pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::open_with_config(path, ReaderConfig::default())
     }
@@ -349,6 +345,7 @@ impl ManagedReader {
         Ok(Self::new(source, config))
     }
 
+    #[cfg(test)]
     pub(crate) fn open_volumes(paths: &[String], config: ReaderConfig) -> io::Result<Self> {
         let source = MultiVolumeSource::open(paths)?;
         Ok(Self::new(Arc::new(source), config))
@@ -806,18 +803,6 @@ struct BytesSource {
     data: Arc<[u8]>,
 }
 
-struct ClosedSource;
-
-impl ByteSource for ClosedSource {
-    fn len(&self) -> u64 {
-        0
-    }
-
-    fn read_at(&self, _offset: u64, _len: usize) -> io::Result<Vec<u8>> {
-        Err(io::Error::other("resource closed"))
-    }
-}
-
 impl ByteSource for BytesSource {
     fn len(&self) -> u64 {
         self.data.len() as u64
@@ -1031,7 +1016,6 @@ impl FileSource {
         let first = offset / BLOCK_SIZE as u64;
         let last = (request_end - 1) / BLOCK_SIZE as u64;
         let manager = manager();
-        let mut produced = 0;
         for index in first..=last {
             let block = manager.read_block(self, index)?;
             let block_start = index * BLOCK_SIZE as u64;
@@ -1039,7 +1023,6 @@ impl FileSource {
             let end = ((request_end - block_start) as usize).min(block.len());
             let short = block.len() < BLOCK_SIZE;
             if start < end {
-                produced += end - start;
                 consume(block, start..end);
             }
             // A short block is the physical EOF observed now (the file shrank
@@ -1048,10 +1031,7 @@ impl FileSource {
                 break;
             }
         }
-        manager
-            .metrics
-            .logical_bytes
-            .fetch_add(produced as u64, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -1111,12 +1091,8 @@ impl ByteSource for FileSource {
         }
         let len = len.min((self.len() - offset) as usize);
         if len > MAX_CACHEABLE_READ_BYTES {
-            let data =
-                self.with_file(|file| read_file_at(file, offset, len, &manager().metrics))?;
-            manager()
-                .metrics
-                .logical_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            let data = self.with_file(|file| read_file_at(file, offset, len))?;
+
             return Ok(data);
         }
 
@@ -1134,19 +1110,8 @@ impl ByteSource for FileSource {
         }
         let len = buffer.len().min((self.len() - offset) as usize);
         if len > MAX_CACHEABLE_READ_BYTES {
-            manager()
-                .metrics
-                .physical_reads
-                .fetch_add(1, Ordering::Relaxed);
             let count = self.with_file(|file| positional_read(file, &mut buffer[..len], offset))?;
-            manager()
-                .metrics
-                .physical_bytes
-                .fetch_add(count as u64, Ordering::Relaxed);
-            manager()
-                .metrics
-                .logical_bytes
-                .fetch_add(count as u64, Ordering::Relaxed);
+
             return Ok(count);
         }
 
@@ -1184,11 +1149,8 @@ impl ByteSource for FileSource {
             return Ok(Vec::new());
         }
         let len = len.min((self.len() - offset) as usize);
-        let data = self.with_file(|file| read_file_at(file, offset, len, &manager().metrics))?;
-        manager()
-            .metrics
-            .logical_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        let data = self.with_file(|file| read_file_at(file, offset, len))?;
+
         Ok(data)
     }
 
@@ -1199,18 +1161,7 @@ impl ByteSource for FileSource {
         }
         let len = buffer.len().min((self.len() - offset) as usize);
         let count = self.with_file(|file| positional_read(file, &mut buffer[..len], offset))?;
-        manager()
-            .metrics
-            .physical_reads
-            .fetch_add(1, Ordering::Relaxed);
-        manager()
-            .metrics
-            .physical_bytes
-            .fetch_add(count as u64, Ordering::Relaxed);
-        manager()
-            .metrics
-            .logical_bytes
-            .fetch_add(count as u64, Ordering::Relaxed);
+
         Ok(count)
     }
 }
@@ -1270,6 +1221,7 @@ impl MultiVolumeSource {
         first..first + count
     }
 
+    #[cfg(test)]
     fn open(paths: &[String]) -> io::Result<Self> {
         Self::open_extents(paths.iter().map(|path| (path.as_str(), 0, None)))
     }
@@ -1461,20 +1413,6 @@ struct HandlePool {
 struct ReaderManager {
     handles: Mutex<HandlePool>,
     cache_shards: Box<[Mutex<CacheShard>]>,
-    metrics: ManagerMetrics,
-}
-
-#[derive(Default)]
-struct ManagerMetrics {
-    logical_bytes: AtomicU64,
-    physical_bytes: AtomicU64,
-    physical_reads: AtomicU64,
-    cache_hits: AtomicU64,
-    cache_misses: AtomicU64,
-    hot_cache_hits: AtomicU64,
-    handle_hits: AtomicU64,
-    opens: AtomicU64,
-    evictions: AtomicU64,
 }
 
 impl CacheShard {
@@ -1680,7 +1618,6 @@ impl ReaderManager {
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
         if let Some(existing) = handles.touch(&canonical, &physical) {
-            self.metrics.handle_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
         let source = Arc::new(FileSource {
@@ -1697,7 +1634,7 @@ impl ReaderManager {
         let retired = handles.insert(Arc::clone(&source));
         drop(handles);
         drop(retired);
-        self.metrics.opens.fetch_add(1, Ordering::Relaxed);
+
         Ok(source)
     }
 
@@ -1752,7 +1689,7 @@ impl ReaderManager {
         let tier = cache_tier(source, index);
 
         loop {
-            if let Some(block) = self.cached_block(&key, tier)? {
+            if let Some(block) = self.cached_block(&key)? {
                 return Ok(block);
             }
 
@@ -1763,11 +1700,10 @@ impl ReaderManager {
                     continue;
                 }
                 BlockLoadClaim::Owned(load) => {
-                    self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
                     let offset = index * BLOCK_SIZE as u64;
                     let len = BLOCK_SIZE.min(source.len().saturating_sub(offset) as usize);
                     let result = source.with_file(|file| {
-                        let data = read_file_at(file, offset, len, &self.metrics)?;
+                        let data = read_file_at(file, offset, len)?;
                         self.insert_block(source, key, Arc::from(data), tier)
                     });
                     let finish_result = self.finish_block_load(source, index, &load);
@@ -1794,18 +1730,12 @@ impl ReaderManager {
         Ok(shard.entries.contains_key(key))
     }
 
-    fn cached_block(&self, key: &BlockKey, tier: CacheTier) -> io::Result<Option<Arc<[u8]>>> {
+    fn cached_block(&self, key: &BlockKey) -> io::Result<Option<Arc<[u8]>>> {
         let shard_index = cache_shard_index(key);
         let shard = self.cache_shards[shard_index]
             .lock()
             .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
         let block = shard.entries.get(key).map(|entry| Arc::clone(&entry.data));
-        if block.is_some() {
-            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            if matches!(tier, CacheTier::Hot) {
-                self.metrics.hot_cache_hits.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         Ok(block)
     }
 
@@ -1823,34 +1753,10 @@ impl ReaderManager {
         source
             .cached_shards
             .fetch_or(1 << shard_index, Ordering::Relaxed);
-        let (block, evictions) = shard.insert(key, &source.identity.path, data, tier);
-        if evictions != 0 {
-            self.metrics
-                .evictions
-                .fetch_add(evictions, Ordering::Relaxed);
-        }
+        let (block, _) = shard.insert(key, &source.identity.path, data, tier);
         Ok(block)
     }
 
-    fn cache_totals(&self) -> io::Result<(usize, usize, usize, usize)> {
-        let mut entries = 0usize;
-        let mut hot_bytes = 0usize;
-        let mut general_bytes = 0usize;
-        let mut capacity = 0usize;
-        for shard in &self.cache_shards {
-            let shard = shard
-                .lock()
-                .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-            entries += shard.entries.len();
-            hot_bytes += shard.hot.bytes;
-            general_bytes += shard.general.bytes;
-            capacity += shard.entries.capacity()
-                + shard.by_source.capacity()
-                + shard.hot.order.capacity()
-                + shard.general.order.capacity();
-        }
-        Ok((entries, hot_bytes, general_bytes, capacity))
-    }
 }
 
 impl HandlePool {
@@ -1942,71 +1848,6 @@ fn cache_tier(source: &FileSource, index: u64) -> CacheTier {
     }
 }
 
-pub(crate) fn reader_cache_stats() -> io::Result<HashMap<&'static str, u64>> {
-    let manager = manager();
-    let (entries, hot_bytes, general_bytes, mut capacity) = manager.cache_totals()?;
-    let handles = {
-        let handles = manager
-            .handles
-            .lock()
-            .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-        capacity += handles.entries.capacity() + handles.order.capacity();
-        handles.entries.len()
-    };
-    let mut metrics = HashMap::new();
-    metrics.insert(
-        "logical_bytes",
-        (manager.metrics.logical_bytes.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "physical_bytes",
-        (manager.metrics.physical_bytes.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "physical_reads",
-        (manager.metrics.physical_reads.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "cache_hits",
-        (manager.metrics.cache_hits.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "hot_cache_hits",
-        (manager.metrics.hot_cache_hits.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "cache_misses",
-        (manager.metrics.cache_misses.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "handle_hits",
-        (manager.metrics.handle_hits.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "opens",
-        (manager.metrics.opens.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert(
-        "evictions",
-        (manager.metrics.evictions.load(Ordering::Relaxed)) as u64,
-    );
-    metrics.insert("cache_entries", (entries) as u64);
-    metrics.insert("hot_cache_bytes", (hot_bytes) as u64);
-    metrics.insert("general_cache_bytes", (general_bytes) as u64);
-    metrics.insert("open_handles", (handles) as u64);
-    metrics.insert("cache_shards", (CACHE_SHARDS) as u64);
-    metrics.insert("container_capacity", (capacity) as u64);
-    metrics.insert(
-        "relation_regex_cache_entries",
-        (crate::relations::regex_cache_entries()) as u64,
-    );
-    metrics.insert(
-        "seven_zip_kdf_cache_entries",
-        (crate::formats::seven_zip::seven_zip_kdf_cache_entries()) as u64,
-    );
-    Ok(metrics)
-}
-
 pub(crate) fn clear_reader_resources() -> io::Result<HashMap<&'static str, u64>> {
     let relation_regexes = crate::relations::clear_regex_caches();
     crate::password::context::clear();
@@ -2070,14 +1911,13 @@ fn manager() -> &'static ReaderManager {
                 capacity: DEFAULT_HANDLE_CAPACITY,
             }),
             cache_shards,
-            metrics: ManagerMetrics::default(),
         }
     })
 }
 
 /// Capture the stable physical generation independently of the reader cache.
 pub(crate) fn capture_file_generation(path: &Path) -> io::Result<PhysicalFileGeneration> {
-    let file = TrackedFile::open_reader(path, "source_generation")?;
+    let file = TrackedFile::open_reader(path)?;
     physical_file_generation(&file)
 }
 
@@ -2208,16 +2048,10 @@ fn windows_file_generation(file: &File) -> io::Result<WindowsFileGeneration> {
     })
 }
 
-fn read_file_at(
-    file: &File,
-    offset: u64,
-    len: usize,
-    metrics: &ManagerMetrics,
-) -> io::Result<Vec<u8>> {
+fn read_file_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut data = crate::io::resource_error::zeroed_bytes(len)?;
     let mut read = 0usize;
     while read < len {
-        metrics.physical_reads.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         THREAD_PHYSICAL_READS.with(|reads| reads.set(reads.get() + 1));
         let count = positional_read(file, &mut data[read..], offset + read as u64)?;
@@ -2227,14 +2061,12 @@ fn read_file_at(
         }
         read += count;
     }
-    metrics
-        .physical_bytes
-        .fetch_add(data.len() as u64, Ordering::Relaxed);
+
     Ok(data)
 }
 
 fn open_reader_file(path: &Path) -> io::Result<TrackedFile> {
-    TrackedFile::open_reader(path, "reader_file")
+    TrackedFile::open_reader(path)
 }
 
 #[cfg(unix)]
@@ -2993,7 +2825,7 @@ mod tests {
             second.to_string_lossy().into_owned(),
         ];
         let reader = ManagedReader::open_volumes(&paths, ReaderConfig::default()).unwrap();
-        TrackedFile::open_with(&first, "shrunk_volume_test_writer", |options| {
+        TrackedFile::open_with(&first, |options| {
             options.write(true);
         })
         .unwrap()
@@ -3023,7 +2855,7 @@ mod tests {
         assert_eq!(first.read_at(0, 4).unwrap(), b"abcd");
         let key = BlockKey::new(&first, 0);
         assert!(manager()
-            .cached_block(&key, cache_tier(&first, 0))
+            .cached_block(&key)
             .unwrap()
             .is_some());
         let second = manager().open_file(&path).unwrap();
@@ -3113,7 +2945,7 @@ mod tests {
         }
 
         let block = source
-            .with_file(|file| read_file_at(file, 0, BLOCK_SIZE, &manager().metrics))
+            .with_file(|file| read_file_at(file, 0, BLOCK_SIZE))
             .unwrap();
         let key = BlockKey::new(&source, 0);
         manager()
@@ -3237,7 +3069,7 @@ mod tests {
         assert_eq!(first.read_all().unwrap(), b"old!");
         std::fs::rename(&path, &old_path).unwrap();
         std::fs::write(&path, b"new!").unwrap();
-        let replacement = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+        let replacement = TrackedFile::open_with(&path, |options| {
             options.write(true);
         })
         .unwrap();
@@ -3270,7 +3102,7 @@ mod tests {
         // Creation and overwrite can occur in the same Windows clock tick.
         // Start with a historical ChangeTime so the real write/metadata update
         // has a distinct generation without sleeps or altered production I/O.
-        let initial = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+        let initial = TrackedFile::open_with(&path, |options| {
             options.write(true);
         })
         .unwrap();
@@ -3280,7 +3112,7 @@ mod tests {
         let first = ManagedReader::open(&path).unwrap();
         assert_eq!(first.read_all().unwrap(), b"old!");
         std::fs::write(&path, b"new!").unwrap();
-        let file = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+        let file = TrackedFile::open_with(&path, |options| {
             options.write(true);
         })
         .unwrap();
@@ -3310,7 +3142,7 @@ mod tests {
             .unwrap()
             .remove_entry(&old_key, true);
         std::fs::write(&path, b"last").unwrap();
-        let writer = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+        let writer = TrackedFile::open_with(&path, |options| {
             options.write(true);
         })
         .unwrap();

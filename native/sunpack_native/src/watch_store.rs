@@ -50,9 +50,6 @@ impl PathSet {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
         self.0.values()
     }
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
     pub(crate) fn contains(&self, path: &str) -> bool {
         self.0.contains_key(&path_key(path))
     }
@@ -665,12 +662,6 @@ impl NativeWatchOperations {
         }
     }
 
-    pub(crate) fn cursors(cursors: BTreeMap<String, Cursor>) -> Self {
-        Self {
-            operations: Arc::new(Operations(vec![Operation::SetCursors(cursors)])),
-        }
-    }
-
     pub(crate) fn password_generation(generation: i64, signature: String) -> Self {
         Self {
             operations: Arc::new(Operations(vec![Operation::SetMetadata(
@@ -782,9 +773,6 @@ struct SnapshotInput {
 }
 
 impl NativeWatchSnapshot {
-    pub(crate) fn checkpoint_seq(&self) -> u64 {
-        self.checkpoint_seq
-    }
 
     /// Encode, write and fsync the snapshot to an existing temporary file.
     pub(crate) fn write(&self, path: String) -> std::io::Result<u64> {
@@ -798,7 +786,7 @@ impl NativeWatchSnapshot {
                 runtime: &self.data.runtime,
                 promoted: &self.data.promoted,
             };
-            let mut file = TrackedFile::open_with(&path, "watch_state_snapshot", |options| {
+            let mut file = TrackedFile::open_with(&path, |options| {
                 options.write(true).truncate(true);
                 #[cfg(windows)]
                 {
@@ -1201,20 +1189,11 @@ impl NativeWatchState {
         Ok(())
     }
 
-    pub(crate) fn reset(&self) {
-        *self.lock() = StateData::default();
-    }
-
     /// Capacity-only maintenance: never changes records or checkpoint views.
     pub(crate) fn trim_idle_storage(&self) {
         let mut data = self.lock();
         trim_map(&mut data.pending);
         trim_map(&mut data.entries);
-    }
-
-    pub(crate) fn storage_capacities(&self) -> (usize, usize) {
-        let data = self.lock();
-        (data.pending.capacity(), data.entries.capacity())
     }
 
     pub(crate) fn password_generation(&self) -> i64 {
@@ -1223,14 +1202,6 @@ impl NativeWatchState {
 
     pub(crate) fn password_source_signature(&self) -> String {
         self.lock().password_source_signature.clone()
-    }
-
-    pub(crate) fn pending_count(&self) -> usize {
-        self.lock().pending.len()
-    }
-
-    pub(crate) fn entry_count(&self) -> usize {
-        self.lock().entries.len()
     }
 
     pub(crate) fn pending(&self, path: &str) -> Option<Arc<PendingRecord>> {
@@ -1297,21 +1268,6 @@ impl NativeWatchState {
             .filter(|value| blocker.is_none_or(|blocker| value.blocks(blocker)))
             .cloned()
             .collect()
-    }
-
-    pub(crate) fn has_entry_blocker(&self, blocker: &str) -> bool {
-        self.lock()
-            .entries
-            .values()
-            .any(|value| value.blocks(blocker))
-    }
-
-    pub(crate) fn has_pending(&self, path: &str) -> bool {
-        self.lock().pending.contains_key(&path_key(path))
-    }
-
-    pub(crate) fn has_entry(&self, path: &str) -> bool {
-        self.lock().entries.contains_key(&path_key(path))
     }
 
     /// Configuration retirement only visits resident state, never file-index rows.
@@ -1398,72 +1354,6 @@ impl NativeWatchState {
         }
     }
 
-    /// Missing-only retirement keeps durable output recovery, even under a removed directory.
-    pub(crate) fn keys_matching(
-        &self,
-
-        path: &str,
-        recursive: bool,
-        missing_only: bool,
-    ) -> (Vec<String>, Vec<String>) {
-        let expected = path_key(path);
-        let matches =
-            |key: &String| key == &expected || (recursive && is_path_under(key, &expected));
-        let (pending, entries): (Vec<_>, Vec<_>) = {
-            let data = self.lock();
-            if recursive {
-                (
-                    data.pending
-                        .iter()
-                        .filter(|(key, _)| matches(key))
-                        .map(|(key, record)| (key.clone(), Arc::clone(record)))
-                        .collect(),
-                    data.entries
-                        .iter()
-                        .filter(|(key, _)| matches(key))
-                        .map(|(key, record)| (key.clone(), Arc::clone(record)))
-                        .collect(),
-                )
-            } else {
-                (
-                    data.pending
-                        .get(&expected)
-                        .map(|record| (expected.clone(), Arc::clone(record)))
-                        .into_iter()
-                        .collect(),
-                    data.entries
-                        .get(&expected)
-                        .map(|record| (expected.clone(), Arc::clone(record)))
-                        .into_iter()
-                        .collect(),
-                )
-            }
-        };
-        (move || {
-            let mut pending: Vec<_> = pending
-                .into_iter()
-                .filter(|(_, record)| {
-                    !missing_only
-                        || (record.active_outputs.is_empty()
-                            && record.committed_roots.is_empty()
-                            && record.promoted_destinations.is_empty()
-                            && recorded_file_presence(&record.path) == Some(false))
-                })
-                .map(|(key, _)| key)
-                .collect();
-            let mut entries: Vec<_> = entries
-                .into_iter()
-                .filter(|(_, record)| {
-                    !missing_only || recorded_file_presence(&record.path) == Some(false)
-                })
-                .map(|(key, _)| key)
-                .collect();
-            pending.sort();
-            entries.sort();
-            (pending, entries)
-        })()
-    }
-
     /// ``(key, recorded path)`` in the requested retry-entry scope.
     pub(crate) fn entry_paths(&self, path: Option<&str>, recursive: bool) -> Vec<(String, String)> {
         let expected = path.map(path_key);
@@ -1493,6 +1383,7 @@ impl NativeWatchState {
         recorded_file_presence(path)
     }
 
+    #[cfg(test)]
     pub(crate) fn watch_cursors(&self) -> BTreeMap<String, Cursor> {
         self.lock().cursors.clone()
     }
@@ -1536,7 +1427,7 @@ impl NativeWatchState {
     /// Replay already established this boundary while holding the path gate.
     pub(crate) fn truncate_journal_tail(path: String, valid_bytes: u64) -> std::io::Result<()> {
         (|| -> std::io::Result<()> {
-            let file = TrackedFile::open_with(&path, "watch_journal_repair", |options| {
+            let file = TrackedFile::open_with(&path, |options| {
                 options.read(true).write(true);
             })?;
             if file.metadata()?.len() != valid_bytes {
@@ -1737,7 +1628,7 @@ fn decode_operation(operation: &Value) -> std::io::Result<Operation> {
 }
 
 fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
-    let file = TrackedFile::open(path, "watch_state_snapshot_input")?;
+    let file = TrackedFile::open(path)?;
     let (checkpoint_seq, snapshot): (_, SnapshotInput) =
         wal::read_snapshot(file, Kind::TaskSnapshot)
             .map_err(|error| invalid(format!("corrupt watch state snapshot at {path}: {error}")))?;
@@ -1770,7 +1661,7 @@ fn replay_segment_file(
     mut expected_seq: u64,
 ) -> std::io::Result<NativeWatchReplay> {
     let diagnose = |error| invalid(format!("corrupt watch state journal at {path}: {error}"));
-    let file = TrackedFile::open(path, "watch_state_journal_input")?;
+    let file = TrackedFile::open(path)?;
     let mut reader = wal::Reader::new(file, Kind::TaskWal).map_err(diagnose)?;
     let mut replay = NativeWatchReplay {
         applied_seq: 0,

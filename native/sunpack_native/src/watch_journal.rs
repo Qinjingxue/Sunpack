@@ -120,15 +120,6 @@ pub(crate) struct NativeJournalStream {
     stream: Option<String>,
 }
 
-impl NativeJournalStream {
-    pub(crate) fn close(&mut self) -> std::io::Result<()> {
-        if let Some(stream) = self.stream.take() {
-            (self.runtime.release(stream)).map_err(std::io::Error::other)?;
-        }
-        Ok(())
-    }
-}
-
 impl Drop for NativeJournalStream {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
@@ -217,6 +208,7 @@ enum WriterCommand {
         old_start: u64,
         boundary: u64,
     },
+    #[cfg(test)]
     Barrier {
         done: mpsc::Sender<()>,
     },
@@ -408,6 +400,7 @@ impl JournalRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn barrier(&self) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
         self.writer_tx
@@ -417,6 +410,7 @@ impl JournalRuntime {
             .map_err(|_| "native Watch journal writer barrier failed".to_string())
     }
 
+    #[cfg(test)]
     fn flush_all(&self) -> Result<(), String> {
         self.barrier()?;
         let targets = {
@@ -494,7 +488,7 @@ fn open_segment(path: &Path, kind: Kind) -> io::Result<TrackedFile> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = TrackedFile::open_with(path, "watch_journal_segment", |options| {
+    let mut file = TrackedFile::open_with(path, |options| {
         options.create(true).append(true).read(true);
         #[cfg(windows)]
         {
@@ -790,6 +784,7 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                 }
                 shared.cv.notify_all();
             }
+            #[cfg(test)]
             WriterCommand::Barrier { done } => {
                 let _ = done.send(());
             }
@@ -1003,10 +998,6 @@ pub(crate) fn watch_journal_request_flush(
 
 pub(crate) fn watch_journal_seed(stream: &str, seq: u64) -> std::io::Result<()> {
     runtime().seed(stream, seq).map_err(std::io::Error::other)
-}
-
-pub(crate) fn watch_journal_flush_all() -> std::io::Result<()> {
-    (runtime().flush_all()).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]

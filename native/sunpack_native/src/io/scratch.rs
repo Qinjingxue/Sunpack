@@ -372,7 +372,7 @@ fn scratch_file() -> io::Result<TrackedFile> {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        match TrackedFile::open_with(path, "scratch", |options| {
+        match TrackedFile::open_with(path, |options| {
             options
                 .read(true)
                 .write(true)

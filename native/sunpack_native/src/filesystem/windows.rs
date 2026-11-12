@@ -170,7 +170,7 @@ pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i6
     // Use the existing passive registration so promotion callbacks can record
     // directory identities while the namespace is protected by their gate.
     let observation = {
-        let file = TrackedFile::open_passive_with(path, "path_identity_handle", |options| {
+        let file = TrackedFile::open_passive_with(path, |options| {
             options
                 .read(true)
                 .access_mode(FILE_READ_ATTRIBUTES)
@@ -214,11 +214,6 @@ fn open_path(
     is_directory: bool,
 ) -> io::Result<OwnedHandle> {
     let resource = crate::io::resource_lifecycle::NativeResourceGuard::register(
-        if is_directory {
-            "directory_metadata_handle"
-        } else {
-            "file_metadata_handle"
-        },
         [path.to_path_buf()],
     )?;
     let path = canonical_wide(path)?;

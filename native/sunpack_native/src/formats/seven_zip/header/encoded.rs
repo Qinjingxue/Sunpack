@@ -633,13 +633,6 @@ fn seven_zip_kdf_cache(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
-pub(crate) fn seven_zip_kdf_cache_entries() -> usize {
-    seven_zip_kdf_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .len()
-}
-
 pub(crate) fn clear_seven_zip_kdf_cache() -> usize {
     // Idle cleanup owns the same boundary as reader/password-context cleanup.
     // Drop entries and their backing allocation outside the cache lock.

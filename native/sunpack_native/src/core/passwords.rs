@@ -298,7 +298,7 @@ impl<'a> Document<'a> {
 
 fn read_text(path: &Path) -> io::Result<String> {
     let mut text = String::new();
-    TrackedFile::open_reader(path, "builtin_passwords")?.read_to_string(&mut text)?;
+    TrackedFile::open_reader(path)?.read_to_string(&mut text)?;
     Ok(text)
 }
 
@@ -390,7 +390,7 @@ impl BuiltinStore {
 
     fn read_snapshot(&self, force: bool) -> io::Result<Arc<PasswordSnapshot>> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let mut file = match TrackedFile::open_reader(&self.path, "builtin_passwords") {
+        let mut file = match TrackedFile::open_reader(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if state.observed.is_some() {

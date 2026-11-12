@@ -391,7 +391,7 @@ fn probe_cheap_prefix(
 fn open_cheap_file(path: &str) -> std::io::Result<TrackedFile> {
     // Cheap probes still use the lifecycle guard, but skip the managed reader's
     // metadata/canonicalization/handle-cache path for this one-shot read.
-    TrackedFile::open_reader(path, "volume_anchor_cheap")
+    TrackedFile::open_reader(path)
 }
 
 fn read_anchor_header_from(
