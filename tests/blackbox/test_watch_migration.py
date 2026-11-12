@@ -332,3 +332,37 @@ def test_watch_reload_noop_and_invalid_configuration_keep_main_contract(package,
     finally:
         config.write_text(json.dumps(raw), encoding="utf-8")
     assert package.json("watch", "status")["summary"]["running"]
+
+
+def test_watch_configured_user_passwords_decrypt_and_retry_after_reload(package, tmp_path):
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    output = tmp_path / "out"
+    for name, password in [("first", "configured-only"), ("later", "edited-only")]:
+        payload = tmp_path / f"{name}.txt"
+        payload.write_text(name, encoding="utf-8")
+        subprocess.run(
+            [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", f"-p{password}",
+             str(watched / f"{name}.7z"), str(payload)],
+            check=True, capture_output=True,
+        )
+    package.configure(user_passwords=["configured-only", "configured-only"])
+    package.json("watch", "add", watched, "-o", output)
+    package.json("watch", "start", "--no-tray")
+    _wait_for(lambda: any(output.rglob("first.txt")), "Configured Watch password was not used")
+    events = package.data / ".sunpack_watch" / "events.json"
+    def blocked():
+        display = native_fixture("display_events", path=str(events))
+        # Password blockers remain live until the source change resolves them;
+        # completed task rows, such as first.7z, belong to history.
+        return any(
+            row.get("event") == "failed_password" and "later.7z" in str(row)
+            for row in (*display["history"], *display["live"])
+        )
+    _wait_for(blocked, "Second archive did not reach its password blocker")
+    assert not list(output.rglob("later.txt"))
+    package.configure(live=True, user_passwords=["configured-only", "edited-only"])
+    package.json("watch", "reload")
+    _wait_for(lambda: any(output.rglob("later.txt")), "Config-only password edit did not retry blocker")
+    assert [path.read_text(encoding="utf-8") for path in output.rglob("first.txt")] == ["first"]
+    assert [path.read_text(encoding="utf-8") for path in output.rglob("later.txt")] == ["later"]

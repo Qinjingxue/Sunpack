@@ -1576,6 +1576,12 @@ impl NativeWatchCatalog {
         })();
     }
 
+    pub(crate) fn root_replaced(&self, scope: &crate::scan::scope::NativeDiscoveryScope, identity: &str) -> bool {
+        self.store.lock().unwrap().as_ref()
+            .and_then(|store| store.stamps.get(&crate::path_keys::path_key(&scope.root)))
+            .is_some_and(|saved| saved.identity != identity)
+    }
+
     pub(crate) fn cursor(
         &self,
 

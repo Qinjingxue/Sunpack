@@ -2,16 +2,20 @@ use super::cli::{self, Host};
 use super::windows::{self, Event};
 use super::{Session, Stream};
 use crate::core::{config, resources};
-use crate::pipeline::Cancellation;
+use crate::pipeline::{block_on, in_control_poll, Cancellation, Origin};
+use super::cli::reporting::Reply;
+use std::pin::Pin;
+use std::future::Future;
+mod transport;
+mod output;
 use std::ffi::{c_void, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE,
@@ -19,7 +23,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
@@ -224,129 +228,6 @@ fn drain(pipe: *mut c_void, overlapped: &mut OVERLAPPED) {
     }
 }
 
-struct Peer<'a> {
-    pipe: OwnedHandle,
-    stop: Event,
-    shutdown: &'a Event,
-}
-
-impl<'a> Peer<'a> {
-    fn new(pipe: OwnedHandle, shutdown: &'a Event) -> io::Result<Self> {
-        Ok(Self {
-            pipe,
-            stop: Event::new(true)?,
-            shutdown,
-        })
-    }
-
-    fn transfer(
-        &self,
-        event: &Event,
-        cancelled: Option<&Event>,
-        operation: impl FnOnce(*mut c_void, &mut OVERLAPPED) -> i32,
-    ) -> io::Result<usize> {
-        let pipe = self.pipe.as_raw_handle();
-        let mut overlapped = OVERLAPPED {
-            hEvent: event.raw(),
-            ..Default::default()
-        };
-        event.reset()?;
-        if operation(pipe, &mut overlapped) == 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
-                return Err(error);
-            }
-            let handles = [
-                event.raw(),
-                self.stop.raw(),
-                self.shutdown.raw(),
-                cancelled.unwrap_or(&self.stop).raw(),
-            ];
-            let count = if cancelled.is_some() { 4 } else { 3 };
-            // Completed I/O wins over cancellation; its bytes are already sent.
-            match unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, INFINITE) } {
-                WAIT_OBJECT_0 => {}
-                result => {
-                    drain(pipe, &mut overlapped);
-                    return Err(
-                        if (WAIT_OBJECT_0 + 1..WAIT_OBJECT_0 + count).contains(&result) {
-                            io::ErrorKind::ConnectionAborted.into()
-                        } else {
-                            io::Error::last_os_error()
-                        },
-                    );
-                }
-            }
-        }
-        complete(pipe, &mut overlapped)
-    }
-}
-
-struct Reader<'a> {
-    peer: &'a Peer<'a>,
-    event: Event,
-}
-
-impl Read for Reader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        self.peer
-            .transfer(&self.event, None, |pipe, overlapped| unsafe {
-                ReadFile(
-                    pipe,
-                    buffer.as_mut_ptr(),
-                    buffer.len().min(u32::MAX as usize) as u32,
-                    null_mut(),
-                    overlapped,
-                )
-            })
-    }
-}
-
-struct Writer<'a> {
-    peer: &'a Peer<'a>,
-    event: Event,
-    cancelled: &'a Event,
-    failed: bool,
-}
-
-impl Write for Writer<'_> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if self.failed {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let result = self.peer.transfer(
-            &self.event,
-            Some(self.cancelled),
-            |pipe, overlapped| unsafe {
-                WriteFile(
-                    pipe,
-                    buffer.as_ptr(),
-                    buffer.len().min(u32::MAX as usize) as u32,
-                    null_mut(),
-                    overlapped,
-                )
-            },
-        );
-        if result.is_err() {
-            // transfer has drained the operation. Its frame may be truncated:
-            // stop the reader and forbid any subsequent interrupt/exit frame.
-            self.failed = true;
-            self.peer.stop.signal();
-        }
-        result
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 struct Header {
     flags: u32,
     cwd: PathBuf,
@@ -376,109 +257,88 @@ fn read_field(input: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-fn read_text(input: &mut impl Read, size: usize) -> io::Result<String> {
-    String::from_utf8(read_field(input, size)?).map_err(io::Error::other)
+async fn read_word(peer: &transport::Peer) -> io::Result<u32> {
+    Ok(u32::from_be_bytes(peer.read_exact(4).await?.try_into().unwrap()))
 }
-
+async fn read_peer_field(peer: &transport::Peer, length: usize) -> io::Result<Vec<u8>> {
+    if length > MAX_FIELD { return Err(io::ErrorKind::InvalidData.into()); }
+    peer.read_exact(length).await
+}
 impl Header {
-    fn read(input: &mut impl Read, build_id: &[u8; 16], token: &[u8; 32]) -> io::Result<Self> {
-        let mut header = [0; 52];
-        input.read_exact(&mut header)?;
+    async fn read(peer: &transport::Peer, build_id: &[u8; 16], token: &[u8; 32]) -> io::Result<Self> {
+        let header = peer.read_exact(52).await?;
         if &header[..4] != b"SPK2" || &header[4..20] != build_id || &header[20..] != token {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        let flags = read_u32(input)?;
-        let cwd_len = read_u32(input)? as usize;
-        let argc = read_u32(input)?;
-        let cwd = PathBuf::from(read_text(input, cwd_len)?);
-        if !cwd.is_absolute() {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
+        let flags = read_word(peer).await?;
+        let cwd_len = read_word(peer).await? as usize;
+        let argc = read_word(peer).await?;
+        let cwd = PathBuf::from(String::from_utf8(read_peer_field(peer, cwd_len).await?).map_err(io::Error::other)?);
+        if !cwd.is_absolute() { return Err(io::ErrorKind::InvalidInput.into()); }
         let mut argv = Vec::new();
         let mut terminal_size = 80 | 24 << 16;
         for index in 0..argc {
-            let size = read_u32(input)? as usize;
-            let arg = read_text(input, size)?;
+            let size = read_word(peer).await? as usize;
+            let arg = String::from_utf8(read_peer_field(peer, size).await?).map_err(io::Error::other)?;
             if flags & TERMINAL_SIZE_FIELD != 0 && index + 1 == argc {
-                terminal_size = arg
-                    .strip_prefix("--_sunpack-terminal-size=")
+                terminal_size = arg.strip_prefix("--_sunpack-terminal-size=")
                     .and_then(|value| value.split_once('x'))
-                    .and_then(|(width, height)| {
-                        encode_terminal_size(width.parse().ok()?, height.parse().ok()?)
-                    })
+                    .and_then(|(width, height)| encode_terminal_size(width.parse().ok()?, height.parse().ok()?))
                     .ok_or(io::ErrorKind::InvalidData)?;
-            } else {
-                argv.push(arg);
-            }
+            } else { argv.push(arg); }
         }
-        Ok(Self {
-            flags,
-            cwd,
-            argv,
-            terminal_size,
-        })
+        Ok(Self { flags, cwd, argv, terminal_size })
     }
 }
 
-struct Connection<'a> {
-    writer: Mutex<Writer<'a>>,
-    prompt: Mutex<Option<Arc<mpsc::SyncSender<Vec<u8>>>>>,
+struct Connection {
+    peer: transport::Peer,
+    output: output::Output,
+    prompt: Mutex<Option<Arc<PromptAnswer>>>,
     input: Mutex<PromptInput>,
     cancel: Cancellation,
+    finishing: AtomicBool,
     terminal_size: AtomicU32,
     flags: u32,
 }
 
-/// The cancellation wake targets this response channel, even after the control
-/// reader takes its sender and blocks receiving the rest of an input frame.
+#[derive(Default)]
+struct PromptAnswer {
+    reply: Reply<Vec<u8>>,
+    completed: AtomicBool,
+}
+impl PromptAnswer {
+    fn complete(&self, value: io::Result<Vec<u8>>) {
+        // Input and cancellation race for the same one-shot, like main's
+        // Future.done check. A late cancellation must not replace an answer.
+        if !self.completed.swap(true, Ordering::AcqRel) { self.reply.complete(value); }
+    }
+    async fn wait(&self) -> io::Result<Vec<u8>> { self.reply.wait().await }
+}
+
 struct PromptReply<'a> {
-    slot: &'a Mutex<Option<Arc<mpsc::SyncSender<Vec<u8>>>>>,
-    sender: Arc<mpsc::SyncSender<Vec<u8>>>,
-    receive: mpsc::Receiver<Vec<u8>>,
+    slot: &'a Mutex<Option<Arc<PromptAnswer>>>,
+    reply: Arc<PromptAnswer>,
     _cancellation: Option<crate::io::cancellation::Subscription>,
 }
-
 impl<'a> PromptReply<'a> {
-    fn new(
-        slot: &'a Mutex<Option<Arc<mpsc::SyncSender<Vec<u8>>>>>,
-        cancel: &Cancellation,
-    ) -> io::Result<Option<Self>> {
-        let (send, receive) = mpsc::sync_channel(1);
-        let sender = Arc::new(send);
+    fn new(slot: &'a Mutex<Option<Arc<PromptAnswer>>>, cancel: &Cancellation) -> io::Result<Option<Self>> {
+        let reply = Arc::new(PromptAnswer::default());
         {
             let mut pending = slot.lock().unwrap();
-            if cancel.cancelled() {
-                return Ok(None);
-            }
-            if pending.is_some() {
-                return Err(io::Error::other("a prompt is already awaiting input"));
-            }
-            *pending = Some(Arc::clone(&sender));
+            if cancel.cancelled() { return Ok(None); }
+            if pending.is_some() { return Err(io::Error::other("a prompt is already awaiting input")); }
+            *pending = Some(Arc::clone(&reply));
         }
-        let wake = Arc::clone(&sender);
-        let cancellation = cancel.subscribe(move || {
-            // Empty input is the existing EOF response. Never block a canceller
-            // if an answer already occupies the single response slot.
-            let _ = wake.try_send(Vec::new());
-        });
-        Ok(Some(Self {
-            slot,
-            sender,
-            receive,
-            _cancellation: cancellation,
-        }))
+        let wake = Arc::clone(&reply);
+        let cancellation = cancel.subscribe(move || wake.complete(Ok(Vec::new())));
+        Ok(Some(Self { slot, reply, _cancellation: cancellation }))
     }
 }
-
 impl Drop for PromptReply<'_> {
     fn drop(&mut self) {
         let mut slot = self.slot.lock().unwrap();
-        if slot
-            .as_ref()
-            .is_some_and(|sender| Arc::ptr_eq(sender, &self.sender))
-        {
-            slot.take();
-        }
+        if slot.as_ref().is_some_and(|reply| Arc::ptr_eq(reply, &self.reply)) { slot.take(); }
     }
 }
 
@@ -555,46 +415,84 @@ impl PromptInput {
 // Console clients decode each output frame independently. Only inspect the
 // boundary (at most three continuation bytes), not the entire output buffer.
 fn frame_chunk_len(kind: u8, bytes: &[u8]) -> usize {
-    if bytes.len() <= MAX_FIELD || !matches!(kind, 1 | 2) {
-        return bytes.len().min(MAX_FIELD);
-    }
-    let mut end = MAX_FIELD;
-    while end > MAX_FIELD - 3 && bytes[end] & 0xc0 == 0x80 {
+    let limit = if matches!(kind, 1 | 2) { 64 * 1024 } else { MAX_FIELD };
+    if bytes.len() <= limit { return bytes.len(); }
+    let mut end = limit;
+    while end > limit - 3 && bytes[end] & 0xc0 == 0x80 {
         end -= 1;
     }
     if bytes[end] & 0xc0 == 0x80 {
         // Arbitrary byte output must still make progress without losing data.
-        MAX_FIELD
+        limit
     } else {
         end
     }
 }
 
-impl Connection<'_> {
-    fn frame(&self, kind: u8, bytes: &[u8]) -> io::Result<()> {
-        let mut output = self.writer.lock().unwrap();
-        let mut frame = Vec::with_capacity(5 + bytes.len().min(32 * 1024));
-        let mut remaining = bytes;
-        loop {
-            let (chunk, rest) = remaining.split_at(frame_chunk_len(kind, remaining));
-            frame.clear();
-            frame.push(kind);
-            frame.extend((chunk.len() as u32).to_be_bytes());
-            frame.extend(chunk);
-            output.write_all(&frame)?;
-            if rest.is_empty() {
-                break;
-            }
-            remaining = rest;
+fn output_frame(kind: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + bytes.len());
+    frame.push(kind);
+    frame.extend((bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(bytes);
+    frame
+}
+
+impl Connection {
+    fn close(&self) {
+        self.peer.close();
+        self.output.close();
+        if let Some(reply) = self.prompt.lock().unwrap().take() {
+            reply.complete(Err(io::ErrorKind::ConnectionAborted.into()));
         }
-        Ok(())
     }
 
-    fn read_control(&self, reader: &mut impl Read, cwd: &Path) -> io::Result<()> {
+    async fn frame(&self, kind: u8, bytes: &[u8]) -> io::Result<()> {
+        let mut remaining = bytes;
         loop {
-            match read_u32(reader)? {
+            let count = frame_chunk_len(kind, remaining);
+            let (chunk, rest) = remaining.split_at(count);
+            self.output.enqueue(output_frame(kind, chunk)).await?;
+            if rest.is_empty() { return Ok(()); }
+            remaining = rest;
+        }
+    }
+
+    async fn finish_request(
+        &self,
+        request: impl Future<Output = io::Result<()>>,
+        control: Option<crate::pipeline::RequestHandle<()>>,
+        output: crate::pipeline::RequestHandle<()>,
+    ) -> io::Result<()> {
+        let result = cli::settle_unwind(request).await;
+        // main flushes output in finally, including a failed request. Keep
+        // control reads alive during drain so disconnect cancels blocked IO.
+        let _ = self.output.drain().await;
+        self.finishing.store(true, Ordering::Release);
+        self.close();
+        if let Some(control) = control { control.wait().await; }
+        output.wait().await;
+        match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
+    }
+
+    async fn pump_output(&self) {
+        let _close = CloseOutput(&self.output);
+        while let Some(frame) = self.output.next().await {
+            let acknowledge = OutputFrame(&self.output);
+            let result = self.peer.write_all(frame).await;
+            drop(acknowledge);
+            if result.is_err() {
+                self.cancel.cancel();
+                self.close();
+                return;
+            }
+        }
+    }
+
+    async fn read_control(&self, cwd: &Path) -> io::Result<()> {
+        loop {
+            match read_word(&self.peer).await? {
                 RESIZE if self.flags & 10 == 10 => {
-                    let size = encode_terminal_size(read_u32(reader)?, read_u32(reader)?)
+                    let size = encode_terminal_size(read_word(&self.peer).await?, read_word(&self.peer).await?)
                         .ok_or(io::ErrorKind::InvalidData)?;
                     self.terminal_size.store(size, Ordering::Relaxed);
                 }
@@ -604,79 +502,82 @@ impl Connection<'_> {
                         self.prompt.lock().unwrap().take();
                         let language = config::load_language(cwd);
                         let message = format!("{}\n", language.text("interrupt.stopping"));
-                        self.frame(Stream::Err as u8, message.as_bytes())?;
+                        // Like main, reserve the one cancellation notice even
+                        // while ordinary producers are waiting on output space.
+                        self.output.try_enqueue(output_frame(Stream::Err as u8, message.as_bytes()), true)?;
                     }
                 }
                 length => {
-                    let receiver = self.prompt.lock().unwrap().take();
-                    let Some(receiver) = receiver else {
-                        // Cancelling a console read can still produce its empty reply.
-                        return if self.cancel.cancelled() {
-                            Ok(())
-                        } else {
-                            Err(io::ErrorKind::InvalidData.into())
-                        };
+                    let reply = self.prompt.lock().unwrap().take();
+                    let Some(reply) = reply else {
+                        return if self.cancel.cancelled() { Ok(()) } else { Err(io::ErrorKind::InvalidData.into()) };
                     };
-                    let response = read_field(reader, length as usize)?;
-                    let _ = receiver.send(response);
+                    reply.complete(read_peer_field(&self.peer, length as usize).await);
                 }
             }
         }
     }
 
-    fn read_prompt_chunk(&self) -> io::Result<Option<Vec<u8>>> {
-        let Some(reply) = PromptReply::new(&self.prompt, &self.cancel)? else {
-            return Ok(None);
-        };
-        self.frame(3, &[])?;
-        Ok(reply.receive.recv().ok())
+    async fn read_prompt_chunk(&self) -> io::Result<Option<Vec<u8>>> {
+        let Some(reply) = PromptReply::new(&self.prompt, &self.cancel)? else { return Ok(None); };
+        self.frame(3, &[]).await?;
+        self.output.drain().await?;
+        reply.reply.wait().await.map(Some)
+    }
+
+    async fn read_line_async(&self, prompt: &str) -> io::Result<Option<String>> {
+        if !prompt.is_empty() { self.frame(Stream::Out as u8, prompt.as_bytes()).await?; }
+        loop {
+            if self.cancel.cancelled() { return Ok(None); }
+            {
+                let mut input = self.input.lock().unwrap();
+                if let Some(line) = input.line() { return Ok(Some(line)); }
+                if input.eof { return Ok(None); }
+            }
+            let Some(chunk) = self.read_prompt_chunk().await? else { return Ok(None); };
+            self.input.lock().unwrap().push(chunk)?;
+        }
     }
 }
-
-impl Session for Connection<'_> {
+impl Session for Connection {
     fn write(&self, stream: Stream, data: &[u8]) -> io::Result<()> {
-        self.frame(stream as u8, data)
-    }
-
-    fn read_line(&self, prompt: &str) -> io::Result<Option<String>> {
-        let mut input = self.input.lock().unwrap();
-        if !prompt.is_empty() {
-            self.write(Stream::Out, prompt.as_bytes())?;
-        }
+        if self.output.closed() { return Ok(()); }
+        if !in_control_poll() { return block_on(self.awrite(stream, data)); }
+        let mut remaining = data;
         loop {
-            if self.cancel.cancelled() {
-                return Ok(None);
-            }
-            if let Some(line) = input.line() {
-                return Ok(Some(line));
-            }
-            if input.eof {
-                return Ok(None);
-            }
-            let Some(chunk) = self.read_prompt_chunk()? else {
-                return Ok(None);
-            };
-            input.push(chunk)?;
+            let count = frame_chunk_len(stream as u8, remaining);
+            let (chunk, rest) = remaining.split_at(count);
+            self.output.try_enqueue(output_frame(stream as u8, chunk), false)?;
+            if rest.is_empty() { return Ok(()); }
+            remaining = rest;
         }
     }
-
-    fn interactive(&self) -> bool {
-        self.flags & 2 != 0
+    fn awrite<'a>(&'a self, stream: Stream, data: &'a [u8]) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.output.closed() { return Ok(()); }
+            let result = self.frame(stream as u8, data).await;
+            if self.output.closed() { Ok(()) } else { result }
+        })
     }
-
-    fn input_is_terminal(&self) -> bool {
-        self.flags & 4 != 0
+    fn drain(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> { Box::pin(self.output.drain()) }
+    fn read_line(&self, prompt: &str) -> io::Result<Option<String>> { block_on(self.read_line_async(prompt)) }
+    fn aread_line<'a>(&'a self, prompt: &'a str) -> Pin<Box<dyn Future<Output = io::Result<Option<String>>> + Send + 'a>> {
+        Box::pin(self.read_line_async(prompt))
     }
-
-    fn unicode(&self) -> bool {
-        self.flags & 16 != 0
-    }
-
+    fn interactive(&self) -> bool { self.flags & 2 != 0 }
+    fn input_is_terminal(&self) -> bool { self.flags & 4 != 0 }
+    fn unicode(&self) -> bool { self.flags & 16 != 0 }
     fn terminal_size(&self) -> (usize, usize) {
         let size = self.terminal_size.load(Ordering::Relaxed);
         ((size & 0xffff) as usize, (size >> 16) as usize)
     }
 }
+struct CloseOutput<'a>(&'a output::Output);
+impl Drop for CloseOutput<'_> { fn drop(&mut self) { self.0.close(); } }
+struct OutputFrame<'a>(&'a output::Output);
+impl Drop for OutputFrame<'_> { fn drop(&mut self) { self.0.acknowledge(); } }
+struct CloseConnection(Arc<Connection>);
+impl Drop for CloseConnection { fn drop(&mut self) { self.0.close(); } }
 
 struct Activity {
     last_idle: Instant,
@@ -689,75 +590,95 @@ struct Server {
     activity: Mutex<Activity>,
     drained: Condvar,
     wake: Arc<Event>,
-    stop: Event,
+    shutdown: Cancellation,
+    io: transport::Reactor,
     token: [u8; 32],
     build_id: [u8; 16],
 }
 
-impl Server {
-    fn serve_peer(&self, pipe: OwnedHandle) {
-        let _ = self.request(pipe);
-        let mut activity = self.activity.lock().unwrap();
+/// Each connection owns its active count even if thread creation is rejected
+/// (the unstarted closure is dropped), or request execution unwinds.
+struct ActiveRequest(Arc<Server>);
+
+impl ActiveRequest {
+    fn new(server: Arc<Server>) -> Self {
+        server.activity.lock().unwrap().active += 1;
+        Self(server)
+    }
+
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        let mut activity = self.0.activity.lock().unwrap();
         activity.active -= 1;
         if activity.active == 0 {
             activity.last_idle = Instant::now();
-            self.drained.notify_all();
+            self.0.drained.notify_all();
         }
         drop(activity);
-        self.wake.signal();
+        self.0.wake.signal();
+    }
+}
+
+impl Server {
+    fn submit(self: &Arc<Self>, pipe: OwnedHandle) -> crate::pipeline::RequestHandle<io::Result<()>> {
+        let activity = ActiveRequest::new(Arc::clone(self));
+        let handler = Arc::clone(self);
+        let cancel = Cancellation::new();
+        let request = self.host.scheduler.submit(self.host.scheduler.next_id(), Origin::Foreground, &cancel.clone(),
+            move |spawner| Box::pin(async move { handler.request(pipe, spawner, cancel).await }));
+        // Connection lifetime includes output/control and CLI cleanup, like the
+        // protocol's on_closed callback after its owned work finishes.
+        request.on_ready(move || drop(activity));
+        request
     }
 
-    fn request(&self, pipe: OwnedHandle) -> io::Result<()> {
-        let peer = Peer::new(pipe, &self.stop)?;
-        let cancel = Cancellation::new();
-        let output_cancelled = Arc::new(Event::new(true)?);
-        let wake = Arc::clone(&output_cancelled);
-        let _output_cancellation = cancel.subscribe(move || wake.signal());
-        let mut reader = Reader {
-            peer: &peer,
-            event: Event::new(true)?,
+    async fn request(self: &Arc<Self>, pipe: OwnedHandle, spawner: crate::pipeline::scheduling::Spawner<'static>, cancel: Cancellation) -> io::Result<()> {
+        let peer = self.io.bind(pipe, &self.shutdown)?;
+        let header = Header::read(&peer, &self.build_id, &self.token).await?;
+        let connection = Arc::new(Connection {
+            peer, output: output::Output::default(), prompt: Mutex::default(), input: Mutex::default(),
+            cancel: cancel.clone(), finishing: AtomicBool::new(false),
+            terminal_size: AtomicU32::new(header.terminal_size), flags: header.flags,
+        });
+        let _close = CloseConnection(Arc::clone(&connection));
+        let output = {
+            let connection = Arc::clone(&connection);
+            spawner.spawn(Box::pin(async move { connection.pump_output().await }))
         };
-        let mut writer = Writer {
-            peer: &peer,
-            event: Event::new(true)?,
-            cancelled: &output_cancelled,
-            failed: false,
-        };
-        let header = Header::read(&mut reader, &self.build_id, &self.token)?;
-        writer.write_all(&[b"SPS2".as_slice(), &self.build_id].concat())?;
-        let connection = Connection {
-            writer: Mutex::new(writer),
-            prompt: Mutex::default(),
-            input: Mutex::default(),
-            cancel,
-            terminal_size: AtomicU32::new(header.terminal_size),
-            flags: header.flags,
-        };
-        if header.flags & 1 != 0 {
-            connection.frame(0, &0_i32.to_be_bytes())?;
-            self.activity.lock().unwrap().shutting_down = true;
-            self.stop.signal();
-            self.wake.signal();
-            return Ok(());
-        }
-        let cancel = connection.cancel.clone();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                if connection.read_control(&mut reader, &header.cwd).is_err() {
-                    connection.cancel.cancel();
-                    peer.stop.signal();
-                    connection.prompt.lock().unwrap().take();
+        let control = if header.flags & 1 == 0 {
+            let connection = Arc::clone(&connection);
+            let cwd = header.cwd.clone();
+            Some(spawner.spawn(Box::pin(async move {
+                if connection.read_control(&cwd).await.is_err() {
+                    if !connection.finishing.load(Ordering::Acquire) { connection.cancel.cancel(); }
+                    connection.close();
                 }
-            });
-            let result = cli::run(&self.host, &header.cwd, header.argv, &connection, cancel);
-            let code = result.unwrap_or_else(|error| {
-                let _ = connection.write(Stream::Err, format!("{error}\n").as_bytes());
-                3
-            });
-            let result = connection.frame(0, &code.to_be_bytes());
-            peer.stop.signal();
-            result
-        })
+            })))
+        } else { None };
+        connection.finish_request(async {
+            connection.output.enqueue([b"SPS2".as_slice(), &self.build_id].concat()).await?;
+            if header.flags & 1 != 0 {
+                connection.frame(0, &0_i32.to_be_bytes()).await?;
+                connection.output.drain().await?;
+                self.activity.lock().unwrap().shutting_down = true;
+                self.shutdown.cancel();
+                self.wake.signal();
+                return Ok(());
+            }
+            let session: Arc<dyn Session> = connection.clone();
+            let result = cli::run(&self.host, &header.cwd, header.argv, session, cancel).await;
+            let code = match result {
+                Ok(code) => code,
+                Err(error) => {
+                    let _ = connection.awrite(Stream::Err, format!("{error}\n").as_bytes()).await;
+                    3
+                }
+            };
+            connection.frame(0, &code.to_be_bytes()).await?;
+            connection.output.drain().await
+        }, control, output).await
     }
 }
 
@@ -801,7 +722,8 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
             shutting_down: false,
         }),
         drained: Condvar::new(),
-        stop: Event::new(true)?,
+        shutdown: Cancellation::new(),
+        io: transport::Reactor::new()?,
         token,
         build_id,
     });
@@ -843,17 +765,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
                     match connected {
                         Ok(peer) => {
                             served = true;
-                            let mut state = server.activity.lock().unwrap();
-                            state.active += 1;
-                            let handler = Arc::clone(&server);
-                            if let Err(error) = std::thread::Builder::new()
-                                .name("sunpack-request".into())
-                                .stack_size(512 * 1024)
-                                .spawn(move || handler.serve_peer(peer))
-                            {
-                                state.active -= 1;
-                                return Err(error);
-                            }
+                            server.submit(peer);
                         }
                         Err(error) if matches!(error.raw_os_error(), Some(109 | 232 | 233)) => {}
                         Err(error) => return Err(error),
@@ -866,7 +778,7 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
             }
         }
     })();
-    server.stop.signal();
+    server.shutdown.cancel();
     let _ = server.host.watch.stop();
     let _drained = server
         .drained
@@ -941,44 +853,6 @@ pub(super) fn submit_existing(
 }
 
 #[cfg(test)]
-mod prompt_tests {
-    use super::*;
-
-    #[test]
-    fn cancellation_releases_only_its_prompt_even_during_a_partial_reply() {
-        // Client CANCEL coverage cannot catch internal cancellation while the
-        // control reader owns a response sender or a stale waiter is retiring.
-        let slot = Mutex::default();
-        let first_cancel = Cancellation::new();
-        let first = PromptReply::new(&slot, &first_cancel).unwrap().unwrap();
-        assert!(PromptReply::new(&slot, &Cancellation::new()).is_err());
-        let in_flight = slot.lock().unwrap().take().unwrap();
-        let second_cancel = Cancellation::new();
-        let second = PromptReply::new(&slot, &second_cancel).unwrap().unwrap();
-        first_cancel.cancel();
-        assert!(first.receive.recv().unwrap().is_empty());
-        drop(first);
-        assert!(slot
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|sender| { Arc::ptr_eq(sender, &second.sender) }));
-        assert!(matches!(
-            second.receive.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        assert!(in_flight.send(b"late answer".to_vec()).is_err());
-        second.sender.send(b"yes".to_vec()).unwrap();
-        // A full response channel must not block cancellation.
-        second_cancel.cancel();
-        assert_eq!(second.receive.recv().unwrap(), b"yes");
-        drop(second);
-        assert!(slot.lock().unwrap().is_none());
-        assert!(PromptReply::new(&slot, &second_cancel).unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
 mod frame_tests {
     use super::*;
 
@@ -986,101 +860,194 @@ mod frame_tests {
     fn output_frames_keep_utf8_boundaries_and_binary_payloads() {
         // Ordinary short-output tests never cross the protocol limit. Check
         // every possible split inside a UTF-8 scalar with one reusable buffer.
-        let mut bytes = Vec::with_capacity(MAX_FIELD + 4);
+        let limit = 64 * 1024;
+        let mut bytes = Vec::with_capacity(limit + 4);
         for scalar in ["é", "中", "😀"] {
             for split in 1..scalar.len() {
                 bytes.clear();
-                bytes.resize(MAX_FIELD - split, b'a');
+                bytes.resize(limit - split, b'a');
                 bytes.extend_from_slice(scalar.as_bytes());
                 bytes.push(b'\n');
                 for kind in [1, 2] {
                     let end = frame_chunk_len(kind, &bytes);
-                    assert_eq!(end, MAX_FIELD - split);
+                    assert_eq!(end, limit - split);
                     let (first, rest) = bytes.split_at(end);
                     assert!(std::str::from_utf8(first).is_ok());
                     assert_eq!(std::str::from_utf8(rest).unwrap(), format!("{scalar}\n"));
                     assert_eq!(frame_chunk_len(kind, rest), rest.len());
                 }
                 // Control payloads are binary, never interpreted as text.
-                assert_eq!(frame_chunk_len(0, &bytes), MAX_FIELD);
+                assert_eq!(frame_chunk_len(0, &bytes), bytes.len());
             }
         }
         bytes.fill(0x80);
-        assert_eq!(frame_chunk_len(1, &bytes), MAX_FIELD);
+        assert_eq!(frame_chunk_len(1, &bytes), limit);
         assert_eq!(frame_chunk_len(2, &[]), 0);
         assert_eq!(frame_chunk_len(0, &(-1_i32).to_be_bytes()), 4);
         assert_eq!(frame_chunk_len(3, &[]), 0);
     }
 }
 
+
 #[cfg(test)]
-mod output_cancellation_tests {
+mod async_connection_tests {
     use super::*;
+    use std::sync::mpsc;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    fn server() -> Arc<Server> {
+        Arc::new(Server {
+            host: Host::new(), activity: Mutex::new(Activity { last_idle: Instant::now(), active: 0, shutting_down: false }),
+            drained: Condvar::new(), wake: Arc::new(Event::new(false).unwrap()),
+            shutdown: Cancellation::new(), io: transport::Reactor::new().unwrap(), token: [0; 32], build_id: [0; 16],
+        })
+    }
+    fn pipe_pair() -> (File, OwnedHandle) {
+        let name = format!(r"\\.\pipe\SunPack-connection-test-{}-{}", std::process::id(), hex(&windows::random_bytes::<16>().unwrap()));
+        let security = windows::PipeSecurity::current_user().unwrap();
+        let accept = Accept::arm(&windows::wide(OsStr::new(&name)), &security.attributes(), true).unwrap();
+        let client = OpenOptions::new().read(true).write(true).open(name).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(accept.event.raw(), INFINITE) }, WAIT_OBJECT_0);
+        (client, accept.finish().unwrap())
+    }
+    fn connect(server: &Arc<Server>) -> (File, crate::pipeline::RequestHandle<io::Result<()>>) {
+        let (client, peer) = pipe_pair();
+        (client, server.submit(peer))
+    }
+    fn help_request(server: &Server) -> Vec<u8> {
+        let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+        let mut bytes = [b"SPK2".as_slice(), &server.build_id, &server.token].concat();
+        for word in [0, cwd.len() as u32, 1] { bytes.extend(word.to_be_bytes()); }
+        bytes.extend(cwd.as_bytes());
+        bytes.extend(6_u32.to_be_bytes());
+        bytes.extend(b"--help");
+        bytes
+    }
 
     #[test]
-    fn cancelled_output_drains_backpressure_and_rejects_later_frames() {
-        // A real overlapped pipe exercises the blocked WriteFile path that
-        // prompt-channel tests cannot cover. No client reads the large write.
-        let name = format!(
-            r"\\.\pipe\SunPack-output-cancel-test-{}-{}",
-            std::process::id(),
-            hex(&windows::random_bytes::<16>().unwrap()),
-        );
-        let security = windows::PipeSecurity::current_user().unwrap();
-        let accept = Accept::arm(
-            &windows::wide(OsStr::new(&name)),
-            &security.attributes(),
-            true,
-        )
-        .unwrap();
-        let mut client = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(name)
-            .unwrap();
-        let handles = [accept.event.raw()];
-        assert_eq!(
-            unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, INFINITE) },
-            WAIT_OBJECT_0,
-        );
-        let shutdown = Event::new(true).unwrap();
-        let peer = Peer::new(accept.finish().unwrap(), &shutdown).unwrap();
-        let cancel = Cancellation::new();
-        let cancelled = Arc::new(Event::new(true).unwrap());
-        let wake = Arc::clone(&cancelled);
-        let _subscription = cancel.subscribe(move || wake.signal());
-        let mut writer = Writer {
-            peer: &peer,
-            event: Event::new(true).unwrap(),
-            cancelled: &cancelled,
-            failed: false,
-        };
-        writer.write_all(b"ok").unwrap();
-        let mut output = [0; 2];
-        client.read_exact(&mut output).unwrap();
-        assert_eq!(&output, b"ok");
-        cancel.cancel();
-        // Cancellation alone does not close the peer or interrupt its input.
-        let mut reader = Reader {
-            peer: &peer,
-            event: Event::new(true).unwrap(),
-        };
-        client.write_all(b"input").unwrap();
-        let mut input = [0; 5];
-        reader.read_exact(&mut input).unwrap();
-        assert_eq!(&input, b"input");
+    fn incomplete_and_invalid_connections_do_not_block_a_live_cli_or_stop_service() {
+        let server = server();
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            let (mut client, request) = connect(&server);
+            client.write_all(b"S").unwrap();
+            held.push((client, request));
+        }
+        let (mut invalid, rejected) = connect(&server);
+        invalid.write_all(&[0; 52]).unwrap();
+        assert_eq!(rejected.join().unwrap().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(!server.activity.lock().unwrap().shutting_down);
+        let (mut client, healthy) = connect(&server);
+        client.write_all(&help_request(&server)).unwrap();
+        let (finished, ready) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = (|| -> io::Result<i32> {
+                let mut handshake = [0; 20];
+                client.read_exact(&mut handshake)?;
+                assert_eq!(&handshake[..4], b"SPS2");
+                loop {
+                    let mut kind = [0];
+                    client.read_exact(&mut kind)?;
+                    let length = read_u32(&mut client)? as usize;
+                    let bytes = read_field(&mut client, length)?;
+                    if kind[0] == 0 { return Ok(i32::from_be_bytes(bytes.try_into().unwrap())); }
+                }
+            })();
+            finished.send((client, result)).unwrap();
+        });
+        let response = ready.recv_timeout(Duration::from_secs(10));
+        if response.is_err() { server.shutdown.cancel(); }
+        reader.join().unwrap();
+        let (_client, code) = response.expect("incomplete clients consumed CLI execution capacity");
+        assert_eq!(code.unwrap(), 0);
+        healthy.join().unwrap().unwrap();
+        server.shutdown.cancel();
+        for (_client, request) in held { assert!(request.join().unwrap().is_err()); }
+        let activity = server.drained.wait_while(server.activity.lock().unwrap(), |state| state.active != 0).unwrap();
+        assert!(!activity.shutting_down);
+    }
 
-        let error = writer.write_all(&vec![b'x'; 1024 * 1024]).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
-        assert!(writer.failed);
-        let handles = [peer.stop.raw()];
-        assert_eq!(
-            unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, 0) },
-            WAIT_OBJECT_0,
-        );
-        assert_eq!(
-            writer.write_all(b"exit frame").unwrap_err().kind(),
-            io::ErrorKind::ConnectionAborted,
-        );
+    #[test]
+    fn real_prompt_resize_cancel_and_panic_flush_settle_all_connection_work() {
+        let server = server();
+        let (mut client, pipe) = pipe_pair();
+        let connection = Arc::new(Connection {
+            peer: server.io.bind(pipe, &server.shutdown).unwrap(),
+            output: output::Output::default(), prompt: Mutex::default(), input: Mutex::default(),
+            cancel: Cancellation::new(), finishing: AtomicBool::new(false),
+            terminal_size: AtomicU32::new(80 | 24 << 16), flags: 14,
+        });
+        let cancel = connection.cancel.clone();
+        let request = server.host.scheduler.submit(server.host.scheduler.next_id(), Origin::Foreground, &cancel,
+            move |spawner| Box::pin(async move {
+                let _close = CloseConnection(connection.clone());
+                let writer = connection.clone();
+                let output = spawner.spawn(Box::pin(async move { writer.pump_output().await }));
+                let reader = connection.clone();
+                let control = spawner.spawn(Box::pin(async move {
+                    if reader.read_control(&std::env::current_dir().unwrap()).await.is_err() { reader.close(); }
+                }));
+                connection.finish_request(async {
+                    assert_eq!(connection.read_line_async("first").await?.as_deref(), Some("answer\r\n"));
+                    assert_eq!(connection.terminal_size(), (120, 40));
+                    assert_eq!(connection.read_line_async("second").await?, None);
+                    connection.awrite(Stream::Out, b"queued-before-panic").await?;
+                    panic!("request failure after enqueue");
+                }, Some(control), output).await
+            }));
+        let (finished, ready) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut frames = Vec::new();
+            let mut prompts = 0;
+            let result = (|| -> io::Result<()> {
+                loop {
+                    let mut kind = [0];
+                    if client.read_exact(&mut kind).is_err() { return Ok(()); }
+                    let length = read_u32(&mut client)? as usize;
+                    let bytes = read_field(&mut client, length)?;
+                    if kind[0] == 3 {
+                        prompts += 1;
+                        if prompts == 1 {
+                            for word in [RESIZE, 120, 40, 8] { client.write_all(&word.to_be_bytes())?; }
+                            client.write_all(b"answer\r\n")?;
+                        } else { client.write_all(&CANCEL.to_be_bytes())?; }
+                    }
+                    frames.push((kind[0], bytes));
+                }
+            })();
+            finished.send((result, prompts, frames)).unwrap();
+        });
+        let response = ready.recv_timeout(Duration::from_secs(10));
+        if response.is_err() { server.shutdown.cancel(); }
+        reader.join().unwrap();
+        let (result, prompts, frames) = response.expect("prompt/cancel or panic teardown stalled");
+        result.unwrap();
+        assert_eq!(prompts, 2);
+        let notice = frames.iter().position(|(kind, _)| *kind == Stream::Err as u8).unwrap();
+        let final_output = frames.iter().position(|(_, data)| data == b"queued-before-panic").unwrap();
+        assert!(notice < final_output);
+        assert!(request.join().is_err());
+    }
+
+    #[test]
+    fn async_prompt_is_first_wins_and_old_waiter_cannot_remove_new_prompt() {
+        let slot = Mutex::default();
+        let cancel = Cancellation::new();
+        let first = PromptReply::new(&slot, &cancel).unwrap().unwrap();
+        assert!(PromptReply::new(&slot, &Cancellation::new()).is_err());
+        let partial_reply = slot.lock().unwrap().take().unwrap();
+        let next_cancel = Cancellation::new();
+        let next = PromptReply::new(&slot, &next_cancel).unwrap().unwrap();
+        cancel.cancel();
+        assert!(block_on(first.reply.wait()).unwrap().is_empty());
+        partial_reply.complete(Ok(b"late".to_vec()));
+        drop(first);
+        assert!(slot.lock().unwrap().as_ref().is_some_and(|reply| Arc::ptr_eq(reply, &next.reply)));
+        next.reply.complete(Ok(b"yes".to_vec()));
+        next_cancel.cancel();
+        assert_eq!(block_on(next.reply.wait()).unwrap(), b"yes");
+        drop(next);
+        assert!(slot.lock().unwrap().is_none());
+        assert!(PromptReply::new(&slot, &next_cancel).unwrap().is_none());
     }
 }

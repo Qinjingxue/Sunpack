@@ -2,18 +2,42 @@
 //! Async control stays outside host capacity; explicit blocking stages enter Rayon.
 
 use super::{Cancellation, Origin};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 
+/// Serializes async lifecycle transitions without blocking the shared control driver.
+#[derive(Default)]
+pub(crate) struct AsyncGate(Mutex<(bool, Vec<Waker>)>);
+pub(crate) struct AsyncGateGuard<'a>(&'a AsyncGate);
+impl AsyncGate {
+    pub(crate) const fn new() -> Self { Self(Mutex::new((false, Vec::new()))) }
+    pub(crate) async fn lock(&self) -> AsyncGateGuard<'_> {
+        poll_fn(|cx| {
+            let mut state = self.0.lock().unwrap();
+            if !state.0 { state.0 = true; Poll::Ready(AsyncGateGuard(self)) }
+            else {
+                if !state.1.iter().any(|wake| wake.will_wake(cx.waker())) { state.1.push(cx.waker().clone()); }
+                Poll::Pending
+            }
+        }).await
+    }
+}
+impl Drop for AsyncGateGuard<'_> {
+    fn drop(&mut self) {
+        let wakes = { let mut state = self.0.0.lock().unwrap(); state.0 = false; std::mem::take(&mut state.1) };
+        for wake in wakes { wake.wake(); }
+    }
+}
+
 /// Synchronous callers may await the same wakeable operation without creating
 /// another service thread. Background requests use the Future directly.
-pub(super) fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     struct ThreadWake(std::thread::Thread);
     impl Wake for ThreadWake {
         fn wake(self: Arc<Self>) { self.0.unpark(); }
@@ -31,8 +55,9 @@ pub(super) fn block_on<F: Future>(future: F) -> F::Output {
 
 pub(crate) const MAX_PENDING_JOBS: usize = 4096;
 
-pub(super) struct Scheduler {
+pub(crate) struct Scheduler {
     capacity: usize,
+    next_id: AtomicU64,
     pool: rayon::ThreadPool,
     state: Mutex<Admission>,
     driver: OnceLock<mpsc::Sender<DriverEvent>>,
@@ -174,13 +199,14 @@ impl Drop for Slot {
 }
 
 impl Scheduler {
-    pub(super) fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Self::with_capacity(std::thread::available_parallelism().map_or(1, usize::from).clamp(4, 32))
     }
 
     fn with_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             capacity,
+            next_id: AtomicU64::new(1),
             pool: rayon::ThreadPoolBuilder::new().num_threads(capacity)
                 .thread_name(|id| format!("sunpack-stage-{id}"))
                 .build().expect("start shared stage executor"),
@@ -188,6 +214,8 @@ impl Scheduler {
             driver: OnceLock::new(),
         })
     }
+
+    pub(crate) fn next_id(&self) -> u64 { self.next_id.fetch_add(1, Ordering::Relaxed) }
 
     fn enqueue(self: &Arc<Self>, request: u64, origin: Origin, grant: Grant) {
         let mut state = self.state.lock().unwrap();
@@ -272,7 +300,7 @@ impl Scheduler {
 
     /// Suspended owned requests share one wake-driven driver. Blocking stages
     /// share admission with scoped callers; no request owns an OS thread.
-    pub(super) fn submit<T: Send + 'static>(
+    pub(crate) fn submit<T: Send + 'static>(
         self: &Arc<Self>,
         request: u64,
         origin: Origin,
@@ -479,6 +507,7 @@ impl PollJob<'_> {
         } else { self.cancel.clone() };
         let previous = CURRENT_TASK.with(|task| task.replace(Some(Arc::clone(&self.wake))));
         let _current = CurrentTask(previous);
+        let _stage = CurrentStage(IN_STAGE.with(|active| active.replace(self.slot.is_some())));
         let waker = Waker::from(Arc::clone(&self.wake));
         // Spawner catches task panics and settles their Join before this returns.
         let signal = match execution_cancel.run(|| future.as_mut().poll(&mut Context::from_waker(&waker))) {
@@ -525,6 +554,16 @@ struct TaskWake {
 
 thread_local! {
     static CURRENT_TASK: RefCell<Option<Arc<TaskWake>>> = const { RefCell::new(None) };
+    static IN_STAGE: Cell<bool> = const { Cell::new(false) };
+}
+pub(crate) fn in_control_poll() -> bool {
+    CURRENT_TASK.with(|task| task.borrow().is_some()) && !in_stage()
+}
+
+pub(super) fn in_stage() -> bool { IN_STAGE.with(Cell::get) }
+struct CurrentStage(bool);
+impl Drop for CurrentStage {
+    fn drop(&mut self) { IN_STAGE.with(|active| active.set(self.0)); }
 }
 struct CurrentTask(Option<Arc<TaskWake>>);
 impl Drop for CurrentTask {
@@ -574,10 +613,10 @@ impl Wake for TaskWake {
     }
 }
 
-pub(super) type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone)]
-pub(super) struct Spawner<'a> {
+pub(crate) struct Spawner<'a> {
     tx: mpsc::Sender<Task<'a, ()>>,
     signals: Signals,
     cancel: Cancellation,
@@ -639,7 +678,7 @@ impl<T> Join<T> {
     pub(crate) fn join(self) -> std::thread::Result<T> { block_on(self.result()) }
     #[cfg(test)]
     fn blocking_wait(self) -> T { completed(self.join()) }
-    pub(super) async fn wait(self) -> T { completed(self.result().await) }
+    pub(crate) async fn wait(self) -> T { completed(self.result().await) }
     async fn result(self) -> std::thread::Result<T> {
         poll_fn(|cx| {
             let mut state = self.0.state.lock().unwrap();
@@ -660,7 +699,7 @@ impl<'a> Spawner<'a> {
     /// in its parent, so parents never wait for admission held by themselves.
     /// Each consumer takes the next item immediately after finishing its own;
     /// a slow early item cannot stall admission of the rest of the batch.
-    pub(super) fn bounded_map<I, T, F>(&self, items: Vec<I>, operation: F) -> Task<'a, Vec<T>>
+    pub(crate) fn bounded_map<I, T, F>(&self, items: Vec<I>, operation: F) -> Task<'a, Vec<T>>
     where
         I: Send + 'a,
         T: Send + 'a,
@@ -716,7 +755,7 @@ impl<'a> Spawner<'a> {
         })
     }
 
-    pub(super) fn spawn<T: Send + 'a>(&self, future: Task<'a, T>) -> Join<T> {
+    pub(crate) fn spawn<T: Send + 'a>(&self, future: Task<'a, T>) -> Join<T> {
         let cell = Arc::new(Completion::default());
         let receiver = Arc::clone(&cell);
         let cancel = self.cancel.clone();

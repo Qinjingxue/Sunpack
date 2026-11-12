@@ -5,6 +5,9 @@ use crate::pipeline::{Failure, FailureKind};
 use std::borrow::Cow;
 
 pub(super) fn message(failure: &Failure, language: Language) -> Cow<'_, str> {
+    if failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume) {
+        return language.text("failure.possible_missing_volume").into();
+    }
     if failure.kind == FailureKind::PasswordInconclusive {
         return language.text("failure.password_state_unknown").into();
     }
@@ -61,6 +64,18 @@ pub(super) fn message(failure: &Failure, language: Language) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::pipeline::{ArchiveReadFault, FailureEvidence};
+
+    #[test]
+    fn split_recovery_warning_preserves_failure_kind_and_diagnostics() {
+        let mut failure = Failure::new(FailureKind::Damaged, "raw backend damage");
+        failure.evidence = Some(Box::new(FailureEvidence {
+            possible_missing_volume: true,
+            ..FailureEvidence::default()
+        }));
+        assert_eq!(message(&failure, Language::En), Language::En.text("failure.possible_missing_volume"));
+        assert_eq!(failure.kind, FailureKind::Damaged);
+        assert_eq!(failure.message, "raw backend damage");
+    }
 
     #[test]
     fn human_projection_keeps_distinct_causes_and_raw_diagnostics() {

@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, SetEvent,
 };
 
 pub(super) fn wide(text: &OsStr) -> Vec<u16> {
@@ -59,9 +59,6 @@ impl Event {
         unsafe { SetEvent(self.raw()) };
     }
 
-    pub(super) fn reset(&self) -> io::Result<()> {
-        bool_result(unsafe { ResetEvent(self.raw()) })
-    }
 }
 
 pub(super) fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
@@ -158,14 +155,14 @@ impl PipeSecurity {
 }
 
 static CONSOLE_CANCEL: Mutex<Option<Cancellation>> = Mutex::new(None);
-static PRIORITY_TRANSITION: Mutex<()> = Mutex::new(());
+static PRIORITY_TRANSITION: crate::pipeline::AsyncGate = crate::pipeline::AsyncGate::new();
 
 pub(super) fn foreground_active() -> bool {
     process::foreground_active()
 }
 
 pub(super) fn maintain_when_foreground_idle(engine: &Engine, maintain: impl FnOnce()) {
-    let _transition = PRIORITY_TRANSITION.lock().unwrap();
+    let _transition = crate::pipeline::block_on(PRIORITY_TRANSITION.lock());
     if !foreground_active() {
         let _ = process::expire_foreground_override();
         let _ = engine.set_process_mode(process::effective_mode());
@@ -191,9 +188,13 @@ pub(super) fn monotonic_seconds() -> f64 {
 }
 
 pub(super) fn configure_priority(engine: &Engine, mode: ProcessMode) {
-    let _transition = PRIORITY_TRANSITION.lock().unwrap();
+    crate::pipeline::block_on(configure_priority_async(engine, mode));
+}
+
+pub(super) async fn configure_priority_async(engine: &Engine, mode: ProcessMode) {
+    let _transition = PRIORITY_TRANSITION.lock().await;
     let _ = process::configure_mode(mode);
-    let _ = engine.set_process_mode(process::effective_mode());
+    let _ = engine.set_process_mode_async(process::effective_mode()).await;
 }
 
 pub(super) struct Foreground<'a> {
@@ -203,31 +204,32 @@ pub(super) struct Foreground<'a> {
 }
 
 impl<'a> Foreground<'a> {
-    pub(super) fn enter(engine: &'a Engine, watch: &'a super::watch::Watch) -> Self {
-        let _transition = PRIORITY_TRANSITION.lock().unwrap();
+    pub(super) async fn enter_async(engine: &'a Engine, watch: &'a super::watch::Watch) -> Self {
+        let _transition = PRIORITY_TRANSITION.lock().await;
         let host = process::ForegroundPriority::enter();
-        let _ = engine.set_process_mode(process::effective_mode());
-        Self {
-            engine,
-            watch,
-            host: Some(host),
-        }
+        let _ = engine.set_process_mode_async(process::effective_mode()).await;
+        Self { engine, watch, host: Some(host) }
     }
-}
 
-impl Drop for Foreground<'_> {
-    fn drop(&mut self) {
+    pub(super) async fn finish_async(mut self) {
         let last = {
-            let _transition = PRIORITY_TRANSITION.lock().unwrap();
+            let _transition = PRIORITY_TRANSITION.lock().await;
             drop(self.host.take());
             !foreground_active()
         };
         if last {
-            // Watch startup also takes its running lock before this priority
-            // gate. Release the gate before selecting who owns idle expiry.
-            self.watch.foreground_finished(|| {
-                maintain_when_foreground_idle(self.engine, || {});
-            });
+            // Release the priority gate before consulting the Watch lifecycle.
+            // Without Watch, match main's awaited QoS restoration, not a new
+            // broker job that holds execution capacity while waiting for ACK.
+            let mut unwatched = false;
+            self.watch.foreground_finished(|| unwatched = true);
+            if unwatched {
+                let _transition = PRIORITY_TRANSITION.lock().await;
+                if !foreground_active() {
+                    let _ = process::expire_foreground_override();
+                    let _ = self.engine.set_process_mode_async(process::effective_mode()).await;
+                }
+            }
         }
     }
 }

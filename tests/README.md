@@ -44,4 +44,6 @@ cargo test --manifest-path native/Cargo.toml --locked --workspace --profile ci
 
 Watch 用例直接终止真实常驻进程：开始输出时挂起 worker，验证未提交输出回收、取消状态持久化，以及伪装载体内嵌加密分卷的恢复；另一现有用例在载体一段成功、另一段密码阻塞后终止进程，撤掉成功段的密码再恢复，验证已提交内容不被重复执行。恢复后再次启动也检查输出不重复。
 
-与 main 中旧 Python 故障注入工具相比，目前尚未恢复精确停在快照写入前后、WAL 退役边界，以及分卷提升的准备／部分移动／重定基准边界的进程级故障注入。Rust 的 WAL 帧、快照完整性与 journal durable/seal 测试仍需运行，但它们不能替代这些真实进程终止边界的验证。上述黑盒测试需要 Windows 和隔离 Watch Broker，Python 语法检查不能证明恢复行为通过。
+Journal 的 Rust 测试还会启动独立 owner 子进程，并在真实 durable WAL 尚未快照、快照已发布但被锁定的旧 WAL 尚未退役、旧 WAL 已退役这三个边界由父进程强制终止。每种情况都带有新尾部记录，重开两次检查密码代、提升源凭据和输出 ownership 的恢复；它不靠正常析构收尾，也不修改生产路径加入故障注入。
+
+与 main 中旧 Python 故障注入工具相比，完整 Watch 进程仍缺少快照写入进行中，以及分卷提升的准备／部分移动／重定基准边界的精确硬终止验证。上述 Journal 子进程测试并未覆盖这些集成边界，WAL 帧、快照完整性与 durable/seal 单测也不能替代它们。Watch 黑盒测试需要 Windows 和隔离 Watch Broker，Python 语法检查不能证明恢复行为通过。

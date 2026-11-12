@@ -4,23 +4,21 @@ use crate::io::archive_state::{ArchiveInput, OpenMode};
 use crate::io::cancellation::Cancellation;
 use crate::io::reader::NativeArchiveSession;
 use crate::password;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const BATCH_SIZE: usize = 256;
-const MAX_CONTEXTS: usize = 128;
+const MAX_SUCCESSES: usize = 1024;
 const MAX_REJECTIONS: usize = 8192;
 const MAX_RECENT_PASSWORDS: usize = 64;
 
 // Compact exact identities, not hash-only fingerprints: a collision must never
 // skip a password. Single files stay allocation-free; compound keys reuse the
 // existing binary serializer and are shared between plans and cache entries.
-const MAX_KEY_BYTES: usize = 1024 * 1024;
-const MAX_CACHE_KEY_BYTES: usize = 8 * MAX_KEY_BYTES;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Key {
     generation: u64,
     format: &'static str,
@@ -29,6 +27,19 @@ struct Key {
     eocd: Option<u64>,
     zip_spanned: bool,
     compound: Option<Arc<[u8]>>,
+    compound_hash: u64,
+}
+
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Negative entries are keyed per candidate. Hash a compound layout
+        // once when planning, not once per password; Eq still checks the full
+        // identity, so a fast-hash collision cannot reuse another proof.
+        std::hash::Hash::hash(&(
+            self.generation, self.format, self.start, self.end, self.eocd,
+            self.zip_spanned, self.compound.is_some(), self.compound_hash,
+        ), state);
+    }
 }
 
 impl Key {
@@ -49,7 +60,7 @@ impl Key {
             let (source, generation) = session.generation().ok()?;
             (source == path).then_some(generation)
         })?;
-        let compound = if input.volume_attempts.is_some()
+        let compound: Option<Arc<[u8]>> = if input.volume_attempts.is_some()
             || !matches!(input.mode, OpenMode::File | OpenMode::FileRange)
         {
             // Iteration follows the descriptor, not HashMap order. Binding all
@@ -59,30 +70,18 @@ impl Key {
             let members = input.physical_paths().chain(std::iter::once(input.entry_path.as_str()))
                 .map(|path| Some((path, *generations.get(path)?)))
                 .collect::<Option<Vec<_>>>()?;
-            let mut bytes = KeyBytes(Vec::new());
-            serde::Serialize::serialize(&(
+            let bytes = rmp_serde::to_vec_named(&(
                 input.mode, &members, &input.parts, &input.ranges,
                 &input.volume_attempts,
-            ), &mut rmp_serde::Serializer::new(&mut bytes).with_struct_map()).ok()?;
-            Some(Arc::from(bytes.0))
+            )).ok()?;
+            Some(Arc::from(bytes))
         } else { None };
+        let compound_hash = compound.as_deref().map_or(0, |bytes| crate::fast_hash_core::xxh64(bytes, 0));
         Some(Self { generation, format, start, end,
-            eocd: input.analysis.zip_eocd_offset, zip_spanned: input.analysis.zip_spanned, compound })
+            eocd: input.analysis.zip_eocd_offset, zip_spanned: input.analysis.zip_spanned,
+            compound, compound_hash })
     }
 
-    fn bytes(&self) -> usize { self.compound.as_ref().map_or(0, |key| key.len()) }
-}
-
-struct KeyBytes(Vec<u8>);
-impl io::Write for KeyBytes {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_KEY_BYTES.saturating_sub(self.0.len()) {
-            return Err(io::Error::other("password cache key exceeds budget"));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 #[derive(Clone, Default)]
@@ -90,27 +89,54 @@ pub(super) struct AttemptCache(Arc<Mutex<AttemptCacheState>>);
 
 #[derive(Default)]
 struct AttemptCacheState {
-    entries: HashMap<Key, Attempts>,
-    clock: u64,
-    rejections: usize,
-    key_bytes: usize,
+    successes: CacheOrder<Key, Option<Arc<str>>>,
+    negative: CacheOrder<(Key, Arc<str>), ()>,
     recent: VecDeque<Arc<str>>,
 }
 
-#[derive(Default)]
-struct Attempts {
-    proof: Option<Option<Arc<str>>>,
-    rejected: HashSet<Arc<str>>,
-    used: u64,
+// main keeps independent LRU budgets for successful contexts and individual
+// rejected (context, password) pairs. A batch of contexts must not evict all
+// proofs or rejections just because it crosses an unrelated context limit.
+struct CacheOrder<K, V> {
+    entries: HashMap<K, (V, u64)>,
+    order: BTreeMap<u64, K>,
+    clock: u64,
+}
+
+impl<K, V> Default for CacheOrder<K, V> {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), order: BTreeMap::new(), clock: 0 }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V> CacheOrder<K, V> {
+    fn get(&mut self, key: &K) -> Option<&V> {
+        let (value, used) = self.entries.get_mut(key)?;
+        self.order.remove(used);
+        self.clock += 1;
+        *used = self.clock;
+        self.order.insert(*used, key.clone());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V, limit: usize) {
+        self.clock += 1;
+        if let Some((_, used)) = self.entries.insert(key.clone(), (value, self.clock)) {
+            self.order.remove(&used);
+        }
+        self.order.insert(self.clock, key);
+        if self.entries.len() > limit {
+            let (_, key) = self.order.pop_first().unwrap();
+            self.entries.remove(&key);
+        }
+    }
 }
 
 impl AttemptCache {
     pub(super) fn clear(&self) {
         let mut state = self.0.lock().unwrap();
-        state.entries = HashMap::new();
-        state.clock = 0;
-        state.rejections = 0;
-        state.key_bytes = 0;
+        state.successes = CacheOrder::default();
+        state.negative = CacheOrder::default();
     }
 
     pub(super) fn recent(&self) -> Vec<Arc<str>> {
@@ -130,60 +156,25 @@ impl AttemptCache {
     }
 
     fn proof(&self, key: &Key) -> Option<Option<Arc<str>>> {
-        let mut state = self.0.lock().unwrap();
-        let used = state.tick();
-        let entry = state.entries.get_mut(key)?;
-        entry.used = used;
-        entry.proof.clone()
+        self.0.lock().unwrap().successes.get(key).cloned()
     }
 
     fn remove_rejected(&self, key: &Key, candidates: &mut Vec<Arc<str>>) -> bool {
         let mut state = self.0.lock().unwrap();
-        let used = state.tick();
-        let Some(entry) = state.entries.get_mut(key) else {
-            return false;
-        };
-        entry.used = used;
         let before = candidates.len();
-        candidates.retain(|password| !entry.rejected.contains(password));
+        candidates.retain(|password| state.negative.get(&(key.clone(), password.clone())).is_none());
         candidates.len() != before
     }
 
-    fn update(&self, key: Key, operation: impl FnOnce(&mut Attempts)) {
-        let mut state = self.0.lock().unwrap();
-        let used = state.tick();
-        if !state.entries.contains_key(&key) { state.key_bytes += key.bytes(); }
-        let entry = state.entries.entry(key).or_default();
-        let previous = entry.rejected.len();
-        entry.used = used;
-        operation(entry);
-        let next = entry.rejected.len();
-        state.rejections = state.rejections - previous + next;
-        while state.entries.len() > MAX_CONTEXTS || state.rejections > MAX_REJECTIONS
-            || state.key_bytes > MAX_CACHE_KEY_BYTES {
-            let oldest = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.used)
-                .unwrap()
-                .0.clone();
-            state.key_bytes -= oldest.bytes();
-            state.rejections -= state.entries.remove(&oldest).unwrap().rejected.len();
-        }
+    fn remember_proof(&self, key: Key, proof: Option<Arc<str>>) {
+        self.0.lock().unwrap().successes.insert(key, proof, MAX_SUCCESSES);
     }
 
     fn reject(&self, key: Key, candidates: &[Arc<str>]) {
-        self.update(key, |entry| {
-            let room = MAX_REJECTIONS.saturating_sub(entry.rejected.len());
-            entry.rejected.extend(candidates.iter().take(room).cloned());
-        });
-    }
-}
-
-impl AttemptCacheState {
-    fn tick(&mut self) -> u64 {
-        self.clock = self.clock.wrapping_add(1);
-        self.clock
+        let mut state = self.0.lock().unwrap();
+        for password in candidates {
+            state.negative.insert((key.clone(), password.clone()), (), MAX_REJECTIONS);
+        }
     }
 }
 
@@ -372,7 +363,7 @@ impl CandidateSet {
             match result.status {
                 "not_required" => {
                     if let Some(key) = key.as_ref() {
-                        self.cache.update(key.clone(), |entry| entry.proof = Some(None));
+                        self.cache.remember_proof(key.clone(), None);
                     }
                     return Ok(Ok(PasswordPlan::clear()));
                 }
@@ -387,8 +378,7 @@ impl CandidateSet {
                         let password = Arc::clone(&batch[index]);
                         self.cache.remember_recent(password.clone());
                         if let Some(key) = key.as_ref() {
-                            self.cache
-                                .update(key.clone(), |entry| entry.proof = Some(Some(password.clone())));
+                            self.cache.remember_proof(key.clone(), Some(password.clone()));
                         }
                         return Ok(Ok(PasswordPlan::verified(password)));
                     }
@@ -562,7 +552,7 @@ impl PasswordPlan {
         };
         cache.remember_recent(Arc::clone(password));
         if let Some(key) = self.cache_key.as_ref() {
-            cache.update(key.clone(), |entry| entry.proof = Some(Some(Arc::clone(password))));
+            cache.remember_proof(key.clone(), Some(Arc::clone(password)));
         }
         Some(password)
     }
@@ -593,6 +583,62 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attempt_cache_keeps_batch_proofs_and_individual_negative_lru() {
+        // More than 128 live inputs must retain results through a hot retry.
+        // Independently exercise the real limits, so raising one context cap
+        // cannot hide whole-context eviction of negatives or proofs.
+        let cache = AttemptCache::default();
+        let key = |generation| Key { generation, format: "zip", start: 0, end: None,
+            eocd: None, zip_spanned: false, compound: None, compound_hash: 0 };
+        let passwords: Vec<Arc<str>> = (0..4).map(|n| Arc::from(n.to_string())).collect();
+        for n in 0..129 {
+            cache.reject(key(n), &passwords);
+            cache.remember_proof(key(n), Some(Arc::from("good")));
+        }
+        for n in 0..129 {
+            let mut candidates = passwords.clone();
+            assert!(cache.remove_rejected(&key(n), &mut candidates));
+            assert!(candidates.is_empty());
+            assert_eq!(cache.proof(&key(n)).unwrap().as_deref(), Some("good"));
+        }
+        cache.clear();
+        for n in 0..MAX_REJECTIONS as u64 {
+            cache.reject(key(n), &[Arc::from("bad")]);
+        }
+        // Touch one entry and exceed the negative limit: only the oldest pair
+        // is removed, not the rest of a context or the independent proof.
+        cache.remember_proof(key(1), Some(Arc::from("good")));
+        assert!(cache.remove_rejected(&key(0), &mut vec![Arc::from("bad")]));
+        cache.reject(key(0), &[Arc::from("another")]);
+        assert!(!cache.remove_rejected(&key(1), &mut vec![Arc::from("bad")]));
+        assert!(cache.remove_rejected(&key(0), &mut vec![Arc::from("bad")]));
+        assert!(cache.proof(&key(1)).is_some());
+        for n in 2..=MAX_SUCCESSES as u64 + 1 {
+            cache.remember_proof(key(n), Some(Arc::from("good")));
+        }
+        assert!(cache.proof(&key(1)).is_none());
+        assert!(cache.remove_rejected(&key(0), &mut vec![Arc::from("another")]));
+
+        // Force equal hash summaries for different exact layouts. Neither
+        // successful nor negative results may leak across the collision.
+        let mut left = key(0);
+        left.compound = Some(Arc::from([1u8]));
+        let mut right = left.clone();
+        right.compound = Some(Arc::from([2u8]));
+        let hash = |key: &Key| {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hash);
+            hash.finish()
+        };
+        assert_eq!(hash(&left), hash(&right));
+        cache.remember_proof(left.clone(), Some(Arc::from("left")));
+        cache.reject(left, &[Arc::from("wrong")]);
+        assert!(cache.proof(&right).is_none());
+        assert!(!cache.remove_rejected(&right, &mut vec![Arc::from("wrong")]));
+    }
 
     #[test]
     fn preflight_read_failure_retains_machine_readable_evidence() {
@@ -669,7 +715,7 @@ mod tests {
         assert_eq!(plan.selected.as_deref(), Some(""));
         assert_eq!(plan.candidates.len(), 1);
         let key = Key::for_input(&input, &sessions).unwrap();
-        cache.update(key, |entry| entry.proof = Some(Some(Arc::from(""))));
+        cache.remember_proof(key, Some(Arc::from("")));
         let cached = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
         assert!(cached.verified && cached.has_candidates);
         assert_eq!(cached.selected.as_deref(), Some(""));
@@ -700,7 +746,7 @@ mod tests {
             let mut candidates = vec![Arc::from("old-wrong"), Arc::from("new")];
             assert!(cache.remove_rejected(&Key::for_input(&input, &sessions).unwrap(), &mut candidates));
             assert_eq!(candidates, [Arc::<str>::from("new")]);
-            cache.update(key.clone(), |entry| entry.proof = Some(Some(Arc::from("right"))));
+            cache.remember_proof(key.clone(), Some(Arc::from("right")));
             assert_eq!(cache.proof(&key).unwrap().as_deref(), Some("right"));
             // The invalid header would fail a fresh verifier call; a stored
             // proof must return before parsing/KDF for every compound layout.
@@ -747,7 +793,7 @@ mod tests {
         zip.format_hint = "zip".into();
         zip.analysis.zip_spanned = false;
         let range_key = Key::for_input(&zip, &sessions).unwrap();
-        cache.update(range_key.clone(), |entry| entry.proof = Some(Some(Arc::from("right"))));
+        cache.remember_proof(range_key.clone(), Some(Arc::from("right")));
         zip.analysis.zip_spanned = true;
         let volume_key = Key::for_input(&zip, &sessions).unwrap();
         assert!(range_key != volume_key);
@@ -756,21 +802,9 @@ mod tests {
         crate::io::reader::invalidate_reader_path(&tail);
         let sessions = open_sessions(&input).unwrap();
         assert!(Key::for_input(&input, &sessions).unwrap() != planned);
-        let mut oversized = input.clone();
-        oversized.parts[0].canonical_name = "x".repeat(MAX_KEY_BYTES + 1);
-        assert!(Key::for_input(&oversized, &sessions).is_none());
-        // The byte budget complements the context count for large layouts.
-        let bytes: Arc<[u8]> = vec![0; MAX_KEY_BYTES].into();
-        for generation in 0..10 {
-            let mut key = planned.clone();
-            key.generation = generation;
-            key.compound = Some(bytes.clone());
-            cache.reject(key, &[Arc::from("old-wrong")]);
-        }
-        assert!(cache.0.lock().unwrap().key_bytes <= MAX_CACHE_KEY_BYTES);
         cache.clear();
-        assert!(cache.0.lock().unwrap().entries.is_empty());
-        assert_eq!(cache.0.lock().unwrap().key_bytes, 0);
+        assert!(cache.0.lock().unwrap().successes.entries.is_empty());
+        assert!(cache.0.lock().unwrap().negative.entries.is_empty());
         drop(sessions);
         let _ = std::fs::remove_file(head);
         let _ = std::fs::remove_file(tail);

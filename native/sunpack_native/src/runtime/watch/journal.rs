@@ -416,6 +416,112 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 mod tests {
     use super::*;
 
+    // Unlike dropping Journal, killing a separate owner cannot finish a
+    // checkpoint, flush the stream or run destructors on the way out. Cover
+    // the three durable representations with one coarse recovery scenario.
+    #[test]
+    fn hard_process_death_replays_checkpoint_and_retirement_boundaries() {
+        use std::io::{BufRead, Read, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const CHILD: &str = "SUNPACK_JOURNAL_CRASH_CHILD";
+        const PHASE: &str = "SUNPACK_JOURNAL_CRASH_PHASE";
+        const READY: &str = "sunpack-journal-crash-ready";
+        if let Some(marker) = std::env::var_os(CHILD) {
+            let marker = PathBuf::from(marker);
+            let dir = marker.with_extension("state");
+            let owned = marker.with_extension("owned");
+            fs::create_dir(&owned).unwrap();
+            let journal = Journal::open(&dir).unwrap();
+            journal.commit(true, |_| {
+                let mut operations = NativeWatchOperations::password_generation(1, "one".into());
+                let (volume, id, _) = crate::filesystem::watch_path_identity(owned.to_str().unwrap())?;
+                operations.extend(NativeWatchOperations::owned_outputs(
+                    &[owned.to_string_lossy().into_owned()], &[&format!("{volume}|{id}")],
+                ));
+                operations.put_promoted(serde_json::from_value(serde_json::json!({
+                    "path": marker,
+                    "generation": crate::io::reader::capture_file_generation(&marker)?.persisted(),
+                }))?);
+                Ok(operations)
+            }).unwrap();
+            journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(2, "two".into()))).unwrap();
+            let phase = std::env::var(PHASE).unwrap();
+            // Hold SHARE_DELETE closed only in the published/pre-retirement
+            // case. Snapshot publication succeeds while its covered WAL stays.
+            let retained = (phase == "published").then(|| {
+                OpenOptions::new().read(true).share_mode(3)
+                    .open(segment_path(&dir, 1)).unwrap()
+            });
+            if phase != "before_snapshot" {
+                journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+                journal.compact().unwrap();
+                journal.wait_for_checkpoint().unwrap();
+                assert!(dir.join("state.snapshot").is_file());
+                assert_eq!(segment_path(&dir, 1).exists(), phase == "published");
+            } else {
+                assert!(!dir.join("state.snapshot").exists());
+            }
+            // A tail after the captured prefix must survive both retained and
+            // retired covered segments, rather than being discarded on open.
+            journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(3, "three".into()))).unwrap();
+            println!("{READY}");
+            io::stdout().flush().unwrap();
+            let mut byte = [0];
+            io::stdin().read_exact(&mut byte).unwrap();
+            drop(retained);
+            panic!("the parent must kill the journal owner without unwinding");
+        }
+
+        for phase in ["before_snapshot", "published", "retired"] {
+            let marker = crate::test_support::temp_file("journal_process_death", b"generation");
+            let dir = marker.with_extension("state");
+            let owned = marker.with_extension("owned");
+            let test_name = format!("{}::hard_process_death_replays_checkpoint_and_retirement_boundaries", module_path!().split_once("::").unwrap().1);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(CHILD, &marker).env(PHASE, phase)
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+                .spawn().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (send, ready) = mpsc::sync_channel(1);
+            let reader = thread::spawn(move || {
+                for line in io::BufReader::new(stdout).lines() {
+                    if line.unwrap().contains(READY) {
+                        let _ = send.send(());
+                        return;
+                    }
+                }
+            });
+            let reached = ready.recv_timeout(Duration::from_secs(30));
+            // Kill on timeout too, so a failed boundary does not leave a child
+            // or its exclusive state lock behind and hang the remaining suite.
+            let killed = child.kill();
+            let status = child.wait().unwrap();
+            reader.join().unwrap();
+            reached.expect("journal child did not reach the requested crash boundary");
+            killed.unwrap();
+            assert!(!status.success());
+            for _ in 0..2 {
+                let journal = Journal::open(&dir).unwrap();
+                assert_eq!(journal.state().password_generation(), 3, "{phase}");
+                assert!(!journal.state().promoted_source(marker.to_str().unwrap()).unwrap().is_replaced());
+                assert_eq!(journal.state().runtime_keys("owned|").len(), 1);
+                let mut events = vec![owned.join("nested.zip")];
+                journal.filter_owned_events(&mut events, &owned);
+                assert!(events.is_empty(), "replayed ownership must still filter output events");
+                if phase != "before_snapshot" {
+                    assert!(!segment_path(&dir, 1).exists());
+                }
+            }
+            fs::remove_dir_all(&dir).unwrap();
+            fs::remove_dir(&owned).unwrap();
+            fs::remove_file(marker).unwrap();
+        }
+    }
+
     // Exercises the durable writer and replay, not just error classification:
     // an unavailable snapshot must not lose the sealed WAL or stop appends.
     #[test]

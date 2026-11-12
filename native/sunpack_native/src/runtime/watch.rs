@@ -1,4 +1,8 @@
 use super::{cli, windows};
+use cli::reporting::Reply;
+use crate::pipeline::{block_on, stage, AsyncGate};
+use std::future::poll_fn;
+use std::task::{Poll, Waker};
 use crate::core::config::{self, Config, Snapshot};
 use crate::core::passwords::BuiltinStore;
 use crate::core::resources::{self, FileMutex};
@@ -20,7 +24,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
+#[cfg(test)]
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -218,8 +224,65 @@ impl Drop for BrokerLease {
     }
 }
 
+// Keep synchronous tests/OS callbacks compatible, while async commands await
+// the existing reply cell. Dropping an unserved command always wakes its caller.
+enum CommandReply<T> {
+    #[cfg(test)]
+    Sync(mpsc::SyncSender<io::Result<T>>),
+    Async(Option<Arc<Reply<T>>>),
+}
+impl<T> CommandReply<T> {
+    fn send(mut self, value: io::Result<T>) -> io::Result<()> {
+        match &mut self {
+            #[cfg(test)]
+            Self::Sync(send) => send.send(value).map_err(|_| io::Error::other("Watch reply disconnected")),
+            Self::Async(reply) => { reply.take().unwrap().complete(value); Ok(()) }
+        }
+    }
+}
+impl<T> Drop for CommandReply<T> {
+    fn drop(&mut self) {
+        if let Self::Async(Some(reply)) = self { reply.complete(Err(io::ErrorKind::Interrupted.into())); }
+    }
+}
+fn command_reply<T: Default>() -> (CommandReply<T>, Arc<Reply<T>>) {
+    let reply = Arc::new(Reply::default());
+    (CommandReply::Async(Some(Arc::clone(&reply))), reply)
+}
+
+// The once caller and a concurrent stop can both observe terminal completion.
+#[derive(Default)]
+struct RunCompletion(Mutex<(Option<Result<i32, (io::ErrorKind, String)>>, Vec<Waker>)>);
+impl RunCompletion {
+    fn complete(&self, result: &io::Result<i32>) {
+        let wakes = {
+            let mut state = self.0.lock().unwrap();
+            state.0 = Some(result.as_ref().copied().map_err(|e| (e.kind(), e.to_string())));
+            std::mem::take(&mut state.1)
+        };
+        for wake in wakes { wake.wake(); }
+    }
+    async fn wait(&self) -> io::Result<i32> {
+        poll_fn(|cx| {
+            let mut state = self.0.lock().unwrap();
+            if let Some(result) = &state.0 { Poll::Ready(result.clone().map_err(|(kind, text)| io::Error::new(kind, text))) }
+            else {
+                if !state.1.iter().any(|wake| wake.will_wake(cx.waker())) { state.1.push(cx.waker().clone()); }
+                Poll::Pending
+            }
+        }).await
+    }
+}
+struct FinishRun(Arc<RunCompletion>);
+impl Drop for FinishRun {
+    fn drop(&mut self) {
+        let missing = self.0.0.lock().unwrap().0.is_none();
+        if missing { self.0.complete(&Err(io::Error::other("Watch thread failed"))); }
+    }
+}
+
 pub(super) struct Watch {
-    lifecycle: Mutex<()>,
+    lifecycle: AsyncGate,
     running: Mutex<Option<Running>>,
     wake_host: Arc<dyn Fn() + Send + Sync>,
     external: Arc<Mutex<Option<ExternalOutputs>>>,
@@ -235,7 +298,7 @@ struct ExternalOutputs {
 impl Watch {
     pub(super) fn new(wake_host: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
-            lifecycle: Mutex::new(()),
+            lifecycle: AsyncGate::new(),
             running: Mutex::default(),
             wake_host,
             external: Arc::default(),
@@ -274,174 +337,183 @@ impl Watch {
         }))
     }
 
-    pub(super) fn start(&self, cwd: &Path, engine: Arc<Engine>, tray: bool) -> io::Result<Value> {
-        let _lifecycle = self.lifecycle.lock().unwrap();
-        let mut slot = self.running.lock().unwrap();
-        if slot
-            .as_ref()
-            .is_some_and(|running| running.continuous && !running.thread.is_finished())
-        {
-            return Ok(
-                json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}),
-            );
+    pub(super) async fn start_async(&self, cwd: &Path, engine: Arc<Engine>, tray: bool) -> io::Result<Value> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let previous = {
+            let mut slot = self.running.lock().unwrap();
+            if slot.as_ref().is_some_and(|run| run.continuous && !run.thread.is_finished()) {
+                return Ok(json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}));
+            }
+            slot.take()
+        };
+        if let Some(previous) = previous { previous.hub.stop(); let _ = Self::join_run(previous).await; }
+        let (running, ready) = self.spawn_run(cwd, engine, tray, false, Cancellation::default()).await?;
+        let hub = Arc::clone(&running.hub);
+        *self.running.lock().unwrap() = Some(running);
+        // Like main, publish the host-owned service before readiness and allow
+        // stop to interrupt startup without cancelling the caller's future.
+        drop(_lifecycle);
+        if let Err(error) = ready.wait().await {
+            let _lifecycle = self.lifecycle.lock().await;
+            let failed = {
+                let mut slot = self.running.lock().unwrap();
+                if slot.as_ref().is_some_and(|run| Arc::ptr_eq(&run.hub, &hub)) { slot.take() } else { None }
+            };
+            if let Some(failed) = failed { let _ = Self::join_run(failed).await; }
+            return Err(error);
         }
-        if let Some(previous) = slot.take() {
-            previous.hub.stop();
-            drop(slot);
-            let _ = previous.thread.join();
-            slot = self.running.lock().unwrap();
-        }
-        let (running, _) = self.spawn_run(cwd, engine, tray, false, Cancellation::default())?;
-        *slot = Some(running);
         (self.wake_host)();
         Ok(json!({"running":true,"started":true,"generation":self.generation.load(Ordering::Relaxed)}))
     }
 
-    // Publish one-shot work in the same lifecycle slot as continuous Watch.
-    // No lifecycle/running mutex is held while already-submitted work drains.
-    fn spawn_run(
-        &self,
-        cwd: &Path,
-        engine: Arc<Engine>,
-        tray: bool,
-        once: bool,
-        cancel: Cancellation,
-    ) -> io::Result<(Running, mpsc::Receiver<io::Result<i32>>)> {
+    async fn spawn_run(&self, cwd: &Path, engine: Arc<Engine>, tray: bool, once: bool,
+        cancel: Cancellation) -> io::Result<(Running, Arc<Reply<()>>)> {
+        stage("watch_config", &cancel).await?;
+        let snapshot = config::load_snapshot(cwd)?;
+        // main applies the configured QoS before opening/handshaking the
+        // shared engine. Worker acknowledgement is an async wait, not a
+        // blocking Watch startup stage. Both once and continuous use this path.
+        windows::configure_priority_async(&engine, snapshot.config.runtime.process_mode).await;
+        engine.worker_ready(&snapshot.config.performance.worker, &cancel).await?;
         let cwd = cwd.to_path_buf();
         let hub = Arc::new(Hub::new());
         let worker_hub = Arc::clone(&hub);
         let wake = Arc::clone(&self.wake_host);
         let external = Arc::clone(&self.external);
         let last_error = Arc::clone(&self.last_error);
+        let (ready, wait) = command_reply();
+        let completion = Arc::new(RunCompletion::default());
+        let finished = FinishRun(Arc::clone(&completion));
+        stage("watch_start", &Cancellation::new()).await?;
         self.generation.fetch_add(1, Ordering::Relaxed);
-        let (ready, wait) = mpsc::sync_channel(1);
-        let (finished, completion) = mpsc::sync_channel(1);
-        let thread = thread::Builder::new()
-            .name("sunpack-watch".into())
-            .spawn(move || {
-                let cancel_hub = Arc::clone(&worker_hub);
-                let _cancel = cancel.subscribe(move || cancel_hub.cancel());
-                let result = match cancel.run(|| {
-                    cancel.check()?;
-                    Scheduler::open(cwd, engine, worker_hub, !once, tray, external)
-                }) {
-                    Ok(mut scheduler) => {
-                        *last_error.lock().unwrap() = None;
-                        let _ = ready.send(Ok(()));
-                        scheduler.run(once)
-                    }
-                    Err(error) => {
-                        let _ = ready.send(Err(io::Error::new(error.kind(), error.to_string())));
-                        Err(error)
-                    }
-                };
-                if let Err(error) = &result {
-                    if !cancel.cancelled() {
-                        *last_error.lock().unwrap() = Some(error.to_string());
-                    }
+        let thread = thread::Builder::new().name("sunpack-watch".into()).spawn(move || {
+            let cancel_hub = Arc::clone(&worker_hub);
+            let _cancel = cancel.subscribe(move || cancel_hub.cancel());
+            let result = match cancel.run(|| {
+                cancel.check()?;
+                Scheduler::open(cwd, engine, worker_hub, !once, tray, external, snapshot)
+            }) {
+                Ok(mut scheduler) => {
+                    *last_error.lock().unwrap() = None;
+                    let _ = ready.send(Ok(()));
+                    scheduler.run(once)
                 }
-                let _ = finished.send(result.as_ref().copied()
-                    .map_err(|error| io::Error::new(error.kind(), error.to_string())));
-                wake();
-                result.map(|_| ())
-            })?;
-        let startup = wait.recv().map_err(io::Error::other)?;
-        if let Err(error) = startup {
-            let _ = thread.join();
-            return Err(error);
-        }
-        Ok((Running { hub, thread, continuous: !once }, completion))
+                Err(error) => {
+                    let _ = ready.send(Err(io::Error::new(error.kind(), error.to_string())));
+                    Err(error)
+                }
+            };
+            if let Err(error) = &result {
+                if !cancel.cancelled() { *last_error.lock().unwrap() = Some(error.to_string()); }
+            }
+            finished.0.complete(&result);
+            wake();
+            result.map(|_| ())
+        })?;
+        Ok((Running { hub, thread, continuous: !once, completion }, wait))
     }
 
-    pub(super) fn stop(&self) -> io::Result<Value> {
-        let _lifecycle = self.lifecycle.lock().unwrap();
-        let mut slot = self.running.lock().unwrap();
+    async fn join_run(running: Running) -> io::Result<()> {
+        let _ = running.completion.wait().await;
+        // Completion precedes only thread epilogue. Join/reap is blocking work,
+        // never an await on a live scheduler while holding an executor slot.
+        stage("watch_close", &Cancellation::new()).await?;
+        running.thread.join().map_err(|_| io::Error::other("Watch thread failed"))?
+    }
+
+    pub(super) async fn stop_async(&self) -> io::Result<Value> {
+        let lifecycle = self.lifecycle.lock().await;
         let generation = self.generation.load(Ordering::Relaxed);
-        let Some(running) = slot.take() else {
+        let current = self.running.lock().unwrap().as_ref().map(|running|
+            (Arc::clone(&running.hub), Arc::clone(&running.completion), !running.thread.is_finished()));
+        let Some((hub, completion, stopped)) = current else {
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
         };
-        drop(slot);
-        if running.thread.is_finished() {
-            let _ = running.thread.join();
-            return Ok(json!({"running":false,"stopped":false,"generation":generation}));
-        }
-        running.hub.stop();
-        running
-            .thread
-            .join()
-            .map_err(|_| io::Error::other("Watch thread failed"))??;
+        hub.stop();
+        // Keep the old service published while it drains, as main does.
+        // Concurrent start sees that service; concurrent stop joins the same
+        // completion rather than serializing a new lifecycle transaction.
+        drop(lifecycle);
+        let result = completion.wait().await;
+        let _lifecycle = self.lifecycle.lock().await;
+        let running = {
+            let mut slot = self.running.lock().unwrap();
+            if slot.as_ref().is_some_and(|run| Arc::ptr_eq(&run.hub, &hub)) { slot.take() } else { None }
+        };
+        let joined = if let Some(running) = running { Self::join_run(running).await } else { Ok(()) };
         (self.wake_host)();
-        Ok(json!({"running":false,"stopped":true,"generation":generation}))
+        if stopped { result?; joined?; }
+        Ok(json!({"running":false,"stopped":stopped,"generation":self.generation.load(Ordering::Relaxed)}))
     }
 
-    pub(super) fn run_once(
-        &self,
-        cwd: &Path,
-        engine: Arc<Engine>,
-        cancel: &Cancellation,
-    ) -> io::Result<i32> {
+    pub(super) async fn run_once_async(&self, cwd: &Path, engine: Arc<Engine>, cancel: &Cancellation) -> io::Result<i32> {
         cancel.check()?;
-        let lifecycle = self.lifecycle.lock().unwrap();
-        let mut slot = self.running.lock().unwrap();
-        if let Some(run) = slot.as_ref().filter(|run| !run.thread.is_finished()) {
-            let hub = Arc::clone(&run.hub);
-            drop(slot);
+        let lifecycle = self.lifecycle.lock().await;
+        let hub = self.running.lock().unwrap().as_ref().filter(|run| !run.thread.is_finished()).map(|run| Arc::clone(&run.hub));
+        if let Some(hub) = hub {
             drop(lifecycle);
-            let (send, receive) = mpsc::sync_channel(1);
-            let interrupted = send.clone();
-            let _cancel = cancel.subscribe(move || {
-                let _ = interrupted.try_send(Err(crate::io::cancellation::cancelled_io()));
-            });
-            if !hub.queue_once(send) {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            receive.recv().map_err(io::Error::other)??;
+            let (send, receive) = command_reply();
+            // Cancellation wakes this caller without stopping continuous Watch.
+            // The queued reply remains owned by the service until it settles.
+            let cancelled = Arc::new(Reply::<()>::default());
+            let wake = Arc::clone(&cancelled);
+            let _cancel = cancel.subscribe(move || wake.complete(Err(crate::io::cancellation::cancelled_io())));
+            if !hub.queue_once(send) { return Err(io::ErrorKind::Interrupted.into()); }
+            let response = receive.wait();
+            let interrupted = cancelled.wait();
+            // poll_fn preserves one wake registration on each branch.
+            let mut response = Box::pin(response);
+            let mut interrupted = Box::pin(interrupted);
+            use std::future::Future;
+            poll_fn(|cx| match response.as_mut().poll(cx) {
+                Poll::Ready(value) => Poll::Ready(value),
+                Poll::Pending => interrupted.as_mut().poll(cx),
+            }).await?;
             cancel.check()?;
             return Ok(0);
         }
-        if let Some(previous) = slot.take() {
-            let _ = previous.thread.join();
-        }
-        let (running, completion) = self.spawn_run(cwd, engine, false, true, cancel.clone())?;
+        let previous = self.running.lock().unwrap().take();
+        if let Some(previous) = previous { let _ = Self::join_run(previous).await; }
+        let (running, ready) = self.spawn_run(cwd, engine, false, true, cancel.clone()).await?;
         let hub = Arc::clone(&running.hub);
-        *slot = Some(running);
-        drop(slot);
+        let completion = Arc::clone(&running.completion);
+        *self.running.lock().unwrap() = Some(running);
         drop(lifecycle);
         (self.wake_host)();
-        let result = completion.recv().map_err(io::Error::other)?;
-        let _lifecycle = self.lifecycle.lock().unwrap();
-        let mut slot = self.running.lock().unwrap();
-        // stop/start may already have replaced this generation while it drained.
-        if slot.as_ref().is_some_and(|run| Arc::ptr_eq(&run.hub, &hub)) {
-            let _ = slot.take().unwrap().thread.join();
-        }
-        drop(slot);
+        let startup = ready.wait().await;
+        let result = completion.wait().await;
+        let _lifecycle = self.lifecycle.lock().await;
+        let running = {
+            let mut slot = self.running.lock().unwrap();
+            if slot.as_ref().is_some_and(|run| Arc::ptr_eq(&run.hub, &hub)) { slot.take() } else { None }
+        };
+        if let Some(running) = running { let _ = Self::join_run(running).await; }
         cancel.check()?;
+        startup?;
         result
     }
 
-    pub(super) fn reload(&self) -> io::Result<Value> {
-        let result = self.reload_result()?;
+    pub(super) async fn reload_async(&self) -> io::Result<Value> {
+        let result = self.reload_result().await?;
         let running = result.is_some();
         let reloaded = result.is_some_and(|result| result.unwrap_or(false));
         Ok(json!({"running":running,"reloaded":reloaded,"generation":self.generation.load(Ordering::Relaxed)}))
     }
 
-    // Keep success separate from semantic change internally: an observer may
-    // have applied a root edit before the explicit command reaches this queue.
-    fn reload_result(&self) -> io::Result<Option<io::Result<bool>>> {
-        let hub = self
-            .running
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|run| !run.thread.is_finished())
-            .map(|run| Arc::clone(&run.hub));
+    async fn reload_result(&self) -> io::Result<Option<io::Result<bool>>> {
+        let hub = self.running.lock().unwrap().as_ref().filter(|run| !run.thread.is_finished()).map(|run| Arc::clone(&run.hub));
         let Some(hub) = hub else { return Ok(None); };
-        let (ready, wait) = mpsc::sync_channel(1);
+        let (ready, wait) = command_reply();
         hub.queue_reload(Some(ready));
-        Ok(Some(wait.recv().map_err(io::Error::other)?))
+        Ok(Some(wait.wait().await))
     }
+
+    // Compatibility for non-driver shutdown and existing synchronous tests.
+    pub(super) fn stop(&self) -> io::Result<Value> { block_on(self.stop_async()) }
+    #[cfg(test)]
+    pub(super) fn run_once(&self, cwd: &Path, engine: Arc<Engine>, cancel: &Cancellation) -> io::Result<i32> { block_on(self.run_once_async(cwd, engine, cancel)) }
+    #[cfg(test)]
+    pub(super) fn reload(&self) -> io::Result<Value> { block_on(self.reload_async()) }
 
     pub(super) fn roots(&self, cwd: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
         let path = roots_path(cwd)?;
@@ -452,7 +524,7 @@ impl Watch {
         Ok((path, roots))
     }
 
-    pub(super) fn add(
+    pub(super) async fn add_async(
         &self,
         cwd: &Path,
         paths: &[PathBuf],
@@ -460,6 +532,7 @@ impl Watch {
         deep: bool,
         recursive: bool,
     ) -> io::Result<Value> {
+        stage("watch_directory", &Cancellation::new()).await?;
         let path = roots_path(cwd)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -503,7 +576,7 @@ impl Watch {
                 write_roots(&path, &roots)?;
             }
         }
-        let apply = self.root_change_status(running, !added.is_empty() || !updated.is_empty())?;
+        let apply = self.root_change_status(running, !added.is_empty() || !updated.is_empty()).await?;
         let apply = apply.map(|(applied, generation)| {
             json!({
                 "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
@@ -516,7 +589,8 @@ impl Watch {
         }))
     }
 
-    pub(super) fn remove(&self, cwd: &Path, paths: &[PathBuf]) -> io::Result<Value> {
+    pub(super) async fn remove_async(&self, cwd: &Path, paths: &[PathBuf]) -> io::Result<Value> {
+        stage("watch_directory", &Cancellation::new()).await?;
         let path = roots_path(cwd)?;
         let mut removed = Vec::new();
         {
@@ -536,7 +610,7 @@ impl Watch {
             }
         }
         let apply = self
-            .root_change_status(self.is_running(), !removed.is_empty())?
+            .root_change_status(self.is_running(), !removed.is_empty()).await?
             .map(|(applied, generation)| {
                 json!({
                     "roots_path":path,"removed":removed,"applied":applied,
@@ -546,15 +620,15 @@ impl Watch {
         Ok(json!({"roots_path":path,"removed":removed,"apply":apply}))
     }
 
-    fn root_change_status(&self, running: bool, changed: bool) -> io::Result<Option<(bool, u64)>> {
+    async fn root_change_status(&self, running: bool, changed: bool) -> io::Result<Option<(bool, u64)>> {
         if !running {
             return Ok(None);
         }
-        let applied = changed && self.reload_result()?.is_some_and(|result| result.is_ok());
+        let applied = changed && self.reload_result().await?.is_some_and(|result| result.is_ok());
         Ok(Some((applied, self.generation.load(Ordering::Relaxed))))
     }
 
-    pub(super) fn rebuild_log(&self, cwd: &Path) -> io::Result<bool> {
+    pub(super) async fn rebuild_log_async(&self, cwd: &Path) -> io::Result<bool> {
         let hub = self
             .running
             .lock()
@@ -563,16 +637,17 @@ impl Watch {
             .filter(|run| !run.thread.is_finished())
             .map(|run| Arc::clone(&run.hub));
         if let Some(hub) = hub {
-            let (send, receive) = mpsc::sync_channel(1);
+            let (send, receive) = command_reply();
             hub.update(|signals| signals.rebuild.push(send));
-            return receive.recv().map_err(io::Error::other)?;
+            return receive.wait().await;
         }
+        stage("catalog_maintenance", &Cancellation::new()).await?;
         let dir = state_dir(cwd)?;
         let state = journal::Journal::open(&dir)?;
         state.rebuild_log()
     }
 
-    pub(super) fn cancel_batch(&self, id: &str) -> bool {
+    pub(super) async fn cancel_batch_async(&self, id: &str) -> bool {
         let hub = self
             .running
             .lock()
@@ -583,9 +658,9 @@ impl Watch {
         let Some(hub) = hub else {
             return false;
         };
-        let (send, receive) = mpsc::sync_channel(1);
+        let (send, receive) = command_reply();
         hub.update(|signals| signals.cancel.push((id.to_owned(), send)));
-        receive.recv().unwrap_or(false)
+        receive.wait().await.unwrap_or(false)
     }
 }
 
@@ -669,6 +744,7 @@ struct Running {
     hub: Arc<Hub>,
     thread: JoinHandle<io::Result<()>>,
     continuous: bool,
+    completion: Arc<RunCompletion>,
 }
 
 #[derive(Default)]
@@ -676,15 +752,15 @@ struct Signals {
     changed_roots: HashMap<String, HashSet<PathBuf>>,
     topology_roots: HashSet<String>,
     reload: bool,
-    reload_waiters: Vec<mpsc::SyncSender<io::Result<bool>>>,
-    once: Vec<mpsc::SyncSender<io::Result<()>>>,
+    reload_waiters: Vec<CommandReply<bool>>,
+    once: Vec<CommandReply<()>>,
     password_changed: bool,
     foreground_finished: bool,
     maintenance: bool,
     clipboard: Option<Vec<String>>,
     volumes_changed: bool,
-    rebuild: Vec<mpsc::SyncSender<io::Result<bool>>>,
-    cancel: Vec<(String, mpsc::SyncSender<bool>)>,
+    rebuild: Vec<CommandReply<bool>>,
+    cancel: Vec<(String, CommandReply<bool>)>,
     roots: Vec<RootCompleted>,
     completed: Vec<String>,
 }
@@ -770,7 +846,7 @@ impl Hub {
         self.stop();
     }
 
-    fn queue_once(&self, waiter: mpsc::SyncSender<io::Result<()>>) -> bool {
+    fn queue_once(&self, waiter: CommandReply<()>) -> bool {
         let mut signals = self.signals.lock().unwrap();
         if self.stopped.load(Ordering::Acquire) {
             return false;
@@ -821,7 +897,7 @@ impl Hub {
         self.wake.notify_one();
     }
 
-    fn queue_reload(&self, wait: Option<mpsc::SyncSender<io::Result<bool>>>) {
+    fn queue_reload(&self, wait: Option<CommandReply<bool>>) {
         self.update(|signals| {
             signals.reload = true;
             signals.reload_waiters.extend(wait);
@@ -1310,15 +1386,25 @@ struct Scheduler {
 
 impl Scheduler {
     fn open(
+        cwd: PathBuf, engine: Arc<Engine>, hub: Arc<Hub>, continuous: bool,
+        tray_enabled: bool, external: Arc<Mutex<Option<ExternalOutputs>>>, snapshot: Snapshot,
+    ) -> io::Result<Self> {
+        let executor = Arc::clone(&engine);
+        executor.run_stage("watch_start", Origin::Watch, || {
+            Self::open_blocking(cwd, engine, hub, continuous, tray_enabled, external, snapshot)
+        })
+    }
+
+    fn open_blocking(
         cwd: PathBuf,
         engine: Arc<Engine>,
         hub: Arc<Hub>,
         continuous: bool,
         tray_enabled: bool,
         external: Arc<Mutex<Option<ExternalOutputs>>>,
+        snapshot: Snapshot,
     ) -> io::Result<Self> {
         let lease = BrokerLease::acquire()?;
-        let snapshot = config::load_snapshot(&cwd)?;
         let root_file = roots_path(&cwd)?;
         let dir = state_dir(&cwd)?;
         let journal = Arc::new(journal::Journal::open(&dir)?);
@@ -1376,7 +1462,6 @@ impl Scheduler {
         scheduler.retire_missing_entries(None, true)?;
         scheduler.retire_stale_promoted(None, true)?;
         scheduler.reconcile_shell();
-        windows::configure_priority(&scheduler.engine, scheduler.settings.runtime.process_mode);
         scheduler.recover_pending(None)?;
         if !scheduler.continuous && !scheduler.roots.is_empty()
             && scheduler.settings.watch.clipboard_monitor_enabled {
@@ -1553,6 +1638,8 @@ impl Scheduler {
     }
 
     fn reconcile_roots(&mut self) -> io::Result<bool> {
+        let engine = Arc::clone(&self.engine);
+        let (entries, next, policy_changed) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
         let (entries, rejected) = {
             // Read, classify, and prune the same root policy. GUI and CLI
             // writers share this lock; pruning an older snapshot can remove a
@@ -1619,8 +1706,12 @@ impl Scheduler {
                         || old.deep != root.deep
                 })
             });
+            Ok((entries, next, policy_changed))
+        })?;
+        // Draining async requests must never hold a blocking-stage permit.
+        if policy_changed { self.drain_active(&mut Ok(0))?; }
+        engine.run_stage("watch_directory", Origin::Watch, || {
         if policy_changed {
-            self.drain_active(&mut Ok(0))?;
             let reroute = self
                 .pending
                 .iter()
@@ -1676,9 +1767,15 @@ impl Scheduler {
         retirement?;
         self.root_progress.retirement = false;
         Ok(self.root_progress.checkpoint)
+        })
     }
 
-    fn rearm_root_observers(&mut self, changed: Option<&HashSet<String>>) {
+    fn rearm_root_observers(&mut self, changed: Option<&HashSet<String>>) -> () {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_rearm", Origin::Watch, || self.rearm_root_observers_blocking(changed))
+    }
+
+    fn rearm_root_observers_blocking(&mut self, changed: Option<&HashSet<String>>) {
         // Ordinary content notifications never invalidate these subscriptions.
         // Resolve only topology-invalidated roots; preserve other memberships.
         let desired = parent_memberships(self.roots.iter()
@@ -1721,16 +1818,16 @@ impl Scheduler {
     }
 
     fn reload(&mut self) -> io::Result<bool> {
-        let snapshot = config::reload_snapshot(&self.cwd)?;
+        let snapshot = self.engine.run_stage("watch_config_reload", Origin::Watch, || config::reload_snapshot(&self.cwd))?;
         let config_changed = *self.settings != snapshot.config;
         let scheduler_changed = scheduler_configuration_changed(&self.settings, &snapshot.config);
         let observers_changed = self.config_sources != snapshot.sources
             || self.config_observers.iter().any(|observer| observer.stopping.load(Ordering::Acquire));
         // Keep the previous subscriptions alive until apply succeeds. A failed
         // apply must not publish sources or lose the old recovery notifications.
-        let observers = observers_changed.then(|| Self::observe_config(
+        let observers = observers_changed.then(|| self.engine.run_stage("watch_rearm", Origin::Watch, || Self::observe_config(
             &self.cwd, &snapshot, &self.root_file, self.passwords.path(), &self.hub,
-        )).transpose()?;
+        ))).transpose()?;
         if scheduler_changed {
             self.drain_active(&mut Ok(0))?;
         }
@@ -1754,7 +1851,9 @@ impl Scheduler {
             if config_changed {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
             }
-            self.checkpoint_reload(scheduler_changed || roots_changed)
+            self.checkpoint_reload(scheduler_changed || roots_changed)?;
+            if config_changed { self.password_update(false)?; }
+            Ok(())
         })();
         if let Err(error) = apply {
             if let Some(settings) = previous {
@@ -1838,7 +1937,7 @@ impl Scheduler {
             }
             let signals = self.hub.wait_drain(cancellation_observed);
             for (batch, waiter) in signals.cancel {
-                let _ = waiter.send(self.cancel_display_batch(&batch));
+                let _ = waiter.send(Ok(self.cancel_display_batch(&batch)));
             }
             for root in signals.roots {
                 if let Err(error) = self.complete_root(root) { *result = Err(error); }
@@ -1876,10 +1975,12 @@ impl Scheduler {
         *self.external.lock().unwrap() = None;
         *self.hub.claims.lock().unwrap() = HashMap::new();
         *self.hub.seeds.lock().unwrap() = HashMap::new();
-        self.catalog.commit(true);
-        self.catalog.close();
-        self.journal.log(json!({"event":"watch_stopped"}));
-        self.journal.flush()?;
+        self.engine.run_stage("watch_close", Origin::Watch, || {
+            self.catalog.commit(true);
+            self.catalog.close();
+            self.journal.log(json!({"event":"watch_stopped"}));
+            self.journal.flush()
+        })?;
         if self.hub.cancelled.load(Ordering::Acquire) {
             return Err(crate::io::cancellation::cancelled_io());
         }
@@ -1899,8 +2000,10 @@ impl Scheduler {
                 break;
             }
             if self.active.is_empty() && self.pending.is_empty() {
-                self.catalog.commit(true);
-                self.journal.compact()?;
+                self.engine.run_stage("catalog_commit", Origin::Watch, || {
+                    self.catalog.commit(true);
+                    self.journal.compact()
+                })?;
             }
             let due = self.next_admission();
             let deadline = match (due, self.cache_deadline) {
@@ -1909,7 +2012,7 @@ impl Scheduler {
             };
             let signals = self.hub.wait(deadline);
             for (batch, waiter) in signals.cancel {
-                let _ = waiter.send(self.cancel_display_batch(&batch));
+                let _ = waiter.send(Ok(self.cancel_display_batch(&batch)));
             }
             let mut completion_error = None;
             for root in signals.roots {
@@ -1929,7 +2032,8 @@ impl Scheduler {
                 return Err(error);
             }
             for waiter in signals.rebuild {
-                let _ = waiter.send(self.journal.rebuild_log());
+                let result = self.engine.run_stage("catalog_maintenance", Origin::Watch, || self.journal.rebuild_log());
+                let _ = waiter.send(result);
             }
             if let Some(clipboard) = signals.clipboard {
                 self.merge_clipboard(&clipboard)?;
@@ -1965,9 +2069,11 @@ impl Scheduler {
                 if self.options.is_some() && (all_roots || !signals.topology_roots.is_empty()) {
                     self.rearm_root_observers((!all_roots).then_some(&signals.topology_roots));
                 }
-                let recovery = all_roots || !signals.topology_roots.is_empty()
-                    || signals.changed_roots.values().any(|paths| paths.is_empty()
-                        || paths.iter().any(|path| !path.is_file()));
+                let recovery = self.engine.run_stage("watch_directory", Origin::Watch, || {
+                    all_roots || !signals.topology_roots.is_empty()
+                        || signals.changed_roots.values().any(|paths| paths.is_empty()
+                            || paths.iter().any(|path| !path.is_file()))
+                });
                 let result = (if recovery {
                     self.checkpoint(&signals.changed_roots, all_roots, false)
                 } else {
@@ -1998,7 +2104,11 @@ impl Scheduler {
             {
                 self.cache_deadline = None;
                 if self.active.is_empty() && self.pending.is_empty() {
-                    windows::maintain_when_foreground_idle(&self.engine, || {
+                    let engine = Arc::clone(&self.engine);
+                    let mut maintenance = Ok(());
+                    windows::maintain_when_foreground_idle(&engine, || engine.run_stage("catalog_maintenance", Origin::Watch, || {
+                        maintenance = self.checkpoint(&HashMap::new(), true, false);
+                        if maintenance.is_err() { return; }
                         let _ = crate::io::reader::clear_reader_resources();
                         self.engine.clear_idle_passwords();
                         self.journal.state().trim_idle_storage();
@@ -2007,7 +2117,8 @@ impl Scheduler {
                         self.active.shrink_to_fit();
                         self.active_paths.shrink_to_fit();
                         self.hub.seeds.lock().unwrap().shrink_to_fit();
-                    });
+                    }));
+                    maintenance?;
                 }
             }
         }
@@ -2043,6 +2154,11 @@ impl Scheduler {
     }
 
     fn observe_file_changes(&mut self, changed: &HashMap<String, HashSet<PathBuf>>) -> io::Result<()> {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_directory", Origin::Watch, || self.observe_file_changes_blocking(changed))
+    }
+
+    fn observe_file_changes_blocking(&mut self, changed: &HashMap<String, HashSet<PathBuf>>) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
         // Match main's ordinary file-event path: enqueue in memory without
         // refreshing the durable inventory or advancing its USN stamp. The
@@ -2067,10 +2183,16 @@ impl Scheduler {
                 }
             }
         }
+        if self.cache_deadline.is_none() { self.arm_idle_cleanup(); }
         Ok(())
     }
 
-    fn checkpoint(
+    fn checkpoint(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, all_roots: bool, startup: bool) -> io::Result<()> {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_usn_checkpoint", Origin::Watch, || self.checkpoint_blocking(changed, all_roots, startup))
+    }
+
+    fn checkpoint_blocking(
         &mut self,
         changed: &HashMap<String, HashSet<PathBuf>>,
         all_roots: bool,
@@ -2106,6 +2228,8 @@ impl Scheduler {
             // cursor. A rename may replace its path while recovery is running.
             let identity = output_identity(&scope.root).ok();
             let current = filesystem::watch_volume_cursor(&scope.root);
+            let arrived = !startup && (reopened.contains(&id) || identity.as_deref()
+                .is_some_and(|identity| self.catalog.root_replaced(&scope, identity)));
             let cached = identity.as_deref().and_then(|identity| self.catalog.cursor(&scope, identity));
             if let (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end))) =
                 (&current, &cached)
@@ -2127,7 +2251,7 @@ impl Scheduler {
                     entry.2.push(scope.clone());
                 }
             }
-            probes.push((id, root, scope, identity, current, cached));
+            probes.push((id, root, scope, identity, current, cached, arrived));
         }
         if !reopened.is_empty() {
             // Old snapshots can have only an outside literal name while its
@@ -2156,7 +2280,7 @@ impl Scheduler {
         let mut admitted = HashSet::new();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
-        for (id, root, scope, identity, current, cached) in probes {
+        for (id, root, scope, identity, current, cached, arrived) in probes {
             let range = match (&current, &cached) {
                 (Ok((volume, journal, end)), Some((old_volume, old_journal, old_end)))
                     if volume == old_volume
@@ -2255,9 +2379,9 @@ impl Scheduler {
                     }
                 }
             }
-            if !root.scanned {
+            if !root.scanned || arrived {
                 paths.extend(self.catalog.candidate_paths(&scope, None));
-                if errors.is_empty() && current.is_ok() && identity.is_some() {
+                if !root.scanned && errors.is_empty() && current.is_ok() && identity.is_some() {
                     marks.push(id.clone());
                 }
             }
@@ -2791,6 +2915,11 @@ impl Scheduler {
     }
 
     fn password_update(&mut self, startup: bool) -> io::Result<()> {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("password_reload", Origin::Watch, || self.password_update_blocking(startup))
+    }
+
+    fn password_update_blocking(&mut self, startup: bool) -> io::Result<()> {
         let snapshot = match self.passwords.reload() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2799,9 +2928,9 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        let signature = snapshot.signature();
+        let signature = password_source_signature(&self.settings.user_passwords, snapshot.signature());
         let state = self.journal.state();
-        let changed = !password_signature_matches(&state.password_source_signature(), signature);
+        let changed = state.password_source_signature() != signature;
         if changed || startup {
             // A prior runtime can publish the password generation before
             // scheduling every affected blocker. Reconcile entries once when
@@ -2846,7 +2975,7 @@ impl Scheduler {
                 .failure_payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|before| password_signature_matches(before, &snapshot.scope_signature(directory)))
+                .is_some_and(|before| before == password_source_signature(&self.settings.user_passwords, &snapshot.scope_signature(directory)))
             {
                 continue;
             }
@@ -3205,25 +3334,14 @@ fn output_identity(path: &str) -> io::Result<String> {
     Ok(format!("{volume}|{identity}"))
 }
 
-fn password_signature_matches(previous: &str, current: &str) -> bool {
-    if previous == current {
-        return true;
-    }
-    if previous.len() != 32 {
-        return false;
-    }
-    // Python Watch combined the built-in digest with a digest of its explicit
-    // request password list. Persistent Watch has no explicit CLI passwords.
-    static EMPTY_LIST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let empty_list = EMPTY_LIST.get_or_init(|| {
-        let mut hash = crate::fast_hash_core::Hash128::new();
-        hash.update(b"[]");
-        hash.hexdigest()
-    });
+fn password_source_signature(user: &[String], builtin: &str) -> String {
     let mut hash = crate::fast_hash_core::Hash128::new();
-    hash.update(empty_list.as_bytes());
-    hash.update(current.as_bytes());
-    previous == hash.hexdigest()
+    hash.update(serde_json::to_string(user).unwrap().as_bytes());
+    let user = hash.hexdigest();
+    let mut hash = crate::fast_hash_core::Hash128::new();
+    hash.update(user.as_bytes());
+    hash.update(builtin.as_bytes());
+    hash.hexdigest()
 }
 
 fn recovery_output_matches(
@@ -3269,6 +3387,11 @@ impl Scheduler {
     }
 
     fn prepare_ready(&mut self, now: Instant, available: usize) -> io::Result<Vec<(String, Pending)>> {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_admission", Origin::Watch, || self.prepare_ready_blocking(now, available))
+    }
+
+    fn prepare_ready_blocking(&mut self, now: Instant, available: usize) -> io::Result<Vec<(String, Pending)>> {
         let ready = {
             let claims = self.hub.claims.lock().unwrap();
             due_admissions(&self.due, now, available, |path| {
@@ -3446,7 +3569,12 @@ impl Scheduler {
         self.pending.insert(id, pending);
     }
 
-    fn start_batch(
+    fn start_batch(&mut self, root_id: String, candidates: Vec<WatchCandidateRow>, recovery: Option<Arc<Recovery>>) -> io::Result<()> {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery))
+    }
+
+    fn start_batch_blocking(
         &mut self,
         id: String,
         candidates: Vec<WatchCandidateRow>,
@@ -3498,6 +3626,7 @@ impl Scheduler {
         request.max_depth = cli::depth(self.settings.recursive_extract);
         request.deep = root.deep;
         let passwords = self.passwords.snapshot();
+        request.passwords = self.settings.user_passwords.iter().map(|value| Arc::from(value.as_str())).collect();
         request.password_snapshot = Some(Arc::clone(&passwords));
         if let Some(recovery) = &recovery {
             request.password_scope = (!recovery.password_scope.as_os_str().is_empty())
@@ -3745,7 +3874,12 @@ impl Scheduler {
         }, completed).map(|_| ())
     }
 
-    fn apply_completion(&mut self, batch: &str, mut active: CompletionContext, mut completed: Completed) -> io::Result<Outcome> {
+    fn apply_completion(&mut self, batch: &str, active: CompletionContext, completed: Completed) -> io::Result<Outcome> {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_complete_state", Origin::Watch, || self.apply_completion_blocking(batch, active, completed))
+    }
+
+    fn apply_completion_blocking(&mut self, batch: &str, mut active: CompletionContext, mut completed: Completed) -> io::Result<Outcome> {
         consume_claimed_pending(
             &mut self.pending, &mut self.due, &mut self.unpublished,
             &active.groups, &active.touched, &mut active.inputs,
@@ -3940,6 +4074,7 @@ impl Scheduler {
                 Some(input_failure),
                 self.journal.state().entry(&candidate.path).as_deref(),
                 &active.passwords,
+                &self.settings.user_passwords,
                 Some(&group),
                 Some(&recovery),
             );
@@ -3961,7 +4096,7 @@ impl Scheduler {
             let password_updated = payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|previous| previous != current_passwords.scope_signature(&recovery.password_scope));
+                .is_some_and(|previous| previous != password_source_signature(&self.settings.user_passwords, &current_passwords.scope_signature(&recovery.password_scope)));
             let pending = regroup.then(|| self.pending.get_mut(&id)).flatten();
             let handed_off = pending.is_some();
             handoff_promoted_blocker(&mut entry, route_root, root,
@@ -4052,6 +4187,7 @@ impl Scheduler {
                         input_failure,
                         self.journal.state().entry(&candidate.path).as_deref(),
                         &active.passwords,
+                &self.settings.user_passwords,
                         group.map(Arc::as_ref),
                         active.recovery.as_deref(),
                     );
@@ -4075,7 +4211,7 @@ impl Scheduler {
                     .failure_payload
                     .get("password_signature")
                     .and_then(Value::as_str)
-                    .is_some_and(|before| before != current_passwords.scope_signature(directory))
+                    .is_some_and(|before| before != password_source_signature(&self.settings.user_passwords, &current_passwords.scope_signature(directory)))
                 {
                     retry.push(candidate.path.clone());
                 }
@@ -4300,6 +4436,7 @@ fn make_entry(
     failure: Option<&InputFailure<'_>>,
     previous: Option<&crate::watch_store::EntryRecord>,
     passwords: &crate::core::passwords::PasswordSnapshot,
+    user_passwords: &[String],
     group: Option<&SourceGroup>,
     recovery: Option<&Recovery>,
 ) -> Arc<crate::watch_store::EntryRecord> {
@@ -4326,7 +4463,7 @@ fn make_entry(
             |recovery| recovery.password_dir(path),
         );
         payload["password_scope_dir"] = json!(dir);
-        payload["password_signature"] = json!(passwords.scope_signature(dir));
+        payload["password_signature"] = json!(password_source_signature(user_passwords, &passwords.scope_signature(dir)));
     }
     let kind = serde_json::to_value(kind)
         .ok()
@@ -5307,11 +5444,11 @@ mod tests {
         };
         let passwords = crate::core::passwords::PasswordSnapshot::default();
         let entry = make_entry(&candidate, "carrier blocked", Some(carrier), None,
-            &passwords, None, None);
+            &passwords, &[], None, None);
         assert_eq!(entry.status, "suspended_missing_volume");
         assert_eq!(entry.failure_payload["blockers"], json!(["missing_volume", "password"]));
         assert_eq!(entry.failure_payload["password_signature"],
-            json!(passwords.scope_signature(Path::new(promoted_path).parent().unwrap())));
+            json!(password_source_signature(&[], &passwords.scope_signature(Path::new(promoted_path).parent().unwrap()))));
         let retry_paths = outcome.archives.iter().filter(|archive| promoted_retry(archive, &failures))
             .map(|archive| key(&archive.path)).collect::<HashSet<_>>();
         assert_eq!(retry_paths.len(), 1, "one physical retry retains all logical receipts");
@@ -5425,14 +5562,13 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_python_password_blockers_keep_their_generation() {
-        // WatchScheduler._password_signature_for_scope in the Python runtime
-        // wraps this built-in scope signature with the empty user-password list.
-        let current = "a55be77812b08557859dab8291a7ac45";
-        let legacy = "1dc1efb66b9a5c864c8abd4d5e769223";
-        assert!(password_signature_matches(legacy, current));
-        assert!(password_signature_matches(current, current));
-        assert!(!password_signature_matches(legacy, "7fa575ff785f4d5a6e3e7afaa5e05bcb"));
+    fn configured_passwords_participate_in_watch_blocker_signatures() {
+        let builtin = "a55be77812b08557859dab8291a7ac45";
+        assert_eq!(password_source_signature(&[], builtin), "1dc1efb66b9a5c864c8abd4d5e769223");
+        assert_ne!(password_source_signature(&["new password".into()], builtin),
+            password_source_signature(&[], builtin));
+        assert_ne!(password_source_signature(&["new password".into()], builtin),
+            password_source_signature(&["new password".into()], "changed builtin"));
     }
 
     #[test]
@@ -5459,7 +5595,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         hub.stop();
         let (waiter, _) = mpsc::sync_channel(1);
-        assert!(!hub.queue_once(waiter));
+        assert!(!hub.queue_once(CommandReply::Sync(waiter)));
         let (send, receive) = mpsc::channel();
         let worker_hub = Arc::clone(&hub);
         let waiter = thread::spawn(move || {
@@ -5535,8 +5671,8 @@ mod tests {
         let hub = Hub::new();
         let (reload, reload_result) = mpsc::sync_channel(1);
         let (once, once_result) = mpsc::sync_channel(1);
-        hub.queue_reload(Some(reload));
-        assert!(hub.queue_once(once));
+        hub.queue_reload(Some(CommandReply::Sync(reload)));
+        assert!(hub.queue_once(CommandReply::Sync(once)));
         hub.update(|signals| {
             signals.root_changed("old-root", Some(vec![PathBuf::from("archive.zip")]));
             signals.password_changed = true;
@@ -5562,27 +5698,101 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_stop_keeps_the_draining_generation_visible_to_start() {
+        use std::future::Future;
+        use std::task::Context;
+        let watch = Watch::new(Arc::new(|| {}));
+        let hub = Arc::new(Hub::new());
+        let completion = Arc::new(RunCompletion::default());
+        let finished = FinishRun(Arc::clone(&completion));
+        let worker_hub = Arc::clone(&hub);
+        let (release, released) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            worker_hub.wait(None);
+            released.recv().unwrap();
+            finished.0.complete(&Ok(0));
+            Ok(())
+        });
+        watch.generation.store(4, Ordering::Relaxed);
+        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true, completion });
+        let mut first = Box::pin(watch.stop_async());
+        let mut second = Box::pin(watch.stop_async());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        // A missing worker path also proves start never tries to spawn/handshake.
+        let start = block_on(watch.start_async(Path::new("."),
+            Arc::new(Engine::new(PathBuf::from("unused-worker"))), false)).unwrap();
+        assert_eq!(start, json!({"running":true,"started":false,"generation":4}));
+        release.send(()).unwrap();
+        for response in [block_on(first).unwrap(), block_on(second).unwrap()] {
+            assert_eq!(response, json!({"running":false,"stopped":true,"generation":4}));
+        }
+        assert!(!watch.is_running());
+    }
+
+    #[test]
+    fn asynchronous_reload_and_stop_release_the_shared_control_driver() {
+        let watch = Arc::new(Watch::new(Arc::new(|| {})));
+        let hub = Arc::new(Hub::new());
+        let completion = Arc::new(RunCompletion::default());
+        let finished = FinishRun(Arc::clone(&completion));
+        let worker_hub = Arc::clone(&hub);
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let pending = worker_hub.wait(None);
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            // A disappearing service must wake an async reply even without send.
+            drop(pending);
+            worker_hub.wait(None);
+            finished.0.complete(&Ok(0));
+            Ok(())
+        });
+        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true, completion });
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let caller = Arc::clone(&watch);
+        let reload = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { caller.reload_async().await });
+        entering.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let caller = Arc::clone(&watch);
+        let stop = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { caller.stop_async().await });
+        let (progress, progressed) = mpsc::channel();
+        let independent = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { progress.send(()).unwrap(); });
+        let responsive = progressed.recv_timeout(std::time::Duration::from_secs(5));
+        release.send(()).unwrap();
+        independent.join().unwrap();
+        assert_eq!(reload.join().unwrap().unwrap()["reloaded"], false);
+        assert_eq!(stop.join().unwrap().unwrap()["stopped"], true);
+        responsive.expect("Watch lifecycle wait blocked another control request");
+    }
+
+    #[test]
     fn root_apply_ack_accepts_observer_first_noop_but_not_apply_failure() {
         let watch = Watch::new(Arc::new(|| {}));
         let hub = Arc::new(Hub::new());
         let worker_hub = Arc::clone(&hub);
+        let completion = Arc::new(RunCompletion::default());
+        let finished = FinishRun(Arc::clone(&completion));
         let worker = thread::spawn(move || {
+            let finished = finished;
             for result in [Ok(false), Ok(false), Err(io::Error::other("apply failed")), Err(io::Error::other("apply failed"))] {
                 let signals = worker_hub.wait(None);
                 assert_eq!(signals.reload_waiters.len(), 1);
                 signals.reload_waiters.into_iter().next().unwrap().send(result).unwrap();
             }
             worker_hub.wait(None);
+            finished.0.complete(&Ok(0));
             Ok(())
         });
-        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true });
+        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true, completion });
         // FileObserver already applied the write: explicit reload is a
         // successful no-op, but the changed root command was still applied.
-        assert_eq!(watch.root_change_status(true, true).unwrap(), Some((true, 0)));
+        assert_eq!(block_on(watch.root_change_status(true, true)).unwrap(), Some((true, 0)));
         assert_eq!(watch.reload().unwrap()["reloaded"], false);
-        assert_eq!(watch.root_change_status(true, true).unwrap(), Some((false, 0)));
+        assert_eq!(block_on(watch.root_change_status(true, true)).unwrap(), Some((false, 0)));
         assert_eq!(watch.reload().unwrap()["reloaded"], false);
-        assert_eq!(watch.root_change_status(true, false).unwrap(), Some((false, 0)));
+        assert_eq!(block_on(watch.root_change_status(true, false)).unwrap(), Some((false, 0)));
         watch.stop().unwrap();
     }
 
@@ -5592,15 +5802,19 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let worker_hub = Arc::clone(&hub);
         let (entered, wait_entered) = mpsc::channel();
+        let completion = Arc::new(RunCompletion::default());
+        let finished = FinishRun(Arc::clone(&completion));
         let worker = thread::spawn(move || {
+            let finished = finished;
             let pending = worker_hub.wait(None);
             assert_eq!(pending.once.len(), 1);
             entered.send(()).unwrap();
             worker_hub.wait(None);
             drop(pending);
+            finished.0.complete(&Ok(0));
             Ok(())
         });
-        *watch.running.lock().unwrap() = Some(Running { hub: Arc::clone(&hub), thread: worker, continuous: true });
+        *watch.running.lock().unwrap() = Some(Running { hub: Arc::clone(&hub), thread: worker, continuous: true, completion });
         let cancel = Cancellation::new();
         let request_cancel = cancel.clone();
         let caller_watch = Arc::clone(&watch);
@@ -5625,12 +5839,16 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let worker_hub = Arc::clone(&hub);
         let worker_watch = Arc::clone(&watch);
+        let completion = Arc::new(RunCompletion::default());
+        let finished = FinishRun(Arc::clone(&completion));
         let worker = thread::spawn(move || {
+            let finished = finished;
             worker_hub.wait(None);
             worker_watch.foreground_finished(|| {});
+            finished.0.complete(&Ok(0));
             Ok(())
         });
-        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true });
+        *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, continuous: true, completion });
         let (send, receive) = mpsc::channel();
         let stop = thread::spawn(move || {
             let _ = send.send(watch.stop());

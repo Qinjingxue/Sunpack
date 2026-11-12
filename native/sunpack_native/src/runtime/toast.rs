@@ -1442,6 +1442,7 @@ mod tests {
             path: PathBuf::from(path),
             depth: 1,
             segment: parent.map(|_| Segment {
+                format: "zip".into(),
                 index,
                 count: 2,
                 offset: 0,

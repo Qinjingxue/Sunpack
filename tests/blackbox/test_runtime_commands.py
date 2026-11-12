@@ -81,7 +81,7 @@ def test_cli_password_values_and_noninteractive_prompt_contract(package):
     # Main preserves text-source candidates; NUL validation belongs to builtin JSON.
     nul = package.run("passwords", "--ask-pw", input="truncated\x00suffix\n\n")
     assert nul.returncode == 0, nul.stderr
-    assert "truncated\x00suffix" in nul.stdout
+    assert "truncated\\x00suffix" in nul.stdout
 
 
 def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):

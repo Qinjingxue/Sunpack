@@ -95,7 +95,7 @@ def test_password_text_sources_preserve_nul_candidates(package, tmp_path):
     ]
     interactive = package.run("passwords", "--no-bpw", "-a", input="bad\x00candidate\n\n")
     assert interactive.returncode == 0, interactive.stderr
-    assert "bad\x00candidate" in interactive.stdout
+    assert "bad\\x00candidate" in interactive.stdout
 
 
 def test_enabled_invalid_regex_only_blocks_filtered_scans_and_reports_all_rules(package, tmp_path):
@@ -140,3 +140,31 @@ def test_deep_extract_defers_bad_filters_until_recursive_output_scan(package, tm
     recursive = package.run("extract", "-d", "-r", "2", source, "--json")
     assert recursive.returncode != 0
     assert "regex" in recursive.stdout + recursive.stderr
+
+
+@pytest.mark.parametrize("operation", ["scan", "extract"])
+@pytest.mark.parametrize("failure", ["config", "worker", "worker_start", "password_file"])
+def test_archive_infrastructure_failures_keep_main_exit_classification(package, tmp_path, operation, failure):
+    archive = tmp_path / "input.zip"
+    with zipfile.ZipFile(archive, "w") as payload:
+        payload.writestr("member.txt", "payload")
+    args = [operation, archive]
+    if failure == "config":
+        # No previous normalized snapshot exists in this fresh runtime.
+        path = package.data / "sunpack_config.json"
+        path.unlink()
+        path.mkdir()
+        code = 3
+    elif failure in {"worker", "worker_start"}:
+        # Remove only the isolated package's link, never the build output.
+        worker = package.launcher.parent.parent / "tools" / "sunpack_sevenzip_worker.exe"
+        worker.unlink()
+        if failure == "worker_start":
+            worker.write_bytes(b"not an executable")
+        code = 1
+    else:
+        args += ["-P", tmp_path / "absent-passwords.txt"]
+        code = 2
+    result = package.run(*args, "--json")
+    assert result.returncode == code, (result.stdout, result.stderr)
+    assert json.loads(result.stdout)["errors"]

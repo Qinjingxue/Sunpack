@@ -38,7 +38,8 @@ use std::fs;
 use std::future::poll_fn;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::task::{Poll, Waker};
 
@@ -53,9 +54,8 @@ impl std::ops::Deref for Engine {
 pub struct EngineState {
     worker_path: PathBuf,
     worker: Mutex<WorkerOwner>,
-    mode_changes: Mutex<()>,
+    mode_changes: super::AsyncGate,
     leases: Arc<Leases>,
-    next_job: AtomicU64,
     password_attempts: AttemptCache,
     scheduler: OnceLock<Arc<Scheduler>>,
     shell: ShellNotifier,
@@ -75,9 +75,8 @@ impl Engine {
                 process: None,
                 desired_mode: ProcessMode::Normal,
             }),
-            mode_changes: Mutex::new(()),
+            mode_changes: super::AsyncGate::default(),
             leases: Arc::new(Leases::default()),
-            next_job: AtomicU64::new(1),
             password_attempts: AttemptCache::default(),
             scheduler: OnceLock::new(),
             shell: ShellNotifier::default(),
@@ -85,55 +84,70 @@ impl Engine {
         }))
     }
 
+    fn next_id(&self) -> u64 {
+        self.scheduler.get_or_init(Scheduler::new).next_id()
+    }
+
+    pub(crate) fn with_scheduler(worker: PathBuf, scheduler: Arc<Scheduler>) -> Self {
+        let engine = Self::new(worker);
+        assert!(engine.scheduler.set(scheduler).is_ok());
+        engine
+    }
+
+    pub(crate) fn spawn_control<T: Send + 'static>(
+        &self, origin: Origin, cancel: &Cancellation,
+        future: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> super::scheduling::Join<T> {
+        let id = self.next_id();
+        self.scheduler.get_or_init(Scheduler::new).submit(id, origin, cancel, |_| Box::pin(future))
+    }
+
+    pub(crate) async fn reserve_foreground_async(
+        &self, inputs: &[PathBuf], cancel: &Cancellation,
+    ) -> io::Result<RequestClaimGuard> {
+        let id = self.next_id();
+        self.leases.reserve_request_async(id, Origin::Foreground, inputs, cancel).await
+    }
+
+    pub(crate) async fn run_reserved_async<O: Observer + 'static>(
+        &self, request: Request, observer: Arc<O>, reservation: Arc<RequestClaimGuard>,
+    ) -> io::Result<Outcome> {
+        debug_assert!(Arc::ptr_eq(&reservation.registry, &self.leases));
+        self.submit_with_claim(request, observer, Some(reservation), |result| result).wait().await
+    }
+
+    /// Synchronous service work uses the same admission and fixed executor as
+    /// archive stages. Nested blocking helpers reuse the admitted stage.
+    pub(crate) fn run_stage<T: Send>(
+        &self, name: &'static str, origin: Origin, work: impl FnOnce() -> T + Send,
+    ) -> T {
+        if super::scheduling::in_stage() { return work(); }
+        let cancel = Cancellation::new();
+        let id = self.next_id();
+        self.scheduler.get_or_init(Scheduler::new).run(id, origin, &cancel, |_| Box::pin(async {
+            stage(name, &cancel).await.expect("uncancelled service stage");
+            work()
+        }))
+    }
+
     pub fn run(&self, request: Request, notify: impl Fn(Event) + Send + Sync) -> io::Result<Outcome> {
         self.run_with(request, &notify)
     }
 
-    pub(crate) fn run_with(
-        &self,
-        request: Request,
-        observer: &impl Observer,
-    ) -> io::Result<Outcome> {
-        self.run_with_claim(request, observer, None)
-    }
-
-    pub(crate) fn reserve_foreground(
-        &self,
-        inputs: &[PathBuf],
-        cancel: &Cancellation,
-    ) -> io::Result<RequestClaimGuard> {
-        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
-        self.leases
-            .reserve_request(id, Origin::Foreground, inputs, cancel)
-    }
-
-    pub(crate) fn run_reserved(
-        &self,
-        request: Request,
-        observer: &impl Observer,
-        reservation: &RequestClaimGuard,
-    ) -> io::Result<Outcome> {
-        debug_assert!(Arc::ptr_eq(&reservation.registry, &self.leases));
-        self.run_with_claim(request, observer, Some(reservation))
-    }
-
-    fn run_with_claim(
+    fn run_with(
         &self,
         mut request: Request,
         observer: &impl Observer,
-        reservation: Option<&RequestClaimGuard>,
     ) -> io::Result<Outcome> {
         // main enters its shared pipeline service (including the handshake)
         // before admitting discovery or preflight work.
-        super::scheduling::block_on(self.worker(&request.config.performance.worker, &request.cancel))?;
+        super::scheduling::block_on(self.worker(&request.config.performance.worker, &request.cancel))
+            .map_err(super::startup_error)?;
         if let Some(output) = request.output_root.take() {
             request.output_root = Some(std::path::absolute(output)?);
         }
-        let request_id = reservation.map_or_else(
-            || self.next_job.fetch_add(1, Ordering::Relaxed),
-            |reservation| reservation.id,
-        );
-        let _request_claim = if reservation.is_none() && request.mode == Mode::Extract {
+        let request_id = self.next_id();
+        let _request_claim = if request.mode == Mode::Extract {
             Some(self.leases.reserve_request(
                 request_id,
                 request.origin,
@@ -169,21 +183,32 @@ impl Engine {
         &self, request: Request, observer: Arc<O>,
         complete: impl FnOnce(io::Result<Outcome>) -> T + Send + 'static,
     ) -> super::scheduling::Join<T> {
-        let request_id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        self.submit_with_claim(request, observer, None, complete)
+    }
+
+    fn submit_with_claim<O: Observer + 'static, T: Send + 'static>(
+        &self, request: Request, observer: Arc<O>, reservation: Option<Arc<RequestClaimGuard>>,
+        complete: impl FnOnce(io::Result<Outcome>) -> T + Send + 'static,
+    ) -> super::scheduling::Join<T> {
+        let request_id = reservation.as_ref().map_or_else(
+            || self.next_id(), |claim| claim.id);
         let engine = self.clone();
         self.scheduler.get_or_init(Scheduler::new).submit(
             request_id, request.origin, &request.cancel.clone(), move |spawner| {
                 Box::pin(async move {
                     let result = async {
-                    engine.worker(&request.config.performance.worker, &request.cancel).await?;
+                    engine.worker(&request.config.performance.worker, &request.cancel).await
+                        .map_err(super::startup_error)?;
                     stage("request_admission", &request.cancel).await?;
                     let mut request = request;
                     if let Some(output) = request.output_root.take() {
                         request.output_root = Some(std::path::absolute(output)?);
                     }
-                    let _claim = if request.mode == Mode::Extract {
-                        Some(engine.leases.reserve_request_async(request_id, request.origin,
-                            &request.inputs, &request.cancel).await?)
+                    let _claim = if reservation.is_some() {
+                        reservation
+                    } else if request.mode == Mode::Extract {
+                        Some(Arc::new(engine.leases.reserve_request_async(request_id, request.origin,
+                            &request.inputs, &request.cancel).await?))
                     } else { None };
                     stage("discovery", &request.cancel).await?;
                     let run = engine.prepare(request, ObserverRef::Owned(observer), request_id)?;
@@ -254,7 +279,12 @@ impl Engine {
             checkpoints,
             promoted_sources,
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
+            cleanup_tasks: Mutex::default(),
         }))
+    }
+
+    pub(crate) async fn worker_ready(&self, config: &WorkerConfig, cancel: &Cancellation) -> io::Result<()> {
+        self.worker(config, cancel).await.map(|_| ()).map_err(super::startup_error)
     }
 
     async fn worker(&self, config: &WorkerConfig, cancel: &Cancellation) -> io::Result<Arc<Process>> {
@@ -293,11 +323,15 @@ impl Engine {
     }
 
     pub(crate) fn set_process_mode(&self, mode: ProcessMode) -> io::Result<bool> {
+        super::scheduling::block_on(self.set_process_mode_async(mode))
+    }
+
+    pub(crate) async fn set_process_mode_async(&self, mode: ProcessMode) -> io::Result<bool> {
         // Serialize control acknowledgments, but never hold the ownership lock
         // while stdin or its ACK is pending: scheduled jobs need that lock to
         // borrow the live worker. A replacement starts with desired_mode even
         // if the old process exits during this transition.
-        let _change = self.mode_changes.lock().unwrap();
+        let _change = self.mode_changes.lock().await;
         let process = {
             let mut owner = self.worker.lock().unwrap();
             owner.desired_mode = mode;
@@ -307,7 +341,10 @@ impl Engine {
             }
             process
         };
-        process.map_or(Ok(false), |process| process.set_process_mode(mode))
+        match process {
+            Some(process) => process.set_process_mode_async(mode).await,
+            None => Ok(false),
+        }
     }
 
     pub(crate) fn clear_idle_passwords(&self) {
@@ -348,6 +385,12 @@ struct Run<'a, O> {
     checkpoints: HashMap<CheckpointKey, Vec<usize>>,
     promoted_sources: HashMap<String, usize>,
     scan_errors: Mutex<DirectoryReadErrors>,
+    cleanup_tasks: Mutex<Vec<PendingCleanup>>,
+}
+
+struct PendingCleanup {
+    paths: Vec<PathBuf>,
+    task: super::scheduling::Join<Outcome>,
 }
 
 /// One shared decision per depth, like main's prompt gates. Only the blocking
@@ -416,8 +459,10 @@ impl RecursivePrompts {
         })
     }
 
-    async fn allow(&self, depth: usize, pending: usize, cancel: &Cancellation,
-        inline: Option<&(dyn Fn(usize, usize) -> bool + Sync)>) -> bool {
+    async fn allow<F: std::future::Future<Output = bool> + Send>(
+        &self, depth: usize, pending: usize, cancel: &Cancellation,
+        inline: Option<impl FnOnce(usize, usize) -> F + Send>,
+    ) -> bool {
         if cancel.cancelled() {
             return false;
         }
@@ -432,7 +477,7 @@ impl RecursivePrompts {
         };
         if first {
             if let Some(prompt) = inline {
-                let allowed = stage("report", cancel).await.is_ok() && prompt(depth, pending);
+                let allowed = stage("report", cancel).await.is_ok() && prompt(depth, pending).await;
                 decision.complete(allowed);
             } else {
                 let request = Some((depth, pending, Arc::clone(&decision)));
@@ -888,6 +933,7 @@ impl CreatedOutputs {
 }
 
 struct Executed {
+    planned_output: Option<PathBuf>,
     result: ArchiveResult,
     inventory: Option<NativeOutputInventory>,
     input: ArchiveInput,
@@ -913,6 +959,14 @@ impl<'run, O: Observer> Run<'run, O> {
     }
 
     async fn finish(&self, mut executed: io::Result<Outcome>) -> io::Result<Outcome> {
+        // Drain background releases before request completion and rollback,
+        // without retaining the archive consumer while cleanup runs.
+        let mut cleanup = Outcome::default();
+        self.drain_cleanup(None, &mut cleanup).await;
+        if let Ok(outcome) = &mut executed {
+            outcome.cleanup_results.append(&mut cleanup.cleanup_results);
+            outcome.errors.append(&mut cleanup.errors);
+        }
         // Scheduler completion joins every writer, even on cancellation. Never
         // roll back a tree while a native job or recursive branch can write it.
         if self.request.cancel.cancelled() {
@@ -940,6 +994,25 @@ impl<'run, O: Observer> Run<'run, O> {
                 }),
         );
         Ok(outcome)
+    }
+
+    async fn drain_cleanup(&self, root: Option<&Path>, outcome: &mut Outcome) {
+        let pending = {
+            let mut tasks = self.cleanup_tasks.lock().unwrap();
+            let mut selected = Vec::new();
+            let mut index = 0;
+            while index < tasks.len() {
+                if root.is_none_or(|root| tasks[index].paths.iter().any(|path| relative_to(path, root).is_some())) {
+                    selected.push(tasks.swap_remove(index));
+                } else { index += 1; }
+            }
+            selected
+        };
+        for pending in pending {
+            let mut cleanup = pending.task.wait().await;
+            outcome.cleanup_results.append(&mut cleanup.cleanup_results);
+            outcome.errors.append(&mut cleanup.errors);
+        }
     }
 
     fn filtered_options(&self) -> io::Result<&NativeDirectoryScanOptions> {
@@ -1046,7 +1119,7 @@ impl<'run, O: Observer> Run<'run, O> {
         parent: Option<TaskId>,
         segment: Option<Segment>,
     ) -> TaskId {
-        let id = self.engine.next_job.fetch_add(1, Ordering::Relaxed);
+        let id = self.engine.next_id();
         self.observer.notify(Event::Queued {
             id,
             parent,
@@ -1114,6 +1187,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     this.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth, &candidates)
                 })
                 .collect();
+            let mut split_input = task.entry().mode.structured() || task.entry().physical_paths().nth(1).is_some();
             let multi = task.inputs.len() > 1;
             let count = task.inputs.len();
             let ids: Vec<_> = task
@@ -1128,6 +1202,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             depth,
                             Some(task_id),
                             Some(Segment {
+                                format: logical.input.format_hint.clone(),
                                 index: index + 1,
                                 count,
                                 offset: extent.map_or(0, |extent| extent.start),
@@ -1212,14 +1287,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         && this.request.config.extraction.content_requirement
                             == ContentRequirement::Complete
                     {
-                        let output = checkpoint.output();
-                        shell.parent(output);
-                        this.discard_failed_output(&result, output, &mut outcome)?;
-                        result.output = None;
+                        // Apply physical retention after sibling aggregation.
                         result.partial = false;
-                        result.files = 0;
-                        result.bytes = 0;
-                        result.recovered_complete_files = 0;
                     }
                     let inventory = if children_already_complete || (result.failure.is_some() && !result.partial) {
                         None
@@ -1230,6 +1299,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             .map(|path| scan_output_inventory_impl(&path.to_string_lossy()))
                     };
                     Executed {
+                        planned_output: result.output.clone(),
                         input,
                         result,
                         inventory,
@@ -1241,6 +1311,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         task.source,
                         depth,
                         carrier.as_deref(),
+                        None,
                         &candidates,
                         &mut shell,
                         &mut outcome,
@@ -1268,52 +1339,60 @@ impl<'run, O: Observer> Run<'run, O> {
                         // Main replaces the whole single-input extraction only
                         // after resolving a usable physical family. Until then,
                         // its damaged payload remains available for recovery.
-                        if let Some(output) = executed.result.output.as_deref() {
-                            this.discard_failed_output(&executed.result, output, &mut outcome)?;
+                        let retry_output = executed.planned_output.clone();
+                        let cleaned = match retry_output.as_deref() {
+                            Some(output) => this.discard_failed_output(&executed.result, output, &mut outcome)?,
+                            None => true,
+                        };
+                        if cleaned {
                             executed.result.output = None;
-                        }
-                        this.observer.after_output(&executed.result)?;
-                        drop(lease);
-                        lease = this.claim_task(&replacement).await?;
-                        stage("preflight", cancel).await?;
-                        generations = this.capture_generations(&replacement);
-                        if watch_root && !this.should_process_watch(&replacement, &generations)? {
-                            this.observer.notify(Event::Skipped { id: task_id });
-                            return Ok(outcome);
-                        }
-                        this.observer.claim_sources(
-                            Path::new(&replacement.entry().entry_path),
-                            &replacement.owned_paths,
-                            depth,
-                        )?;
-                        attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
-                            replacement
-                                .entry()
-                                .physical_paths()
-                                .map(path_key)
-                                .collect::<Vec<_>>()
-                        });
-                        promotion_sources = std::mem::take(&mut replacement.owned_paths);
-                        let logical = replacement
-                            .inputs
-                            .into_iter()
-                            .next()
-                            .expect("volume retry has one logical input");
-                        executed = this
-                            .execute_input(
-                                logical,
-                                id,
-                                replacement.source,
+                            this.observer.after_output(&executed.result)?;
+                            drop(lease);
+                            lease = this.claim_task(&replacement).await?;
+                            stage("preflight", cancel).await?;
+                            generations = this.capture_generations(&replacement);
+                            if watch_root && !this.should_process_watch(&replacement, &generations)? {
+                                this.observer.notify(Event::Skipped { id: task_id });
+                                return Ok(outcome);
+                            }
+                            this.observer.claim_sources(
+                                Path::new(&replacement.entry().entry_path),
+                                &replacement.owned_paths,
                                 depth,
-                                None,
-                                &candidates,
-                                &mut shell,
-                                &mut outcome,
-                            )
-                            .await?;
+                            )?;
+                            attempted = replacement.entry().volume_attempts.as_ref().map(|_| {
+                                replacement
+                                    .entry()
+                                    .physical_paths()
+                                    .map(path_key)
+                                    .collect::<Vec<_>>()
+                            });
+                            split_input = replacement.entry().mode.structured()
+                                || replacement.entry().physical_paths().nth(1).is_some();
+                            promotion_sources = std::mem::take(&mut replacement.owned_paths);
+                            let logical = replacement
+                                .inputs
+                                .into_iter()
+                                .next()
+                                .expect("volume retry has one logical input");
+                            executed = this
+                                .execute_input(
+                                    logical,
+                                    id,
+                                    replacement.source,
+                                    depth,
+                                    None,
+                                    retry_output.as_deref(),
+                                    &candidates,
+                                    &mut shell,
+                                    &mut outcome,
+                                )
+                                .await?;
+                        }
                     }
                 }
                 let Executed {
+                    planned_output: _,
                     mut result,
                     inventory,
                     mut input,
@@ -1344,6 +1423,24 @@ impl<'run, O: Observer> Run<'run, O> {
                     });
                 }
                 parent_outputs.push((result, inventory, input, id, children_already_complete, remaining_depth));
+            }
+            // Main retains best-effort bytes per input before applying the
+            // physical carrier's content policy. A complete sibling keeps
+            // failed siblings' salvage, without accepting them for recursion.
+            if this.request.config.extraction.content_requirement == ContentRequirement::Complete
+                && !parent_outputs.iter().any(|(result, ..)| result.failure.is_none())
+            {
+                for (result, inventory, ..) in &mut parent_outputs {
+                    if let Some(output) = result.output.clone() {
+                        if this.discard_failed_output(result, &output, &mut outcome)? {
+                            result.output = None;
+                            result.files = 0;
+                            result.bytes = 0;
+                            result.recovered_complete_files = 0;
+                        }
+                    }
+                    *inventory = None;
+                }
             }
             // Finish every logical parent before prompting or descending into
             // any segment. Independent output trees share the existing request
@@ -1410,6 +1507,8 @@ impl<'run, O: Observer> Run<'run, O> {
                     && !cancel.cancelled()
                 {
                     if let Some(output) = result.output.as_deref() {
+                        this.drain_cleanup(Some(output), &mut descendants).await;
+                        stage("postprocess", cancel).await?;
                         if remove_empty_or_promoted(output, &descendants.removed_promotion_dirs) {
                             this.observer.discard_output(&result, output)?;
                             result.output = None;
@@ -1425,6 +1524,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     && children_complete
                     && !cancel.cancelled()
                 {
+                    if let Some(output) = result.output.as_deref() {
+                        this.drain_cleanup(Some(output), &mut descendants).await;
+                    }
                     stage("postprocess", cancel).await?;
                     flatten_result(
                         &*this.observer, &mut result, &mut descendants, Some(&this.created_outputs),
@@ -1573,70 +1675,48 @@ impl<'run, O: Observer> Run<'run, O> {
                         .map(|source| (path, source))
                 })
                 .collect();
-            if sources_complete && this.request.mode == Mode::Extract
-                && stage("source_cleanup", cancel).await.is_ok()
-            {
+            if sources_complete && this.request.mode == Mode::Extract {
                 if watch_root && complete {
+                    stage("output_state", &Cancellation::new()).await?;
                     this.observer.sources_processed(&completed, &generations)?;
                 }
-                let mode = if depth > 1 {
-                    CleanupMode::Delete
-                } else {
-                    this.request.config.post_extract.archive_cleanup_mode
-                };
-                if let Some(first) = completed.first_mut() {
-                    if admitted_promoted.is_empty() || mode == CleanupMode::Delete {
-                        if mode != CleanupMode::Keep {
-                            let mut selected: Vec<_> =
-                                promotion_sources.iter().map(PathBuf::from).collect();
-                            dedup_paths(&mut selected);
-                            this.cleanup_sources(
-                                first,
-                                &selected,
-                                &generations,
-                                mode,
-                                &mut outcome,
-                                &mut shell,
-                            )?;
-                        }
-                    } else {
-                        let mut generated: Vec<_> = admitted_promoted
-                            .iter()
-                            .map(|(path, _)| PathBuf::from(path))
-                            .collect();
-                        dedup_paths(&mut generated);
-                        if mode != CleanupMode::Keep {
-                            let generated_keys: HashSet<_> =
-                                admitted_promoted.iter().map(|(path, _)| *path).collect();
-                            let mut originals: Vec<_> = promotion_sources
-                                .iter()
-                                .filter(|path| !generated_keys.contains(path))
-                                .map(PathBuf::from)
-                                .collect();
-                            dedup_paths(&mut originals);
-                            this.cleanup_sources(
-                                first,
-                                &originals,
-                                &generations,
-                                mode,
-                                &mut outcome,
-                                &mut shell,
-                            )?;
-                        }
-                        this.cleanup_sources(
-                            first,
-                            &generated,
-                            &generations,
-                            CleanupMode::Delete,
-                            &mut outcome,
-                            &mut shell,
-                        )?;
+                let mode = if depth > 1 { CleanupMode::Delete }
+                    else { this.request.config.post_extract.archive_cleanup_mode };
+                let generated: HashSet<_> = admitted_promoted.iter().map(|(path, _)| (*path).clone()).collect();
+                let mut deletes = Vec::new();
+                let mut recycles = Vec::new();
+                for path in &promotion_sources {
+                    if mode == CleanupMode::Delete || generated.contains(path) {
+                        deletes.push(PathBuf::from(path));
+                    } else if mode == CleanupMode::Recycle {
+                        recycles.push(PathBuf::from(path));
                     }
                 }
+                dedup_paths(&mut deletes);
+                dedup_paths(&mut recycles);
+                let paths = deletes.iter().chain(&recycles).cloned().collect();
+                let cleanup = Arc::clone(&this);
+                let task = spawner.spawn(Box::pin(async move {
+                    // The family lease outlives its archive consumer, until the
+                    // background deletion/recycle has released its sources.
+                    let _lease = lease;
+                    let mut outcome = Outcome::default();
+                    if deletes.is_empty() && recycles.is_empty() { return outcome; }
+                    if stage("background_source_cleanup", &cleanup.request.cancel).await.is_err() {
+                        return outcome;
+                    }
+                    let mut shell = cleanup.engine.shell.branch();
+                    cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut outcome, &mut shell);
+                    cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut outcome, &mut shell);
+                    outcome
+                }));
+                this.cleanup_tasks.lock().unwrap().push(PendingCleanup { paths, task });
             } else {
-                outcome
-                    .promoted_sources
-                    .extend(admitted_promoted.into_iter().map(|(_, source)| source));
+                outcome.promoted_sources.extend(admitted_promoted.into_iter().map(|(_, source)| source));
+                drop(lease);
+            }
+            if this.request.mode == Mode::Extract {
+                project_possible_missing_volume(&mut completed, split_input);
             }
             if let Some(result) = completed.first() {
                 this.observer.notify(Event::Finished {
@@ -1662,7 +1742,6 @@ impl<'run, O: Observer> Run<'run, O> {
                 .cleanup_results
                 .append(&mut children.cleanup_results);
             outcome.uncommitted = !outputs_committed || children.uncommitted;
-            drop(lease);
             if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
                 outcome.archives = this
                     .observer
@@ -1889,7 +1968,7 @@ impl<'run, O: Observer> Run<'run, O> {
             })
     }
 
-    async fn claim_task(&self, task: &Task) -> io::Result<Lease<'_>> {
+    async fn claim_task(&self, task: &Task) -> io::Result<Lease> {
         let keys = task
             .owned_paths
             .iter()
@@ -2005,6 +2084,7 @@ impl<'run, O: Observer> Run<'run, O> {
         source: DiscoverySource,
         depth: usize,
         carrier: Option<&Path>,
+        retry_output: Option<&Path>,
         candidates: &CandidateSet,
         shell: &mut ShellUpdates<'_>,
         outcome: &mut Outcome,
@@ -2019,6 +2099,7 @@ impl<'run, O: Observer> Run<'run, O> {
         if let Some(failure) = failure {
             result.failure = Some(failure);
             return Ok(Executed {
+                planned_output: None,
                 result,
                 inventory: None,
                 input,
@@ -2026,7 +2107,7 @@ impl<'run, O: Observer> Run<'run, O> {
         }
         if self.request.cancel.cancelled() {
             result.failure = Some(Failure::new(FailureKind::Cancelled, "Operation interrupted"));
-            return Ok(Executed { result, inventory: None, input });
+            return Ok(Executed { planned_output: None, result, inventory: None, input });
         }
         stage("preflight", &self.request.cancel).await?;
         let plan = match candidates.plan(&input, password, &self.request.cancel) {
@@ -2034,6 +2115,7 @@ impl<'run, O: Observer> Run<'run, O> {
             Ok(Err(failure)) => {
                 result.failure = Some(failure);
                 return Ok(Executed {
+                    planned_output: None,
                     result,
                     inventory: None,
                     input,
@@ -2048,6 +2130,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     },
                 );
                 return Ok(Executed {
+                    planned_output: None,
                     result,
                     inventory: None,
                     input,
@@ -2069,7 +2152,14 @@ impl<'run, O: Observer> Run<'run, O> {
                 || self.preferred_output(&input, depth),
                 |root| root.join(archive_name(&input)),
             );
-            match self.reserve_output(preferred, &result, carrier)? {
+            let reserved = if let Some(path) = retry_output {
+                // Hold the original claim across replacement and recreate
+                // main's fixed out_dir, rather than a numbered sibling.
+                self.recreate_reserved_output(path, &result)?
+            } else {
+                self.reserve_output(preferred, &result, carrier)?
+            };
+            match reserved {
                 Ok(path) => {
                     shell.output(&path);
                     Some(path)
@@ -2077,6 +2167,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 Err(failure) => {
                     result.failure = Some(failure);
                     return Ok(Executed {
+                    planned_output: None,
                         result,
                         inventory: None,
                         input,
@@ -2089,7 +2180,7 @@ impl<'run, O: Observer> Run<'run, O> {
         let job_id = format!(
             "{}:{}",
             std::process::id(),
-            self.engine.next_job.fetch_add(1, Ordering::Relaxed)
+            self.engine.next_id()
         );
         let output_string = output
             .as_ref()
@@ -2225,9 +2316,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     {
                         plan.remember_rejections(&self.engine.password_attempts);
                     }
-                    if self.request.config.extraction.content_requirement
-                        == ContentRequirement::AllowPartial
-                        && failure.kind != FailureKind::PasswordInconclusive
+                    if failure.kind != FailureKind::PasswordInconclusive
                         && recoverable_content_failure(&frame)
                     {
                         if let Some(output) = &output {
@@ -2237,7 +2326,10 @@ impl<'run, O: Observer> Run<'run, O> {
                             // main keeps nonempty failed output for manual recovery,
                             // but only verified files authorize recursive processing.
                             if verified_files > 0 || stats.file_count() > 0 {
-                                result.partial = verified_files > 0;
+                                result.partial = accepts_partial_content(
+                                    self.request.config.extraction.content_requirement,
+                                    failure.kind, verified_files,
+                                );
                                 result.files = stats.file_count() as u64;
                                 result.recovered_complete_files = verified_files as u64;
                                 result.bytes = stats.total_size();
@@ -2255,11 +2347,12 @@ impl<'run, O: Observer> Run<'run, O> {
             Err(error) => result.failure = Some(self.process_or_file_failure(error, true)),
         }
         if result.failure.is_some() && result.output.is_none() {
-            if let Some(path) = output {
-                self.discard_failed_output(&result, &path, outcome)?;
+            if let Some(path) = &output {
+                self.discard_failed_output(&result, path, outcome)?;
             }
         }
         Ok(Executed {
+            planned_output: output,
             result,
             inventory,
             input,
@@ -2268,18 +2361,18 @@ impl<'run, O: Observer> Run<'run, O> {
 
     fn discard_failed_output(
         &self, result: &ArchiveResult, path: &Path, outcome: &mut Outcome,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if let Err(error) = cleanup_owned_output(path) {
             // Physical deletion is local to this failed archive. Keep its
             // durable guard, but do not discard the other logical results.
             record_cleanup(outcome, path, "delete", Err(error));
-            return Ok(());
+            return Ok(false);
         }
         self.observer.discard_output(result, path)?;
         // No recursive children have started for this worker's failed output.
         // Retire ownership only after both deletion and journal update succeed.
         self.created_outputs.lock().unwrap().commit(path);
-        Ok(())
+        Ok(true)
     }
 
     fn process_or_file_failure(&self, error: io::Error, worker: bool) -> Failure {
@@ -2328,9 +2421,8 @@ impl<'run, O: Observer> Run<'run, O> {
         if self.request.config.recursive_extract != Recursion::Prompt {
             return true;
         }
-        let prompt = |depth, pending| self.observer.allow_recursive(depth, pending);
         let inline = matches!(self.observer, ObserverRef::Owned(_))
-            .then_some(&prompt as &(dyn Fn(usize, usize) -> bool + Sync));
+            .then_some(|depth, pending| self.observer.allow_recursive_async(depth, pending));
         self.recursion.allow(depth, pending, &self.request.cancel, inline).await
     }
 
@@ -2355,6 +2447,19 @@ impl<'run, O: Observer> Run<'run, O> {
         root.join(archive_name(input))
     }
 
+    fn recreate_reserved_output(&self, path: &Path, result: &ArchiveResult) -> io::Result<Result<PathBuf, Failure>> {
+        match self.observer.register_output(result, path) {
+            Ok(()) => {
+                self.created_outputs.lock().unwrap().register(path, result);
+                Ok(Ok(path.to_owned()))
+            }
+            Err(error) if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) => {
+                Ok(Err(file_failure(error)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn reserve_output(
         &self,
         preferred: PathBuf,
@@ -2374,13 +2479,12 @@ impl<'run, O: Observer> Run<'run, O> {
 
     fn cleanup_sources(
         &self,
-        result: &mut ArchiveResult,
         paths: &[PathBuf],
         generations: &HashMap<String, PhysicalFileGeneration>,
         cleanup: CleanupMode,
         outcome: &mut Outcome,
         shell: &mut ShellUpdates<'_>,
-    ) -> io::Result<()> {
+    ) {
         let mode = match cleanup {
             CleanupMode::Keep => unreachable!("keep needs no source cleanup"),
             CleanupMode::Delete => "delete",
@@ -2403,20 +2507,23 @@ impl<'run, O: Observer> Run<'run, O> {
             }
         }
         if valid.is_empty() {
-            return Ok(());
+            return;
         }
         let keys = valid
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
-        let _promotion = Promotion::begin(keys)?;
-        let old = std::mem::replace(
-            &mut result.source_paths,
-            valid.iter().map(|path| (*path).clone()).collect(),
-        );
-        let publish = self.observer.before_cleanup(result);
-        result.source_paths = old;
-        publish?;
+        let _promotion = match Promotion::begin(keys) {
+            Ok(promotion) => promotion,
+            Err(error) => {
+                for path in valid {
+                    let copy = error.raw_os_error().map(io::Error::from_raw_os_error)
+                        .unwrap_or_else(|| io::Error::new(error.kind(), error.to_string()));
+                    record_cleanup(outcome, path, mode, Err(copy));
+                }
+                return;
+            }
+        };
         for path in valid {
             let removed = match cleanup {
                 CleanupMode::Delete => remove_owned_file(path),
@@ -2428,7 +2535,6 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             record_cleanup(outcome, path, mode, removed);
         }
-        Ok(())
     }
 }
 
@@ -2601,6 +2707,8 @@ fn worker_evidence(
     let stderr_tail = field("stderr_tail");
     let stage = field("failure_stage");
     let native_kind = field("failure_kind");
+    let missing_volume_suspected = flag(result, "missing_volume_suspected")
+        || flag(diagnostics, "missing_volume_suspected");
     let missing_volume_name = field("missing_volume_name");
     let missing_volume_evidence = field("missing_volume_evidence");
     let input = diagnostics
@@ -2619,7 +2727,7 @@ fn worker_evidence(
         read_error,
     });
     let recovery = recovery.filter(|preview| !preview.files.is_empty());
-    (stderr_tail.is_some()
+    (missing_volume_suspected || stderr_tail.is_some()
         || stage.is_some()
         || native_kind.is_some()
         || missing_volume_name.is_some()
@@ -2628,6 +2736,7 @@ fn worker_evidence(
         || recovery.is_some())
     .then(|| {
         Box::new(FailureEvidence {
+            missing_volume_suspected,
             stderr_tail,
             stage,
             native_kind,
@@ -2728,6 +2837,34 @@ fn classify_worker_failure(
     classified.password_retry = kind == FailureKind::PasswordInconclusive
         && failure == "password_or_volume_inconclusive";
     classified
+}
+
+// Report the carrier-level warning without rewriting failure categories used
+// by password blockers and recovery. Main retains those causes under its
+// extraction_report wrapper too.
+fn project_possible_missing_volume(results: &mut [ArchiveResult], split: bool) {
+    let confirmed = results.iter().any(|result| result.failure.as_ref()
+        .is_some_and(|failure| failure.kind == FailureKind::MissingVolume));
+    let partial = results.iter().any(|result| result.partial)
+        && results.iter().all(|result| result.failure.is_none() || result.partial);
+    let suspected = results.iter().filter_map(|result| result.failure.as_ref())
+        .filter_map(|failure| failure.evidence.as_deref())
+        .any(|evidence| evidence.missing_volume_suspected
+            || evidence.archive_read_fault.as_ref().is_some_and(|fault| fault.possible_missing_volume));
+    let warning = split && !confirmed && (partial || suspected);
+    for failure in results.iter_mut().filter_map(|result| result.failure.as_mut()) {
+        if warning {
+            failure.evidence.get_or_insert_with(Default::default).possible_missing_volume = true;
+        } else if let Some(evidence) = &mut failure.evidence {
+            evidence.possible_missing_volume = false;
+        }
+    }
+}
+
+fn accepts_partial_content(requirement: ContentRequirement, failure: FailureKind, complete_files: usize) -> bool {
+    requirement == ContentRequirement::AllowPartial
+        && matches!(failure, FailureKind::Damaged | FailureKind::MissingVolume)
+        && complete_files > 0
 }
 
 fn recoverable_content_failure(frame: &WorkerFrame) -> bool {
@@ -3182,8 +3319,8 @@ impl Drop for RequestClaimGuard {
     }
 }
 
-struct Lease<'a> {
-    owner: &'a Leases,
+struct Lease {
+    owner: Arc<Leases>,
     keys: HashSet<String>,
 }
 
@@ -3286,7 +3423,7 @@ impl Leases {
         self: &Arc<Self>,
         keys: HashSet<String>,
         cancel: &Cancellation,
-    ) -> io::Result<Lease<'_>> {
+    ) -> io::Result<Lease> {
         let mut waiting = LeaseWait {
             owner: self,
             id: None,
@@ -3319,7 +3456,7 @@ impl Leases {
             Poll::Pending
         })
         .await?;
-        Ok(Lease { owner: self, keys })
+        Ok(Lease { owner: Arc::clone(self), keys })
     }
 }
 
@@ -3340,7 +3477,7 @@ impl Drop for LeaseWait<'_> {
     }
 }
 
-impl Drop for Lease<'_> {
+impl Drop for Lease {
     fn drop(&mut self) {
         let mut state = self.owner.state.lock().unwrap();
         let active = &mut state.active;
@@ -3718,7 +3855,7 @@ mod tests {
             let mut shell = engine.shell.branch();
             let mut outcome = Outcome::default();
             let mut future = Box::pin(run.execute_input(logical, 1, DiscoverySource::Embedded,
-                1, None, &run.candidates, &mut shell, &mut outcome));
+                1, None, None, &run.candidates, &mut shell, &mut outcome));
             let waker = Waker::from(Arc::new(NoWake));
             let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) else {
                 panic!("preflight failure started worker execution");
@@ -3751,6 +3888,7 @@ mod tests {
             checkpoints: HashMap::new(),
             promoted_sources: HashMap::new(),
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
+            cleanup_tasks: Mutex::default(),
         })
     }
 
@@ -3886,6 +4024,76 @@ mod tests {
             fs::remove_file(source).unwrap();
           }
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn source_cleanup_runs_after_consumer_finish_and_is_joined_by_request() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for locked in [false, true] {
+        let source = crate::test_support::temp_file("background_source_cleanup", b"archive");
+        let held = locked.then(|| fs::OpenOptions::new().read(true).share_mode(1).open(&source).unwrap());
+        let output = source.with_extension("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("payload"), b"keep").unwrap();
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), output.file_name().unwrap().to_string_lossy().into_owned());
+        let generations = HashMap::from([(path_key(&input.entry_path), capture_file_generation(&source).unwrap())]);
+        let mut request = Request::new(vec![source.clone()], Mode::Extract);
+        request.max_depth = 0;
+        let config = Arc::make_mut(&mut request.config);
+        config.post_extract.archive_cleanup_mode = CleanupMode::Delete;
+        config.post_extract.flatten_single_directory = false;
+        let mut result = receipt(&input, DiscoverySource::Embedded, 1);
+        result.output = Some(output.clone());
+        result.files = 1;
+        request.checkpoints.push(InputCheckpoint::create(&source, &input, &result, &generations, None, true, 1).unwrap());
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        let observer = |event| {
+            if matches!(event, Event::Finished { .. }) {
+                assert!(source.exists(), "consumer waited for source cleanup before reporting completion");
+                finished.store(true, Ordering::Release);
+            }
+        };
+        let mut run = test_run(&engine, &request, &observer);
+        for (index, checkpoint) in request.checkpoints.iter().enumerate() {
+            Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+        }
+        let task = Task {
+            primary: None, inputs: vec![LogicalInput { input, password: None, failure: None }],
+            owned_paths: vec![source.to_string_lossy().into_owned()], source: DiscoverySource::Embedded, retry: None,
+        };
+        let scheduler = Scheduler::new();
+        scheduler.configure_capacity(1);
+        let outcome = scheduler.run(1, Origin::Foreground, &request.cancel, |spawner| Box::pin(async {
+            let outcome = run.execute_task(task, 1, 1, None, spawner).await;
+            run.finish(outcome).await
+        })).unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(source.exists(), locked, "request returned before background cleanup settled");
+        assert_eq!(outcome.cleanup_results.len(), usize::from(locked));
+        assert_eq!(outcome.errors.iter().filter(|error| error.kind == InputErrorKind::Cleanup).count(), usize::from(locked));
+        assert_eq!(fs::read(output.join("payload")).unwrap(), b"keep");
+        drop(held);
+        if locked { fs::remove_file(source).unwrap(); }
+        fs::remove_dir_all(output).unwrap();
+        }
+    }
+
+    #[test]
+    fn synchronous_service_work_reuses_shared_stage_and_nested_admission() {
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let scheduler = engine.scheduler.get_or_init(Scheduler::new);
+        scheduler.configure_capacity(1);
+        let value = engine.run_stage("watch_admission", Origin::Watch, || {
+            assert!(crate::pipeline::scheduling::in_stage());
+            engine.run_stage("watch_usn_checkpoint", Origin::Watch, || {
+                assert!(crate::pipeline::scheduling::in_stage());
+                42
+            })
+        });
+        assert_eq!(value, 42);
+        assert!(!crate::pipeline::scheduling::in_stage());
     }
 
     #[test]
@@ -4269,7 +4477,7 @@ mod tests {
                             let finished = &finished;
                             Box::pin(async move {
                                 let results = spawner.bounded_map(vec![(); 8], move |_| {
-                                    Box::pin(prompts.allow(2, 1, cancel, None))
+                                    Box::pin(prompts.allow(2, 1, cancel, None::<fn(usize, usize) -> std::future::Ready<bool>>))
                                 }).await;
                                 finished.send(()).unwrap();
                                 results
@@ -4650,7 +4858,134 @@ mod tests {
     }
 
     #[test]
-    fn partial_recovery_uses_native_content_stage_not_high_level_kind() {
+    #[cfg(windows)]
+    fn complete_carrier_keeps_salvage_only_with_a_complete_sibling() {
+        for complete_sibling in [false, true] {
+            let source = crate::test_support::temp_file("carrier_salvage", &[0; 16]);
+            let container = source.with_extension("output");
+            fs::create_dir(&container).unwrap();
+            let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(),
+                container.file_name().unwrap().to_string_lossy().into_owned());
+            let inputs: Vec<_> = archive_input_slices(&input, &[
+                ("zip", 0, Some(8)), ("zip", 8, Some(16)),
+            ]).unwrap().0.into_iter().map(Option::unwrap).collect();
+            let generations = HashMap::from([
+                (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
+            ]);
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let mut request = Request::new(vec![source.clone()], Mode::Extract);
+            request.max_depth = 0;
+            Arc::make_mut(&mut request.config).extraction.content_requirement = ContentRequirement::Complete;
+            Arc::make_mut(&mut request.config).post_extract.archive_cleanup_mode = CleanupMode::Keep;
+            for (index, input) in inputs.iter().enumerate() {
+                let output = container.join(format!("segment-{index}"));
+                fs::create_dir(&output).unwrap();
+                fs::write(output.join("payload"), b"keep").unwrap();
+                let mut result = receipt(input, DiscoverySource::Embedded, 1);
+                result.output = Some(output);
+                result.files = 1;
+                result.bytes = 4;
+                if index != 0 || !complete_sibling {
+                    result.partial = true;
+                    result.recovered_complete_files = 1;
+                    result.failure = Some(Failure::new(FailureKind::Damaged, "CRC error"));
+                }
+                request.checkpoints.push(InputCheckpoint::create(
+                    &source, input, &result, &generations, Some(&container), true, 0,
+                ).unwrap());
+            }
+            let observer = |_: Event| {};
+            let mut run = test_run(&engine, &request, &observer);
+            for (index, checkpoint) in request.checkpoints.iter().enumerate() {
+                Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+            }
+            let task = Task {
+                primary: None,
+                inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
+                owned_paths: vec![source.to_string_lossy().into_owned()],
+                source: DiscoverySource::Embedded,
+                retry: None,
+            };
+            let outcome = Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
+                run.execute_task(task, 1, 1, None, spawner)
+            }).unwrap();
+            assert_eq!(outcome.archives.len(), 2);
+            assert_eq!(outcome.failed(), if complete_sibling { 1 } else { 2 });
+            assert!(outcome.archives.iter().all(|result| !result.partial));
+            assert!(source.is_file());
+            for index in 0..2 {
+                assert_eq!(container.join(format!("segment-{index}/payload")).is_file(), complete_sibling);
+            }
+            release_reader_resources_under_roots(vec![container.to_string_lossy().into_owned()]).unwrap();
+            if container.exists() { fs::remove_dir_all(container).unwrap(); }
+            fs::remove_file(source).unwrap();
+        }
+    }
+
+    #[test]
+    fn split_recovery_warning_preserves_original_failure_and_confirmation() {
+        let input = ArchiveInput::file("split.zip.001".into(), "zip".into(), "split".into());
+        for (split, partial, kind, suspected, expected) in [
+            (true, true, FailureKind::Damaged, false, true),
+            (true, false, FailureKind::Damaged, true, true),
+            (true, false, FailureKind::Damaged, false, false),
+            (false, true, FailureKind::Damaged, true, false),
+            (true, true, FailureKind::MissingVolume, true, false),
+            (true, false, FailureKind::WrongPassword, false, false),
+        ] {
+            let mut result = receipt(&input, DiscoverySource::Direct, 1);
+            result.partial = partial;
+            let mut failure = Failure::new(kind, "native cause");
+            failure.evidence = worker_evidence(&json!({"missing_volume_suspected": suspected}), None);
+            result.failure = Some(failure);
+            project_possible_missing_volume(std::slice::from_mut(&mut result), split);
+            let failure = result.failure.unwrap();
+            assert_eq!(failure.kind, kind);
+            assert_eq!(failure.evidence.as_ref().is_some_and(|e| e.possible_missing_volume), expected);
+            let restored: Failure = serde_json::from_value(serde_json::to_value(failure).unwrap()).unwrap();
+            assert_eq!(restored.evidence.as_ref().is_some_and(|e| e.possible_missing_volume), expected);
+        }
+        // One confirmed missing-volume cause suppresses a speculative carrier
+        // warning, even when another independently recovered segment is damaged.
+        let mut first = receipt(&input, DiscoverySource::Direct, 1);
+        first.partial = true;
+        first.failure = Some(Failure::new(FailureKind::Damaged, "CRC"));
+        let mut second = receipt(&input, DiscoverySource::Direct, 1);
+        second.partial = true;
+        second.failure = Some(Failure::new(FailureKind::MissingVolume, "part2"));
+        let mut results = [first, second];
+        project_possible_missing_volume(&mut results, true);
+        assert!(results.iter().all(|r| !r.failure.as_ref().unwrap().evidence.as_ref()
+            .is_some_and(|e| e.possible_missing_volume)));
+    }
+
+    #[test]
+    fn replacement_recreates_the_original_numbered_reservation() {
+        let source = crate::test_support::temp_file("replacement_output", b"source");
+        let preferred = source.with_extension("output");
+        fs::create_dir(&preferred).unwrap();
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        let result = receipt(&input, DiscoverySource::Direct, 1);
+        let request = Request::new(vec![source.clone()], Mode::Extract);
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let observer = |_: Event| {};
+        let run = test_run(&engine, &request, &observer);
+        let output = run.reserve_output(preferred.clone(), &result, None).unwrap().unwrap();
+        assert_ne!(output, preferred);
+        fs::write(output.join("old"), b"payload").unwrap();
+        assert!(run.discard_failed_output(&result, &output, &mut Outcome::default()).unwrap());
+        let recreated = run.recreate_reserved_output(&output, &result).unwrap().unwrap();
+        assert_eq!(recreated, output);
+        assert!(output.is_dir());
+        assert!(!output.join("old").exists());
+        assert!(run.output_names.registry.lock().unwrap().claimed.contains_key(&output_key(&output)));
+        fs::remove_dir(output).unwrap();
+        fs::remove_dir(preferred).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn retained_payload_does_not_authorize_partial_success() {
         for (kind, stage, expected) in [
             ("unsupported_method", "item_extract", true),
             ("data_error", "", true),
@@ -4666,6 +5001,13 @@ mod tests {
             });
             assert_eq!(recoverable_content_failure(&frame), expected);
             assert_eq!(recoverable_file_count(&frame), if expected { 2 } else { 0 });
+        }
+        for kind in [FailureKind::Damaged, FailureKind::MissingVolume,
+            FailureKind::WrongPassword, FailureKind::Unsupported, FailureKind::PasswordInconclusive] {
+            assert_eq!(accepts_partial_content(ContentRequirement::AllowPartial, kind, 2),
+                matches!(kind, FailureKind::Damaged | FailureKind::MissingVolume));
+            assert!(!accepts_partial_content(ContentRequirement::Complete, kind, 2));
+            assert!(!accepts_partial_content(ContentRequirement::AllowPartial, kind, 0));
         }
     }
 
@@ -4690,7 +5032,7 @@ mod tests {
         outcome.archives.push(receipt(&input, DiscoverySource::Direct, 1));
         // Replaced non-directory output fails independently of ACL privileges.
         run.created_outputs.lock().unwrap().register(&source, &failed);
-        run.discard_failed_output(&failed, &source, &mut outcome).unwrap();
+        assert!(!run.discard_failed_output(&failed, &source, &mut outcome).unwrap());
         assert_eq!(outcome.archives.len(), 1);
         assert_eq!(outcome.cleanup_results.len(), 1);
         assert!(run.created_outputs.lock().unwrap().0.contains_key(&output_key(&source)));

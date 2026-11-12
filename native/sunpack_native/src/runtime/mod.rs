@@ -64,7 +64,7 @@ pub fn main() -> i32 {
             };
             let cancel = crate::pipeline::Cancellation::new();
             let _control = windows::ConsoleControl::install(cancel.clone());
-            cli::run(&host, &cwd, args, &session, cancel)
+            cli::run_console(&host, &cwd, args, std::sync::Arc::new(session), cancel)
         }
     };
     result.unwrap_or_else(|error| {
@@ -90,9 +90,18 @@ fn valid_identity(id: &str) -> bool {
 }
 
 #[cfg(windows)]
-trait Session: Sync {
+trait Session: Send + Sync {
     fn write(&self, stream: Stream, data: &[u8]) -> io::Result<()>;
     fn read_line(&self, prompt: &str) -> io::Result<Option<String>>;
+    fn awrite<'a>(&'a self, stream: Stream, data: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.write(stream, data) })
+    }
+    fn drain(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn aread_line<'a>(&'a self, prompt: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Option<String>>> + Send + 'a>> {
+        Box::pin(async move { self.read_line(prompt) })
+    }
     fn interactive(&self) -> bool;
     fn input_is_terminal(&self) -> bool;
     fn unicode(&self) -> bool;

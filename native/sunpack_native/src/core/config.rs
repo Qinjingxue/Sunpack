@@ -22,6 +22,7 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub watch: WatchConfig,
     pub passwords: PasswordConfig,
+    pub user_passwords: Vec<String>,
     pub recursive_extract: Recursion,
     pub recursive_authorization: AuthorizationConfig,
     pub embedded_scan: EmbeddedConfig,
@@ -768,7 +769,15 @@ impl Config {
                 })
             })
             .collect();
+        let mut user_passwords: Vec<String> = match value.get("user_passwords") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|_| invalid("user_passwords must be an array of strings"))?,
+        };
+        let mut seen = std::collections::HashSet::new();
+        user_passwords.retain(|password| seen.insert(password.clone()));
         Ok(Self {
+            user_passwords,
             cli: CliConfig {
                 language: raw_language(value),
             },
@@ -1144,6 +1153,14 @@ fn utc_minute(value: &str) -> Option<i128> {
 #[cfg(test)]
 mod filter_runtime_tests {
     use super::*;
+
+    #[test]
+    fn configured_user_passwords_are_literal_ordered_and_deduplicated() {
+        let mut raw = defaults().clone();
+        raw["user_passwords"] = serde_json::json!([" first ", "", " first ", "second\0"]);
+        let config = Config::parse(&raw).unwrap();
+        assert_eq!(config.user_passwords, [" first ", "", "second\0"]);
+    }
 
     #[test]
     fn normalized_configuration_equality_ignores_syntax_but_not_runtime_changes() {

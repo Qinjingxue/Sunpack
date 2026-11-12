@@ -107,11 +107,17 @@ struct State {
     startup_abandoned: bool,
     applied_mode: Option<ProcessMode>,
     mode_reply: Option<(Option<ProcessMode>, bool)>,
+    mode_waiter: Option<Waker>,
     closed: Option<WorkerExit>,
     input_closed: bool,
     writes: VecDeque<InputFrame>,
     completion_epoch: u64,
     claimed_epoch: u64,
+}
+
+struct ModeWaiter<'a>(&'a Shared);
+impl Drop for ModeWaiter<'_> {
+    fn drop(&mut self) { self.0.state.lock().unwrap().mode_waiter.take(); }
 }
 
 // One outstanding write per awaiting sender. Queue entries share the sender's
@@ -162,8 +168,8 @@ impl WriteCompletion {
         poll_fn(|cx| self.poll(cx)).await
     }
 
-    // Process-mode changes and final shutdown run on their owning caller,
-    // outside the shared scheduler. They use the same ordered writer.
+    // Final shutdown and synchronous transport tests use the same ordered
+    // writer as asynchronous submissions and process-mode changes.
     fn wait_blocking(&self) -> io::Result<()> {
         let state = self.state.lock().unwrap();
         let mut state = self
@@ -416,61 +422,52 @@ impl Process {
 
     /// The engine serializes control commands. Startup and subsequent
     /// transitions share the same acknowledged applied-state cache.
+    #[cfg(test)]
     pub(super) fn set_process_mode(&self, mode: ProcessMode) -> io::Result<bool> {
-        {
+        super::scheduling::block_on(self.set_process_mode_async(mode))
+    }
+
+    pub(super) async fn set_process_mode_async(&self, mode: ProcessMode) -> io::Result<bool> {
+        let startup = {
             let mut state = self.shared.state.lock().unwrap();
-            if !state.ready && state.closed.is_none() {
-                // A mode change during startup joins the handshake instead of
-                // racing an independent control command or publishing early.
+            if let Some(reason) = &state.closed { return Err(reason.error()); }
+            if !state.ready {
+                // Join startup without becoming a worker borrower. A mode
+                // setter must not keep an abandoned startup process alive.
                 state.startup_mode = Some(mode);
                 self.shared.changed.notify_all();
-                state = self.shared.changed.wait_while(state, |state| {
-                    !state.ready && state.closed.is_none()
-                }).unwrap();
-                if let Some(reason) = &state.closed {
-                    return Err(reason.error());
+                true
+            } else {
+                if state.applied_mode == Some(mode) { return Ok(true); }
+                state.mode_reply = None;
+                state.applied_mode = None;
+                false
+            }
+        };
+        let _waiter = ModeWaiter(&self.shared);
+        if !startup {
+            let frame = encode_worker_frame(
+                &json!({"worker_command":"set_process_mode", "mode":mode_name(mode)}),
+            )?;
+            self.send(Arc::new(frame)).wait().await?;
+        }
+        poll_fn(|cx| {
+            let mut state = self.shared.state.lock().unwrap();
+            if startup {
+                if let Some(reason) = &state.closed { return Poll::Ready(Err(reason.error())); }
+                if state.ready { return Poll::Ready(Ok(state.applied_mode == Some(mode))); }
+            } else {
+                if let Some((reply, applied)) = state.mode_reply.take() {
+                    return Poll::Ready(if reply == Some(mode) { Ok(applied) } else {
+                        Err(io::Error::new(io::ErrorKind::InvalidData,
+                            "worker acknowledged a different process mode"))
+                    });
                 }
-                return Ok(state.applied_mode == Some(mode));
+                if let Some(reason) = &state.closed { return Poll::Ready(Err(reason.error())); }
             }
-            if let Some(reason) = &state.closed {
-                return Err(reason.error());
-            }
-            if state.applied_mode == Some(mode) {
-                return Ok(true);
-            }
-            state.mode_reply = None;
-            state.applied_mode = None;
-        }
-        let frame = encode_worker_frame(
-            &json!({"worker_command":"set_process_mode", "mode":mode_name(mode)}),
-        )?;
-        self.send(Arc::new(frame)).wait_blocking()?;
-        let state = self.shared.state.lock().unwrap();
-        let mut state = self
-            .shared
-            .changed
-            .wait_while(state, |state| {
-                state.mode_reply.is_none() && state.closed.is_none()
-            })
-            .unwrap();
-        if let Some((reply, applied)) = state.mode_reply.take() {
-            if reply != Some(mode) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "worker acknowledged a different process mode",
-                ));
-            }
-            return Ok(applied);
-        }
-        Err(state.closed.as_ref().map_or_else(
-            || {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "worker exited during process mode change",
-                )
-            },
-            WorkerExit::error,
-        ))
+            state.mode_waiter = Some(cx.waker().clone());
+            Poll::Pending
+        }).await
     }
 
     pub(super) async fn submit(
@@ -831,11 +828,12 @@ impl Shared {
             }
         }
         if matches!(kind, "worker_ready" | "process_mode_ack") {
-            let wakes = if state.ready {
+            let mut wakes = if state.ready {
                 state.ready_waiters.values_mut().filter_map(Option::take).collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
+            wakes.extend(state.mode_waiter.take());
             drop(state);
             self.changed.notify_all();
             for wake in wakes {
@@ -944,7 +942,8 @@ impl Shared {
         }
         state.input_closed = true;
         state.closed = Some(exit);
-        let wakes: Vec<_> = state.ready_waiters.values_mut().filter_map(Option::take).collect();
+        let mut wakes: Vec<_> = state.ready_waiters.values_mut().filter_map(Option::take).collect();
+        wakes.extend(state.mode_waiter.take());
         drop(state);
         self.changed.notify_all();
         for wake in wakes {
@@ -1259,7 +1258,9 @@ mod tests {
         assert_eq!(process.shared.state.lock().unwrap().ready_waiters.len(), 2);
 
         let changing = Arc::clone(&process);
-        let control = thread::spawn(move || changing.set_process_mode(ProcessMode::High));
+        let control = scheduler.submit(100, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async move {
+            changing.set_process_mode_async(ProcessMode::High).await
+        }));
         {
             let state = process.shared.state.lock().unwrap();
             let (state, timeout) = process.shared.changed.wait_timeout_while(state, timeout, |state| {
@@ -1294,6 +1295,60 @@ mod tests {
         drop(process);
         let shutdown = encode_worker_frame(&json!({"worker_command":"shutdown"})).unwrap();
         assert_eq!(*bytes.lock().unwrap(), [mode_write, shutdown].concat());
+    }
+
+    #[test]
+    fn process_mode_write_ack_and_exit_do_not_block_shared_control() {
+        // The startup test exercises its special handshake path. This covers
+        // an already-ready worker: both stdin backpressure and the ACK must
+        // suspend control polls, and process exit must wake the pending setter.
+        let timeout = Duration::from_secs(10);
+        let scheduler = Scheduler::new();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (entered, writing) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::channel();
+        let process = Process::with_test_input(GatedInput {
+            entered, release: released, barriers: 1, bytes,
+        });
+        let changing = Arc::clone(&process);
+        let control = scheduler.submit(100, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async move {
+            changing.set_process_mode_async(ProcessMode::High).await
+        }));
+        writing.recv_timeout(timeout).unwrap();
+        let probe = |id| {
+            let (send, receive) = mpsc::channel();
+            let task = scheduler.submit(id, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async move {
+                send.send(()).unwrap();
+            }));
+            (task, receive.recv_timeout(timeout))
+        };
+        let (during_write, write_responsive) = probe(101);
+        release.send(()).unwrap();
+        let (during_ack, ack_responsive) = probe(102);
+        process.test_event(json!({"type":"process_mode_ack", "mode":"high", "applied":true}));
+        assert!(control.join().unwrap().unwrap());
+        during_write.join().unwrap();
+        during_ack.join().unwrap();
+        write_responsive.expect("process mode write blocked the control driver");
+        ack_responsive.expect("process mode ACK blocked the control driver");
+
+        let changing = Arc::clone(&process);
+        let (send, pending) = mpsc::channel();
+        let control = scheduler.submit(103, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async move {
+            let mut change = Box::pin(changing.set_process_mode_async(ProcessMode::Normal));
+            let mut send = Some(send);
+            poll_fn(|cx| {
+                let result = change.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(send) = send.take() { send.send(()).unwrap(); }
+                }
+                result
+            }).await
+        }));
+        pending.recv_timeout(timeout).unwrap();
+        process.test_exit();
+        assert!(control.join().unwrap().is_err());
+        assert!(process.shared.state.lock().unwrap().mode_waiter.is_none());
     }
 
     #[test]

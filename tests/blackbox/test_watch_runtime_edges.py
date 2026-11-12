@@ -58,13 +58,16 @@ def test_watch_rearms_the_root_object_after_rename_and_recreation(package, tmp_p
     rebuilt = wait_for_rebuild(0)
     # The old directory remains alive, so an old handle can remain healthy
     # even though the configured path now denotes a different object.
-    watched.rename(tmp_path / "old-root")
-    nested = watched / "nested"
+    replacement = tmp_path / "replacement"
+    nested = replacement / "nested"
     nested.mkdir(parents=True)
-    # Let the parent sentinel rebuild the replacement root's empty baseline.
-    # Files present before this point are intentionally not treated as arrivals.
-    wait_for_rebuild(rebuilt)
     _zip(nested / "first.zip", "first.txt", b"replacement root")
+    watched.rename(tmp_path / "old-root")
+    replacement.rename(watched)
+    nested = watched / "nested"
+    # Runtime directory arrival must enumerate archives already present in
+    # the new object, unlike startup's missing-catalog conservative baseline.
+    wait_for_rebuild(rebuilt)
     _wait_for_output(output, "first.txt", b"replacement root")
 
     # A later change below an already existing subdirectory cannot be rescued

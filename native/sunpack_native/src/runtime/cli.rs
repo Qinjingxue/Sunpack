@@ -20,10 +20,11 @@ mod live;
 pub(super) mod reporting;
 
 pub(super) struct Host {
+    pub(super) scheduler: Arc<crate::pipeline::Scheduler>,
     engine: OnceLock<Arc<Engine>>,
     passwords: Mutex<Option<Arc<passwords::BuiltinStore>>>,
     idle: Mutex<Duration>,
-    pub(super) watch: watch::Watch,
+    pub(super) watch: Arc<watch::Watch>,
 }
 
 impl Host {
@@ -33,10 +34,11 @@ impl Host {
 
     pub(super) fn with_wake(wake: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
+            scheduler: crate::pipeline::Scheduler::new(),
             engine: OnceLock::new(),
             passwords: Mutex::default(),
             idle: Mutex::new(Duration::from_secs_f64(config::default_idle_seconds())),
-            watch: watch::Watch::new(Arc::new(wake)),
+            watch: Arc::new(watch::Watch::new(Arc::new(wake))),
         }
     }
 
@@ -60,7 +62,7 @@ impl Host {
         }
         let worker = resources::worker_path(cwd)?;
         Ok(Arc::clone(
-            self.engine.get_or_init(|| Arc::new(Engine::new(worker))),
+            self.engine.get_or_init(|| Arc::new(Engine::with_scheduler(worker, Arc::clone(&self.scheduler)))),
         ))
     }
 
@@ -530,19 +532,27 @@ fn write_json(session: &dyn Session, value: &impl Serialize) -> io::Result<()> {
     writer.flush()
 }
 
-pub(super) fn run(
+pub(super) fn run_console(
+    host: &Host, cwd: &Path, args: Vec<String>, session: Arc<dyn Session>, cancel: Cancellation,
+) -> io::Result<i32> {
+    crate::pipeline::block_on(run(host, cwd, args, session, cancel))
+}
+
+pub(super) async fn run(
     host: &Host,
     cwd: &Path,
     args: Vec<String>,
-    session: &dyn Session,
+    owned_session: Arc<dyn Session>,
     cancel: Cancellation,
 ) -> io::Result<i32> {
+    let session = owned_session.as_ref();
+    crate::pipeline::stage("cli", &Cancellation::new()).await?;
     if args
         .first()
         .is_some_and(|arg| arg == "--cancel-watch-batch")
     {
         return Ok(match args.get(1) {
-            Some(id) if host.watch.cancel_batch(id) => 0,
+            Some(id) if host.watch.cancel_batch_async(id).await => 0,
             _ => 1,
         });
     }
@@ -573,19 +583,24 @@ pub(super) fn run(
     let generation = config::generation(cwd);
     let language = generation.language();
     let execution = match options.command {
-        "scan" | "extract" => generation.normalized(true).and_then(|config| {
-            host.configure_idle(&config);
-            archives(host, cwd, &options, session, language, &cancel, config)
-        }),
-        "passwords" => generation
-            .normalized(true)
-            .and_then(|config| show_passwords(host, cwd, &options, session, language, config)),
-        "config" => show_config(cwd, &options, session, language),
+        "scan" | "extract" => match generation.normalized(true) {
+            Ok(config) => {
+                host.configure_idle(&config);
+                archives(host, cwd, &options, Arc::clone(&owned_session), language, &cancel, config).await
+            }
+            Err(error) => Err(error),
+        },
+        "passwords" => match generation.normalized(true) {
+            Ok(config) => show_passwords(host, cwd, &options, session, language, config).await,
+            Err(error) => Err(error),
+        },
+        "config" => show_config(cwd, &options, session, language).await,
         "version" => show_version(session),
         "doctor" => doctor(cwd, session, options.json, language),
-        "watch" => watch_command(host, cwd, &options, session, language, &cancel),
+        "watch" => watch_command(host, cwd, &options, session, language, &cancel).await,
         _ => unreachable!(),
     };
+    crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
     let (code, result) = match execution {
         Ok(value) => value,
         Err(error) if is_cancellation(&error) => {
@@ -594,7 +609,7 @@ pub(super) fn run(
         Err(error) => {
             let mut result = CommandResult::new(options.command);
             let (code, message) = match options.command {
-                "version" => (3, "cli.runtime_failure"),
+                "version" | "scan" | "extract" => (3, "cli.runtime_failure"),
                 "watch" => (1, "cli.operation_failed"),
                 _ => (2, "cli.operation_failed"),
             };
@@ -618,9 +633,10 @@ pub(super) fn run(
             && code != 130
             && (options.command != "extract" || code != 0)
         {
-            let _ = session.read_line(language.text("cli.press_enter"))?;
+            let _ = session.aread_line(language.text("cli.press_enter")).await?;
         }
     }
+    session.drain().await?;
     Ok(code)
 }
 
@@ -676,10 +692,10 @@ fn targets(cwd: &Path, options: &Options) -> io::Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec<Arc<str>>> {
-    line(session, Stream::Out, language.text("cli.password_prompt"))?;
+async fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec<Arc<str>>> {
+    session.awrite(Stream::Out, format!("{}\n", language.text("cli.password_prompt")).as_bytes()).await?;
     let mut passwords = Vec::new();
-    while let Some(value) = session.read_line(language.text("cli.password_input_prompt"))? {
+    while let Some(value) = session.aread_line(language.text("cli.password_input_prompt")).await? {
         let value = value.trim_end_matches(['\r', '\n']);
         if value.is_empty() {
             break;
@@ -689,18 +705,19 @@ fn prompt_passwords(session: &dyn Session, language: Language) -> io::Result<Vec
     Ok(passwords)
 }
 
-fn cli_passwords(
+async fn cli_passwords(
     cwd: &Path,
     options: &Options,
     session: &dyn Session,
     language: Language,
 ) -> io::Result<Vec<Arc<str>>> {
+    crate::pipeline::stage("password_file", &Cancellation::new()).await?;
     let mut result = options.passwords.clone();
     if let Some(file) = &options.password_file {
         result = crate::password::lists::read_password_file(resolve(cwd, file)?, Some(result))?;
     }
     if options.prompt_passwords {
-        result.extend(prompt_passwords(session, language)?);
+        result.extend(prompt_passwords(session, language).await?);
     }
     if options.password_file.is_none() || options.prompt_passwords {
         dedupe(&mut result);
@@ -724,18 +741,18 @@ fn cli_clipboard(settings: &Config) -> Vec<Arc<str>> {
     }
 }
 
-fn confirm(session: &dyn Session, language: Language, prompt: &str) -> io::Result<bool> {
-    confirm_on(session, language, prompt, Stream::Out)
+async fn confirm(session: &dyn Session, language: Language, prompt: &str) -> io::Result<bool> {
+    confirm_on(session, language, prompt, Stream::Out).await
 }
 
-fn confirm_on(session: &dyn Session, language: Language, prompt: &str, stream: Stream) -> io::Result<bool> {
+async fn confirm_on(session: &dyn Session, language: Language, prompt: &str, stream: Stream) -> io::Result<bool> {
     loop {
-        session.write(stream, prompt.as_bytes())?;
-        let Some(answer) = session.read_line("")? else { return Ok(false); };
+        session.awrite(stream, prompt.as_bytes()).await?;
+        let Some(answer) = session.aread_line("").await? else { return Ok(false); };
         match answer.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => return Ok(true),
             "n" | "no" | "" => return Ok(false),
-            _ => line(session, stream, language.text("cli.answer_yes_no"))?,
+            _ => session.awrite(stream, format!("{}\n", language.text("cli.answer_yes_no")).as_bytes()).await?,
         }
     }
 }
@@ -848,9 +865,10 @@ impl ArchiveSummary {
                 if let Some(warning) = entries
                     .iter()
                     .filter_map(|entry| entry.failure.as_ref())
-                    .find(|failure| failure.kind == FailureKind::MissingVolume)
+                    .find(|failure| failure.kind == FailureKind::MissingVolume
+                        || failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume))
                 {
-                    recovery["warning"] = json!({"kind": warning.kind, "message": warning.message});
+                    recovery["warning"] = json!({"kind": warning.kind, "message": failure_message(warning, language)});
                 }
                 summary.recovered.push(recovery);
             } else {
@@ -886,10 +904,10 @@ fn input_error_message(error: &InputError, language: Language, json: bool) -> St
     }
 }
 
-struct Progress<'a> {
-    session: &'a dyn Session,
-    watch: &'a watch::Watch,
-    cancel: &'a Cancellation,
+struct Progress {
+    session: Arc<dyn Session>,
+    watch: Arc<watch::Watch>,
+    cancel: Cancellation,
     language: Language,
     display: Mutex<Display>,
     reporting: reporting::Reports,
@@ -899,6 +917,24 @@ struct Progress<'a> {
     verbose: bool,
 }
 
+// Preserve finally-style async teardown even when a worker future unwinds.
+pub(super) async fn settle_unwind<T>(future: impl std::future::Future<Output = T>) -> std::thread::Result<T> {
+    let mut future = Box::pin(future);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            std::future::Future::poll(future.as_mut(), cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }).await
+}
+
+struct ReportClose<'a>(&'a reporting::Reports);
+impl Drop for ReportClose<'_> {
+    fn drop(&mut self) { self.0.close(); }
+}
+
 #[derive(Default)]
 struct Display {
     panel: Option<live::Panel>,
@@ -906,36 +942,29 @@ struct Display {
     deferred: Vec<u8>,
 }
 
-impl Progress<'_> {
-    fn run<T>(&self, execute: impl FnOnce() -> T) -> T {
-        if !self.visible {
-            return execute();
-        }
-        self.reporting.serve(
-            |event| self.display_event(event),
-            |id, archives| self.finish_scope(id, archives),
-            execute,
-        )
-    }
-
+impl Progress {
     fn clear_panel(&self) -> io::Result<()> {
         let mut display = self.display.lock().unwrap();
         if let Some(mut panel) = display.panel.take() {
             // The launcher can already have printed its interrupt message.
             // In that case the old cursor position no longer belongs to us.
             if !self.cancel.cancelled() {
-                panel.clear(self.session)?;
+                panel.clear(self.session.as_ref())?;
             }
         }
         Ok(())
     }
 
-    fn display_event(&self, event: Event) {
+    fn flush_events(&self) {
+        let mut display = self.display.lock().unwrap();
+        for event in self.reporting.take_events() { self.display_event(event, &mut display); }
+    }
+
+    fn display_event(&self, event: Event, display: &mut Display) {
         if self.cancel.cancelled() {
             return;
         }
         if self.session.interactive() {
-            let mut display = self.display.lock().unwrap();
             if self.cancel.cancelled() {
                 return;
             }
@@ -943,7 +972,7 @@ impl Progress<'_> {
             display
                 .panel
                 .get_or_insert_with(live::Panel::default)
-                .update(self.session, self.language, event, prompting);
+                .update(self.session.as_ref(), self.language, event, prompting);
         } else if let Event::ResourceWait { path, state, .. } = event {
             if !state.disk {
                 return;
@@ -954,7 +983,7 @@ impl Progress<'_> {
                 .unwrap_or(path.as_os_str())
                 .to_string_lossy();
             let _ = line(
-                self.session,
+                self.session.as_ref(),
                 Stream::Err,
                 &format!("{filename}: {status} — {hint}"),
             );
@@ -967,6 +996,7 @@ impl Progress<'_> {
         if self.cancel.cancelled() {
             return Ok(());
         }
+        for event in self.reporting.take_events() { self.display_event(event, &mut display); }
         if let Some(panel) = &mut display.panel {
             panel.remove(id);
         }
@@ -976,22 +1006,22 @@ impl Progress<'_> {
             }
         } else {
             if let Some(panel) = &mut display.panel {
-                panel.clear(self.session)?;
+                panel.clear(self.session.as_ref())?;
             }
             if let Some(report) = report {
-                let mut writer = BufWriter::new(SessionWriter(self.session));
+                let mut writer = BufWriter::new(SessionWriter(self.session.as_ref()));
                 report.write(&mut writer)?;
                 writer.flush()?;
             }
             if let Some(panel) = &mut display.panel {
-                panel.redraw(self.session, self.language, true);
+                panel.redraw(self.session.as_ref(), self.language, true);
             }
         }
         Ok(())
     }
 }
 
-impl Observer for Progress<'_> {
+impl Observer for Progress {
     fn worker_updates(&self) -> crate::pipeline::WorkerUpdates {
         use crate::pipeline::WorkerUpdates;
         if !self.visible {
@@ -1024,13 +1054,13 @@ impl Observer for Progress<'_> {
         archives: Vec<ArchiveResult>,
     ) -> io::Result<Vec<ArchiveResult>> {
         if self.visible {
-            self.reporting.finish(id, archives).await
-        } else {
-            Ok(archives)
+            crate::pipeline::stage("report", &Cancellation::new()).await?;
+            self.finish_scope(id, &archives)?;
         }
+        Ok(archives)
     }
 
-    fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
+    async fn allow_recursive_async(&self, depth: usize, pending: usize) -> bool {
         if !self.prompt {
             return true;
         }
@@ -1041,15 +1071,17 @@ impl Observer for Progress<'_> {
                 ("round", &depth.saturating_sub(1).to_string()),
             ],
         );
+        if crate::pipeline::stage("report", &self.cancel).await.is_err() { return false; }
         {
             let mut display = self.display.lock().unwrap();
             if let Some(panel) = &mut display.panel {
-                let _ = panel.clear(self.session);
+                let _ = panel.clear(self.session.as_ref());
             }
             display.prompting = true;
         }
-        let confirmed = confirm_on(self.session, self.language, &prompt,
-            if self.visible { Stream::Out } else { Stream::Err }).unwrap_or(false);
+        let confirmed = confirm_on(self.session.as_ref(), self.language, &prompt,
+            if self.visible { Stream::Out } else { Stream::Err }).await.unwrap_or(false);
+        let _ = crate::pipeline::stage("report", &Cancellation::new()).await;
         let mut display = self.display.lock().unwrap();
         display.prompting = false;
         if !display.deferred.is_empty() {
@@ -1058,7 +1090,7 @@ impl Observer for Progress<'_> {
         }
         if !self.cancel.cancelled() {
             if let Some(panel) = &mut display.panel {
-                panel.redraw(self.session, self.language, true);
+                panel.redraw(self.session.as_ref(), self.language, true);
             }
         }
         confirmed
@@ -1104,7 +1136,7 @@ struct ScopeReport<'a> {
 }
 
 impl<'a> ScopeReport<'a> {
-    fn new(archives: &'a [ArchiveResult], progress: &Progress<'a>) -> Self {
+    fn new(archives: &'a [ArchiveResult], progress: &Progress) -> Self {
         let mut report = Self {
             archives,
             unicode: progress.session.unicode(),
@@ -1276,12 +1308,27 @@ impl<'a> ScopeReport<'a> {
     }
 }
 
+fn command_error(
+    command: &'static str,
+    code: i32,
+    key: &str,
+    error: io::Error,
+    language: Language,
+) -> (i32, CommandResult) {
+    let mut result = CommandResult::new(command);
+    result.errors.push(language.translate(key, &[("error", &error.to_string())]));
+    (code, result)
+}
+
 fn archive_request_error(
     error: io::Error,
     inputs: &[PathBuf],
     command: &'static str,
     language: Language,
 ) -> io::Result<(i32, CommandResult)> {
+    if error.get_ref().is_some_and(|inner| inner.is::<crate::pipeline::StartupError>()) {
+        return Ok(command_error(command, 1, "cli.persistent_request_failed", error, language));
+    }
     let Some(conflict) = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<crate::pipeline::BusyConflict>())
@@ -1300,19 +1347,23 @@ fn archive_request_error(
     Ok((1, result))
 }
 
-fn archives(
+async fn archives(
     host: &Host,
     cwd: &Path,
     options: &Options,
-    session: &dyn Session,
+    owned_session: Arc<dyn Session>,
     language: Language,
     cancel: &Cancellation,
     mut settings: Config,
 ) -> io::Result<(i32, CommandResult)> {
+    let session = owned_session.as_ref();
     let inputs = targets(cwd, options)?;
-    let engine = host.engine(cwd)?;
-    let reservation = match engine.reserve_foreground(&inputs, cancel) {
-        Ok(reservation) => reservation,
+    let engine = match host.engine(cwd) {
+        Ok(engine) => engine,
+        Err(error) => return Ok(command_error(options.command, 1, "cli.persistent_request_failed", error, language)),
+    };
+    let reservation = match engine.reserve_foreground_async(&inputs, cancel).await {
+        Ok(reservation) => Arc::new(reservation),
         Err(error) => return archive_request_error(error, &inputs, options.command, language),
     };
     let mut overrides = serde_json::Map::new();
@@ -1338,7 +1389,12 @@ fn archives(
     }
     let scan = options.command == "scan";
     let mut candidate_paths = inputs.clone();
-    let mut user = cli_passwords(cwd, options, session, language)?;
+    let mut user = match cli_passwords(cwd, options, session, language).await {
+        Ok(passwords) => passwords,
+        Err(error) if is_cancellation(&error) => return Err(error),
+        Err(error) => return Ok(command_error(options.command, 2, "cli.operation_failed", error, language)),
+    };
+    crate::pipeline::stage("password_reload", cancel).await?;
     let builtin = if options.no_builtins {
         None
     } else {
@@ -1385,10 +1441,10 @@ fn archives(
             line(session, Stream::Out, language.text("interrupt.hint"))?;
         }
     }
-    let progress = Progress {
-        session,
-        watch: &host.watch,
-        cancel,
+    let progress = Arc::new(Progress {
+        session: Arc::clone(&owned_session),
+        watch: Arc::clone(&host.watch),
+        cancel: cancel.clone(),
         language,
         display: Mutex::default(),
         reporting: reporting::Reports::default(),
@@ -1396,13 +1452,14 @@ fn archives(
         prompt: settings.recursive_extract == Recursion::Prompt,
         visible: !options.json && !scan,
         verbose: options.verbose,
-    };
+    });
     let max_depth = depth(settings.recursive_extract);
     let settings = Arc::new(settings);
     if !host.watch.is_running() {
-        windows::configure_priority(&engine, settings.runtime.process_mode);
+        windows::configure_priority_async(&engine, settings.runtime.process_mode).await;
     }
-    let _foreground = windows::Foreground::enter(&engine, &host.watch);
+    let foreground = windows::Foreground::enter_async(&engine, &host.watch).await;
+    let execution = async {
     let mut result = CommandResult::new(options.command);
     let mut retries = 0;
     let mut all_archives = BTreeMap::new();
@@ -1428,7 +1485,22 @@ fn archives(
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
         request.promoted_sources = std::mem::take(&mut promoted_sources);
-        let current = progress.run(|| engine.run_reserved(request, &progress, &reservation));
+        progress.reporting.reopen();
+        let _report_close = ReportClose(&progress.reporting);
+        let reporting = if progress.visible {
+            let progress = Arc::clone(&progress);
+            Some(engine.spawn_control(crate::pipeline::Origin::Foreground, &Cancellation::new(), async move {
+                progress.reporting.serve_async(|| progress.flush_events()).await;
+            }))
+        } else { None };
+        let current = settle_unwind(engine.run_reserved_async(request, Arc::clone(&progress), Arc::clone(&reservation))).await;
+        progress.reporting.close();
+        if let Some(reporting) = reporting { reporting.wait().await; }
+        let current = match current {
+            Ok(current) => current,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
         let cleared = progress.clear_panel();
         let current = match current {
             Ok(outcome) => outcome,
@@ -1545,14 +1617,14 @@ fn archives(
             session,
             language,
             language.text("cli.password_retry_prompt"),
-        )?;
+        ).await?;
         if cancel.cancelled() {
             return interrupted(options, session, language, Some(&inputs), Vec::new());
         }
         if !retry {
             break;
         }
-        let additional = prompt_passwords(session, language)?;
+        let additional = prompt_passwords(session, language).await?;
         if cancel.cancelled() {
             return interrupted(options, session, language, Some(&inputs), Vec::new());
         }
@@ -1568,6 +1640,7 @@ fn archives(
         dedupe(&mut user);
         retries += 1;
     }
+    crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
     let counts = ArchiveSummary::collect(all_archives.values(), language, options.json);
     result.errors = counts.errors;
     let scan_errors = all_errors
@@ -1739,6 +1812,10 @@ fn archives(
         line(session, Stream::Out, &"-".repeat(54))?;
     }
     Ok((i32::from(!result.errors.is_empty()), result))
+    };
+    let result = settle_unwind(execution).await;
+    foreground.finish_async().await;
+    match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
 }
 
 fn report_scan(
@@ -2114,7 +2191,36 @@ fn password_item(
         "builtin_passwords":builtin,"use_builtin_passwords":use_builtin,"combined_passwords":combined})
 }
 
-fn show_passwords(
+// The command displays Python-style list values, as main does. Escape only
+// their textual representation; the candidates themselves remain unchanged.
+fn password_repr(value: &str) -> String {
+    static NON_PRINTABLE: OnceLock<regex::Regex> = OnceLock::new();
+    let non_printable = NON_PRINTABLE.get_or_init(|| regex::Regex::new(r"[\p{C}\p{Z}]").unwrap());
+    let quote = if value.contains('\'') && !value.contains('"') { '"' } else { '\'' };
+    let mut text = String::with_capacity(value.len() + 2);
+    text.push(quote);
+    for ch in value.chars() {
+        match ch {
+            '\\' => text.push_str("\\\\"),
+            '\t' => text.push_str("\\t"),
+            '\n' => text.push_str("\\n"),
+            '\r' => text.push_str("\\r"),
+            c if c == quote => { text.push('\\'); text.push(c); }
+            c if c != ' ' && non_printable.is_match(c.encode_utf8(&mut [0; 4])) => {
+                use std::fmt::Write;
+                let code = c as u32;
+                if code <= 0xff { let _ = write!(text, "\\x{code:02x}"); }
+                else if code <= 0xffff { let _ = write!(text, "\\u{code:04x}"); }
+                else { let _ = write!(text, "\\U{code:08x}"); }
+            }
+            c => text.push(c),
+        }
+    }
+    text.push(quote);
+    text
+}
+
+async fn show_passwords(
     host: &Host,
     cwd: &Path,
     options: &Options,
@@ -2122,7 +2228,8 @@ fn show_passwords(
     language: Language,
     settings: Config,
 ) -> io::Result<(i32, CommandResult)> {
-    let user = cli_passwords(cwd, options, session, language)?;
+    let user = cli_passwords(cwd, options, session, language).await?;
+    crate::pipeline::stage("password_reload", &Cancellation::new()).await?;
     let clipboard = cli_clipboard(&settings);
     let snapshot = if options.no_builtins {
         None
@@ -2159,9 +2266,7 @@ fn show_passwords(
                     values
                         .iter()
                         .filter_map(Value::as_str)
-                        .map(|value| {
-                            format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
-                        })
+                        .map(password_repr)
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
@@ -2177,7 +2282,7 @@ fn show_passwords(
     Ok((0, result))
 }
 
-fn show_config(
+async fn show_config(
     cwd: &Path,
     options: &Options,
     session: &dyn Session,
@@ -2186,12 +2291,14 @@ fn show_config(
     let mut result = CommandResult::new("config");
     result.inputs = json!({"action": options.action});
     if options.rule_stdin {
-        let input = session.read_line("")?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        let input = session.aread_line("").await?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        crate::pipeline::stage("cli", &Cancellation::new()).await?;
         let rule = serde_json::from_str(&input)?;
         config::PathRule::parse(&rule)?.compile()?;
         result.summary = json!({"valid": true});
         return Ok((0, result));
     }
+    crate::pipeline::stage("cli", &Cancellation::new()).await?;
     let (path, payload) = config::load_raw(cwd)?;
     result.summary = json!({"config_path": path, "changed": false});
     let errors = match Config::parse(&payload) {
@@ -2319,7 +2426,7 @@ fn doctor(
     Ok((i32::from(failed != 0), result))
 }
 
-fn watch_command(
+async fn watch_command(
     host: &Host,
     cwd: &Path,
     options: &Options,
@@ -2332,13 +2439,13 @@ fn watch_command(
     let mut code = 0;
     match options.action.as_str() {
         "start" if options.once => {
-            code = host.watch.run_once(cwd, host.engine(cwd)?, cancel)?;
+            code = host.watch.run_once_async(cwd, host.engine(cwd)?, cancel).await?;
             result.inputs["once"] = Value::Bool(true);
             result.summary = json!({"exit_code": code});
         }
-        "start" => result.summary = host.watch.start(cwd, host.engine(cwd)?, !options.no_tray)?,
-        "stop" => result.summary = host.watch.stop()?,
-        "reload" => result.summary = host.watch.reload()?,
+        "start" => result.summary = host.watch.start_async(cwd, host.engine(cwd)?, !options.no_tray).await?,
+        "stop" => result.summary = host.watch.stop_async().await?,
+        "reload" => result.summary = host.watch.reload_async().await?,
         "add" => {
             let paths = targets(cwd, options)?;
             let output = options.output.as_deref();
@@ -2354,10 +2461,11 @@ fn watch_command(
             }
             result.summary =
                 host.watch
-                    .add(cwd, &paths, output, options.deep, options.recursive)?;
+                    .add_async(cwd, &paths, output, options.deep, options.recursive).await?;
             result.summary["start_requested"] = Value::Bool(options.start);
             if options.start && !host.watch.is_running() {
-                result.summary["start"] = host.watch.start(cwd, host.engine(cwd)?, true)?;
+                result.summary["start"] = host.watch.start_async(cwd, host.engine(cwd)?, true).await?;
+                crate::pipeline::stage("cli", &Cancellation::new()).await?;
                 let (_, effective) = host.watch.roots(cwd)?;
                 let effective: HashSet<_> = effective.iter().map(|path| path_key(path)).collect();
                 let mut rejected = Vec::new();
@@ -2406,7 +2514,7 @@ fn watch_command(
         "remove" => {
             let paths = targets(cwd, options)?;
             result.inputs["paths"] = json!(paths);
-            result.summary = host.watch.remove(cwd, &paths)?;
+            result.summary = host.watch.remove_async(cwd, &paths).await?;
             result.items = result.summary["removed"]
                 .as_array()
                 .cloned()
@@ -2452,7 +2560,7 @@ fn watch_command(
             };
         }
         "rebuild-log" => {
-            let rebuilt = host.watch.rebuild_log(cwd)?;
+            let rebuilt = host.watch.rebuild_log_async(cwd).await?;
             result.summary = json!({"rebuilt": rebuilt});
             let key = if rebuilt {
                 "cli.watch.rebuild_log_done"
@@ -2475,6 +2583,14 @@ fn watch_command(
 #[cfg(test)]
 mod option_tests {
     use super::*;
+
+    #[test]
+    fn password_display_escapes_controls_without_changing_candidates() {
+        assert_eq!(password_repr("a\t\0\n\r\\z"), "'a\\t\\x00\\n\\r\\\\z'");
+        assert_eq!(password_repr("can't"), "\"can't\"");
+        assert_eq!(password_repr("a'\"b"), "'a\\'\"b'");
+        assert_eq!(password_repr("\u{4e2d}\u{6587}\u{2028}"), "'\u{4e2d}\u{6587}\\u2028'");
+    }
 
     // One parser-level regression covers resolution, value consumption and
     // subparser boundaries; no worker/filesystem is needed for these failures.
@@ -2571,6 +2687,9 @@ mod recursive_prompt_tests {
 
     #[derive(Default)]
     struct Input {
+        interactive: bool,
+        cancel_input: bool,
+        reads: std::sync::atomic::AtomicUsize,
         answers: Mutex<VecDeque<String>>,
         stdout: Mutex<Vec<u8>>,
         stderr: Mutex<Vec<u8>>,
@@ -2585,27 +2704,93 @@ mod recursive_prompt_tests {
         }
         fn read_line(&self, prompt: &str) -> io::Result<Option<String>> {
             self.write(Stream::Out, prompt.as_bytes())?;
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.cancel_input { return Err(crate::io::cancellation::cancelled_io()); }
             Ok(self.answers.lock().unwrap().pop_front())
         }
-        fn interactive(&self) -> bool { false }
+        fn interactive(&self) -> bool { self.interactive }
         fn input_is_terminal(&self) -> bool { false }
         fn unicode(&self) -> bool { true }
         fn terminal_size(&self) -> (usize, usize) { (80, 25) }
     }
 
     #[test]
+    fn failed_request_drains_and_joins_queued_progress_before_unwinding() {
+        let reports = Arc::new(reporting::Reports::default());
+        reports.notify(Event::Working { id: 7 });
+        // Capture the failure before releasing the request's reporter lifetime.
+        let failure = crate::pipeline::block_on(settle_unwind(async { panic!("request failure") }));
+        assert!(failure.is_err());
+        reports.close();
+        let scheduler = crate::pipeline::Scheduler::new();
+        let (sent, received) = std::sync::mpsc::channel();
+        let service = Arc::clone(&reports);
+        let output = scheduler.submit(1, crate::pipeline::Origin::Foreground, &Cancellation::new(), move |_| Box::pin(async move {
+            service.serve_async(|| {
+                for event in service.take_events() { sent.send(event).unwrap(); }
+            }).await;
+        }));
+        output.join().unwrap();
+        assert!(matches!(received.try_recv().unwrap(), Event::Working { id: 7 }));
+        assert!(received.try_recv().is_err());
+        assert!(reports.take_events().is_empty());
+    }
+
+    #[test]
+    fn scope_completion_flushes_queued_panel_events_before_removing_the_scope() {
+        let input = Arc::new(Input { interactive: true, ..Input::default() });
+        let progress = Progress {
+            session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+            cancel: Cancellation::new(), language: Language::En,
+            display: Mutex::default(), reporting: reporting::Reports::default(),
+            branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+        };
+        progress.notify(Event::Queued { id: 7, parent: None, path: "test.zip".into(), depth: 1, segment: None });
+        progress.finish_scope(7, &[]).unwrap();
+        input.stdout.lock().unwrap().clear();
+        progress.flush_events();
+        assert!(input.stdout.lock().unwrap().is_empty(), "a queued old event must not resurrect a completed scope");
+    }
+
+    #[test]
+    fn cancelling_password_prompt_returns_interrupted_not_usage() {
+        let host = Host::new();
+        // Prompt cancellation must finish before any worker can be started.
+        assert!(host.engine.set(Arc::new(Engine::with_scheduler(
+            PathBuf::from("missing-worker-for-cancelled-prompt.exe"), Arc::clone(&host.scheduler),
+        ))).is_ok());
+        let input = Arc::new(Input { cancel_input: true, ..Input::default() });
+        let cwd = std::env::current_dir().unwrap();
+        let result = crate::pipeline::block_on(run(
+            &host, &cwd,
+            vec!["extract".into(), "--ask-pw".into(), "--no-pause".into(), "cancelled.zip".into()],
+            input.clone(), Cancellation::new(),
+        ));
+        assert_eq!(input.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(result.unwrap(), 130);
+    }
+
+    #[test]
+    fn connection_command_future_can_move_between_shared_executor_polls() {
+        fn assert_send(_: impl std::future::Future + Send) {}
+        let host = Host::new();
+        let input: Arc<dyn Session> = Arc::new(Input::default());
+        assert_send(run(&host, Path::new("."), vec!["version".into()], input, Cancellation::new()));
+    }
+
+    #[test]
     fn json_recursion_reads_authorization_without_polluting_stdout() {
-        let input = Input::default();
+        let input = Arc::new(Input::default());
         input.answers.lock().unwrap().extend(["invalid".into(), "yes".into(), "n".into()]);
-        let watch = watch::Watch::new(Arc::new(|| {}));
+        let watch = Arc::new(watch::Watch::new(Arc::new(|| {})));
         let cancel = Cancellation::default();
         let progress = Progress {
-            session: &input, watch: &watch, cancel: &cancel, language: Language::En,
+            session: input.clone(), watch, cancel, language: Language::En,
             display: Mutex::default(), reporting: reporting::Reports::default(),
             branches: Mutex::default(), prompt: true, visible: false, verbose: false,
         };
-        assert!(progress.allow_recursive(2, 1));
-        assert!(!progress.allow_recursive(3, 1));
+        assert!(crate::pipeline::block_on(progress.allow_recursive_async(2, 1)));
+        assert!(!crate::pipeline::block_on(progress.allow_recursive_async(3, 1)));
         assert!(input.answers.lock().unwrap().is_empty());
         assert!(input.stdout.lock().unwrap().is_empty());
         assert!(!input.stderr.lock().unwrap().is_empty());

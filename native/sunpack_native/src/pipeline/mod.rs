@@ -5,7 +5,7 @@ mod cleanup;
 mod coordinator;
 mod discovery;
 mod passwords;
-mod scheduling;
+pub(crate) mod scheduling;
 mod shell_updates;
 mod worker;
 
@@ -23,7 +23,25 @@ pub(crate) use checkpoint::PromotedSource;
 pub use coordinator::Engine;
 pub(crate) use coordinator::{common_ancestor, common_output_base};
 pub(crate) use discovery::scan_options;
-pub(crate) use scheduling::{stage, Join as RequestHandle, MAX_PENDING_JOBS};
+pub(crate) use scheduling::{AsyncGate, block_on, in_control_poll, stage, Join as RequestHandle, Scheduler, MAX_PENDING_JOBS};
+
+// Initialization failures have a distinct CLI boundary in main: closing the
+// failed engine also closes its request broker, so the persistent host reports
+// request failure (1), rather than usage (2) or a running-command error (3).
+#[derive(Debug)]
+pub(crate) struct StartupError(io::Error);
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for StartupError {}
+
+pub(crate) fn startup_error(error: io::Error) -> io::Error {
+    if crate::io::cancellation::is_cancellation(&error) { error }
+    else { io::Error::new(error.kind(), StartupError(error)) }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -160,6 +178,10 @@ impl Failure {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FailureEvidence {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing_volume_suspected: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub possible_missing_volume: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -435,8 +457,9 @@ pub struct ResourceWait {
 
 pub type TaskId = u64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Segment {
+    pub format: String,
     pub index: usize,
     pub count: usize,
     pub offset: u64,
@@ -551,10 +574,6 @@ pub(crate) trait Observer: Send + Sync {
         crate::scan::scope::create_output_root_exclusive(output).map_err(OutputCreateError::wrap)
     }
 
-    fn before_cleanup(&self, _archive: &ArchiveResult) -> io::Result<()> {
-        Ok(())
-    }
-
     fn after_output(&self, _archive: &ArchiveResult) -> io::Result<()> {
         Ok(())
     }
@@ -603,6 +622,11 @@ pub(crate) trait Observer: Send + Sync {
 
     fn after_flatten(&self, _output: &Path) -> io::Result<()> {
         Ok(())
+    }
+
+    fn allow_recursive_async(&self, depth: usize, pending: usize)
+        -> impl std::future::Future<Output = bool> + Send {
+        async move { self.allow_recursive(depth, pending) }
     }
 
     fn allow_recursive(&self, _depth: usize, _pending: usize) -> bool {

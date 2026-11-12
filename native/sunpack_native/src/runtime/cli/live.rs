@@ -69,7 +69,7 @@ impl Panel {
                     let end = segment
                         .end_offset
                         .map_or_else(|| "?".into(), |end| end.to_string());
-                    format!("{label} [{}, {end})", segment.offset)
+                    format!("{label} ({}) [{}, {end})", segment.format, segment.offset)
                 } else {
                     path.file_name()
                         .unwrap_or(path.as_os_str())
@@ -515,6 +515,7 @@ mod tests {
                 Some(1),
                 "carrier.dat",
                 Some(Segment {
+                    format: "zip".into(),
                     index,
                     count: 2,
                     offset: 100 * index as u64,
@@ -554,8 +555,8 @@ mod tests {
             .map(|row| row.text.as_str())
             .collect();
         assert_eq!(rows.len(), 5);
-        assert!(rows[1].starts_with("├─ Segment 1 [100, 150) [Disk full]  60%"));
-        assert!(rows[2].starts_with("└─ Segment 2 [200, 250) [Waiting]"));
+        assert!(rows[1].starts_with("├─ Segment 1 (zip) [100, 150) [Disk full]  60%"));
+        assert!(rows[2].starts_with("└─ Segment 2 (zip) [200, 250) [Waiting]"));
         assert!(rows[3].starts_with("   └─ nested.zip [Preparing]"));
         assert_eq!(rows[4], "other.zip [Extracting]");
         assert!(String::from_utf8_lossy(&terminal.output.lock().unwrap())
