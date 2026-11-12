@@ -316,6 +316,26 @@ pub struct ArchiveResult {
     pub promotion_original_path: Option<PathBuf>,
 }
 
+/// Runtime disposition of one physical input. Carrier segments retain their
+/// own output receipts, but retry causes belong to the carrier as a whole.
+#[derive(Default)]
+pub(crate) struct InputFailure<'a> {
+    pub(crate) failed: bool,
+    pub(crate) password: Option<&'a Failure>,
+    pub(crate) missing: Option<&'a Failure>,
+    pub(crate) terminal: Option<&'a Failure>,
+}
+
+impl<'a> InputFailure<'a> {
+    pub(crate) fn retryable(&self) -> bool {
+        self.failed && (self.password.is_some() || self.missing.is_some())
+    }
+
+    pub(crate) fn failure(&self) -> Option<&'a Failure> {
+        self.failed.then(|| self.missing.or(self.password).or(self.terminal)).flatten()
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Outcome {
     pub archives: Vec<ArchiveResult>,
@@ -332,6 +352,24 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    pub(crate) fn input_failures(&self) -> HashMap<String, InputFailure<'_>> {
+        let mut inputs: HashMap<String, InputFailure<'_>> = HashMap::new();
+        for archive in &self.archives {
+            let Some(failure) = archive.failure.as_ref() else { continue; };
+            let input = inputs.entry(crate::path_keys::path_key(&archive.path.to_string_lossy()))
+                .or_default();
+            input.failed |= !archive.partial;
+            match failure.kind {
+                FailureKind::MissingVolume => { input.missing.get_or_insert(failure); }
+                FailureKind::PasswordRequired | FailureKind::WrongPassword
+                    | FailureKind::PasswordInconclusive => { input.password.get_or_insert(failure); }
+                _ if !archive.partial => { input.terminal.get_or_insert(failure); }
+                _ => {}
+            }
+        }
+        inputs
+    }
+
     pub fn succeeded(&self) -> usize {
         self.archives
             .iter()

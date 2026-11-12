@@ -310,7 +310,20 @@ impl InputCheckpoint {
 
     pub(super) fn promoted(&mut self, moves: &[(PathBuf, PathBuf)]) -> io::Result<()> {
         for (source, destination) in moves {
+            let entry_moved = self.input.entry == *source;
             self.relocate(source, destination);
+            if entry_moved {
+                if let Some(facts) = self.partial.as_mut().and_then(|partial| partial.retry_facts.as_mut()) {
+                    // Collision aliases can change a disguised carrier's
+                    // discovery name without changing its bytes or analysis.
+                    // Preserve names supplied by relation semantics instead
+                    // of replacing them with a physical filename.
+                    let logical_name = crate::scan::directory::filesystem_logical_name;
+                    if facts.logical_name == logical_name(&source.to_string_lossy()) {
+                        facts.logical_name = logical_name(&destination.to_string_lossy());
+                    }
+                }
+            }
         }
         for source in &mut self.sources {
             source.generation = capture_file_generation(&source.path)?.persisted();
@@ -421,6 +434,85 @@ mod tests {
     use super::*;
     use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
     use std::{fs, sync::Arc};
+
+    #[test]
+    fn promoted_partial_collision_reuses_receipt_after_fresh_discovery_naming() {
+        use crate::io::archive_state::archive_input_slices;
+        use crate::postprocess::NativeBlockedInputPromotion;
+        use crate::scan::directory::filesystem_logical_name;
+
+        let marker = crate::test_support::temp_file("checkpoint_promotion_collision", b"marker");
+        let root = marker.with_extension("output");
+        for (filename, promoted_name) in [("carrier.bin", "carrier.bin"), ("carrier.zip", "carrier")] {
+            let nested = root.join("nested");
+            let container = nested.join("retained");
+            let output = container.join("segment");
+            fs::create_dir_all(&output).unwrap();
+            fs::write(output.join("payload"), b"keep").unwrap();
+            let source = nested.join(filename);
+            fs::write(&source, b"archive!").unwrap();
+            fs::write(root.join(filename), b"existing").unwrap();
+            let discover = |path: &Path| {
+                let path = path.to_string_lossy();
+                let carrier = ArchiveInput::file(
+                    path.to_string(), "zip".into(), filesystem_logical_name(&path),
+                );
+                archive_input_slices(&carrier, &[("zip", 0, Some(4))])
+                    .unwrap().0.remove(0).unwrap()
+            };
+            let input = discover(&source);
+            let failure = Failure::new(FailureKind::Damaged, "accepted partial");
+            let mut checkpoint = InputCheckpoint {
+                schema_version: SCHEMA_VERSION,
+                carrier: source.clone(),
+                input: LogicalLayout {
+                    entry: source.clone(), mode: input.mode, format: input.format_hint.clone(),
+                    parts: input.parts.clone(), ranges: input.ranges.clone(),
+                },
+                sources: vec![SourceGeneration {
+                    path: source.clone(), generation: capture_file_generation(&source).unwrap().persisted(),
+                }].into_boxed_slice(),
+                output: OwnedDirectory::capture(&output).unwrap(),
+                container: Some(OwnedDirectory::capture(&container).unwrap()),
+                files: 1, bytes: 4, encrypted: None,
+                discovery_source: DiscoverySource::Embedded, children_complete: true,
+                remaining_depth: 0,
+                partial: Some(PartialReceipt {
+                    failure, complete_files: 1,
+                    retry_facts: Some(RetryFacts {
+                        logical_name: input.logical_name.clone(), analysis: input.analysis.clone(),
+                    }),
+                }),
+            };
+            let plan = NativeBlockedInputPromotion::new(
+                vec![source.to_string_lossy().into_owned()], root.clone(),
+            ).unwrap();
+            let destination = plan.moves()[0].1.clone();
+            assert_ne!(destination, root.join(filename));
+            let (_, _, _, error, _) = plan.execute(|| Ok(()));
+            assert!(error.is_empty(), "{error}");
+            checkpoint.promoted(plan.moves()).unwrap();
+            let checkpoint: InputCheckpoint = serde_json::from_value(
+                serde_json::to_value(checkpoint).unwrap(),
+            ).unwrap();
+            let rediscovered = discover(&destination);
+            assert_eq!(rediscovered.logical_name, promoted_name);
+            let generations = HashMap::from([(
+                path_key(&rediscovered.entry_path), capture_file_generation(&destination).unwrap(),
+            )]);
+            assert!(checkpoint.valid_for(&rediscovered, &generations));
+            let result = checkpoint.result(1);
+            assert!(result.retained && result.partial);
+            assert_eq!(result.failure.unwrap().kind, FailureKind::Damaged);
+            assert_eq!(result.recovered_complete_files, 1);
+            assert_eq!(fs::read(output.join("payload")).unwrap(), b"keep");
+            let mut changed = rediscovered;
+            changed.analysis.password_required = true;
+            assert!(!checkpoint.valid_for(&changed, &generations));
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::remove_file(marker).unwrap();
+    }
 
     #[test]
     fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternatives() {

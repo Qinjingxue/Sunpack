@@ -159,15 +159,16 @@ impl PipeSecurity {
 
 static CONSOLE_CANCEL: Mutex<Option<Cancellation>> = Mutex::new(None);
 static PRIORITY_TRANSITION: Mutex<()> = Mutex::new(());
-static FOREGROUND_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) fn foreground_active() -> bool {
-    FOREGROUND_ACTIVE.load(std::sync::atomic::Ordering::Acquire) != 0
+    process::foreground_active()
 }
 
-pub(super) fn maintain_when_foreground_idle(maintain: impl FnOnce()) {
+pub(super) fn maintain_when_foreground_idle(engine: &Engine, maintain: impl FnOnce()) {
     let _transition = PRIORITY_TRANSITION.lock().unwrap();
     if !foreground_active() {
+        let _ = process::expire_foreground_override();
+        let _ = engine.set_process_mode(process::effective_mode());
         maintain();
     }
 }
@@ -204,7 +205,6 @@ pub(super) struct Foreground<'a> {
 impl<'a> Foreground<'a> {
     pub(super) fn enter(engine: &'a Engine, watch: &'a super::watch::Watch) -> Self {
         let _transition = PRIORITY_TRANSITION.lock().unwrap();
-        FOREGROUND_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Release);
         let host = process::ForegroundPriority::enter();
         let _ = engine.set_process_mode(process::effective_mode());
         Self {
@@ -220,12 +220,14 @@ impl Drop for Foreground<'_> {
         let last = {
             let _transition = PRIORITY_TRANSITION.lock().unwrap();
             drop(self.host.take());
-            let last = FOREGROUND_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release) == 1;
-            let _ = self.engine.set_process_mode(process::effective_mode());
-            last
+            !foreground_active()
         };
         if last {
-            self.watch.foreground_finished();
+            // Watch startup also takes its running lock before this priority
+            // gate. Release the gate before selecting who owns idle expiry.
+            self.watch.foreground_finished(|| {
+                maintain_when_foreground_idle(self.engine, || {});
+            });
         }
     }
 }
@@ -353,6 +355,12 @@ impl ToastPresenter<'_> {
                 sequence,
             )
         })
+    }
+
+    pub(super) fn clear(&self) -> io::Result<()> {
+        let clear: unsafe extern "C" fn(*mut c_void) -> i32 =
+            unsafe { std::mem::transmute(self.library.procedure(b"sunpack_toast_clear\0")?) };
+        hresult(unsafe { clear(self.context) })
     }
 }
 

@@ -1300,7 +1300,10 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             if depth > 1
                 && !cancel.cancelled()
-                && !completed.iter().any(|result| result.partial)
+                // Accepted partial segments do not make a carrier successful
+                // when a sibling failed. Only an entirely accepted carrier
+                // stays in place; promotion retains its sibling outputs.
+                && completed.iter().any(|result| result.failure.is_some() && !result.partial)
                 && completed.iter().any(|result| {
                     result.failure.as_ref().is_some_and(|failure| {
                         matches!(
@@ -1456,8 +1459,8 @@ impl<'run, O: Observer> Run<'run, O> {
     ) -> io::Result<()> {
         let representative = results
             .iter()
-            .position(|result| result.failure.is_some())
-            .expect("blocked task has a failure");
+            .position(|result| result.failure.is_some() && !result.partial)
+            .expect("blocked task has an unaccepted failure");
         let promoted: io::Result<(
             Vec<(PathBuf, PathBuf)>,
             Vec<PromotedSource>,
@@ -3368,6 +3371,145 @@ mod tests {
             1, files.len() as u64, 0,
             files.iter().map(|(_, data)| data.len() as u64).sum(), 1,
         ]).unwrap()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn nested_carrier_promotion_preserves_accepted_siblings_for_retry() {
+        // Exercise the real task boundary and physical move, not just its
+        // predicate: accepted siblings must keep their output and receipts
+        // when another segment blocks the carrier, then survive a root retry.
+        fn execute(
+            engine: &Engine, request: &Request, inputs: &[ArchiveInput],
+            blocked: FailureKind, depth: usize,
+        ) -> Outcome {
+            let observer = |_: Event| {};
+            let mut run = test_run(engine, request, &observer);
+            for (index, checkpoint) in request.checkpoints.iter().enumerate() {
+                run.checkpoints.entry(checkpoint.key()).or_default().push(index);
+            }
+            run.promoted_sources = request.promoted_sources.iter().map(|source| {
+                (path_key(&source.path().to_string_lossy()), source)
+            }).collect();
+            let task = Task {
+                inputs: inputs.iter().enumerate().map(|(index, input)| LogicalInput {
+                    input: input.clone(),
+                    password: None,
+                    failure: (index == 2).then(|| Failure::new(blocked, "blocked segment")),
+                }).collect(),
+                owned_paths: vec![inputs[0].entry_path.clone()],
+                source: DiscoverySource::Embedded,
+                retry: None,
+            };
+            Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
+                run.execute_task(task, 1, depth, None, spawner)
+            }).unwrap()
+        }
+
+        let marker = crate::test_support::temp_file("carrier_partial_promotion", b"marker");
+        let root = marker.with_extension("output");
+        for origin in [Origin::Foreground, Origin::Watch] {
+          for (depth, partial_kind, blocked, accepted, promoted) in [
+            (2, FailureKind::Damaged, FailureKind::PasswordRequired, false, true),
+            (2, FailureKind::Damaged, FailureKind::MissingVolume, false, true),
+            // Main inspects all aggregate causes, including accepted partials.
+            (2, FailureKind::MissingVolume, FailureKind::Damaged, false, true),
+            (2, FailureKind::MissingVolume, FailureKind::WrongPassword, true, false),
+            (2, FailureKind::Damaged, FailureKind::Damaged, false, false),
+            (1, FailureKind::Damaged, FailureKind::PasswordRequired, false, false),
+          ] {
+            let parent = root.join("outer");
+            let source = parent.join("carrier.bin");
+            let container = parent.join("carrier");
+            fs::create_dir_all(&container).unwrap();
+            fs::write(&source, [0; 16]).unwrap();
+            let input = ArchiveInput::file(
+                source.to_string_lossy().into_owned(), "zip".into(), "carrier".into(),
+            );
+            let (segments, _) = archive_input_slices(&input, &[
+                ("zip", 0, Some(4)), ("zip", 4, Some(8)), ("zip", 8, Some(12)),
+            ]).unwrap();
+            let mut inputs: Vec<_> = segments.into_iter().map(Option::unwrap).collect();
+            let generations = HashMap::from([
+                (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
+            ]);
+            let mut request = Request::new(vec![root.clone()], Mode::Extract);
+            request.origin = origin;
+            request.max_depth = 0;
+            Arc::make_mut(&mut request.config).extraction.content_requirement =
+                ContentRequirement::AllowPartial;
+            for (index, input) in inputs.iter().enumerate().take(if accepted { 3 } else { 2 }) {
+                let output = container.join(format!("segment-{index}"));
+                fs::create_dir(&output).unwrap();
+                fs::write(output.join("payload"), b"keep").unwrap();
+                let mut result = receipt(input, DiscoverySource::Embedded, depth);
+                result.output = Some(output);
+                result.files = 1;
+                result.bytes = 4;
+                if index != 0 {
+                    result.partial = true;
+                    result.recovered_complete_files = 1;
+                    result.failure = Some(Failure::new(
+                        if index == 1 { partial_kind } else { blocked }, "accepted partial",
+                    ));
+                }
+                request.checkpoints.push(InputCheckpoint::create(
+                    &source, input, &result, &generations, Some(&container), true, 0,
+                ).unwrap().unwrap());
+            }
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let outcome = execute(&engine, &request, &inputs, blocked, depth);
+            assert_eq!(outcome.archives.len(), 3);
+            assert!(outcome.errors.is_empty());
+            assert_eq!(outcome.failed(), usize::from(!accepted));
+            assert_eq!(subtree_complete(&outcome), promoted);
+            let current = if promoted { root.join("carrier.bin") } else { source.clone() };
+            assert!(current.is_file());
+            assert_eq!(source.is_file(), !promoted);
+            assert_eq!(outcome.promoted_sources.len(), usize::from(promoted));
+            for result in &outcome.archives {
+                assert_eq!(result.path, current);
+                assert_eq!(result.source_paths, [current.clone()]);
+                assert_eq!(result.promoted, promoted);
+                assert_eq!(result.promotion_original_path.as_ref(), promoted.then_some(&source));
+            }
+            let rediscovered = ArchiveInput::file(
+                current.to_string_lossy().into_owned(), "zip".into(),
+                crate::scan::directory::filesystem_logical_name(&current.to_string_lossy()),
+            );
+            inputs = archive_input_slices(&rediscovered, &[
+                ("zip", 0, Some(4)), ("zip", 4, Some(8)), ("zip", 8, Some(12)),
+            ]).unwrap().0.into_iter().map(Option::unwrap).collect();
+            let generations = HashMap::from([
+                (path_key(&inputs[0].entry_path), capture_file_generation(&current).unwrap()),
+            ]);
+            assert_eq!(outcome.checkpoints.len(), request.checkpoints.len());
+            for (index, checkpoint) in outcome.checkpoints.iter().enumerate() {
+                assert_eq!(checkpoint.entry(), current);
+                assert_eq!(checkpoint.carrier(), current);
+                assert_eq!(checkpoint.container(), Some(container.as_path()));
+                assert!(checkpoint.valid_for(&inputs[index], &generations));
+                assert_eq!(fs::read(checkpoint.output().join("payload")).unwrap(), b"keep");
+            }
+            if promoted {
+                request.checkpoints = outcome.checkpoints;
+                request.promoted_sources = outcome.promoted_sources;
+                let retry = execute(&engine, &request, &inputs, blocked, 1);
+                assert_eq!(retry.checkpoints.len(), 2);
+                assert!(retry.archives[..2].iter().all(|result| result.retained));
+                assert_eq!(retry.archives[1].failure.as_ref().unwrap().kind, partial_kind);
+                assert!(retry.archives[1].partial);
+                assert_eq!(retry.archives[1].recovered_complete_files, 1);
+                assert_eq!(retry.archives[2].failure.as_ref().unwrap().kind, blocked);
+                assert_eq!(retry.archives[0].output.as_ref(), Some(&container.join("segment-0")));
+                assert_eq!(retry.archives[1].output.as_ref(), Some(&container.join("segment-1")));
+                assert!(current.is_file());
+            }
+            release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();
+            fs::remove_dir_all(&root).unwrap();
+          }
+        }
+        fs::remove_file(marker).unwrap();
     }
 
     #[test]

@@ -12,6 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
+const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(800);
+
 pub(super) struct Snapshot {
     batch: String,
     kind: u8,
@@ -31,7 +33,8 @@ impl Snapshot {
         let totals = &group.totals;
         let completed = totals.done_bytes + totals.written;
         let total = totals.done_bytes + totals.planned;
-        let count = totals.finished + totals.active;
+        let finished = group.summary.completed();
+        let count = finished + group.active_requests;
         let disk = totals.disk != 0;
         let memory = totals.memory != 0;
         let progress = (totals.unknown == 0 && total != 0 && !disk && !memory && !group.stopping)
@@ -48,7 +51,7 @@ impl Snapshot {
                 group
                     .requests
                     .values()
-                    .flat_map(|tasks| tasks.values())
+                    .flat_map(|request| request.tasks.values())
                     .find_map(|task| task.wait.volume_error)
             };
             let status = if let Some(error) = volume_error {
@@ -74,7 +77,7 @@ impl Snapshot {
                 language.translate(
                     "toast.progress.status",
                     &[
-                        ("completed", &totals.finished.to_string()),
+                        ("completed", &finished.to_string()),
                         ("total", &count.to_string()),
                     ],
                 ),
@@ -114,16 +117,20 @@ impl Snapshot {
             body: language.translate(
                 "toast.progress.body",
                 &[
-                    ("completed", &totals.finished.to_string()),
+                    ("completed", &finished.to_string()),
                     ("total", &count.to_string()),
                 ],
             ),
             progress,
             label: if count == 1 {
-                group.name.as_ref().map_or_else(
-                    || language.text("toast.progress.one").to_owned(),
-                    |(_, name)| name.clone(),
-                )
+                group.requests.values()
+                    .find(|request| request.visible)
+                    .and_then(|request| request.name.as_ref())
+                    .or(group.name.as_ref())
+                    .map_or_else(
+                        || language.text("toast.progress.one").to_owned(),
+                        |(_, name)| name.clone(),
+                    )
             } else {
                 language.translate("toast.progress.multiple", &[("count", &count.to_string())])
             },
@@ -138,9 +145,9 @@ impl Snapshot {
         }
     }
 
-    fn completed(group: Completed, report: Option<PathBuf>) -> Self {
+    fn completed(group: &Completed, report: Option<PathBuf>) -> Self {
         let language = group.language;
-        let summary = group.summary;
+        let summary = &group.summary;
         let succeeded = summary.succeeded;
         let failed = summary.failed;
         let (mut kind, suffix) = match (succeeded, failed) {
@@ -171,7 +178,7 @@ impl Snapshot {
                 ("duration", &duration),
             ],
         );
-        if summary.interrupted {
+        if summary.interrupted != 0 {
             let interrupted = language.text(if summary.rollback_failed {
                 "interrupt.cleanup_failed"
             } else {
@@ -196,7 +203,7 @@ impl Snapshot {
         if kind == 2 && (summary.rollback_failed || summary.cleanup_failed != 0) {
             kind = if succeeded == 0 { 3 } else { 4 };
         }
-        let action = summary.output.map(|path| {
+        let action = summary.output.as_ref().map(|path| {
             (
                 1,
                 language.text("toast.action.open_output").to_owned(),
@@ -287,6 +294,7 @@ struct State {
     completed: VecDeque<Completed>,
     dirty: bool,
     stopping: bool,
+    clear: bool,
 }
 
 struct Group {
@@ -296,23 +304,28 @@ struct Group {
     began: Instant,
     visible: bool,
     stopping: bool,
-    requests: HashMap<Arc<str>, HashMap<TaskId, TaskProgress>>,
+    requests: HashMap<Arc<str>, RequestProgress>,
+    active_requests: usize,
+    finalize_at: Option<Instant>,
+    finalizing: bool,
+    generation: u64,
     totals: Totals,
     summary: Summary,
     report: Arc<Mutex<ReportDraft>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Summary {
     succeeded: usize,
     failed: usize,
-    interrupted: bool,
+    interrupted: usize,
     rollback_failed: bool,
     cleanup_failed: usize,
     output: Option<PathBuf>,
 }
 
 struct Completed {
+    generation: u64,
     id: Arc<str>,
     language: Language,
     elapsed: Duration,
@@ -320,8 +333,17 @@ struct Completed {
     report: Arc<Mutex<ReportDraft>>,
 }
 
+#[derive(Default)]
+struct RequestProgress {
+    tasks: HashMap<TaskId, TaskProgress>,
+    name: Option<(TaskId, String)>,
+    visible: bool,
+    done_bytes: u128,
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct TaskProgress {
+    visible: bool,
     written: u64,
     planned: u64,
     wait: ResourceWait,
@@ -329,20 +351,20 @@ struct TaskProgress {
 
 #[derive(Default)]
 struct Totals {
-    active: usize,
     unknown: usize,
     disk: usize,
     memory: usize,
     volume_errors: usize,
     written: u128,
     planned: u128,
-    finished: usize,
     done_bytes: u128,
 }
 
 impl Totals {
     fn add(&mut self, task: TaskProgress) {
-        self.active += 1;
+        if !task.visible {
+            return;
+        }
         self.unknown += usize::from(task.planned == 0);
         self.disk += usize::from(task.wait.disk);
         self.memory += usize::from(task.wait.memory);
@@ -352,7 +374,9 @@ impl Totals {
     }
 
     fn remove(&mut self, task: TaskProgress, finished: bool) {
-        self.active -= 1;
+        if !task.visible {
+            return;
+        }
         self.unknown -= usize::from(task.planned == 0);
         self.disk -= usize::from(task.wait.disk);
         self.memory -= usize::from(task.wait.memory);
@@ -360,57 +384,70 @@ impl Totals {
         self.planned -= u128::from(task.planned);
         self.written -= u128::from(task.written.min(task.planned));
         if finished {
-            self.finished += 1;
             self.done_bytes += u128::from(task.planned);
         }
     }
 }
 
 impl Group {
+    fn new(request: &str, language: Language) -> Self {
+        // Reserve the upper token space for UI activations. A fresh suffix
+        // also distinguishes batches seeded by the same still-invisible scan,
+        // so an old draft can never share the next batch's spool filename.
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let prefix = u64::from_str_radix(&request[..request.len().min(16)], 16)
+            .expect("hex request ID");
+        debug_assert!(prefix < (1u64 << 63));
+        Self {
+            id: Arc::from(format!("{:016x}{:016x}", prefix | (1u64 << 63),
+                NEXT.fetch_add(1, Ordering::Relaxed))),
+            language,
+            name: None,
+            began: Instant::now(),
+            visible: false,
+            stopping: false,
+            requests: HashMap::new(),
+            active_requests: 0,
+            finalize_at: None,
+            finalizing: false,
+            generation: 0,
+            totals: Totals::default(),
+            summary: Summary::default(),
+            report: Arc::default(),
+        }
+    }
+
     fn event(&mut self, request: &str, event: Event) -> bool {
-        let Some(tasks) = self.requests.get_mut(request) else {
+        let Some(request) = self.requests.get_mut(request) else {
             return false;
         };
+        let tasks = &mut request.tasks;
         let id = match event {
-            Event::Queued {
-                id,
-                parent,
-                segment,
-                path,
-                ..
-            } => {
+            Event::Queued { id, parent, segment, path, .. } => {
                 if segment.is_some() {
                     if let Some(task) = parent.and_then(|parent| tasks.remove(&parent)) {
                         self.totals.remove(task, false);
                     }
                 }
-                if let std::collections::hash_map::Entry::Vacant(slot) = tasks.entry(id) {
-                    if self.totals.active == 0 && self.totals.finished == 0 {
-                        let name = path
-                            .file_name()
-                            .unwrap_or(path.as_os_str())
-                            .to_string_lossy()
-                            .into_owned();
-                        self.name = Some((id, name));
-                    }
-                    let task = TaskProgress::default();
-                    slot.insert(task);
-                    self.totals.add(task);
-                    return true;
+                if parent.is_none() && request.name.is_none() {
+                    let name = path.file_name().unwrap_or(path.as_os_str())
+                        .to_string_lossy().into_owned();
+                    request.name = Some((id, name));
                 }
-                return false;
+                tasks.entry(id).or_default();
+                return request.visible;
             }
             Event::Finished { id, .. } | Event::Skipped { id } => {
                 if let Some(task) = tasks.remove(&id) {
                     let finished = matches!(event, Event::Finished { .. });
-                    if !finished && self.name.as_ref().is_some_and(|(named, _)| *named == id) {
-                        self.name = None;
-                    }
                     self.totals.remove(task, finished);
+                    if finished && task.visible {
+                        request.done_bytes += u128::from(task.planned);
+                    }
                     if tasks.capacity() > 256 {
                         crate::collections::trim_map(tasks);
                     }
-                    return true;
+                    return request.visible;
                 }
                 return false;
             }
@@ -423,108 +460,184 @@ impl Group {
         let Some(task) = tasks.get_mut(&id) else {
             return false;
         };
-        let visible = self.visible;
         let before = *task;
         match event {
             Event::Working { .. } => {
-                self.visible = true;
-                *task = TaskProgress::default();
+                *task = TaskProgress { visible: true, ..TaskProgress::default() };
             }
-            Event::Progress {
-                completed_bytes,
-                total_bytes,
-                ..
-            } => {
-                self.visible = true;
+            Event::Progress { completed_bytes, total_bytes, .. } => {
+                task.visible = true;
                 task.written = completed_bytes;
                 task.planned = total_bytes;
             }
             Event::ResourceWait { state, .. } => {
-                self.visible |= state.disk || state.memory;
+                task.visible |= state.disk || state.memory;
                 task.wait = state;
             }
             Event::Finalizing { .. } => task.wait = ResourceWait::default(),
             _ => unreachable!(),
+        }
+        if task.visible && !request.visible {
+            request.visible = true;
+            self.active_requests += 1;
+            self.generation = self.generation.wrapping_add(1);
+            self.finalize_at = None;
+            if !self.visible {
+                self.began = Instant::now();
+                self.visible = true;
+            }
+            if self.summary.completed() == 0 {
+                self.name = request.name.clone();
+            }
         }
         if before != *task {
             self.totals.remove(before, false);
             self.totals.add(*task);
             true
         } else {
-            visible != self.visible
+            false
         }
     }
 
     fn finish(&mut self, request: &str, summary: Summary) -> bool {
-        let Some(tasks) = self.requests.remove(request) else {
+        let Some(request) = self.requests.remove(request) else {
             return false;
         };
-        for task in tasks.into_values() {
-            self.totals.remove(task, true);
+        let accepted = summary.completed() != 0;
+        for task in request.tasks.into_values() {
+            self.totals.remove(task, accepted);
         }
+        if !accepted {
+            self.totals.done_bytes -= request.done_bytes;
+        }
+        self.active_requests -= usize::from(request.visible);
         if self.requests.capacity() > 256 {
             crate::collections::trim_map(&mut self.requests);
         }
-        self.summary.merge(summary);
+        if accepted {
+            if !self.visible {
+                self.began = Instant::now();
+                self.visible = true;
+                self.name = request.name;
+            }
+            self.finalize_at = None;
+            self.summary.merge(summary);
+            self.generation = self.generation.wrapping_add(1);
+        }
         true
+    }
+
+    fn pending(&self) -> bool {
+        self.active_requests != 0 || (self.stopping && !self.requests.is_empty())
+    }
+}
+
+impl State {
+    fn retire_front(&mut self) {
+        let group = self.groups.pop_front().unwrap();
+        if !group.requests.is_empty() {
+            // Invisible scans neither postpone completion nor lose their
+            // activity when the completed batch is retired.
+            if self.groups.is_empty() {
+                let request = group.requests.keys().next().unwrap();
+                self.groups.push_back(Group::new(request, group.language));
+            }
+            self.groups.front_mut().unwrap().requests.extend(group.requests);
+        }
+        self.dirty = true;
+    }
+
+    fn settle(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        while let Some(group) = self.groups.front_mut() {
+            if group.pending() || group.finalizing {
+                break;
+            }
+            if group.summary.completed() != 0 {
+                let deadline = *group.finalize_at.get_or_insert(now + COMPLETION_DEBOUNCE);
+                if now < deadline {
+                    break;
+                }
+                group.finalizing = true;
+                group.finalize_at = None;
+                self.completed.push_back(Completed {
+                    generation: group.generation,
+                    id: Arc::clone(&group.id),
+                    language: group.language,
+                    elapsed: now.saturating_duration_since(group.began),
+                    summary: group.summary.clone(),
+                    report: Arc::clone(&group.report),
+                });
+                changed = true;
+                break;
+            }
+            if !group.visible && !group.requests.is_empty() {
+                break;
+            }
+            self.clear |= group.visible;
+            self.retire_front();
+            changed = true;
+        }
+        changed
     }
 }
 
 impl Summary {
+    fn completed(&self) -> usize {
+        self.succeeded + self.failed + self.interrupted
+    }
+
     fn for_result(
         result: &io::Result<Outcome>,
         cancelled: bool,
         output_cleanup_failed: bool,
+        visible: bool,
     ) -> Self {
-        let mut summary = Self {
-            interrupted: cancelled,
-            rollback_failed: cancelled && output_cleanup_failed,
-            cleanup_failed: usize::from(!cancelled && output_cleanup_failed),
-            ..Self::default()
-        };
+        if cancelled {
+            return Self {
+                interrupted: 1,
+                rollback_failed: output_cleanup_failed,
+                ..Self::default()
+            };
+        }
+        if !visible {
+            return Self::default();
+        }
+        let mut summary = Self::default();
         match result {
             Ok(outcome) => {
-                summary.failed = outcome
-                    .errors
-                    .iter()
-                    .filter(|error| error.kind != InputErrorKind::Cleanup)
-                    .map(|error| error.count())
-                    .sum();
-                for archive in &outcome.archives {
-                    if archive.failure.is_none() || archive.partial {
-                        summary.succeeded += 1;
-                    } else if archive
-                        .failure
-                        .as_ref()
-                        .is_some_and(|failure| failure.kind == FailureKind::Cancelled)
-                    {
-                        summary.interrupted = true;
-                    } else {
-                        summary.failed += 1;
-                    }
+                // Watch reports one terminal result per request, not one per
+                // nested archive. Physical inputs combine carrier causes;
+                // independent terminal inputs win over retry-only blockers.
+                let failures = outcome.input_failures();
+                if outcome.errors.iter().any(|error| error.kind == InputErrorKind::InvalidInput)
+                    || failures.values().any(|input| input.failed && !input.retryable())
+                {
+                    summary.failed = 1;
+                } else if failures.values().any(|input| input.retryable()) {
+                    return summary;
+                } else if outcome.archives.iter().any(|archive| {
+                    archive.failure.is_none() || archive.partial
+                }) {
+                    summary.succeeded = 1;
+                    let mut outputs = outcome.archives.iter()
+                        .filter_map(|archive| archive.output.as_deref());
+                    summary.output = crate::pipeline::common_ancestor(outputs.clone())
+                        .or_else(|| outputs.next().map(Path::to_owned));
                 }
-                let mut outputs = outcome
-                    .archives
-                    .iter()
-                    .filter_map(|archive| archive.output.as_deref());
-                summary.output = crate::pipeline::common_ancestor(outputs.clone())
-                    .or_else(|| outputs.next().map(Path::to_owned));
-                summary.cleanup_failed += outcome
-                    .cleanup_results
-                    .iter()
-                    .filter(|result| result.status == CleanupStatus::Failed)
-                    .count();
+                summary.cleanup_failed = outcome.cleanup_results.iter()
+                    .filter(|result| result.status == CleanupStatus::Failed).count();
             }
-            Err(_) if !cancelled => summary.failed = 1,
-            Err(_) => {}
+            Err(_) => summary.failed = 1,
         }
+        summary.cleanup_failed += usize::from(output_cleanup_failed);
         summary
     }
 
     fn merge(&mut self, other: Self) {
         self.succeeded += other.succeeded;
         self.failed += other.failed;
-        self.interrupted |= other.interrupted;
+        self.interrupted += other.interrupted;
         self.rollback_failed |= other.rollback_failed;
         self.cleanup_failed += other.cleanup_failed;
         if let Some(output) = other.output {
@@ -545,6 +658,40 @@ struct Shared {
     changed: Condvar,
 }
 
+impl Shared {
+    fn present(&self, show: impl FnOnce()) -> bool {
+        let state = self.state.lock().unwrap();
+        if state.stopping {
+            return false;
+        }
+        show();
+        true
+    }
+
+    fn present_completed(&self, completed: &Completed, show: impl FnOnce()) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.stopping {
+            return false;
+        }
+        let Some(group) = state.groups.front_mut()
+            .filter(|group| group.id == completed.id && group.finalizing)
+        else {
+            return false;
+        };
+        group.finalizing = false;
+        if group.generation != completed.generation || group.pending() {
+            // New visible work owns the same batch and report draft. Discard
+            // the stale published copy, then debounce again when it drains.
+            state.settle(Instant::now());
+            return false;
+        }
+        show();
+        state.retire_front();
+        state.settle(Instant::now());
+        true
+    }
+}
+
 #[derive(Clone)]
 struct Publisher {
     shared: Arc<Shared>,
@@ -554,43 +701,21 @@ struct Publisher {
 #[derive(Clone)]
 pub(super) struct Activity {
     publisher: Publisher,
-    group: Arc<str>,
     request: Arc<str>,
-    language: Language,
-    report: Arc<Mutex<ReportDraft>>,
 }
 
 impl Publisher {
     fn register(&self, request: Arc<str>, language: Language) -> Activity {
         let mut state = self.shared.state.lock().unwrap();
+        if state.settle(Instant::now()) {
+            self.shared.changed.notify_one();
+        }
         if state.groups.back().is_none_or(|group| group.stopping) {
-            // Request IDs use the lower half of the token space. UI
-            // activations use the upper half and can never hit a raw ID.
-            let first = u8::from_str_radix(&request[..1], 16).expect("hex request ID");
-            debug_assert!(first < 8);
-            let id: Arc<str> = Arc::from(format!("{:x}{}", first | 8, &request[1..]));
-            state.groups.push_back(Group {
-                id,
-                language,
-                name: None,
-                began: Instant::now(),
-                visible: false,
-                stopping: false,
-                requests: HashMap::new(),
-                totals: Totals::default(),
-                summary: Summary::default(),
-                report: Arc::default(),
-            });
+            state.groups.push_back(Group::new(&request, language));
         }
         let group = state.groups.back_mut().unwrap();
-        group.requests.insert(Arc::clone(&request), HashMap::new());
-        Activity {
-            publisher: self.clone(),
-            group: Arc::clone(&group.id),
-            request,
-            language: group.language,
-            report: Arc::clone(&group.report),
-        }
+        group.requests.insert(Arc::clone(&request), RequestProgress::default());
+        Activity { publisher: self.clone(), request }
     }
 
     fn stop_group(&self, id: &str) -> Vec<Arc<str>> {
@@ -598,11 +723,14 @@ impl Publisher {
         let Some(group) = state
             .groups
             .front_mut()
-            .filter(|group| group.id.as_ref() == id && group.visible && !group.stopping)
+            .filter(|group| group.id.as_ref() == id && group.visible
+                && !group.stopping && !group.requests.is_empty())
         else {
             return Vec::new();
         };
         group.stopping = true;
+        group.generation = group.generation.wrapping_add(1);
+        group.finalize_at = None;
         let requests = group.requests.keys().cloned().collect();
         self.mark_dirty(&mut state);
         requests
@@ -621,11 +749,14 @@ impl Activity {
         if state.stopping {
             return;
         }
+        if state.settle(Instant::now()) {
+            self.publisher.shared.changed.notify_one();
+        }
         if let Some((index, group)) = state
             .groups
             .iter_mut()
             .enumerate()
-            .find(|(_, group)| group.id == self.group)
+            .find(|(_, group)| group.requests.contains_key(&self.request))
         {
             if group.event(&self.request, event) && group.visible && index == 0 {
                 self.publisher.mark_dirty(&mut state);
@@ -639,44 +770,32 @@ impl Activity {
         cancelled: bool,
         output_cleanup_failed: bool,
     ) {
-        let summary = Summary::for_result(result, cancelled, output_cleanup_failed);
+        let visible = {
+            let state = self.publisher.shared.state.lock().unwrap();
+            if state.stopping {
+                return;
+            }
+            let Some(request) = state.groups.iter()
+                .find_map(|group| group.requests.get(&self.request))
+            else {
+                return;
+            };
+            request.visible
+        };
+        // Receipt projection can be large. It must not hold the presentation
+        // gate or prevent disable from cancelling an active report writer.
+        let summary = Summary::for_result(result, cancelled, output_cleanup_failed, visible);
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping {
             return;
         }
-        let Some((index, group)) = state
-            .groups
-            .iter_mut()
-            .enumerate()
-            .find(|(_, group)| group.id == self.group)
+        let Some(group) = state.groups.iter_mut()
+            .find(|group| group.requests.contains_key(&self.request))
         else {
             return;
         };
-        if !group.finish(&self.request, summary) || index != 0 {
-            return;
-        }
-        while state
-            .groups
-            .front()
-            .is_some_and(|group| group.requests.is_empty())
-        {
-            let group = state.groups.pop_front().unwrap();
-            let summary = group.summary;
-            if group.visible
-                || summary.succeeded != 0
-                || summary.failed != 0
-                || summary.interrupted
-                || summary.cleanup_failed != 0
-            {
-                state.completed.push_back(Completed {
-                    id: group.id,
-                    language: group.language,
-                    elapsed: group.began.elapsed(),
-                    summary,
-                    report: group.report,
-                });
-            }
-        }
+        group.finish(&self.request, summary);
+        state.settle(Instant::now());
         state.dirty = true;
         self.publisher.shared.changed.notify_one();
     }
@@ -687,36 +806,39 @@ impl Activity {
         result: &io::Result<Outcome>,
         ignore_request_error: bool,
     ) {
-        if self.publisher.shared.state.lock().unwrap().stopping {
-            return;
-        }
-        let has_diagnostics = match result {
-            Ok(outcome) => {
-                !outcome.errors.is_empty()
-                    || outcome.archives.iter().any(|archive| {
-                        archive
-                            .failure
-                            .as_ref()
-                            .is_some_and(|failure| failure.kind != FailureKind::Cancelled)
-                    })
+        let (id, language, report) = {
+            let state = self.publisher.shared.state.lock().unwrap();
+            if state.stopping || ignore_request_error {
+                return;
             }
-            Err(_) => !ignore_request_error,
+            let Some(group) = state.groups.iter()
+                .find(|group| group.requests.contains_key(&self.request))
+            else {
+                return;
+            };
+            if !group.requests[&self.request].visible {
+                return;
+            }
+            (Arc::clone(&group.id), group.language, Arc::clone(&group.report))
         };
-        if has_diagnostics {
-            if let Err(error) = self.publisher.reports.append(self, path, result) {
+        if let Err(error) = self.publisher.reports.append(&id, language, &report, path, result) {
+            if !self.publisher.reports.cancellation.cancelled() {
                 eprintln!("SunPack toast failure report: {error}");
             }
         }
     }
+
 }
 
 struct Reports {
+    cancellation: Cancellation,
     directory: PathBuf,
     retention: AtomicU64,
 }
 
 #[derive(Default)]
 struct ReportDraft {
+    poisoned: bool,
     path: Option<PathBuf>,
     failures: usize,
 }
@@ -773,21 +895,33 @@ impl FailureSpool<'_> {
 impl Reports {
     fn append(
         &self,
-        activity: &Activity,
+        id: &str,
+        language: Language,
+        report: &Mutex<ReportDraft>,
         path: &Path,
         result: &io::Result<Outcome>,
     ) -> io::Result<()> {
-        let language = activity.language;
-        let cancel = Cancellation::default();
-        let mut draft = activity.report.lock().unwrap();
+        self.cancellation.check_io()?;
+        let inputs = result.as_ref().ok().map(Outcome::input_failures);
+        if let Ok(outcome) = result {
+            if !inputs.as_ref().unwrap().values().any(|input| input.failed && !input.retryable())
+                && !outcome.errors.iter().any(|error| error.kind == InputErrorKind::InvalidInput)
+            {
+                return Ok(());
+            }
+        }
+        let mut draft = report.lock().unwrap();
+        if draft.poisoned {
+            return Ok(());
+        }
         let failures = draft.failures;
         let details = draft
             .path
-            .get_or_insert_with(|| self.directory.join(format!("batch-{}.tmp", activity.group)));
+            .get_or_insert_with(|| self.directory.join(format!("batch-{id}.tmp")));
         let mut spool = FailureSpool {
             path: details,
             language,
-            cancellation: &cancel,
+            cancellation: &self.cancellation,
             error_prefix: language.translate("toast.report.error", &[("error", "")]),
             details_prefix: language.translate("toast.report.details", &[("details", "")]),
             failures,
@@ -796,10 +930,14 @@ impl Reports {
             match result {
                 Ok(outcome) => {
                     for archive in &outcome.archives {
-                        if let Some(failure) = archive
-                            .failure
-                            .as_ref()
+                        let Some(failure) = archive.failure.as_ref()
                             .filter(|failure| failure.kind != FailureKind::Cancelled)
+                        else {
+                            continue;
+                        };
+                        let key = crate::path_keys::path_key(&archive.path.to_string_lossy());
+                        if inputs.as_ref().unwrap().get(&key)
+                            .is_some_and(|input| input.failed && !input.retryable())
                         {
                             spool.append(&archive.path, &failure.message, failure)?;
                         }
@@ -807,7 +945,7 @@ impl Reports {
                     for error in outcome
                         .errors
                         .iter()
-                        .filter(|error| error.kind != InputErrorKind::Cleanup)
+                        .filter(|error| error.kind == InputErrorKind::InvalidInput)
                     {
                         spool.append(&error.path, &error.message, error)?;
                     }
@@ -824,12 +962,14 @@ impl Reports {
             Ok(())
         })();
         draft.failures = spool.failures;
+        draft.poisoned |= written.is_err();
         written
     }
 
     fn publish(&self, completed: &Completed, shared: &Shared) -> io::Result<Option<PathBuf>> {
         let draft = completed.report.lock().unwrap();
-        if draft.failures == 0 {
+        self.cancellation.check_io()?;
+        if draft.poisoned || draft.failures == 0 {
             return Ok(None);
         }
         let now = SystemTime::now();
@@ -846,14 +986,15 @@ impl Reports {
         let generated = language.translate("toast.report.generated", &[("timestamp", &timestamp)]);
         let summary = language.translate(
             "toast.report.summary",
-            &[("failed", &draft.failures.to_string())],
+            &[("failed", &(completed.summary.failed
+                + usize::from(completed.summary.rollback_failed)).to_string())],
         );
         publish_failure_report(
             draft.path.as_deref(),
             &output.with_extension("tmp"),
             &output,
             [title, "\n", &generated, "\n", &summary, "\n\n"],
-            &Cancellation::default(),
+            &self.cancellation,
         )?;
         drop(draft);
         self.trim(now, shared);
@@ -871,6 +1012,9 @@ impl Reports {
             return;
         };
         for entry in entries.flatten() {
+            if self.cancellation.cancelled() {
+                break;
+            }
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !(name.starts_with("failed-") && (name.ends_with(".txt") || name.ends_with(".tmp"))
@@ -928,6 +1072,7 @@ impl Toast {
     pub(super) fn start(cwd: &Path, diagnostic: PathBuf, retention: u64) -> io::Result<Self> {
         let cwd = cwd.to_owned();
         let reports = Arc::new(Reports {
+            cancellation: Cancellation::new(),
             directory: diagnostic
                 .parent()
                 .unwrap_or_else(|| Path::new(""))
@@ -960,11 +1105,15 @@ impl Toast {
                 let mut sequence = 0u64;
                 let mut last_update: Option<Instant> = None;
                 let minimum_interval = Duration::from_millis(50);
-                loop {
+                'presenter: loop {
                     let mut state = presenter_shared.state.lock().unwrap();
                     let display = loop {
                         if state.stopping {
-                            return;
+                            break 'presenter;
+                        }
+                        state.settle(Instant::now());
+                        if std::mem::take(&mut state.clear) {
+                            break Display::Clear;
                         }
                         if let Some(completed) = state.completed.pop_front() {
                             if state.completed.capacity() > 256 {
@@ -986,34 +1135,77 @@ impl Toast {
                                 state.dirty = false;
                                 break Display::Progress(snapshot);
                             }
+                            let remaining = state.groups.front()
+                                .and_then(|group| group.finalize_at)
+                                .map_or(remaining, |deadline| remaining.min(
+                                    deadline.saturating_duration_since(Instant::now())));
                             state = presenter_shared
                                 .changed
                                 .wait_timeout(state, remaining)
                                 .unwrap()
                                 .0;
+                        } else if let Some(deadline) = state.groups.front()
+                            .and_then(|group| group.finalize_at)
+                        {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            state = presenter_shared.changed.wait_timeout(state, remaining).unwrap().0;
                         } else {
                             state = presenter_shared.changed.wait(state).unwrap();
                         }
                     };
+                    if matches!(display, Display::Clear) {
+                        let _ = presenter.clear();
+                        continue;
+                    }
                     drop(state);
+                    let mut published_report = None;
+                    let mut completion = None;
                     let snapshot = match display {
+                        Display::Clear => unreachable!(),
                         Display::Progress(snapshot) => snapshot,
                         Display::Completed(completed) => {
                             let report =
                                 match presenter_reports.publish(&completed, &presenter_shared) {
                                     Ok(report) => report,
                                     Err(error) => {
-                                        eprintln!("SunPack toast failure report: {error}");
+                                        if !presenter_reports.cancellation.cancelled() {
+                                            eprintln!("SunPack toast failure report: {error}");
+                                        }
                                         None
                                     }
                                 };
-                            Snapshot::completed(completed, report)
+                            published_report = report.clone();
+                            let snapshot = Snapshot::completed(&completed, report);
+                            completion = Some(completed);
+                            snapshot
                         }
                     };
-                    sequence = sequence.wrapping_add(1);
-                    let _ = presenter.show(&snapshot.encode(), sequence);
+                    let payload = snapshot.encode();
+                    // Stop and native publication share this short gate. Report
+                    // IO never holds it, so disable cannot wait on the writer.
+                    let show = || {
+                        sequence = sequence.wrapping_add(1);
+                        let _ = presenter.show(&payload, sequence);
+                    };
+                    let shown = match completion.as_ref() {
+                        Some(completed) => presenter_shared.present_completed(completed, show),
+                        None => presenter_shared.present(show),
+                    };
+                    if !shown {
+                        if let Some(path) = published_report {
+                            let _ = fs::remove_file(path);
+                        }
+                        continue;
+                    }
                     last_update = Some(Instant::now());
                 }
+                let drafts = {
+                    let mut state = presenter_shared.state.lock().unwrap();
+                    (std::mem::take(&mut state.groups), std::mem::take(&mut state.completed))
+                };
+                // The presenter thread owns filesystem cleanup, even while
+                // disabled activities are still held by extraction workers.
+                drop(drafts);
             })?;
         match receive.recv().map_err(io::Error::other)? {
             Ok(()) => Ok(Self {
@@ -1044,6 +1236,7 @@ impl Toast {
 }
 
 enum Display {
+    Clear,
     Progress(Snapshot),
     Completed(Completed),
 }
@@ -1051,17 +1244,19 @@ enum Display {
 impl Drop for Toast {
     fn drop(&mut self) {
         self.publisher.shared.state.lock().unwrap().stopping = true;
+        self.publisher.reports.cancellation.cancel();
         self.publisher.shared.changed.notify_one();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // A writer may be inside a filesystem call. It owns the presenter and
+        // draft cleanup; cancellation makes it exit without showing a stale
+        // toast. Never synchronously join that IO from Watch's service thread.
+        drop(self.thread.take());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{CleanupResult, Segment};
+    use crate::pipeline::{ArchiveResult, CleanupResult, Segment};
 
     fn queued(id: TaskId, path: &str, parent: Option<TaskId>, index: usize) -> Event {
         Event::Queued {
@@ -1102,13 +1297,7 @@ mod tests {
     fn overlapping_requests_share_progress_stop_and_cleanup_result() {
         // Exercise the same state consumed by the presenter, without opening
         // Windows notifications or depending on update timing.
-        let publisher = Publisher {
-            shared: Arc::default(),
-            reports: Arc::new(Reports {
-                directory: PathBuf::new(),
-                retention: AtomicU64::new(30),
-            }),
-        };
+        let publisher = publisher(PathBuf::new());
         let first = Arc::<str>::from("00000000000000000000000000000001");
         let second = Arc::<str>::from("00000000000000000000000000000002");
         let a = publisher.register(Arc::clone(&first), Language::En);
@@ -1122,7 +1311,7 @@ mod tests {
         progress(&b, 4, "ordinary.7z", 100, 200);
         let initial = current(&publisher);
         assert_eq!(initial.progress, Some(0.4));
-        assert_eq!(initial.label, "3 archives");
+        assert_eq!(initial.label, "2 archives");
         assert_eq!(initial.value, "40% · 200 B / 500 B");
 
         a.event(Event::ResourceWait {
@@ -1158,7 +1347,7 @@ mod tests {
             success: true,
         });
         let snapshot = current(&publisher);
-        assert_eq!(snapshot.status, "1/3 finished");
+        assert_eq!(snapshot.status, "0/2 finished");
         assert_eq!(snapshot.progress, Some(0.56));
 
         let mut stopped = publisher.stop_group(&snapshot.action.unwrap().2);
@@ -1175,9 +1364,11 @@ mod tests {
         a.finish(&Err(io::Error::other("output deletion failed")), true, true);
         b.finish(&Ok(Outcome::default()), true, false);
         assert!(publisher.stop_group(&initial.batch).is_empty());
+        assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+        finish_debounce(&publisher);
+        let interrupted = Snapshot::completed(&take_completed(&publisher), None);
         assert_eq!(current(&publisher).label, "later.zip");
-        let mut state = publisher.shared.state.lock().unwrap();
-        let interrupted = Snapshot::completed(state.completed.pop_front().unwrap(), None);
+        let state = publisher.shared.state.lock().unwrap();
         assert_eq!(
             interrupted.body,
             Language::En.text("interrupt.cleanup_failed")
@@ -1186,6 +1377,7 @@ mod tests {
         drop(state);
 
         let mut outcome = Outcome::default();
+        outcome.archives.push(archive("later.zip", None));
         outcome.cleanup_results.push(CleanupResult {
             path: "later.zip".into(),
             mode: "delete",
@@ -1194,9 +1386,345 @@ mod tests {
             message: "Access denied".to_owned(),
         });
         later.finish(&Ok(outcome), false, false);
-        let mut state = publisher.shared.state.lock().unwrap();
-        let completed = Snapshot::completed(state.completed.pop_front().unwrap(), None);
+        finish_debounce(&publisher);
+        let completed = Snapshot::completed(&take_completed(&publisher), None);
+        let state = publisher.shared.state.lock().unwrap();
         assert!(completed.body.contains("Paths with cleanup errors: 1."));
         assert!(state.groups.is_empty());
+    }
+    fn publisher(directory: PathBuf) -> Publisher {
+        Publisher {
+            shared: Arc::default(),
+            reports: Arc::new(Reports {
+                cancellation: Cancellation::new(),
+                directory,
+                retention: AtomicU64::new(30),
+            }),
+        }
+    }
+
+    fn archive(name: &str, failure: Option<FailureKind>) -> ArchiveResult {
+        ArchiveResult {
+            path: name.into(), format: "zip".into(), output: Some(name.into()),
+            failure: failure.map(|kind| crate::pipeline::Failure::new(kind, name)),
+            files: 1, bytes: 42, encrypted: None, depth: 1,
+            offset: 0, end_offset: None, volume_completeness: None,
+            volume_attempts: None, source_paths: Vec::new(), password: None,
+            discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
+            partial: false, retained: false, recovered_complete_files: 0,
+            promoted: false, promotion_original_path: None,
+        }
+    }
+
+    fn success() -> io::Result<Outcome> {
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive("outer.zip", None));
+        outcome.archives.push(archive("nested.zip", None));
+        Ok(outcome)
+    }
+
+    fn finish_debounce(publisher: &Publisher) {
+        let mut state = publisher.shared.state.lock().unwrap();
+        let deadline = state.groups.front().unwrap().finalize_at.unwrap();
+        state.settle(deadline);
+    }
+
+    fn take_completed(publisher: &Publisher) -> Completed {
+        let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+        assert!(publisher.shared.present_completed(&completed, || {}));
+        completed
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            Self(std::env::temp_dir().join(format!(
+                "sunpack-toast-{}-{}-{}", std::process::id(),
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            )))
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
+        // Unlike aggregate-count tests this exercises report admission: a
+        // retry or pre-extraction error must not create a diagnostic file.
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let invisible = publisher.register(Arc::from("01"), Language::En);
+        invisible.event(queued(1, "invisible.zip", None, 0));
+        let error = Err(io::Error::other("pre-extraction failure"));
+        invisible.record(Path::new("invisible.zip"), &error, false);
+        invisible.finish(&error, false, false);
+        assert!(!directory.0.exists());
+        assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+
+        for (index, kind) in [FailureKind::PasswordRequired, FailureKind::WrongPassword,
+            FailureKind::PasswordInconclusive, FailureKind::MissingVolume].into_iter().enumerate()
+        {
+            let activity = publisher.register(Arc::from(format!("1{index}")), Language::En);
+            activity.event(queued(1, "retry.zip", None, 0));
+            progress(&activity, 1, "retry.zip", 1, 2);
+            let mut outcome = Outcome::default();
+            outcome.archives.push(archive("successful-sibling.zip", None));
+            outcome.archives.push(archive("retry.zip", Some(kind)));
+            let result = Ok(outcome);
+            activity.record(Path::new("retry.zip"), &result, false);
+            activity.finish(&result, false, false);
+            let mut state = publisher.shared.state.lock().unwrap();
+            assert!(state.groups.is_empty());
+            assert!(state.completed.is_empty());
+            assert!(std::mem::take(&mut state.clear));
+            assert!(!directory.0.exists());
+        }
+
+        // Retry evidence from an accepted segment still owns a failed
+        // physical carrier, but an entirely accepted carrier stays successful.
+        for (index, kind) in [FailureKind::MissingVolume, FailureKind::WrongPassword]
+            .into_iter().enumerate()
+        {
+            let activity = publisher.register(Arc::from(format!("3{index}")), Language::En);
+            activity.event(queued(1, "carrier.bin", None, 0));
+            progress(&activity, 1, "carrier.bin", 1, 2);
+            let mut outcome = Outcome::default();
+            let mut partial = archive("carrier.bin", Some(kind));
+            partial.partial = true;
+            outcome.archives.push(partial);
+            outcome.archives.push(archive("CARRIER.bin", Some(FailureKind::Damaged)));
+            let result = Ok(outcome);
+            activity.record(Path::new("carrier.bin"), &result, false);
+            activity.finish(&result, false, false);
+            assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
+            assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+            assert!(!directory.0.exists());
+
+            let mut accepted = archive("carrier.bin", Some(kind));
+            accepted.partial = true;
+            let mut outcome = Outcome::default();
+            outcome.archives.push(accepted);
+            let summary = Summary::for_result(&Ok(outcome), false, false, true);
+            assert_eq!((summary.succeeded, summary.failed), (1, 0));
+        }
+
+        let activity = publisher.register(Arc::from("20"), Language::En);
+        activity.event(queued(1, "terminal.zip", None, 0));
+        progress(&activity, 1, "terminal.zip", 1, 2);
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive("successful-sibling.zip", None));
+        outcome.archives.push(archive("terminal.zip", Some(FailureKind::Damaged)));
+        outcome.archives.push(archive("password-only.zip", Some(FailureKind::WrongPassword)));
+        let mut carrier = archive("blocked-carrier.bin", Some(FailureKind::MissingVolume));
+        carrier.partial = true;
+        outcome.archives.push(carrier);
+        outcome.archives.push(archive("blocked-carrier.bin", Some(FailureKind::Damaged)));
+        let mut partial = archive("accepted-recovery.zip", Some(FailureKind::Damaged));
+        partial.partial = true;
+        outcome.archives.push(partial);
+        outcome.errors.push(crate::pipeline::InputError {
+            path: "log-only-scan".into(), message: "log-only-scan".into(),
+            kind: InputErrorKind::FilesystemScan, scan_operation: Some("read".into()),
+            scan_count: Some(7),
+        });
+        let result = Ok(outcome);
+        activity.record(Path::new("terminal.zip"), &result, false);
+        activity.finish(&result, false, false);
+        finish_debounce(&publisher);
+        let completed = take_completed(&publisher);
+        assert_eq!((completed.summary.succeeded, completed.summary.failed), (0, 1));
+        let draft = completed.report.lock().unwrap();
+        assert_eq!(draft.failures, 1);
+        let text = fs::read_to_string(draft.path.as_ref().unwrap()).unwrap();
+        assert!(text.contains("terminal.zip"));
+        assert!(!text.contains("password-only.zip"));
+        assert!(!text.contains("blocked-carrier.bin"));
+        assert!(!text.contains("accepted-recovery.zip"));
+        assert!(!text.contains("log-only-scan"));
+    }
+
+    #[test]
+    fn debounce_coalesces_requests_without_waiting_for_invisible_scans() {
+        // Drive the production deadline directly. This catches early final
+        // notifications, recursive archive counts, and orphaned activities
+        // after an invisible scan moves to the next batch, without sleeping.
+        let publisher = publisher(PathBuf::new());
+        // This first request seeds the original batch but outlives it. Its
+        // next batch must have a new notification tag and spool filename.
+        let c = publisher.register(Arc::from("03"), Language::En);
+        c.event(queued(3, "slow-scan.zip", None, 0));
+        let a = publisher.register(Arc::from("01"), Language::En);
+        a.event(queued(1, "outer.zip", None, 0));
+        progress(&a, 1, "outer.zip", 2, 2);
+        a.finish(&success(), false, false);
+        let first_deadline = publisher.shared.state.lock().unwrap()
+            .groups.front().unwrap().finalize_at.unwrap();
+        let b = publisher.register(Arc::from("02"), Language::En);
+        b.event(queued(2, "next.zip", None, 0));
+        {
+            let mut state = publisher.shared.state.lock().unwrap();
+            assert_eq!(state.groups.front().unwrap().finalize_at, Some(first_deadline));
+            state.settle(first_deadline - Duration::from_millis(1));
+            assert!(state.completed.is_empty());
+        }
+        progress(&b, 2, "next.zip", 1, 2);
+        assert!(publisher.shared.state.lock().unwrap().groups.front().unwrap().finalize_at.is_none());
+        assert_eq!(current(&publisher).status, "1/2 finished");
+        b.finish(&success(), false, false);
+        finish_debounce(&publisher);
+        {
+            let completed = take_completed(&publisher);
+            let state = publisher.shared.state.lock().unwrap();
+            assert_eq!(completed.summary.succeeded, 2);
+            assert_eq!(state.groups.front().unwrap().requests.len(), 1);
+            assert_ne!(state.groups.front().unwrap().id, completed.id);
+        }
+        progress(&c, 3, "slow-scan.zip", 1, 2);
+        assert_eq!(current(&publisher).label, "slow-scan.zip");
+        assert_eq!(current(&publisher).status, "0/1 finished");
+        c.finish(&success(), false, false);
+        finish_debounce(&publisher);
+        assert_eq!(take_completed(&publisher).summary.succeeded, 1);
+        assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
+    }
+
+    #[test]
+    fn a_failed_append_poisons_previously_written_report_records() {
+        // A single failed record must invalidate the whole report, including
+        // earlier successful appends. Low-level append rollback tests cannot
+        // detect publication of that otherwise well-formed incomplete file.
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let draft = Arc::new(Mutex::new(ReportDraft::default()));
+        let error = Err(io::Error::other("terminal failure"));
+        publisher.reports.append("81", Language::En, &draft, Path::new("a.zip"), &error).unwrap();
+        let path = draft.lock().unwrap().path.clone().unwrap();
+        let original = fs::read(&path).unwrap();
+        // Point the next append at a directory, an actual deterministic IO
+        // failure on Windows and Unix, then restore the valid first record.
+        draft.lock().unwrap().path = Some(directory.0.clone());
+        assert!(publisher.reports.append("81", Language::En, &draft, Path::new("b.zip"), &error).is_err());
+        draft.lock().unwrap().path = Some(path.clone());
+        publisher.reports.append("81", Language::En, &draft, Path::new("c.zip"), &error).unwrap();
+        assert!(draft.lock().unwrap().poisoned);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let completed = Completed {
+            generation: 0,
+            id: Arc::from("81"), language: Language::En, elapsed: Duration::ZERO,
+            summary: Summary { failed: 3, ..Summary::default() }, report: draft,
+        };
+        assert!(publisher.reports.publish(&completed, &publisher.shared).unwrap().is_none());
+        drop(completed);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn disabling_toasts_cancels_and_detaches_an_active_report_writer() {
+        // Hold a writer on a channel rather than timing large disk writes.
+        // Drop must return before release, and both the report IO and the
+        // presentation gate must reject the writer's late completion.
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let draft = Arc::new(Mutex::new(ReportDraft::default()));
+        let result = Err(io::Error::other("failure"));
+        publisher.reports.append("81", Language::En, &draft, Path::new("a.zip"), &result).unwrap();
+        let path = draft.lock().unwrap().path.clone().unwrap();
+        let completed = Completed {
+            generation: 0,
+            id: Arc::from("81"), language: Language::En, elapsed: Duration::ZERO,
+            summary: Summary { failed: 1, ..Summary::default() }, report: draft,
+        };
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let worker = publisher.clone();
+        let thread = thread::spawn(move || {
+            let draft = completed.report.lock().unwrap();
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            drop(draft);
+            assert!(worker.reports.cancellation.cancelled());
+            assert!(worker.reports.append("81", Language::En, &completed.report,
+                Path::new("b.zip"), &result).is_err());
+            assert!(worker.reports.publish(&completed, &worker.shared).is_err());
+            assert!(!worker.shared.present(|| panic!("stale toast after disable")));
+            drop(completed);
+            done.send(()).unwrap();
+        });
+        ready.recv().unwrap();
+        let toast = Toast { publisher: publisher.clone(), thread: Some(thread) };
+        let (stopped, stop_complete) = mpsc::channel();
+        let stop = thread::spawn(move || {
+            drop(toast);
+            stopped.send(()).unwrap();
+        });
+        let returned = stop_complete.recv_timeout(Duration::from_secs(5));
+        // Always release before asserting, so a regression cannot leak a
+        // blocked test thread or leave the temporary report locked.
+        release.send(()).unwrap();
+        stop.join().unwrap();
+        assert!(returned.is_ok(), "disable synchronously joined the active writer");
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!path.exists());
+        assert!(!fs::read_dir(&directory.0).unwrap().any(|entry| {
+            entry.unwrap().path().extension().is_some_and(|ext| ext == "txt")
+        }));
+    }
+    #[test]
+    fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
+        // Pause at the report/presentation boundary, where checking only
+        // shutdown allowed an old final toast to overwrite fresh progress.
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let first = publisher.register(Arc::from("01"), Language::En);
+        first.event(queued(1, "first.zip", None, 0));
+        progress(&first, 1, "first.zip", 1, 2);
+        let failure = Err(io::Error::other("first failure"));
+        first.record(Path::new("first.zip"), &failure, false);
+        first.finish(&failure, false, false);
+        finish_debounce(&publisher);
+        let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+        let batch = Arc::clone(&completed.id);
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let worker = publisher.clone();
+        let thread = thread::spawn(move || {
+            let report = worker.reports.publish(&completed, &worker.shared).unwrap().unwrap();
+            entered.send(report.clone()).unwrap();
+            released.recv().unwrap();
+            assert!(!worker.shared.present_completed(&completed, || {
+                panic!("old completion replaced active batch progress");
+            }));
+            fs::remove_file(report).unwrap();
+        });
+        let stale_report = ready.recv().unwrap();
+        let next = publisher.register(Arc::from("02"), Language::En);
+        next.event(queued(2, "next.zip", None, 0));
+        progress(&next, 2, "next.zip", 1, 2);
+        assert_eq!(current(&publisher).batch, batch.as_ref());
+        assert_eq!(current(&publisher).status, "1/2 finished");
+        let failure = Err(io::Error::other("second failure"));
+        next.record(Path::new("next.zip"), &failure, false);
+        next.finish(&failure, false, false);
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(!stale_report.exists());
+        assert_eq!(publisher.shared.state.lock().unwrap().groups.front().unwrap().summary.failed, 2);
+        finish_debounce(&publisher);
+        let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+        let report = publisher.reports.publish(&completed, &publisher.shared).unwrap().unwrap();
+        assert!(publisher.shared.present_completed(&completed, || {}));
+        assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
+        let text = fs::read_to_string(report).unwrap();
+        assert!(text.contains("first failure"));
+        assert!(text.contains("second failure"));
+        assert_eq!(completed.summary.failed, 2);
     }
 }

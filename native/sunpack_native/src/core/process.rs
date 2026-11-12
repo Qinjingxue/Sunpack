@@ -127,21 +127,45 @@ pub(crate) fn apply_mode(mode: ProcessMode) -> io::Result<()> {
 struct PriorityPolicy {
     configured: ProcessMode,
     foreground: usize,
+    foreground_override: bool,
 }
 
 static PRIORITY: Mutex<PriorityPolicy> = Mutex::new(PriorityPolicy {
     configured: ProcessMode::Normal,
     foreground: 0,
+    foreground_override: false,
 });
 
 impl PriorityPolicy {
     fn effective(&self) -> ProcessMode {
-        if self.foreground == 0 {
-            self.configured
-        } else {
+        if self.foreground_override {
             ProcessMode::High
+        } else {
+            self.configured
         }
     }
+
+    fn enter_foreground(&mut self) {
+        self.foreground += 1;
+        self.foreground_override = true;
+    }
+
+    fn leave_foreground(&mut self) {
+        self.foreground -= 1;
+    }
+
+    fn expire_foreground_override(&mut self) {
+        if self.foreground == 0 {
+            self.foreground_override = false;
+        }
+    }
+}
+
+pub(crate) fn foreground_active() -> bool {
+    PRIORITY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .foreground != 0
 }
 
 pub(crate) fn effective_mode() -> ProcessMode {
@@ -157,12 +181,18 @@ pub(crate) fn configure_mode(mode: ProcessMode) -> io::Result<()> {
     apply_mode(priority.effective())
 }
 
+pub(crate) fn expire_foreground_override() -> io::Result<()> {
+    let mut priority = PRIORITY.lock().unwrap_or_else(|error| error.into_inner());
+    priority.expire_foreground_override();
+    apply_mode(priority.effective())
+}
+
 pub(crate) struct ForegroundPriority;
 
 impl ForegroundPriority {
     pub(crate) fn enter() -> Self {
         let mut priority = PRIORITY.lock().unwrap_or_else(|error| error.into_inner());
-        priority.foreground += 1;
+        priority.enter_foreground();
         let _ = apply_mode(priority.effective());
         Self
     }
@@ -171,8 +201,9 @@ impl ForegroundPriority {
 impl Drop for ForegroundPriority {
     fn drop(&mut self) {
         let mut priority = PRIORITY.lock().unwrap_or_else(|error| error.into_inner());
-        priority.foreground -= 1;
-        let _ = apply_mode(priority.effective());
+        // Watch owns expiry after its idle interval. Without Watch, the runtime
+        // expires the override as soon as the last foreground request leaves.
+        priority.leave_foreground();
     }
 }
 
@@ -376,18 +407,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn foreground_priority_restores_only_after_the_last_request() {
-        // Pure policy check: no global process-priority changes and no sleeps.
-        // Cache maintenance must not control the lifetime of this override.
-        let mut policy = PriorityPolicy { configured: ProcessMode::Background, foreground: 2 };
+    fn foreground_priority_survives_completion_until_idle_maintenance() {
+        // Covers retained CLI QoS, overlapping requests, and config reload with
+        // one pure policy scenario; no global priority changes or timed waits.
+        let mut policy = PriorityPolicy {
+            configured: ProcessMode::Background,
+            foreground: 0,
+            foreground_override: false,
+        };
+        assert_eq!(policy.effective(), ProcessMode::Background);
+        policy.enter_foreground();
+        policy.enter_foreground();
         assert_eq!(policy.effective(), ProcessMode::High);
-        policy.foreground -= 1;
+        policy.leave_foreground();
+        policy.expire_foreground_override();
         assert_eq!(policy.effective(), ProcessMode::High);
         policy.configured = ProcessMode::Normal;
         assert_eq!(policy.effective(), ProcessMode::High);
-        policy.foreground -= 1;
+        policy.leave_foreground();
+        assert_eq!(policy.foreground, 0);
+        assert_eq!(policy.effective(), ProcessMode::High);
+        // A request arriving before maintenance must protect the same override.
+        policy.enter_foreground();
+        policy.expire_foreground_override();
+        assert_eq!(policy.effective(), ProcessMode::High);
+        policy.leave_foreground();
+        policy.expire_foreground_override();
         assert_eq!(policy.effective(), ProcessMode::Normal);
         policy.configured = ProcessMode::Background;
+        assert_eq!(policy.effective(), ProcessMode::Background);
+        // The no-Watch path can expire immediately after the final release.
+        policy.enter_foreground();
+        policy.leave_foreground();
+        policy.expire_foreground_override();
+        policy.expire_foreground_override();
         assert_eq!(policy.effective(), ProcessMode::Background);
     }
 }
