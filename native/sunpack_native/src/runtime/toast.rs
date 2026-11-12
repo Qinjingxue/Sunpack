@@ -1779,9 +1779,16 @@ mod tests {
         let draft = completed.report.lock().unwrap();
         assert_eq!(draft.failures, 1);
         let text = fs::read_to_string(draft.path.as_ref().unwrap()).unwrap();
-        assert!(text.contains("c/nested.zip"));
-        assert!(!text.contains("promoted.zip"));
-        assert!(!text.contains("d.zip"));
+        // Match complete report-header paths: "c/nested.zip" contains "d.zip".
+        let has_report_path = |path: &str| text.lines().any(|line| {
+            line.split_once("] ").is_some_and(|(index, reported)| {
+                index.strip_prefix('[').is_some_and(|index| index.parse::<usize>().is_ok())
+                    && reported == path
+            })
+        });
+        assert!(has_report_path("c/nested.zip"));
+        assert!(!has_report_path("promoted.zip"));
+        assert!(!has_report_path("d.zip"));
 
         // No owner metadata: independent paths stay independent, while
         // case-folded segments of one physical carrier remain one task.
