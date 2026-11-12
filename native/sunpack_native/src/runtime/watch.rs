@@ -32,6 +32,8 @@ use std::time::Instant;
 
 mod journal;
 mod quiet;
+#[cfg(test)]
+mod crash_boundaries;
 
 const ROOTS_FILE: &str = "sunpack_watch_roots.txt";
 const WATCH_METADATA: &str = ".sunpack_watch";
@@ -950,16 +952,17 @@ impl FileObserver {
         recursive: bool,
         notify: impl Fn(Option<Vec<String>>) + Send + 'static,
     ) -> io::Result<Self> {
-        Self::start_with_filter(path, recursive, 0x01 | 0x02 | 0x08 | 0x10, notify)
+        Self::start_with_filter(path, recursive, 0x01 | 0x02 | 0x08 | 0x10, 4096, notify)
     }
 
     fn start_with_filter(
         path: &Path,
         recursive: bool,
         filter: u32,
+        buffer_bytes: usize,
         notify: impl Fn(Option<Vec<String>>) + Send + 'static,
     ) -> io::Result<Self> {
-        let changes = Arc::new(NativeConfigChanges::observe(path.to_owned(), recursive, filter)?);
+        let changes = Arc::new(NativeConfigChanges::observe(path.to_owned(), recursive, filter, buffer_bytes)?);
         let stopping = Arc::new(AtomicBool::new(false));
         let read = Arc::clone(&changes);
         let stop = Arc::clone(&stopping);
@@ -1028,8 +1031,10 @@ impl RootObserver {
         let journal = Arc::clone(journal);
         // Match watchdog's business-root notifications, including ACL and
         // attributes-only changes that can make an unreadable candidate usable.
+        // Use watchdog 6.0.0's exact 64,000-byte business-root buffer; small
+        // configuration/ancestor subscriptions keep their 4 KiB allocation.
         let observer = FileObserver::start_with_filter(
-            directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, move |names| {
+            directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, 64_000, move |names| {
             let mut paths = names.map(|names| names.into_iter()
                 .map(|name| watched_dir.join(name))
                 .filter(|path| scope.contains(&path.to_string_lossy())).collect::<Vec<_>>());

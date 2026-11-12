@@ -46,4 +46,6 @@ Watch 用例直接终止真实常驻进程：开始输出时挂起 worker，验�
 
 Journal 的 Rust 测试还会启动独立 owner 子进程，并在真实 durable WAL 尚未快照、快照已发布但被锁定的旧 WAL 尚未退役、旧 WAL 已退役这三个边界由父进程强制终止。每种情况都带有新尾部记录，重开两次检查密码代、提升源凭据和输出 ownership 的恢复；它不靠正常析构收尾，也不修改生产路径加入故障注入。
 
-与 main 中旧 Python 故障注入工具相比，完整 Watch 进程仍缺少快照写入进行中，以及分卷提升的准备／部分移动／重定基准边界的精确硬终止验证。上述 Journal 子进程测试并未覆盖这些集成边界，WAL 帧、快照完整性与 durable/seal 单测也不能替代它们。Watch 黑盒测试需要 Windows 和隔离 Watch Broker，Python 语法检查不能证明恢复行为通过。
+Watch 的 cfg(test) 进程边界用例还会在真实 flatten 意图已持久化、根目录移到 work、叶目录已发布、输出 rebase 已提交但 work 尚未清理四个边界，由父进程强制终止 owner。恢复调用生产 recover_flattens，重复重开校验目录身份、逻辑 checkpoint、owned 排除和意图退役；未发生移动的 prepare 边界验证恢复退役意图后仍可继续执行。分卷提升用例构造真实 durable promotion 意图并移动零个、一个或全部成员，在发布提升来源收据前后硬终止；独立恢复进程调用生产 Scheduler::recover_pending，检查旧 owner 退役、原位置与已移动位置的所有成员恰好入队、数据与文件身份保持，并再次重开验证幂等。
+
+这些 cfg(test) 用例直接构造合法持久化状态并执行生产文件操作，不是完整安装版 sunpack-runtime 的故障注入。它们不需要为生产代码添加等待或测试开关，也不证明 worker 到回调间的全部调度时序；完整 Watch 进程在快照写入进行中及 promotion/flatten 精确内部步骤的端到端硬终止仍未覆盖。Watch 黑盒测试需要 Windows 和隔离 Watch Broker，Python 语法检查不能证明恢复行为通过。

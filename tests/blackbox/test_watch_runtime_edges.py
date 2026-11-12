@@ -260,18 +260,20 @@ def test_owned_outputs_are_excluded_after_restart_but_admit_replacement(
 
 def test_watch_retries_unobserved_candidate_after_acl_only_recovery(package, tmp_path):
     # No data/rename event occurs after permission is restored. Validate real
-    # attributes denial and an idle, empty queue before the SECURITY-only repair;
-    # the unreadable path may be filtered before candidate_error is logged.
+    # metadata-visible but identity-unreadable candidate and an idle, empty queue
+    # before the SECURITY-only repair. A raw SYNCHRONIZE deny is necessary:
+    # FileSystemAccessRule strips SYNCHRONIZE from Deny rules, and denying
+    # parent enumeration would fail is_file before reaching candidate_error.
     watched = tmp_path / "watched"
     watched.mkdir()
     output = tmp_path / "out"
-    source = tmp_path / "restricted.zip"
+    source = watched / "restricted.zip"
     _zip(source, "restored.txt", b"ACL-only arrival recovery")
     idle_probe = tmp_path / "idle-probe.zip"
     _zip(idle_probe, "probe.txt", b"idle reader barrier")
     acl_script = tmp_path / "candidate-acl.ps1"
     acl_script.write_text(r"""
-param([string]$Path, [string]$Saved, [switch]$Restore, [switch]$Directory)
+param([string]$Path, [string]$Saved, [switch]$Restore)
 $ErrorActionPreference = 'Stop'
 $acl = Get-Acl -LiteralPath $Path
 if ($Restore) {
@@ -279,9 +281,10 @@ if ($Restore) {
 } else {
     [IO.File]::WriteAllText($Saved, $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $rights = if ($Directory) { [Security.AccessControl.FileSystemRights]::ListDirectory } else { [Security.AccessControl.FileSystemRights]::ReadAttributes }
-    $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, [Security.AccessControl.AccessControlType]::Deny)
-    $acl.AddAccessRule($rule)
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor($acl.Sddl)
+    $ace = New-Object Security.AccessControl.CommonAce([Security.AccessControl.AceFlags]::None, [Security.AccessControl.AceQualifier]::AccessDenied, 0x100000, $sid, $false, $null)
+    $raw.DiscretionaryAcl.InsertAce(0, $ace)
+    $acl.SetSecurityDescriptorSddlForm($raw.GetSddlForm([Security.AccessControl.AccessControlSections]::Access), [Security.AccessControl.AccessControlSections]::Access)
 }
 Set-Acl -LiteralPath $Path -AclObject $acl
 if ($Restore) {
@@ -290,28 +293,22 @@ if ($Restore) {
 }
 """, encoding="utf-8")
     saved = tmp_path / "original-acl.txt"
-    saved_directory = tmp_path / "original-directory-acl.txt"
 
-    def acl(path, restore=False, directory=False):
+    def acl(path, restore=False):
         command = ["powershell.exe", "-NoProfile", "-File", str(acl_script),
-                   "-Path", str(path), "-Saved", str(saved_directory if directory else saved)]
-        if directory:
-            command.append("-Directory")
+                   "-Path", str(path), "-Saved", str(saved)]
         if restore:
             command.append("-Restore")
         subprocess.run(command, check=True, capture_output=True, text=True)
 
     package.configure(watch={"runtime_cache_cleanup_idle_seconds": 0.25})
-    package.json("watch", "add", watched, "-o", output)
-    package.json("watch", "start", "--no-tray")
+    package.json("watch", "add", watched, "-R", "-o", output)
     events = package.data / ".sunpack_watch" / "events.json"
     current = source
     try:
         acl(source)
-        acl(watched, directory=True)
-        target = watched / source.name
-        source.rename(target)
-        current = target
+        package.json("watch", "start", "--no-tray")
+        assert current.is_file() and current.stat().st_size > 0
         # Assert that this machine/token really reaches the required failure:
         # FILE_READ_ATTRIBUTES alone may remain available through parent list.
         import ctypes
@@ -325,6 +322,17 @@ if ($Restore) {
             kernel.CloseHandle(ctypes.c_void_p(handle))
             pytest.fail("ACL fixture did not deny FILE_READ_ATTRIBUTES")
         assert error == 5, error
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                history = native_fixture("display_events", path=str(events))["history"]
+                if any(item.get("event") == "candidate_error" and Path(item.get("path", "")) == current for item in history):
+                    break
+            except (OSError, subprocess.CalledProcessError):
+                pass
+            time.sleep(0.01)
+        else:
+            pytest.fail("Identity denial did not reach the exact candidate_error path")
         assert package.json("watch", "status")["summary"]["pending"] == 0
         package.json("scan", idle_probe)
         # Reader-cache release is an observable idle-maintenance barrier. An
@@ -343,13 +351,10 @@ if ($Restore) {
             pytest.fail("Watch idle maintenance did not release the foreground reader")
         assert saw_cached_reader, "idle barrier did not observe a retained reader"
         assert not list(output.rglob("restored.txt"))
-        acl(watched, restore=True, directory=True)
         acl(current, restore=True)
         _wait_for_output(output, "restored.txt", b"ACL-only arrival recovery")
         assert len(list(output.rglob("restored.txt"))) == 1
     finally:
-        if saved_directory.exists():
-            acl(watched, restore=True, directory=True)
         if saved.exists():
             acl(current, restore=True)
         package.json("watch", "stop")

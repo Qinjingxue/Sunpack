@@ -1273,7 +1273,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     .request
                     .max_depth
                     .saturating_sub(depth.saturating_sub(1));
-                let children_already_complete = checkpoint
+                let mut children_already_complete = checkpoint
                     .is_some_and(|checkpoint| checkpoint.children_complete(remaining_depth));
                 let mut executed = if let Some(checkpoint) = checkpoint {
                     let mut input = logical.input;
@@ -1284,12 +1284,20 @@ impl<'run, O: Observer> Run<'run, O> {
                         // root. Carry its logical failure, not its output slot.
                         result.output = None;
                     }
-                    if result.partial
-                        && this.request.config.extraction.content_requirement
-                            == ContentRequirement::Complete
-                    {
-                        // Apply physical retention after sibling aggregation.
-                        result.partial = false;
+                    let previously_partial = result.partial;
+                    if let Some(failure) = result.failure.as_ref() {
+                        // Receipts preserve extraction facts, not the old policy's
+                        // acceptance decision. Main reevaluates retained results
+                        // after a content-policy reload in either direction.
+                        result.partial = result.output.is_some()
+                            && accepts_partial_content(
+                                this.request.config.extraction.content_requirement,
+                                failure.kind, result.recovered_complete_files,
+                            );
+                    }
+                    if result.partial && !previously_partial {
+                        // A rejected retained segment never scanned its children.
+                        children_already_complete = false;
                     }
                     let inventory = if children_already_complete || (result.failure.is_some() && !result.partial) {
                         None
@@ -2353,7 +2361,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             if verified_files > 0 || stats.file_count() > 0 {
                                 result.partial = accepts_partial_content(
                                     self.request.config.extraction.content_requirement,
-                                    failure.kind, verified_files,
+                                    failure.kind, verified_files as u64,
                                 );
                                 result.files = stats.file_count() as u64;
                                 result.recovered_complete_files = verified_files as u64;
@@ -2906,7 +2914,7 @@ fn project_possible_missing_volume(results: &mut [ArchiveResult], split: bool) {
     }
 }
 
-fn accepts_partial_content(requirement: ContentRequirement, failure: FailureKind, complete_files: usize) -> bool {
+fn accepts_partial_content(requirement: ContentRequirement, failure: FailureKind, complete_files: u64) -> bool {
     requirement == ContentRequirement::AllowPartial
         && matches!(failure, FailureKind::Damaged | FailureKind::MissingVolume)
         && complete_files > 0
@@ -4212,7 +4220,8 @@ mod tests {
             (2, FailureKind::Damaged, FailureKind::MissingVolume, false, true),
             // Main inspects all aggregate causes, including accepted partials.
             (2, FailureKind::MissingVolume, FailureKind::Damaged, false, true),
-            (2, FailureKind::MissingVolume, FailureKind::WrongPassword, true, false),
+            // All accepted partials must use main's recoverable categories.
+            (2, FailureKind::MissingVolume, FailureKind::Damaged, true, false),
             (2, FailureKind::Damaged, FailureKind::Damaged, false, false),
             (1, FailureKind::Damaged, FailureKind::PasswordRequired, false, false),
           ] {
@@ -4994,6 +5003,91 @@ mod tests {
             release_reader_resources_under_roots(vec![container.to_string_lossy().into_owned()]).unwrap();
             if container.exists() { fs::remove_dir_all(container).unwrap(); }
             fs::remove_file(source).unwrap();
+        }
+    }
+
+    #[test]
+    fn retained_carrier_recomputes_content_policy_without_reexecuting_inputs() {
+        // Exercise the real receipt/aggregate path in both policy directions.
+        // Missing-volume reload must not freeze the previous acceptance flag;
+        // password and unsupported failures never become accepted partials.
+        for kind in [FailureKind::Damaged, FailureKind::MissingVolume,
+                     FailureKind::WrongPassword, FailureKind::Unsupported] {
+            for (complete_files, has_output) in [(1, true), (0, true), (1, false)] {
+                let source = crate::test_support::temp_file("retained_policy_reload", &[0; 16]);
+                let container = source.with_extension("output");
+                fs::create_dir(&container).unwrap();
+                let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(),
+                    container.file_name().unwrap().to_string_lossy().into_owned());
+                let inputs: Vec<_> = archive_input_slices(&input, &[
+                    ("zip", 0, Some(8)), ("zip", 8, Some(16)),
+                ]).unwrap().0.into_iter().map(Option::unwrap).collect();
+                let generations = HashMap::from([
+                    (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
+                ]);
+                let engine = Engine::new(PathBuf::from("unused-worker"));
+                let mut request = Request::new(vec![source.clone()], Mode::Extract);
+                request.max_depth = 0;
+                Arc::make_mut(&mut request.config).post_extract.archive_cleanup_mode = CleanupMode::Keep;
+                for (index, input) in inputs.iter().enumerate() {
+                    let output = container.join(format!("segment-{index}"));
+                    fs::create_dir(&output).unwrap();
+                    fs::write(output.join("payload"), b"keep").unwrap();
+                    let mut result = receipt(input, DiscoverySource::Embedded, 1);
+                    result.output = Some(output);
+                    result.files = 1;
+                    result.bytes = 4;
+                    if index == 1 {
+                        result.failure = Some(Failure::new(kind, "retained failure"));
+                        result.recovered_complete_files = complete_files;
+                        if !has_output { result.output = None; }
+                    }
+                    let mut checkpoint = InputCheckpoint::create(
+                        &source, input, &result, &generations, Some(&container), true, 0,
+                    ).unwrap();
+                    checkpoint.set_password_signature(|| CandidateSet::new(
+                        Arc::from([]), None, &AttemptCache::default(), None,
+                    ).signature(&input.entry_path));
+                    request.checkpoints.push(checkpoint);
+                }
+                for requirement in [ContentRequirement::Complete,
+                                    ContentRequirement::AllowPartial, ContentRequirement::Complete] {
+                    Arc::make_mut(&mut request.config).extraction.content_requirement = requirement;
+                    let outcome = {
+                        let observer = |_: Event| {};
+                        let mut run = test_run(&engine, &request, &observer);
+                        for (index, checkpoint) in request.checkpoints.iter().enumerate() {
+                            Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+                        }
+                        let task = Task {
+                            primary: None,
+                            inputs: inputs.iter().cloned().map(|input| LogicalInput {
+                                input, password: None, failure: None,
+                            }).collect(),
+                            owned_paths: vec![source.to_string_lossy().into_owned()],
+                            source: DiscoverySource::Embedded, retry: None,
+                        };
+                        Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
+                            run.execute_task(task, 1, 1, None, spawner)
+                        }).unwrap()
+                    };
+                    let accepted = requirement == ContentRequirement::AllowPartial
+                        && matches!(kind, FailureKind::Damaged | FailureKind::MissingVolume)
+                        && complete_files > 0 && has_output;
+                    assert_eq!(outcome.archives.len(), 2);
+                    assert_eq!(outcome.archives[1].partial, accepted);
+                    assert_eq!(outcome.failed(), usize::from(!accepted));
+                    assert!(outcome.archives.iter().all(|result| result.retained));
+                    assert!(outcome.errors.is_empty());
+                    for index in 0..2 {
+                        assert_eq!(fs::read(container.join(format!("segment-{index}/payload"))).unwrap(), b"keep");
+                    }
+                    request.checkpoints = outcome.checkpoints;
+                }
+                release_reader_resources_under_roots(vec![container.to_string_lossy().into_owned()]).unwrap();
+                fs::remove_dir_all(container).unwrap();
+                fs::remove_file(source).unwrap();
+            }
         }
     }
 
