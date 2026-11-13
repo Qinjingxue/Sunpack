@@ -44,11 +44,12 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
             for (source, output) in [(&owner, &root), (&nested, &nested_output)] {
                 let value = json!({
                     "schema_version":1,"carrier":source,
-                    "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
+                    "input":crate::io::archive_state::ArchiveInput::file(
+                        source.to_string_lossy().into_owned(), "zip".into(), "archive".into(),
+                    ),
                     "sources":[{"path":source,"generation":capture_file_generation(source)?.persisted()}],
                     "output":output,"container":root,"files":1,"bytes":17,
-                    "encrypted":false,"discovery_source":"direct","children_complete":true,
-                    "remaining_depth":1,
+                    "encrypted":false,"discovery_source":"direct",
                 });
                 operations.extend(NativeWatchOperations::checkpoint(owner_text,
                     output.to_str().unwrap(), Some(value)));
@@ -355,7 +356,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         assert!(!scheduler.pending.contains_key(&key(&sibling)));
         assert!(scheduler.catalog.observation(sibling.to_str().unwrap()).is_some());
         // A late notification no longer carries the sealed claim observation.
-        scheduler.enqueue(&key(&watched), sibling.to_string_lossy().into_owned(), false).unwrap();
+        scheduler.enqueue(&key(&watched), sibling.to_string_lossy().into_owned(), CandidateAdmission::Observe).unwrap();
         assert_eq!(scheduler.pending.len(), 1);
         assert_eq!(scheduler.due.len(), 1);
         return;

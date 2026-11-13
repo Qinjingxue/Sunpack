@@ -1,4 +1,4 @@
-//! CLI FailureInfo receipts. Execution keeps native evidence; this projection
+//! Public failure reports for CLI and Watch. Execution keeps native evidence; this projection
 //! uses the recorded creation boundary, never a guessed native worker phase.
 use crate::core::i18n::Language;
 use crate::pipeline::{ArchiveResult, DiscoverySource, Failure, FailureContext, FailureKind, InputError};
@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 #[derive(Serialize)]
-pub(super) struct Report {
+pub(in crate::runtime) struct Report {
     kind: &'static str,
     stage: &'static str,
     message: String,
@@ -67,9 +67,9 @@ impl Report {
         report
     }
 
-    fn from_failure(failure: &Failure, language: Language) -> Self {
+    pub(in crate::runtime) fn from_failure(failure: &Failure, language: Language) -> Self {
         let context = failure.context.as_deref();
-        let mut spec = super::super::failure::original_message_spec(failure, language);
+        let mut spec = super::original_message_spec(failure, language);
         let mut stage = "";
         let mut details = json!({});
         let mut user_action = if failure.is_password_retry() { "request_password" } else { "" };
@@ -89,7 +89,7 @@ impl Report {
             Some(FailureContext::InputAdmission { missing_paths }) => {
                 stage = "input_admission";
                 message_language = Language::En;
-                spec = super::super::failure::Message::key("failure.missing_volume");
+                spec = super::Message::key("failure.missing_volume");
                 user_action = "";
                 details = json!({"missing_volume_confirmed": true, "missing_paths": missing_paths});
             }
@@ -97,7 +97,7 @@ impl Report {
                 stage = "password_resolution";
                 if failure.kind == FailureKind::MissingVolume { user_action = "wait_for_volume"; }
                 if failure.kind == FailureKind::BackendUnavailable {
-                    spec = super::super::failure::Message::key("failure.password_verifier_unavailable");
+                    spec = super::Message::key("failure.password_verifier_unavailable");
                 }
                 // Only native resolver results carry an actual diagnostic and
                 // read-error record. A missing one is not reconstructed from a
@@ -107,6 +107,10 @@ impl Report {
                 {
                     details = json!({"diagnostic": failure.message, "read_error": evidence.archive_read_fault.as_ref().map(read_error)});
                 }
+            }
+            Some(FailureContext::WorkerWarning) => {
+                stage = "extraction";
+                message_language = Language::En;
             }
             Some(FailureContext::Extraction) => {
                 stage = "extraction";
@@ -144,11 +148,11 @@ impl Report {
             }
             Some(FailureContext::OutputCreate { error, .. }) => {
                 stage = "preflight";
-                spec = super::super::failure::Message::error("extract.dir_create_failed", error);
+                spec = super::Message::error("extract.dir_create_failed", error);
             }
             Some(FailureContext::Postprocess { destination }) => {
                 stage = "postprocess";
-                spec = super::super::failure::Message::key("");
+                spec = super::Message::key("");
                 raw_message = Some(failure.message.clone());
                 details["destination"] = json!(destination);
                 user_action = "";
@@ -156,7 +160,7 @@ impl Report {
             None => {
                 // Older persisted failures lack the creation boundary. Preserve
                 // their original facts rather than inventing a stage or key.
-                spec = super::super::failure::Message::key("");
+                spec = super::Message::key("");
                 raw_message = Some(failure.message.clone());
             }
         }
@@ -170,7 +174,15 @@ impl Report {
         }
     }
 
-    pub(super) fn filesystem_scan(error: &InputError, language: Language) -> Self {
+    pub(in crate::runtime) fn input_error(error: &InputError, language: Language) -> Self {
+        if let Some(failure) = error.failure.as_deref() {
+            Self::from_failure(failure, language)
+        } else {
+            Self::invalid(error, language)
+        }
+    }
+
+    pub(in crate::runtime) fn filesystem_scan(error: &InputError, language: Language) -> Self {
         let operation = error.scan_operation.as_deref().unwrap_or("");
         let key = format!("filesystem_scan.{operation}");
         let message = language.translate(&key, &[("path", &error.path.to_string_lossy()), ("error", &error.message)]);
@@ -182,13 +194,19 @@ impl Report {
         }
     }
 
-    pub(super) fn invalid(error: &InputError) -> Self {
+    fn invalid(error: &InputError, language: Language) -> Self {
+        let key = "failure.direct_file_required";
+        let message = invalid_input_message(error, language);
         Self {
-            kind: "invalid_input", stage: "input", message: error.message.clone(),
-            message_key: "".into(), message_params: json!({}), user_action: "", causes: vec![],
+            kind: "invalid_input", stage: "input", message,
+            message_key: key.into(), message_params: json!({"path": error.path}), user_action: "", causes: vec![],
             details: json!({"path": error.path}),
         }
     }
+}
+
+pub(in crate::runtime) fn invalid_input_message(error: &InputError, language: Language) -> String {
+    language.translate("failure.direct_file_required", &[("path", &error.path.to_string_lossy())])
 }
 
 fn aggregate_key(all_password: bool) -> &'static str {
@@ -196,19 +214,25 @@ fn aggregate_key(all_password: bool) -> &'static str {
 }
 
 /// Summary text uses the same carrier decision without allocating JSON reports.
-pub(super) fn carrier_message<'a>(entries: &[&'a ArchiveResult], language: Language) -> std::borrow::Cow<'a, str> {
+pub(in crate::runtime) fn carrier_message<'a>(entries: &[&'a ArchiveResult], language: Language) -> std::borrow::Cow<'a, str> {
     let failures = || entries.iter().filter_map(|entry| entry.failure.as_ref());
     if let Some(failure) = failures().find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. }))) {
-        return super::failure_message(failure, language);
+        return super::message(failure, language);
     }
     if failures().any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume)) {
         return language.text("failure.possible_missing_volume").into();
     }
-    if entries.len() > 1 {
-        let key = aggregate_key(failures().all(|failure| matches!(failure.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword)));
+    scan_message(entries.iter().copied(), language)
+}
+
+pub(in crate::runtime) fn scan_message<'a>(entries: impl Iterator<Item = &'a ArchiveResult> + ExactSizeIterator, language: Language) -> std::borrow::Cow<'a, str> {
+    let count = entries.len();
+    let mut failures = entries.filter_map(|entry| entry.failure.as_ref());
+    if count > 1 {
+        let key = aggregate_key(failures.all(|failure| matches!(failure.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword)));
         return language.text(key).into();
     }
-    failures().next().map_or_else(|| "".into(), |failure| super::failure_message(failure, language))
+    failures.next().map_or_else(|| "".into(), |failure| super::original_message_spec(failure, language).render(language))
 }
 
 fn aggregate(causes: Vec<Report>, count: usize, language: Language) -> Report {
@@ -231,84 +255,91 @@ fn aggregate(causes: Vec<Report>, count: usize, language: Language) -> Report {
         details: json!({"segment_count": count, "failed_segment_count": causes.len()}), causes }
 }
 
-pub(super) fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Report> {
+pub(in crate::runtime) fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Report> {
+    archive_groups(archives.iter()).into_iter()
+        .filter_map(|entries| archive_report(&entries, language)).collect()
+}
+
+pub(in crate::runtime) fn archive_groups<'a>(archives: impl IntoIterator<Item = &'a ArchiveResult>) -> Vec<Vec<&'a ArchiveResult>> {
     let mut positions = HashMap::new();
     let mut groups: Vec<Vec<&ArchiveResult>> = Vec::new();
     for archive in archives {
-        let key = (super::path_key(&archive.path), archive.depth);
+        let key = (crate::watch_store::watch_path_key(&archive.path.to_string_lossy()), archive.depth);
         let position = *positions.entry(key).or_insert_with(|| { groups.push(Vec::new()); groups.len() - 1 });
         groups[position].push(archive);
     }
-    groups.into_iter().filter_map(|entries| {
-        let mut causes: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
-            .map(|failure| Report::from_failure(failure, language)).collect();
-        if causes.is_empty() { return None; }
-        let recovery = entries.iter().filter_map(|entry| entry.failure.as_ref()).find_map(recovery);
-        let report_count = recovery.map_or(entries.len(), |recovery| recovery.input_count());
-        let aggregated = entries.len() > 1 || recovery.is_some_and(|recovery| recovery.aggregated());
-        let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
-            .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
-        // Admission inspects the physical task before per-input execution.
-        // Its repeated receipts are one task failure, not failed segments.
-        let admission = entries.iter().all(|entry| entry.failure.as_ref().is_some_and(|failure|
-            matches!(failure.context.as_deref(), Some(FailureContext::InputAdmission { .. }))));
-        let mut report = if admission { causes.remove(0) } else if let Some(failure) = postprocess {
-            let mut outer = Report::from_failure(failure, language);
-            let original: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
-                .flat_map(|failure| {
-                    let wrapped = matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. }));
-                    failure.causes.iter().filter(move |_| wrapped)
-                        .chain(std::iter::once(failure).filter(move |_| !wrapped))
-                }).collect();
-            if !original.is_empty() {
-                let admission = original.iter().all(|failure|
-                    matches!(failure.context.as_deref(), Some(FailureContext::InputAdmission { .. })));
-                let mut reports: Vec<_> = original.iter().map(|failure| Report::from_failure(failure, language)).collect();
-                let mut original_report = if !admission && aggregated {
-                    aggregate(reports, report_count, language)
-                } else { reports.remove(0) };
-                if let Some(scope) = original.iter().find_map(|failure| failure.discovery_scope.as_deref()) {
-                    original_report.details["discovery_scope"] = json!(scope);
-                }
-                if let Some(recovery) = recovery { original_report.attach_recovery(recovery, language); }
-                outer.causes = vec![original_report];
+    groups
+}
+
+pub(in crate::runtime) fn archive_report(entries: &[&ArchiveResult], language: Language) -> Option<Report> {
+    let mut causes: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
+        .map(|failure| Report::from_failure(failure, language)).collect();
+    if causes.is_empty() { return None; }
+    let recovery = entries.iter().filter_map(|entry| entry.failure.as_ref()).find_map(recovery);
+    let report_count = recovery.map_or(entries.len(), |recovery| recovery.input_count());
+    let aggregated = entries.len() > 1 || recovery.is_some_and(|recovery| recovery.aggregated());
+    let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
+        .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
+    // Admission inspects the physical task before per-input execution.
+    // Its repeated receipts are one task failure, not failed segments.
+    let admission = entries.iter().all(|entry| entry.failure.as_ref().is_some_and(|failure|
+        matches!(failure.context.as_deref(), Some(FailureContext::InputAdmission { .. }))));
+    let mut report = if admission { causes.remove(0) } else if let Some(failure) = postprocess {
+        let mut outer = Report::from_failure(failure, language);
+        let original: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
+            .flat_map(|failure| {
+                let wrapped = matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. }));
+                failure.causes.iter().filter(move |_| wrapped)
+                    .chain(std::iter::once(failure).filter(move |_| !wrapped))
+            }).collect();
+        if !original.is_empty() {
+            let admission = original.iter().all(|failure|
+                matches!(failure.context.as_deref(), Some(FailureContext::InputAdmission { .. })));
+            let mut reports: Vec<_> = original.iter().map(|failure| Report::from_failure(failure, language)).collect();
+            let mut original_report = if !admission && aggregated {
+                aggregate(reports, report_count, language)
+            } else { reports.remove(0) };
+            if let Some(scope) = original.iter().find_map(|failure| failure.discovery_scope.as_deref()) {
+                original_report.details["discovery_scope"] = json!(scope);
             }
-            outer
-        } else if aggregated {
-            aggregate(causes, report_count, language)
-        } else { causes.remove(0) };
-        if postprocess.is_none() {
-            if let Some(recovery) = recovery { report.attach_recovery(recovery, language); }
+            if let Some(recovery) = recovery { original_report.attach_recovery(recovery, language); }
+            outer.causes = vec![original_report];
         }
-        let warning = entries.iter().filter_map(|entry| entry.failure.as_ref())
-            .any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume));
-        if warning && postprocess.is_none() {
-            let partial = entries.iter().any(|entry| entry.partial)
-                && entries.iter().all(|entry| entry.failure.is_none() || entry.partial);
-            let key = "failure.possible_missing_volume";
-            let mut details = json!({"missing_volume_confirmed": false,
-                "evidence": if partial { "partial_recovery_on_split_input" } else { "backend_possible_missing_volume" },
-                "partial_recovery": partial, "original_failure_kind": report.kind});
-            for key in ["input_recovery", "retry_output_dir"] {
-                if let Some(value) = report.details.get(key) { details[key] = value.clone(); }
-            }
-            report = Report { kind: "damaged", stage: "extraction_report",
-                message: language.text(key).to_owned(), message_key: key.into(),
-                message_params: json!({}), user_action: "", causes: vec![report], details };
+        outer
+    } else if aggregated {
+        aggregate(causes, report_count, language)
+    } else { causes.remove(0) };
+    if postprocess.is_none() {
+        if let Some(recovery) = recovery { report.attach_recovery(recovery, language); }
+    }
+    let warning = entries.iter().filter_map(|entry| entry.failure.as_ref())
+        .any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume));
+    if warning && postprocess.is_none() {
+        let partial = entries.iter().any(|entry| entry.partial)
+            && entries.iter().all(|entry| entry.failure.is_none() || entry.partial);
+        let key = "failure.possible_missing_volume";
+        let mut details = json!({"missing_volume_confirmed": false,
+            "evidence": if partial { "partial_recovery_on_split_input" } else { "backend_possible_missing_volume" },
+            "partial_recovery": partial, "original_failure_kind": report.kind});
+        for key in ["input_recovery", "retry_output_dir"] {
+            if let Some(value) = report.details.get(key) { details[key] = value.clone(); }
         }
-        if postprocess.is_none() {
-            if let Some(scope) = entries.iter().filter_map(|entry| entry.failure.as_ref())
-                .find_map(|failure| failure.discovery_scope.as_deref())
-            {
-                report.details["discovery_scope"] = json!(scope);
-            }
+        report = Report { kind: "damaged", stage: "extraction_report",
+            message: language.text(key).to_owned(), message_key: key.into(),
+            message_params: json!({}), user_action: "", causes: vec![report], details };
+    }
+    if postprocess.is_none() {
+        if let Some(scope) = entries.iter().filter_map(|entry| entry.failure.as_ref())
+            .find_map(|failure| failure.discovery_scope.as_deref())
+        {
+            report.details["discovery_scope"] = json!(scope);
         }
-        if entries.iter().any(|entry| entry.promoted) {
-            report.details["path"] = json!(entries[0].path);
-            report.details["promoted_nested_input"] = json!(true);
-        }
-        Some(report)
-    }).collect()
+    }
+    if entries.iter().any(|entry| entry.promoted) {
+        report.details["path"] = json!(entries[0].path);
+        report.details["promoted_nested_input"] = json!(true);
+    }
+    Some(report)
 }
 
 #[cfg(test)]
@@ -320,7 +351,7 @@ mod tests {
     fn scan_failure_preserves_main_receipt_and_count() {
         let error = InputError { path: "folder".into(), message: "3".into(),
             kind: crate::pipeline::InputErrorKind::FilesystemScan,
-            scan_operation: Some("output_scan".into()), scan_count: Some(3) };
+            scan_operation: Some("output_scan".into()), scan_count: Some(3), failure: None };
         let report = serde_json::to_value(Report::filesystem_scan(&error, Language::En)).unwrap();
         assert_eq!(report, json!({"kind": "filesystem_error", "stage": "filesystem_scan",
             "message": "Output scan incomplete: folder (3 unreadable entries)",
@@ -363,6 +394,15 @@ mod tests {
         let restored: Failure = serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
         assert_eq!(restored.evidence.unwrap().stderr_tail.as_deref(), Some("worker detail"));
         assert_eq!(failure.message, "raw worker text");
+
+        let warning = Failure::new(FailureKind::Unknown, "raw worker warning")
+            .with_context(FailureContext::WorkerWarning);
+        let report = serde_json::to_value(Report::from_failure(&warning, Language::Zh)).unwrap();
+        assert_eq!(report["stage"], "extraction");
+        assert_eq!(report["message_key"], "failure.warning_busy_or_partial");
+        assert_eq!(report["message"], Language::En.text("failure.warning_busy_or_partial"));
+        assert_eq!(super::super::message(&warning, Language::Zh), Language::Zh.text("failure.warning_busy_or_partial"));
+        assert_eq!(warning.message, "raw worker warning");
 
         let promoted = Failure::new(FailureKind::FilesystemError, "Unable to promote blocked nested input: denied")
             .with_context(FailureContext::Postprocess { destination: "out".into() })

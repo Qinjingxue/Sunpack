@@ -502,10 +502,11 @@ mod tests {
             data.pending.insert(path_key(&pending.path), Arc::new(pending));
             let receipt: crate::pipeline::InputCheckpoint = serde_json::from_value(json!({
                 "schema_version":1,"carrier":base.join("source.zip"),
-                "input":{"entry":base.join("source.zip"),"mode":"file","format":"zip","parts":[],"ranges":[]},
+                "input":crate::io::archive_state::ArchiveInput::file(
+                    base.join("source.zip").to_string_lossy().into_owned(), "zip".into(), "source".into(),
+                ),
                 "sources":[],"output":checkpoint,"container":container,
                 "files":1,"bytes":1,"encrypted":false,"discovery_source":"embedded",
-                "children_complete":true,"remaining_depth":0
             })).unwrap();
             data.runtime.insert("checkpoint|test".into(), serde_json::to_value(receipt).unwrap());
             data.runtime.insert("flatten|test".into(), json!({"root":flatten}));

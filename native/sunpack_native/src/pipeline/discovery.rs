@@ -210,6 +210,7 @@ pub(super) fn discover(
                 path: PathBuf::from(path),
                 message: "A regular input file is required".to_owned(),
                 kind: InputErrorKind::InvalidInput,
+                failure: None,
                 scan_operation: None,
                 scan_count: None,
             }),
@@ -240,17 +241,14 @@ pub(super) fn discover(
         .iter()
         .map(|scope| (scope.key().to_owned(), scope.clone()))
         .collect();
-    let share_recursive = request.recursive && options.can_share_recursive_context();
-    if share_recursive && scopes.len() > 1 {
+    if request.recursive && scopes.len() > 1 {
         let roots: HashMap<_, _> = scopes.iter().map(|scope| (scope.key(), scope)).collect();
         let covered: Vec<_> = scopes
             .iter()
             .map(|scope| {
                 path_ancestors(scope.key()).skip(1).any(|parent| {
                     roots.get(parent).is_some_and(|root| {
-                        root.max_depth.is_none()
-                            && root.contains_key(scope.key())
-                            && walk_can_reach(root.key(), &scope.root)
+                        root.max_depth.is_none() && root.contains_key(scope.key())
                     })
                 })
             })
@@ -281,18 +279,8 @@ pub(super) fn discover(
         logical_scopes
             .entry(logical_scope.key().to_owned())
             .or_insert(logical_scope);
-        if !roots.is_empty() {
-            let key = path_key(path);
-            let parent_path = parent.to_string_lossy();
-            if path_ancestors(&key).any(|candidate| {
-                roots.get(candidate).is_some_and(|scope| {
-                    scope.contains_key(&key)
-                        && (scope.key() == path_key(&parent_path).trim_end_matches('\\')
-                            || (share_recursive && walk_can_reach(scope.key(), &parent_path)))
-                })
-            }) {
-                continue;
-            }
+        if !roots.is_empty() && covering_root(&path_key(path)) {
+            continue;
         }
         let parent = request
             .discovery_scope
@@ -315,7 +303,8 @@ pub(super) fn discover(
     // Share physical enumeration, never the logical relation boundary. Each
     // selected file keeps its original parent scope, including replacement retry.
     let mut shared_roots = HashMap::new();
-    if share_recursive
+    if request.recursive
+        && options.can_share_recursive_context()
         && !request.direct
         && request.discovery_scope.is_none()
         && request.watch_catalog.is_none()
@@ -393,6 +382,16 @@ pub(super) fn discover(
     }
     for (filtered, _) in shared_snapshots.values() {
         result.scan_errors.extend(filtered.scan_errors());
+    }
+    // Main resolves one combined candidate table. Watch batches already
+    // partition file targets by catalog bucket, which stays the read boundary.
+    if request.watch_catalog.is_none() {
+        if let [first, rest @ ..] = tables.as_mut_slice() {
+            for table in rest {
+                first.extend(table);
+            }
+            tables.truncate(1);
+        }
     }
     result.project(&mut tables, candidates, &verified, request, false)?;
     if request.origin == Origin::Watch {
@@ -498,7 +497,9 @@ impl OutputDiscovery {
                 result.tasks.iter().map(|task| {
                     (
                         task.entry().entry_path.as_str(),
-                        task.owned_paths.as_slice(),
+                        task.inputs
+                            .iter()
+                            .flat_map(|logical| logical.input.physical_paths()),
                     )
                 }),
                 policy,
@@ -776,9 +777,8 @@ impl Discovered {
             scoped.finish(table, &mut batch, &mut embedded_tasks, candidates, verified)?;
             self.tasks.extend(scoped.tasks);
             self.blocked_paths.extend(scoped.blocked_paths);
-            self.scan_errors.merge_report(scoped.scan_errors);
+            self.errors.extend(scoped.errors);
         }
-        merge_shared_inputs(&mut self.tasks);
         Ok(())
     }
 
@@ -831,23 +831,24 @@ impl Discovered {
         for row in rows {
             if let Some(error) = row.error {
                 let (path, format) = table.summary(row.index)?;
+                let failure = embedded_read_failure(&path, error.to_string());
                 if format.is_empty() {
-                    self.blocked_paths.insert(path_key(&path));
-                    self.scan_errors.push_detail(
-                        Path::new(&path),
-                        "embedded_scan",
-                        error.to_string(),
-                    );
+                    self.blocked_paths.extend(table.path_keys(row.index)?);
+                    self.errors.push(InputError {
+                        path: PathBuf::from(path),
+                        message: failure.message.clone(),
+                        kind: InputErrorKind::EmbeddedDiscovery,
+                        failure: Some(Box::new(failure)),
+                        scan_operation: None,
+                        scan_count: None,
+                    });
                 } else {
                     let mut task = project_task(
                         table.project(row.index)?,
                         DiscoverySource::Embedded,
                         verified,
                     );
-                    task.inputs[0].failure = Some(Failure::new(
-                        FailureKind::FilesystemError,
-                        error.to_string(),
-                    ));
+                    task.inputs[0].failure = Some(failure);
                     embedded_tasks.push(task);
                 }
             } else if let Some(scan) = row.scan {
@@ -880,7 +881,12 @@ impl Discovered {
                 (path, values)
             })
             .collect();
-        for row in batch.resolve_volumes(table, Some(passwords))? {
+        let volumes = batch.resolve_volumes(table, Some(passwords))?;
+        let mut replaced = HashSet::new();
+        let mut shared_inputs = false;
+        // The volume pass can add logical inputs backed by sources that
+        // Embedded already projected. Ordinary candidates have been deduped.
+        for row in volumes {
             if let Some(scan) = row.scan {
                 let task = project_task(
                     table.project(row.index)?,
@@ -901,26 +907,44 @@ impl Discovered {
                 if let Some(password) = row.password {
                     task.inputs[0].password = Some(password);
                 }
+                for path in &task.owned_paths {
+                    self.blocked_paths.remove(&path_key(path));
+                }
                 embedded_tasks.push(task);
             }
         }
-        if !embedded_tasks.is_empty() {
-            let replaced: HashSet<_> = embedded_tasks
-                .iter()
-                .flat_map(|task| task.owned_paths.iter().map(|path| path_key(path)))
-                .collect();
+        for task in embedded_tasks.iter() {
+            let blocked = task.inputs.len() == 1 && task.inputs[0].failure.is_some();
+            for path in &task.owned_paths {
+                let key = path_key(path);
+                if blocked {
+                    self.blocked_paths.insert(key.clone());
+                }
+                shared_inputs |= !replaced.insert(key);
+            }
+        }
+        if !replaced.is_empty() || !self.blocked_paths.is_empty() {
+            let is_replaced = |path: &str| {
+                let key = path_key(path);
+                replaced.contains(&key) || self.blocked_paths.contains(&key)
+            };
             self.tasks.retain(|task| {
-                task.inputs
+                if let Some(input) = task
+                    .inputs
                     .iter()
-                    .any(|input| input.input.volume_attempts.is_some())
-                    || !task
-                        .owned_paths
-                        .iter()
-                        .any(|path| replaced.contains(&path_key(path)))
+                    .find(|input| input.input.volume_attempts.is_some())
+                {
+                    shared_inputs |= input.input.physical_paths().any(&is_replaced);
+                    true
+                } else {
+                    !task.owned_paths.iter().any(|path| is_replaced(path))
+                }
             });
             self.tasks.append(embedded_tasks);
         }
-        merge_shared_inputs(&mut self.tasks);
+        if shared_inputs && self.tasks.len() > 1 {
+            merge_shared_inputs(&mut self.tasks, &mut self.blocked_paths);
+        }
         Ok(())
     }
 }
@@ -1084,6 +1108,17 @@ fn password_required(item: &EmbeddedCandidate) -> bool {
             || item.validation.starts_with("rar5_encryption_header_crc"))
 }
 
+fn embedded_read_failure(path: &str, error: String) -> Failure {
+    Failure::new(FailureKind::FilesystemError, error.clone()).with_context(
+        super::FailureContext::Discovery {
+            discovery: DiscoverySource::Embedded,
+            reason: "embedded_scan_io_error".to_owned(),
+            path: PathBuf::from(path),
+            error,
+        },
+    )
+}
+
 fn discovery_failure(reason: &str, source: DiscoverySource, path: &str) -> Option<Failure> {
     let (kind, message) = match reason {
         "needs_password" | "embedded_password_required" => {
@@ -1111,7 +1146,7 @@ fn discovery_failure(reason: &str, source: DiscoverySource, path: &str) -> Optio
     Some(failure)
 }
 
-fn merge_shared_inputs(tasks: &mut Vec<Task>) {
+fn merge_shared_inputs(tasks: &mut Vec<Task>, blocked_paths: &mut HashSet<String>) {
     let mut owners = HashMap::new();
     let mut parents: Vec<_> = (0..tasks.len()).collect();
     let mut shared = false;
@@ -1130,15 +1165,16 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>) {
     if !shared {
         return;
     }
-    let mut combined: BTreeMap<usize, Task> = BTreeMap::new();
+    let mut combined: BTreeMap<usize, (Task, bool)> = BTreeMap::new();
     for (index, task) in std::mem::take(tasks).into_iter().enumerate() {
         let group = root(&mut parents, index);
         match combined.entry(group) {
             std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(task);
+                slot.insert((task, false));
             }
             std::collections::btree_map::Entry::Occupied(mut slot) => {
-                let combined = slot.get_mut();
+                let (combined, shared) = slot.get_mut();
+                *shared = true;
                 if combined.primary.is_none() {
                     combined.primary = Some(Box::new(combined.entry().clone()));
                 }
@@ -1153,12 +1189,16 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>) {
             }
         }
     }
-    tasks.extend(combined.into_values().map(|mut task| {
-        if task.primary.is_some() {
-            task.source = DiscoverySource::Embedded;
+    tasks.extend(combined.into_values().map(|(mut task, shared)| {
+        if !shared {
+            return task;
         }
         let mut seen = HashSet::new();
-        task.owned_paths.retain(|path| seen.insert(path_key(path)));
+        task.owned_paths.retain(|path| {
+            let key = path_key(path);
+            blocked_paths.remove(&key);
+            seen.insert(key)
+        });
         task.inputs.sort_by_cached_key(|logical| {
             (
                 path_key(&logical.input.entry_path),
@@ -1188,6 +1228,11 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>) {
             }
             same
         });
+        if task.primary.is_some() && task.inputs.len() > 1 {
+            task.source = DiscoverySource::Embedded;
+        } else if task.inputs.len() == 1 {
+            task.primary = None;
+        }
         task
     }));
 }
@@ -1427,7 +1472,7 @@ mod tests {
             } else {
                 vec![embedded, relation]
             };
-            merge_shared_inputs(&mut tasks);
+            merge_shared_inputs(&mut tasks, &mut HashSet::new());
             assert_eq!(tasks.len(), 1);
             let task = &tasks[0];
             assert_eq!(task.entry().entry_path, paths[0]);

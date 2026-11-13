@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::Path;
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
 fn check(name: &str, status: &str, detail: impl Into<String>) -> Value {
     let mut row = json!({"name":name,"status":status});
@@ -241,7 +241,7 @@ fn context_menu(root: &Path) -> io::Result<Value> {
     ];
     let mut count = 0;
     for parent in parents {
-        count += usize::from(windows::registry_key_exists(HKEY_CURRENT_USER, parent)?);
+        count += usize::from(windows::registry_key_exists(HKEY_LOCAL_MACHINE, parent)?);
     }
     if count == 0 {
         return Ok(check("context_menu", "skip", "not installed"));
@@ -256,7 +256,7 @@ fn context_menu(root: &Path) -> io::Result<Value> {
         "SunPack.FileContextMenu",
     ] {
         let key = format!(r"Software\Classes\{class}\shell\DirectExtract\command");
-        let command = windows::registry_text(HKEY_CURRENT_USER, &key, "")?
+        let command = windows::registry_text(HKEY_LOCAL_MACHINE, &key, "")?
             .ok_or_else(|| io::Error::other(format!("missing command: {key}")))?;
         if !command.replace('/', "\\").to_lowercase().contains(&target) {
             return Ok(check(

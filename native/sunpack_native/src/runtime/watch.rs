@@ -570,15 +570,6 @@ impl Watch {
                     }
                     continue;
                 }
-                if running
-                    && nearest_directory(root).is_some_and(|directory| {
-                        filesystem::watch_filesystem_type(&directory.to_string_lossy())
-                            .is_ok_and(|name| !name.eq_ignore_ascii_case("NTFS"))
-                    })
-                {
-                    rejected.push(root.clone());
-                    continue;
-                }
                 roots.push(Root {
                     path: root.clone(),
                     output: output.map(|value| resolve_output(root, value)).transpose()?,
@@ -588,12 +579,25 @@ impl Watch {
                 });
                 added.push(root.clone());
             }
-            validate_outputs(&roots)?;
             if !added.is_empty() || !updated.is_empty() {
                 write_roots(&path, &roots)?;
             }
         }
-        let apply = self.root_change_status(running, !added.is_empty() || !updated.is_empty()).await?;
+        let changed = !added.is_empty() || !updated.is_empty();
+        let apply = self.root_change_status(running, changed).await?;
+        if running && changed {
+            stage("watch_directory", &Cancellation::new()).await?;
+            let retained: HashSet<_> = read_roots(&path)?.iter().map(|root| key(&root.path)).collect();
+            for changes in [&mut added, &mut updated] {
+                changes.retain(|root| {
+                    let keep = retained.contains(&key(root));
+                    if !keep {
+                        rejected.push(root.clone());
+                    }
+                    keep
+                });
+            }
+        }
         let apply = apply.map(|(applied, generation)| {
             json!({
                 "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
@@ -641,7 +645,7 @@ impl Watch {
         if !running {
             return Ok(None);
         }
-        let applied = changed && self.reload_result().await?.is_some_and(|result| result.is_ok());
+        let applied = changed && self.reload_result().await?.transpose()?.is_some();
         Ok(Some((applied, self.generation.load(Ordering::Relaxed))))
     }
 
@@ -744,14 +748,18 @@ impl Drop for Watch {
 fn validate_outputs(roots: &[Root]) -> io::Result<()> {
     let output: Vec<_> = roots
         .iter()
-        .filter_map(|root| root.output.as_deref().map(key))
+        .filter_map(|root| root.output.as_deref().map(|output| (&root.path, output, key(output))))
         .collect();
-    for (index, outer) in output.iter().enumerate() {
-        for inner in &output[index + 1..] {
-            if inner != outer && (is_path_under(inner, outer) || is_path_under(outer, inner)) {
-                return Err(io::Error::other(
-                    "Watch output roots must not contain one another",
-                ));
+    for (index, (first_root, first_output, first_key)) in output.iter().enumerate() {
+        for (second_root, second_output, second_key) in &output[index + 1..] {
+            if first_key != second_key
+                && (is_path_under(first_key, second_key) || is_path_under(second_key, first_key))
+            {
+                return Err(io::Error::other(format!(
+                    "watch output roots must not contain one another: {} -> {}; {} -> {}",
+                    first_root.display(), first_output.display(),
+                    second_root.display(), second_output.display(),
+                )));
             }
         }
     }
@@ -1088,6 +1096,7 @@ impl RootObserver {
         directory: &Path,
         root: &Root,
         scope: NativeDiscoveryScope,
+        passwords: &Path,
         hub: &Arc<Hub>,
         journal: &Arc<journal::Journal>,
     ) -> io::Result<Self> {
@@ -1095,6 +1104,8 @@ impl RootObserver {
         let id = key(&root.path);
         let watched_dir = directory.to_owned();
         let recursive = root.recursive;
+        let password_name = passwords.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let password_path = key(passwords);
         let hub = Arc::clone(hub);
         let journal = Arc::clone(journal);
         // Match watchdog's business-root notifications, including ACL and
@@ -1105,19 +1116,29 @@ impl RootObserver {
             directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, 64_000, move |names| {
             let mut modified = HashSet::new();
             let mut topology = HashSet::new();
+            let mut password_changed = false;
             let mut paths = names.map(|names| names.into_iter()
-                .map(|change| {
+                .filter_map(|change| {
                     let path = watched_dir.join(change.name);
+                    if path.file_name().is_some_and(|name| {
+                        name.to_string_lossy().eq_ignore_ascii_case(&password_name)
+                    }) && key(&path) == password_path {
+                        password_changed = true;
+                        return None;
+                    }
                     if change.action == 3 { modified.insert(path.clone()); }
                     else { topology.insert(path.clone()); }
-                    path
+                    Some(path)
                 })
                 .filter(|path| scope.contains(&path.to_string_lossy())).collect::<Vec<_>>());
             if let Some(paths) = paths.as_mut() {
                 journal.filter_owned_events(paths, &watched_dir);
             }
-            if paths.as_ref().is_none_or(|paths| !paths.is_empty()) {
+            let root_changed = paths.as_ref().is_none_or(|paths| !paths.is_empty());
+            if password_changed || root_changed {
                 hub.update(|signals| {
+                    signals.password_changed |= password_changed;
+                    if !root_changed { return; }
                     if let Some(paths) = &paths {
                         for path in paths {
                             if topology.contains(path) {
@@ -1233,6 +1254,7 @@ impl RootObservers {
         &mut self,
         root: &Root,
         scope: &NativeDiscoveryScope,
+        passwords: &Path,
         hub: &Arc<Hub>,
         journal: &Arc<journal::Journal>,
     ) -> (bool, Vec<io::Error>) {
@@ -1244,7 +1266,7 @@ impl RootObservers {
             self.root.take();
         }
         if self.root.is_none() && root.path.is_dir() {
-            match RootObserver::start(&root.path, root, scope.clone(), hub, journal) {
+            match RootObserver::start(&root.path, root, scope.clone(), passwords, hub, journal) {
                 Ok(observer) => self.root = Some(observer),
                 Err(error) => errors.push(error),
             }
@@ -1278,6 +1300,15 @@ struct Pending {
     due: Instant,
     force: bool,
     recovery: Option<Arc<Recovery>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateAdmission {
+    Observe,
+    Retry,
+    // Startup USN recovery and pipeline completion errors may clear an
+    // interrupted generation even when the content is unchanged.
+    ExplicitRetry,
 }
 
 // Park only deadlines, retaining the sealed observations for completion and
@@ -1939,7 +1970,7 @@ impl Scheduler {
             .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
         {
             let (replaced, errors) = self.root_observers.entry(id.clone()).or_default()
-                .rearm(root, scope, &self.hub, &self.journal);
+                .rearm(root, scope, self.passwords.path(), &self.hub, &self.journal);
             if replaced {
                 self.available_roots.remove(id);
             }
@@ -2184,6 +2215,11 @@ impl Scheduler {
             }
             if signals.foreground_finished {
                 self.arm_idle_cleanup();
+            } else if signals.password_changed && self.cache_deadline.is_none() {
+                let path = self.passwords.path().to_string_lossy();
+                if self.roots.values().any(|(_, scope)| scope.contains(&path)) {
+                    self.arm_idle_cleanup();
+                }
             }
             if signals.reload {
                 let reload = self.reload();
@@ -2318,14 +2354,14 @@ impl Scheduler {
                 let path = path.to_string_lossy();
                 if !scope.contains(&path) || self.catalog.is_owned(&path) { continue; }
                 let peers = self.catalog.bucket_paths(&scope, &path);
-                self.enqueue(id, path.to_string(), false)?;
+                self.enqueue(id, path.to_string(), CandidateAdmission::Observe)?;
                 for peer in peers.into_iter().filter(|peer| peer.as_str() != path.as_ref()) {
                     if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
                         entry.failure_payload.get("blockers").and_then(Value::as_array)
                             .is_some_and(|blockers| blockers.iter().any(|value| value == "missing_volume"))
                     }) {
                         if let Some((root, recovery)) = self.blocker_route(&entry) {
-                            self.enqueue_with_recovery(&root, peer, true, recovery)?;
+                            self.enqueue_with_recovery(&root, peer, recovery)?;
                         }
                     }
                 }
@@ -2528,17 +2564,30 @@ impl Scheduler {
                     }
                 }
             }
+            let recovered_paths = paths.len();
             if !root.scanned || arrived {
                 paths.extend(self.catalog.candidate_paths(&scope, None));
                 if !root.scanned && errors.is_empty() && current.is_ok() && identity.is_some() {
                     marks.push(id.clone());
                 }
             }
-            for path in paths {
+            for (index, path) in paths.into_iter().enumerate() {
+                // Initial inventory is not an explicit retry. Only paths
+                // reported by startup recovery bypass an interrupted entry.
+                let admission = if startup && index < recovered_paths {
+                    if self.journal.state().entry(&path).is_some_and(|entry| {
+                        matches!(entry.status.as_str(), "failed_password" | "suspended_missing_volume")
+                    }) {
+                        continue;
+                    }
+                    CandidateAdmission::ExplicitRetry
+                } else {
+                    CandidateAdmission::Observe
+                };
                 let path_id = watch_path_key(&path);
                 if admitted.insert(path_id) {
                     let peers = self.catalog.bucket_paths(&scope, &path);
-                    self.enqueue(&id, path.clone(), false)?;
+                    self.enqueue(&id, path.clone(), admission)?;
                     for peer in peers.into_iter().filter(|peer| peer != &path) {
                         if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
                             entry
@@ -2552,7 +2601,7 @@ impl Scheduler {
                             let key = watch_path_key(&peer);
                             if let Some((root, recovery)) = self.blocker_route(&entry) {
                                 if admitted.insert(key) {
-                                    self.enqueue_with_recovery(&root, peer, true, recovery)?;
+                                    self.enqueue_with_recovery(&root, peer, recovery)?;
                                 }
                             }
                         }
@@ -2765,8 +2814,8 @@ impl Scheduler {
         })
     }
 
-    fn enqueue(&mut self, root_id: &str, path: String, force: bool) -> io::Result<()> {
-        self.enqueue_with_recovery(root_id, path, force, None)
+    fn enqueue(&mut self, root_id: &str, path: String, admission: CandidateAdmission) -> io::Result<()> {
+        self.observe_candidate_with_quiet(root_id, path, admission, None, None, None)
     }
 
     fn defer_claimed_path(&mut self, id: &str) -> bool {
@@ -2784,21 +2833,13 @@ impl Scheduler {
         &mut self,
         root_id: &str,
         path: String,
-        force: bool,
         recovery: Option<Arc<Recovery>>,
     ) -> io::Result<()> {
-        self.observe_candidate(root_id, path, force, recovery, None)
-    }
-
-    fn observe_candidate(
-        &mut self, root_id: &str, path: String, force: bool,
-        recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
-    ) -> io::Result<()> {
-        self.observe_candidate_with_quiet(root_id, path, force, recovery, captured, None)
+        self.observe_candidate_with_quiet(root_id, path, CandidateAdmission::Retry, recovery, None, None)
     }
 
     fn observe_candidate_with_quiet(
-        &mut self, root_id: &str, path: String, force: bool,
+        &mut self, root_id: &str, path: String, admission: CandidateAdmission,
         recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
         tracker: Option<quiet::Quiet>,
     ) -> io::Result<()> {
@@ -2867,7 +2908,8 @@ impl Scheduler {
             blocked_unchanged
         };
         let boundary = quiet::is_boundary(&candidate);
-        if (interrupted.is_some() && blocked_unchanged)
+        let force = admission != CandidateAdmission::Observe;
+        if (admission != CandidateAdmission::ExplicitRetry && interrupted.is_some() && blocked_unchanged)
             || (!force && (unchanged || blocked_unchanged))
         {
             if let Some(before) = blocked.filter(|before| {
@@ -2925,6 +2967,15 @@ impl Scheduler {
                 pending.candidate = candidate;
             }
             return Ok(());
+        }
+        if let Some(interrupted) = interrupted {
+            self.journal.commit(false, |state| {
+                Ok(if state.entry(&candidate.path).is_some_and(|current| Arc::ptr_eq(interrupted, &current)) {
+                    crate::watch_store::NativeWatchOperations::retire_entries(std::iter::once(id.clone()))
+                } else {
+                    crate::watch_store::NativeWatchOperations::empty()
+                })
+            })?;
         }
         let now = Instant::now();
         let prior = self.pending.remove(&id);
@@ -3151,7 +3202,7 @@ impl Scheduler {
             {
                 continue;
             }
-            self.enqueue_with_recovery(&root, entry.path.clone(), true, recovery)?;
+            self.enqueue_with_recovery(&root, entry.path.clone(), recovery)?;
             self.journal
                 .log(json!({"event":"retry_password_failure","path":entry.path}));
         }
@@ -3168,7 +3219,7 @@ impl Scheduler {
             }
             let id = watch_path_key(&entry.path);
             if !self.pending.contains_key(&id) {
-                self.enqueue_with_recovery(&root, entry.path.clone(), true, recovery)?;
+                self.enqueue_with_recovery(&root, entry.path.clone(), recovery)?;
             }
         }
         self.persist_candidates(BTreeMap::new(), true)
@@ -3437,7 +3488,7 @@ impl Scheduler {
                     };
                     Some(Arc::new(recovery))
                 };
-                self.enqueue_with_recovery(&root, path.clone(), true, recovery)?;
+                self.enqueue_with_recovery(&root, path.clone(), recovery)?;
                 if !self.pending.contains_key(&id) && !NativePresence::at(&path).is_absent() {
                     rebase = false;
                 }
@@ -4101,7 +4152,7 @@ impl Scheduler {
                 if !self.pending.contains_key(&path) {
                     let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
                     let tracker = quiet.remove(&path);
-                    self.observe_candidate_with_quiet(&root, path, false, recovery.clone(), captured.as_ref(), tracker)?;
+                    self.observe_candidate_with_quiet(&root, path, CandidateAdmission::Observe, recovery.clone(), captured.as_ref(), tracker)?;
                 }
             }
             Ok(result)
@@ -4190,7 +4241,7 @@ impl Scheduler {
                     self.journal.log(json!({"event":"failed_terminal","path":candidate.path,
                         "owner":batch,"error":error.to_string()}));
                     self.observe_candidate_with_quiet(
-                        &active.root, candidate.path.clone(), true, active.recovery.clone(),
+                        &active.root, candidate.path.clone(), CandidateAdmission::ExplicitRetry, active.recovery.clone(),
                         None, quiet.remove(&id),
                     )?;
                 }
@@ -4236,7 +4287,7 @@ impl Scheduler {
                     "path":error.path,"owner":batch,"error":error.message}));
             }
         }
-        let error_paths = completion_input_errors(&outcome.errors, &completed.outputs, &groups);
+        let error_paths = completion_input_errors(&outcome.errors, &completed.outputs, &groups, &active.inputs);
         let mut operations = crate::watch_store::NativeWatchOperations::empty();
         let current_passwords = self.passwords.snapshot();
         let mut retry = Vec::new();
@@ -4352,6 +4403,7 @@ impl Scheduler {
         let canonical_inputs: HashMap<_, _> = active.inputs.iter()
             .map(|candidate| (watch_path_key(&candidate.path), candidate.clone())).collect();
         let mut projected_groups = HashSet::new();
+        let mut reported_discovery = HashSet::new();
         for candidate in active.inputs {
             let id = watch_path_key(&candidate.path);
             if self.pending.contains_key(&id)
@@ -4367,14 +4419,15 @@ impl Scheduler {
             let canonical_id = watch_path_key(&canonical);
             let archives = by_path.get(&canonical_id).or_else(|| by_path.get(&id));
             let input_error = error_paths.get(&canonical_id).or_else(|| error_paths.get(&id));
-            let failed_archive = input_error.is_none()
+            let discovery_failure = input_error.and_then(|error| error.failure.as_deref());
+            let failed_archive = (input_error.is_none() || discovery_failure.is_some())
                 .then(|| archives.and_then(|items| completion_failed_archive(items, &input_failures))).flatten();
             let input_failure = failed_archive.and_then(|archive| input_failures
                 .get(&crate::path_keys::path_key(&archive.path.to_string_lossy())));
-            let failure = input_failure.and_then(InputFailure::failure);
+            let failure = discovery_failure.or_else(|| input_failure.and_then(InputFailure::failure));
             let failure_message = failure.map(|failure| super::failure::message(failure, self.settings.cli.language));
-            let error = input_error.map(|error| error.as_str())
-                .or_else(|| failure_message.as_deref());
+            let error = failure_message.as_deref()
+                .or_else(|| input_error.map(|error| error.message.as_str()));
             let retryable = input_failure.is_some_and(InputFailure::retryable);
             // A multipart request has one logical result and one blocker.
             // Physical sibling generations only need their pending WAL retired.
@@ -4412,6 +4465,7 @@ impl Scheduler {
                 // A promoted terminal child may outlive its successfully
                 // consumed outer source. That is still this owner's failure.
                 && !failed_archive.is_some_and(|archive| archive.depth > 1)
+                && (discovery_failure.is_none() || retryable)
                 && (NativePresence::at(&canonical).is_absent()
                     || (!retryable
                         && group.is_some_and(|group| {
@@ -4445,13 +4499,19 @@ impl Scheduler {
                     .filter(|entry| entry.status == "interrupted")
             } else {
                 error.map(|error| {
+                    let record_error = if discovery_failure.is_some() && retryable {
+                        input_failure.and_then(InputFailure::failure)
+                            .map(|failure| super::failure::message(failure, self.settings.cli.language))
+                    } else {
+                        None
+                    };
                     let mut entry = make_entry(
                         &candidate,
-                        error,
+                        record_error.as_deref().unwrap_or(error),
                         input_failure,
                         self.journal.state().entry(&candidate.path).as_deref(),
                         &active.passwords,
-                &self.user_password_signature,
+                        &self.user_password_signature,
                         group.map(Arc::as_ref),
                         active.recovery.as_deref(),
                     );
@@ -4482,6 +4542,8 @@ impl Scheduler {
             }
             let event = if completed.cancelled {
                 "pipeline_request_interrupted"
+            } else if discovery_failure.is_some() {
+                "failed_terminal"
             } else if let Some(record) = &record {
                 record.status.as_str()
             } else if archives.is_some() {
@@ -4492,15 +4554,36 @@ impl Scheduler {
             if published.insert(watch_path_key(&canonical)) {
                 let outputs = completion_output_dirs(archives.into_iter().flatten()
                     .filter_map(|item| item.output.as_deref()), &output_containers);
-                self.journal
-                    .log(json!({"event":event,"path":canonical,"owner":batch,
+                let mut event = json!({"event":event,"path":canonical,"owner":batch,
                     "error":error,"error_kind":failure.map(|failure| failure.kind),
-                    "output_dirs":outputs,"retire_group":true}));
+                    "output_dirs":outputs,"retire_group":true});
+                if let (Some(input_error), Some(failure)) = (input_error, discovery_failure) {
+                    reported_discovery.insert(input_error.path.as_path());
+                    event["failures"] = json!([super::failure::report::Report::from_failure(
+                        failure, self.settings.cli.language,
+                    )]);
+                }
+                self.journal.log(event);
             }
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
                 &candidate.path,
                 record.filter(|entry| entry.status != "failed_terminal"),
             ));
+        }
+        if !completed.cancelled {
+            for error in &outcome.errors {
+                let Some(failure) = error.failure.as_deref() else { continue; };
+                // Top-level discovery can fail on a peer that was never
+                // admitted as a task. Its request still has a terminal failure.
+                if !reported_discovery.contains(error.path.as_path()) {
+                    self.journal.log(json!({
+                        "event":"failed_terminal","path":error.path,"owner":batch,
+                        "error":super::failure::message(failure, self.settings.cli.language),
+                        "error_kind":failure.kind,"retire_group":true,
+                        "failures":[super::failure::report::Report::from_failure(failure, self.settings.cli.language)],
+                    }));
+                }
+            }
         }
         self.journal.commit(true, |state| {
             for archive in outcome
@@ -4525,7 +4608,7 @@ impl Scheduler {
                 .and_then(|entry| self.blocker_route(&entry))
             {
                 let tracker = quiet.remove(&watch_path_key(&path));
-                self.observe_candidate_with_quiet(&root, path, true, recovery, None, tracker)?;
+                self.observe_candidate_with_quiet(&root, path, CandidateAdmission::Retry, recovery, None, tracker)?;
             }
         }
         self.persist_candidates(BTreeMap::new(), false)?;
@@ -4644,14 +4727,31 @@ fn completion_input_errors<'a>(
     errors: &'a [crate::pipeline::InputError],
     outputs: &BTreeMap<String, String>,
     groups: &HashMap<String, Arc<SourceGroup>>,
-) -> HashMap<String, &'a String> {
+    inputs: &[WatchCandidateRow],
+) -> HashMap<String, &'a crate::pipeline::InputError> {
+    use crate::scan::catalog::catalog_stem;
+    use crate::pipeline::InputErrorKind;
     let mut paths = HashMap::new();
-    for error in errors.iter().filter(|error| !matches!(error.kind,
-        crate::pipeline::InputErrorKind::Cleanup | crate::pipeline::InputErrorKind::FilesystemScan))
-    {
-        paths.entry(key(&error.path)).or_insert(&error.message);
-        if let Some(owner) = completion_owner(&error.path, outputs, groups) {
-            paths.entry(owner).or_insert(&error.message);
+    for error in errors {
+        if matches!(error.kind, InputErrorKind::Cleanup | InputErrorKind::FilesystemScan) {
+            continue;
+        }
+        let path = key(&error.path);
+        let owner = completion_owner(&error.path, outputs, groups).or_else(|| {
+            if error.kind != InputErrorKind::EmbeddedDiscovery
+                || inputs.iter().any(|input| watch_path_key(&input.path) == path)
+            {
+                return None;
+            }
+            // A residual peer can fail discovery for its catalog bucket
+            // without having been explicitly admitted as a source.
+            let stem = catalog_stem(&path);
+            inputs.iter().find(|input| catalog_stem(&input.path) == stem)
+                .map(|input| watch_path_key(&input.path))
+        });
+        paths.entry(path).or_insert(error);
+        if let Some(owner) = owner {
+            paths.entry(owner).or_insert(error);
         }
     }
     paths
@@ -5504,6 +5604,31 @@ mod tests {
     }
 
     #[test]
+    fn business_root_routes_password_file_notification_only_to_password_reload() {
+        let marker = crate::test_support::temp_file("watch_password_event", b"");
+        let directory = marker.with_extension("work");
+        let watched = directory.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let root = Root { path: watched.clone(), output: None, recursive: true, deep: false, scanned: true };
+        let state = directory.join("state");
+        let journal = Arc::new(journal::Journal::open(&state, 7).unwrap());
+        let hub = Arc::new(Hub::new());
+        let passwords = watched.join("builtin_passwords.json");
+        let observer = RootObserver::start(
+            &watched, &root, root.scope(&[], &state), &passwords, &hub, &journal,
+        ).unwrap();
+        fs::write(&passwords, b"{}").unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let signals = hub.wait(Some(deadline));
+        assert!(signals.password_changed);
+        assert!(signals.changed_roots.is_empty());
+        drop(observer);
+        drop(journal);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
     fn relative_roots_use_process_directory_not_roots_file_directory() {
         let marker = crate::test_support::temp_file("relative_watch_roots", b"");
         fs::write(&marker, "relative-input | child-output | false | true | false\n").unwrap();
@@ -5749,19 +5874,26 @@ mod tests {
         let mut errors = vec![
             InputError { path: nested.into(), message: "scan denied".into(),
                 kind: InputErrorKind::FilesystemScan,
+                failure: None,
                 scan_operation: Some("read_directory".into()), scan_count: Some(2) },
             InputError { path: root.into(), message: "cleanup failed".into(),
-                kind: InputErrorKind::Cleanup, scan_operation: None, scan_count: None },
+                kind: InputErrorKind::Cleanup, failure: None, scan_operation: None, scan_count: None },
         ];
         // Neither diagnostic may override a successful archive or its retry
         // cause, even when the diagnostic resolves to that archive's owner.
-        assert!(completion_input_errors(&errors, &outputs, &HashMap::new()).is_empty());
-        errors.push(InputError { path: nested.into(), message: "invalid input".into(),
-            kind: InputErrorKind::InvalidInput, scan_operation: None, scan_count: None });
-        let paths = completion_input_errors(&errors, &outputs, &HashMap::new());
+        assert!(completion_input_errors(&errors, &outputs, &HashMap::new(), &[]).is_empty());
+        errors.push(InputError {
+            path: nested.into(),
+            message: "embedded read failed".into(),
+            kind: InputErrorKind::EmbeddedDiscovery,
+            failure: Some(Box::new(crate::pipeline::Failure::new(FailureKind::FilesystemError, "embedded read failed"))),
+            scan_operation: None,
+            scan_count: None,
+        });
+        let paths = completion_input_errors(&errors, &outputs, &HashMap::new(), &[]);
         assert_eq!(paths.len(), 2);
-        assert_eq!(paths[&key(root)].as_str(), "invalid input");
-        assert_eq!(paths[&key(nested)].as_str(), "invalid input");
+        assert_eq!(paths[&key(root)].failure.as_ref().unwrap().kind, FailureKind::FilesystemError);
+        assert_eq!(paths[&key(nested)].message, "embedded read failed");
         // The projection borrows; CLI and diagnostics retain the original data.
         assert_eq!(errors.len(), 3);
         assert_eq!(errors[0].scan_count, Some(2));
@@ -5892,16 +6024,14 @@ mod tests {
             );
             serde_json::from_value::<crate::pipeline::InputCheckpoint>(json!({
                 "schema_version":1,"carrier":source,
-                "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
+                "input":input,
                 "sources":[{"path":source,"generation":capture_file_generation(source).unwrap().persisted()}],
                 "output":output,
                 "container":null,"files":1,"bytes":4,"encrypted":false,"discovery_source":"direct",
-                "children_complete":false,"remaining_depth":2,
                 "failure":partial.then(|| json!({
                     "partial":true,"password_signature":null,
                     "failure":{"kind":"damaged","message":"accepted recovery"},
-                    "complete_files":1,"retry_facts":{"logical_name":"nested",
-                        "analysis":input.analysis,"plan_signature":null}})),
+                    "complete_files":1})),
             })).unwrap()
         };
         let checkpoints = vec![receipt(&carrier, &segment, false), receipt(&nested, &child_output, true),
@@ -6183,7 +6313,7 @@ mod tests {
         // successful no-op, but the changed root command was still applied.
         assert_eq!(block_on(watch.root_change_status(true, true)).unwrap(), Some((true, 0)));
         assert_eq!(watch.reload().unwrap()["reloaded"], false);
-        assert_eq!(block_on(watch.root_change_status(true, true)).unwrap(), Some((false, 0)));
+        assert_eq!(block_on(watch.root_change_status(true, true)).unwrap_err().to_string(), "apply failed");
         assert_eq!(watch.reload().unwrap()["reloaded"], false);
         assert_eq!(block_on(watch.root_change_status(true, false)).unwrap(), Some((false, 0)));
         watch.stop().unwrap();
@@ -6488,12 +6618,13 @@ mod tests {
                     container.to_str().unwrap().to_owned(), Some(true), None)?.unwrap();
                 operations.extend(NativeWatchOperations::checkpoint(owner, output.to_str().unwrap(), Some(json!({
                     "schema_version":1,"carrier":source,
-                    "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
+                    "input":crate::io::archive_state::ArchiveInput::file(
+                        source.to_string_lossy().into_owned(), "zip".into(), "logical-input".into(),
+                    ),
                     "sources":[{"path":source,"generation":capture_file_generation(&source)?.persisted()}],
                     "output":output,
                     "container":container,
                     "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",
-                    "children_complete":false,"remaining_depth":2,
                 }))));
                 Ok(operations)
             }).unwrap();
@@ -6627,12 +6758,13 @@ mod tests {
                 for (source, output) in [(&owner_file, &work), (&nested, &nested_output)] {
                     let value = json!({
                         "schema_version":1,"carrier":source,
-                        "input":{"entry":source,"mode":"file","format":"zip","parts":[],"ranges":[]},
+                        "input":crate::io::archive_state::ArchiveInput::file(
+                            source.to_string_lossy().into_owned(), "zip".into(), "archive".into(),
+                        ),
                         "sources":[{"path":source,"generation":capture_file_generation(source)?.persisted()}],
                         "output":output,
                         "container":work,
                         "files":1,"bytes":9,"encrypted":false,"discovery_source":"direct",
-                        "children_complete":true,"remaining_depth":1,
                     });
                     operations.extend(NativeWatchOperations::checkpoint(
                         owner, output.to_str().unwrap(), Some(value),

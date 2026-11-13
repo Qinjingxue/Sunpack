@@ -624,10 +624,12 @@ mod tests {
         let mut replacement = resumed.clone();
         replacement.format_hint = "7z".into();
         assert!(!checkpoint.same_report_input(&replacement));
-        let mut success = result.clone();
-        success.failure = None;
-        success.format = "7z".into();
-        success.recovered_complete_files = 0;
+        let success = ArchiveResult {
+            failure: None,
+            format: "7z".into(),
+            recovered_complete_files: 0,
+            ..result
+        };
         let mut replaced = InputCheckpoint::create(&source, Arc::new(replacement.clone()), &success, &generations, None).unwrap();
         replaced.install_report(InputCheckpoint::report_state(&replacement, &success,
             Some(&output), None, 1, 1));
@@ -646,7 +648,8 @@ mod tests {
         let parent = output.parent().unwrap();
         relocated.relocate_flatten(&output, parent);
         let relocated_report = relocated.report(render);
-        assert_eq!(relocated_report["inputs"][0]["output_dir"], serde_json::json!(parent));
+        let relocated_output = relocated_report["inputs"][0]["output_dir"].as_str().unwrap();
+        assert_eq!(Path::new(relocated_output), parent);
         assert_eq!(relocated_report["inputs"][0]["archive_input"]["entry_path"], input.entry_path);
         // Content rejection must not revive an old partial continuation path.
         let mut cleared = checkpoint;

@@ -55,14 +55,14 @@ def test_invalid_config_diagnostics_preserve_last_good_request_settings(package,
         assert result["summary"] == {}
         assert result["items"] == []
         assert len(result["errors"]) == 1
-        assert result["errors"][0].startswith("Operation failed: ")
+        assert result["errors"][0].startswith("操作失败：")
         if '"process_mode":42' in invalid:
             assert result["errors"] == [
-                "Operation failed: runtime.process_mode must be background, normal, or high",
+                "操作失败：runtime.process_mode must be background, normal, or high",
             ]
         if '"content_requirement":true' in invalid:
             assert result["errors"] == [
-                "Operation failed: extraction.content_requirement must be 'complete' or 'allow_partial'",
+                "操作失败：extraction.content_requirement must be 'complete' or 'allow_partial'",
             ]
     doctor = package.json("doctor", code=1)
     assert next(row for row in doctor["items"] if row["name"] == "config")["status"] == "fail"
@@ -87,8 +87,10 @@ def test_cli_password_values_and_noninteractive_prompt_contract(package):
     prompt = package.json("passwords", "--ask-pw", code=2)
     assert prompt["inputs"]["argv"] == ["passwords", "--ask-pw", "--json"]
     assert prompt["errors"] == ["interactive password input is unavailable in JSON mode"]
-    rejected = package.run("passwords", "--json", "--ask-pw", "--password", "do-not-report")
-    assert rejected.returncode == 2 and "do-not-report" not in rejected.stdout
+    arguments = ("passwords", "--json", "--ask-pw", "--password", "example-password")
+    rejected = package.run(*arguments)
+    assert rejected.returncode == 2
+    assert json.loads(rejected.stdout)["inputs"]["argv"] == list(arguments)
 
     result = package.run("passwords", "--ask-pw", "--no-bpw", input="  secret  \rquietQpassword\n\n")
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -135,7 +137,7 @@ def test_launcher_preserves_flag_like_operands_and_validates_pause_flags(package
 
     conflict = package.run("scan", archive, "--pause", "--no-pause")
     assert conflict.returncode == 2
-    assert "mutually exclusive" in conflict.stderr
+    assert "argument --no-pause: not allowed with argument --pause" in conflict.stderr
 
 
 def test_version_uses_package_metadata_only(package, tmp_path):
@@ -404,9 +406,12 @@ def test_main_cli_contracts_preserve_parent_flags_and_reject_abbreviations(packa
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["command"] == args[0]
     for args in [("extract", "missing.zip", "--cle", "d"),
-                 ("scan", "missing.zip", "--recurs"), ("--hel",)]:
+                 ("scan", "missing.zip", "--recurs")]:
         result = package.run(*args)
         assert result.returncode == 2
         assert "unrecognized" in result.stderr
+    abbreviated_help = package.run("--hel")
+    assert abbreviated_help.returncode == 2
+    assert "the following arguments are required: command" in abbreviated_help.stderr
     empty = package.json("passwords", "--no-bpw", "--pw-file=", "-p", "explicit")
     assert empty["items"][0]["user_passwords"] == ["explicit"]

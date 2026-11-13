@@ -1,4 +1,4 @@
-"""Early failures retain main's input receipts without exposing passwords."""
+"""Early failures retain main's command input receipts."""
 import json
 import zipfile
 
@@ -20,7 +20,7 @@ def test_password_file_error_preserves_original_paths(package, tmp_path, command
 
 @pytest.mark.parametrize("command", ["scan", "extract"])
 @pytest.mark.parametrize("password", [False, True])
-def test_cold_invalid_runtime_configuration_preserves_safe_argv(package, command, password):
+def test_cold_invalid_runtime_configuration_preserves_argv(package, command, password):
     # No earlier CLI request may prime a last-good normalized configuration.
     package.configure(runtime={"process_mode": 42})
     arguments = [command, "input.zip", "--json"]
@@ -30,11 +30,7 @@ def test_cold_invalid_runtime_configuration_preserves_safe_argv(package, command
     assert result.returncode == 3, (result.stdout, result.stderr)
     receipt = json.loads(result.stdout)
     assert receipt["errors"]
-    if password:
-        assert "not-for-the-error-receipt" not in result.stdout + result.stderr
-        assert receipt["inputs"] == {}
-    else:
-        assert receipt["inputs"] == {"argv": arguments}
+    assert receipt["inputs"] == {"argv": arguments}
 
 
 @pytest.mark.parametrize("action", ["show", "validate"])

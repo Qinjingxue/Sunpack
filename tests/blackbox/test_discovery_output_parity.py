@@ -23,9 +23,62 @@ def test_direct_read_failure_is_reported_once_without_fallback(package, tmp_path
         report = package.json("extract", "--direct-file", "-d", source, code=1)
     finally:
         kernel.CloseHandle(handle)
-    assert report["summary"]["scan_error_count"] == 1, report
+    assert report["summary"]["scan_error_count"] == 0, report
     assert report["summary"]["processed_count"] == 0, report
-    assert report["summary"]["failed_count"] == 0, report
+    assert report["summary"]["failed_count"] == 1, report
+    assert report["tasks"][0]["failures"][0]["stage"] == "embedded_boundary"
+
+
+def test_recursive_authorization_counts_split_sfx_data_members(package, tmp_path):
+    split = tmp_path / "split"
+    split.mkdir()
+    payload = tmp_path / "inner.txt"
+    payload.write_bytes(bytes(range(256)) * 9)
+    stub = package.tools / "7zCon.sfx"
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v2k", f"-sfx{stub}",
+         str(split / "same.exe"), str(payload)],
+        check=True, capture_output=True,
+    )
+    launcher = split / "same.exe"
+    parts = sorted(split.glob("same.7z.*"))
+    assert len(parts) == 2
+    assert launcher.stat().st_size > sum(part.stat().st_size for part in parts)
+    source = tmp_path / "outer.zip"
+    with zipfile.ZipFile(source, "w") as archive:
+        for item in [launcher, *parts]:
+            archive.write(item, item.name)
+    output = tmp_path / "out"
+    package.configure(recursive_authorization={"enabled": True, "byte_ratio_exponent": 1,
+                      "project_ratio_exponent": 1, "minimum_authorization_score": 0.85})
+
+    report = package.json("extract", "-r", "*", "-o", output, source)
+
+    assert report["summary"]["success_count"] == 1
+    assert sorted(item.name for item in (output / "outer").iterdir()) == [
+        "same.7z.001", "same.7z.002", "same.exe",
+    ]
+
+
+def test_overlapping_recursive_targets_keep_ancestor_scan_filters(package, tmp_path):
+    root = tmp_path / "inputs"
+    child = root / "child"
+    child.mkdir(parents=True)
+    archive = child / "archive.zip"
+    with zipfile.ZipFile(archive, "w") as stream:
+        stream.writestr("item.txt", b"payload")
+    package.configure(filesystem={"scan_filters_enabled": True, "scan_filters": [
+        {"name": "blacklist", "enabled": True, "paths": [{"value": "child", "regex": False}]},
+    ]})
+    filtered = package.json("scan", "-R", root, child, archive)
+    assert filtered["items"] == []
+
+    package.configure(filesystem={"scan_filters": [
+        {"name": "size_range", "enabled": True, "min_bytes": 1},
+    ]})
+    admitted = package.json("scan", "-R", "-v", root, child, archive)
+    item, = admitted["items"]
+    assert item["discovery_source"] == "relations"
 
 
 @pytest.mark.parametrize("keep_first_segment", [False, True])
@@ -73,7 +126,7 @@ def test_numbered_collision_normalizes_unicode_decimal_suffix(package, tmp_path)
 
 @pytest.mark.parametrize("cleanup", ["k", "d", "r"])
 @pytest.mark.parametrize("embedded", [False, True], ids=["split", "embedded-split"])
-def test_recursive_shared_walk_preserves_each_file_relation_scope(
+def test_recursive_file_targets_share_embedded_relation_candidates(
     package, tmp_path, cleanup, embedded,
 ):
     root = tmp_path / "inputs"
@@ -100,21 +153,26 @@ def test_recursive_shared_walk_preserves_each_file_relation_scope(
         archive.writestr("ordinary.txt", b"ordinary")
     package.configure(filesystem={"scan_filters_enabled": False})
 
-    # Adding an unrelated ancestor target may share its recursive walk, but
-    # cannot make this child's missing siblings visible to discovery/retry.
+    # A lone selection sees only its original scope. An ancestor file target
+    # contributes its snapshot to embedded volume resolution.
     alone = package.json("extract", "-d", "-R", "-c", "k", "-r", "1",
                          "-o", tmp_path / "alone", head, code=1)
     combined_out = tmp_path / "combined"
+    assert alone["summary"]["failed_count"] == 1
     combined = package.json("extract", "-d", "-R", "-c", cleanup, "-r", "1",
-                            "-o", combined_out, ordinary, head, code=1)
-    assert alone["summary"]["failed_count"] == combined["summary"]["failed_count"] == 1
-    assert combined["summary"]["success_count"] == 1
+                            "-o", combined_out, ordinary, head, code=0 if embedded else 1)
+    assert combined["summary"]["failed_count"] == int(not embedded)
+    assert combined["summary"]["success_count"] == 1 + int(embedded)
     assert next(combined_out.rglob("ordinary.txt")).read_bytes() == b"ordinary"
+    if embedded:
+        assert next(combined_out.rglob(payload.name)).read_bytes() == content
+        assert all(part.exists() == (cleanup == "k") for part in [head, *tails])
+        return
+
     assert not list(combined_out.rglob(payload.name))
     assert {part: part.read_bytes() for part in original} == original
 
-    # The same tails inside the original recursive boundary must still work,
-    # including the embedded split route, proving this is not a blanket reject.
+    # Ordinary split discovery picks up the tails inside the original boundary.
     nested = child / "download"
     nested.mkdir()
     for tail in tails:

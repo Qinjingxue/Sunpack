@@ -1,7 +1,7 @@
 //! Request-local result blocks. Recursive returns splice ownership rather than
 //! copying every descendant through every ancestor. Public results remain Vecs.
 use super::{ArchiveResult, CleanupResult, CleanupStatus, FailureKind, InputError,
-    InputErrorKind, InputCheckpoint, Outcome, PromotedSource};
+    InputErrorKind, InputCheckpoint, Outcome, PromotedSource, ScanTaskFailure};
 use std::collections::LinkedList;
 use std::ops::{Index, IndexMut};
 
@@ -16,7 +16,9 @@ impl ResultFacts for ArchiveResult {
     }
 }
 impl ResultFacts for InputError {
-    fn incomplete(&self) -> bool { self.kind != InputErrorKind::Cleanup }
+    fn incomplete(&self) -> bool {
+        !matches!(self.kind, InputErrorKind::Cleanup | InputErrorKind::EmbeddedDiscovery)
+    }
 }
 impl ResultFacts for CleanupResult {
     fn incomplete(&self) -> bool { self.mode == "flatten" && self.status == CleanupStatus::Failed }
@@ -108,7 +110,7 @@ impl<T: ResultFacts> From<Vec<T>> for Results<T> {
     }
 }
 impl<T: ResultFacts> Extend<T> for Results<T> {
-    fn extend(&mut self, items: impl IntoIterator<Item = T>) {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, items: I) {
         let block: Vec<_> = items.into_iter().collect();
         self.append(&mut Self::from(block));
     }
@@ -135,6 +137,7 @@ impl<'a, T> IntoIterator for &'a mut Results<T> {
 pub(super) struct RunOutcome {
     pub archives: Results<ArchiveResult>,
     pub errors: Results<InputError>,
+    pub scan_failures: Vec<ScanTaskFailure>,
     pub checkpoints: Results<InputCheckpoint>,
     pub cleanup_results: Results<CleanupResult>,
     pub promoted_sources: Results<PromotedSource>,
@@ -152,6 +155,7 @@ impl RunOutcome {
 impl From<Outcome> for RunOutcome {
     fn from(value: Outcome) -> Self {
         Self { archives: value.archives.into(), errors: value.errors.into(),
+            scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into(), cleanup_results: value.cleanup_results.into(),
             promoted_sources: value.promoted_sources.into(), removed_promotion_dirs: value.removed_promotion_dirs.into(),
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }
@@ -160,6 +164,7 @@ impl From<Outcome> for RunOutcome {
 impl From<RunOutcome> for Outcome {
     fn from(value: RunOutcome) -> Self {
         Self { archives: value.archives.into_vec(), errors: value.errors.into_vec(),
+            scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into_vec(), cleanup_results: value.cleanup_results.into_vec(),
             promoted_sources: value.promoted_sources.into_vec(), removed_promotion_dirs: value.removed_promotion_dirs.into_vec(),
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }

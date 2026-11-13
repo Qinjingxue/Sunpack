@@ -159,6 +159,7 @@ pub enum FailureContext {
     InputAdmission { missing_paths: Vec<PathBuf> },
     PasswordResolution,
     Extraction,
+    WorkerWarning,
     OutputCreate { error: String, #[serde(default)] path: Option<PathBuf> },
     Postprocess { destination: PathBuf },
 }
@@ -347,6 +348,8 @@ pub struct InputError {
     pub path: PathBuf,
     pub message: String,
     pub kind: InputErrorKind,
+    #[serde(skip)]
+    pub(crate) failure: Option<Box<Failure>>,
     #[serde(rename = "operation", skip_serializing_if = "Option::is_none")]
     pub scan_operation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -364,6 +367,7 @@ impl InputError {
 pub enum InputErrorKind {
     InvalidInput,
     FilesystemScan,
+    EmbeddedDiscovery,
     Cleanup,
 }
 
@@ -456,10 +460,19 @@ impl<'a> InputFailure<'a> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ScanTaskFailure {
+    pub(crate) path: PathBuf,
+    pub(crate) archives: std::ops::Range<usize>,
+    pub(crate) preflight: Option<Box<Failure>>,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Outcome {
     pub archives: Vec<ArchiveResult>,
     pub errors: Vec<InputError>,
+    #[serde(skip)]
+    pub(crate) scan_failures: Vec<ScanTaskFailure>,
     #[serde(skip)]
     pub checkpoints: Vec<InputCheckpoint>,
     pub cleanup_results: Vec<CleanupResult>,
@@ -634,7 +647,9 @@ impl TaskCompletion {
         Failure {
             kind: failure.kind,
             message: failure.message.clone(),
-            context: None,
+            context: failure.context.as_deref()
+                .filter(|context| matches!(context, FailureContext::WorkerWarning))
+                .map(|context| Box::new(context.clone())),
             discovery_scope: None,
             recovery: None,
             causes: failure.causes.clone(),

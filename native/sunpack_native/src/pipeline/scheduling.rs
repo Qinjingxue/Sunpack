@@ -689,11 +689,6 @@ impl<T> Join<T> {
 }
 
 impl<'a> Spawner<'a> {
-    #[cfg(test)]
-    pub(super) fn consumer_budget(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.consumers)
-    }
-
     /// Consume a batch using a shared request-level budget, as the original
     /// coordinator did. A recursive batch with no free consumers runs inline
     /// in its parent, so parents never wait for admission held by themselves.

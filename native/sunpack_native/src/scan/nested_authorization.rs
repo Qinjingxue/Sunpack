@@ -51,10 +51,10 @@ impl ScopeAccumulator {
     }
 }
 
-pub(crate) fn authorize_nested_candidates<'a>(
+pub(crate) fn authorize_nested_candidates<'a, Members: Iterator<Item = &'a str>>(
     snapshot: &NativeDirectorySnapshot,
     root: &Path,
-    candidates: impl ExactSizeIterator<Item = (&'a str, &'a [String])>,
+    candidates: impl ExactSizeIterator<Item = (&'a str, Members)>,
     policy: AuthorizationConfig,
 ) -> Vec<bool> {
     let root_key = path_key(&root);
@@ -69,14 +69,10 @@ pub(crate) fn authorize_nested_candidates<'a>(
             continue;
         };
         let scope_key = path_key(&scope_path);
-        let member_keys = if raw_members.is_empty() {
-            HashSet::from([path_key(entry)])
-        } else {
-            raw_members
-                .iter()
-                .map(|member| path_key(Path::new(member)))
-                .collect()
-        };
+        let mut member_keys: HashSet<_> = raw_members.map(path_key_from_str).collect();
+        if member_keys.is_empty() {
+            member_keys.insert(path_key(entry));
+        }
         add_candidate(&mut root_candidates, root, entry, &member_keys);
         if scope_key != root_key {
             add_candidate(

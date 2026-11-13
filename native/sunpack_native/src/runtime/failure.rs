@@ -1,13 +1,14 @@
 //! Human-facing projection shared by CLI and Watch. The serialized Failure
 //! retains its original message and structured evidence for diagnosis.
 use crate::core::i18n::Language;
-use crate::pipeline::{Failure, FailureKind};
+use crate::pipeline::{Failure, FailureContext, FailureKind};
 use std::borrow::Cow;
 
-#[derive(Clone, Copy)]
+pub(super) mod report;
+
 pub(super) enum MessageParams<'a> {
     None,
-    Read { field: &'a str, offset: u64, requested: usize, actual: usize },
+    Read { field: Cow<'static, str>, offset: u64, requested: usize, actual: usize },
     Process { kind: &'a str, message: &'a str },
     Error(&'a str),
 }
@@ -48,7 +49,7 @@ impl<'a> Message<'a> {
     }
     pub fn render(&self, language: Language) -> Cow<'a, str> {
         if let Some(raw) = self.raw { return raw.into(); }
-        match self.params {
+        match &self.params {
             MessageParams::None => language.text(self.key).into(),
             MessageParams::Read { field, offset, requested, actual } => language.translate(self.key, &[
                 ("field", field), ("offset", &offset.to_string()),
@@ -79,6 +80,9 @@ fn describe(failure: &Failure, language: Language, warning: bool) -> Message<'_>
     if warning && failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume) {
         return Message::key("failure.possible_missing_volume");
     }
+    if matches!(failure.context.as_deref(), Some(FailureContext::WorkerWarning)) {
+        return Message::key("failure.warning_busy_or_partial");
+    }
     if failure.kind == FailureKind::PasswordInconclusive {
         return Message::key("failure.password_state_unknown");
     }
@@ -93,7 +97,7 @@ fn describe(failure: &Failure, language: Language, warning: bool) -> Message<'_>
             "failure.archive_field_read_failed"
         };
         let field_key = format!("archive.field.{}", fault.field);
-        let field = language.lookup(&field_key).unwrap_or(&fault.field);
+        let field = language.lookup(&field_key).map_or(Cow::Owned(field_key), Cow::Borrowed);
         return Message { key, raw: None, params: MessageParams::Read {
             field, offset: fault.offset, requested: fault.requested, actual: fault.actual,
         } };

@@ -1,9 +1,12 @@
+use super::failure::report::{self, Report};
 use super::windows::ToastLibrary;
 use crate::core::i18n::Language;
 use crate::failure_report::{append_failure_report, publish_failure_report, FailureRecord};
 use crate::pipeline::{
-    Cancellation, CleanupStatus, Event, FailureKind, InputErrorKind, Outcome, ResourceWait, TaskId,
+    ArchiveResult, Cancellation, CleanupStatus, Event, FailureKind, InputError, InputErrorKind,
+    Outcome, ResourceWait, TaskId,
 };
+use serde::{ser::SerializeSeq, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,10 +161,7 @@ impl Snapshot {
                     .find(|request| request.visible)
                     .and_then(|request| request.name.as_ref())
                     .or(group.name.as_ref())
-                    .map_or_else(
-                        || language.text("toast.progress.one").to_owned(),
-                        |(_, name)| name.clone(),
-                    )
+                    .map_or_else(String::new, |(_, name)| name.clone())
             } else {
                 language.translate("toast.progress.multiple", &[("count", &count.to_string())])
             },
@@ -290,7 +290,7 @@ impl Snapshot {
 fn format_bytes(bytes: u128) -> String {
     let mut divisor = 1;
     let mut unit = "B";
-    for candidate in ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"] {
+    for candidate in ["KiB", "MiB", "GiB", "TiB"] {
         if bytes / divisor < 1024 {
             break;
         }
@@ -800,10 +800,14 @@ fn completion_roots(
             root.terminal |= input.failed && !input.retryable();
         }
     }
-    for error in outcome.errors.iter().filter(|error| error.kind == InputErrorKind::InvalidInput) {
+    for error in outcome.errors.iter().filter(|error| is_terminal_input_error(error)) {
         roots.entry(result_owner(&error.path, owner)).or_default().terminal = true;
     }
     roots
+}
+
+fn is_terminal_input_error(error: &InputError) -> bool {
+    matches!(error.kind, InputErrorKind::InvalidInput | InputErrorKind::EmbeddedDiscovery)
 }
 
 #[derive(Default)]
@@ -1045,15 +1049,19 @@ impl Activity {
             else {
                 return;
             };
-            if !group.requests[&self.request].visible {
+            let request = &group.requests[&self.request];
+            if !request.visible {
                 return;
             }
             (Arc::clone(&group.id), group.language, Arc::clone(&group.report),
-                group.requests[&self.request].started.clone(), group.requests[&self.request].settled.clone())
+                request.visible_roots.iter().filter_map(|id| request.roots.get(id).cloned()).collect::<Vec<_>>(),
+                request.settled.clone())
         };
-        let started = started.iter().map(|path| result_owner(path, &owner))
-            .filter(|root| result.is_ok() || !settled.contains(root)).collect::<HashSet<_>>();
-        if result.is_err() && !started.contains(&result_owner(path, &owner)) { return; }
+        let started: HashMap<_, _> = started.into_iter().filter_map(|path| {
+            let root = result_owner(&path, &owner);
+            (!settled.contains(&root)).then_some((root, path))
+        }).collect();
+        if result.is_err() && !started.contains_key(&result_owner(path, &owner)) { return; }
         if let Err(error) = self.publisher.reports.append_data(&id, language, &report, path, result,
             &owner, Some(&started)) {
             if !self.publisher.reports.cancellation.cancelled() {
@@ -1098,8 +1106,8 @@ impl FailureSpool<'_> {
     fn append(
         &mut self,
         path: &Path,
-        error: &String,
-        details: &impl serde::Serialize,
+        errors: &[String],
+        details: Option<&RootFailureReport<'_>>,
     ) -> io::Result<()> {
         let index = self.failures + 1;
         let header = self.language.translate(
@@ -1114,15 +1122,73 @@ impl FailureSpool<'_> {
             &FailureRecord {
                 header: &header,
                 error_prefix: &self.error_prefix,
-                errors: std::slice::from_ref(error),
+                errors,
                 unknown_error: self.language.text("toast.report.unknown_error"),
                 details_prefix: &self.details_prefix,
-                details: Some(details),
+                details,
             },
             self.cancellation,
         )?;
         self.failures = index;
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RootFailures<'a> {
+    archives: Vec<&'a ArchiveResult>,
+    input_errors: Vec<&'a InputError>,
+}
+
+struct RootFailureReport<'a> {
+    archives: Vec<Vec<&'a ArchiveResult>>,
+    input_errors: Vec<&'a InputError>,
+    language: Language,
+}
+
+impl Serialize for RootFailureReport<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut array = serializer.serialize_seq(None)?;
+        for error in self.input_errors.iter().filter(|error| error.kind == InputErrorKind::EmbeddedDiscovery) {
+            array.serialize_element(&Report::input_error(error, self.language))?;
+        }
+        for entries in &self.archives {
+            if let Some(report) = report::archive_report(entries, self.language) {
+                array.serialize_element(&report)?;
+            }
+        }
+        for error in self.input_errors.iter().filter(|error| error.kind == InputErrorKind::InvalidInput) {
+            array.serialize_element(&Report::input_error(error, self.language))?;
+        }
+        array.end()
+    }
+}
+
+impl RootFailureReport<'_> {
+    fn errors(&self) -> Vec<String> {
+        let mut messages: Vec<_> = self.archives.iter().filter_map(|entries| {
+            let path = &entries.first()?.path;
+            let name = if entries.iter().any(|entry| entry.promoted) {
+                path.as_os_str()
+            } else {
+                path.file_name().unwrap_or(path.as_os_str())
+            };
+            let message = report::carrier_message(entries, self.language);
+            Some(format!("{} [{message}]", name.to_string_lossy()))
+        }).collect();
+        messages.extend(self.input_errors.iter()
+            .filter(|error| error.kind == InputErrorKind::InvalidInput)
+            .map(|error| report::invalid_input_message(error, self.language)));
+        if messages.is_empty() {
+            messages.extend(self.input_errors.iter().filter_map(|error| error.failure.as_deref()).map(|failure| {
+                if failure.message.is_empty() {
+                    self.language.text("watch.failure.extraction_failed").to_owned()
+                } else {
+                    failure.message.clone()
+                }
+            }));
+        }
+        messages
     }
 }
 
@@ -1136,7 +1202,7 @@ impl Reports {
         path: &Path,
         result: &io::Result<Outcome>,
         owner: &impl Fn(&Path) -> Option<String>,
-        started: Option<&HashSet<String>>,
+        started: Option<&HashMap<String, PathBuf>>,
     ) -> io::Result<()> {
         self.append_data(id, language, report, path, result.as_ref(), owner, started)
     }
@@ -1144,15 +1210,35 @@ impl Reports {
     fn append_data(
         &self, id: &str, language: Language, report: &Mutex<ReportDraft>, path: &Path,
         result: Result<&Outcome, &io::Error>, owner: &impl Fn(&Path) -> Option<String>,
-        started: Option<&HashSet<String>>,
+        started: Option<&HashMap<String, PathBuf>>,
     ) -> io::Result<()> {
         self.cancellation.check_io()?;
-        let inputs = result.ok().map(Outcome::input_failures);
-        let roots = result.ok().map(|outcome| completion_roots(outcome, owner));
-        let terminal = |root: &str| started.is_none_or(|started| started.contains(root))
-            && roots.as_ref().is_some_and(|roots| roots.get(root).is_some_and(|root| root.terminal));
-        if roots.as_ref().is_some_and(|roots| !roots.keys().any(|root| terminal(root))) {
-            return Ok(());
+        let mut roots = HashMap::<String, RootFailures<'_>>::new();
+        let visible = |root: &str| started.is_none_or(|started| started.contains_key(root));
+        if let Ok(outcome) = result {
+            let inputs = outcome.input_failures();
+            if !inputs.is_empty() {
+                for archive in &outcome.archives {
+                    let key = crate::path_keys::path_key(&archive.path.to_string_lossy());
+                    if inputs.get(&key).is_some_and(|input| input.failed && !input.retryable())
+                        && archive.failure.as_ref().is_none_or(|failure| failure.kind != FailureKind::Cancelled)
+                    {
+                        let root = archive_owner(archive, owner);
+                        if visible(&root) {
+                            roots.entry(root).or_default().archives.push(archive);
+                        }
+                    }
+                }
+            }
+            for error in outcome.errors.iter().filter(|error| is_terminal_input_error(error)) {
+                let root = result_owner(&error.path, owner);
+                if visible(&root) {
+                    roots.entry(root).or_default().input_errors.push(error);
+                }
+            }
+            if roots.is_empty() {
+                return Ok(());
+            }
         }
         let mut draft = report.lock().unwrap();
         if draft.poisoned {
@@ -1170,37 +1256,18 @@ impl Reports {
             details_prefix: language.translate("toast.report.details", &[("details", "")]),
             failures,
         };
-        let written = (|| {
-            match result {
-                Ok(outcome) => {
-                    for archive in &outcome.archives {
-                        let Some(failure) = archive.failure.as_ref()
-                            .filter(|failure| failure.kind != FailureKind::Cancelled)
-                        else {
-                            continue;
-                        };
-                        let key = crate::path_keys::path_key(&archive.path.to_string_lossy());
-                        if terminal(&archive_owner(archive, owner))
-                            && inputs.as_ref().unwrap().get(&key)
-                            .is_some_and(|input| input.failed && !input.retryable())
-                        {
-                            spool.append(&archive.path, &super::failure::message(failure, language).into_owned(), failure)?;
-                        }
-                    }
-                    for error in outcome
-                        .errors
-                        .iter()
-                        .filter(|error| error.kind == InputErrorKind::InvalidInput
-                            && terminal(&result_owner(&error.path, owner)))
-                    {
-                        spool.append(&error.path, &error.message, error)?;
-                    }
-
-                }
-                Err(error) => spool.append(path, &error.to_string(), &None::<String>)?,
-            }
-            Ok(())
-        })();
+        let written = match result {
+            Err(error) => spool.append(path, &[error.to_string()], None),
+            Ok(_) => roots.into_iter().try_for_each(|(key, root)| {
+                let source = started.and_then(|paths| paths.get(&key)).map_or(path, PathBuf::as_path);
+                let report = RootFailureReport {
+                    archives: report::archive_groups(root.archives),
+                    input_errors: root.input_errors,
+                    language,
+                };
+                spool.append(source, &report.errors(), Some(&report))
+            }),
+        };
         draft.failures = spool.failures;
         draft.poisoned |= written.is_err();
         written
@@ -1210,20 +1277,16 @@ impl Reports {
         if completed.summary.report_failed { return Ok(None); }
         let draft = completed.report.lock().unwrap();
         self.cancellation.check_io()?;
-        if draft.poisoned || draft.failures == 0 {
+        let summary = &completed.summary;
+        if draft.poisoned || !(summary.failed != 0 || (summary.rollback_failed && summary.succeeded != 0)) {
             return Ok(None);
         }
         let now = SystemTime::now();
-        let seconds = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let output = self
-            .directory
-            .join(format!("failed-{seconds:020}-{}.txt", completed.id));
+        let (timestamp, file_stamp) = report_time()?;
+        let suffix = u32::from_be_bytes(super::windows::random_bytes()?);
+        let output = self.directory.join(format!("failed-{file_stamp}-{suffix:08x}.txt"));
         let language = completed.language;
         let title = language.text("toast.report.title");
-        let timestamp = report_time();
         let generated = language.translate("toast.report.generated", &[("timestamp", &timestamp)]);
         let summary = language.translate(
             "toast.report.summary",
@@ -1288,20 +1351,32 @@ impl Reports {
     }
 }
 
-fn report_time() -> String {
-    use windows_sys::Win32::Foundation::SYSTEMTIME;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetSystemTime(time: *mut SYSTEMTIME);
-    }
-    let mut time = SYSTEMTIME::default();
+fn report_time() -> io::Result<(String, String)> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTimeEx};
+    let mut instant = FILETIME::default();
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    let mut local_ticks = FILETIME::default();
     unsafe {
-        GetSystemTime(&mut time);
+        GetSystemTimeAsFileTime(&mut instant);
+        if FileTimeToSystemTime(&instant, &mut utc) == 0
+            || SystemTimeToTzSpecificLocalTimeEx(std::ptr::null(), &utc, &mut local) == 0
+            || SystemTimeToFileTime(&local, &mut local_ticks) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
-    )
+    let ticks = |time: FILETIME| i64::from(time.dwHighDateTime) << 32 | i64::from(time.dwLowDateTime);
+    let utc_ticks = ticks(instant);
+    let offset = (ticks(local_ticks) - (utc_ticks / 10_000 * 10_000)) / 600_000_000;
+    let sign = if offset < 0 { '-' } else { '+' };
+    let offset = offset.abs();
+    let SYSTEMTIME { wYear: year, wMonth: month, wDay: day,
+        wHour: hour, wMinute: minute, wSecond: second, .. } = local;
+    Ok((format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{sign}{:02}:{:02}",
+        offset / 60, offset % 60), format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")))
 }
 
 pub(super) struct Toast {
@@ -1631,8 +1706,15 @@ mod tests {
             summary: Summary { succeeded: 1, interrupted: 1, rollback_failed: true,
                 ..Summary::default() },
         };
-        let snapshot = Snapshot::completed(&completed, None);
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let report = publisher.reports.publish(&completed, &publisher.shared).unwrap().unwrap();
+        let text = fs::read_to_string(&report).unwrap();
+        assert!(text.contains(&Language::En.translate("toast.report.summary", &[("failed", "1")])));
+        assert_eq!(text.lines().count(), 4);
+        let snapshot = Snapshot::completed(&completed, Some(report));
         assert_eq!(snapshot.kind, 4);
+        assert!(snapshot.report_action.is_some());
         assert_eq!(snapshot.title, Language::En.text("toast.final.mixed.title"));
         let duration = Language::En.translate("duration.seconds", &[("seconds", "0")]);
         assert!(snapshot.body.starts_with(&Language::En.translate("toast.final.mixed.body",
@@ -1756,7 +1838,7 @@ mod tests {
         finish_debounce(&publisher);
         let completed = Snapshot::completed(&take_completed(&publisher), None);
         let state = publisher.shared.state.lock().unwrap();
-        assert!(completed.body.contains("Paths with cleanup errors: 1."));
+        assert!(completed.body.contains(&Language::En.translate("cleanup.incomplete", &[("count", "1")])));
         assert!(state.groups.is_empty());
     }
     fn publisher(directory: PathBuf) -> Publisher {
@@ -1956,6 +2038,10 @@ mod tests {
         outcome.archives.push(promoted);
         outcome.archives.push(archive("c.zip", None));
         outcome.archives.push(archive("c/nested.zip", Some(FailureKind::Damaged)));
+        let mut segment = archive("c/nested.zip", Some(FailureKind::Damaged));
+        segment.offset = 100;
+        outcome.archives.push(segment);
+        outcome.archives.push(archive("c/another.zip", Some(FailureKind::Damaged)));
         outcome.archives.push(archive("d.zip", Some(FailureKind::Damaged)));
         let result = Ok(outcome);
         activity.record(Path::new("a.zip"), &result, false, &owner);
@@ -1966,16 +2052,17 @@ mod tests {
         let draft = completed.report.lock().unwrap();
         assert_eq!(draft.failures, 1);
         let text = fs::read_to_string(draft.path.as_ref().unwrap()).unwrap();
-        // Match complete report-header paths: "c/nested.zip" contains "d.zip".
-        let has_report_path = |path: &str| text.lines().any(|line| {
-            line.split_once("] ").is_some_and(|(index, reported)| {
-                index.strip_prefix('[').is_some_and(|index| index.parse::<usize>().is_ok())
-                    && reported == path
-            })
-        });
-        assert!(has_report_path("c/nested.zip"));
-        assert!(!has_report_path("promoted.zip"));
-        assert!(!has_report_path("d.zip"));
+        assert!(text.lines().any(|line| line == "[1] c.zip"));
+        assert!(!text.lines().any(|line| line.starts_with("[2] ")));
+        let prefix = Language::En.translate("toast.report.details", &[("details", "")]);
+        let details: serde_json::Value = serde_json::from_str(
+            text.lines().find_map(|line| line.strip_prefix(&prefix)).unwrap()).unwrap();
+        assert_eq!(details.as_array().unwrap().len(), 2);
+        assert_eq!(details[0]["kind"], "inputs_failed");
+        assert_eq!(details[0]["causes"].as_array().unwrap().len(), 2);
+        assert_eq!(details[1]["kind"], "damaged");
+        assert!(!text.contains("promoted.zip"));
+        assert!(!text.lines().any(|line| line.ends_with("] d.zip")));
 
         // No owner metadata: independent paths stay independent, while
         // case-folded segments of one physical carrier remain one task.
@@ -2073,7 +2160,7 @@ mod tests {
         outcome.errors.push(crate::pipeline::InputError {
             path: "log-only-scan".into(), message: "log-only-scan".into(),
             kind: InputErrorKind::FilesystemScan, scan_operation: Some("read".into()),
-            scan_count: Some(7),
+            scan_count: Some(7), failure: None,
         });
         let result = Ok(outcome);
         activity.record(Path::new("terminal.zip"), &result, false, one_root);

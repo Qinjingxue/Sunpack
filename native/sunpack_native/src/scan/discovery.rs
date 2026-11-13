@@ -812,6 +812,12 @@ impl NativeCandidateTable {
         Self::default()
     }
 
+    pub(crate) fn extend(&mut self, other: &mut Self) {
+        self.rows.append(&mut other.rows);
+        self.relation_sources.append(&mut other.relation_sources);
+        self.relation_failures.extend(other.relation_failures.drain());
+    }
+
     pub(crate) fn append_directory(
         &mut self,
 

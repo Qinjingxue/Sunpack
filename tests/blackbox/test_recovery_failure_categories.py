@@ -124,7 +124,9 @@ def test_complete_carrier_keeps_damaged_segment_output_beside_success(package, t
     report = package.json("extract", "-d", "-r", "1", "-c", "d", "-o", output, carrier, code=1)
     assert report["summary"]["failed_count"] == 1, report
     assert report["summary"]["partial_success_count"] == 0, report
-    assert report["tasks"][0]["failures"][0]["kind"] == "damaged", report
+    failure, = report["tasks"][0]["failures"]
+    assert failure["kind"] == "inputs_failed", report
+    assert any(cause["kind"] == "damaged" for cause in failure["causes"]), report
     good, = output.rglob("success.txt")
     recovered, = output.rglob("recovered.txt")
     assert good.read_bytes() == b"independent successful segment"

@@ -98,7 +98,9 @@ def test_plan5_mixed_carrier_preserves_recoverable_segments(package, tmp_path, c
     else:
         assert summary["success_count"] == summary["partial_success_count"] == 0
         assert summary["failed_count"] == 1
-        assert any(item["kind"] == "wrong_password" for item in report["tasks"][0]["failures"])
+        failure, = report["tasks"][0]["failures"]
+        assert failure["kind"] == "inputs_failed"
+        assert any(cause["kind"] == "wrong_password" for cause in failure["causes"])
     _assert_markers(output, case.segments, encrypted=correct_password)
     assert case.file_path.is_file()
 

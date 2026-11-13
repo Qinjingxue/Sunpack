@@ -320,15 +320,7 @@ fn flatten_single_branch_chain_with_publisher(
 ) {
     let leaf = match resume_leaf {
         Some(leaf) => Some(leaf.to_path_buf()),
-        None => match discover_flatten_leaf(root) {
-            Ok(leaf) => leaf,
-            Err(error) => {
-                stats
-                    .errors
-                    .push(format!("{}: {error}", normalize_path(root)));
-                return;
-            }
-        },
+        None => discover_flatten_leaf(root),
     };
     let Some(leaf) = leaf else {
         return;
@@ -397,25 +389,21 @@ fn flatten_single_branch_chain_with_publisher(
     }
 }
 
-fn discover_flatten_leaf(root: &Path) -> io::Result<Option<PathBuf>> {
-    let Some(mut current) = only_child_directory(root)? else {
-        return Ok(None);
-    };
-    while let Some(child) = only_child_directory(&current)? {
+fn discover_flatten_leaf(root: &Path) -> Option<PathBuf> {
+    let mut current = only_child_directory(root)?;
+    while let Some(child) = only_child_directory(&current) {
         current = child;
     }
-    Ok(Some(current))
+    Some(current)
 }
 
-fn only_child_directory(dir: &Path) -> io::Result<Option<PathBuf>> {
-    let mut entries = fs::read_dir(dir)?;
-    let Some(first) = entries.next().transpose()? else {
-        return Ok(None);
-    };
-    Ok(
-        (entries.next().transpose()?.is_none() && first.file_type()?.is_dir())
-            .then(|| first.path()),
-    )
+fn only_child_directory(dir: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(dir).ok()?;
+    let first = entries.next()?.ok()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    first.metadata().ok()?.is_dir().then(|| first.path())
 }
 
 fn rename_root_to_visible_work(root: &Path, stats: &mut FlattenStats) -> Option<PathBuf> {
@@ -674,6 +662,30 @@ mod tests {
         assert_eq!(stats.output_dir.as_deref(), Some(output.path()));
         assert_eq!(stats.source_dir.as_ref(), Some(&build));
         assert!(stats.errors.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn flatten_keeps_last_proven_level_when_deeper_enumeration_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE};
+
+        let output = TestDirectory::new("locked_leaf");
+        let leaf = output.path().join("wrapper");
+        fs::create_dir(&leaf).unwrap();
+        fs::write(leaf.join("payload"), b"payload").unwrap();
+        // Permit the directory entry to be inspected, but deny a new listing
+        // handle. The lock is released before publishing the discovered leaf.
+        let locked = fs::OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&leaf).unwrap();
+        assert!(fs::read_dir(&leaf).is_err());
+
+        let discovered = discover_flatten_leaf(output.path()).unwrap();
+        drop(locked);
+
+        assert_eq!(discovered, leaf);
     }
 
     #[test]
