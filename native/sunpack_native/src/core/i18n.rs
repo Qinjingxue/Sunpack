@@ -16,17 +16,15 @@ impl Language {
         }
     }
 
+    pub fn lookup(self, key: &str) -> Option<&'static str> {
+        catalog::MESSAGES.binary_search_by_key(&key, |message| message.0).ok().map(|index| {
+            let (_, en, zh) = catalog::MESSAGES[index];
+            match self { Self::En => en, Self::Zh => zh }
+        })
+    }
+
     pub fn text(self, key: &str) -> &str {
-        match catalog::MESSAGES.binary_search_by_key(&key, |message| message.0) {
-            Ok(index) => {
-                let (_, en, zh) = catalog::MESSAGES[index];
-                match self {
-                    Self::En => en,
-                    Self::Zh => zh,
-                }
-            }
-            Err(_) => key,
-        }
+        self.lookup(key).unwrap_or(key)
     }
 
     pub fn translate(self, key: &str, params: &[(&str, &str)]) -> String {

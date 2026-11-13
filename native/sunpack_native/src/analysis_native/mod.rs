@@ -1,4 +1,3 @@
-mod diagnostic;
 pub(crate) mod structure;
 pub(crate) mod view;
 pub(crate) mod volume_anchor;

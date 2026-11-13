@@ -14,7 +14,6 @@ enum Phase {
     Queued,
     Preparing,
     Working,
-    Finalizing,
     Finished(TaskStatus),
 }
 
@@ -119,7 +118,8 @@ impl Panel {
             Event::Started { id, .. } => (id, Some(Phase::Preparing)),
             Event::Waiting { id } => (id, Some(Phase::Queued)),
             Event::Working { id } => (id, Some(Phase::Working)),
-            Event::Finalizing { id } => (id, Some(Phase::Finalizing)),
+            // main keeps the current row until the execution result is known.
+            Event::Finalizing { .. } => return,
             Event::Finished { id, result, .. } => {
                 let status = result.status;
                 if let Some(task) = self.tasks.get_mut(&id) {
@@ -134,10 +134,25 @@ impl Panel {
                 total_bytes,
                 ..
             } => {
-                if let Some(task) = self.tasks.get_mut(&id) {
-                    task.progress = (total_bytes != 0).then_some((completed_bytes, total_bytes));
+                let Some(task) = self.tasks.get_mut(&id) else { return; };
+                if matches!(task.phase, Phase::Finished(_)) { return; }
+                let render = !prompting && session.interactive();
+                let old_percent = if render {
+                    task.progress.map(|(completed, total)| (progress_ratio(completed, total) * 100.0) as usize)
+                } else { None };
+                task.progress = (total_bytes != 0).then_some((completed_bytes, total_bytes));
+                if task.wait.disk || task.wait.memory { return; }
+                let changed_phase = !matches!(task.phase, Phase::Working);
+                task.phase = Phase::Working;
+                if render {
+                    let percent = task.progress.map(|(completed, total)| (progress_ratio(completed, total) * 100.0) as usize);
+                    // main avoids even viewport traversal when the visible
+                    // percent and phase have not changed.
+                    if changed_phase || old_percent != percent {
+                        self.redraw(session, language, false);
+                    }
                 }
-                (id, None)
+                return;
             }
             Event::ResourceWait { id, state, .. } => {
                 if let Some(task) = self.tasks.get_mut(&id) {
@@ -398,19 +413,42 @@ pub(super) fn wait_status(state: ResourceWait, language: Language) -> (&'static 
     (language.text(status), hint)
 }
 
-pub(super) fn progress_text(progress: Option<(u64, u64)>, bar: bool) -> String {
-    let percent = progress.filter(|&(_, total)| total != 0)
-        .map(|(completed, total)| (completed as u128 * 100 / total as u128).min(100) as usize);
-    let mut text = String::new();
-    if bar {
-        let filled = percent.unwrap_or(0) / 5;
-        let _ = write!(text, " [{}{}]", "#".repeat(filled), "-".repeat(20 - filled));
+// Python's int/int division rounds the exact quotient once. Casting both
+// operands first can change percent boundaries above the exact-integer range.
+fn progress_ratio(completed: u64, total: u64) -> f64 {
+    if completed >= total { return 1.0; }
+    if completed == 0 { return 0.0; }
+    if total <= (1_u64 << 53) { return completed as f64 / total as f64; }
+    let mut exponent = total.leading_zeros() as i32 - completed.leading_zeros() as i32;
+    if (completed as u128) << (-exponent as u32) < total as u128 { exponent -= 1; }
+    let numerator = (completed as u128) << (52 - exponent) as u32;
+    let divisor = total as u128;
+    let mut significand = numerator / divisor;
+    let remainder = numerator % divisor;
+    if remainder * 2 > divisor || (remainder * 2 == divisor && significand & 1 != 0) {
+        significand += 1;
     }
-    match percent {
-        Some(percent) => { let _ = write!(text, " {percent:3}%"); }
+    if significand == (1_u128 << 53) {
+        significand >>= 1;
+        exponent += 1;
+    }
+    f64::from_bits(((exponent + 1023) as u64) << 52 | (significand as u64 - (1_u64 << 52)))
+}
+
+fn append_progress(text: &mut String, progress: Option<(u64, u64)>, bar: bool) {
+    let ratio = progress.filter(|&(_, total)| total != 0)
+        .map(|(completed, total)| progress_ratio(completed, total));
+    if bar {
+        let filled = (ratio.unwrap_or(0.0) * 20.0) as usize;
+        text.push_str(" [");
+        text.push_str(&"####################"[..filled]);
+        text.push_str(&"--------------------"[..20 - filled]);
+        text.push(']');
+    }
+    match ratio {
+        Some(ratio) => { let _ = write!(text, " {:3}%", (ratio * 100.0) as usize); }
         None => text.push_str("  --%"),
     }
-    text
 }
 
 fn row_status(task: &TaskRow, available: usize, language: Language) -> String {
@@ -421,7 +459,6 @@ fn row_status(task: &TaskRow, available: usize, language: Language) -> String {
             Phase::Queued => "report.status.waiting",
             Phase::Preparing => "report.status.preparing",
             Phase::Working => "report.status.extracting",
-            Phase::Finalizing => "report.status.finalizing",
             Phase::Finished(status) => super::task_status_key(status),
         };
         (language.text(status), String::new())
@@ -434,10 +471,12 @@ fn row_status(task: &TaskRow, available: usize, language: Language) -> String {
 pub(super) fn status_text(
     status: &str, progress: Option<(u64, u64)>, hint: &str, available: Option<usize>,
 ) -> String {
-    let mut state = format!("[{status}]{}", progress_text(progress, true));
-    if available.is_some_and(|width| display_width(&state) > width) {
-        state = format!("[{status}]{}", progress_text(progress, false));
-    }
+    let bar = available.is_none_or(|width| display_width(status) + 30 <= width);
+    let mut state = String::with_capacity(status.len() + 2 + if bar { 28 } else { 5 } + hint.len() + usize::from(!hint.is_empty()));
+    state.push('[');
+    state.push_str(status);
+    state.push(']');
+    append_progress(&mut state, progress, bar);
     if !hint.is_empty() {
         state.push(' ');
         state.push_str(hint);
@@ -541,6 +580,41 @@ mod tests {
             depth: if id == 5 { 2 } else { 1 },
             segment,
         }
+    }
+
+    #[test]
+    fn progress_rounding_and_post_worker_phase_match_main() {
+        assert_eq!(status_text("X", Some((29, 100)), "", Some(10)), "[X]  28%");
+        assert_eq!(status_text("X", Some((58, 100)), "", None), "[X] [###########---------]  57%");
+        assert_eq!(status_text("X", Some((101, 100)), "", None), "[X] [####################] 100%");
+        assert_eq!(status_text("X", Some((1, 0)), "", Some(10)), "[X]  --%");
+        // Golden ratios from Python's integer true division, including values
+        // that would round differently if each operand were converted first.
+        for (completed, total, expected) in [
+            (9_007_199_254_740_991, 9_007_199_254_740_993, 0.9999999999999998),
+            (2_612_087_783_874_887, 9_007_199_254_740_993, 0.28999999999999987),
+            (5_349_555_781_375_769_968, u64::MAX, 0.29),
+            (1, u64::MAX, 5.421010862427522e-20),
+        ] {
+            assert_eq!(progress_ratio(completed, total), expected);
+        }
+        let terminal = Terminal { size: (80, 30), output: Mutex::default() };
+        let mut panel = Panel::default();
+        panel.update(&terminal, Language::En, queued(1, None, "archive.zip", None), true);
+        panel.update(&terminal, Language::En, Event::Working { id: 1 }, true);
+        panel.update(&terminal, Language::En, Event::Progress {
+            id: 1, path: "archive.zip".into(), completed_bytes: 29, total_bytes: 100,
+        }, true);
+        let before = row_status(&panel.tasks[&1], 80, Language::En);
+        panel.update(&terminal, Language::En, Event::Finalizing { id: 1 }, true);
+        assert_eq!(row_status(&panel.tasks[&1], 80, Language::En), before);
+        assert!(terminal.output.lock().unwrap().is_empty());
+        panel.last_render = None;
+        panel.update(&terminal, Language::En, Event::Progress {
+            id: 1, path: "archive.zip".into(), completed_bytes: 290, total_bytes: 1000,
+        }, false);
+        assert!(panel.last_render.is_none(), "unchanged percent must not traverse the viewport");
+        assert_eq!(panel.tasks[&1].progress, Some((290, 1000)));
     }
 
     #[test]

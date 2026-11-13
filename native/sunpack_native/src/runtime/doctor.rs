@@ -24,21 +24,25 @@ fn checked(name: &str, result: io::Result<String>) -> Value {
 
 pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
     let settings = config::load_raw(cwd).and_then(|(path, payload)| {
-        let settings = config::Config::parse(&payload)?;
-        let errors = settings.validate_scan_filters();
-        if !errors.is_empty() {
-            return Err(io::Error::other(errors.join("\n")));
-        }
-        Ok((path, settings))
+        config::Config::parse(&payload).map(|settings| (path, settings))
     });
+    let config_check = match &settings {
+        Ok((path, settings)) => {
+            let errors = settings.validate_scan_filters();
+            if errors.is_empty() {
+                check("config", "ok", path.display().to_string())
+            } else {
+                let mut row = check("config", "fail", errors.join("; "));
+                row["config_path"] = json!(path);
+                row["errors"] = json!(errors);
+                row
+            }
+        }
+        Err(error) => check("config", "fail", error.to_string()),
+    };
+    let config_valid = config_check["status"] == "ok";
     let mut checks = vec![
-        checked(
-            "config",
-            settings
-                .as_ref()
-                .map(|(path, _)| path.display().to_string())
-                .map_err(|error| io::Error::other(error.to_string())),
-        ),
+        config_check,
         checked(
             "native",
             std::env::current_exe().map(|path| path.display().to_string()),
@@ -92,6 +96,7 @@ pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
         });
     }
     checks.push(match settings {
+        _ if !config_valid => check("toast", "skip", "configuration is invalid"),
         Ok((_, settings)) if settings.watch.toast_enabled => checked(
             "toast",
             windows::ToastLibrary::load(cwd)

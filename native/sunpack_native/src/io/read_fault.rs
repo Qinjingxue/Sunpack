@@ -159,23 +159,7 @@ impl ReadFault {
         io::Error::new(self.io_kind, self)
     }
 
-    pub(crate) fn to_diagnostic(&self) -> serde_json::Value {
-        serde_json::json!({
-            "code": self.code,
-            "operation": self.operation,
-            "field": self.field,
-            "location": self.location.as_str(),
-            "offset": self.offset,
-            "requested": self.requested,
-            "actual": self.actual,
-            "source_len": self.source_len,
-            "volume_number": self.volume_number,
-            "io_kind": format!("{:?}", self.io_kind).to_lowercase(),
-            "os_error": self.os_error,
-            "detail": self.detail,
-            "possible_missing_volume": self.possible_missing_volume(),
-        })
-    }
+
 }
 
 impl fmt::Display for ReadFault {

@@ -4,7 +4,7 @@
 // segment boundaries, selection, and the extraction segment plan.
 
 use crate::analysis_native::structure::{
-    has_compression_stream_header, inspect_compression_stream_reader,
+    has_compression_stream_header, inspect_compression_stream_reader, StreamObservation,
 };
 use crate::io::archive_state::{AnalysisFacts, ArchiveInput, OpenMode, VolumeCompleteness};
 use crate::io::cancellation::{CancellableOnce, Cancellation};
@@ -148,38 +148,29 @@ impl Segment {
     }
 }
 
-// Keep only the evidence needed by format selection and segment planning.
+// Keep only the facts consumed by selection and extraction planning.
 enum EvidenceDetails {
     Empty,
-    Fields(DiagnosticFields),
+    Embedded { anchor: bool, zip_eocd_offset: Option<u64> },
+    Zip(Box<ZipObservation>),
+    Tar(Box<TarObservation>),
     Rar(Box<RarObservation>),
     SevenZip(Box<SevenZipObservation>),
-}
-
-impl From<DiagnosticFields> for EvidenceDetails {
-    fn from(value: DiagnosticFields) -> Self {
-        Self::Fields(value)
-    }
+    Stream(Arc<crate::analysis_native::structure::StreamObservation>),
 }
 
 impl EvidenceDetails {
-    fn password_required(&self) -> std::io::Result<bool> {
+    fn password_required(&self) -> bool {
         match self {
-            Self::Rar(value) => Ok(value.password_required.unwrap_or(false)),
-            Self::SevenZip(value) => Ok(value.password_required),
-            Self::Fields(value) => truthy(value, "password_required"),
-            Self::Empty => Ok(false),
+            Self::Rar(value) => value.password_required.unwrap_or(false),
+            Self::SevenZip(value) => value.password_required,
+            Self::Zip(value) => value.password_required,
+            _ => false,
         }
     }
 
-    fn embedded_anchor(&self) -> std::io::Result<bool> {
-        match self {
-            Self::Fields(value) if str_of(value, "source")? == "embedded_scan" => {
-                let kind = str_of(value, "candidate_kind")?;
-                Ok(!kind.is_empty() && kind != "logical_archive")
-            }
-            _ => Ok(false),
-        }
+    fn embedded_anchor(&self) -> bool {
+        matches!(self, Self::Embedded { anchor: true, .. })
     }
 }
 
@@ -264,7 +255,7 @@ struct ReportContext<'a> {
     disk_starts: Option<&'a [u64]>,
     hits: Arc<[SignatureHit]>,
     embedded_scan: Option<&'a NativeScanResult>,
-    stream_structure: Option<Option<Arc<DiagnosticFields>>>,
+    stream_structure: Option<Option<Arc<StreamObservation>>>,
 }
 
 pub(crate) struct AnalysisSegment {
@@ -364,15 +355,8 @@ impl AnalysisBinaryView {
                 cancellation.check()?;
                 evidences.push(match context.run_module(module) {
                     Ok(evidence) => evidence,
-                    Err(error) => {
-                        let message = error.to_string();
-                        let mut details = DiagnosticFields::new();
-                        details.put("message", &message)?;
-                        if crate::io::resource_error::is_memory_error(&error) {
-                            details.put("error", "out_of_memory")?;
-                            details.put("failure_kind", "resource_unavailable")?;
-                        }
-                        Evidence::new(module.kind.format(), "error", Vec::new(), details)
+                    Err(_) => {
+                        Evidence::new(module.kind.format(), "error", Vec::new(), EvidenceDetails::Empty)
                     }
                 });
             }
@@ -392,32 +376,31 @@ impl AnalysisBinaryView {
             .iter()
             .copied()
             .min_by_key(|index| evidences[*index].range_key());
-        let plan = SegmentPlan::build(&evidences, &selected, size)?;
-        let to_segment = |(evidence, index): (usize, usize)| -> io::Result<AnalysisSegment> {
+        let plan = SegmentPlan::build(&evidences, &selected, size);
+        let to_segment = |(evidence, index): (usize, usize)| {
             let evidence = &evidences[evidence];
             let segment = &evidence.segments[index];
-            Ok(AnalysisSegment {
+            AnalysisSegment {
                 format_hint: evidence.format.clone(),
                 start: segment.start,
                 end: segment.end,
                 zip_eocd_offset: segment.zip_eocd_offset,
                 password_required: segment
                     .password_required
-                    .unwrap_or(evidence.details.password_required()?),
+                    .unwrap_or(evidence.details.password_required()),
                 damage_flags: (!segment.damage_flags.is_empty())
                     .then(|| Arc::new(segment.damage_flags.clone())),
-            })
+            }
         };
         let extractable_segments = plan
             .extractable
             .into_iter()
             .map(to_segment)
-            .collect::<io::Result<_>>()?;
-        let password_segment = plan.password_segment.map(to_segment).transpose()?;
+            .collect();
+        let password_segment = plan.password_segment.map(to_segment);
         let primary = best_selected.map(|index| &evidences[index]);
         let mut facts = primary
             .map(Evidence::analysis_facts)
-            .transpose()?
             .unwrap_or_default();
         if !plan.missing_volume_evidence.is_empty() {
             facts.volume_completeness = Some(VolumeCompleteness::Missing);
@@ -490,16 +473,11 @@ impl<'a> ReportContext<'a> {
             }
             exact_starts.insert(start);
 
-            let mut details = DiagnosticFields::new();
-            details.put("source", "embedded_scan")?;
-            details.put("boundary_kind", "exact")?;
-            details.put("boundary_confidence", "high")?;
-            details.put("integrity_confidence", "deferred")?;
             candidates.push(Evidence::new(
                 "rar",
                 "extractable",
                 vec![Segment::new(start, Some(end), Vec::new())],
-                details,
+                EvidenceDetails::Empty,
             ));
         }
         let mut starts = embedded.iter().map(|item| item.offset).collect::<Vec<_>>();
@@ -513,9 +491,9 @@ impl<'a> ReportContext<'a> {
             .filter(|start| !exact_starts.contains(start))
         {
             let native = (self.view.probe_rar_native(start))?;
-            candidates.push(rar_from_native(native, start)?);
+            candidates.push(rar_from_native(native, start));
         }
-        combine_candidates("rar", candidates, self.preserve_multiple())
+        Ok(combine_candidates("rar", candidates, self.preserve_multiple()))
     }
 
     // ---- 7z -------------------------------------------------------------
@@ -533,7 +511,7 @@ impl<'a> ReportContext<'a> {
                 .iter()
                 .map(|item| seven_zip_from_embedded(item))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            return combine_candidates("7z", candidates, true);
+            return Ok(combine_candidates("7z", candidates, true));
         }
         let hits = self.hits(|kind| kind == ReportHitKind::SevenZip);
         if hits.is_empty() {
@@ -545,9 +523,9 @@ impl<'a> ReportContext<'a> {
         let mut candidates = Vec::new();
         for start in starts {
             let native = (self.view.probe_seven_zip_native(start))?;
-            candidates.push(seven_zip_from_native(native, start)?);
+            candidates.push(seven_zip_from_native(native, start));
         }
-        combine_candidates("7z", candidates, self.preserve_multiple())
+        Ok(combine_candidates("7z", candidates, self.preserve_multiple()))
     }
 
     // ---- TAR ------------------------------------------------------------
@@ -562,9 +540,6 @@ impl<'a> ReportContext<'a> {
                 let boundary_kind = item.boundary_kind;
                 let exact = end.is_some() && boundary_kind == "exact" && item.extractable;
 
-                let mut details = DiagnosticFields::new();
-                details.put("source", "embedded_scan")?;
-                details.put("boundary_kind", boundary_kind)?;
                 candidates.push(Evidence::new(
                     "tar",
                     if exact { "extractable" } else { "damaged" },
@@ -577,10 +552,10 @@ impl<'a> ReportContext<'a> {
                             vec!["tar_boundary_unresolved".to_string()]
                         },
                     )],
-                    details,
+                    EvidenceDetails::Empty,
                 ));
             }
-            return combine_candidates("tar", candidates, true);
+            return Ok(combine_candidates("tar", candidates, true));
         }
         // Ordinary analysis owns only a TAR starting at the logical input start.
         // Nonzero TAR candidates belong to the canonical embedded scanner;
@@ -590,57 +565,28 @@ impl<'a> ReportContext<'a> {
             .unwrap_or_else(|| Evidence::not_found("tar")))
     }
 
-    fn tar_observation(&self, start: u64) -> std::io::Result<DiagnosticFields> {
-        let mut raw = self.view.walk_tar(start)?;
-        set_default(&mut raw, "archive_offset", start)?;
-        let detected = if truthy(&raw, "plausible")? {
-            ".tar"
-        } else {
-            ""
-        };
-        set_default(&mut raw, "detected_ext", detected)?;
-        let error = str_of(&raw, "error")?;
-        let mut damage_flags = str_list(&raw, "damage_flags")?;
-        if !error.is_empty() && !TAR_BENIGN_ERRORS.contains(&error.as_str()) {
-            damage_flags.push(error);
-        }
-        let integrity = match raw.get("stored_checksum") {
-            Some(stored) if value_truthy(stored) => match raw.get("computed_checksum") {
-                Some(computed) if stored == computed => "high",
-                _ => "low",
-            },
-            _ => "unknown",
-        };
-        raw.put("integrity_confidence", integrity)?;
-        raw.put("damage_flags", sorted_unique(damage_flags))?;
-        Ok(raw)
-    }
-
     fn tar_candidate(&self, start: u64) -> std::io::Result<Option<Evidence>> {
-        let result = self.tar_observation(start)?;
-        if truthy(&result, "plausible")? {
-            let segment = Segment::new(
-                start,
-                opt_u64_of(&result, "segment_end")?,
-                read_fault_damage_flags(&result)?,
-            );
+        let mut result = self.view.walk_tar(start)?;
+        if let Some(fault) = &result.read_fault {
+            result.damage_flags.extend(native_read_fault_flags(fault));
+        }
+        if !result.error.is_empty() && !TAR_BENIGN_ERRORS.contains(&result.error.as_str()) {
+            result.damage_flags.push(result.error.clone());
+        }
+        result.damage_flags = sorted_unique(result.damage_flags);
+        let mut damage_flags = result.damage_flags.clone();
+        append_read_fault_field(&mut damage_flags, result.read_fault.as_ref());
+        if result.plausible {
+            let segment = Segment::new(start, result.segment_end, damage_flags);
             return Ok(Some(Evidence::new(
-                "tar",
-                "extractable",
-                vec![segment],
-                result.clone(),
+                "tar", "extractable", vec![segment], EvidenceDetails::Tar(Box::new(result)),
             )));
         }
-        if truthy(&result, "magic_matched")? {
-            let mut damage_flags = read_fault_damage_flags(&result)?;
-            if damage_flags.is_empty() {
-                damage_flags.push("tar_metadata_bad".to_string());
-            }
+        if result.magic_matched {
+            if damage_flags.is_empty() { damage_flags.push("tar_metadata_bad".to_owned()); }
             return Ok(Some(Evidence::new(
-                "tar",
-                "damaged",
-                vec![Segment::new(start, None, damage_flags)],
-                result,
+                "tar", "damaged", vec![Segment::new(start, None, damage_flags)],
+                EvidenceDetails::Tar(Box::new(result)),
             )));
         }
         Ok(None)
@@ -662,11 +608,11 @@ impl<'a> ReportContext<'a> {
         let mut logical = Vec::new();
         for item in &embedded {
             if item.candidate_kind == "logical_archive" {
-                logical.push(zip_from_embedded(item)?);
+                logical.push(zip_from_embedded(item));
             }
         }
         if !logical.is_empty() {
-            return combine_candidates("zip", logical, true);
+            return Ok(combine_candidates("zip", logical, true));
         }
         // Resolve only on recovery, once per analysis, including an absent local header.
         let mut earliest_local = None::<Option<u64>>;
@@ -680,12 +626,11 @@ impl<'a> ReportContext<'a> {
         let mut evidences = Vec::new();
         for eocd_offset in eocd_hits {
             let native = self.zip_eocd_observation(eocd_offset)?;
-            if native.is_empty()
-                || !(truthy(&native, "magic_matched")? || truthy(&native, "plausible")?)
+            if !(native.magic_matched || native.plausible)
             {
                 continue;
             }
-            let archive_offset = u64_of(&native, "archive_offset")?;
+            let archive_offset = native.archive_offset;
             if archive_offset != 0
                 && !hits
                     .iter()
@@ -697,9 +642,9 @@ impl<'a> ReportContext<'a> {
                 continue;
             }
             evidences.push(
-                match zip_local_header_recovery(&native, &hits, &mut earliest_local)? {
+                match zip_local_header_recovery(&native, &hits, &mut earliest_local) {
                     Some(recovered) => recovered,
-                    None => zip_from_native(native, &hits, self.view.reader.len())?,
+                    None => zip_from_native(native, &hits, self.view.reader.len()),
                 },
             );
         }
@@ -715,8 +660,6 @@ impl<'a> ReportContext<'a> {
             if known_starts.contains(&start) {
                 continue;
             }
-            let mut details = DiagnosticFields::new();
-            details.put("boundary_confidence", "low")?;
             evidences.push(Evidence::new(
                 "zip",
                 "damaged",
@@ -725,81 +668,18 @@ impl<'a> ReportContext<'a> {
                     None,
                     vec!["central_directory_unavailable".to_string()],
                 )],
-                details,
+                EvidenceDetails::Empty,
             ));
         }
-        combine_candidates("zip", evidences, self.preserve_multiple())
+        Ok(combine_candidates("zip", evidences, self.preserve_multiple()))
     }
 
-    fn zip_eocd_observation(&self, requested: u64) -> std::io::Result<DiagnosticFields> {
-        let candidate = self.view.locate_zip_eocd_native(Some(requested))?;
-        if !truthy(&candidate, "eocd_candidate_found")? {
-            let mut raw = DiagnosticFields::new();
-            raw.put("plausible", false)?;
-            raw.put("magic_matched", false)?;
-            raw.put("error", "eocd_not_found")?;
-            raw.extend(candidate.clone());
-            zip_observation(&mut raw)?;
-            return Ok(raw);
-        }
-        let eocd_offset = u64_of(&candidate, "eocd_candidate_offset")?;
-        let mut raw = self
-            .view
-            .probe_zip_with_disk_starts(eocd_offset, self.disk_starts)?;
-        raw.extend(candidate.clone());
-        set_default(
-            &mut raw,
-            "comment_length",
-            i64_of(&candidate, "eocd_candidate_comment_length")?,
-        )?;
-        set_default(
-            &mut raw,
-            "declared_central_directory_offset",
-            i64_of(&candidate, "eocd_candidate_cd_offset")?,
-        )?;
-        set_default(
-            &mut raw,
-            "declared_central_directory_size",
-            i64_of(&candidate, "eocd_candidate_cd_size")?,
-        )?;
-        let total_entries = i64_of(&raw, "total_entries")?;
-        set_default(&mut raw, "declared_total_entries", total_entries)?;
-        let size = self.view.reader.len() as i64;
-        let segment_end = match i64_of(&raw, "segment_end")? {
-            0 => size,
-            value => value,
+    fn zip_eocd_observation(&self, requested: u64) -> std::io::Result<ZipObservation> {
+        let Some(candidate) = self.view.locate_zip_eocd_native(requested)? else {
+            return Ok(ZipObservation { error: "eocd_not_found".into(), ..Default::default() });
         };
-        set_default(
-            &mut raw,
-            "trailing_bytes_after_eocd",
-            (size - segment_end).max(0),
-        )?;
-        let physical_cd = i64_of(&raw, "central_directory_offset")?;
-        let declared_cd = i64_of(&raw, "declared_central_directory_offset")?;
-        set_default(&mut raw, "physical_central_directory_offset", physical_cd)?;
-        set_default(&mut raw, "inferred_central_directory_offset", physical_cd)?;
-        let directory_size = i64_of(&raw, "central_directory_size")?;
-        set_default(&mut raw, "inferred_central_directory_size", directory_size)?;
-        set_default(
-            &mut raw,
-            "central_directory_offset_delta",
-            physical_cd - declared_cd,
-        )?;
-        set_default(&mut raw, "central_directory_size_delta", 0)?;
-        set_default(&mut raw, "entry_count_delta", 0)?;
-        let links = i64_of(&raw, "local_header_links_checked")?;
-        let links_ok = truthy(&raw, "local_header_links_ok")?;
-        set_default(
-            &mut raw,
-            "local_header_links_ok_count",
-            if links_ok { links } else { 0 },
-        )?;
-        set_default(
-            &mut raw,
-            "local_header_links_error_count",
-            if links_ok { 0 } else { 1 },
-        )?;
-        zip_observation(&mut raw)?;
+        let mut raw = self.view.probe_zip_with_disk_starts(candidate.offset, self.disk_starts)?;
+        raw.comment_length = candidate.comment_length;
         Ok(raw)
     }
 
@@ -827,37 +707,39 @@ impl<'a> ReportContext<'a> {
                 segment.extractable = extractable;
                 segments.push(segment);
             }
-            let mut details = DiagnosticFields::new();
-            details.put("source", "embedded_scan")?;
-            details.put("boundary_confidence", if complete { "high" } else { "low" })?;
             return Ok(Evidence::new(
                 format,
                 if complete { "extractable" } else { "damaged" },
                 segments,
-                details,
+                EvidenceDetails::Empty,
             ));
         }
-        let result = self.stream_observation(format)?;
-        if !truthy(&result, "magic_matched")? {
-            return Ok(Evidence::new(format, "not_found", Vec::new(), result));
+        let Some(result) = self.full_stream_structure()? else {
+            return Ok(Evidence::not_found(format));
+        };
+        if result.format != format {
+            return Ok(Evidence::not_found(format));
         }
-        let mut damage_flags = str_list(&result, "damage_flags")?;
-        let error = str_of(&result, "error")?;
+        if !result.magic_matched {
+            return Ok(Evidence::new(format, "not_found", Vec::new(), EvidenceDetails::Stream(result)));
+        }
+        let mut damage_flags = result.damage_flags.clone();
+        let error = result.error.clone();
         if !error.is_empty() {
             damage_flags.push(error);
         }
         let mut damage_flags = sorted_unique(damage_flags);
-        let structure_complete = truthy(&result, "structure_validation_complete")?;
-        let boundary_exact = truthy(&result, "boundary_exact")?;
-        let trailing = trailing_bytes(&result)?;
-        let plausible = truthy(&result, "plausible")?;
+        let structure_complete = result.structure_complete;
+        let boundary_exact = result.boundary_exact;
+        let trailing = result.trailing_bytes;
+        let plausible = result.plausible;
         if plausible
             && structure_complete
             && boundary_exact
             && damage_flags.is_empty()
             && trailing == Some(0)
         {
-            let end = match u64_of(&result, "segment_end")? {
+            let end = match result.segment_end.unwrap_or_default() {
                 0 => self.view.reader.len(),
                 value => value,
             };
@@ -865,7 +747,7 @@ impl<'a> ReportContext<'a> {
                 format,
                 "extractable",
                 vec![Segment::new(0, Some(end), Vec::new())],
-                result,
+                EvidenceDetails::Stream(result),
             ));
         }
         if plausible {
@@ -874,12 +756,12 @@ impl<'a> ReportContext<'a> {
                 damage_flags = sorted_unique(damage_flags);
             }
 
-            let end = opt_u64_of(&result, "segment_end")?;
+            let end = result.segment_end;
             return Ok(Evidence::new(
                 format,
                 "damaged",
                 vec![Segment::new(0, end, damage_flags)],
-                result,
+                EvidenceDetails::Stream(result),
             ));
         }
         if damage_flags.is_empty() {
@@ -893,27 +775,13 @@ impl<'a> ReportContext<'a> {
                 "weak"
             },
             vec![Segment::new(0, None, damage_flags)],
-            result,
+            EvidenceDetails::Stream(result),
         ))
-    }
-
-    fn stream_observation(&mut self, format: &str) -> std::io::Result<DiagnosticFields> {
-        let raw = match self.full_stream_structure()? {
-            Some(structure) if structure.get("format").and_then(Value::as_str) == Some(format) => {
-                (*structure).clone()
-            }
-            Some(structure) => structure
-                .get("format")
-                .map(|actual| DiagnosticFields::from_iter([("format".to_owned(), actual.clone())]))
-                .unwrap_or_default(),
-            None => DiagnosticFields::new(),
-        };
-        stream_observation(raw, format)
     }
 
     /// Full-stream validation walks the complete structure, so it runs at most once
     /// per analysis and once per physical file generation across analyses.
-    fn full_stream_structure(&mut self) -> io::Result<Option<Arc<DiagnosticFields>>> {
+    fn full_stream_structure(&mut self) -> io::Result<Option<Arc<StreamObservation>>> {
         if let Some(structure) = &self.stream_structure {
             return Ok(structure.clone());
         }
@@ -955,7 +823,7 @@ fn append_native_field_flag(flags: &mut Vec<String>, fault: Option<&(ReadFault, 
     }
 }
 
-fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evidence> {
+fn rar_from_native(mut raw: RarObservation, start: u64) -> Evidence {
     let mut damage_flags = raw
         .damage_flags
         .iter()
@@ -965,13 +833,7 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evide
         raw.error = legacy;
         damage_flags.extend(native_read_fault_flags(fault));
     }
-    raw.archive_offset = if raw.archive_offset == 0 {
-        start
-    } else {
-        raw.archive_offset
-    };
     raw.plausible |= raw.header_crc_ok;
-    raw.block_walk_ok |= raw.end_block_found;
     let error = raw.error;
     if !error.is_empty() {
         damage_flags.push(error.into());
@@ -981,12 +843,12 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evide
     }
     damage_flags = sorted_unique(damage_flags);
     if !raw.magic_matched {
-        return Ok(Evidence::new(
+        return Evidence::new(
             "rar",
             "not_found",
             Vec::new(),
             EvidenceDetails::Rar(Box::new(raw)),
-        ));
+        );
     }
     let taxonomy =
         if damage_flags.iter().any(|flag| flag == "probably_truncated") && raw.blocks_checked > 0 {
@@ -1021,14 +883,13 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> std::io::Result<Evide
     }
     if taxonomy == "valid_encrypted_but_unwalkable" {
         raw.password_required = Some(true);
-        raw.header_encrypted = Some(true);
     }
-    Ok(Evidence::new(
+    Evidence::new(
         "rar",
         status,
         vec![Segment::new(start, end, segment_flags)],
         EvidenceDetails::Rar(Box::new(raw)),
-    ))
+    )
 }
 
 fn seven_zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence> {
@@ -1037,23 +898,15 @@ fn seven_zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence
         .end_offset
         .ok_or_else(|| io::Error::other("validated 7z has no end"))?;
 
-    let validation = item.validation;
-    let mut details = DiagnosticFields::new();
-    details.put("source", "embedded_scan")?;
-    details.put("validation", &validation)?;
-    details.put("candidate_kind", "logical_archive")?;
-    details.put("boundary_kind", "exact")?;
-    details.put("boundary_confidence", "high")?;
-    details.put("integrity_confidence", "deferred")?;
     Ok(Evidence::new(
         "7z",
         "extractable",
         vec![Segment::new(start, Some(end), Vec::new())],
-        details,
+        EvidenceDetails::Empty,
     ))
 }
 
-fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> std::io::Result<Evidence> {
+fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> Evidence {
     let mut damage_flags = Vec::new();
     if let Some((fault, legacy)) = &raw.read_fault {
         raw.error = legacy;
@@ -1073,12 +926,12 @@ fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> std::io::R
         damage_flags.push("directory_integrity_bad_or_unknown".into());
     }
     if !raw.magic_matched {
-        return Ok(Evidence::new(
+        return Evidence::new(
             "7z",
             "not_found",
             Vec::new(),
             EvidenceDetails::SevenZip(Box::new(raw)),
-        ));
+        );
     }
     let status = if raw.strong_accept {
         "extractable"
@@ -1099,272 +952,86 @@ fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> std::io::R
             })
         })
     };
-    Ok(Evidence::new(
+    Evidence::new(
         "7z",
         status,
         vec![Segment::new(start, end, damage_flags)],
         EvidenceDetails::SevenZip(Box::new(raw)),
-    ))
+    )
 }
 
-fn zip_observation(raw: &mut DiagnosticFields) -> std::io::Result<()> {
-    let error = str_of(raw, "error")?;
-    let damage_flags = sorted_unique(str_list(raw, "damage_flags")?);
-    let plausible = truthy(raw, "plausible")?;
-    let boundary = if plausible && error.is_empty() {
-        "high"
-    } else if truthy(raw, "magic_matched")? {
-        "low"
-    } else {
-        "none"
-    };
-    let integrity = if truthy(raw, "content_integrity_warning")? || !damage_flags.is_empty() {
-        "low"
-    } else if truthy(raw, "local_header_links_ok")? || plausible {
-        "medium"
-    } else {
-        "unknown"
-    };
-    set_default(raw, "boundary_confidence", boundary)?;
-    set_default(raw, "integrity_confidence", integrity)?;
-    set_default(raw, "damage_flags", damage_flags)?;
-    Ok(())
-}
-
-fn zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence> {
+fn zip_from_embedded(item: &EmbeddedCandidate) -> Evidence {
     let start = item.offset;
-    let end = item.end_offset;
-
-    let validation = item.validation;
-    let boundary_kind = item.boundary_kind;
-    let bounded_end = end.filter(|end| *end > start);
-    let extractable = boundary_kind == "exact" && item.extractable && bounded_end.is_some();
-    let exact = boundary_kind == "exact";
-    let mut details = DiagnosticFields::new();
-    details.put("source", "embedded_scan")?;
-    details.put("validation", &validation)?;
-    details.put("archive_offset", start)?;
-    if let Some(offset) = item.zip_eocd_offset {
-        details.put("eocd_offset", offset)?;
-    }
-    details.put("candidate_kind", item.candidate_kind)?;
-    details.put("boundary_kind", &boundary_kind)?;
-    details.put(
-        "boundary_confidence",
-        if exact { "high" } else { "unresolved" },
-    )?;
-    details.put(
-        "integrity_confidence",
-        if exact { "deferred" } else { "unknown" },
-    )?;
+    let bounded_end = item.end_offset.filter(|end| *end > start);
+    let extractable = item.boundary_kind == "exact" && item.extractable && bounded_end.is_some();
     let mut segment = Segment::new(start, bounded_end, Vec::new());
-    segment.zip_eocd_offset = item
-        .zip_eocd_offset
-        .and_then(|offset| offset.checked_sub(start));
-    Ok(Evidence::new(
-        "zip",
-        if extractable {
-            "extractable"
-        } else {
-            "damaged"
+    segment.zip_eocd_offset = item.zip_eocd_offset.and_then(|offset| offset.checked_sub(start));
+    Evidence::new(
+        "zip", if extractable { "extractable" } else { "damaged" }, vec![segment],
+        EvidenceDetails::Embedded {
+            anchor: !item.candidate_kind.is_empty() && item.candidate_kind != "logical_archive",
+            zip_eocd_offset: item.zip_eocd_offset,
         },
-        vec![segment],
-        details,
-    ))
+    )
 }
 
 fn zip_from_native(
-    mut native: DiagnosticFields,
+    native: ZipObservation,
     hits: &[ReportSignatureHit],
     view_size: u64,
-) -> std::io::Result<Evidence> {
-    let magic_matched = truthy(&native, "magic_matched")?;
-    if !magic_matched && hits.is_empty() {
-        return Ok(Evidence::new("zip", "not_found", Vec::new(), native));
+) -> Evidence {
+    if !native.magic_matched && hits.is_empty() {
+        return Evidence::new("zip", "not_found", Vec::new(), EvidenceDetails::Zip(Box::new(native)));
     }
-    let archive_offset = u64_of(&native, "archive_offset")?;
-    let eocd_offset = u64_of(&native, "eocd_offset")?;
-    let comment_length = u64_of(&native, "comment_length")?;
-    let end_offset = (eocd_offset != 0).then(|| eocd_offset + 22 + comment_length);
-    let plausible = truthy(&native, "plausible")?;
-    let walk_ok =
-        truthy(&native, "central_directory_walk_ok")? && truthy(&native, "local_header_links_ok")?;
-    let status = if plausible && walk_ok {
-        "extractable"
-    } else if plausible {
-        "damaged"
-    } else {
-        "weak"
-    };
-    let mut damage_flags = read_fault_damage_flags(&native)?;
-    let error = str_of(&native, "error")?;
-    if !error.is_empty() {
-        damage_flags.push(error);
+    let archive_offset = native.archive_offset;
+    let end_offset = (native.eocd_offset != 0).then(|| native.eocd_offset + 22 + native.comment_length);
+    let walk_ok = native.central_directory_walk_ok && native.local_header_links_ok;
+    let status = if native.plausible && walk_ok { "extractable" }
+        else if native.plausible { "damaged" } else { "weak" };
+    let mut damage_flags = native.read_fault.as_ref().map(native_read_fault_flags).unwrap_or_default();
+    append_read_fault_field(&mut damage_flags, native.read_fault.as_ref());
+    if !native.error.is_empty() { damage_flags.push(native.error.clone()); }
+    if !native.content_integrity_warning.is_empty() {
+        damage_flags.push("content_integrity_bad_or_unknown".to_owned());
     }
-    let crc_warning = str_of(&native, "content_integrity_warning")?;
-    if !crc_warning.is_empty() {
-        damage_flags.push("content_integrity_bad_or_unknown".to_string());
-        native.put("integrity_confidence", "low")?;
-        native.put("content_damage_reason", &crc_warning)?;
-    } else {
-        set_default(
-            &mut native,
-            "integrity_confidence",
-            if plausible { "medium" } else { "unknown" },
-        )?;
-    }
-    set_default(
-        &mut native,
-        "boundary_confidence",
-        if plausible && walk_ok { "high" } else { "low" },
-    )?;
-    let segments = if !hits.is_empty() || plausible {
-        let mut segment = Segment::new(
-            archive_offset,
-            end_offset.map(|end| end.min(view_size)),
-            damage_flags,
-        );
-        segment.zip_eocd_offset = opt_u64_of(&native, "eocd_offset")?
-            .and_then(|offset| offset.checked_sub(archive_offset));
+    let segments = if !hits.is_empty() || native.plausible {
+        let mut segment = Segment::new(archive_offset, end_offset.map(|end| end.min(view_size)), damage_flags);
+        segment.zip_eocd_offset = native.eocd_offset.checked_sub(archive_offset);
         vec![segment]
-    } else {
-        Vec::new()
-    };
-    Ok(Evidence::new("zip", status, segments, native))
+    } else { Vec::new() };
+    Evidence::new("zip", status, segments, EvidenceDetails::Zip(Box::new(native)))
 }
 
 fn zip_local_header_recovery(
-    native: &DiagnosticFields,
+    native: &ZipObservation,
     hits: &[ReportSignatureHit],
     earliest_local: &mut Option<Option<u64>>,
-) -> std::io::Result<Option<Evidence>> {
-    if !ZIP_LOCAL_RECOVERY_ERRORS.contains(&str_of(native, "error")?.as_str()) {
-        return Ok(None);
-    }
+) -> Option<Evidence> {
+    if !ZIP_LOCAL_RECOVERY_ERRORS.contains(&native.error.as_str()) { return None; }
     if earliest_local.is_none() {
-        let mut start = None::<u64>;
-        for hit in hits {
-            if hit.kind == ReportHitKind::ZipLocal {
-                let offset = hit.offset;
-                start = Some(start.map_or(offset, |current| current.min(offset)));
-            }
-        }
-        *earliest_local = Some(start);
+        *earliest_local = Some(hits.iter().filter(|hit| hit.kind == ReportHitKind::ZipLocal)
+            .map(|hit| hit.offset).min());
     }
-    let Some(start) = (*earliest_local).flatten() else {
-        return Ok(None);
-    };
-    let mut details = native.clone();
-    details.put("boundary_confidence", "low")?;
-    details.put("integrity_confidence", "unknown")?;
-    details.put("directory_confidence", "low")?;
-    Ok(Some(Evidence::new(
-        "zip",
-        "damaged",
-        vec![Segment::new(
-            start,
-            None,
-            vec![
-                "central_directory_unreliable".to_string(),
-                "local_header_recovery".to_string(),
-            ],
-        )],
-        details,
-    )))
-}
-
-fn stream_observation(raw: DiagnosticFields, requested: &str) -> std::io::Result<DiagnosticFields> {
-    let actual = str_of(&raw, "format")?;
-    let mut raw = if !requested.is_empty() && actual != requested {
-        let mut replaced = DiagnosticFields::new();
-        replaced.put("format", requested)?;
-        replaced.put("actual_format", actual)?;
-        replaced.put("magic_matched", false)?;
-        replaced.put("plausible", false)?;
-        replaced.put("structure_status", "invalid")?;
-        replaced.put("structure_validation_complete", false)?;
-        replaced.put("integrity_status", "failed")?;
-        replaced.put("integrity_validation_complete", true)?;
-        replaced.put("boundary_exact", false)?;
-        replaced.put("error", format!("{requested}_magic_not_found"))?;
-        replaced.put("damage_flags", Vec::<&str>::new())?;
-        replaced.put("evidence", Vec::<&str>::new())?;
-        replaced
-    } else {
-        raw
-    };
-    let structure_complete = truthy(&raw, "structure_validation_complete")?;
-    let integrity_status = str_or(&raw, "integrity_status", "deferred")?;
-    set_default(
-        &mut raw,
-        "structure_status",
-        if structure_complete {
-            "complete"
-        } else {
-            "incomplete"
-        },
-    )?;
-    set_default(
-        &mut raw,
-        "structure_validation_complete",
-        structure_complete,
-    )?;
-    set_default(&mut raw, "boundary_exact", structure_complete)?;
-    set_default(&mut raw, "integrity_status", &integrity_status)?;
-    set_default(
-        &mut raw,
-        "integrity_validation_complete",
-        integrity_status == "verified" || integrity_status == "failed",
-    )?;
-    let trailing = trailing_bytes(&raw)?;
-    let damage_flags = sorted_unique(str_list(&raw, "damage_flags")?);
-    let error = str_of(&raw, "error")?;
-    let (boundary, integrity) = if structure_complete
-        && truthy(&raw, "boundary_exact")?
-        && damage_flags.is_empty()
-        && trailing == Some(0)
-    {
-        (
-            "high",
-            if integrity_status == "verified" {
-                "high"
-            } else {
-                "unknown"
-            },
-        )
-    } else if !damage_flags.is_empty() || !error.is_empty() {
-        ("low", "low")
-    } else if truthy(&raw, "plausible")? {
-        ("medium", "unknown")
-    } else {
-        ("none", "unknown")
-    };
-    let file_size = i64_of(&raw, "file_size")?;
-    if !raw.contains_key("segment_end") {
-        match trailing {
-            Some(trailing) if structure_complete && file_size >= trailing => {
-                raw.put("segment_end", file_size - trailing)?
-            }
-            _ => raw.put("segment_end", Value::Null)?,
-        }
-    }
-    raw.put("boundary_confidence", boundary)?;
-    raw.put("integrity_confidence", integrity)?;
-    set_default(&mut raw, "damage_flags", damage_flags)?;
-    Ok(raw)
+    let Some(start) = (*earliest_local).flatten() else { return None; };
+    // The retained native facts still govern password and volume planning.
+    Some(Evidence::new(
+        "zip", "damaged", vec![Segment::new(start, None,
+            vec!["central_directory_unreliable".into(), "local_header_recovery".into()])],
+        EvidenceDetails::Zip(Box::new(native.clone())),
+    ))
 }
 
 fn combine_candidates(
     format: &str,
     candidates: Vec<Evidence>,
     preserve_multiple: bool,
-) -> std::io::Result<Evidence> {
+) -> Evidence {
     let mut usable = candidates
         .into_iter()
         .filter(|item| !item.segments.is_empty())
         .collect::<Vec<_>>();
     if usable.is_empty() {
-        return Ok(Evidence::not_found(format));
+        return Evidence::not_found(format);
     }
     if usable
         .iter()
@@ -1383,14 +1050,14 @@ fn combine_candidates(
         }
     }
     if !preserve_multiple {
-        return Ok(usable.swap_remove(best));
+        return usable.swap_remove(best);
     }
     let mut seen = HashMap::new();
     let mut segments: Vec<Segment> = Vec::new();
     let mut details = EvidenceDetails::Empty;
     let status = usable[best].status;
     for (index, item) in usable.into_iter().enumerate() {
-        let password_required = item.details.password_required()?;
+        let password_required = item.details.password_required();
         if index == best {
             details = item.details;
         }
@@ -1421,12 +1088,12 @@ fn combine_candidates(
             segment.end.unwrap_or(0),
         )
     });
-    Ok(Evidence {
+    Evidence {
         format: format.to_string(),
         status,
         segments,
         details,
-    })
+    }
 }
 
 fn status_rank(status: &str) -> u8 {
@@ -1447,11 +1114,11 @@ struct SegmentPlan {
 
 impl SegmentPlan {
     /// Order the canonical extractable carved segments by physical position.
-    fn build(evidences: &[Evidence], selected: &[usize], size: u64) -> std::io::Result<Self> {
+    fn build(evidences: &[Evidence], selected: &[usize], size: u64) -> Self {
         let mut candidates = Vec::new();
         for &evidence_index in selected {
             let evidence = &evidences[evidence_index];
-            if evidence.details.embedded_anchor()? {
+            if evidence.details.embedded_anchor() {
                 continue;
             }
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
@@ -1477,7 +1144,7 @@ impl SegmentPlan {
         });
         let mut password_segment = None::<(usize, usize)>;
         for (evidence_index, evidence) in evidences.iter().enumerate() {
-            let password_required = evidence.details.password_required()?;
+            let password_required = evidence.details.password_required();
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
                 if segment.start == 0 || !segment.password_required.unwrap_or(password_required) {
                     continue;
@@ -1509,12 +1176,6 @@ impl SegmentPlan {
                         .saturating_add(raw.next_header_offset)
                         .saturating_add(raw.next_header_size)
                 }
-                EvidenceDetails::Fields(details) if truthy(details, "start_header_crc_ok")? => {
-                    u64_of(details, "archive_offset")?
-                        .saturating_add(32)
-                        .saturating_add(u64_of(details, "next_header_offset")?)
-                        .saturating_add(u64_of(details, "next_header_size")?)
-                }
                 _ => continue,
             };
             if expected_end > size {
@@ -1523,109 +1184,40 @@ impl SegmentPlan {
             }
         }
 
-        Ok(Self {
+        Self {
             extractable: candidates,
             password_segment,
             missing_volume_evidence,
-        })
+        }
     }
 }
 
 impl Evidence {
-    fn structure_complete(&self, details: &DiagnosticFields) -> io::Result<bool> {
-        Ok(match &self.details {
-            EvidenceDetails::Rar(value) => {
-                value.end_block_found && value.error.is_empty() && value.read_fault.is_none()
-            }
-            EvidenceDetails::SevenZip(value) => {
-                value.next_header_crc_ok && value.next_header_nid_valid && value.error.is_empty()
-            }
-            _ if self.format == "zip" => {
-                truthy(&details, "central_directory_walk_ok")?
-                    && truthy(&details, "local_header_links_ok")?
-            }
-            _ if self.format == "tar" => {
-                truthy(&details, "walk_complete")? && str_of(&details, "error")?.is_empty()
-            }
-            _ => truthy(&details, "structure_validation_complete")?,
-        })
-    }
-
-    fn analysis_facts(&self) -> io::Result<AnalysisFacts> {
-        let fields = match &self.details {
-            EvidenceDetails::Fields(fields) => Some(fields),
-            _ => None,
-        };
+    fn analysis_facts(&self) -> AnalysisFacts {
         let structure_complete = match &self.details {
-            EvidenceDetails::Rar(value) => {
-                value.end_block_found && value.error.is_empty() && value.read_fault.is_none()
-            }
-            EvidenceDetails::SevenZip(value) => {
-                value.next_header_crc_ok && value.next_header_nid_valid && value.error.is_empty()
-            }
-            _ => match fields {
-                Some(fields) => self.structure_complete(fields)?,
-                None => false,
-            },
+            EvidenceDetails::Rar(value) => value.end_block_found && value.error.is_empty() && value.read_fault.is_none(),
+            EvidenceDetails::SevenZip(value) => value.next_header_crc_ok && value.next_header_nid_valid && value.error.is_empty(),
+            EvidenceDetails::Zip(value) => value.central_directory_walk_ok && value.local_header_links_ok,
+            EvidenceDetails::Tar(value) => value.walk_complete && value.error.is_empty(),
+            EvidenceDetails::Stream(value) => value.structure_complete,
+            _ => false,
         };
-        let zip_eocd_offset = if self.format == "zip" {
-            fields
-                .and_then(|fields| fields.get("eocd_offset"))
-                .and_then(Value::as_u64)
-        } else {
-            None
+        let (zip_eocd_offset, zip_spanned) = match &self.details {
+            EvidenceDetails::Zip(value) => (Some(value.eocd_offset), value.is_multi_disk),
+            EvidenceDetails::Embedded { zip_eocd_offset, .. } => (*zip_eocd_offset, false),
+            _ => (None, false),
         };
-        Ok(AnalysisFacts {
-            zip_eocd_offset,
-            zip_spanned: fields
-                .and_then(|fields| fields.get("is_multi_disk"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            password_required: self.details.password_required()?,
-            structure_complete,
-            ..Default::default()
-        })
+        AnalysisFacts { zip_eocd_offset, zip_spanned,
+            password_required: self.details.password_required(), structure_complete,
+            ..Default::default() }
     }
 }
 
-/// Trailing bytes after the last stream member. A truncated stream reports the
-/// field as unavailable, which leaves the boundary unproven.
-fn trailing_bytes(dict: &DiagnosticFields) -> std::io::Result<Option<i64>> {
-    match dict.get("archive.trailing_data") {
-        None => Ok(Some(0)),
-        Some(value) if value.is_null() => Ok(Some(0)),
-        Some(value) => Ok(value.as_i64()),
+fn append_read_fault_field(flags: &mut Vec<String>, fault: Option<&ReadFault>) {
+    if let Some(fault) = fault {
+        let field = fault.field.trim();
+        if !field.is_empty() { flags.push(format!("field_read_error:{field}")); }
     }
-}
-
-fn read_fault_damage_flags(native: &DiagnosticFields) -> std::io::Result<Vec<String>> {
-    let flags = str_list(native, "damage_flags")?;
-    let Some(fault) = native.get("read_error") else {
-        return Ok(flags);
-    };
-    let Some(fault) = fault.as_object() else {
-        return Ok(flags);
-    };
-    let mut flags = flags;
-    flags.push("read_error".to_string());
-    if str_of(fault, "code")? == "unexpected_eof" {
-        flags.push("input_truncated".to_string());
-    }
-    let field = str_of(fault, "field")?;
-    let field = field.trim();
-    if !field.is_empty() {
-        flags.push(format!("field_read_error:{field}"));
-    }
-    if truthy(fault, "possible_missing_volume")? {
-        flags.push("missing_volume".to_string());
-    }
-    let mut unique = Vec::with_capacity(flags.len());
-    for flag in flags {
-        if !flag.is_empty() && !unique.contains(&flag) {
-            unique.push(flag);
-        }
-    }
-    Ok(unique)
 }
 
 // ---- Format identity confirmation ----------------------------------------
@@ -1672,7 +1264,7 @@ pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
 
 // ---- Full-stream structure cache -----------------------------------------
 
-type StreamStructureSlot = CancellableOnce<Result<Arc<DiagnosticFields>, Arc<io::Error>>>;
+type StreamStructureSlot = CancellableOnce<Result<Arc<StreamObservation>, Arc<io::Error>>>;
 type StreamStructureEntry = (FileIdentity, Arc<StreamStructureSlot>);
 
 fn stream_structure_cache() -> &'static Mutex<VecDeque<StreamStructureEntry>> {
@@ -1684,7 +1276,7 @@ fn stream_structure_cached(
     identity: FileIdentity,
     reader: &ManagedReader,
     header: &[u8],
-) -> io::Result<Arc<DiagnosticFields>> {
+) -> io::Result<Arc<StreamObservation>> {
     let cancellation = Cancellation::current();
     cancellation.check()?;
     let slot = loop {
@@ -1770,78 +1362,6 @@ pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) -> u
     before - entries.len()
 }
 
-// ---- Diagnostic field access ----------------------------------------------
-
-fn value_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|number| number != 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
-}
-
-fn truthy(fields: &DiagnosticFields, key: &str) -> io::Result<bool> {
-    Ok(fields.get(key).is_some_and(value_truthy))
-}
-
-fn i64_of(fields: &DiagnosticFields, key: &str) -> io::Result<i64> {
-    Ok(fields.get(key).and_then(Value::as_i64).unwrap_or_default())
-}
-
-fn u64_of(fields: &DiagnosticFields, key: &str) -> io::Result<u64> {
-    Ok(opt_u64_of(fields, key)?.unwrap_or_default())
-}
-
-fn opt_u64_of(fields: &DiagnosticFields, key: &str) -> io::Result<Option<u64>> {
-    Ok(fields.get(key).and_then(|value| {
-        value
-            .as_u64()
-            .or_else(|| value.as_i64().map(|value| value.max(0) as u64))
-    }))
-}
-
-fn str_of(fields: &DiagnosticFields, key: &str) -> io::Result<String> {
-    Ok(fields
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned())
-}
-
-fn str_or(fields: &DiagnosticFields, key: &str, default: &str) -> io::Result<String> {
-    Ok(fields
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(default)
-        .to_owned())
-}
-
-fn str_list(fields: &DiagnosticFields, key: &str) -> io::Result<Vec<String>> {
-    Ok(fields
-        .get(key)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect())
-}
-
-fn set_default(
-    fields: &mut DiagnosticFields,
-    key: &str,
-    value: impl serde::Serialize,
-) -> io::Result<()> {
-    if !fields.contains_key(key) {
-        fields.put(key, value)?;
-    }
-    Ok(())
-}
-
 fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
     values.retain(|value| !value.is_empty());
     values.sort();
@@ -1859,10 +1379,13 @@ mod report_tests {
         segments: &[(u64, Option<u64>)],
         details: &[(&str, &str)],
     ) -> Evidence {
-        let mut dict = DiagnosticFields::new();
-        for (key, value) in details {
-            dict.put(*key, *value).unwrap();
-        }
+        let password_required = details.iter().any(|&(key, value)| key == "password_required" && !value.is_empty());
+        let anchor = details.iter().any(|&(key, value)| key == "candidate_kind" && value != "logical_archive" && !value.is_empty());
+        let facts = if anchor {
+            EvidenceDetails::Embedded { anchor: true, zip_eocd_offset: None }
+        } else {
+            EvidenceDetails::Zip(Box::new(ZipObservation { password_required, ..Default::default() }))
+        };
         Evidence::new(
             format,
             status,
@@ -1870,7 +1393,7 @@ mod report_tests {
                 .iter()
                 .map(|(start, end)| Segment::new(*start, *end, Vec::new()))
                 .collect(),
-            dict,
+            facts,
         )
     }
 
@@ -1921,7 +1444,7 @@ mod report_tests {
             ),
             evidence("tar", "extractable", &[(90, None)], &[]),
         ];
-        let plan = SegmentPlan::build(&evidences, &[0, 1, 2, 3], 100).unwrap();
+        let plan = SegmentPlan::build(&evidences, &[0, 1, 2, 3], 100);
         assert_eq!(
             planned(&evidences, &plan),
             vec![("7z".into(), 0), ("rar".into(), 40)]
@@ -1950,7 +1473,7 @@ mod report_tests {
                 &[("password_required", "yes")],
             ),
         ];
-        let plan = SegmentPlan::build(&evidences, &[], 200).unwrap();
+        let plan = SegmentPlan::build(&evidences, &[], 200);
         assert_eq!(plan.password_segment, Some((2, 0)));
         assert!(plan.extractable.is_empty());
     }
@@ -1958,23 +1481,18 @@ mod report_tests {
     #[test]
     fn plan_proves_missing_volume_from_seven_zip_declared_end() {
         let mut seven = evidence("7z", "damaged", &[(0, None)], &[]);
-        let EvidenceDetails::Fields(details) = &mut seven.details else {
-            unreachable!()
-        };
-        details.put("start_header_crc_ok", true).unwrap();
-        details.put("archive_offset", 0).unwrap();
-        details.put("next_header_offset", 100).unwrap();
-        details.put("next_header_size", 10).unwrap();
+        seven.details = EvidenceDetails::SevenZip(Box::new(SevenZipObservation {
+            start_header_crc_ok: true, archive_offset: 0, next_header_offset: 100, next_header_size: 10,
+            ..Default::default()
+        }));
         let evidences = vec![seven];
         assert_eq!(
             SegmentPlan::build(&evidences, &[], 50)
-                .unwrap()
                 .missing_volume_evidence,
             "seven_zip_start_header_length"
         );
         assert_eq!(
             SegmentPlan::build(&evidences, &[], 142)
-                .unwrap()
                 .missing_volume_evidence,
             ""
         );
@@ -1983,21 +1501,18 @@ mod report_tests {
     #[test]
     fn combine_prefers_first_outer_range_and_deduplicates_segments() {
         let candidates = vec![
-            evidence("rar", "weak", &[(9, None)], &[("id", "weak")]),
-            evidence("rar", "extractable", &[(30, Some(50))], &[("id", "first")]),
+            evidence("rar", "weak", &[(9, None)], &[]),
+            evidence("rar", "extractable", &[(30, Some(50))], &[]),
             evidence(
                 "rar",
                 "extractable",
                 &[(4, Some(20)), (30, Some(50))],
-                &[("id", "second")],
+                &[("password_required", "yes")],
             ),
         ];
-        let combined = combine_candidates("rar", candidates, true).unwrap();
+        let combined = combine_candidates("rar", candidates, true);
         assert_eq!(combined.status, "extractable");
-        let EvidenceDetails::Fields(details) = &combined.details else {
-            panic!("combined evidence did not retain its primary details");
-        };
-        assert_eq!(str_of(details, "id").unwrap(), "second");
+        assert!(combined.details.password_required());
         let spans = combined
             .segments
             .iter()
@@ -2021,9 +1536,9 @@ mod report_tests {
                 &[("password_required", "yes")],
             ),
         ];
-        let combined = combine_candidates("zip", candidates, true).unwrap();
+        let combined = combine_candidates("zip", candidates, true);
         let evidences = vec![combined];
-        let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
+        let plan = SegmentPlan::build(&evidences, &[0], 100);
         assert_eq!(planned(&evidences, &plan), vec![("zip".into(), 40)]);
         assert_eq!(plan.password_segment, Some((0, 0)));
         assert_eq!(evidences[0].range_key().0, 40);
@@ -2039,50 +1554,73 @@ mod report_tests {
             ),
             evidence("rar", "damaged", &[(10, Some(20))], &[]),
         ];
-        let evidences = vec![combine_candidates("rar", candidates, true).unwrap()];
-        let plan = SegmentPlan::build(&evidences, &[0], 100).unwrap();
+        let evidences = vec![combine_candidates("rar", candidates, true)];
+        let plan = SegmentPlan::build(&evidences, &[0], 100);
         assert_eq!(plan.password_segment, Some((0, 1)));
     }
 
     #[test]
-    fn read_fault_projects_field_truncation_and_missing_volume_flags() {
-        let mut native = DiagnosticFields::new();
-        native
-            .put("damage_flags", vec!["read_error", "probably_truncated"])
-            .unwrap();
-        let mut fault = DiagnosticFields::new();
-        fault.put("code", "unexpected_eof").unwrap();
-        fault.put("field", " zip.eocd ").unwrap();
-        fault.put("possible_missing_volume", true).unwrap();
-        native.put("read_error", fault).unwrap();
-        assert_eq!(
-            read_fault_damage_flags(&native).unwrap(),
-            vec![
-                "read_error",
-                "probably_truncated",
-                "input_truncated",
-                "field_read_error:zip.eocd",
-                "missing_volume",
-            ]
-        );
-        native.remove("read_error").unwrap();
-        assert_eq!(
-            read_fault_damage_flags(&native).unwrap(),
-            vec!["read_error", "probably_truncated"]
-        );
+    fn typed_zip_and_tar_facts_retain_planning_boundaries() {
+        // Exercise real probes and the final facts together: dictionary-field
+        // conversion errors otherwise silently default password/boundary facts.
+        let mut zip = vec![0u8; 30 + 46 + 22];
+        zip[..4].copy_from_slice(ZIP_LOCAL);
+        zip[30..34].copy_from_slice(ZIP_CENTRAL);
+        zip[38..40].copy_from_slice(&1u16.to_le_bytes()); // encrypted central member
+        zip[76..80].copy_from_slice(ZIP_EOCD);
+        zip[84..86].copy_from_slice(&1u16.to_le_bytes());
+        zip[86..88].copy_from_slice(&1u16.to_le_bytes());
+        zip[88..92].copy_from_slice(&46u32.to_le_bytes());
+        zip[92..96].copy_from_slice(&30u32.to_le_bytes());
+        let zip_path = crate::test_support::temp_file("typed_zip_facts", &zip);
+        {
+            let view = AnalysisBinaryView::new(&zip_path.to_string_lossy(), 0).unwrap();
+            let observed = view.probe_zip_with_disk_starts(76, None).unwrap();
+            assert!(observed.plausible && observed.password_required);
+            let evidence = zip_from_native(observed,
+                &[ReportSignatureHit { kind: ReportHitKind::ZipLocal, offset: 0 }], zip.len() as u64);
+            assert_eq!(evidence.status, "extractable");
+            assert_eq!(evidence.segments[0].end, Some(zip.len() as u64));
+            let facts = evidence.analysis_facts();
+            assert!(facts.structure_complete && facts.password_required);
+            assert_eq!(facts.zip_eocd_offset, Some(76));
+        }
+        let mut tar = vec![0u8; 3 * TAR_BLOCK_SIZE];
+        tar[0] = b'x';
+        for range in [100..108, 108..116, 116..124, 124..136, 136..148] {
+            tar[range.start..range.end - 1].fill(b'0');
+        }
+        tar[148..156].fill(b' ');
+        tar[156] = b'0';
+        tar[257..263].copy_from_slice(b"ustar\0");
+        let checksum = format!("{:06o}\0 ", tar_checksum(&tar[..TAR_BLOCK_SIZE]));
+        tar[148..156].copy_from_slice(checksum.as_bytes());
+        let tar_path = crate::test_support::temp_file("typed_tar_facts", &tar);
+        {
+            let view = AnalysisBinaryView::new(&tar_path.to_string_lossy(), 0).unwrap();
+            let context = ReportContext { view: &view, disk_starts: None, hits: Vec::new().into(),
+                embedded_scan: None, stream_structure: None };
+            let evidence = context.tar_candidate(0).unwrap().unwrap();
+            assert_eq!(evidence.status, "extractable");
+            assert_eq!(evidence.segments[0].end, Some(tar.len() as u64));
+            assert!(evidence.analysis_facts().structure_complete);
+        }
+        crate::io::reader::release_reader_resources_under_roots(vec![
+            zip_path.to_string_lossy().into_owned(), tar_path.to_string_lossy().into_owned(),
+        ]).unwrap();
+        std::fs::remove_file(zip_path).unwrap();
+        std::fs::remove_file(tar_path).unwrap();
     }
 
     #[test]
-    fn truncated_stream_trailing_size_is_unknown_not_an_error() {
-        let mut raw = DiagnosticFields::new();
-        raw.put("format", "gzip").unwrap();
-        raw.put("magic_matched", true).unwrap();
-        raw.put("plausible", false).unwrap();
-        raw.put("structure_validation_complete", true).unwrap();
-        raw.put("archive.trailing_data", "unavailable").unwrap();
-        raw.put("file_size", 100).unwrap();
-        let observed = stream_observation(raw, "gzip").unwrap();
-        assert!(observed.get("segment_end").unwrap().is_null());
-        assert_eq!(str_of(&observed, "boundary_confidence").unwrap(), "none");
+    fn read_fault_projects_field_truncation_and_missing_volume_flags() {
+        let fault = ReadFault::short_read("read_record", 0, 22, 10, 10)
+            .with_field(" zip.eocd ", FieldLocation::Tail);
+        let mut flags = native_read_fault_flags(&fault);
+        append_read_fault_field(&mut flags, Some(&fault));
+        assert_eq!(flags, ["read_error", "input_truncated", "probably_truncated",
+            "missing_volume", "field_read_error:zip.eocd"]);
     }
+
+
 }

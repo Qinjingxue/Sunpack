@@ -12,16 +12,8 @@ struct SevenZipObservation {
     start_header_crc_ok: bool,
     next_header_crc_checked: bool,
     next_header_crc_ok: bool,
-    next_header_nid: u8,
     next_header_nid_valid: bool,
-    version_major: u8,
-    version_minor: u8,
     password_required: bool,
-    encrypted_header: bool,
-    encrypted_payload: bool,
-    password_state: &'static str,
-    encryption_scan_complete: bool,
-    evidence: Vec<&'static str>,
     read_fault: Option<(ReadFault, &'static str)>,
 }
 
@@ -29,7 +21,6 @@ impl AnalysisBinaryView {
     fn probe_seven_zip_native(&self, start_offset: u64) -> std::io::Result<SevenZipObservation> {
         let mut result = SevenZipObservation {
             archive_offset: start_offset,
-            password_state: "unknown",
             ..Default::default()
         };
         let header = match self.read_field_at_bytes(
@@ -49,8 +40,7 @@ impl AnalysisBinaryView {
             return Ok(result);
         }
         result.magic_matched = true;
-        result.version_major = header[6];
-        result.version_minor = header[7];
+
         if header[6] != 0 {
             result.error = "unsupported_version";
             return Ok(result);
@@ -98,10 +88,7 @@ impl AnalysisBinaryView {
             return Ok(result);
         }
         result.plausible = true;
-        let mut evidence = Vec::new();
-        evidence.push("7z:signature");
-        evidence.push("7z:start_header_crc");
-        evidence.push("7z:next_header_range");
+
         {
             // CRC covers the complete declared range with a fixed working buffer.
             // Spill large headers for shared encryption-fact parsing without
@@ -134,10 +121,9 @@ impl AnalysisBinaryView {
             let nid_valid = next_header.is_empty() || nid == 0x01 || nid == 0x17;
             result.next_header_crc_checked = true;
             result.next_header_crc_ok = crc_ok;
-            result.next_header_nid = nid;
+
             result.next_header_nid_valid = nid_valid;
             if crc_ok {
-                evidence.push("7z:next_header_crc");
                 if nid_valid {
                     let encryption = {
                         crate::formats::seven_zip::seven_zip_encryption_facts_from_next_header(
@@ -145,18 +131,8 @@ impl AnalysisBinaryView {
                         )
                     };
                     result.password_required = encryption.password_required;
-                    result.encrypted_header = encryption.encrypted_header;
-                    result.encrypted_payload = encryption.encrypted_payload;
-                    result.password_state = if encryption.password_required {
-                        "required"
-                    } else if encryption.scan_complete {
-                        "not_required"
-                    } else {
-                        "unknown"
-                    };
-                    result.encryption_scan_complete = encryption.scan_complete;
                     result.strong_accept = true;
-                    evidence.push("7z:next_header_nid");
+
                 } else {
                     result.error = "next_header_nid_unrecognized";
                 }
@@ -164,7 +140,7 @@ impl AnalysisBinaryView {
                 result.error = "next_header_crc_mismatch";
             }
         }
-        result.evidence = evidence;
+
         Ok(result)
     }
 }

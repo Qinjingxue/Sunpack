@@ -30,9 +30,6 @@ fn parse_octal(field: &[u8]) -> Option<u64> {
 
 #[derive(Clone, Copy)]
 struct TarHeaderIdentity {
-    stored_checksum: u64,
-    computed_checksum: u64,
-    member_size: u64,
     ustar_magic: bool,
     name_nonempty: bool,
     numeric_fields_valid: bool,
@@ -47,9 +44,6 @@ fn tar_header_identity(header: &[u8], offset: u64, file_size: u64) -> TarHeaderI
     let computed_checksum = tar_checksum(header);
     let ustar_magic = matches!(&header[257..263], b"ustar\x00" | b"ustar ");
     TarHeaderIdentity {
-        stored_checksum: stored_checksum.unwrap_or(0),
-        computed_checksum,
-        member_size: member_size.unwrap_or(0),
         ustar_magic,
         name_nonempty: header[0..100].iter().any(|byte| *byte != 0),
         numeric_fields_valid: stored_checksum.is_some()
@@ -60,11 +54,8 @@ fn tar_header_identity(header: &[u8], offset: u64, file_size: u64) -> TarHeaderI
             && parse_octal(&header[136..148]).is_some(),
         typeflag_valid: header[156] == 0 || (0x20..0x7f).contains(&header[156]),
         payload_in_range: member_size.is_some_and(|size| {
-            offset
-                .saturating_add(TAR_BLOCK_SIZE as u64)
-                .saturating_add(size)
-                .saturating_add(tar_padding(size))
-                <= file_size
+            offset.saturating_add(TAR_BLOCK_SIZE as u64)
+                .saturating_add(size).saturating_add(tar_padding(size)) <= file_size
         }),
         validated_size: crate::formats::tar::checked_header_size(
             stored_checksum,

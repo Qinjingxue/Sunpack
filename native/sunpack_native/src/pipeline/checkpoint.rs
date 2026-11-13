@@ -347,6 +347,7 @@ impl InputCheckpoint {
         }
         paths.remap(&mut self.carrier);
         paths.remap(&mut self.input.entry);
+        if let Some(receipt) = &mut self.failure { paths.remap_failure(&mut receipt.failure); }
         if let Some(planned) = &mut self.planned_output { paths.remap(planned); }
         if self.has_output() { paths.remap(&mut self.output); }
         if let Some(container) = &mut self.container { paths.remap(container); }

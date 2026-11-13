@@ -147,10 +147,42 @@ pub enum FailureKind {
     Unknown,
 }
 
+/// The creation boundary of a failure, retained for user-facing reports.
+/// Native evidence remains separate: a worker phase is not the report stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum FailureContext {
+    Discovery { discovery: DiscoverySource, reason: String, path: PathBuf, error: String },
+    InputAdmission { missing_paths: Vec<PathBuf> },
+    PasswordResolution,
+    Extraction,
+    OutputCreate { error: String },
+    Postprocess { destination: PathBuf },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureScope {
+    pub root: String,
+    pub max_depth: Option<usize>,
+    pub excluded_subtrees: Vec<String>,
+}
+
+impl FailureScope {
+    pub(crate) fn from_scope(scope: &crate::scan::scope::NativeDiscoveryScope) -> Self {
+        let mut excluded_subtrees = scope.excluded_subtrees();
+        excluded_subtrees.sort();
+        Self { root: scope.root.clone(), max_depth: scope.max_depth, excluded_subtrees }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Box<FailureContext>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_scope: Option<Box<FailureScope>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub causes: Vec<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,6 +205,11 @@ impl Failure {
         self.kind == kind || self.causes.iter().any(|cause| cause.contains(kind))
     }
 
+    pub(crate) fn with_context(mut self, context: FailureContext) -> Self {
+        self.context = Some(Box::new(context));
+        self
+    }
+
     pub(crate) fn with_cause(mut self, cause: Option<Self>) -> Self {
         self.causes.extend(cause);
         self
@@ -182,6 +219,8 @@ impl Failure {
         Self {
             kind,
             message: message.into(),
+            context: None,
+            discovery_scope: None,
             causes: Vec::new(),
             evidence: None,
             password_retry: false,
@@ -567,6 +606,8 @@ impl TaskCompletion {
             failure: result.failure.as_ref().map(|failure| Failure {
                 kind: failure.kind,
                 message: failure.message.clone(),
+                context: None,
+                discovery_scope: None,
                 causes: failure.causes.clone(),
                 password_retry: failure.password_retry,
                 // Only the fields used by the common human-facing projection.

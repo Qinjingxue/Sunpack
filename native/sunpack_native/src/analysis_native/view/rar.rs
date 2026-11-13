@@ -1,41 +1,22 @@
 // Native RAR observation shared by single-file and multi-volume analysis.
-// Completed observations can be rendered as diagnostic fields.
 #[derive(Default)]
 struct RarObservation {
     plausible: bool,
     magic_matched: bool,
     strong_accept: bool,
     error: &'static str,
-    archive_offset: u64,
     segment_end: u64,
-    version: u8,
     blocks_checked: usize,
     end_block_found: bool,
-    end_block_flags: u64,
-    first_header_offset: u64,
-    first_header_size: u64,
-    first_header_type: u64,
-    header_crc_checked: bool,
     header_crc_ok: bool,
-    second_block_checked: bool,
-    second_block_ok: bool,
-    second_block_type: u64,
-    second_block_size: u64,
-    block_walk_ok: bool,
-    evidence: Vec<&'static str>,
     damage_flags: Vec<&'static str>,
-    damaged_header_type: Option<u64>,
-    header_encrypted: Option<bool>,
     password_required: Option<bool>,
     read_fault: Option<(ReadFault, &'static str)>,
 }
 
 impl AnalysisBinaryView {
     fn probe_rar_native(&self, start_offset: u64) -> std::io::Result<RarObservation> {
-        let mut result = RarObservation {
-            archive_offset: start_offset,
-            ..Default::default()
-        };
+        let mut result = RarObservation::default();
         let header = match self.read_field_at_bytes(
             start_offset,
             RAR5.len(),
@@ -50,11 +31,9 @@ impl AnalysisBinaryView {
         };
         if header.starts_with(RAR5) {
             result.magic_matched = true;
-            result.version = 5;
             self.probe_rar5(&mut result, start_offset)?;
         } else if header.starts_with(RAR4) {
             result.magic_matched = true;
-            result.version = 4;
             self.probe_rar4(&mut result, start_offset)?;
         } else if header.starts_with(b"Rar!") {
             result.magic_matched = true;
@@ -68,8 +47,7 @@ impl AnalysisBinaryView {
     fn probe_rar4(&self, result: &mut RarObservation, start_offset: u64) -> std::io::Result<()> {
         let mut cursor = start_offset + RAR4.len() as u64;
         let size = self.reader.len();
-        let mut evidence = Vec::new();
-        evidence.push("rar4:signature");
+
         let mut index = 0;
         loop {
             if cursor.saturating_add(7) > size {
@@ -95,15 +73,6 @@ impl AnalysisBinaryView {
             let header_type = fixed[2];
             let header_flags = u16_le(&fixed, 3);
             let header_size = u16_le(&fixed, 5) as u64;
-            if index == 0 {
-                result.first_header_offset = cursor;
-                result.first_header_type = u64::from(header_type);
-                result.first_header_size = header_size;
-            } else if index == 1 {
-                result.second_block_checked = true;
-                result.second_block_type = u64::from(header_type);
-                result.second_block_size = header_size;
-            }
             if !matches!(header_type, 0x72..=0x7B) {
                 result.blocks_checked = index;
                 result.error = "rar4_block_unknown_type";
@@ -130,15 +99,12 @@ impl AnalysisBinaryView {
             let full_header = self.read_at_bytes(cursor, header_size as usize)?;
             let crc_ok = (crc32(&full_header[2..]) & 0xFFFF) == header_crc as u32;
             if index == 0 {
-                result.header_crc_checked = true;
                 result.header_crc_ok = crc_ok;
-            } else if index == 1 {
-                result.second_block_ok = crc_ok;
             }
             if !crc_ok {
                 result.blocks_checked = index;
                 result.error = "rar4_block_crc_mismatch";
-                result.damaged_header_type = Some(header_type as u64);
+
                 let flag = match header_type {
                     0x73 => "rar_main_header_crc_bad",
                     0x74 => "rar_file_header_crc_bad",
@@ -174,11 +140,6 @@ impl AnalysisBinaryView {
                 result.error = "rar4_main_header_missing";
                 return Ok(());
             }
-            if index == 0 {
-                evidence.push("rar4:main_header");
-            } else if index == 1 {
-                result.block_walk_ok = true;
-            }
             // A validated plaintext main header that declares MHD_PASSWORD
             // (0x0080) means every following header is encrypted, so the block
             // walk cannot continue without the password.  Mirror the RAR5
@@ -189,26 +150,19 @@ impl AnalysisBinaryView {
             // derive the segment end from the next archive boundary) and let
             // extraction retry with the password.
             if index == 0 && header_flags & 0x0080 != 0 {
-                evidence.push("rar4:encryption_header");
                 result.plausible = true;
                 result.strong_accept = true;
-                result.header_encrypted = Some(true);
                 result.password_required = Some(true);
-                result.block_walk_ok = true;
                 result.blocks_checked = 1usize;
                 result.segment_end = 0;
-                result.evidence = evidence;
                 return Ok(());
             }
             if header_type == 0x7B {
-                evidence.push("rar4:end_block");
                 result.plausible = true;
                 result.strong_accept = true;
                 result.blocks_checked = index + 1;
                 result.end_block_found = true;
-                result.end_block_flags = u64::from(header_flags);
                 result.segment_end = next_cursor;
-                result.evidence = evidence;
                 return Ok(());
             }
             cursor = next_cursor;
@@ -219,8 +173,7 @@ impl AnalysisBinaryView {
     fn probe_rar5(&self, result: &mut RarObservation, start_offset: u64) -> std::io::Result<()> {
         let mut cursor = start_offset + RAR5.len() as u64;
         let size = self.reader.len();
-        let mut evidence = Vec::new();
-        evidence.push("rar5:signature");
+
         let mut index = 0;
         loop {
             if cursor.saturating_add(6) > size {
@@ -297,15 +250,6 @@ impl AnalysisBinaryView {
                 result.error = "rar5_header_flags_vint_missing";
                 return Ok(());
             };
-            if index == 0 {
-                result.first_header_offset = cursor;
-                result.first_header_type = header_type;
-                result.first_header_size = header_size;
-            } else if index == 1 {
-                result.second_block_checked = true;
-                result.second_block_type = header_type;
-                result.second_block_size = header_size;
-            }
             if !matches!(header_type, 1..=5) && header_flags & 0x0004 == 0 {
                 result.blocks_checked = index;
                 result.error = "rar5_block_unknown_non_skippable_type";
@@ -314,15 +258,12 @@ impl AnalysisBinaryView {
             let stored_crc = u32_le(&full, 0);
             let crc_ok = crc32(&full[4..]) == stored_crc;
             if index == 0 {
-                result.header_crc_checked = true;
                 result.header_crc_ok = crc_ok;
-            } else if index == 1 {
-                result.second_block_ok = crc_ok;
             }
             if !crc_ok {
                 result.blocks_checked = index;
                 result.error = "rar5_block_crc_mismatch";
-                result.damaged_header_type = Some(header_type as u64);
+
                 let flag = match header_type {
                     1 => "rar_main_header_crc_bad",
                     2 => "rar_file_header_crc_bad",
@@ -375,15 +316,11 @@ impl AnalysisBinaryView {
             // strong structural evidence rather than a missing-main-header
             // failure.
             if index == 0 && header_type == 4 && next_cursor + 16 <= size {
-                evidence.push("rar5:encryption_header");
                 result.plausible = true;
                 result.strong_accept = true;
-                result.header_encrypted = Some(true);
                 result.password_required = Some(true);
-                result.block_walk_ok = true;
                 result.blocks_checked = 1usize;
                 result.segment_end = 0;
-                result.evidence = evidence;
                 return Ok(());
             }
             if index == 0 && header_type != 1 {
@@ -391,23 +328,12 @@ impl AnalysisBinaryView {
                 result.error = "rar5_main_header_missing";
                 return Ok(());
             }
-            if index == 0 {
-                evidence.push("rar5:main_header");
-            } else if index == 1 {
-                result.block_walk_ok = true;
-            }
             if header_type == 5 {
-                let end_flags = read_vint(&full, field_cursor)
-                    .map(|(value, _)| value)
-                    .unwrap_or(0);
-                evidence.push("rar5:end_block");
                 result.plausible = true;
                 result.strong_accept = true;
                 result.blocks_checked = index + 1;
                 result.end_block_found = true;
-                result.end_block_flags = end_flags;
                 result.segment_end = next_cursor;
-                result.evidence = evidence;
                 return Ok(());
             }
             cursor = next_cursor;

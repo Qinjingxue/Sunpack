@@ -1188,12 +1188,13 @@ impl<'run, O: Observer> Run<'run, O> {
             stage("preflight", cancel).await?;
             let mut outcome = Outcome::default();
             let mut shell = this.engine.shell.branch();
-            let mut generations = this.capture_generations(&task);
+            let (mut generations, missing) = this.capture_generations(&task);
             let discovered = task.source != DiscoverySource::Direct;
+            let discovery_scope = task.scope.clone();
             let watch_root = depth == 1
                 && this.request.origin == Origin::Watch
                 && this.request.mode == Mode::Extract;
-            if !this.should_process_task(&task, &generations, discovered, watch_root)? {
+            if !this.should_process_task(&task, &generations, &missing, discovered, watch_root)? {
                 this.observer.notify(Event::Skipped { id: task_id });
                 return Ok(outcome);
             }
@@ -1202,6 +1203,11 @@ impl<'run, O: Observer> Run<'run, O> {
                 path: PathBuf::from(&task.entry().entry_path),
                 depth,
             });
+            let scan_discovery_failures = if this.request.mode == Mode::Scan && task.inputs.len() > 1
+                && discovered && !missing.is_empty() {
+                task.inputs.iter().map(|logical| logical.failure.clone()).collect::<Vec<_>>()
+            } else { Vec::new() };
+            this.admit_missing_inputs(&mut task, &missing, discovered);
             this.plan_inputs(&mut task)?;
             this.observer.claim_sources(
                 Path::new(&task.entry().entry_path),
@@ -1211,13 +1217,77 @@ impl<'run, O: Observer> Run<'run, O> {
             let owner_path = PathBuf::from(&task.entry().entry_path);
             let root_scope = owner_path.parent();
             let source_scope = inherited_scope.as_deref().or(root_scope);
+            // Task preflight precedes segment queueing. Keep single missing-
+            // volume failures on the existing one-replacement retry path.
+            let admission = task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
+                matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. }))));
+            let discovery_blocked = task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
+                matches!(failure.context.as_deref(), Some(super::FailureContext::Discovery { .. }))));
+            let single_volume_retry = task.inputs.len() == 1 && task.inputs[0].failure.as_ref()
+                .is_some_and(|failure| failure.contains(FailureKind::MissingVolume));
+            if !single_volume_retry && (admission || discovery_blocked) {
+                let failure = task.inputs[0].failure.as_ref().expect("task preflight failure");
+                let mut completed: Vec<_> = if this.request.mode == Mode::Scan || discovery_blocked {
+                    // main scan_items still projects every original descriptor.
+                    task.inputs.iter().enumerate().map(|(index, logical)| {
+                        let mut result = receipt(&logical.input, task.source, depth);
+                        result.password = logical.password.as_deref().map(str::to_owned);
+                        result.volume_attempts = logical.input.volume_attempts.clone();
+                        // scan_items gives the original node failure precedence
+                        // over the terminal task's admission failure.
+                        result.failure = if discovery_blocked { logical.failure.clone() }
+                            else { scan_discovery_failures.get(index).cloned().flatten() };
+                        result
+                    }).collect()
+                } else {
+                    vec![receipt(task.entry(), task.source, depth)]
+                };
+                for result in &mut completed {
+                    result.failure.get_or_insert_with(|| failure.clone());
+                    if this.request.mode == Mode::Extract {
+                        if admission { result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect(); }
+                        if let Some(scope) = discovery_scope.as_deref() {
+                            result.failure.as_mut().unwrap().discovery_scope =
+                                Some(Box::new(super::FailureScope::from_scope(scope)));
+                        }
+                    }
+                }
+                if this.request.mode == Mode::Extract && depth > 1 && !cancel.cancelled()
+                    && completed.iter().any(|result| result.failure.as_ref().is_some_and(|failure|
+                        failure.is_password_retry() || failure.contains(FailureKind::MissingVolume)))
+                {
+                    let destination = this.promotion_directory(source_scope.unwrap_or(Path::new(".")));
+                    this.promote_blocked(&task.owned_paths, &destination, &generations,
+                        &mut completed, &mut outcome, &mut shell).await?;
+                }
+                outcome.promoted_sources.extend(task.owned_paths.iter().filter_map(|path|
+                    this.admitted_promotion(path, &generations, watch_root)));
+                drop(lease);
+                let mut completion = if discovery_blocked {
+                    super::TaskCompletion::from_group(&completed)
+                } else { super::TaskCompletion::from_result(&completed[0]) };
+                if admission && this.request.mode == Mode::Scan { completion.failure = Some(failure.clone()); }
+                this.observer.notify(Event::Finished {
+                    id: task_id, path: owner_path, depth, result: completion,
+                });
+                outcome.archives = completed;
+                if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
+                    outcome.archives = this.observer.scope_finished(task_id,
+                        std::mem::take(&mut outcome.archives)).await?;
+                }
+                return Ok(outcome);
+            }
             let candidates = this.candidates.with_scope(source_scope);
             let preferred_carrier = this.preferred_output(task.entry(), depth);
             let mut retained: Vec<_> = task
                 .inputs
                 .iter()
                 .map(|logical| {
-                    this.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth, &candidates)
+                    if logical.failure.as_ref().is_some_and(|failure|
+                        matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. })))
+                    { None } else {
+                        this.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth, &candidates)
+                    }
                 })
                 .collect();
             let mut split_input = task.entry().mode.structured() || task.entry().physical_paths().nth(1).is_some();
@@ -1438,11 +1508,13 @@ impl<'run, O: Observer> Run<'run, O> {
                             drop(lease);
                             lease = this.claim_task(&replacement).await?;
                             stage("preflight", cancel).await?;
-                            generations = this.capture_generations(&replacement);
-                            if !this.should_process_task(&replacement, &generations, discovered, watch_root)? {
+                            let (current_generations, missing) = this.capture_generations(&replacement);
+                            generations = current_generations;
+                            if !this.should_process_task(&replacement, &generations, &missing, discovered, watch_root)? {
                                 this.observer.notify(Event::Skipped { id: task_id });
                                 return Ok(outcome);
                             }
+                            this.admit_missing_inputs(&mut replacement, &missing, discovered);
                             this.observer.claim_sources(
                                 Path::new(&replacement.entry().entry_path),
                                 &replacement.owned_paths,
@@ -1749,6 +1821,15 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 }
             }
+            if this.request.mode == Mode::Extract {
+                if let Some(scope) = discovery_scope.as_deref() {
+                    for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
+                        if failure.discovery_scope.is_none() {
+                            failure.discovery_scope = Some(Box::new(super::FailureScope::from_scope(scope)));
+                        }
+                    }
+                }
+            }
             if depth > 1
                 && !cancel.cancelled()
                 // Accepted partial segments do not make a carrier successful
@@ -1972,15 +2053,24 @@ impl<'run, O: Observer> Run<'run, O> {
             Ok((moves, receipts, success, error)) => {
                 outcome.promoted_sources.extend(receipts);
                 let paths = PromotionPaths::new(&moves);
-                for result in results {
+                for result in results.iter_mut() {
                     if success {
                         result.promotion_original_path = Some(result.path.clone());
                     }
                     paths.remap(&mut result.path);
+                    if let Some(failure) = &mut result.failure { paths.remap_failure(failure); }
                     for source in &mut result.source_paths {
                         paths.remap(source);
                     }
                     result.promoted = success;
+                    if success {
+                        if let Some(failure) = &mut result.failure {
+                            failure.discovery_scope = Some(Box::new(super::FailureScope {
+                                root: destination.to_string_lossy().into_owned(),
+                                max_depth: Some(0), excluded_subtrees: Vec::new(),
+                            }));
+                        }
+                    }
                     if !success {
                         result.failure = Some(Failure::new(
                             FailureKind::FilesystemError,
@@ -1988,7 +2078,8 @@ impl<'run, O: Observer> Run<'run, O> {
                                 "Unable to promote blocked nested input: {}",
                                 error.as_deref().unwrap_or("unknown move failure")
                             ),
-                        ).with_cause(result.failure.take()));
+                        ).with_context(super::FailureContext::Postprocess { destination: destination.to_owned() })
+                            .with_cause(result.failure.take()));
                     }
                 }
                 for checkpoint in &mut outcome.checkpoints {
@@ -2002,7 +2093,8 @@ impl<'run, O: Observer> Run<'run, O> {
                 results[representative].failure = Some(Failure::new(
                     FailureKind::FilesystemError,
                     format!("Unable to promote blocked nested input: {error}"),
-                ).with_cause(results[representative].failure.take()));
+                ).with_context(super::FailureContext::Postprocess { destination: destination.to_owned() })
+                    .with_cause(results[representative].failure.take()));
             }
         }
         Ok(())
@@ -2109,24 +2201,42 @@ impl<'run, O: Observer> Run<'run, O> {
         self.engine.leases.acquire(keys, &self.request.cancel).await
     }
 
-    fn capture_generations(&self, task: &Task) -> HashMap<String, PhysicalFileGeneration> {
-        if self.request.mode != Mode::Extract {
-            return HashMap::new();
+    fn capture_generations(&self, task: &Task) -> (HashMap<String, PhysicalFileGeneration>, Vec<PathBuf>) {
+        // The lease owns this one metadata snapshot. Keep actual NotFound
+        // observations separate from permission/read errors; neither is inferred
+        // from a missing generation entry or rechecked later with another stat.
+        let mut generations = HashMap::new();
+        let mut missing = Vec::new();
+        for path in &task.owned_paths {
+            match capture_file_generation(Path::new(path)) {
+                Ok(generation) => { generations.insert(path_key(path), generation); }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(PathBuf::from(path)),
+                Err(_) => {}
+            }
         }
-        task.owned_paths
-            .iter()
-            .filter_map(|path| {
-                capture_file_generation(Path::new(path))
-                    .ok()
-                    .map(|generation| (path_key(path), generation))
-            })
-            .collect()
+        (generations, missing)
+    }
+
+    fn admit_missing_inputs(&self, task: &mut Task, missing: &[PathBuf], discovered: bool) {
+        if !discovered || missing.is_empty() { return; }
+        // main has a task-level discovery blocker only when every segment
+        // failed discovery. Otherwise admission precedes all segment work.
+        if task.inputs.iter().all(|logical| logical.failure.as_ref().is_some_and(|failure|
+            matches!(failure.context.as_deref(), Some(super::FailureContext::Discovery { .. }))))
+        { return; }
+        let failure = Failure::new(FailureKind::MissingVolume,
+            crate::core::i18n::Language::En.text("failure.missing_volume"))
+            .with_context(super::FailureContext::InputAdmission { missing_paths: missing.to_vec() });
+        for logical in &mut task.inputs {
+            logical.failure = Some(failure.clone());
+        }
     }
 
     fn should_process_task(
         &self,
         task: &Task,
         generations: &HashMap<String, PhysicalFileGeneration>,
+        missing: &[PathBuf],
         discovered: bool,
         watch_root: bool,
     ) -> io::Result<bool> {
@@ -2134,10 +2244,7 @@ impl<'run, O: Observer> Run<'run, O> {
         // Explicit direct inputs still take the ordinary open/failure path.
         // Keep the original proposal's eligibility through volume replacement;
         // finding a relation later does not turn a Direct task into discovery.
-        if discovered && task.owned_paths.iter().all(|path| {
-            !generations.contains_key(&path_key(path))
-                && Path::new(path).try_exists().is_ok_and(|exists| !exists)
-        }) {
+        if discovered && !missing.is_empty() && missing.len() == task.owned_paths.len() {
             return Ok(false);
         }
         if !watch_root {
@@ -2255,7 +2362,7 @@ impl<'run, O: Observer> Run<'run, O> {
         let plan = match candidates.plan(&input, password, &self.request.cancel) {
             Ok(Ok(plan)) => plan,
             Ok(Err(failure)) => {
-                result.failure = Some(failure);
+                result.failure = Some(failure.with_context(super::FailureContext::PasswordResolution));
                 return Ok(Executed {
                     planned_output: None,
                     result,
@@ -2501,7 +2608,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         }
                     }
                     failure.evidence = worker_evidence(value, frame.recovery.take(), plan.evidence);
-                    result.failure = Some(failure);
+                    result.failure = Some(failure.with_context(super::FailureContext::Extraction));
                 }
             }
             Err(error) => result.failure = Some(self.process_or_file_failure(error, true)),
@@ -2542,6 +2649,7 @@ impl<'run, O: Observer> Run<'run, O> {
             Failure::new(FailureKind::Cancelled, "Operation interrupted")
         } else if worker {
             Failure::new(FailureKind::ProcessError, error.to_string())
+                .with_context(super::FailureContext::Extraction)
         } else {
             file_failure(error)
         }
@@ -2785,6 +2893,16 @@ impl PromotionPaths {
         self.0.get(&resolved_key(path))
     }
 
+    pub(super) fn remap_failure(&self, failure: &mut Failure) {
+        let mut pending = vec![failure];
+        while let Some(failure) = pending.pop() {
+            if let Some(super::FailureContext::Discovery { path, .. }) = failure.context.as_deref_mut() {
+                self.remap(path);
+            }
+            pending.extend(&mut failure.causes);
+        }
+    }
+
     pub(super) fn remap(&self, path: &mut PathBuf) -> bool {
         if let Some(target) = self.target(path) {
             *path = target.clone();
@@ -2860,7 +2978,12 @@ fn file_failure(error: io::Error) -> Failure {
     } else {
         FailureKind::FilesystemError
     };
-    Failure::new(kind, error.to_string())
+    let failure = Failure::new(kind, error.to_string());
+    if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) {
+        failure.with_context(super::FailureContext::OutputCreate { error: original.to_string() })
+    } else {
+        failure
+    }
 }
 
 fn flag(result: &Value, name: &str) -> bool {
@@ -4311,6 +4434,7 @@ mod tests {
             inputs: vec![LogicalInput { input, password: Some(Arc::from("secret")), failure: None }],
             source: DiscoverySource::Direct,
             retry: None,
+            scope: None,
         };
         run.plan_inputs(&mut task).unwrap();
         assert_eq!(task.inputs.len(), 1);
@@ -4379,6 +4503,126 @@ mod tests {
     }
 
     #[test]
+    fn partial_departure_is_an_admission_failure_and_keeps_surviving_generation() {
+        let path = crate::test_support::temp_file("partial_departure", b"archive");
+        let missing = path.with_extension("missing");
+        for (mode, count) in [Mode::Scan, Mode::Extract].into_iter()
+            .flat_map(|mode| [1, 2].map(|count| (mode, count))) {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(vec![path.clone()], mode);
+            let events = Mutex::new(Vec::new());
+            let observer = |event: Event| { events.lock().unwrap().push(event); };
+            let run = test_run(&engine, &request, &observer);
+            let mut task = Task {
+                primary: None,
+                owned_paths: vec![path.to_string_lossy().into_owned(), missing.to_string_lossy().into_owned()],
+                inputs: vec![LogicalInput {
+                    input: ArchiveInput::file(path.to_string_lossy().into_owned(), "rar".into(), "archive".into()),
+                    password: None, failure: None,
+                }],
+                source: DiscoverySource::Relations, retry: None,
+                scope: Some(Arc::new(crate::scan::scope::NativeDiscoveryScope::new(
+                    path.parent().unwrap().to_string_lossy().into_owned(), Some(0), Vec::new()))),
+            };
+            let (generations, absent) = run.capture_generations(&task);
+            assert_eq!(absent, vec![missing.clone()]);
+            assert_eq!(generations.len(), 1);
+            assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
+            assert!(run.should_process_task(&task, &generations, &absent, true, false).unwrap());
+            run.admit_missing_inputs(&mut task, &absent, false);
+            assert!(task.inputs[0].failure.is_none());
+            task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
+                .with_context(super::super::FailureContext::Discovery {
+                    discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
+                    path: path.clone(), error: String::new(),
+                }));
+            run.admit_missing_inputs(&mut task, &absent, true);
+            assert_eq!(task.inputs[0].failure.as_ref().unwrap().kind, FailureKind::Unsupported);
+            let input = task.inputs[0].input.clone();
+            task.inputs.push(LogicalInput { input, password: None, failure: None });
+            run.admit_missing_inputs(&mut task, &absent, true);
+            assert!(task.inputs.iter().all(|logical| matches!(logical.failure.as_ref().unwrap().context.as_deref(),
+                Some(super::super::FailureContext::InputAdmission { .. }))));
+            task.inputs.pop();
+            task.inputs[0].failure = None;
+            if count == 2 {
+                let input = task.inputs[0].input.clone();
+                task.inputs.push(LogicalInput { input, password: Some(Arc::from("known")), failure: None });
+                task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
+                    .with_context(super::super::FailureContext::Discovery {
+                        discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
+                        path: path.clone(), error: String::new(),
+                    }));
+            }
+            let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
+                run.execute_task(task, 1, 1, None, spawner)
+            }).unwrap();
+            assert_eq!(outcome.archives.len(), if mode == Mode::Scan { count } else { 1 });
+            let events = events.lock().unwrap();
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Started { .. })).count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Finished { .. })).count(), 1);
+            assert!(!events.iter().any(|event| matches!(event, Event::Queued { .. })));
+            assert!(events.iter().any(|event| matches!(event, Event::Finished { result, .. }
+                if result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::MissingVolume))));
+            if mode == Mode::Scan && count == 2 {
+                assert_eq!(outcome.archives[0].failure.as_ref().unwrap().kind, FailureKind::Unsupported);
+                assert_eq!(outcome.archives[1].password.as_deref(), Some("known"));
+            }
+            let failure = outcome.archives.last().unwrap().failure.as_ref().unwrap();
+            assert_eq!(failure.kind, FailureKind::MissingVolume);
+            assert!(matches!(failure.context.as_deref(), Some(super::super::FailureContext::InputAdmission { missing_paths }) if missing_paths == &[missing.clone()]));
+            assert_eq!(failure.discovery_scope.is_some(), mode == Mode::Extract);
+            assert!(path.exists());
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discovery_blocked_tasks_finish_before_segment_queueing() {
+        let path = crate::test_support::temp_file("discovery_preflight", b"carrier");
+        for (mode, count) in [Mode::Scan, Mode::Extract].into_iter()
+            .flat_map(|mode| [1, 2].map(|count| (mode, count))) {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(vec![path.clone()], mode);
+            let events = Mutex::new(Vec::new());
+            let observer = |event: Event| { events.lock().unwrap().push(event); };
+            let run = test_run(&engine, &request, &observer);
+            let inputs = (0..count).map(|index| LogicalInput {
+                input: ArchiveInput::file(path.to_string_lossy().into_owned(), "zip".into(), "carrier".into()),
+                password: Some(Arc::from("known")),
+                failure: Some(Failure::new(if index == 0 { FailureKind::Unsupported } else { FailureKind::Damaged },
+                    "discovery detail").with_context(super::super::FailureContext::Discovery {
+                        discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
+                        path: path.clone(), error: "discovery detail".into(),
+                    })),
+            }).collect();
+            let task = Task {
+                primary: None, inputs, owned_paths: vec![path.to_string_lossy().into_owned()],
+                source: DiscoverySource::Embedded, retry: None,
+                scope: Some(Arc::new(crate::scan::scope::NativeDiscoveryScope::new(
+                    path.parent().unwrap().to_string_lossy().into_owned(), Some(0), Vec::new()))),
+            };
+            let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner|
+                run.execute_task(task, 1, 1, None, spawner)).unwrap();
+            assert_eq!(outcome.archives.len(), count);
+            for (index, result) in outcome.archives.iter().enumerate() {
+                assert_eq!(result.failure.as_ref().unwrap().kind,
+                    if index == 0 { FailureKind::Unsupported } else { FailureKind::Damaged });
+                assert_eq!(result.failure.as_ref().unwrap().discovery_scope.is_some(), mode == Mode::Extract);
+                assert_eq!(result.password.as_deref(), Some("known"));
+                assert!(result.output.is_none());
+            }
+            let events = events.lock().unwrap();
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Started { .. })).count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Finished { .. })).count(), 1);
+            assert!(!events.iter().any(|event| matches!(event, Event::Queued { .. })));
+            assert!(events.iter().any(|event| matches!(event, Event::Finished { result, .. }
+                if result.status == super::super::TaskStatus::Failed)));
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn departed_discovered_tasks_skip_before_started_across_modes_and_depths() {
         // Exercise the real task boundary, not just its predicate: no worker,
         // Started event, or failed receipt may be produced for a stale proposal.
@@ -4400,6 +4644,7 @@ mod tests {
                         inputs: vec![LogicalInput { input: input.clone(), password: None, failure: None }],
                         source: DiscoverySource::Detection,
                         retry: None,
+                        scope: None,
                     };
                     let outcome = Scheduler::new().run(1, origin, &request.cancel, |spawner| {
                         run.execute_task(task, 1, depth, None, spawner)
@@ -4414,14 +4659,15 @@ mod tests {
                         inputs: vec![LogicalInput { input: input.clone(), password: None, failure: None }],
                         source: DiscoverySource::Direct,
                         retry: None,
+                        scope: None,
                     };
-                    assert!(run.should_process_task(&direct, &HashMap::new(), false, false).unwrap());
+                    assert!(run.should_process_task(&direct, &HashMap::new(), &[path.clone()], false, false).unwrap());
                     // A replacement can be classified Relations while retaining
                     // the original Direct task's no-silent-skip boundary.
                     let mut replacement = direct;
                     replacement.source = DiscoverySource::Relations;
-                    assert!(run.should_process_task(&replacement, &HashMap::new(), false, false).unwrap());
-                    assert!(!run.should_process_task(&replacement, &HashMap::new(), true, false).unwrap());
+                    assert!(run.should_process_task(&replacement, &HashMap::new(), &[path.clone()], false, false).unwrap());
+                    assert!(!run.should_process_task(&replacement, &HashMap::new(), &[path.clone()], true, false).unwrap());
                 }
             }
         }
@@ -4539,6 +4785,7 @@ mod tests {
                 inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
                 source: DiscoverySource::Embedded,
                 retry: None,
+                scope: None,
             };
             // One host slot also exercises parked recursive siblings without
             // depending on the test machine's CPU count or worker subprocesses.
@@ -4687,6 +4934,7 @@ mod tests {
         let task = Task {
             primary: None, inputs: vec![LogicalInput { input, password: None, failure: None }],
             owned_paths: vec![source.to_string_lossy().into_owned()], source: DiscoverySource::Embedded, retry: None,
+            scope: None,
         };
         let scheduler = Scheduler::new();
         scheduler.configure_capacity(1);
@@ -4744,6 +4992,7 @@ mod tests {
                         failure: Some(Failure::new(kind, "archive blocked")) }],
                     owned_paths: vec![source.to_string_lossy().into_owned()],
                     source: DiscoverySource::Embedded, retry: None,
+                    scope: None,
                 };
                 Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
                     run.execute_task(task, 1, 2, None, spawner)
@@ -4828,6 +5077,7 @@ mod tests {
                 owned_paths: vec![inputs[0].entry_path.clone()],
                 source: DiscoverySource::Embedded,
                 retry: None,
+                scope: None,
             };
             Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
                 run.execute_task(task, 1, depth, None, spawner)
@@ -5246,6 +5496,7 @@ mod tests {
                     owned_paths: Vec::new(),
                     source: DiscoverySource::Direct,
                     retry: None,
+                    scope: None,
                 }],
                 errors: Vec::new(),
                 scan_errors: DirectoryReadErrors::report(),
@@ -5361,6 +5612,7 @@ mod tests {
                 inputs: vec![LogicalInput { input, password: None,
                     failure: blocked.then(|| Failure::new(FailureKind::MissingVolume, "missing")) }],
                 source: DiscoverySource::Direct, retry: None,
+                scope: None,
             }
         };
         for (candidate, blocked) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -5696,6 +5948,7 @@ mod tests {
                 owned_paths: vec![source.to_string_lossy().into_owned()],
                 source: DiscoverySource::Embedded,
                 retry: None,
+                scope: None,
             };
             let outcome = Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
                 run.execute_task(task, 1, 1, None, spawner)
@@ -5773,6 +6026,7 @@ mod tests {
                             }).collect(),
                             owned_paths: vec![source.to_string_lossy().into_owned()],
                             source: DiscoverySource::Embedded, retry: None,
+                            scope: None,
                         };
                         Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
                             run.execute_task(task, 1, 1, None, spawner)
@@ -6186,6 +6440,7 @@ mod tests {
                 owned_paths: Vec::new(),
                 source: DiscoverySource::Direct,
                 retry: None,
+                scope: None,
             }],
             errors: Vec::new(),
             scan_errors: DirectoryReadErrors::report(),

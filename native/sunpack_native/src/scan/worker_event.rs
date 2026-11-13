@@ -8,7 +8,6 @@ use serde_json::{json, Map, Value};
 use std::{fmt, io};
 
 const PREVIEW_FILES: usize = 50;
-const PREVIEW_ISSUES: usize = 10;
 
 #[derive(Default)]
 struct TraceCounts {
@@ -17,48 +16,16 @@ struct TraceCounts {
 }
 
 impl TraceCounts {
-    fn preview_slot(&self, status: RecoveryStatus) -> Option<usize> {
-        let files = &self.preview.files;
-        if files.len() < PREVIEW_FILES {
-            return Some(files.len());
-        }
-        if status != RecoveryStatus::Complete
-            && files
-                .iter()
-                .filter(|file| file.status != RecoveryStatus::Complete)
-                .count()
-                < PREVIEW_ISSUES
-        {
-            return files
-                .iter()
-                .rposition(|file| file.status == RecoveryStatus::Complete);
-        }
-        None
-    }
-
-    fn insert(&mut self, slot: usize, file: RecoveryFile) {
-        if slot == self.preview.files.len() {
-            self.preview.files.push(file);
-        } else {
-            self.preview.files[slot] = file;
-        }
-    }
-
     fn merge(&mut self, chunk: Self) {
         self.items += chunk.items;
         self.preview.complete_files += chunk.preview.complete_files;
         self.preview.partial_files += chunk.preview.partial_files;
         self.preview.failed_files += chunk.preview.failed_files;
         self.preview.incomplete_files += chunk.preview.incomplete_files;
-        if self.preview.files.is_empty() {
-            self.preview.files = chunk.preview.files;
-        } else {
-            for file in chunk.preview.files {
-                if let Some(slot) = self.preview_slot(file.status) {
-                    self.insert(slot, file);
-                }
-            }
-        }
+        // Main exposes the first 50 non-directory trace entries, in worker
+        // order. Keep only that prefix while counting every reported member.
+        let remaining = PREVIEW_FILES.saturating_sub(self.preview.files.len());
+        self.preview.files.extend(chunk.preview.files.into_iter().take(remaining));
     }
 
     fn finish(mut self) -> RecoveryPreview {
@@ -68,7 +35,6 @@ impl TraceCounts {
             + preview.failed_files
             + preview.incomplete_files;
         preview.omitted_files = count - preview.files.len();
-        preview.files.sort_unstable_by_key(|file| file.index);
         self.preview
     }
 }
@@ -129,27 +95,24 @@ impl<'de> Deserialize<'de> for TraceCounts {
                     } else if item.bytes_written != 0 {
                         trace.preview.partial_files += 1;
                         RecoveryStatus::Partial
-                    } else if item.failed || item.operation_result != 0 {
+                    } else if item.failed || (item.done && item.operation_result != 0) {
                         trace.preview.failed_files += 1;
                         RecoveryStatus::Failed
                     } else {
                         trace.preview.incomplete_files += 1;
                         RecoveryStatus::Incomplete
                     };
-                    if let Some(slot) = trace.preview_slot(status) {
-                        trace.insert(
-                            slot,
-                            RecoveryFile {
-                                index: item.index,
-                                path: item.path.to_owned(),
-                                output_path: (!item.output_path.is_empty()
-                                    && item.output_path != item.path)
-                                    .then(|| item.output_path.to_owned()),
-                                status,
-                                bytes_written: item.bytes_written,
-                                expected_size: item.has_expected_size.then_some(item.expected_size),
-                            },
-                        );
+                    if trace.preview.files.len() < PREVIEW_FILES {
+                        trace.preview.files.push(RecoveryFile {
+                            index: item.index,
+                            path: item.path.to_owned(),
+                            output_path: (!item.output_path.is_empty()
+                                && item.output_path != item.path)
+                                .then(|| item.output_path.to_owned()),
+                            status,
+                            bytes_written: item.bytes_written,
+                            expected_size: item.has_expected_size.then_some(item.expected_size),
+                        });
                     }
                 }
                 Ok(trace)
@@ -611,6 +574,38 @@ mod tests {
             assert_eq!(&*row.magic, b"abc");
             assert_eq!(row.mtime_ns, Some(123));
         }
+    }
+
+    #[test]
+    fn trace_preview_keeps_main_prefix_across_chunks() {
+        let mut trace = TraceCounts::default();
+        for range in [0..55, 55..60] {
+            let items = range.map(|position| {
+                let failed = position >= 50 && position != 59;
+                json!({
+                    "index": 100 - position, "path": format!("file-{position}"),
+                    "output_path": "", "is_dir": false, "encrypted": false,
+                    "bytes_written": if position < 50 { 1 } else { 0 },
+                    "expected_size": 1, "has_expected_size": true,
+                    "source_crc32": 0, "has_source_crc32": false,
+                    "output_crc32": 0, "has_output_crc32": false, "crc_verified": false,
+                    "operation_result": if position >= 50 { 1 } else { 0 },
+                    "operation_result_name": "", "hresult": 0, "win32_error": 0,
+                    "done": position != 59, "failed": failed,
+                })
+            }).collect::<Vec<_>>();
+            // Parsing also verifies the prefix bound before chunk merging and
+            // main's unfinished/nonzero-result classification (last member).
+            trace.merge(serde_json::from_str(&serde_json::to_string(&items).unwrap()).unwrap());
+        }
+        assert_eq!(trace.items, 60);
+        let preview = trace.finish();
+        assert_eq!(preview.complete_files, 50);
+        assert_eq!(preview.failed_files, 9);
+        assert_eq!(preview.incomplete_files, 1);
+        assert_eq!(preview.omitted_files, 10);
+        assert_eq!(preview.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+            (0..50).map(|position| format!("file-{position}")).collect::<Vec<_>>());
     }
 
     #[test]

@@ -32,10 +32,10 @@ impl IntegrityStatus {
 pub(crate) struct StructureValidation {
     pub(crate) end_offset: u64,
     pub(crate) stream_count: usize,
+    #[cfg(test)]
     pub(crate) block_count: usize,
     pub(crate) decoded_size: Option<u64>,
     pub(crate) integrity: IntegrityStatus,
-    pub(crate) checksum_present: bool,
 }
 
 #[derive(Debug)]
@@ -892,16 +892,6 @@ pub(crate) fn gzip_fixed_header_flags(fixed: &[u8; 10]) -> ValidationResult<u8> 
 // One optional-header grammar serves streaming validation, identity probes and
 // analysis views, including logical multi-volume readers. Strings and extra
 // fields are consumed in bulk and do not need to be retained.
-#[derive(Debug)]
-pub(crate) struct GzipHeader {
-    pub(crate) flags: u8,
-    pub(crate) payload_start: u64,
-    pub(crate) extra: Option<std::ops::Range<usize>>,
-    pub(crate) name: Option<std::ops::Range<usize>>,
-    pub(crate) comment: Option<std::ops::Range<usize>>,
-    pub(crate) crc16: Option<u16>,
-}
-
 trait GzipHeaderInput {
     fn position(&self) -> u64;
     fn array<const N: usize>(&mut self) -> ValidationResult<[u8; N]>;
@@ -969,7 +959,7 @@ fn gzip_field<T>(result: ValidationResult<T>, field: &'static str) -> Validation
     })
 }
 
-fn read_gzip_header(input: &mut impl GzipHeaderInput) -> ValidationResult<GzipHeader> {
+fn read_gzip_header(input: &mut impl GzipHeaderInput) -> ValidationResult<u64> {
     let fixed = gzip_field(input.array::<10>(), "short_gzip_header")?;
     let flags = gzip_fixed_header_flags(&fixed)?;
     let has_crc = flags & 0x02 != 0;
@@ -977,35 +967,23 @@ fn read_gzip_header(input: &mut impl GzipHeaderInput) -> ValidationResult<GzipHe
     if has_crc {
         hasher.update(&fixed);
     }
-    let mut header = GzipHeader {
-        flags,
-        payload_start: 0,
-        extra: None,
-        name: None,
-        comment: None,
-        crc16: None,
-    };
     if flags & 0x04 != 0 {
         let bytes = gzip_field(input.array::<2>(), "gzip_extra_length_missing")?;
         if has_crc {
             hasher.update(&bytes);
         }
-        let start = input.position() as usize;
         let length = u16::from_le_bytes(bytes) as usize;
         gzip_field(
             input.consume(length, has_crc.then_some(&mut hasher)),
             "gzip_extra_out_of_range",
         )?;
-        header.extra = Some(start..start + length);
     }
-    for (flag, range, error) in [
-        (0x08, &mut header.name, "gzip_name_unterminated"),
-        (0x10, &mut header.comment, "gzip_comment_unterminated"),
+    for (flag, error) in [
+        (0x08, "gzip_name_unterminated"),
+        (0x10, "gzip_comment_unterminated"),
     ] {
         if flags & flag != 0 {
-            let start = input.position() as usize;
             gzip_field(input.string(has_crc.then_some(&mut hasher)), error)?;
-            *range = Some(start..input.position() as usize - 1);
         }
     }
     if has_crc {
@@ -1013,13 +991,11 @@ fn read_gzip_header(input: &mut impl GzipHeaderInput) -> ValidationResult<GzipHe
         if stored != (hasher.finalize() & 0xffff) as u16 {
             return invalid("gzip_header_crc_bad");
         }
-        header.crc16 = Some(stored);
     }
-    header.payload_start = input.position();
-    Ok(header)
+    Ok(input.position())
 }
 
-pub(crate) fn gzip_header_from_slice(data: &[u8], start: usize) -> ValidationResult<GzipHeader> {
+pub(crate) fn gzip_payload_offset_from_slice(data: &[u8], start: usize) -> ValidationResult<u64> {
     let mut input = std::io::Cursor::new(data);
     input.set_position(start as u64);
     read_gzip_header(&mut input)
@@ -1029,25 +1005,13 @@ fn gzip_header(cursor: &mut ByteCursor<'_>) -> ValidationResult<()> {
     read_gzip_header(cursor).map(|_| ())
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct GzipAnalysis {
-    pub(crate) structure: StructureValidation,
-    pub(crate) first_member_end: u64,
-    pub(crate) first_member_compressed_bytes: u64,
-    pub(crate) first_member_block_count: usize,
-    pub(crate) first_member_decoded_size: u64,
-    pub(crate) first_member_stored_crc32: u32,
-    pub(crate) first_member_computed_crc32: Option<u32>,
-    pub(crate) first_member_stored_size: u32,
-}
-
 fn walk_gzip_structure(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
     integrity_limit: Option<u64>,
     mut visit: impl FnMut(u64) -> ValidationResult<()>,
-) -> ValidationResult<GzipAnalysis> {
+) -> ValidationResult<StructureValidation> {
     let mut cursor = ByteCursor::new(reader, offset, limit);
     let mut members = 0usize;
     let mut blocks = 0usize;
@@ -1055,12 +1019,10 @@ fn walk_gzip_structure(
     let mut remaining_integrity = integrity_limit;
     let mut integrity_failed = false;
     let mut integrity_complete = integrity_limit.is_some();
-    let mut first_member = None;
 
     loop {
         visit(cursor.position())?;
         gzip_header(&mut cursor)?;
-        let deflate_start = cursor.position();
         let mut output = match remaining_integrity {
             Some(remaining) => DeflateOutput::verifying(remaining),
             None => DeflateOutput::counting(),
@@ -1069,7 +1031,6 @@ fn walk_gzip_structure(
             let mut bits = LsbBits::new(&mut cursor);
             parse_deflate(&mut bits, &mut output)?
         };
-        let deflate_end = cursor.position();
         let member_size = output.decoded_size();
         let computed_crc = output.finish_checksum();
         let trailer = cursor.read_array::<8>()?;
@@ -1099,18 +1060,6 @@ fn walk_gzip_structure(
             .ok_or(ValidationError::Invalid("deflate_block_count_overflow"))?;
         members += 1;
 
-        if first_member.is_none() {
-            first_member = Some((
-                cursor.position(),
-                deflate_end.saturating_sub(deflate_start),
-                member_blocks,
-                member_size,
-                stored_crc,
-                computed_crc,
-                stored_size,
-            ));
-        }
-
         if cursor.position() + 3 > limit {
             break;
         }
@@ -1120,16 +1069,6 @@ fn walk_gzip_structure(
         }
     }
 
-    let (
-        first_member_end,
-        first_member_compressed_bytes,
-        first_member_block_count,
-        first_member_decoded_size,
-        first_member_stored_crc32,
-        first_member_computed_crc32,
-        first_member_stored_size,
-    ) = first_member.ok_or(ValidationError::Invalid("gzip_member_missing"))?;
-
     let integrity = if integrity_failed {
         IntegrityStatus::Failed
     } else if integrity_complete {
@@ -1138,22 +1077,13 @@ fn walk_gzip_structure(
         IntegrityStatus::Deferred
     };
 
-    Ok(GzipAnalysis {
-        structure: StructureValidation {
-            end_offset: cursor.position(),
-            stream_count: members,
-            block_count: blocks,
-            decoded_size: Some(decoded_size),
-            integrity,
-            checksum_present: true,
-        },
-        first_member_end,
-        first_member_compressed_bytes,
-        first_member_block_count,
-        first_member_decoded_size,
-        first_member_stored_crc32,
-        first_member_computed_crc32,
-        first_member_stored_size,
+    Ok(StructureValidation {
+        end_offset: cursor.position(),
+        stream_count: members,
+        #[cfg(test)]
+        block_count: blocks,
+        decoded_size: Some(decoded_size),
+        integrity,
     })
 }
 
@@ -1162,7 +1092,7 @@ pub(crate) fn analyze_gzip_structure(
     offset: u64,
     limit: u64,
     integrity_limit: u64,
-) -> ValidationResult<GzipAnalysis> {
+) -> ValidationResult<StructureValidation> {
     walk_gzip_structure(reader, offset, limit, Some(integrity_limit), |_| Ok(()))
 }
 
@@ -1180,7 +1110,7 @@ pub(crate) fn validate_gzip_structure_observed(
     limit: u64,
     visit: impl FnMut(u64) -> ValidationResult<()>,
 ) -> ValidationResult<StructureValidation> {
-    Ok(walk_gzip_structure(reader, offset, limit, None, visit)?.structure)
+    walk_gzip_structure(reader, offset, limit, None, visit)
 }
 
 pub(crate) fn validate_bzip2_structure(
@@ -1290,6 +1220,7 @@ pub(crate) fn validate_bzip2_structure_observed(
 ) -> ValidationResult<StructureValidation> {
     let mut cursor = ByteCursor::new(reader, offset, limit);
     let mut streams = 0usize;
+    #[cfg(test)]
     let mut total_blocks = 0usize;
     loop {
         visit(cursor.position())?;
@@ -1395,7 +1326,8 @@ pub(crate) fn validate_bzip2_structure_observed(
             if nblock == 0 || orig_ptr >= nblock {
                 return invalid("bzip2_orig_ptr_out_of_range");
             }
-            total_blocks += 1;
+            #[cfg(test)]
+            { total_blocks += 1; }
         }
         streams += 1;
         if cursor.position() + 4 > limit {
@@ -1409,10 +1341,10 @@ pub(crate) fn validate_bzip2_structure_observed(
     Ok(StructureValidation {
         end_offset: cursor.position(),
         stream_count: streams,
+        #[cfg(test)]
         block_count: total_blocks,
         decoded_size: None,
         integrity: IntegrityStatus::Deferred,
-        checksum_present: true,
     })
 }
 
@@ -1721,6 +1653,7 @@ pub(crate) fn validate_xz_structure_exact(
     }
     let mut reverse_end = limit;
     let mut streams_reversed = 0usize;
+    #[cfg(test)]
     let mut total_blocks = 0usize;
     let mut decoded_size = Some(0u64);
     let mut checksum_present = false;
@@ -1787,7 +1720,8 @@ pub(crate) fn validate_xz_structure_exact(
             block_cursor = block_cursor
                 .checked_add(padded)
                 .ok_or(ValidationError::Invalid("xz_block_offset_overflow"))?;
-            total_blocks += 1;
+            #[cfg(test)]
+            { total_blocks += 1; }
         }
         if block_cursor != index_start {
             return invalid("xz_block_index_boundary_mismatch");
@@ -1802,6 +1736,7 @@ pub(crate) fn validate_xz_structure_exact(
     Ok(StructureValidation {
         end_offset: limit,
         stream_count: streams_reversed,
+        #[cfg(test)]
         block_count: total_blocks,
         decoded_size,
         integrity: if checksum_present {
@@ -1809,7 +1744,6 @@ pub(crate) fn validate_xz_structure_exact(
         } else {
             IntegrityStatus::NotPresent
         },
-        checksum_present,
     })
 }
 
@@ -1840,6 +1774,7 @@ pub(crate) fn validate_zstd_structure_observed(
 ) -> ValidationResult<StructureValidation> {
     let mut cursor = offset;
     let mut frames = 0usize;
+    #[cfg(test)]
     let mut blocks = 0usize;
     let mut checksum_present = false;
     loop {
@@ -1916,7 +1851,8 @@ pub(crate) fn validate_zstd_structure_observed(
                     return invalid("zstd_block_header_invalid");
                 }
                 bytes.skip(if block_type == 1 { 1 } else { block_size })?;
-                blocks += 1;
+                #[cfg(test)]
+                { blocks += 1; }
                 if last {
                     break;
                 }
@@ -1943,6 +1879,7 @@ pub(crate) fn validate_zstd_structure_observed(
     Ok(StructureValidation {
         end_offset: cursor,
         stream_count: frames,
+        #[cfg(test)]
         block_count: blocks,
         decoded_size: None,
         integrity: if checksum_present {
@@ -1950,7 +1887,6 @@ pub(crate) fn validate_zstd_structure_observed(
         } else {
             IntegrityStatus::NotPresent
         },
-        checksum_present,
     })
 }
 
@@ -2052,10 +1988,9 @@ mod tests {
                     let data = member.repeat(2);
                     let source = reader(data.clone());
                     let result = analyze_gzip_structure(&source, 0, source.len(), 1024).unwrap();
-                    assert_eq!(result.structure.end_offset, data.len() as u64);
-                    assert_eq!(result.structure.stream_count, 2);
-                    assert_eq!(result.structure.integrity, IntegrityStatus::Verified);
-                    assert_eq!(result.first_member_end, member.len() as u64);
+                    assert_eq!(result.end_offset, data.len() as u64);
+                    assert_eq!(result.stream_count, 2);
+                    assert_eq!(result.integrity, IntegrityStatus::Verified);
                     if crc {
                         let mut damaged = member.clone();
                         damaged[header_len - 1] ^= 1;
@@ -2301,10 +2236,9 @@ mod tests {
         let source = reader(data.clone());
         let result =
             analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-        assert_eq!(result.structure.end_offset, data.len() as u64);
-        assert_eq!(result.structure.stream_count, 128);
-        assert_eq!(result.structure.integrity, IntegrityStatus::Verified);
-        assert!(result.first_member_computed_crc32.is_some());
+        assert_eq!(result.end_offset, data.len() as u64);
+        assert_eq!(result.stream_count, 128);
+        assert_eq!(result.integrity, IntegrityStatus::Verified);
     }
 
     #[test]
@@ -2314,10 +2248,9 @@ mod tests {
         let source = reader(data.clone());
         let result =
             analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-        assert_eq!(result.structure.end_offset, data.len() as u64);
-        assert_eq!(result.structure.decoded_size, Some(payload.len() as u64));
-        assert_eq!(result.structure.integrity, IntegrityStatus::Deferred);
-        assert!(result.first_member_computed_crc32.is_none());
+        assert_eq!(result.end_offset, data.len() as u64);
+        assert_eq!(result.decoded_size, Some(payload.len() as u64));
+        assert_eq!(result.integrity, IntegrityStatus::Deferred);
     }
 
     #[test]
@@ -2332,9 +2265,9 @@ mod tests {
         let source = reader(data.clone());
         let result =
             analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-        assert_eq!(result.structure.end_offset, data.len() as u64);
-        assert_eq!(result.structure.stream_count, 2);
-        assert_eq!(result.structure.integrity, IntegrityStatus::Failed);
+        assert_eq!(result.end_offset, data.len() as u64);
+        assert_eq!(result.stream_count, 2);
+        assert_eq!(result.integrity, IntegrityStatus::Failed);
     }
 
     #[test]
@@ -2349,9 +2282,9 @@ mod tests {
         let source = reader(data.clone());
         let result =
             analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
-        assert_eq!(result.structure.end_offset, archive_end as u64);
-        assert_eq!(result.structure.stream_count, 2);
-        assert_eq!(result.structure.integrity, IntegrityStatus::Verified);
+        assert_eq!(result.end_offset, archive_end as u64);
+        assert_eq!(result.stream_count, 2);
+        assert_eq!(result.integrity, IntegrityStatus::Verified);
     }
 
     #[test]

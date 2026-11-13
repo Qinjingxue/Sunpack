@@ -2,10 +2,6 @@ impl<'a> ReportContext<'a> {
     fn lz4_module(&mut self) -> io::Result<Evidence> {
         let rows = self.embedded("lz4", true);
         if !rows.is_empty() {
-            let mut details = DiagnosticFields::new();
-            details.put("source", "embedded_scan")?;
-            details.put("candidate_kind", "logical_archive")?;
-            details.put("candidates", &rows)?;
             let mut blocked = false;
             let segments = rows
                 .into_iter()
@@ -22,7 +18,7 @@ impl<'a> ReportContext<'a> {
                 "lz4",
                 if blocked { "damaged" } else { "extractable" },
                 segments,
-                details,
+                EvidenceDetails::Empty,
             ));
         }
 
@@ -37,27 +33,27 @@ impl<'a> ReportContext<'a> {
         let Some(facts) = self.full_stream_structure()? else {
             return Ok(Evidence::not_found("lz4"));
         };
-        if str_of(&facts, "format")? != "lz4"
-            || (u64_of(&facts, "structure.stream_count")? == 0
+        if facts.format != "lz4"
+            || (facts.stream_count == 0
                 && matches!(
-                    str_of(&facts, "error")?.as_str(),
+                    facts.error.as_str(),
                     "" | "lz4_magic_not_found"
                 ))
         {
             return Ok(Evidence::not_found("lz4"));
         }
-        let complete = truthy(&facts, "structure_validation_complete")?;
+        let complete = facts.structure_complete;
         let segment = lz4_segment(
             0,
-            opt_u64_of(&facts, "segment_end")?,
+            facts.segment_end,
             complete,
-            &str_of(&facts, "error")?,
+            &facts.error,
         );
         Ok(Evidence::new(
             "lz4",
             if complete { "extractable" } else { "damaged" },
             vec![segment],
-            (*facts).clone(),
+            EvidenceDetails::Stream(facts),
         ))
     }
 }

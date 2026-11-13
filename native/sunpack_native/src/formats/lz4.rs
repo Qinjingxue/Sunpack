@@ -103,9 +103,13 @@ pub(crate) struct Index {
     pub(crate) start: u64,
     pub(crate) end: u64,
     pub(crate) frames: usize,
+    #[cfg(test)]
     pub(crate) skips: usize,
+    #[cfg(test)]
     pub(crate) content_checksums: usize,
+    #[cfg(test)]
     pub(crate) block_checksums: usize,
+    #[cfg(test)]
     pub(crate) blocks: usize,
     pub(crate) decoded_size: Option<u64>,
     pub(crate) complete: bool,
@@ -231,7 +235,8 @@ fn walk_inner(
         if skippable(magic) {
             let size = input.word(cursor + 4)?;
             advance(&mut cursor, 8 + u64::from(size), limit)?;
-            index.skips += 1;
+            #[cfg(test)]
+            { index.skips += 1; }
             index.end = cursor;
             continue;
         }
@@ -253,12 +258,15 @@ fn walk_inner(
                     u64::from(size) + if header.block_checksum { 4 } else { 0 },
                     limit,
                 )?;
-                index.blocks += 1;
+                #[cfg(test)]
+                { index.blocks += 1; }
             }
             if header.content_checksum {
                 advance(&mut cursor, 4, limit)?;
-                index.content_checksums += 1;
+                #[cfg(test)]
+                { index.content_checksums += 1; }
             }
+            #[cfg(test)]
             if header.block_checksum {
                 index.block_checksums += 1;
             }
@@ -281,9 +289,6 @@ impl Index {
         self.frames > 0 || self.error.starts_with("lz4_") && self.error != "lz4_magic_not_found"
     }
 
-    pub(crate) fn checksum_present(&self) -> bool {
-        self.content_checksums != 0 || self.block_checksums != 0
-    }
 }
 
 #[repr(C)]

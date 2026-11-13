@@ -89,8 +89,8 @@ def test_allow_partial_rejects_nonrecoverable_worker_failure_after_complete_memb
     assert report["summary"]["success_count"] == 0, report
     assert report["summary"]["partial_success_count"] == 0, report
     assert report["tasks"][0]["failures"][0]["kind"] == failure, report
-    detail, = report["summary"]["failure_details"]
-    assert detail["failure"]["evidence"]["stage"] == "item_extract", report
+    assert report["tasks"][0]["failures"][0]["stage"] == "extraction", report
+    assert "failure_details" not in report["summary"], report
     assert source.is_file()
     assert not list(output.rglob("must-not-recurse.txt"))
 

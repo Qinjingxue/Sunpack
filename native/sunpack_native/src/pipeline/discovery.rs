@@ -35,6 +35,7 @@ pub(super) struct Task {
     pub owned_paths: Vec<String>,
     pub source: DiscoverySource,
     pub retry: Option<Arc<RetryScope>>,
+    pub scope: Option<Arc<NativeDiscoveryScope>>,
 }
 
 impl Task {
@@ -54,6 +55,7 @@ impl Task {
             owned_paths,
             source,
             retry: None,
+            scope: None,
         }
     }
 
@@ -81,7 +83,7 @@ impl Default for Discovered {
 }
 
 pub(super) struct RetryScope {
-    scope: NativeDiscoveryScope,
+    scope: Arc<NativeDiscoveryScope>,
     snapshot: NativeDirectorySnapshot,
     bucket: String,
 }
@@ -349,7 +351,7 @@ pub(super) fn discover(
         let table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
         tables.push(table);
         retry_scopes.push(Arc::new(RetryScope {
-            scope: scope.clone(),
+            scope: Arc::new(scope.clone()),
             snapshot: raw,
             bucket: String::new(),
         }));
@@ -381,7 +383,7 @@ pub(super) fn discover(
         )?;
         tables.push(table);
         retry_scopes.push(Arc::new(RetryScope {
-            scope,
+            scope: Arc::new(scope),
             snapshot: raw,
             bucket,
         }));
@@ -504,7 +506,7 @@ impl OutputDiscovery {
         assign_retry_scopes(
             &mut result.tasks,
             &[Arc::new(RetryScope {
-                scope: NativeDiscoveryScope::new(root, None, Vec::new()),
+                scope: Arc::new(NativeDiscoveryScope::new(root, None, Vec::new())),
                 snapshot: raw,
                 bucket: String::new(),
             })],
@@ -534,7 +536,7 @@ fn retain_logical_retry_scopes(
         };
         let retry = Arc::new(RetryScope {
             snapshot: scope_view(&source.snapshot, &scope),
-            scope,
+            scope: Arc::new(scope),
             bucket: source.bucket.clone(),
         });
         by_root.insert(retry.scope.key().to_owned(), Arc::clone(&retry));
@@ -553,7 +555,7 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
             .collect::<HashMap<_, _>>()
     });
     let has_buckets = scopes.iter().any(|scope| !scope.bucket.is_empty());
-    for task in tasks.iter_mut().filter(|task| task.inputs.len() == 1) {
+    for task in tasks.iter_mut() {
         let input = task.entry();
         let may_split = input.mode.structured()
             || matches!(input.format_hint.as_str(), "zip" | "rar" | "7z")
@@ -561,25 +563,27 @@ fn assign_retry_scopes(tasks: &mut [Task], scopes: &[Arc<RetryScope>]) {
                 .failure
                 .as_ref()
                 .is_some_and(|failure| failure.kind == FailureKind::MissingVolume);
-        if may_split {
-            let key = path_key(&input.entry_path);
-            let bucket = has_buckets.then(|| crate::scan::catalog::catalog_stem(&input.entry_path));
-            task.retry = if let Some(by_root) = &by_root {
-                path_ancestors(&key).find_map(|root| {
-                    bucket
-                        .as_deref()
-                        .and_then(|bucket| by_root.get(&(root, bucket)))
-                        .or_else(|| by_root.get(&(root, "")))
-                        .filter(|scope| scope.scope.contains_key(&key))
-                        .map(|scope| Arc::clone(scope))
-                })
-            } else {
-                let scope = &scopes[0];
-                (scope.scope.contains_key(&key)
-                    && (scope.bucket.is_empty() || bucket.as_ref() == Some(&scope.bucket)))
-                .then(|| Arc::clone(scope))
-            };
+        let key = path_key(&input.entry_path);
+        let bucket = has_buckets.then(|| crate::scan::catalog::catalog_stem(&input.entry_path));
+        let selected = if let Some(by_root) = &by_root {
+            path_ancestors(&key).find_map(|root| {
+                bucket
+                    .as_deref()
+                    .and_then(|bucket| by_root.get(&(root, bucket)))
+                    .or_else(|| by_root.get(&(root, "")))
+                    .filter(|scope| scope.scope.contains_key(&key))
+                    .map(|scope| Arc::clone(scope))
+            })
+        } else {
+            let scope = &scopes[0];
+            (scope.scope.contains_key(&key)
+                && (scope.bucket.is_empty() || bucket.as_ref() == Some(&scope.bucket)))
+            .then(|| Arc::clone(scope))
+        };
+        if task.source != DiscoverySource::Direct {
+            task.scope = selected.as_ref().map(|scope| Arc::clone(&scope.scope));
         }
+        if task.inputs.len() == 1 && may_split { task.retry = selected; }
     }
 }
 
@@ -948,7 +952,7 @@ fn project_task(
                 if relation.standalone && password.is_some() && reason == Some("needs_password") {
                     None
                 } else {
-                    reason.and_then(discovery_failure)
+                    reason.and_then(|reason| discovery_failure(reason, source, &relation.input.entry_path))
                 };
             let mut task = Task::single(relation.input, relation.owned_paths, source, failure);
             task.inputs[0].password = password;
@@ -1046,8 +1050,11 @@ fn project_segments(
         input.analysis.zip_eocd_offset = item
             .zip_eocd_offset
             .and_then(|offset| offset.checked_sub(item.offset));
-        let mut failure = failure.and_then(discovery_failure);
+        let mut failure = failure.and_then(|reason| discovery_failure(reason, DiscoverySource::Embedded, &input.entry_path));
         if let (Some(failure), Some(error)) = (&mut failure, errors.remove(&item.offset)) {
+            if let Some(super::FailureContext::Discovery { error: diagnostic, .. }) = failure.context.as_deref_mut() {
+                *diagnostic = error.clone();
+            }
             failure.message = error;
         }
         inputs.push(LogicalInput {
@@ -1072,12 +1079,12 @@ fn password_required(item: &EmbeddedCandidate) -> bool {
             || item.validation.starts_with("rar5_encryption_header_crc"))
 }
 
-pub(super) fn discovery_failure(reason: &str) -> Option<Failure> {
+fn discovery_failure(reason: &str, source: DiscoverySource, path: &str) -> Option<Failure> {
     let (kind, message) = match reason {
         "needs_password" | "embedded_password_required" => {
-            return Some(Failure::password_required())
+            (FailureKind::PasswordRequired, "Password not found in the password list")
         }
-        "wrong_password" | "embedded_wrong_password" => return Some(Failure::password()),
+        "wrong_password" | "embedded_wrong_password" => (FailureKind::WrongPassword, "Password not found in the password list"),
         "missing_volume" | "ambiguous_volume_mapping" | "structural_conflict" => {
             (FailureKind::MissingVolume, "Missing volume")
         }
@@ -1088,7 +1095,9 @@ pub(super) fn discovery_failure(reason: &str) -> Option<Failure> {
         "embedded_scan_io_error" => (FailureKind::FilesystemError, "Unable to read archive input"),
         _ => return None,
     };
-    let mut failure = Failure::new(kind, message);
+    let mut failure = Failure::new(kind, message).with_context(super::FailureContext::Discovery {
+        discovery: source, reason: reason.to_owned(), path: PathBuf::from(path), error: String::new(),
+    });
     failure.evidence = Some(Box::new(super::FailureEvidence {
         stage: Some("discovery".into()),
         native_kind: Some(reason.to_owned()),
@@ -1350,7 +1359,7 @@ mod tests {
         // Both an explicit child directory and a covered child file's parent
         // remain logical boundaries when only the ancestor was discovered.
         let mut scopes = vec![Arc::new(RetryScope {
-            scope: outer.clone(),
+            scope: Arc::new(outer.clone()),
             snapshot: outer_raw,
             bucket: String::new(),
         })];
@@ -1370,6 +1379,23 @@ mod tests {
         )];
         assign_retry_scopes(&mut tasks, &scopes);
         assert_eq!(tasks[0].retry.as_ref().unwrap().scope.key(), inner.key());
+        assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());
+        // Scope is a discovery fact, not a split-retry capability. A TAR and a
+        // multi-input carrier retain it without retaining the retry snapshot.
+        tasks[0].retry = None;
+        tasks[0].inputs[0].input.format_hint = "tar".into();
+        assign_retry_scopes(&mut tasks, &scopes);
+        assert!(tasks[0].retry.is_none());
+        assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());
+        let input = tasks[0].entry().clone();
+        tasks[0].inputs.push(LogicalInput { input, password: None, failure: None });
+        assign_retry_scopes(&mut tasks, &scopes);
+        assert!(tasks[0].retry.is_none());
+        assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());
+        tasks[0].scope = None;
+        tasks[0].source = DiscoverySource::Direct;
+        assign_retry_scopes(&mut tasks, &scopes);
+        assert!(tasks[0].scope.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

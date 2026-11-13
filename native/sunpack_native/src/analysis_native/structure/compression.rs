@@ -24,96 +24,6 @@ fn count_decoded(reader: &mut impl Read) -> (u64, std::io::Result<()>) {
     }
 }
 
-const GZIP_FIELDS: &[&str] = &[
-    "member.header.magic",
-    "member.header.compression_method",
-    "member.header.flags",
-    "member.header.mtime_xfl_os",
-    "member.header.extra_length",
-    "member.header.extra",
-    "member.header.name",
-    "member.header.comment",
-    "member.header.crc16",
-    "member.deflate.blocks",
-    "member.deflate.final_block",
-    "member.decoded_content",
-    "member.trailer.crc32",
-    "member.trailer.isize",
-    "member.boundary",
-    "member.next_member",
-    "archive.trailing_data",
-];
-const BZIP2_FIELDS: &[&str] = &[
-    "stream.magic",
-    "stream.block_size_100k",
-    "block.marker",
-    "block.crc32",
-    "block.randomized",
-    "block.orig_ptr",
-    "block.huffman_tables",
-    "block.encoded_data",
-    "block.decoded_content",
-    "block.sequence",
-    "stream.end_marker",
-    "stream.combined_crc32",
-    "archive.trailing_data",
-];
-const XZ_FIELDS: &[&str] = &[
-    "stream.header.magic",
-    "stream.header.flags",
-    "stream.header.crc32",
-    "block.header.size",
-    "block.header.flags",
-    "block.header.compressed_size",
-    "block.header.uncompressed_size",
-    "block.header.filters",
-    "block.header.crc32",
-    "block.compressed_data",
-    "block.uncompressed_data",
-    "block.padding",
-    "block.check",
-    "block.sequence",
-    "index.indicator",
-    "index.record_count",
-    "index.records.unpadded_size",
-    "index.records.uncompressed_size",
-    "index.padding",
-    "index.crc32",
-    "stream.footer.crc32",
-    "stream.footer.backward_size",
-    "stream.footer.flags",
-    "stream.footer.magic",
-    "stream.padding",
-    "archive.stream_sequence",
-    "archive.trailing_data",
-];
-const ZSTD_FIELDS: &[&str] = &[
-    "frame.magic",
-    "frame.header.descriptor",
-    "frame.header.content_size_flag",
-    "frame.header.single_segment_flag",
-    "frame.header.checksum_flag",
-    "frame.header.dictionary_id_flag",
-    "frame.header.window_descriptor",
-    "frame.header.dictionary_id",
-    "frame.header.content_size",
-    "block.header.last_block",
-    "block.header.type",
-    "block.header.size",
-    "block.content",
-    "block.literals",
-    "block.sequences",
-    "block.previous_window",
-    "block.previous_entropy_tables",
-    "frame.decoded_content",
-    "frame.content_checksum",
-    "frame.sequence",
-    "skippable.magic",
-    "skippable.frame_size",
-    "skippable.user_data",
-    "archive.trailing_data",
-];
-
 #[derive(Clone, Copy)]
 enum StructuralStreamKind {
     Gzip,
@@ -161,19 +71,10 @@ struct CompressionIdentityResult {
 
 fn compression_identity_result(
     format: &'static str,
-    _ext: &'static str,
-    _magic_matched: bool,
-    _file_size: u64,
-    _bytes_read: u64,
     plausible: bool,
     error: &'static str,
-    _evidence: &[&'static str],
 ) -> CompressionIdentityResult {
-    CompressionIdentityResult {
-        format,
-        plausible,
-        error,
-    }
+    CompressionIdentityResult { format, plausible, error }
 }
 
 const GZIP_IDENTITY_PAYLOAD_BYTES: usize = 1024;
@@ -208,14 +109,14 @@ fn validate_gzip_identity_payload(input: &[u8]) -> Result<(), &'static str> {
 fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityResult {
     let reader = match ManagedReader::open(path) {
         Ok(value) => value,
-        Err(_) => return compression_identity_result("", "", false, 0, 0, false, "os_error", &[]),
+        Err(_) => return compression_identity_result("", false, "os_error"),
     };
     let file_size = reader.len();
     let read_size = file_size.min(BZIP2_IDENTITY_BYTES as u64) as usize;
     let mut data = match reader.read_direct_at(0, read_size) {
         Ok(value) => value,
         Err(_) => {
-            return compression_identity_result("", "", false, file_size, 0, false, "os_error", &[])
+            return compression_identity_result("", false, "os_error")
         }
     };
 
@@ -227,20 +128,10 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         data = match reader.read_direct_at(0, expanded) {
             Ok(value) => value,
             Err(_) => {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    data.len() as u64,
-                    false,
-                    "gzip_header_read_failed",
-                    &["gzip:magic"],
-                )
+                return compression_identity_result("gzip", false, "gzip_header_read_failed")
             }
         };
     }
-    let base_bytes_read = data.len() as u64;
     if crate::formats::lz4::leading(&data) {
         let identity = crate::formats::lz4::identity(&reader, 0);
         // Skippable magic is shared with Zstandard and does not establish LZ4.
@@ -249,165 +140,60 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
                 Ok(valid) => (valid, ""),
                 Err(e) => (false, e),
             };
-            let bytes_read = reader
-                .stats()
-                .map(|s| s.read_bytes)
-                .unwrap_or(base_bytes_read);
-            return compression_identity_result(
-                "lz4",
-                ".lz4",
-                true,
-                file_size,
-                bytes_read,
-                valid,
-                error,
-                &["lz4:header"],
-            );
+            return compression_identity_result("lz4", valid, error);
         }
     }
 
     if data.starts_with(b"\x1f\x8b") {
-        let parsed = match crate::scan::compression_stream::gzip_header_from_slice(&data, 0) {
+        let payload_start = match crate::scan::compression_stream::gzip_payload_offset_from_slice(&data, 0) {
             Ok(value) => value,
             Err(error) => {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read,
-                    false,
-                    error.code(),
-                    &["gzip:magic"],
-                )
+                return compression_identity_result("gzip", false, error.code())
             }
         };
-        let (bytes_read, payload) = {
-            let wanted = (file_size - parsed.payload_start)
+        let payload = {
+            let wanted = (file_size - payload_start)
                 .min((GZIP_IDENTITY_PAYLOAD_BYTES + 8) as u64) as usize;
-            let available = &data[parsed.payload_start as usize..];
+            let available = &data[payload_start as usize..];
             if available.len() >= wanted {
-                (
-                    base_bytes_read,
-                    std::borrow::Cow::Borrowed(&available[..wanted]),
-                )
+                std::borrow::Cow::Borrowed(&available[..wanted])
             } else {
-                match reader.read_direct_at(parsed.payload_start, wanted) {
-                    Ok(bytes) => (
-                        base_bytes_read + bytes.len() as u64,
-                        std::borrow::Cow::Owned(bytes),
-                    ),
+                match reader.read_direct_at(payload_start, wanted) {
+                    Ok(bytes) => std::borrow::Cow::Owned(bytes),
                     Err(_) => {
-                        return compression_identity_result(
-                            "gzip",
-                            ".gz",
-                            true,
-                            file_size,
-                            base_bytes_read,
-                            false,
-                            "os_error",
-                            &["gzip:header"],
-                        )
+                        return compression_identity_result("gzip", false, "os_error")
                     }
                 }
             }
         };
         let result = validate_gzip_identity_payload(&payload);
-        return compression_identity_result(
-            "gzip",
-            ".gz",
-            true,
-            file_size,
-            bytes_read,
-            result.is_ok(),
-            result.err().unwrap_or(""),
-            &[],
-        );
+        return compression_identity_result("gzip", result.is_ok(), result.err().unwrap_or(""));
     }
 
     if data.starts_with(b"BZh") {
-        let (plausible, error, evidence): (_, _, &[_]) =
-            match validate_bzip2_identity(&data, file_size) {
-                Ok(true) => (
-                    true,
-                    "",
-                    &["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"],
-                ),
-                Ok(false) => (
-                    true,
-                    "",
-                    &[
-                        "bzip2:magic",
-                        "bzip2:block_size",
-                        "bzip2:first_block_marker",
-                        "bzip2:first_block_header",
-                    ],
-                ),
-                Err(error) => (false, error.code(), &["bzip2:magic"]),
-            };
-        return compression_identity_result(
-            "bzip2",
-            ".bz2",
-            true,
-            file_size,
-            base_bytes_read,
-            plausible,
-            error,
-            evidence,
-        );
+        let (plausible, error) = match validate_bzip2_identity(&data, file_size) {
+            Ok(_) => (true, ""),
+            Err(error) => (false, error.code()),
+        };
+        return compression_identity_result("bzip2", plausible, error);
     }
 
     if data.starts_with(XZ_MAGIC) {
         let result = validate_xz_identity(&data, file_size, |size| reader.read_direct_at(12, size));
-        let (plausible, error, extra) = match result {
-            Ok(extra) => (true, "", extra as u64),
-            Err(error) => (false, error.code(), 0),
+        let (plausible, error) = match result {
+            Ok(_) => (true, ""),
+            Err(error) => (false, error.code()),
         };
-        return compression_identity_result(
-            "xz",
-            ".xz",
-            true,
-            file_size,
-            base_bytes_read + extra,
-            plausible,
-            error,
-            if plausible {
-                &[
-                    "xz:magic",
-                    "xz:header_crc32",
-                    "xz:first_block_or_empty_index",
-                ]
-            } else {
-                &["xz:magic"]
-            },
-        );
+        return compression_identity_result("xz", plausible, error);
     }
 
     if data.starts_with(ZSTD_MAGIC) {
         if data.len() < 8 {
-            return compression_identity_result(
-                "zstd",
-                ".zst",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "zstd_frame_header_short",
-                &["zstd:magic"],
-            );
+            return compression_identity_result("zstd", false, "zstd_frame_header_short");
         }
         let descriptor = data[4];
         if descriptor & 0x18 != 0 {
-            return compression_identity_result(
-                "zstd",
-                ".zst",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "zstd_reserved_or_unused_bit_set",
-                &["zstd:magic"],
-            );
+            return compression_identity_result("zstd", false, "zstd_reserved_or_unused_bit_set");
         }
         let single = descriptor & 0x20 != 0;
         let dict_size = match descriptor & 0x03 {
@@ -419,16 +205,7 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         let mut cursor = 5usize;
         if !single {
             if cursor >= data.len() {
-                return compression_identity_result(
-                    "zstd",
-                    ".zst",
-                    true,
-                    file_size,
-                    base_bytes_read,
-                    false,
-                    "zstd_window_descriptor_missing",
-                    &["zstd:magic", "zstd:frame_descriptor"],
-                );
+                return compression_identity_result("zstd", false, "zstd_window_descriptor_missing");
             }
             cursor += 1;
         }
@@ -438,28 +215,10 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             .checked_add(dict_size)
             .and_then(|value| value.checked_add(fcs_size))
         else {
-            return compression_identity_result(
-                "zstd",
-                ".zst",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "zstd_frame_header_overflow",
-                &["zstd:magic", "zstd:frame_descriptor"],
-            );
+            return compression_identity_result("zstd", false, "zstd_frame_header_overflow");
         };
         if block_header_offset + 3 > data.len() {
-            return compression_identity_result(
-                "zstd",
-                ".zst",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "zstd_first_block_header_missing",
-                &["zstd:magic", "zstd:frame_descriptor"],
-            );
+            return compression_identity_result("zstd", false, "zstd_first_block_header_missing");
         }
         let block_header = u32::from(data[block_header_offset])
             | (u32::from(data[block_header_offset + 1]) << 8)
@@ -467,16 +226,7 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         let block_type = (block_header >> 1) & 0x03;
         let block_size = u64::from(block_header >> 3);
         if block_type == 3 || block_size > 128 * 1024 {
-            return compression_identity_result(
-                "zstd",
-                ".zst",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "zstd_first_block_header_invalid",
-                &["zstd:magic", "zstd:frame_descriptor"],
-            );
+            return compression_identity_result("zstd", false, "zstd_first_block_header_invalid");
         }
         let stored_size = if block_type == 1 { 1 } else { block_size };
         if (block_header_offset as u64)
@@ -484,70 +234,26 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             .and_then(|value| value.checked_add(stored_size))
             .map_or(true, |end| end > file_size)
         {
-            return compression_identity_result(
-                "zstd",
-                ".zst",
-                true,
-                file_size,
-                base_bytes_read,
-                false,
-                "zstd_first_block_out_of_range",
-                &["zstd:magic", "zstd:frame_descriptor"],
-            );
+            return compression_identity_result("zstd", false, "zstd_first_block_out_of_range");
         }
-        return compression_identity_result(
-            "zstd",
-            ".zst",
-            true,
-            file_size,
-            base_bytes_read,
-            true,
-            "",
-            &[
-                "zstd:magic",
-                "zstd:frame_descriptor",
-                "zstd:first_block_header",
-            ],
-        );
+        return compression_identity_result("zstd", true, "");
     }
 
-    compression_identity_result(
-        "",
-        "",
-        false,
-        file_size,
-        base_bytes_read,
-        false,
-        "compression_stream_magic_not_found",
-        &[],
-    )
+    compression_identity_result("", false, "compression_stream_magic_not_found")
 }
 
 fn inspect_structural_stream(
     reader: &ManagedReader,
     kind: StructuralStreamKind,
-) -> std::io::Result<DiagnosticFields> {
+) -> std::io::Result<StreamObservation> {
     let file_size = reader.len();
-    let (format, ext, fields, cost) = match kind {
-        StructuralStreamKind::Gzip => ("gzip", ".gz", GZIP_FIELDS, "compressed_token_linear"),
-        StructuralStreamKind::Bzip2 => {
-            ("bzip2", ".bz2", BZIP2_FIELDS, "compressed_bitstream_linear")
-        }
-        StructuralStreamKind::Xz => ("xz", ".xz", XZ_FIELDS, "metadata_linear_payload_skipped"),
-        StructuralStreamKind::Zstd => (
-            "zstd",
-            ".zst",
-            ZSTD_FIELDS,
-            "block_header_linear_payload_skipped",
-        ),
+    let format = match kind {
+        StructuralStreamKind::Gzip => "gzip",
+        StructuralStreamKind::Bzip2 => "bzip2",
+        StructuralStreamKind::Xz => "xz",
+        StructuralStreamKind::Zstd => "zstd",
     };
-    let mut d = compression_base(format, ext, true)?;
-    for field in fields {
-        d.put(*field, "not_decoded")?;
-    }
-    d.put("validation_scope", "complete_structure")?;
-    d.put("validation_cost", cost)?;
-    d.put("file_size", file_size)?;
+    let mut d = compression_base(format, true);
     let validation = kind.validate(reader, file_size);
     let structure = match validation {
         Ok(value) => value,
@@ -556,65 +262,40 @@ fn inspect_structural_stream(
                 return Err(crate::io::resource_error::to_io_error(error));
             }
             let code = error.code();
-            d.put("structure_status", "invalid")?;
-            d.put("structure_validation_complete", false)?;
-            d.put("boundary_exact", false)?;
-            d.put("integrity_status", "failed")?;
-            d.put("integrity_validation_complete", true)?;
-            d.put("plausible", false)?;
-            d.put("confidence", "none")?;
-            d.put("error", code)?;
-            d.put("damage_flags", [code])?;
-            finish_fields(&mut d, fields)?;
+
+            d.structure_complete = false;
+            d.boundary_exact = false;
+
+            d.plausible = false;
+
+            d.error = code.into();
+            d.damage_flags = ([code]).into_iter().map(str::to_owned).collect();
             return Ok(d);
         }
     };
-    project_structural_validation(&mut d, &structure, file_size)?;
+    d.stream_count = structure.stream_count;
     let trailing = file_size.saturating_sub(structure.end_offset);
     let damage_flags = if trailing > 0 {
         vec!["trailing_junk"]
     } else {
         Vec::new()
     };
-    d.put("plausible", true)?;
-    d.put("confidence", "strong")?;
-    d.put("structure_status", "complete")?;
-    d.put("structure_validation_complete", true)?;
-    d.put("boundary_exact", true)?;
-    d.put("segment_end", structure.end_offset)?;
-    d.put("archive.trailing_data", trailing)?;
-    d.put("trailing_data_verified", true)?;
-    d.put("integrity_status", structure.integrity.as_str())?;
-    d.put("integrity_validation_complete", false)?;
-    d.put("checksum_present", structure.checksum_present)?;
-    d.put("damage_flags", damage_flags)?;
-    finish_fields(&mut d, fields)?;
+    d.plausible = true;
+
+    d.structure_complete = true;
+    d.boundary_exact = true;
+    d.segment_end = Some(structure.end_offset);
+    d.trailing_bytes = Some(trailing as u64);
+
+    d.damage_flags = damage_flags.into_iter().map(str::to_owned).collect();
     Ok(d)
 }
 
-fn project_structural_validation(
-    d: &mut DiagnosticFields,
-    structure: &StructureValidation,
-    file_size: u64,
-) -> std::io::Result<()> {
-    d.put("structure.stream_count", structure.stream_count)?;
-    d.put("structure.block_count", structure.block_count)?;
-    d.put(
-        "structure.compressed_bytes",
-        structure.end_offset.min(file_size),
-    )?;
-    d.put("structure.decoded_size", structure.decoded_size)?;
-    Ok(())
-}
-
 fn apply_structural_contract(
-    d: &mut DiagnosticFields,
+    d: &mut StreamObservation,
     reader: &ManagedReader,
     validation_limit: u64,
     kind: StructuralStreamKind,
-    // End offset of the prefix the eager decoder checked; integrity is only
-    // verified when that prefix covers the whole validated structure.
-    integrity_verified_end: Option<u64>,
     damage_flags: &mut Vec<&'static str>,
 ) -> std::io::Result<()> {
     let file_size = reader.len();
@@ -625,24 +306,13 @@ fn apply_structural_contract(
             if trailing > 0 && !damage_flags.contains(&"trailing_junk") {
                 damage_flags.push("trailing_junk");
             }
-            let integrity = if integrity_verified_end.is_some_and(|end| end >= structure.end_offset)
-                && structure.checksum_present
-            {
-                "verified"
-            } else {
-                structure.integrity.as_str()
-            };
-            d.put("validation_scope", "complete_structure")?;
-            d.put("structure_status", "complete")?;
-            d.put("structure_validation_complete", true)?;
-            d.put("boundary_exact", true)?;
-            d.put("segment_end", structure.end_offset)?;
-            d.put("archive.trailing_data", trailing)?;
-            d.put("trailing_data_verified", true)?;
-            d.put("integrity_status", integrity)?;
-            d.put("integrity_validation_complete", integrity == "verified")?;
-            d.put("checksum_present", structure.checksum_present)?;
-            project_structural_validation(d, &structure, file_size)?;
+
+            d.structure_complete = true;
+            d.boundary_exact = true;
+            d.segment_end = Some(structure.end_offset);
+            d.trailing_bytes = Some(trailing as u64);
+
+            d.stream_count = structure.stream_count;
         }
         Err(error) => {
             if let crate::scan::compression_stream::ValidationError::Io(error) = error {
@@ -652,114 +322,58 @@ fn apply_structural_contract(
             if !damage_flags.contains(&code) {
                 damage_flags.push(code);
             }
-            d.put("structure_status", "invalid")?;
-            d.put("structure_validation_complete", false)?;
-            d.put("boundary_exact", false)?;
-            d.put("integrity_status", "failed")?;
-            d.put("integrity_validation_complete", true)?;
-            d.put("plausible", false)?;
-            d.put("confidence", "none")?;
-            d.put("error", code)?;
+
+            d.structure_complete = false;
+            d.boundary_exact = false;
+
+            d.plausible = false;
+
+            d.error = code.into();
         }
     }
     Ok(())
 }
 
-fn compression_base(format: &str, ext: &str, magic: bool) -> std::io::Result<DiagnosticFields> {
-    let mut d = dict()?;
-    d.put("plausible", false)?;
-    d.put("error", "")?;
-    d.put("magic_matched", magic)?;
-    d.put("format", format)?;
-    d.put("detected_ext", ext)?;
-    d.put("confidence", "none")?;
-    d.put("evidence", Vec::<&str>::new())?;
-    Ok(d)
+/// Only facts consumed by format selection and segment planning. Diagnostics
+/// for decoded fields are not serialized on this internal analysis path.
+#[derive(Default)]
+pub(crate) struct StreamObservation {
+    pub(crate) format: String,
+    pub(crate) magic_matched: bool,
+    pub(crate) plausible: bool,
+    pub(crate) error: String,
+    pub(crate) damage_flags: Vec<String>,
+    pub(crate) structure_complete: bool,
+    pub(crate) boundary_exact: bool,
+    pub(crate) segment_end: Option<u64>,
+    pub(crate) trailing_bytes: Option<u64>,
+    pub(crate) stream_count: usize,
 }
 
-fn finish_fields(d: &mut DiagnosticFields, fields: &[&str]) -> std::io::Result<()> {
-    let mut missing = Vec::<&str>::new();
-    for field in fields {
-        if !d.contains_key(*field) {
-            d.put(field, "unavailable")?;
-            missing.push(*field);
-        }
-    }
-    d.put("semantic_field_count", fields.len())?;
-    d.put("semantic_fields", fields)?;
-    d.put("semantic_missing_fields", missing)?;
-    Ok(())
+fn compression_base(format: &str, magic_matched: bool) -> StreamObservation {
+    StreamObservation { format: format.into(), magic_matched, ..StreamObservation::default() }
 }
 
-fn compression_empty(
-    error: &str,
-    format: &str,
-    ext: &str,
-    magic: bool,
-) -> std::io::Result<DiagnosticFields> {
-    let mut d = compression_base(format, ext, magic)?;
-    d.put("error", error)?;
-    Ok(d)
+fn compression_empty(error: &str, format: &str, magic_matched: bool) -> StreamObservation {
+    StreamObservation { error: error.into(), ..compression_base(format, magic_matched) }
 }
 
-fn hex_bytes(value: &[u8]) -> String {
-    value.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn inspect_gzip(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
+fn inspect_gzip(reader: &ManagedReader) -> std::io::Result<StreamObservation> {
     let file_size = reader.len();
     let data = (reader.read_all()).map_err(crate::io::resource_error::to_io_error)?;
-    let mut d = compression_base("gzip", ".gz", data.starts_with(b"\x1f\x8b"))?;
+    let mut d = compression_base("gzip", data.starts_with(b"\x1f\x8b"));
     let mut damage_flags = Vec::new();
-    d.put(
-        "member.header.magic",
-        hex_bytes(data.get(0..2).unwrap_or(&[])),
-    )?;
-    let parsed = match crate::scan::compression_stream::gzip_header_from_slice(&data, 0) {
-        Ok(value) => value,
-        Err(error) => {
-            d.put("error", error.code())?;
-            d.put("damage_flags", [error.code()])?;
-            finish_fields(&mut d, GZIP_FIELDS)?;
-            return Ok(d);
-        }
-    };
-    d.put("member.header.compression_method", data[2])?;
-    d.put("member.header.flags", parsed.flags)?;
-    d.put(
-        "member.header.mtime_xfl_os",
-        format!("mtime={};xfl={};os={}", u32_le(&data, 4), data[8], data[9]),
-    )?;
-    if let Some(range) = parsed.extra {
-        d.put("member.header.extra_length", range.len())?;
-        d.put("member.header.extra", hex_bytes(&data[range]))?;
-    } else {
-        d.put("member.header.extra_length", 0)?;
-        d.put("member.header.extra", "absent")?;
+
+    if let Err(error) = crate::scan::compression_stream::gzip_payload_offset_from_slice(&data, 0) {
+        d.error = error.code().into();
+        d.damage_flags = vec![error.code().into()];
+        return Ok(d);
     }
-    for (key, range) in [
-        ("member.header.name", parsed.name),
-        ("member.header.comment", parsed.comment),
-    ] {
-        d.put(
-            key,
-            range
-                .map(|range| String::from_utf8_lossy(&data[range]).into_owned())
-                .unwrap_or_else(|| "absent".to_string()),
-        )?;
-    }
-    d.put(
-        "member.header.crc16",
-        parsed
-            .crc16
-            .map(|crc| format!("stored={crc};computed={crc};ok=true"))
-            .unwrap_or_else(|| "absent".to_string()),
-    )?;
 
     // Move the bounded compressed input into the canonical reader so the structural
     // walk and integrity observer share one byte source without cloning the file.
     let reader = ManagedReader::from_bytes(data, crate::io::reader::ReaderConfig::default());
-    let analysis =
+    let structure =
         match analyze_gzip_structure(&reader, 0, file_size, STREAM_STRUCTURE_DECODE_MAX_BYTES) {
             Ok(value) => value,
             Err(error) => {
@@ -767,109 +381,37 @@ fn inspect_gzip(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
                 if !damage_flags.contains(&code) {
                     damage_flags.push(code);
                 }
-                d.put("structure_status", "invalid")?;
-                d.put("structure_validation_complete", false)?;
-                d.put("boundary_exact", false)?;
-                d.put("integrity_status", "failed")?;
-                d.put("integrity_validation_complete", true)?;
-                d.put("plausible", false)?;
-                d.put("confidence", "none")?;
-                d.put("error", code)?;
-                d.put("damage_flags", damage_flags)?;
-                d.put("file_size", file_size)?;
-                finish_fields(&mut d, GZIP_FIELDS)?;
+
+                d.structure_complete = false;
+                d.boundary_exact = false;
+
+                d.plausible = false;
+
+                d.error = code.into();
+                d.damage_flags = damage_flags.into_iter().map(str::to_owned).collect();
                 return Ok(d);
             }
         };
-    let structure = &analysis.structure;
     let integrity = structure.integrity.as_str();
     if integrity == "failed" && !damage_flags.contains(&"gzip_footer_bad") {
         damage_flags.push("gzip_footer_bad");
     }
 
-    d.put(
-        "member.deflate.blocks",
-        format!(
-            "compressed_bytes={};block_count={};decoder_status=Ok(())",
-            analysis.first_member_compressed_bytes, analysis.first_member_block_count
-        ),
-    )?;
-    d.put("member.deflate.final_block", true)?;
-    d.put("member.decoded_content", analysis.first_member_decoded_size)?;
-    if let Some(computed) = analysis.first_member_computed_crc32 {
-        d.put(
-            "member.trailer.crc32",
-            format!(
-                "stored={};computed={computed};ok={}",
-                analysis.first_member_stored_crc32,
-                analysis.first_member_stored_crc32 == computed
-            ),
-        )?;
-    } else {
-        d.put(
-            "member.trailer.crc32",
-            format!(
-                "stored={};computed=deferred;ok=deferred",
-                analysis.first_member_stored_crc32
-            ),
-        )?;
-    }
-    d.put(
-        "member.trailer.isize",
-        format!(
-            "stored={};decoded_mod={};ok=true",
-            analysis.first_member_stored_size, analysis.first_member_decoded_size as u32
-        ),
-    )?;
-    d.put("member.boundary", analysis.first_member_end)?;
-    d.put("member.next_member", structure.stream_count > 1)?;
-
     let trailing = file_size.saturating_sub(structure.end_offset);
-    d.put("archive.trailing_data", trailing)?;
+    d.trailing_bytes = Some(trailing as u64);
     if trailing > 0 && !damage_flags.contains(&"trailing_junk") {
         damage_flags.push("trailing_junk");
     }
-    d.put("trailing_data_verified", true)?;
-    d.put("plausible", true)?;
-    d.put("confidence", "strong")?;
-    d.put("validation_scope", "complete_structure")?;
-    d.put(
-        "validation_cost",
-        "compressed_token_linear+bounded_integrity",
-    )?;
-    d.put("structure_status", "complete")?;
-    d.put("structure_validation_complete", true)?;
-    d.put("boundary_exact", true)?;
-    d.put("segment_end", structure.end_offset)?;
-    d.put("integrity_status", integrity)?;
-    d.put(
-        "integrity_validation_complete",
-        integrity == "verified" || integrity == "failed",
-    )?;
-    d.put("checksum_present", structure.checksum_present)?;
-    project_structural_validation(&mut d, structure, file_size)?;
-    d.put("damage_flags", damage_flags)?;
-    d.put("file_size", file_size)?;
-    finish_fields(&mut d, GZIP_FIELDS)?;
-    Ok(d)
-}
 
-struct BitReader<'a> {
-    data: &'a [u8],
-    bit: usize,
-}
-impl<'a> BitReader<'a> {
-    fn read(&mut self, bits: usize) -> Option<u64> {
-        if self.bit + bits > self.data.len() * 8 {
-            return None;
-        }
-        let mut value = 0u64;
-        for _ in 0..bits {
-            value = (value << 1) | ((self.data[self.bit / 8] >> (7 - self.bit % 8)) & 1) as u64;
-            self.bit += 1;
-        }
-        Some(value)
-    }
+    d.plausible = true;
+
+    d.structure_complete = true;
+    d.boundary_exact = true;
+    d.segment_end = Some(structure.end_offset);
+
+    d.stream_count = structure.stream_count;
+    d.damage_flags = damage_flags.into_iter().map(str::to_owned).collect();
+    Ok(d)
 }
 
 fn marker_positions(data: &[u8], marker: u64) -> Vec<usize> {
@@ -908,90 +450,18 @@ fn marker_positions(data: &[u8], marker: u64) -> Vec<usize> {
     output
 }
 
-fn bzip_huffman_summary(data: &[u8], start_bit: usize) -> String {
-    let mut reader = BitReader {
-        data,
-        bit: start_bit,
-    };
-    let mut groups = 0usize;
-    if let Some(in_use16) = reader.read(16) {
-        let mut symbols = 0usize;
-        for group in 0..16 {
-            if in_use16 & (1 << (15 - group)) != 0 {
-                if let Some(bits) = reader.read(16) {
-                    symbols += bits.count_ones() as usize;
-                } else {
-                    return "truncated".into();
-                }
-            }
-        }
-        groups = reader.read(3).unwrap_or(0) as usize;
-        let selectors = reader.read(15).unwrap_or(0);
-        return format!("symbols={symbols};groups={groups};selectors={selectors}");
-    }
-    format!("groups={groups};truncated")
-}
-
-fn inspect_bzip2(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
+fn inspect_bzip2(reader: &ManagedReader) -> std::io::Result<StreamObservation> {
     let file_size = reader.len();
     let data = (reader.read_all()).map_err(crate::io::resource_error::to_io_error)?;
     let magic = data.starts_with(b"BZh") && data.get(3).is_some_and(|v| b"123456789".contains(v));
-    let mut d = compression_base("bzip2", ".bz2", magic)?;
+    let mut d = compression_base("bzip2", magic);
     let mut damage_flags = Vec::new();
-    d.put(
-        "stream.magic",
-        String::from_utf8_lossy(data.get(0..3).unwrap_or(&[])).to_string(),
-    )?;
-    d.put(
-        "stream.block_size_100k",
-        data.get(3).map(|v| v.saturating_sub(b'0')).unwrap_or(0),
-    )?;
+
     if !magic {
-        d.put("error", "bzip2_magic_not_found")?;
-        finish_fields(&mut d, BZIP2_FIELDS)?;
+        d.error = "bzip2_magic_not_found".into();
         return Ok(d);
     }
-    let (blocks, ends) = (|| {
-        (
-            marker_positions(&data, 0x314159265359),
-            marker_positions(&data, 0x177245385090),
-        )
-    })();
-    d.put(
-        "block.marker",
-        blocks.first().map(|v| *v as u64).unwrap_or(u64::MAX),
-    )?;
-    d.put("block.sequence", blocks.len())?;
-    if let Some(bit) = blocks.first() {
-        let mut reader = BitReader {
-            data: &data,
-            bit: bit + 48,
-        };
-        let block_crc = reader.read(32).unwrap_or(0) as u32;
-        let randomized = reader.read(1).unwrap_or(0) != 0;
-        let orig_ptr = reader.read(24).unwrap_or(0);
-        d.put("block.crc32", block_crc)?;
-        d.put("block.randomized", randomized)?;
-        d.put("block.orig_ptr", orig_ptr)?;
-        d.put(
-            "block.huffman_tables",
-            bzip_huffman_summary(&data, reader.bit),
-        )?;
-        let end_bit = blocks
-            .get(1)
-            .copied()
-            .or_else(|| ends.first().copied())
-            .unwrap_or(data.len() * 8);
-        d.put("block.encoded_data", end_bit.saturating_sub(reader.bit))?;
-    }
-    d.put("stream.end_marker", !ends.is_empty())?;
-    if let Some(bit) = ends.first() {
-        let mut reader = BitReader {
-            data: &data,
-            bit: bit + 48,
-        };
-        d.put("stream.combined_crc32", reader.read(32).unwrap_or(0) as u32)?;
-    }
+    let ends = marker_positions(&data, 0x177245385090);
     let mut decoder = bzip2::read::BzDecoder::new(Cursor::new(data.as_slice()));
     let (decoded_size, decode_status) = count_decoded(&mut decoder);
     let decode_limited = decoded_size > STREAM_STRUCTURE_DECODE_MAX_BYTES;
@@ -1001,7 +471,7 @@ fn inspect_bzip2(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
         .map(|bit| (bit + 48 + 32 + 7) / 8)
         .unwrap_or(data.len());
     let consumed = decoder.get_ref().position() as usize;
-    d.put("block.decoded_content", decoded_size)?;
+
     let trailing = if decode_limited {
         0
     } else {
@@ -1010,18 +480,15 @@ fn inspect_bzip2(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
     // The single-stream decoder stops at the first end marker; concatenated
     // streams are not trailing data.  The structural contract below walks every
     // stream and owns the trailing_junk decision.
-    d.put("archive.trailing_data", trailing)?;
-    d.put("trailing_data_verified", decode_ok)?;
-    d.put(
-        "plausible",
-        (decode_ok && !ends.is_empty()) || (decode_limited && magic),
-    )?;
-    d.put("confidence", if decode_ok { "strong" } else { "medium" })?;
+    d.trailing_bytes = Some(trailing as u64);
+
+    d.plausible = (decode_ok && !ends.is_empty()) || (decode_limited && magic);
+
     if ends.is_empty() && !decode_limited {
         damage_flags.push("probably_truncated");
     }
     if !decode_ok && !decode_limited {
-        d.put("error", "bzip2_decode_failed")?;
+        d.error = "bzip2_decode_failed".into();
         damage_flags.push("bzip2_block_bad");
     }
     apply_structural_contract(
@@ -1029,12 +496,9 @@ fn inspect_bzip2(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
         reader,
         file_size,
         StructuralStreamKind::Bzip2,
-        decode_ok.then_some(marker_boundary as u64),
         &mut damage_flags,
     )?;
-    d.put("damage_flags", damage_flags)?;
-    d.put("file_size", file_size)?;
-    finish_fields(&mut d, BZIP2_FIELDS)?;
+    d.damage_flags = damage_flags.into_iter().map(str::to_owned).collect();
     Ok(d)
 }
 
@@ -1096,7 +560,7 @@ fn xz_index_records<'a>(
     Some(records)
 }
 
-fn xz_block_header_fields(header: &[u8]) -> Option<(Option<u64>, Option<u64>, Vec<String>)> {
+fn xz_block_compressed_size(header: &[u8]) -> Option<Option<u64>> {
     // The caller excludes the header CRC; no VLI or property may consume it
     // (or compressed bytes belonging to the following block payload).
     let flags = *header.get(1)?;
@@ -1106,21 +570,17 @@ fn xz_block_header_fields(header: &[u8]) -> Option<(Option<u64>, Option<u64>, Ve
     } else {
         None
     };
-    let uncompressed = if flags & 0x80 != 0 {
-        Some(read_vli(header, &mut cursor)?)
-    } else {
-        None
-    };
-    let mut filters = Vec::new();
+    if flags & 0x80 != 0 {
+        read_vli(header, &mut cursor)?;
+    }
     for _ in 0..(flags & 0x03) + 1 {
-        let id = read_vli(header, &mut cursor)?;
+        read_vli(header, &mut cursor)?;
         let prop_size = usize::try_from(read_vli(header, &mut cursor)?).ok()?;
         let end = cursor.checked_add(prop_size)?;
-        let props = header.get(cursor..end)?;
-        filters.push(format!("id={id}:props={}", hex_bytes(props)));
+        header.get(cursor..end)?;
         cursor = end;
     }
-    Some((compressed, uncompressed, filters))
+    Some(compressed)
 }
 
 fn xz_check_size(check_type: u8) -> usize {
@@ -1205,10 +665,10 @@ mod xz_bounds_tests {
             &[1, 0x80, 0x80, 0x80][..],
             &[1, 1, 0x21, 0][..], // Second filter is absent.
         ] {
-            assert!(xz_block_header_fields(header).is_none(), "{header:?}");
+            assert!(xz_block_compressed_size(header).is_none(), "{header:?}");
         }
-        let fields = xz_block_header_fields(&[2, 0, 0x21, 1, 0x16, 0, 0, 0]).unwrap();
-        assert_eq!(fields.2, vec!["id=33:props=16"]);
+        let fields = xz_block_compressed_size(&[2, 0, 0x21, 1, 0x16, 0, 0, 0]).unwrap();
+        assert_eq!(fields, None);
     }
 
     fn malformed_stream(block: &[u8], index: &[u8]) -> Vec<u8> {
@@ -1231,7 +691,7 @@ mod xz_bounds_tests {
         data
     }
 
-    fn inspect_fixture(data: &[u8], check: impl FnOnce(&DiagnosticFields)) {
+    fn inspect_fixture(data: &[u8], check: impl FnOnce(&StreamObservation)) {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "sunpack-xz-bounds-{}-{}.bin",
@@ -1254,12 +714,46 @@ mod xz_bounds_tests {
             (spilling_header, "xz_block_header_bad"),
         ] {
             inspect_fixture(&data, |result| {
-                let flags: Vec<String> =
-                    serde_json::from_value(result["damage_flags"].clone()).unwrap();
+                let flags = &result.damage_flags;
                 assert!(flags.iter().any(|value| value == flag), "{flags:?}");
-                assert_eq!(result.get("block.sequence").unwrap().as_u64().unwrap(), 0);
             });
         }
+    }
+
+    #[test]
+    fn typed_stream_observations_preserve_boundaries_and_damage() {
+        // The report consumes these facts rather than the former diagnostic
+        // dictionaries. Cover every stream producer at that shared boundary.
+        let payload = b"typed stream facts";
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(payload).unwrap();
+        let gzip = gzip.finish().unwrap();
+        let mut bzip = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        bzip.write_all(payload).unwrap();
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 1);
+        xz.write_all(payload).unwrap();
+        let zstd = zstd::stream::encode_all(&payload[..], 1).unwrap();
+        for (format, bytes) in [
+            ("gzip", gzip.clone()), ("bzip2", bzip.finish().unwrap()),
+            ("xz", xz.finish().unwrap()), ("zstd", zstd),
+        ] {
+            let length = bytes.len() as u64;
+            let reader = ManagedReader::from_bytes(bytes, crate::io::reader::ReaderConfig::default());
+            let head = reader.read_cached_at(0, 32).unwrap();
+            let facts = inspect_compression_stream_reader(&reader, &head).unwrap();
+            assert_eq!(facts.format, format);
+            assert!(facts.magic_matched && facts.plausible && facts.structure_complete);
+            assert!(facts.boundary_exact && facts.error.is_empty() && facts.damage_flags.is_empty());
+            assert_eq!(facts.segment_end, Some(length));
+            assert_eq!(facts.trailing_bytes, Some(0));
+        }
+        let mut damaged = gzip;
+        let crc = damaged.len() - 8;
+        damaged[crc] ^= 1;
+        let reader = ManagedReader::from_bytes(damaged, crate::io::reader::ReaderConfig::default());
+        let head = reader.read_cached_at(0, 32).unwrap();
+        let facts = inspect_compression_stream_reader(&reader, &head).unwrap();
+        assert!(facts.damage_flags.iter().any(|flag| flag == "gzip_footer_bad"));
     }
 
     #[test]
@@ -1267,49 +761,28 @@ mod xz_bounds_tests {
         let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
         encoder.write_all(b"payload").unwrap();
         inspect_fixture(&encoder.finish().unwrap(), |result| {
-            assert!(result.get("plausible").unwrap().as_bool().unwrap());
-            assert_eq!(
-                result.get("index.record_count").unwrap().as_u64().unwrap(),
-                1
-            );
-            assert_eq!(result.get("block.sequence").unwrap().as_u64().unwrap(), 1);
-            assert_eq!(
-                result
-                    .get("index.records.uncompressed_size")
-                    .unwrap()
-                    .as_u64()
-                    .unwrap(),
-                7
-            );
+            assert!(result.plausible);
+            assert!(result.structure_complete);
+            assert_eq!(result.trailing_bytes, Some(0));
+            assert!(result.damage_flags.is_empty());
+            assert!(result.segment_end.is_some());
         });
     }
 }
 
-fn inspect_xz(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
+fn inspect_xz(reader: &ManagedReader) -> std::io::Result<StreamObservation> {
     let file_size = reader.len();
     let data = (reader.read_all()).map_err(crate::io::resource_error::to_io_error)?;
-    let mut d = compression_base("xz", ".xz", data.starts_with(XZ_MAGIC))?;
+    let mut d = compression_base("xz", data.starts_with(XZ_MAGIC));
     let mut damage_flags = Vec::new();
-    d.put(
-        "stream.header.magic",
-        hex_bytes(data.get(..6).unwrap_or(&[])),
-    )?;
+
     if data.len() < 24 || !data.starts_with(XZ_MAGIC) {
-        d.put("error", "xz_header_or_footer_missing")?;
-        finish_fields(&mut d, XZ_FIELDS)?;
+        d.error = "xz_header_or_footer_missing".into();
         return Ok(d);
     }
     let flags = &data[6..8];
     let header_crc = u32_le(&data, 8);
-    d.put("stream.header.flags", hex_bytes(flags))?;
-    d.put(
-        "stream.header.crc32",
-        format!(
-            "stored={header_crc};computed={};ok={}",
-            crc32(flags),
-            header_crc == crc32(flags)
-        ),
-    )?;
+
     if header_crc != crc32(flags) {
         damage_flags.push("xz_header_crc_bad");
     }
@@ -1332,22 +805,13 @@ fn inspect_xz(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
     let footer = &data[footer_start..];
     let footer_crc = u32_le(footer, 0);
     let backward_size = (u32_le(footer, 4) as u64 + 1) * 4;
-    d.put(
-        "stream.footer.crc32",
-        format!(
-            "stored={footer_crc};computed={};ok={}",
-            crc32(&footer[4..10]),
-            footer_crc == crc32(&footer[4..10])
-        ),
-    )?;
+
     if footer_crc != crc32(&footer[4..10]) {
         damage_flags.push("xz_footer_crc_bad");
     }
     // Concatenated streams may use different checks. The canonical structural
     // walk compares each footer to its own header.
-    d.put("stream.footer.backward_size", backward_size)?;
-    d.put("stream.footer.flags", hex_bytes(&footer[8..10]))?;
-    d.put("stream.footer.magic", hex_bytes(&footer[10..12]))?;
+
     let index_start = footer_start
         .checked_sub(backward_size as usize)
         .unwrap_or(0);
@@ -1355,13 +819,13 @@ fn inspect_xz(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
     let index_data = &data[..index_crc_pos];
     let mut index_cursor = index_start;
     let index_valid_start = index_start >= 12 && index_data.get(index_cursor) == Some(&0);
-    d.put("index.indicator", index_valid_start)?;
+
     if !index_valid_start {
         damage_flags.push("xz_index_bad");
     }
     index_cursor = index_cursor.saturating_add(1);
     let record_count = read_vli(index_data, &mut index_cursor);
-    d.put("index.record_count", record_count.unwrap_or(0))?;
+
     let records = record_count
         .filter(|_| index_valid_start)
         .and_then(|count| xz_index_records(index_data, &mut index_cursor, count))
@@ -1376,31 +840,21 @@ fn inspect_xz(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
                 padded: 0,
             }
         });
-    d.put("index.records.unpadded_size", records.unpadded)?;
-    d.put("index.records.uncompressed_size", records.uncompressed)?;
-    d.put("index.padding", index_crc_pos.saturating_sub(index_cursor))?;
+
     if index_crc_pos + 4 <= data.len() && index_start <= index_crc_pos {
         let stored = u32_le(&data, index_crc_pos);
         let computed = crc32(&data[index_start..index_crc_pos]);
         let ok = stored == computed;
-        d.put(
-            "index.crc32",
-            format!("stored={stored};computed={};ok={ok}", computed),
-        )?;
+
         if !ok {
             damage_flags.push("xz_index_bad");
         }
     }
 
     let mut block_cursor = index_start.saturating_sub(records.padded as usize);
-    let mut block_count = 0usize;
-    let mut total_compressed = 0u64;
-    let mut total_padding = 0usize;
-    let mut first_filters = String::new();
     let check_size = xz_check_size(footer[9] & 0x0f);
-    let mut first_header = None;
     (|| {
-        for (unpadded, expected_uncompressed) in records.iter() {
+        for (unpadded, _) in records.iter() {
             if block_cursor >= index_start {
                 break;
             }
@@ -1409,93 +863,44 @@ fn inspect_xz(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
                 damage_flags.push("xz_block_header_bad");
                 break;
             }
-            let block_flags = data[block_cursor + 1];
-            let Some((declared_compressed, declared_uncompressed, filters)) =
-                xz_block_header_fields(&data[block_cursor..block_cursor + header_size - 4])
+            let Some(declared_compressed) =
+                xz_block_compressed_size(&data[block_cursor..block_cursor + header_size - 4])
             else {
                 damage_flags.push("xz_block_header_bad");
                 break;
             };
-            if first_filters.is_empty() {
-                first_filters = filters.join(",");
-            }
-            let stored_header_crc = u32_le(&data, block_cursor + header_size - 4);
-            if block_count == 0 {
-                first_header = Some((
-                    header_size,
-                    block_flags,
-                    declared_compressed
-                        .unwrap_or(unpadded.saturating_sub(header_size as u64 + check_size as u64)),
-                    declared_uncompressed.unwrap_or(expected_uncompressed),
-                    stored_header_crc,
-                    crc32(&data[block_cursor..block_cursor + header_size - 4]),
-                ));
-            }
             let compressed_size = declared_compressed
                 .unwrap_or(unpadded.saturating_sub(header_size as u64 + check_size as u64));
-            total_compressed = total_compressed.saturating_add(compressed_size);
             let unpadded_actual = header_size as u64 + compressed_size + check_size as u64;
             let padding = ((4 - unpadded_actual % 4) % 4) as usize;
-            total_padding += padding;
             block_cursor = block_cursor.saturating_add(unpadded_actual as usize + padding);
-            block_count += 1;
         }
     })();
-    if let Some((size, flags, compressed, uncompressed, stored, computed)) = first_header {
-        d.put("block.header.size", size)?;
-        d.put("block.header.flags", flags)?;
-        d.put("block.header.compressed_size", compressed)?;
-        d.put("block.header.uncompressed_size", uncompressed)?;
-        d.put(
-            "block.header.crc32",
-            format!(
-                "stored={stored};computed={computed};ok={}",
-                stored == computed
-            ),
-        )?;
-    }
-    d.put("block.header.filters", first_filters)?;
-    d.put("block.compressed_data", total_compressed)?;
-    d.put("block.padding", total_padding)?;
-    d.put(
-        "block.check",
-        format!("type={};size={check_size}", flags[1] & 0x0f),
-    )?;
-    d.put("block.sequence", block_count)?;
     let after_footer = footer_start + 12;
     let zero_padding = data[after_footer..].iter().take_while(|b| **b == 0).count();
     let aligned_padding = zero_padding - zero_padding % 4;
     // Structure analysis does not need an LZMA dictionary. The Index already
     // provides decoded sizes; payload checks remain deferred until extraction.
-    d.put("block.uncompressed_data", records.uncompressed)?;
-    let stream_count = data.windows(6).filter(|w| *w == XZ_MAGIC).count();
-    d.put("archive.stream_sequence", stream_count)?;
-    d.put("stream.padding", aligned_padding)?;
+
     let trailing = data.len().saturating_sub(after_footer + aligned_padding);
-    d.put("archive.trailing_data", trailing)?;
+    d.trailing_bytes = Some(trailing as u64);
     if trailing > 0 {
         damage_flags.push("trailing_junk");
     }
     let valid = &footer[10..12] == b"YZ" && index_valid_start;
-    d.put("plausible", valid)?;
-    d.put("confidence", if valid { "strong" } else { "medium" })?;
+    d.plausible = valid;
+
     if !valid {
-        d.put("error", "xz_structural_validation_failed")?;
+        d.error = "xz_structural_validation_failed".into();
     }
     apply_structural_contract(
         &mut d,
         reader,
         (after_footer + aligned_padding) as u64,
         StructuralStreamKind::Xz,
-        None,
         &mut damage_flags,
     )?;
-    if let Some(size) = d.get("structure.decoded_size").cloned() {
-        d.put("block.uncompressed_data", size)?;
-    }
-    d.put("damage_flags", damage_flags)?;
-    d.put("file_size", file_size)?;
-    finish_fields(&mut d, XZ_FIELDS)?;
+    d.damage_flags = damage_flags.into_iter().map(str::to_owned).collect();
     Ok(d)
 }
 
@@ -1512,21 +917,14 @@ fn zstd_field_size(flag: u8, single: bool, content_size: bool) -> usize {
     }
 }
 
-fn little_uint(data: &[u8]) -> u64 {
-    data.iter()
-        .enumerate()
-        .fold(0u64, |v, (i, b)| v | ((*b as u64) << (8 * i)))
-}
-
-fn inspect_zstd(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
+fn inspect_zstd(reader: &ManagedReader) -> std::io::Result<StreamObservation> {
     let file_size = reader.len();
     let data = (reader.read_all()).map_err(crate::io::resource_error::to_io_error)?;
-    let mut d = compression_base("zstd", ".zst", data.starts_with(ZSTD_MAGIC))?;
+    let mut d = compression_base("zstd", data.starts_with(ZSTD_MAGIC));
     let mut damage_flags = Vec::new();
-    d.put("frame.magic", hex_bytes(data.get(..4).unwrap_or(&[])))?;
+
     if data.len() < 6 || !data.starts_with(ZSTD_MAGIC) {
-        d.put("error", "zstd_magic_or_header_missing")?;
-        finish_fields(&mut d, ZSTD_FIELDS)?;
+        d.error = "zstd_magic_or_header_missing".into();
         return Ok(d);
     }
     let descriptor = data[4];
@@ -1534,24 +932,10 @@ fn inspect_zstd(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
     let single = descriptor & 0x20 != 0;
     let checksum = descriptor & 0x04 != 0;
     let dict_flag = descriptor & 0x03;
-    d.put("frame.header.descriptor", descriptor)?;
-    d.put("frame.header.content_size_flag", fcs_flag)?;
-    d.put("frame.header.single_segment_flag", single)?;
-    d.put("frame.header.checksum_flag", checksum)?;
-    d.put("frame.header.dictionary_id_flag", dict_flag)?;
+
     let mut cursor = 5usize;
     if !single {
-        let wd = data[cursor];
         cursor += 1;
-        let exponent = (wd >> 3) as u32;
-        let base = 1u64 << (10 + exponent);
-        let window = base + (base / 8) * (wd & 7) as u64;
-        d.put(
-            "frame.header.window_descriptor",
-            format!("raw={wd};window={window}"),
-        )?;
-    } else {
-        d.put("frame.header.window_descriptor", "absent(single_segment)")?;
     }
     let dict_size = match dict_flag {
         0 => 0,
@@ -1560,35 +944,12 @@ fn inspect_zstd(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
         _ => 4,
     };
     let dict_end = cursor.saturating_add(dict_size).min(data.len());
-    d.put(
-        "frame.header.dictionary_id",
-        if dict_size == 0 {
-            0
-        } else {
-            little_uint(&data[cursor..dict_end])
-        },
-    )?;
+
     cursor = dict_end;
     let fcs_size = zstd_field_size(fcs_flag, single, single || fcs_flag != 0);
     let fcs_end = cursor.saturating_add(fcs_size).min(data.len());
-    let mut content_size = little_uint(&data[cursor..fcs_end]);
-    if fcs_flag == 1 {
-        content_size += 256;
-    }
-    d.put(
-        "frame.header.content_size",
-        if fcs_size == 0 {
-            "absent".to_string()
-        } else {
-            content_size.to_string()
-        },
-    )?;
     cursor = fcs_end;
-    let mut blocks = 0usize;
-    let mut total_content = 0usize;
     let mut last = false;
-    let mut first_type = 0u8;
-    let mut first_size = 0usize;
     (|| {
         while cursor + 3 <= data.len() && !last {
             let h = data[cursor] as u32
@@ -1598,100 +959,32 @@ fn inspect_zstd(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
             last = h & 1 != 0;
             let block_type = ((h >> 1) & 3) as u8;
             let block_size = (h >> 3) as usize;
-            if blocks == 0 {
-                first_type = block_type;
-                first_size = block_size;
-            }
             let stored_size = if block_type == 1 { 1 } else { block_size };
             if block_type == 3 || cursor + stored_size > data.len() {
                 break;
             }
-            total_content += stored_size;
             cursor += stored_size;
-            blocks += 1;
         }
     })();
-    d.put("block.header.last_block", last)?;
-    d.put("block.header.type", first_type)?;
-    d.put("block.header.size", first_size)?;
-    d.put("block.content", total_content)?;
-    d.put(
-        "block.literals",
-        if first_type == 2 {
-            "compressed_block_literals_section"
-        } else {
-            "not_compressed_layout"
-        },
-    )?;
-    d.put(
-        "block.sequences",
-        if first_type == 2 {
-            "compressed_block_sequences_section"
-        } else {
-            "not_compressed_layout"
-        },
-    )?;
-    d.put(
-        "block.previous_window",
-        if dict_size > 0 {
-            "dictionary_or_previous_block"
-        } else {
-            "previous_blocks"
-        },
-    )?;
-    d.put(
-        "block.previous_entropy_tables",
-        if first_type == 2 {
-            "repeat_mode_possible"
-        } else {
-            "not_used"
-        },
-    )?;
+
     if checksum && cursor + 4 <= data.len() {
-        d.put("frame.content_checksum", u32_le(&data, cursor))?;
+
         cursor += 4;
-    } else {
-        d.put("frame.content_checksum", "absent")?;
     }
     // Inspect frame/block headers without allocating the advertised window.
-    d.put("frame.decoded_content", "not_decoded")?;
-    d.put(
-        "frame.sequence",
-        data.windows(4).filter(|w| *w == ZSTD_MAGIC).count(),
-    )?;
-    let mut skippable_count = 0usize;
-    let mut skip_size = 0usize;
-    let mut skip_data = 0usize;
-    let mut scan = 0usize;
-    (|| {
-        while scan + 8 <= data.len() {
-            let magic = u32_le(&data, scan);
-            if (0x184d2a50..=0x184d2a5f).contains(&magic) {
-                let size = u32_le(&data, scan + 4) as usize;
-                skippable_count += 1;
-                skip_size += size;
-                skip_data += size.min(data.len().saturating_sub(scan + 8));
-                scan = scan.saturating_add(8 + size);
-                continue;
-            }
-            scan += 1;
-        }
-    })();
-    d.put("skippable.magic", skippable_count)?;
-    d.put("skippable.frame_size", skip_size)?;
-    d.put("skippable.user_data", skip_data)?;
+
     let trailing = data.len().saturating_sub(cursor);
-    d.put("archive.trailing_data", trailing)?;
+    d.trailing_bytes = Some(trailing as u64);
     // The canonical walk below owns the tail: subsequent frames and skippable
     // frames are part of this logical stream, not trailing junk.
     let valid = last && descriptor & 0x08 == 0;
-    d.put("plausible", valid)?;
-    d.put("confidence", if valid { "strong" } else { "medium" })?;
+    d.plausible = valid;
+
     if descriptor & 0x08 != 0 {
-        d.put("error", "zstd_reserved_bit_set")?;
+        d.error = "zstd_reserved_bit_set".into();
         damage_flags.push("zstd_reserved_bit_set");
     } else if !valid {
-        d.put("error", "zstd_frame_validation_failed")?;
+        d.error = "zstd_frame_validation_failed".into();
         damage_flags.push(if !last {
             "probably_truncated"
         } else {
@@ -1703,11 +996,8 @@ fn inspect_zstd(reader: &ManagedReader) -> std::io::Result<DiagnosticFields> {
         reader,
         file_size,
         StructuralStreamKind::Zstd,
-        None,
         &mut damage_flags,
     )?;
-    d.put("damage_flags", damage_flags)?;
-    d.put("file_size", file_size)?;
-    finish_fields(&mut d, ZSTD_FIELDS)?;
+    d.damage_flags = damage_flags.into_iter().map(str::to_owned).collect();
     Ok(d)
 }

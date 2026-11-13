@@ -21,7 +21,9 @@ def test_doctor_validates_disabled_regex_without_disabling_runtime(package, tmp_
     doctor = package.json("doctor", code=1)
     config_check = next(row for row in doctor["items"] if row["name"] == "config")
     assert config_check["status"] == "fail"
-    assert config_check["detail"]
+    assert config_check["errors"] == validation["items"][0]["errors"]
+    assert config_check["detail"] == "; ".join(config_check["errors"])
+    assert config_check["config_path"] == str(package.data / "sunpack_config.json")
 
     source = tmp_path / "source"
     source.mkdir()

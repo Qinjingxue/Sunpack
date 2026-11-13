@@ -4,15 +4,86 @@ use crate::core::i18n::Language;
 use crate::pipeline::{Failure, FailureKind};
 use std::borrow::Cow;
 
+#[derive(Clone, Copy)]
+pub(super) enum MessageParams<'a> {
+    None,
+    Read { field: &'a str, offset: u64, requested: usize, actual: usize },
+    Process { kind: &'a str, message: &'a str },
+    Error(&'a str),
+}
+
+impl serde::Serialize for MessageParams<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let count = match self { Self::None => 0, Self::Read { .. } => 4, Self::Process { .. } => 2, Self::Error(_) => 1 };
+        let mut map = serializer.serialize_map(Some(count))?;
+        match self {
+            Self::None => {},
+            Self::Read { field, offset, requested, actual } => {
+                map.serialize_entry("field", field)?;
+                map.serialize_entry("offset", offset)?;
+                map.serialize_entry("requested", requested)?;
+                map.serialize_entry("actual", actual)?;
+            }
+            Self::Process { kind, message } => {
+                map.serialize_entry("kind", kind)?;
+                map.serialize_entry("message", message)?;
+            }
+            Self::Error(error) => map.serialize_entry("error", error)?,
+        }
+        map.end()
+    }
+}
+
+pub(super) struct Message<'a> {
+    pub key: &'static str,
+    pub params: MessageParams<'a>,
+    raw: Option<&'a str>,
+}
+
+impl<'a> Message<'a> {
+    pub(super) fn key(key: &'static str) -> Self { Self { key, params: MessageParams::None, raw: None } }
+    pub(super) fn error(key: &'static str, error: &'a str) -> Self {
+        Self { key, params: MessageParams::Error(error), raw: None }
+    }
+    pub fn render(&self, language: Language) -> Cow<'a, str> {
+        if let Some(raw) = self.raw { return raw.into(); }
+        match self.params {
+            MessageParams::None => language.text(self.key).into(),
+            MessageParams::Read { field, offset, requested, actual } => language.translate(self.key, &[
+                ("field", field), ("offset", &offset.to_string()),
+                ("requested", &requested.to_string()), ("actual", &actual.to_string()),
+            ]).into(),
+            MessageParams::Process { kind, message } => language.translate(self.key, &[
+                ("kind", kind), ("message", message),
+            ]).into(),
+            MessageParams::Error(error) => language.translate(self.key, &[("error", error)]).into(),
+        }
+    }
+}
+
 pub(super) fn message(failure: &Failure, language: Language) -> Cow<'_, str> {
-    if failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume) {
-        return language.text("failure.possible_missing_volume").into();
+    message_spec(failure, language).render(language)
+}
+
+// One key/parameter projection feeds human text and structured CLI reports.
+pub(super) fn message_spec(failure: &Failure, language: Language) -> Message<'_> {
+    describe(failure, language, true)
+}
+
+pub(super) fn original_message_spec(failure: &Failure, language: Language) -> Message<'_> {
+    describe(failure, language, false)
+}
+
+fn describe(failure: &Failure, language: Language, warning: bool) -> Message<'_> {
+    if warning && failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume) {
+        return Message::key("failure.possible_missing_volume");
     }
     if failure.kind == FailureKind::PasswordInconclusive {
-        return language.text("failure.password_state_unknown").into();
+        return Message::key("failure.password_state_unknown");
     }
     if failure.kind != FailureKind::FilesystemError && failure.is_password_retry() {
-        return language.text("failure.password_not_in_list").into();
+        return Message::key("failure.password_not_in_list");
     }
     let evidence = failure.evidence.as_deref();
     if let Some(fault) = evidence.and_then(|evidence| evidence.archive_read_fault.as_ref()) {
@@ -22,23 +93,19 @@ pub(super) fn message(failure: &Failure, language: Language) -> Cow<'_, str> {
             "failure.archive_field_read_failed"
         };
         let field_key = format!("archive.field.{}", fault.field);
-        let field = language.text(&field_key);
-        let field = if field == field_key { &fault.field } else { field };
-        return language.translate(key, &[
-            ("field", field), ("offset", &fault.offset.to_string()),
-            ("requested", &fault.requested.to_string()), ("actual", &fault.actual.to_string()),
-        ]).into();
+        let field = language.lookup(&field_key).unwrap_or(&fault.field);
+        return Message { key, raw: None, params: MessageParams::Read {
+            field, offset: fault.offset, requested: fault.requested, actual: fault.actual,
+        } };
     }
     let reason = evidence.and_then(|evidence| evidence.native_kind.as_deref());
     if failure.kind == FailureKind::ProcessError {
-        return language.translate("failure.worker_process_failed", &[
-            ("kind", reason.filter(|kind| !kind.is_empty()).unwrap_or("process_error")),
-            ("message", if failure.message.trim().is_empty() {
+        return Message { key: "failure.worker_process_failed", raw: None, params: MessageParams::Process {
+            kind: reason.filter(|kind| !kind.is_empty()).unwrap_or("process_error"),
+            message: if failure.message.trim().is_empty() {
                 "worker failed without a result"
-            } else {
-                failure.message.trim()
-            }),
-        ]).into();
+            } else { failure.message.trim() },
+        } };
     }
     let key = match reason {
         Some("missing_volume") if evidence.and_then(|e| e.stage.as_deref()) == Some("discovery") => "failure.possible_missing_volume",
@@ -52,12 +119,10 @@ pub(super) fn message(failure: &Failure, language: Language) -> Cow<'_, str> {
             FailureKind::ResourceUnavailable => "failure.out_of_memory",
             FailureKind::Cancelled => "failure.user_interrupted",
             FailureKind::PasswordInconclusive => "failure.password_state_unknown",
-            // Filesystem messages may contain specific actionable
-            // detail. Do not replace those with a generic archive diagnosis.
-            _ => return (&failure.message).into(),
+            _ => return Message { key: "", params: MessageParams::None, raw: Some(&failure.message) },
         },
     };
-    language.text(key).into()
+    Message::key(key)
 }
 
 #[cfg(test)]

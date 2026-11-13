@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod live;
+mod failures;
+mod json;
 pub(super) mod reporting;
 
 pub(super) struct Host {
@@ -119,14 +121,14 @@ const COMMANDS: &[(&str, &str)] = &[
 impl Options {
     fn parse(argv: &[String]) -> io::Result<Self> {
         let mut args: VecDeque<_> = argv.iter().map(|arg| Cow::Borrowed(arg.as_str())).collect();
-        let mut unrecognized = None;
+        let mut unrecognized = Vec::new();
         let command = loop {
             let Some(arg) = args.pop_front() else {
-                if let Some(arg) = unrecognized { return Err(invalid(format!("unrecognized argument: {arg}"))); }
+                if !unrecognized.is_empty() { return Err(parser_error("", "", "the following arguments are required: command")); }
                 return Ok(Self { help: true, ..Self::default() });
             };
             if arg == "--" {
-                break args.pop_front().ok_or_else(|| invalid("a command is required"))?;
+                break args.pop_front().ok_or_else(|| parser_error("", "", "the following arguments are required: command"))?;
             }
             if !looks_like_option(&arg) { break arg; }
             if arg.starts_with("-h") && !arg.starts_with("--") {
@@ -135,16 +137,16 @@ impl Options {
             }
             let (flag, inline) = arg.split_once('=').map_or((arg.as_ref(), None), |(f, v)| (f, Some(v)));
             if flag == "-h" || flag == "--help" {
-                if inline.is_some() { return Err(invalid(format!("{flag} does not take a value"))); }
+                if let Some(value) = inline { return Err(explicit_argument("", "", flag, value)); }
                 return Ok(Self { help: true, ..Self::default() });
             }
-            unrecognized.get_or_insert_with(|| arg.into_owned());
+            unrecognized.push(arg.into_owned());
         };
         let command = COMMANDS
             .iter()
             .find(|(name, alias)| command.as_ref() == *name || command.as_ref() == *alias)
             .map(|(name, _)| *name)
-            .ok_or_else(|| invalid(format!("invalid choice: {command}")))?;
+            .ok_or_else(|| invalid_choice("", "", "command", &command, "extract, e, watch, w, scan, s, passwords, pw, config, cfg, doctor, d, version, ver"))?;
         let mut options = Self {
             command,
             ..Self::default()
@@ -153,23 +155,22 @@ impl Options {
         let mut supplied = false;
         let mut after_action = false;
         let mut paths_closed = false;
-        let mut inherited_pause = false;
         // argparse reports unknown arguments only after processing actions;
         // a later help action may exit successfully first.
         while let Some(mut arg) = args.pop_front() {
             supplied = true;
             if arg == "--" && !positional {
-                if paths_closed { unrecognized.get_or_insert_with(|| "--".to_owned()); }
+                if paths_closed { unrecognized.push("--".to_owned()); }
                 after_action |= !options.action.is_empty();
                 positional = true;
                 continue;
             }
             if positional || !looks_like_option(&arg) {
                 if matches!(command, "watch" | "config") && options.action.is_empty() {
-                    // main restores explicitly supplied common flags after argparse's
-                    // subparser defaults. Preserve their parsed values, not raw argv
-                    // text (which may be a password or a path after `--`).
-                    inherited_pause |= options.pause;
+                    // argparse's selected subparser installs fresh common defaults.
+                    // main restores only exact raw argv flags after parsing below.
+                    options.json = false;
+                    options.verbose = false;
                     options.pause = false;
                     options.no_pause = false;
                     positional = false;
@@ -183,15 +184,30 @@ impl Options {
                         ("watch", "add" | "remove" | "startup" | "start" | "status" | "stop" | "reload" | "list" | "rebuild-log")
                         | ("config", "show" | "validate"))
                     {
-                        return Err(invalid(format!("invalid action: {action}")));
+                        return Err(invalid_choice(command, "", &format!("{command}_action"), &action, if command == "watch" { "start, add, remove, rm, list, ls, reload, rebuild-log, stop, status, st, startup" } else { "show, validate" }));
                     }
                     options.action = action;
                 } else {
                     if paths_closed {
-                        unrecognized.get_or_insert_with(|| arg.into_owned());
+                        unrecognized.push(arg.into_owned());
                         continue;
                     }
                     after_action = true;
+                    if !matches!(command, "extract" | "scan")
+                        && !(command == "watch" && matches!(options.action.as_str(), "add" | "remove" | "startup"))
+                    {
+                        unrecognized.push(arg.into_owned());
+                        continue;
+                    }
+                    if command == "watch" && options.action == "startup" {
+                        if options.paths.is_empty() && !matches!(arg.as_ref(), "enable" | "disable" | "status") {
+                            return Err(invalid_choice(command, &options.action, "action", &arg, "enable, disable, status"));
+                        }
+                        if !options.paths.is_empty() {
+                            unrecognized.push(arg.into_owned());
+                            continue;
+                        }
+                    }
                     options.paths.push(arg.into_owned());
                 }
                 continue;
@@ -220,7 +236,7 @@ impl Options {
                             .filter(|value| !looks_like_option(value))
                             .map(Cow::into_owned)
                     })
-                    .ok_or_else(|| invalid(format!("{flag} expects a value")))
+                    .ok_or_else(|| argument_error(command, &options.action, flag, "expected one argument"))
             };
             let archives = matches!(command, "extract" | "scan");
             let watch_add = command == "watch" && options.action == "add";
@@ -229,8 +245,8 @@ impl Options {
             let passwords = archives || command == "passwords";
             match flag {
                 "-h" | "--help" => {
-                    if inline.is_some() {
-                        return Err(invalid(format!("{flag} does not take a value")));
+                    if let Some(value) = inline {
+                        return Err(explicit_argument(command, &options.action, flag, value));
                     }
                     options.help = true;
                     break;
@@ -238,33 +254,37 @@ impl Options {
                 "-j" | "--json" if command != "version" => options.json = true,
                 "-v" | "--verbose" if common => options.verbose = true,
                 "--pause" if common => {
-                    if options.no_pause { return Err(invalid("--pause and --no-pause are mutually exclusive")); }
+                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
+                    if options.no_pause { return Err(argument_error(command, &options.action, "--pause", "not allowed with argument --no-pause")); }
                     options.pause = true;
                 }
                 "--no-pause" if common => {
-                    if options.pause { return Err(invalid("--pause and --no-pause are mutually exclusive")); }
+                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
+                    if options.pause { return Err(argument_error(command, &options.action, "--no-pause", "not allowed with argument --pause")); }
                     options.no_pause = true;
                 }
                 "-R" | "--recursive" if archives || watch_add => options.recursive = true,
                 "-d" | "--deep-detect" if archives || watch_add => options.deep = true,
                 "--direct" | "--direct-file" if command == "extract" => options.direct = true,
                 "-f" | "--flatten" if command == "extract" => {
-                    if options.flatten == Some(false) { return Err(invalid("--flatten and --no-flatten are mutually exclusive")); }
+                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
+                    if options.flatten == Some(false) { return Err(argument_error(command, &options.action, "-f", "not allowed with argument -F/--no-flatten")); }
                     options.flatten = Some(true)
                 }
                 "-F" | "--no-flatten" if command == "extract" => {
-                    if options.flatten == Some(true) { return Err(invalid("--flatten and --no-flatten are mutually exclusive")); }
+                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
+                    if options.flatten == Some(true) { return Err(argument_error(command, &options.action, "-F", "not allowed with argument -f/--flatten")); }
                     options.flatten = Some(false)
                 }
                 "-r" | "--recur" if command == "extract" => {
                     let value = take()?.trim().to_owned();
-                    Recursion::parse(&value)?;
+                    Recursion::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
                     options.depth = Some(value);
                     continue;
                 }
                 "-c" | "--cleanup" if command == "extract" => {
                     let value = take()?.trim().to_ascii_lowercase();
-                    CleanupMode::parse(&value)?;
+                    CleanupMode::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
                     options.cleanup = Some(value);
                     continue;
                 }
@@ -291,12 +311,12 @@ impl Options {
                     options.rule_stdin = true
                 }
                 _ => {
-                    unrecognized.get_or_insert_with(|| arg.into_owned());
+                    unrecognized.push(arg.into_owned());
                     continue;
                 }
             }
-            if inline.is_some() {
-                return Err(invalid(format!("{flag} does not take a value")));
+            if let Some(value) = inline {
+                return Err(explicit_argument(command, &options.action, flag, value));
             }
         }
         let wants_paths = match (command, options.action.as_str()) {
@@ -310,38 +330,38 @@ impl Options {
         if options.help {
             return Ok(options);
         }
-        if let Some(arg) = unrecognized {
-            return Err(invalid(format!("unrecognized argument: {arg}")));
-        }
         if options.no_pause && options.pause {
-            return Err(invalid("--pause and --no-pause are mutually exclusive"));
+            return Err(argument_error(command, &options.action, "--no-pause", "not allowed with argument --pause"));
         }
         if wants_paths && options.paths.is_empty() {
             if !supplied || (command == "watch" && !after_action) {
                 options.help = true;
             } else {
-                return Err(invalid("the following arguments are required: paths"));
+                return Err(parser_error(command, &options.action, if options.action == "startup" { "the following arguments are required: action" } else { "the following arguments are required: paths" }));
             }
-        } else if !wants_paths && !options.paths.is_empty() {
-            return Err(invalid(format!(
-                "unrecognized arguments: {}",
-                options.paths.join(" ")
-            )));
         }
         if matches!(command, "watch" | "config") && options.action.is_empty() {
             if supplied {
-                return Err(invalid("the following argument is required: action"));
+                return Err(parser_error(command, "", format!("the following arguments are required: {command}_action")));
             }
             options.help = true;
         }
-        if options.action == "startup"
-            && !options.help
-            && (options.paths.len() != 1
-                || !matches!(options.paths[0].as_str(), "enable" | "disable" | "status"))
-        {
-            return Err(invalid("startup expects enable, disable, or status"));
+        // An empty required subparser invokes help before the parent reports
+        // unknown arguments, just like _ContextArgumentParser in main.
+        if options.help { return Ok(options); }
+        if !unrecognized.is_empty() {
+            return Err(parser_error("", "", format!("unrecognized arguments: {}", unrecognized.join(" "))));
         }
-        options.pause |= inherited_pause;
+        // Deliberately match main's raw argv restoration, including option-
+        // shaped positional paths after `--`. Do not rewrite the values themselves.
+        for argument in argv {
+            match argument.as_str() {
+                "-j" | "--json" => options.json = true,
+                "-v" | "--verbose" => options.verbose = true,
+                "--pause" => options.pause = true,
+                _ => {}
+            }
+        }
         Ok(options)
     }
 }
@@ -372,12 +392,12 @@ fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: 
         let tail = &arg[index + 1..]; // recognized option letters are ASCII
         if takes_value {
             if tail.is_empty() && next.is_none_or(looks_like_option) {
-                return Err(invalid(format!("-{} expects a value", char::from(flag))));
+                return Err(argument_error(command, action, &format!("-{}", char::from(flag)), "expected one argument"));
             }
             break;
         }
         if tail.starts_with('=') || tail.starts_with('-') {
-            return Err(invalid(format!("-{} does not take a value", char::from(flag))));
+            return Err(explicit_argument(command, action, &format!("-{}", char::from(flag)), tail.strip_prefix('=').unwrap_or(tail)));
         }
     }
     Ok(())
@@ -387,6 +407,9 @@ fn looks_like_option(arg: &str) -> bool {
     let Some(value) = arg.strip_prefix('-') else {
         return false;
     };
+    // argparse's negative-number regex uses $, which also matches before one
+    // final newline. Normalize only this lexical check, never the actual value.
+    let value = value.strip_suffix('\n').filter(|value| !value.is_empty()).unwrap_or(value);
     // Numeric negative values can be passed as separate arguments, including passwords.
     !value.is_empty()
         && !arg.contains(' ')
@@ -398,6 +421,48 @@ fn looks_like_option(arg: &str) -> bool {
                     .chain(fraction.chars())
                     .all(|character| config::decimal_digit(character).is_some())
         })
+}
+
+// main suppresses usage and lets argparse report canonical parser scope.
+fn parser_error(command: &str, action: &str, message: impl std::fmt::Display) -> io::Error {
+    let mut program = String::from("sunpack");
+    if !command.is_empty() { program.push(' '); program.push_str(command); }
+    if !action.is_empty() { program.push(' '); program.push_str(action); }
+    invalid(format!("{program}: error: {message}"))
+}
+
+fn argument_name(flag: &str) -> &str {
+    match flag {
+        "-h" | "--help" => "-h/--help",
+        "-j" | "--json" => "-j/--json",
+        "-v" | "--verbose" => "-v/--verbose",
+        "-p" | "--password" => "-p/--password",
+        "-P" | "--pw-file" => "-P/--pw-file",
+        "-a" | "--ask-pw" => "-a/--ask-pw",
+        "--no-builtin-pw" | "--no-bpw" => "--no-builtin-pw/--no-bpw",
+        "-R" | "--recursive" => "-R/--recursive",
+        "-d" | "--deep-detect" => "-d/--deep-detect",
+        "-r" | "--recur" => "-r/--recur",
+        "-c" | "--cleanup" => "-c/--cleanup",
+        "-o" | "--out-dir" => "-o/--out-dir",
+        "-f" | "--flatten" => "-f/--flatten",
+        "-F" | "--no-flatten" => "-F/--no-flatten",
+        "-s" | "--start" => "-s/--start",
+        "--direct-file" | "--direct" => "--direct-file/--direct",
+        _ => flag,
+    }
+}
+
+fn argument_error(command: &str, action: &str, flag: &str, message: &str) -> io::Error {
+    parser_error(command, action, format!("argument {}: {message}", argument_name(flag)))
+}
+
+fn explicit_argument(command: &str, action: &str, flag: &str, value: &str) -> io::Error {
+    argument_error(command, action, flag, &format!("ignored explicit argument {}", password_repr(value)))
+}
+
+fn invalid_choice(command: &str, action: &str, name: &str, value: &str, choices: &str) -> io::Error {
+    argument_error(command, action, name, &format!("invalid choice: {} (choose from {choices})", password_repr(value)))
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -412,84 +477,98 @@ fn line(session: &dyn Session, stream: Stream, text: &str) -> io::Result<()> {
 }
 
 fn help(options: &Options, language: Language, session: &dyn Session) -> io::Result<()> {
-    let mut help = String::new();
-    use std::fmt::Write;
-    let mut entry = |option: &str, description: &str| {
-        writeln!(help, "  {option:<36} {}", language.text(description)).unwrap();
-    };
+    // Match main's registered argparse actions, including their order/metavars.
+    // All current labels and descriptions fit its 120-column help layout.
+    let mut positional = Vec::new();
+    let mut optional = vec![("-h/--help".to_owned(), "cli.help".to_owned())];
     if options.command.is_empty() {
         for (command, alias) in COMMANDS {
-            entry(
-                &format!("{command} ({alias})"),
-                &format!("cli.{command}.help"),
-            );
+            positional.push((format!("{command} ({alias})"), format!("cli.{command}.help")));
         }
-    } else if options.command == "watch" && options.action.is_empty() {
-        for action in [
-            "start",
-            "add",
-            "remove",
-            "list",
-            "reload",
-            "rebuild-log",
-            "stop",
-            "status",
-            "startup",
-        ] {
-            entry(action, &format!("cli.watch.{}", action.replace('-', "_")));
+    } else {
+        if options.command != "version" {
+            optional.push(("-j/--json".into(), "cli.json".into()));
         }
-    } else if options.command == "config" && options.action.is_empty() {
-        entry("show", "cli.config.show_help");
-        entry("validate", "cli.config.validate_help");
-    } else if options.command == "watch" {
-        match options.action.as_str() {
-            "add" => {
-                entry("paths", "cli.watch.paths");
-                entry("-o/--out-dir OUTPUT_DIR", "cli.watch.output_dir");
-                entry("-s/--start", "cli.watch.start_after_add");
-                entry("-R/--recursive", "cli.recursive_scan");
-                entry("-d/--deep-detect", "cli.watch.deep_detect");
-            }
-            "remove" => entry("paths", "cli.watch.paths"),
-            "start" => {
-                entry("--once", "cli.watch.once");
-                entry("--no-tray", "cli.watch.no_tray");
-            }
-            "startup" => entry("action", "cli.watch.startup_action"),
+        if matches!(options.command, "scan" | "extract" | "watch") {
+            optional.extend([
+                ("-v/--verbose".into(), "cli.verbose".into()),
+                ("--no-pause".into(), "cli.no_pause".into()),
+                ("--pause".into(), "cli.pause".into()),
+            ]);
+        }
+        if matches!(options.command, "scan" | "extract") {
+            positional.push(("paths".into(), format!("cli.{}.paths", options.command)));
+            optional.extend([
+                ("-R/--recursive".into(), "cli.recursive_scan".into()),
+                ("-d/--deep-detect".into(), "cli.deep_detect".into()),
+            ]);
+        }
+        if matches!(options.command, "scan" | "extract" | "passwords") {
+            optional.extend([
+                ("-p/--password PASSWORD".into(), "cli.password".into()),
+                ("-P/--pw-file PASSWORD_FILE".into(), "cli.password_file".into()),
+                ("-a/--ask-pw".into(), "cli.prompt_passwords".into()),
+                ("--no-builtin-pw/--no-bpw".into(), "cli.no_builtin_passwords".into()),
+            ]);
+        }
+        match options.command {
+            "extract" => optional.extend([
+                ("-r/--recur RECURSIVE_EXTRACT".into(), "cli.recursive_extract".into()),
+                ("-c/--cleanup ARCHIVE_CLEANUP_MODE".into(), "cli.archive_cleanup_mode".into()),
+                ("-o/--out-dir OUTPUT_DIR".into(), "cli.output_dir".into()),
+                ("-f/--flatten".into(), "cli.flatten".into()),
+                ("-F/--no-flatten".into(), "cli.no_flatten".into()),
+                ("--direct-file/--direct".into(), "cli.extract.direct_file".into()),
+            ]),
+            "watch" => match options.action.as_str() {
+                "" => {
+                    for (action, label) in [
+                        ("start", "start"), ("add", "add"), ("remove", "remove (rm)"),
+                        ("list", "list (ls)"), ("reload", "reload"), ("rebuild-log", "rebuild-log"),
+                        ("stop", "stop"), ("status", "status (st)"), ("startup", "startup"),
+                    ] {
+                        positional.push((label.into(), format!("cli.watch.{}", action.replace('-', "_"))));
+                    }
+                }
+                "add" => {
+                    positional.push(("paths".into(), "cli.watch.paths".into()));
+                    optional.extend([
+                        ("-o/--out-dir OUTPUT_DIR".into(), "cli.watch.output_dir".into()),
+                        ("-s/--start".into(), "cli.watch.start_after_add".into()),
+                        ("-R/--recursive".into(), "cli.recursive_scan".into()),
+                        ("-d/--deep-detect".into(), "cli.watch.deep_detect".into()),
+                    ]);
+                }
+                "remove" => positional.push(("paths".into(), "cli.watch.paths".into())),
+                "startup" => positional.push(("action".into(), "cli.watch.startup_action".into())),
+                "start" => optional.extend([
+                    ("--once".into(), "cli.watch.once".into()),
+                    ("--no-tray".into(), "cli.watch.no_tray".into()),
+                ]),
+                _ => {}
+            },
+            "config" if options.action.is_empty() => positional.extend([
+                ("show".into(), "cli.config.show_help".into()),
+                ("validate".into(), "cli.config.validate_help".into()),
+            ]),
             _ => {}
         }
-    } else if matches!(options.command, "scan" | "extract") {
-        entry("paths", &format!("cli.{}.paths", options.command));
-        entry("-R/--recursive", "cli.recursive_scan");
-        entry("-d/--deep-detect", "cli.deep_detect");
-        if options.command == "extract" {
-            entry("--direct-file/--direct", "cli.extract.direct_file");
-            entry("-o/--out-dir DIR", "cli.output_dir");
-            entry("-f/--flatten", "cli.flatten");
-            entry("-F/--no-flatten", "cli.no_flatten");
-            entry("-r/--recur ROUNDS", "cli.recursive_extract");
-            entry("-c/--cleanup MODE", "cli.archive_cleanup_mode");
+    }
+    let width = positional.iter().chain(&optional)
+        .map(|(option, _)| option.chars().count()).max().unwrap_or(0) + 2;
+    let mut help = String::new();
+    use std::fmt::Write;
+    for (heading, entries) in [("cli.positional_arguments", positional), ("cli.options", optional)] {
+        if entries.is_empty() { continue; }
+        if !help.is_empty() { help.push('\n'); }
+        writeln!(help, "{}:", language.text(heading)).unwrap();
+        for (option, description) in entries {
+            writeln!(help, "  {option:<width$}{}", language.text(&description)).unwrap();
         }
     }
-    if matches!(options.command, "scan" | "extract" | "passwords") {
-        entry("-p/--password PASSWORD", "cli.password");
-        entry("-P/--pw-file FILE", "cli.password_file");
-        entry("-a/--ask-pw", "cli.prompt_passwords");
-        entry("--no-builtin-pw/--no-bpw", "cli.no_builtin_passwords");
-    }
-    if !matches!(options.command, "" | "version") {
-        entry("-j/--json", "cli.json");
-    }
-    if matches!(options.command, "scan" | "extract" | "watch") {
-        entry("-v/--verbose", "cli.verbose");
-        entry("--no-pause", "cli.no_pause");
-        entry("--pause", "cli.pause");
-    }
-    entry("-h/--help", "cli.help");
     session.write(Stream::Out, help.as_bytes())
 }
 
-#[derive(Serialize)]
 struct CommandResult {
     command: &'static str,
     inputs: Value,
@@ -498,6 +577,8 @@ struct CommandResult {
     items: Vec<Value>,
     tasks: Vec<Value>,
     logs: Vec<String>,
+    config_order: Option<config::order::Order>,
+    emitted_errors: usize,
 }
 
 impl CommandResult {
@@ -510,7 +591,17 @@ impl CommandResult {
             items: Vec::new(),
             tasks: Vec::new(),
             logs: Vec::new(),
+            config_order: None,
+            emitted_errors: 0,
         }
+    }
+
+    fn emit_errors(&mut self, session: &dyn Session) -> io::Result<()> {
+        for error in &self.errors[self.emitted_errors..] {
+            line(session, Stream::Err, error)?;
+            self.emitted_errors += 1;
+        }
+        Ok(())
     }
 }
 
@@ -559,7 +650,7 @@ pub(super) async fn run(
     let options = match Options::parse(&args) {
         Ok(options) => options,
         Err(error) => {
-            line(session, Stream::Err, &format!("sunpack: error: {error}"))?;
+            line(session, Stream::Err, &error.to_string())?;
             return Ok(2);
         }
     };
@@ -601,7 +692,7 @@ pub(super) async fn run(
         _ => unreachable!(),
     };
     crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
-    let (code, result) = match execution {
+    let (code, mut result) = match execution {
         Ok(value) => value,
         Err(error) if is_cancellation(&error) => {
             interrupted(&options, session, language, None, Vec::new())?
@@ -622,9 +713,7 @@ pub(super) async fn run(
     if options.json {
         write_json(session, &result)?;
     } else {
-        for error in &result.errors {
-            line(session, Stream::Err, error)?;
-        }
+        result.emit_errors(session)?;
         for log in &result.logs {
             line(session, Stream::Out, log)?;
         }
@@ -633,7 +722,7 @@ pub(super) async fn run(
             && code != 130
             && (options.command != "extract" || code != 0)
         {
-            let _ = session.aread_line(language.text("cli.press_enter")).await?;
+            let _ = session.aread_line(language.text("cli.pause_prompt")).await?;
         }
     }
     session.drain().await?;
@@ -788,22 +877,6 @@ fn password_failure(archive: &ArchiveResult) -> bool {
 
 use super::failure::message as failure_message;
 
-#[derive(Serialize)]
-struct FailureReport<'a> {
-    kind: FailureKind,
-    message: std::borrow::Cow<'a, str>,
-    details: FailureDetails<'a>,
-    #[serde(skip_serializing_if = "<[crate::pipeline::Failure]>::is_empty")]
-    causes: &'a [crate::pipeline::Failure],
-}
-
-#[derive(Serialize)]
-struct FailureDetails<'a> {
-    path: &'a Path,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    promoted_nested_input: Option<bool>,
-}
-
 #[derive(Default)]
 struct ArchiveSummary {
     success: usize,
@@ -844,8 +917,12 @@ impl ArchiveSummary {
                 let invalid = failure.kind == FailureKind::InvalidInput;
                 summary.input_errors += usize::from(invalid);
                 summary.failed += usize::from(!invalid);
-                let message = failure_message(failure, language);
-                let text = format!("{}: {message}", entries[0].path.display());
+                let message = failures::carrier_message(entries, language);
+                let path = &entries[0].path;
+                let task = if invalid || entries.iter().any(|entry| entry.promoted) {
+                    path.as_os_str()
+                } else { path.file_name().unwrap_or(path.as_os_str()) };
+                let text = format!("{} [{message}]", task.to_string_lossy());
                 summary.errors.push(if json {
                     text
                 } else {
@@ -983,9 +1060,11 @@ impl Progress {
         if !interactive {
             if let Event::ResourceWait { path, state, .. } = &event {
                 if state.disk {
-                    let (status, hint) = live::wait_status(state, self.language);
+                    let (_, hint) = live::wait_status(
+                        crate::pipeline::ResourceWait { memory: false, ..*state }, self.language,
+                    );
                     let filename = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-                    let _ = line(self.session.as_ref(), Stream::Err, &format!("{filename}: {status} — {hint}"));
+                    let _ = line(self.session.as_ref(), Stream::Err, &format!("{filename}: {hint}"));
                 }
             }
         }
@@ -1553,31 +1632,8 @@ async fn archives(
                 .iter()
                 .filter(|error| error.kind == InputErrorKind::InvalidInput);
             let input_errors = invalid_inputs.clone().count() + counts.input_errors;
-            let failures = current
-                .archives
-                .iter()
-                .filter_map(|archive| {
-                    let failure = archive.failure.as_ref()?;
-                    Some(FailureReport {
-                        kind: failure.kind,
-                        message: failure_message(failure, language),
-                        causes: &failure.causes,
-                        details: FailureDetails {
-                            path: &archive.path,
-                            promoted_nested_input: archive.promoted.then_some(true),
-                        },
-                    })
-                })
-                .chain(invalid_inputs.map(|error| FailureReport {
-                    kind: FailureKind::InvalidInput,
-                    message: (&error.message).into(),
-                    causes: &[],
-                    details: FailureDetails {
-                        path: &error.path,
-                        promoted_nested_input: None,
-                    },
-                }))
-                .collect::<Vec<_>>();
+            let mut failures = failures::collect(&current.archives, language);
+            failures.extend(invalid_inputs.map(failures::Report::invalid));
             result.tasks.push(json!({
                 "success_count": counts.success, "failed_count": counts.failed,
                 "input_error_count": input_errors, "scan_error_count": scan_errors,
@@ -1664,7 +1720,6 @@ async fn archives(
     }
     crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
     let counts = ArchiveSummary::collect(all_archives.values(), language, options.json);
-    result.errors = counts.errors;
     let scan_errors = all_errors
         .values()
         .filter(|error| error.kind == InputErrorKind::FilesystemScan)
@@ -1675,12 +1730,12 @@ async fn archives(
         .filter(|error| error.kind == InputErrorKind::InvalidInput)
         .count()
         + counts.input_errors;
-    result.errors.extend(
-        all_errors
-            .values()
-            .filter(|error| error.kind != InputErrorKind::Cleanup)
-            .map(|error| input_error_message(error, language, options.json)),
-    );
+    // main emits scan failures before discovered target failures.
+    for kind in [InputErrorKind::FilesystemScan, InputErrorKind::InvalidInput] {
+        result.errors.extend(all_errors.values().filter(|error| error.kind == kind)
+            .map(|error| input_error_message(error, language, options.json)));
+    }
+    result.errors.extend(counts.errors);
     if !options.json && scan_errors != 0 {
         result
             .errors
@@ -1693,25 +1748,11 @@ async fn archives(
         });
         result.summary = json!({
             "success_count": counts.success, "failed_count": counts.failed, "scan_error_count": scan_errors,
-            "scan_failures": all_errors.values().filter(|error| error.kind == InputErrorKind::FilesystemScan).collect::<Vec<_>>(),
+            "scan_failures": all_errors.values().filter(|error| error.kind == InputErrorKind::FilesystemScan).map(|error| failures::Report::filesystem_scan(error, language)).collect::<Vec<_>>(),
             "input_error_count": input_errors, "processed_count": counts.processed,
             "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
             "password_retry_count": retries, "cleanup_results": cleanup.values().collect::<Vec<_>>(),
         });
-        let failure_details: Vec<_> = all_archives
-            .values()
-            .filter_map(|entry| {
-                let failure = entry.failure.as_ref()?;
-                failure.evidence.as_ref()?;
-                Some(
-                    json!({"path": entry.path, "depth": entry.depth, "offset": entry.offset,
-                "end_offset": entry.end_offset, "partial": entry.partial, "failure": failure}),
-                )
-            })
-            .collect();
-        if !failure_details.is_empty() {
-            result.summary["failure_details"] = Value::Array(failure_details);
-        }
         result.items.push(password_item(
             &user,
             &clipboard,
@@ -1809,6 +1850,7 @@ async fn archives(
                 )?;
             }
         }
+        result.emit_errors(session)?;
         if counts.partial > 0 && result.errors.is_empty() {
             line(
                 session,
@@ -1912,27 +1954,9 @@ fn report_scan(
             };
             let show_parts =
                 plan.is_none() && (entry.source_paths.len() > 1 || completeness.is_some());
-            if let Some(failure) = &entry.failure {
-                let text = format!("{}: {}", entry.path.display(), failure_message(failure, language));
-                if options.json {
-                    result.errors.push(text);
-                } else if !(password_failure(entry) && entry.password.is_none())
-                    && !(failure.kind == FailureKind::MissingVolume
-                        && entry.volume_completeness.as_deref() == Some("missing"))
-                {
-                    let error =
-                        language.translate("cli.scan.error", &[("error", &failure_message(failure, language))]);
-                    let text = if embedded {
-                        format!(
-                            "{}: [{}, {}): {error}",
-                            entry.path.display(),
-                            entry.offset,
-                            end_offset(entry)
-                        )
-                    } else {
-                        format!("{}: {error}", entry.path.display())
-                    };
-                    line(session, Stream::Err, &text)?;
+            if options.json {
+                if let Some(failure) = &entry.failure {
+                    result.errors.push(format!("{}: {}", entry.path.display(), failure_message(failure, language)));
                 }
             }
             if options.json {
@@ -1942,15 +1966,10 @@ fn report_scan(
                     entry.format,
                     entry.offset
                 );
-                let mut item =
-                    json!({"main_path": entry.path, "format": entry.format, "input_id": input_id});
+                let mut item = json!({"main_path": entry.path, "input_id": input_id});
                 let obj = item.as_object_mut().unwrap();
-                if let Some(failure) = entry
-                    .failure
-                    .as_ref()
-                    .filter(|failure| failure.evidence.is_some())
-                {
-                    obj.insert("failure".into(), json!(failure));
+                if !entry.format.is_empty() {
+                    obj.insert("format".into(), json!(entry.format));
                 }
                 if embedded {
                     obj.insert("offset".into(), json!(entry.offset));
@@ -1969,7 +1988,7 @@ fn report_scan(
                 }
                 if options.verbose {
                     obj.insert("discovery_source".into(), json!(entry.discovery_source));
-                    if let Some(flags) = &entry.damage_flags {
+                    if let Some(flags) = entry.damage_flags.as_ref().filter(|flags| !flags.is_empty()) {
                         obj.insert("damage_flags".into(), json!(flags));
                     }
                 }
@@ -2007,8 +2026,27 @@ fn report_scan(
                     );
                     line(session, Stream::Out, &format!("{prefix}{text}"))?;
                 }
-                let format = language.translate("cli.scan.format", &[("format", &entry.format)]);
-                line(session, Stream::Out, &format!("{prefix}{format}"))?;
+                if let Some(failure) = &entry.failure {
+                    if !(password_failure(entry) && entry.password.is_none())
+                        && !(failure.kind == FailureKind::MissingVolume
+                            && entry.volume_completeness.as_deref() == Some("missing"))
+                    {
+                        let error = language.translate("cli.scan.error", &[
+                            ("error", &failure_message(failure, language)),
+                        ]);
+                        let text = if embedded {
+                            format!("{}: [{}, {}): {error}",
+                                entry.path.display(), entry.offset, end_offset(entry))
+                        } else {
+                            format!("{}: {error}", entry.path.display())
+                        };
+                        line(session, Stream::Err, &text)?;
+                    }
+                }
+                if !entry.format.is_empty() {
+                    let format = language.translate("cli.scan.format", &[("format", &entry.format)]);
+                    line(session, Stream::Out, &format!("{prefix}{format}"))?;
+                }
                 if let Some(plan) = plan {
                     report_volume_plan(plan, prefix, language, session)?;
                 } else if show_parts {
@@ -2049,7 +2087,7 @@ fn report_scan(
                     };
                     let text = language.translate("cli.scan.source", &[("source", source)]);
                     line(session, Stream::Out, &format!("{prefix}{text}"))?;
-                    if let Some(flags) = &entry.damage_flags {
+                    if let Some(flags) = entry.damage_flags.as_ref().filter(|flags| !flags.is_empty()) {
                         let text =
                             language.translate("cli.scan.damage", &[("flags", &flags.join(", "))]);
                         line(session, Stream::Out, &format!("{prefix}{text}"))?;
@@ -2326,13 +2364,22 @@ async fn show_config(
         return Ok((0, result));
     }
     crate::pipeline::stage("cli", &Cancellation::new()).await?;
-    let (path, payload) = config::load_raw(cwd)?;
+    let (path, payload, order) = if options.action == "show" {
+        let (path, payload, order) = config::load_raw_ordered(cwd)?;
+        (path, payload, Some(order))
+    } else {
+        let (path, payload) = config::load_raw(cwd)?;
+        (path, payload, None)
+    };
     result.summary = json!({"config_path": path, "changed": false});
     let errors = match Config::parse(&payload) {
         Ok(_) if options.action == "show" => {
             // The persistent runtime validates configuration before dispatch,
             // even when show returns the original, unnormalized document.
-            if !options.json { write_json(session, &payload)?; }
+            if !options.json {
+                write_json(session, &config::order::Ordered(&payload, order.as_ref().unwrap()))?;
+            }
+            result.config_order = order;
             result.items.push(payload);
             return Ok((0, result));
         }
@@ -2604,34 +2651,6 @@ mod option_tests {
     use super::*;
 
     #[test]
-    fn extract_failure_report_keeps_nested_archive_causes() {
-        use crate::pipeline::Failure;
-        for kind in [FailureKind::PasswordRequired, FailureKind::MissingVolume] {
-            let archive = Failure::new(kind, "archive blocked");
-            let promotion = Failure::new(FailureKind::FilesystemError, "promotion denied")
-                .with_cause(Some(archive));
-            let failure = Failure::new(FailureKind::FilesystemError, "postprocess failed")
-                .with_cause(Some(promotion));
-            let report = FailureReport {
-                kind: failure.kind,
-                message: failure_message(&failure, Language::En),
-                causes: &failure.causes,
-                details: FailureDetails { path: Path::new("nested.zip"), promoted_nested_input: None },
-            };
-            let json = serde_json::to_value(report).unwrap();
-            assert_eq!(json["kind"], "filesystem_error");
-            assert_eq!(json["message"], "postprocess failed");
-            assert_eq!(json["causes"][0]["message"], "promotion denied");
-            assert_eq!(json["causes"][0]["causes"][0]["kind"], serde_json::to_value(kind).unwrap());
-        }
-        let invalid = FailureReport {
-            kind: FailureKind::InvalidInput, message: "invalid input".into(), causes: &[],
-            details: FailureDetails { path: Path::new("missing.zip"), promoted_nested_input: None },
-        };
-        assert!(serde_json::to_value(invalid).unwrap().get("causes").is_none());
-    }
-
-    #[test]
     fn password_display_escapes_controls_without_changing_candidates() {
         assert_eq!(password_repr("a\t\0\n\r\\z"), "'a\\t\\x00\\n\\r\\\\z'");
         assert_eq!(password_repr("can't"), "\"can't\"");
@@ -2658,7 +2677,24 @@ mod option_tests {
         assert!(parse(&["watch", "--json", "status"]).unwrap().json);
         assert!(parse(&["watch", "--verbose", "status"]).unwrap().verbose);
         assert!(parse(&["config", "-j", "show"]).unwrap().json);
-        assert!(!parse(&["extract", "--", "--json"]).unwrap().json);
+        let value = parse(&["extract", "--", "--json", "--verbose", "--pause"]).unwrap();
+        assert!(value.json && value.verbose && value.pause);
+        assert_eq!(value.paths, ["--json", "--verbose", "--pause"]);
+        // Only exact argv tokens restore flags. Attached passwords remain data.
+        for password in ["--json", "-j", "--verbose", "-v", "--pause"] {
+            let token = format!("--password={password}");
+            let value = parse(&["extract", &token, "a.zip"]).unwrap();
+            assert_eq!(value.passwords[0].as_ref(), password);
+            assert!(!value.json && !value.verbose && !value.pause);
+        }
+        let value = parse(&["watch", "-jv", "status"]).unwrap();
+        assert!(!value.json && !value.verbose);
+        let value = parse(&["watch", "-j", "-v", "status"]).unwrap();
+        assert!(value.json && value.verbose);
+        let value = parse(&["watch", "-jv", "status", "-j"]).unwrap();
+        assert!(value.json && !value.verbose);
+        let value = parse(&["watch", "--pause", "start", "--no-pause"]).unwrap();
+        assert!(value.pause && value.no_pause);
         let value = parse(&["extract", "--pw-file=", "--out-dir=", "a.zip"]).unwrap();
         assert!(value.password_file.is_none());
         assert!(value.output.is_none());
@@ -2689,11 +2725,13 @@ mod option_tests {
         assert!(value.verbose);
         assert_eq!(value.passwords.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), ["secret", "-.5", "-with space"]);
         assert_eq!(value.paths, ["--no-b"]);
-        for password in ["-１２３", "-١٢٣", "-१२३", "-.１２", "-١.٢"] {
+        for password in ["-１２３", "-١٢٣", "-१२३", "-.１２", "-١.٢", "-1\n", "-.1\n", "-１２\n"] {
             let value = parse(&["passwords", "--no-bpw", "--password", password, "--json"]).unwrap();
             assert_eq!(value.passwords[0].as_ref(), password);
         }
-        assert!(parse(&["passwords", "--password", "-²"]).is_err());
+        for password in ["-²", "-\n", "-1\n\n", "-1\r\n"] {
+            assert!(parse(&["passwords", "--password", password]).is_err());
+        }
         assert_eq!(parse(&["extract", "a.zip", "--", "-b.zip"]).unwrap().paths, ["a.zip", "-b.zip"]);
         let value = parse(&["watch", "--json", "--", "start", "--once"]).unwrap();
         assert!(value.once);
@@ -2717,6 +2755,9 @@ mod option_tests {
             vec!["watch", "--once", "start", "--help"],
             vec!["watch", "start", "--unknown", "--help"],
             vec!["watch", "--help", "invalid"],
+            vec!["--unknown", "extract"],
+            vec!["watch", "--unknown", "add"],
+            vec!["--unknown", "watch"],
         ] { assert!(parse(&args).unwrap().help, "{args:?}"); }
         for args in [
             vec!["extract", "--password", "--help"],
@@ -2746,9 +2787,11 @@ mod recursive_prompt_tests {
         answers: Mutex<VecDeque<String>>,
         stdout: Mutex<Vec<u8>>,
         stderr: Mutex<Vec<u8>>,
+        combined: Mutex<Vec<u8>>,
     }
     impl Session for Input {
         fn write(&self, stream: Stream, bytes: &[u8]) -> io::Result<()> {
+            self.combined.lock().unwrap().extend_from_slice(bytes);
             match stream {
                 Stream::Out => self.stdout.lock().unwrap().extend_from_slice(bytes),
                 Stream::Err => self.stderr.lock().unwrap().extend_from_slice(bytes),
@@ -2765,6 +2808,94 @@ mod recursive_prompt_tests {
         fn input_is_terminal(&self) -> bool { false }
         fn unicode(&self) -> bool { !self.ascii }
         fn terminal_size(&self) -> (usize, usize) { (80, 25) }
+    }
+
+    // Covers localized help grouping and the noninteractive disk warning, which
+    // final archive-tree tests cannot observe.
+    #[test]
+    fn help_sections_and_disk_wait_text_match_main() {
+        for language in [Language::En, Language::Zh] {
+            let snapshots: Value = serde_json::from_str(include_str!("../../../../tests/data/cli_help_main.json")).unwrap();
+            let pages = snapshots[if language == Language::En { "en" } else { "zh" }].as_object().unwrap();
+            for (command, expected) in pages {
+                let input = Input::default();
+                let mut arguments: Vec<_> = command.split_whitespace().map(str::to_owned).collect();
+                arguments.push("--help".into());
+                let options = Options::parse(&arguments).unwrap();
+                help(&options, language, &input).unwrap();
+                let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
+                assert_eq!(text, expected.as_str().unwrap(), "{language:?} {command}");
+            }
+            for volume_error in [None, Some(5)] {
+                let input = Arc::new(Input::default());
+                let progress = Progress {
+                    session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+                    cancel: Cancellation::new(), language,
+                    display: Mutex::default(), reporting: reporting::Reports::default(),
+                    branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+                };
+                progress.notify(Event::ResourceWait {
+                    id: 1, path: "input.zip".into(),
+                    state: crate::pipeline::ResourceWait { disk: true, memory: true, volume_error },
+                });
+                progress.flush_events();
+                let text = String::from_utf8(input.stderr.lock().unwrap().clone()).unwrap();
+                let hint = match volume_error {
+                    Some(error) => language.translate("report.status.disk_unavailable", &[("error", &error.to_string())]),
+                    None => language.text("report.status.disk_resume_hint").into(),
+                };
+                assert_eq!(text, format!("input.zip: {hint}\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn parser_errors_match_main_text_stream_and_exit_code() {
+        // Captured by executing main's real parser classes, registrations and
+        // value converters. Usage is suppressed; diagnostics remain on stderr.
+        let cases: &[(&[&str], &str)] = &[
+            (&["extract", "x", "-p"], "sunpack extract: error: argument -p/--password: expected one argument\n"),
+            (&["e", "x", "--password"], "sunpack extract: error: argument -p/--password: expected one argument\n"),
+            (&["passwords", "--json=x"], "sunpack passwords: error: argument -j/--json: ignored explicit argument 'x'\n"),
+            (&["scan", "x", "--pause", "--no-pause"], "sunpack scan: error: argument --no-pause: not allowed with argument --pause\n"),
+            (&["extract", "x", "-F", "-f"], "sunpack extract: error: argument -f/--flatten: not allowed with argument -F/--no-flatten\n"),
+            (&["extract", "x", "--foo", "--bar"], "sunpack: error: unrecognized arguments: --foo --bar\n"),
+            (&["nonsense"], "sunpack: error: argument command: invalid choice: 'nonsense' (choose from extract, e, watch, w, scan, s, passwords, pw, config, cfg, doctor, d, version, ver)\n"),
+            (&["watch", "nonsense"], "sunpack watch: error: argument watch_action: invalid choice: 'nonsense' (choose from start, add, remove, rm, list, ls, reload, rebuild-log, stop, status, st, startup)\n"),
+            (&["config", "nonsense"], "sunpack config: error: argument config_action: invalid choice: 'nonsense' (choose from show, validate)\n"),
+            (&["watch", "--json"], "sunpack watch: error: the following arguments are required: watch_action\n"),
+            (&["config", "--json"], "sunpack config: error: the following arguments are required: config_action\n"),
+            (&["watch", "startup", "nonsense"], "sunpack watch startup: error: argument action: invalid choice: 'nonsense' (choose from enable, disable, status)\n"),
+            (&["watch", "startup", "enable", "disable"], "sunpack: error: unrecognized arguments: disable\n"),
+            (&["scan", "-j"], "sunpack scan: error: the following arguments are required: paths\n"),
+            (&["--foo"], "sunpack: error: the following arguments are required: command\n"),
+            (&["--"], "sunpack: error: the following arguments are required: command\n"),
+            (&["version", "-h=x"], "sunpack version: error: argument -h/--help: ignored explicit argument 'x'\n"),
+            (&["extract", "x", "-h=x"], "sunpack extract: error: argument -h/--help: ignored explicit argument 'x'\n"),
+            (&["scan", "x", "-jp"], "sunpack scan: error: argument -p/--password: expected one argument\n"),
+            (&["scan", "x", "-junknown"], "sunpack: error: unrecognized arguments: -unknown\n"),
+            (&["extract", "x", "-r", "0"], "sunpack extract: error: argument -r/--recur: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
+            (&["extract", "x", "--recur=bad"], "sunpack extract: error: argument -r/--recur: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
+            (&["extract", "x", "-c", "bad"], "sunpack extract: error: argument -c/--cleanup: archive_cleanup_mode must be one of: d, r, k\n"),
+            (&["scan", "x", "-j=thing"], "sunpack scan: error: argument -j/--json: ignored explicit argument 'thing'\n"),
+            (&["watch", "rm", "--pause", "--no-pause"], "sunpack watch remove: error: argument --no-pause: not allowed with argument --pause\n"),
+            (&["watch", "--foo", "nonsense"], "sunpack watch: error: argument watch_action: invalid choice: 'nonsense' (choose from start, add, remove, rm, list, ls, reload, rebuild-log, stop, status, st, startup)\n"),
+            (&["extract", "--foo"], "sunpack extract: error: the following arguments are required: paths\n"),
+            (&["extract", "--foo", "--bar"], "sunpack extract: error: the following arguments are required: paths\n"),
+            (&["--foo", "scan", "x", "--bar"], "sunpack: error: unrecognized arguments: --foo --bar\n"),
+            (&["watch", "startup", "--json"], "sunpack watch startup: error: the following arguments are required: action\n"),
+            (&["watch", "startup", "bad", "--help"], "sunpack watch startup: error: argument action: invalid choice: 'bad' (choose from enable, disable, status)\n"),
+        ];
+        let host = Host::new();
+        for &(args, expected) in cases {
+            let input = Arc::new(Input::default());
+            let code = run_console(&host, Path::new("."),
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+                input.clone(), Cancellation::new()).unwrap();
+            assert_eq!(code, 2, "{args:?}");
+            assert!(input.stdout.lock().unwrap().is_empty(), "{args:?}");
+            assert_eq!(&*input.stderr.lock().unwrap(), expected.as_bytes(), "{args:?}");
+        }
     }
 
     #[test]
@@ -2908,16 +3039,70 @@ mod recursive_prompt_tests {
             assert!(text.find("child.zip").unwrap() < text.find(&segment).unwrap(), "{text}");
             assert!(text.find(&segment).unwrap() < text.find("\nother.zip\n").unwrap(), "{text}");
             let options = Options::parse(&["scan".into(), "carrier.bin".into()]).unwrap();
+            input.combined.lock().unwrap().clear();
             let mut outcome = Outcome::default();
             outcome.archives = archives;
             report_scan(outcome, vec![], &options, input.as_ref(), Language::En).unwrap();
             let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
+            let combined = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
+            let segment = Language::En.translate("cli.scan.segment", &[("index", "2")]);
+            let error = Language::En.translate("cli.scan.error", &[("error", Language::En.text("failure.damaged"))]);
+            assert!(combined.find(&segment).unwrap() < combined.find(&error).unwrap(), "{combined}");
             let format = Language::En.translate("cli.scan.format", &[("format", "zip")]);
             for last in [false, true] {
                 let (_, continuation) = tree_edge(!ascii, last);
                 assert!(text.lines().any(|line| line == format!("{continuation}  {format}")), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn final_failure_summary_uses_main_names_and_emits_errors_once() {
+        let mut archive = report_archive("C:/inputs/blocked.zip", 0);
+        archive.failure = Some(crate::pipeline::Failure::new(FailureKind::Damaged, "native detail"));
+        let summary = ArchiveSummary::collect([&archive], Language::En, true);
+        assert_eq!(summary.errors, [format!("blocked.zip [{}]", Language::En.text("failure.damaged"))]);
+        archive.promoted = true;
+        let summary = ArchiveSummary::collect([&archive], Language::En, true);
+        assert_eq!(summary.errors, [format!("C:/inputs/blocked.zip [{}]", Language::En.text("failure.damaged"))]);
+        archive.promoted = false;
+        let mut sibling = report_archive("C:/inputs/blocked.zip", 10);
+        sibling.failure = Some(crate::pipeline::Failure::new(FailureKind::WrongPassword, "native password"));
+        let summary = ArchiveSummary::collect([&archive, &sibling], Language::En, false);
+        let message = format!("blocked.zip [{}]", Language::En.text("failure.embedded_extract_failed"));
+        assert_eq!(summary.errors, [Language::En.translate("report.failed", &[("task", &message)])]);
+        let input = Input::default();
+        let mut result = CommandResult::new("extract");
+        result.errors = summary.errors;
+        result.emit_errors(&input).unwrap();
+        line(&input, Stream::Out, &"-".repeat(54)).unwrap();
+        result.emit_errors(&input).unwrap();
+        let text = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, format!("{}\n{}\n", result.errors[0], "-".repeat(54)));
+        assert!(!serde_json::to_value(&result).unwrap().as_object().unwrap().contains_key("emitted_errors"));
+    }
+
+    #[test]
+    fn scan_json_keeps_main_sparse_fields_without_internal_failure_evidence() {
+        let options = Options::parse(&["scan".into(), "--json".into(), "-v".into(), "input.bin".into()]).unwrap();
+        let mut archive = report_archive("input.bin", 0);
+        archive.format.clear();
+        archive.damage_flags = Some(vec![]);
+        let mut failure = crate::pipeline::Failure::new(FailureKind::Damaged, "damage");
+        failure.evidence = Some(Box::new(crate::pipeline::FailureEvidence {
+            stage: Some("item_extract".into()), ..Default::default()
+        }));
+        archive.failure = Some(failure);
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive);
+        let (_, report) = report_scan(outcome, vec![], &options, &Input::default(), Language::En).unwrap();
+        let item = &report.items[0];
+        assert!(item.get("format").is_none());
+        assert!(item.get("damage_flags").is_none());
+        assert!(item.get("failure").is_none());
+        assert_eq!(item["error_kind"], "damaged");
+        assert_eq!(item["error"], Language::En.text("failure.damaged"));
+        assert_eq!(item["discovery_source"], "direct");
     }
 
     // Rendering must not consume a native call frame per nesting level. The

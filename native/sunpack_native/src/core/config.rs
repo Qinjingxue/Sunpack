@@ -1,3 +1,4 @@
+pub(crate) mod order;
 use super::{i18n::Language, resources};
 use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
 use crate::scan::path_filter::{NativePathRule, RuleEntry};
@@ -383,24 +384,42 @@ impl Layers {
     }
 
     fn parse(&self) -> io::Result<Value> {
-        let mut value = match self
+        self.parse_ordered(false).map(|(value, _)| value)
+    }
+
+    fn parse_ordered(&self, capture: bool) -> io::Result<(Value, order::Order)> {
+        let parse = |text: &str, path: &Path| -> io::Result<(Value, order::Order)> {
+            if !capture { return parse_json(text, path).map(|value| (value, order::Order::Scalar)); }
+            let order::Captured(value, order) = serde_json::from_str(text)
+                .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
+            if !value.is_object() {
+                return Err(invalid(format!("Config file must contain a JSON object: {}", path.display())));
+            }
+            Ok((value, order))
+        };
+        let (mut value, mut order) = match self
             .sources
             .advanced
             .as_deref()
             .zip(self.advanced.as_deref())
         {
-            Some((path, text)) => parse_json(text, path)?,
-            None => Value::Object(Map::new()),
+            Some((path, text)) => parse(text, path)?,
+            None => (Value::Object(Map::new()), order::Order::Object(Vec::new())),
         };
         if let Some((path, text)) = self.sources.simple.as_deref().zip(self.simple.as_deref()) {
-            merge(&mut value, parse_json(text, path)?, false);
+            let (layer, layer_order) = parse(text, path)?;
+            if capture { order.merge(layer_order, false); }
+            merge(&mut value, layer, false);
         }
         if let Some(text) = self.overrides.as_deref() {
-            let layer = match self.sources.override_file.as_deref() {
-                Some(path) => parse_json(text, path)?,
-                None => serde_json::from_str(text).map_err(|error| {
-                    invalid(format!("{OVERRIDES} must be an inline JSON object or an existing JSON file: {error}"))
-                })?,
+            let (layer, layer_order) = match self.sources.override_file.as_deref() {
+                Some(path) => parse(text, path)?,
+                None => {
+                    let parsed: Result<_, serde_json::Error> = if capture {
+                        serde_json::from_str::<order::Captured>(text).map(|order::Captured(value, order)| (value, order))
+                    } else { serde_json::from_str(text).map(|value| (value, order::Order::Scalar)) };
+                    parsed.map_err(|error| invalid(format!("{OVERRIDES} must be an inline JSON object or an existing JSON file: {error}")))?
+                }
             };
             let object = layer
                 .as_object()
@@ -416,9 +435,10 @@ impl Layers {
                     unknown.join(", ")
                 )));
             }
+            if capture { order.merge(layer_order, false); }
             merge(&mut value, layer, false);
         }
-        Ok(value)
+        Ok((value, order))
     }
 }
 
@@ -426,6 +446,12 @@ pub fn load_raw(cwd: &Path) -> io::Result<(PathBuf, Value)> {
     let layers = Layers::read(resolve_sources(cwd))?;
     let value = layers.parse()?;
     Ok((layers.sources.primary().to_path_buf(), value))
+}
+
+pub(crate) fn load_raw_ordered(cwd: &Path) -> io::Result<(PathBuf, Value, order::Order)> {
+    let layers = Layers::read(resolve_sources(cwd))?;
+    let (value, order) = layers.parse_ordered(true)?;
+    Ok((layers.sources.primary().to_path_buf(), value, order))
 }
 
 struct Generation {
