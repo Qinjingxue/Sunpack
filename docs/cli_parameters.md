@@ -42,7 +42,7 @@ These options apply to `extract` and `scan`:
 | `--pause` | Wait for a key press before exiting. |
 | `--no-pause` | Do not pause after the command finishes. |
 
-`extract` and `scan` use high process priority while any foreground archive request is active. When the last foreground request finishes, the shared runtime and native worker return to the configured `runtime.process_mode`. Watch cache cleanup still uses `watch.runtime_cache_cleanup_idle_seconds` independently.
+`extract` and `scan` use high process priority while any foreground archive request is active. After the last foreground request finishes, an active Watch retains foreground priority until its idle deadline; without Watch, the shared runtime and native worker immediately return to the configured `runtime.process_mode`. Watch cache cleanup follows `watch.runtime_cache_cleanup_idle_seconds`.
 
 `passwords` supports only `--json` plus the password input options; `config` supports `--json`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
 
@@ -50,7 +50,7 @@ For `extract` and `scan`, normal text goes to stdout and errors go to stderr. `[
 
 JSON `summary.scan_error_count` counts filesystem scan errors, including errors whose individual details were omitted. Filesystem scan diagnostics retain at most 100 records per report, plus one total omission summary; the existing 20-detail limit per directory also applies. Above the report budget, only the omitted count is accumulated, without retaining each path or error identity. Archive task results remain available independently of this diagnostic budget.
 
-When the native worker supplies archive failure evidence, `extract --json` lists it by logical archive in `summary.failure_details`; `scan --json` includes it in the corresponding `items[].failure`. The `evidence` can include the failure stage, missing volume name, last read location, and a recovery preview of up to 50 files. `recovery.omitted_files` counts files outside the preview. Per-file bytes describe the worker's write attempts; `summary.recovered_outputs` identifies the outputs retained by extraction.
+`extract --json` reports archive and input failures in `tasks[].failures`. `scan --json` reports a logical archive error as `items[].error` and `items[].error_kind`; it does not expose the internal worker evidence or recovery preview. Scan fields are sparse: byte ranges appear for range inputs or embedded extents, and volume fields only for actual volume layouts or confirmed missing volumes. Internal unknown completeness is omitted; unresolved volume attempt plans use `pending` (or `missing` when confirmed). Retained extraction outputs are listed in `summary.recovered_outputs`.
 
 For `extract`, `summary.failed_count` and each attempt's `failed_count` count archive processing failures. `input_error_count` separately counts invalid inputs, such as a directory passed to `--direct-file`; these use `[Input error]` in text output. Attempts also include `scan_error_count` and `input_error_count`. Bounded filesystem diagnostic details are stored once in `summary.scan_failures`; each attempt's `failures` contains archive and input failures. Classification uses structured failure kinds and target results. All error categories remain in `errors` and cause a nonzero exit code, even when other archives succeed.
 

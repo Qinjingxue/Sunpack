@@ -415,6 +415,8 @@ pub enum CleanupStatus {
 
 #[derive(Debug, Serialize)]
 pub struct ArchiveResult {
+    #[serde(skip)]
+    pub(crate) scan_layout: ScanLayout,
     pub path: PathBuf,
     pub format: String,
     pub output: Option<PathBuf>,
@@ -438,6 +440,36 @@ pub struct ArchiveResult {
     pub recovered_complete_files: u64,
     pub promoted: bool,
     pub promotion_original_path: Option<PathBuf>,
+}
+
+/// Sparse presentation facts retained while the canonical input is available.
+/// Extraction diagnostics keep their original completeness independently.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ScanLayout {
+    pub(crate) range: bool,
+    pub(crate) volumes: bool,
+}
+
+impl ScanLayout {
+    pub(crate) fn from_input(input: &crate::io::archive_state::ArchiveInput) -> Self {
+        use crate::io::archive_state::{AnalysisOrigin, OpenMode};
+        let extent = input.physical_extents().next();
+        Self {
+            range: extent.is_some_and(|extent| extent.start != 0
+                || matches!(input.mode, OpenMode::FileRange | OpenMode::ConcatRanges)
+                || extent.end.is_some() && input.analysis.origin == AnalysisOrigin::Embedded),
+            volumes: !input.volume_style.is_empty() || input.mode.structured(),
+        }
+    }
+
+    pub(crate) fn volumes<'a>(self, result: &'a ArchiveResult) -> (bool, Option<&'a str>) {
+        let completeness = result.volume_completeness.as_deref();
+        if result.volume_attempts.is_some() {
+            return (false, Some(if completeness == Some("missing") { "missing" } else { "pending" }));
+        }
+        let show = self.volumes || result.source_paths.len() > 1 || completeness == Some("missing");
+        (show, completeness.filter(|value| show && matches!(*value, "complete" | "missing")))
+    }
 }
 
 /// Runtime disposition of one physical input. Carrier segments retain their
@@ -766,6 +798,10 @@ pub(crate) trait Observer: Send + Sync {
     fn worker_updates(&self) -> WorkerUpdates {
         WorkerUpdates::All
     }
+
+    // Publish logical roots after discovery, before any root can complete.
+    // Admitted physical aliases are not necessarily independent tasks.
+    fn roots_planned<'a>(&self, _paths: impl Iterator<Item = &'a str>) {}
 
     // The default keeps the caller's aggregate result. Watch transfers a
     // settled root to its ordinary completion queue without cloning receipts.

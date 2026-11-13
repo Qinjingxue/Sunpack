@@ -323,6 +323,7 @@ fn push_text(output: &mut Vec<u8>, value: &str) {
 struct State {
     groups: VecDeque<Group>,
     completed: VecDeque<Completed>,
+    published: VecDeque<(Completed, Option<PathBuf>)>,
     dirty: bool,
     stopping: bool,
     clear: bool,
@@ -343,6 +344,7 @@ struct Group {
     totals: Totals,
     summary: Summary,
     report: Arc<Mutex<ReportDraft>>,
+    cancellation: Cancellation,
 }
 
 // Match main's bounded per-request warning lines; completed batches never
@@ -378,6 +380,14 @@ struct Completed {
     elapsed: Duration,
     summary: Summary,
     report: Arc<Mutex<ReportDraft>>,
+    cancellation: Cancellation,
+}
+
+impl Completed {
+    fn needs_report(&self) -> bool {
+        !self.summary.report_failed && (self.summary.failed != 0
+            || (self.summary.rollback_failed && self.summary.succeeded != 0))
+    }
 }
 
 #[derive(Default)]
@@ -471,6 +481,7 @@ impl Group {
             totals: Totals::default(),
             summary: Summary::default(),
             report: Arc::default(),
+            cancellation: Cancellation::new(),
         }
     }
 
@@ -664,6 +675,7 @@ impl State {
                     elapsed: now.saturating_duration_since(group.began),
                     summary: group.summary.clone(),
                     report: Arc::clone(&group.report),
+                    cancellation: group.cancellation.clone(),
                 });
                 changed = true;
                 break;
@@ -825,6 +837,20 @@ struct Shared {
 }
 
 impl Shared {
+    fn discard_batches(&self) {
+        let (groups, completed, published) = {
+            let mut state = self.state.lock().unwrap();
+            (std::mem::take(&mut state.groups), std::mem::take(&mut state.completed),
+                std::mem::take(&mut state.published))
+        };
+        // Unpresented reports are invalid, like main's detached finalize result.
+        // File removal and draft destruction must never hold the state gate.
+        for (_, report) in published {
+            if let Some(path) = report { let _ = fs::remove_file(path); }
+        }
+        drop((groups, completed));
+    }
+
     fn present(&self, batch: &str, show: impl FnOnce()) -> bool {
         let state = self.state.lock().unwrap();
         if state.stopping || state.groups.front().is_none_or(|group| group.id.as_ref() != batch) {
@@ -875,6 +901,37 @@ pub(super) struct Activity {
 }
 
 impl Publisher {
+    // Report copies and retention enumeration use the existing shared I/O
+    // admission, never the sole native presenter thread.
+    fn publish(&self, engine: &crate::pipeline::Engine, completed: Completed) -> crate::pipeline::RequestHandle<()> {
+        let reports = Arc::clone(&self.reports);
+        let shared = Arc::clone(&self.shared);
+        let cancel = completed.cancellation.clone();
+        engine.spawn_control(crate::pipeline::Origin::Watch, &cancel.clone(), async move {
+            let result = async {
+                crate::pipeline::stage("watch_failure_report", &cancel).await?;
+                reports.publish(&completed, &shared)
+            }.await;
+            let report = match result {
+                Ok(report) => report,
+                Err(error) => {
+                    if !cancel.cancelled() {
+                        eprintln!("SunPack toast failure report: {error}");
+                    }
+                    None
+                }
+            };
+            let mut state = shared.state.lock().unwrap();
+            if state.stopping || !state.groups.iter().any(|group| group.id == completed.id) {
+                drop(state);
+                if let Some(path) = report { let _ = fs::remove_file(path); }
+            } else {
+                state.published.push_back((completed, report));
+                shared.changed.notify_one();
+            }
+        })
+    }
+
     fn register(&self, request: Arc<str>, language: Language) -> Activity {
         let mut state = self.shared.state.lock().unwrap();
         if state.stopping {
@@ -894,13 +951,14 @@ impl Publisher {
     fn reset_batches(&self) {
         let retired = {
             let mut state = self.shared.state.lock().unwrap();
+            for group in &state.groups { group.cancellation.cancel(); }
             let retired = (std::mem::take(&mut state.groups), std::mem::take(&mut state.completed));
             state.clear = true;
             self.mark_dirty(&mut state);
             retired
         };
-        // Old activities can no longer publish; release their report drafts
-        // outside the state gate. In-flight presenter copies fail the same gate.
+        // Old activities can no longer publish; active report copies observe
+        // the batch cancellation and completed copies fail the presentation gate.
         drop(retired);
     }
 
@@ -914,6 +972,8 @@ impl Publisher {
         else {
             return Vec::new();
         };
+        // Stopping extraction keeps this batch valid: earlier failures still
+        // need their final report. Only reset/disable invalidates report I/O.
         group.stopping = true;
         group.generation = group.generation.wrapping_add(1);
         group.finalize_at = None;
@@ -1315,11 +1375,11 @@ impl Reports {
     }
 
     fn publish(&self, completed: &Completed, shared: &Shared) -> io::Result<Option<PathBuf>> {
-        if completed.summary.report_failed { return Ok(None); }
+        if !completed.needs_report() { return Ok(None); }
         let draft = completed.report.lock().unwrap();
         self.cancellation.check_io()?;
-        let summary = &completed.summary;
-        if draft.poisoned || !(summary.failed != 0 || (summary.rollback_failed && summary.succeeded != 0)) {
+        completed.cancellation.check_io()?;
+        if draft.poisoned {
             return Ok(None);
         }
         let now = SystemTime::now();
@@ -1339,14 +1399,14 @@ impl Reports {
             &output.with_extension("tmp"),
             &output,
             [title, "\n", &generated, "\n", &summary, "\n\n"],
-            &self.cancellation,
+            &completed.cancellation,
         )?;
         drop(draft);
-        self.trim(now, shared);
+        self.trim(now, shared, &completed.cancellation);
         Ok(Some(output))
     }
 
-    fn trim(&self, now: SystemTime, shared: &Shared) {
+    fn trim(&self, now: SystemTime, shared: &Shared, cancellation: &Cancellation) {
         let age = Duration::from_secs(
             self.retention
                 .load(Ordering::Relaxed)
@@ -1357,7 +1417,7 @@ impl Reports {
             return;
         };
         for entry in entries.flatten() {
-            if self.cancellation.cancelled() {
+            if cancellation.cancelled() {
                 break;
             }
             let name = entry.file_name();
@@ -1428,6 +1488,7 @@ pub(super) struct Toast {
 impl Toast {
     pub(super) fn start(
         cwd: &Path,
+        engine: Arc<crate::pipeline::Engine>,
         diagnostic: PathBuf,
         retention: u64,
         report_error: impl Fn(&'static str, &io::Error) + Send + 'static,
@@ -1478,11 +1539,15 @@ impl Toast {
                         if std::mem::take(&mut state.clear) {
                             break Display::Clear;
                         }
+                        if let Some((completed, report)) = state.published.pop_front() {
+                            break Display::Published(completed, report);
+                        }
                         if let Some(completed) = state.completed.pop_front() {
                             if state.completed.capacity() > 256 {
                                 crate::collections::trim_deque(&mut state.completed);
                             }
-                            break Display::Completed(completed);
+                            break if completed.needs_report() { Display::Completed(completed) }
+                                else { Display::Published(completed, None) };
                         }
                         if state.dirty {
                             let group = state.groups.front().filter(|group| group.visible);
@@ -1523,26 +1588,16 @@ impl Toast {
                         if let Some(error) = error { report_error("toast_error", &error); }
                         continue;
                     }
-                    let mut published_report = None;
-                    let mut completion = None;
-                    let snapshot = match display {
-                        Display::Clear => unreachable!(),
-                        Display::Progress(snapshot) => snapshot,
-                        Display::Completed(completed) => {
-                            let report =
-                                match presenter_reports.publish(&completed, &presenter_shared) {
-                                    Ok(report) => report,
-                                    Err(error) => {
-                                        if !presenter_reports.cancellation.cancelled() {
-                                            eprintln!("SunPack toast failure report: {error}");
-                                        }
-                                        None
-                                    }
-                                };
-                            published_report = report.clone();
-                            let snapshot = Snapshot::completed(&completed, report);
-                            completion = Some(completed);
-                            snapshot
+                    if let Display::Completed(completed) = display {
+                        Publisher { shared: Arc::clone(&presenter_shared), reports: Arc::clone(&presenter_reports) }
+                            .publish(&engine, completed);
+                        continue;
+                    }
+                    let (snapshot, completion, published_report) = match display {
+                        Display::Clear | Display::Completed(_) => unreachable!(),
+                        Display::Progress(snapshot) => (snapshot, None, None),
+                        Display::Published(completed, report) => {
+                            (Snapshot::completed(&completed, report.clone()), Some(completed), report)
                         }
                     };
                     let payload = snapshot.encode();
@@ -1574,19 +1629,19 @@ impl Toast {
                         continue;
                     }
                     if !available {
-                        presenter_shared.state.lock().unwrap().stopping = true;
+                        {
+                            let mut state = presenter_shared.state.lock().unwrap();
+                            state.stopping = true;
+                            for group in &state.groups { group.cancellation.cancel(); }
+                        }
                         presenter_reports.cancellation.cancel();
                         break;
                     }
                     last_update = Some(Instant::now());
                 }
-                let drafts = {
-                    let mut state = presenter_shared.state.lock().unwrap();
-                    (std::mem::take(&mut state.groups), std::mem::take(&mut state.completed))
-                };
-                // The presenter thread owns filesystem cleanup, even while
-                // disabled activities are still held by extraction workers.
-                drop(drafts);
+                // Drain queued publications too: Activities may keep Shared
+                // alive after the presenter exits, but cannot own stale files.
+                presenter_shared.discard_batches();
             })?;
         match receive.recv().map_err(io::Error::other)? {
             Ok(()) => Ok(Self {
@@ -1624,11 +1679,16 @@ enum Display {
     Clear,
     Progress(Snapshot),
     Completed(Completed),
+    Published(Completed, Option<PathBuf>),
 }
 
 impl Drop for Toast {
     fn drop(&mut self) {
-        self.publisher.shared.state.lock().unwrap().stopping = true;
+        {
+            let mut state = self.publisher.shared.state.lock().unwrap();
+            state.stopping = true;
+            for group in &state.groups { group.cancellation.cancel(); }
+        }
         self.publisher.reports.cancellation.cancel();
         self.publisher.shared.changed.notify_one();
         // The worker owns presenter and draft cleanup. An already accepted
@@ -1727,6 +1787,8 @@ mod tests {
         let snapshot = Snapshot::progress(&group);
         assert_eq!(snapshot.progress, None);
         assert_eq!(snapshot.value, Language::En.text("toast.progress.indeterminate"));
+        // Stopping extraction keeps this batch valid: earlier failures still
+        // need their final report. Only reset/disable invalidates report I/O.
         group.stopping = true;
         let snapshot = Snapshot::progress(&group);
         assert_eq!(snapshot.body, Language::En.text("interrupt.stopping"));
@@ -1747,7 +1809,7 @@ mod tests {
         }
         let mut completed = Completed {
             generation: 0, id: Arc::from("presentation"), language: Language::En,
-            elapsed: Duration::ZERO, report: Arc::default(),
+            elapsed: Duration::ZERO, report: Arc::default(), cancellation: Cancellation::new(),
             summary: Summary { succeeded: 1, interrupted: 1, rollback_failed: true,
                 ..Summary::default() },
         };
@@ -1913,7 +1975,7 @@ mod tests {
             volume_attempts: None, source_paths: Vec::new(), password: None,
             discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
             partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None,
+            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
         }
     }
 
@@ -2306,7 +2368,7 @@ mod tests {
         let completed = Completed {
             generation: 0,
             id: Arc::from("81"), language: Language::En, elapsed: Duration::ZERO,
-            summary: Summary { failed: 3, ..Summary::default() }, report: draft,
+            summary: Summary { failed: 3, ..Summary::default() }, report: draft, cancellation: Cancellation::new(),
         };
         assert!(publisher.reports.publish(&completed, &publisher.shared).unwrap().is_none());
         drop(completed);
@@ -2327,7 +2389,7 @@ mod tests {
         let completed = Completed {
             generation: 0,
             id: Arc::from("81"), language: Language::En, elapsed: Duration::ZERO,
-            summary: Summary { failed: 1, ..Summary::default() }, report: draft,
+            summary: Summary { failed: 1, ..Summary::default() }, report: draft, cancellation: Cancellation::new(),
         };
         let (entered, ready) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -2397,6 +2459,99 @@ mod tests {
             assert_eq!(group.summary.failed, 0);
             assert!(group.report.lock().unwrap().path.is_none());
         }
+    }
+
+    #[test]
+    fn presenter_shutdown_discards_queued_report_and_draft_with_live_activity() {
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let activity = publisher.register(Arc::from("01"), Language::En);
+        activity.event(queued(1, "failed.zip", None, 0));
+        let failure = Err(io::Error::other("failure"));
+        activity.record(Path::new("failed.zip"), &failure, false, one_root);
+        activity.finish(&failure, false, false, one_root);
+        finish_debounce(&publisher);
+        let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+        let draft_path = completed.report.lock().unwrap().path.clone().unwrap();
+        let engine = crate::pipeline::Engine::new(PathBuf::new());
+        publisher.publish(&engine, completed).join().unwrap();
+        let report_path = publisher.shared.state.lock().unwrap().published.front()
+            .unwrap().1.clone().unwrap();
+        assert!(report_path.exists());
+        assert!(draft_path.exists());
+        // Both disable and unrecoverable presenter failure exit through this
+        // cleanup, while extraction observers may still retain the Activity.
+        publisher.shared.state.lock().unwrap().stopping = true;
+        publisher.shared.discard_batches();
+        assert!(!report_path.exists());
+        assert!(!draft_path.exists());
+        let state = activity.publisher.shared.state.lock().unwrap();
+        assert!(state.groups.is_empty());
+        assert!(state.completed.is_empty());
+        assert!(state.published.is_empty());
+    }
+
+    #[test]
+    fn stopping_remaining_work_preserves_the_batch_failure_report() {
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let failed = publisher.register(Arc::from("01"), Language::En);
+        let running = publisher.register(Arc::from("02"), Language::En);
+        failed.event(queued(1, "failed.zip", None, 0));
+        running.event(queued(2, "running.zip", None, 0));
+        let failure = Err(io::Error::other("archive failure before user stop"));
+        failed.record(Path::new("failed.zip"), &failure, false, one_root);
+        failed.finish(&failure, false, false, one_root);
+        let batch = current(&publisher).batch;
+        assert_eq!(publisher.stop_group(&batch), vec![Arc::<str>::from("02")]);
+        running.finish(&Ok(Outcome::default()), true, false, one_root);
+        finish_debounce(&publisher);
+        let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+        assert_eq!(completed.summary.failed, 1);
+        assert_eq!(completed.summary.interrupted, 1);
+        assert!(!completed.cancellation.cancelled());
+        let engine = crate::pipeline::Engine::new(PathBuf::new());
+        publisher.publish(&engine, completed).join().unwrap();
+        let (completed, report) = publisher.shared.state.lock().unwrap().published.pop_front().unwrap();
+        let report = report.expect("stopping must retain previous failures");
+        assert!(fs::read_to_string(&report).unwrap().contains("archive failure before user stop"));
+        assert!(Snapshot::completed(&completed, Some(report)).report_action.is_some());
+        assert!(publisher.shared.present_completed(&completed, || {}));
+    }
+
+    #[test]
+    fn report_publication_does_not_block_progress_and_reset_cancels_its_io() {
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let first = publisher.register(Arc::from("01"), Language::En);
+        first.event(queued(1, "first.zip", None, 0));
+        let failure = Err(io::Error::other("first failure"));
+        first.record(Path::new("first.zip"), &failure, false, one_root);
+        first.finish(&failure, false, false, one_root);
+        finish_debounce(&publisher);
+        let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+        let cancel = completed.cancellation.clone();
+        let draft = Arc::clone(&completed.report);
+        // Hold the actual report I/O gate, not a timed large-file simulation.
+        // Dispatch and progress must remain usable until this gate is released.
+        let held = draft.lock().unwrap();
+        let engine = crate::pipeline::Engine::new(PathBuf::new());
+        let publication = publisher.publish(&engine, completed);
+        let next = publisher.register(Arc::from("02"), Language::En);
+        next.event(queued(2, "next.zip", None, 0));
+        progress(&next, 2, "next.zip", 1, 2);
+        let snapshot = current(&publisher);
+        assert!(publisher.shared.present(&snapshot.batch, || {}));
+        assert!(!cancel.cancelled());
+        publisher.reset_batches();
+        assert!(cancel.cancelled());
+        assert!(publisher.shared.state.lock().unwrap().clear);
+        drop(held);
+        publication.join().unwrap();
+        assert!(publisher.shared.state.lock().unwrap().published.is_empty());
+        assert!(fs::read_dir(&directory.0).unwrap().flatten().all(|entry| {
+            !entry.file_name().to_string_lossy().starts_with("failed-")
+        }));
     }
 
     #[test]

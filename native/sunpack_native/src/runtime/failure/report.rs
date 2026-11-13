@@ -441,7 +441,7 @@ mod tests {
             volume_attempts: None, source_paths: vec![], password: None,
             discovery_source: DiscoverySource::Embedded, damage_flags: None,
             partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None,
+            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
         }).collect();
         let reports = serde_json::to_value(collect(&archives, Language::En)).unwrap();
         assert_eq!(reports.as_array().unwrap().len(), 1);
@@ -485,7 +485,7 @@ mod tests {
             volume_attempts: None, source_paths: vec![], password: None,
             discovery_source: DiscoverySource::Embedded, damage_flags: None,
             partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None,
+            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
         }];
         let reports = serde_json::to_value(collect(&archives, Language::En)).unwrap();
         assert_eq!(reports[0]["kind"], "missing_volume");

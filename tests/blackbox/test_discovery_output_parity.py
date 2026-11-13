@@ -1,10 +1,13 @@
 """Physical discovery errors and final output namespace parity."""
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 import io
 import subprocess
+import time
 import zipfile
 
+import psutil
 import pytest
 
 
@@ -182,3 +185,92 @@ def test_recursive_file_targets_share_embedded_relation_candidates(
                           "-o", recovered, head)
     assert report["summary"]["success_count"] == 1
     assert next(recovered.rglob(payload.name)).read_bytes() == content
+
+
+def _nested_mixed_carrier(package, tmp_path, *, recursive_child=False):
+    # Unlike a successful segment containing a blocked child, this carrier's
+    # own sibling segment fails. Promotion must settle the carrier itself.
+    (tmp_path / "secret.txt").write_bytes(b"secret")
+    locked = tmp_path / "locked.zip"
+    subprocess.run([str(package.tools / "7z.exe"), "a", "-tzip", "-mem=AES256", "-punknown",
+                    str(locked), "secret.txt"], cwd=tmp_path, check=True, capture_output=True)
+    ordinary = io.BytesIO()
+    with zipfile.ZipFile(ordinary, "w") as archive:
+        if recursive_child:
+            child = io.BytesIO()
+            with zipfile.ZipFile(child, "w") as nested:
+                nested.writestr("hello.txt", b"independent success")
+            archive.writestr("next.zip", child.getvalue())
+        else:
+            archive.writestr("hello.txt", b"independent success")
+    carrier = b"prefix" + locked.read_bytes() + b"between" + ordinary.getvalue() + b"tail"
+    outer = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer, "w") as archive:
+        archive.writestr("keep.txt", b"prevent outer flatten")
+        archive.writestr("carrier.bin", carrier)
+    return outer, carrier
+
+
+def test_nested_mixed_carrier_promotes_before_flattening_successful_segment(package, tmp_path):
+    outer, carrier = _nested_mixed_carrier(package, tmp_path)
+    output = tmp_path / "out"
+    package.configure(post_extract={"flatten_single_directory": True}, recursive_authorization={"enabled": False})
+    report = package.json("extract", "-d", "-r", "*", "-c", "k", "--no-builtin-pw", "-o", output, outer, code=1)
+    assert (output / "outer" / "carrier" / "hello.txt").read_bytes() == b"independent success", report
+    assert (output / "outer" / "keep.txt").is_file()
+    assert (tmp_path / "carrier.bin").read_bytes() == carrier
+    assert outer.is_file()
+
+
+def test_nested_mixed_carrier_survives_cancel_during_successful_sibling_recursion(package, tmp_path):
+    outer, carrier = _nested_mixed_carrier(package, tmp_path, recursive_child=True)
+    output = tmp_path / "out"
+    package.configure(recursive_authorization={"enabled": False},
+                      post_extract={"flatten_single_directory": True})
+
+    def wait_for_round(stream, number):
+        marker = f"[CLI] Round {number} finished. Continue recursive extraction? (y/n): "
+        tail = ""
+        while character := stream.read(1):
+            tail = (tail + character)[-len(marker):]
+            if tail == marker:
+                return True
+        return False
+
+    command = [str(package.launcher), "extract", "-d", "-r", "?", "-c", "k",
+               "--no-builtin-pw", "--no-pause", "-o", str(output), str(outer)]
+    with ThreadPoolExecutor(max_workers=1) as reader, subprocess.Popen(
+        command, cwd=package.data, env=package.env, encoding="utf-8",
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ) as process:
+        try:
+            for depth in (1, 2):
+                assert reader.submit(wait_for_round, process.stdout, depth).result(timeout=60)
+                process.stdin.write("y\n")
+                process.stdin.flush()
+            # The depth-three archive has now actually extracted its payload.
+            # Its ordinary recursion prompt holds the request before ancestor
+            # commits, without sleeps, huge archives, or production test hooks.
+            assert reader.submit(wait_for_round, process.stdout, 3).result(timeout=60)
+            assert list(output.rglob("hello.txt"))
+            state, = package.data.glob("runtime-*.state")
+            owner = psutil.Process(int(state.read_text(encoding="utf-8").splitlines()[3]))
+            # Kill only the CLI client. The existing IPC disconnect path cancels
+            # its request in the still-running host and performs normal rollback.
+            process.kill()
+            process.wait(timeout=30)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
+
+    deadline = time.monotonic() + 30
+    while (output / "outer").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not (output / "outer").exists(), "cancelled request did not roll back its uncommitted output"
+    assert outer.is_file()
+    assert (tmp_path / "carrier.bin").read_bytes() == carrier
+    # A successful second connection proves this was request cancellation, not
+    # runtime process death (which would test a different recovery boundary).
+    assert owner.is_running()
+    assert package.json("config", "show")["items"]

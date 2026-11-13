@@ -29,7 +29,8 @@ def _wait_for_blocker(events, source, previous_completion=0):
     pytest.fail("Semantic reload did not retry the unchanged missing-volume blocker")
 
 
-def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_path):
+@pytest.mark.parametrize("policy", ["config", "root_output"])
+def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_path, policy):
     # This verifies the lifecycle admission boundary, not partial acceptance:
     # the absent middle volume still prevents extraction under either policy.
     # A new durable blocker completion proves a second attempt. Diagnostic
@@ -54,7 +55,12 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
     package.json("watch", "start", "--no-tray")
     events = package.data / ".sunpack_watch" / "events.json"
     completion = _wait_for_blocker(events, parts[0])
-    package.configure(extraction={"content_requirement": "allow_partial"})
+    if policy == "config":
+        package.configure(extraction={"content_requirement": "allow_partial"})
+    else:
+        # No Config change and no input event: root policy alone must run
+        # the same recovery lifecycle as main's scheduler restart.
+        package.json("watch", "add", watched, "-o", tmp_path / "new-output")
     package.json("watch", "reload")
     _wait_for_blocker(events, parts[0], completion)
     assert package.json("watch", "stop")["summary"]["stopped"]

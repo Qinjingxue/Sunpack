@@ -195,6 +195,89 @@ const COMMANDS: &[(&str, &str)] = &[
     ("version", "ver"),
 ];
 
+// One declaration drives aliases, arity, parser scope, diagnostics and help.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptionId {
+    Help, Json, Verbose, NoPause, Pause, Recursive, Deep, Password, PasswordFile,
+    AskPassword, NoBuiltins, Recur, Cleanup, Output, Flatten, NoFlatten, Direct,
+    Once, NoTray, Start, RuleStdin,
+}
+
+#[derive(Clone, Copy)]
+enum OptionScope {
+    Any, Json, Common, ArchiveOrAdd, Passwords, Extract, ExtractOrAdd,
+    WatchStart, WatchAdd, Validate,
+}
+
+impl OptionScope {
+    fn accepts(self, command: &str, action: &str) -> bool {
+        let archives = matches!(command, "extract" | "scan");
+        let add = command == "watch" && action == "add";
+        match self {
+            Self::Any => true,
+            Self::Json => !command.is_empty() && command != "version",
+            Self::Common => archives || command == "watch",
+            Self::ArchiveOrAdd => archives || add,
+            Self::Passwords => archives || command == "passwords",
+            Self::Extract => command == "extract",
+            Self::ExtractOrAdd => command == "extract" || add,
+            Self::WatchStart => command == "watch" && action == "start",
+            Self::WatchAdd => add,
+            Self::Validate => command == "config" && action == "validate",
+        }
+    }
+}
+
+struct OptionSpec {
+    id: OptionId,
+    names: &'static str,
+    metavar: &'static str,
+    scope: OptionScope,
+    help: &'static str,
+    watch_help: &'static str,
+    watch_order: usize,
+}
+
+impl OptionSpec {
+    fn takes_value(&self) -> bool { !self.metavar.is_empty() }
+    fn matches(&self, flag: &str) -> bool { self.names.split('/').any(|name| name == flag) }
+}
+
+const OPTION_SPECS: &[OptionSpec] = &[
+    OptionSpec { id: OptionId::Help, names: "-h/--help", metavar: "", scope: OptionScope::Any, help: "cli.help", watch_help: "cli.help", watch_order: 0 },
+    OptionSpec { id: OptionId::Json, names: "-j/--json", metavar: "", scope: OptionScope::Json, help: "cli.json", watch_help: "cli.json", watch_order: 1 },
+    OptionSpec { id: OptionId::Verbose, names: "-v/--verbose", metavar: "", scope: OptionScope::Common, help: "cli.verbose", watch_help: "cli.verbose", watch_order: 2 },
+    OptionSpec { id: OptionId::NoPause, names: "--no-pause", metavar: "", scope: OptionScope::Common, help: "cli.no_pause", watch_help: "cli.no_pause", watch_order: 3 },
+    OptionSpec { id: OptionId::Pause, names: "--pause", metavar: "", scope: OptionScope::Common, help: "cli.pause", watch_help: "cli.pause", watch_order: 4 },
+    OptionSpec { id: OptionId::Recursive, names: "-R/--recursive", metavar: "", scope: OptionScope::ArchiveOrAdd, help: "cli.recursive_scan", watch_help: "cli.recursive_scan", watch_order: 8 },
+    OptionSpec { id: OptionId::Deep, names: "-d/--deep-detect", metavar: "", scope: OptionScope::ArchiveOrAdd, help: "cli.deep_detect", watch_help: "cli.watch.deep_detect", watch_order: 9 },
+    OptionSpec { id: OptionId::Password, names: "-p/--password", metavar: "PASSWORD", scope: OptionScope::Passwords, help: "cli.password", watch_help: "cli.password", watch_order: 7 },
+    OptionSpec { id: OptionId::PasswordFile, names: "-P/--pw-file", metavar: "PASSWORD_FILE", scope: OptionScope::Passwords, help: "cli.password_file", watch_help: "cli.password_file", watch_order: 8 },
+    OptionSpec { id: OptionId::AskPassword, names: "-a/--ask-pw", metavar: "", scope: OptionScope::Passwords, help: "cli.prompt_passwords", watch_help: "cli.prompt_passwords", watch_order: 9 },
+    OptionSpec { id: OptionId::NoBuiltins, names: "--no-builtin-pw/--no-bpw", metavar: "", scope: OptionScope::Passwords, help: "cli.no_builtin_passwords", watch_help: "cli.no_builtin_passwords", watch_order: 10 },
+    OptionSpec { id: OptionId::Recur, names: "-r/--recur", metavar: "RECURSIVE_EXTRACT", scope: OptionScope::Extract, help: "cli.recursive_extract", watch_help: "cli.recursive_extract", watch_order: 11 },
+    OptionSpec { id: OptionId::Cleanup, names: "-c/--cleanup", metavar: "ARCHIVE_CLEANUP_MODE", scope: OptionScope::Extract, help: "cli.archive_cleanup_mode", watch_help: "cli.archive_cleanup_mode", watch_order: 12 },
+    OptionSpec { id: OptionId::Output, names: "-o/--out-dir", metavar: "OUTPUT_DIR", scope: OptionScope::ExtractOrAdd, help: "cli.output_dir", watch_help: "cli.watch.output_dir", watch_order: 6 },
+    OptionSpec { id: OptionId::Flatten, names: "-f/--flatten", metavar: "", scope: OptionScope::Extract, help: "cli.flatten", watch_help: "cli.flatten", watch_order: 14 },
+    OptionSpec { id: OptionId::NoFlatten, names: "-F/--no-flatten", metavar: "", scope: OptionScope::Extract, help: "cli.no_flatten", watch_help: "cli.no_flatten", watch_order: 15 },
+    OptionSpec { id: OptionId::Direct, names: "--direct-file/--direct", metavar: "", scope: OptionScope::Extract, help: "cli.extract.direct_file", watch_help: "cli.extract.direct_file", watch_order: 16 },
+    OptionSpec { id: OptionId::Once, names: "--once", metavar: "", scope: OptionScope::WatchStart, help: "cli.watch.once", watch_help: "cli.watch.once", watch_order: 17 },
+    OptionSpec { id: OptionId::NoTray, names: "--no-tray", metavar: "", scope: OptionScope::WatchStart, help: "cli.watch.no_tray", watch_help: "cli.watch.no_tray", watch_order: 18 },
+    OptionSpec { id: OptionId::Start, names: "-s/--start", metavar: "", scope: OptionScope::WatchAdd, help: "cli.watch.start_after_add", watch_help: "cli.watch.start_after_add", watch_order: 7 },
+    OptionSpec { id: OptionId::RuleStdin, names: "--scan-rule-stdin", metavar: "", scope: OptionScope::Validate, help: "", watch_help: "", watch_order: 20 },
+];
+
+fn option_spec(flag: &str) -> Option<&'static OptionSpec> {
+    OPTION_SPECS.iter().find(|spec| spec.matches(flag))
+}
+
+fn short_option(letter: u8) -> Option<&'static OptionSpec> {
+    OPTION_SPECS.iter().find(|spec| spec.names.split('/').any(|name| {
+        let bytes = name.as_bytes();
+        bytes.len() == 2 && bytes[0] == b'-' && bytes[1] == letter
+    }))
+}
+
 impl Options {
     fn parse(argv: &[String]) -> io::Result<Self> {
         let mut args: VecDeque<_> = argv.iter().map(|arg| Cow::Borrowed(arg.as_str())).collect();
@@ -292,11 +375,12 @@ impl Options {
             paths_closed |= !options.paths.is_empty();
             validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), command, &options.action)?;
             if !arg.starts_with("--") && arg.len() > 2 && arg.as_bytes()[1].is_ascii() {
-                if b"pPocr".contains(&arg.as_bytes()[1]) {
+                let short = short_option(arg.as_bytes()[1]);
+                if short.is_some_and(OptionSpec::takes_value) {
                     if arg.as_bytes()[2] != b'=' {
                         arg.to_mut().insert(2, '=');
                     }
-                } else if b"jvRdfFash".contains(&arg.as_bytes()[1]) {
+                } else if short.is_some() {
                     args.push_front(Cow::Owned(format!("-{}", &arg[2..])));
                     arg = Cow::Owned(arg[..2].to_owned());
                 }
@@ -315,76 +399,72 @@ impl Options {
                     })
                     .ok_or_else(|| argument_error(command, &options.action, flag, "expected one argument"))
             };
-            let archives = matches!(command, "extract" | "scan");
-            let watch_add = command == "watch" && options.action == "add";
-            let watch_start = command == "watch" && options.action == "start";
-            let common = archives || command == "watch";
-            let passwords = archives || command == "passwords";
-            match flag {
-                "-h" | "--help" => {
+            let selected = option_spec(flag).filter(|spec| spec.scope.accepts(command, &options.action));
+            match selected.map(|spec| spec.id) {
+                Some(OptionId::Help) => {
                     if let Some(value) = inline {
                         return Err(explicit_argument(command, &options.action, flag, value));
                     }
                     options.help = true;
                     break;
                 }
-                "-j" | "--json" if command != "version" => options.json = true,
-                "-v" | "--verbose" if common => options.verbose = true,
-                "--pause" if common => {
+                Some(OptionId::Json) => options.json = true,
+                Some(OptionId::Verbose) => options.verbose = true,
+                Some(OptionId::Pause) => {
                     if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.no_pause { return Err(argument_error(command, &options.action, "--pause", "not allowed with argument --no-pause")); }
                     options.pause = true;
                 }
-                "--no-pause" if common => {
+                Some(OptionId::NoPause) => {
                     if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.pause { return Err(argument_error(command, &options.action, "--no-pause", "not allowed with argument --pause")); }
                     options.no_pause = true;
                 }
-                "-R" | "--recursive" if archives || watch_add => options.recursive = true,
-                "-d" | "--deep-detect" if archives || watch_add => options.deep = true,
-                "--direct" | "--direct-file" if command == "extract" => options.direct = true,
-                "-f" | "--flatten" if command == "extract" => {
+                Some(OptionId::Recursive) => options.recursive = true,
+                Some(OptionId::Deep) => options.deep = true,
+                Some(OptionId::Direct) => options.direct = true,
+                Some(OptionId::Flatten) => {
                     if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.flatten == Some(false) { return Err(argument_error(command, &options.action, "-f", "not allowed with argument -F/--no-flatten")); }
                     options.flatten = Some(true)
                 }
-                "-F" | "--no-flatten" if command == "extract" => {
+                Some(OptionId::NoFlatten) => {
                     if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.flatten == Some(true) { return Err(argument_error(command, &options.action, "-F", "not allowed with argument -f/--flatten")); }
                     options.flatten = Some(false)
                 }
-                "-r" | "--recur" if command == "extract" => {
+                Some(OptionId::Recur) => {
                     let value = take()?.trim().to_owned();
                     Recursion::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
                     options.depth = Some(value);
                     continue;
                 }
-                "-c" | "--cleanup" if command == "extract" => {
+                Some(OptionId::Cleanup) => {
                     let value = take()?.trim().to_ascii_lowercase();
                     CleanupMode::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
                     options.cleanup = Some(value);
                     continue;
                 }
-                "-o" | "--out-dir" if command == "extract" || watch_add => {
+                Some(OptionId::Output) => {
                     // Extract treats an empty destination as absent; watch must
                     // retain explicit presence for its single-root validation.
                     options.output = Some(take()?).filter(|value| command != "extract" || !value.is_empty());
                     continue;
                 }
-                "-p" | "--password" if passwords => {
+                Some(OptionId::Password) => {
                     options.passwords.push(take()?.into());
                     continue;
                 }
-                "-P" | "--pw-file" if passwords => {
+                Some(OptionId::PasswordFile) => {
                     options.password_file = Some(take()?).filter(|value| !value.is_empty());
                     continue;
                 }
-                "-a" | "--ask-pw" if passwords => options.prompt_passwords = true,
-                "--no-builtin-pw" | "--no-bpw" if passwords => options.no_builtins = true,
-                "--once" if watch_start => options.once = true,
-                "--no-tray" if watch_start => options.no_tray = true,
-                "-s" | "--start" if watch_add => options.start = true,
-                "--scan-rule-stdin" if command == "config" && options.action == "validate" => {
+                Some(OptionId::AskPassword) => options.prompt_passwords = true,
+                Some(OptionId::NoBuiltins) => options.no_builtins = true,
+                Some(OptionId::Once) => options.once = true,
+                Some(OptionId::NoTray) => options.no_tray = true,
+                Some(OptionId::Start) => options.start = true,
+                Some(OptionId::RuleStdin) => {
                     options.rule_stdin = true
                 }
                 _ => {
@@ -447,25 +527,10 @@ impl Options {
 // executing any of its actions, including help. Unknown suffixes are deferred.
 fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: &str) -> io::Result<()> {
     if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 2 { return Ok(()); }
-    let archives = matches!(command, "extract" | "scan");
-    let common = archives || command == "watch";
-    let passwords = archives || command == "passwords";
-    let watch_add = command == "watch" && action == "add";
     for index in 1..arg.len() {
         let flag = arg.as_bytes()[index];
-        let takes_value = match flag {
-            b'h' => false,
-            b'j' if !command.is_empty() && command != "version" => false,
-            b'v' if common => false,
-            b'R' | b'd' if archives || watch_add => false,
-            b'f' | b'F' if command == "extract" => false,
-            b'a' if passwords => false,
-            b's' if watch_add => false,
-            b'r' | b'c' if command == "extract" => true,
-            b'o' if command == "extract" || watch_add => true,
-            b'p' | b'P' if passwords => true,
-            _ => break,
-        };
+        let Some(spec) = short_option(flag).filter(|spec| spec.scope.accepts(command, action)) else { break; };
+        let takes_value = spec.takes_value();
         let tail = &arg[index + 1..]; // recognized option letters are ASCII
         if takes_value {
             if tail.is_empty() && next.is_none_or(looks_like_option) {
@@ -509,25 +574,7 @@ fn parser_error(command: &str, action: &str, message: impl std::fmt::Display) ->
 }
 
 fn argument_name(flag: &str) -> &str {
-    match flag {
-        "-h" | "--help" => "-h/--help",
-        "-j" | "--json" => "-j/--json",
-        "-v" | "--verbose" => "-v/--verbose",
-        "-p" | "--password" => "-p/--password",
-        "-P" | "--pw-file" => "-P/--pw-file",
-        "-a" | "--ask-pw" => "-a/--ask-pw",
-        "--no-builtin-pw" | "--no-bpw" => "--no-builtin-pw/--no-bpw",
-        "-R" | "--recursive" => "-R/--recursive",
-        "-d" | "--deep-detect" => "-d/--deep-detect",
-        "-r" | "--recur" => "-r/--recur",
-        "-c" | "--cleanup" => "-c/--cleanup",
-        "-o" | "--out-dir" => "-o/--out-dir",
-        "-f" | "--flatten" => "-f/--flatten",
-        "-F" | "--no-flatten" => "-F/--no-flatten",
-        "-s" | "--start" => "-s/--start",
-        "--direct-file" | "--direct" => "--direct-file/--direct",
-        _ => flag,
-    }
+    option_spec(flag).map_or(flag, |spec| spec.names)
 }
 
 fn argument_error(command: &str, action: &str, flag: &str, message: &str) -> io::Error {
@@ -557,79 +604,43 @@ fn help(options: &Options, language: Language, session: &dyn Session) -> io::Res
     // Match main's registered argparse actions, including their order/metavars.
     // All current labels and descriptions fit its 120-column help layout.
     let mut positional = Vec::new();
-    let mut optional = vec![("-h/--help".to_owned(), "cli.help".to_owned())];
-    if options.command.is_empty() {
-        for (command, alias) in COMMANDS {
-            positional.push((format!("{command} ({alias})"), format!("cli.{command}.help")));
+    let mut specs: Vec<_> = OPTION_SPECS.iter()
+        .filter(|spec| spec.scope.accepts(options.command, &options.action) && !spec.help.is_empty())
+        .collect();
+    if options.command == "watch" {
+        specs.sort_by_key(|spec| spec.watch_order);
+    }
+    let optional: Vec<_> = specs.into_iter().map(|spec| {
+        let label = if spec.takes_value() { format!("{} {}", spec.names, spec.metavar) } else { spec.names.to_owned() };
+        let key = if options.command == "watch" { spec.watch_help } else { spec.help };
+        (label, key.to_owned())
+    }).collect();
+    match options.command {
+        "" => {
+            for (command, alias) in COMMANDS {
+                positional.push((format!("{command} ({alias})"), format!("cli.{command}.help")));
+            }
         }
-    } else {
-        if options.command != "version" {
-            optional.push(("-j/--json".into(), "cli.json".into()));
-        }
-        if matches!(options.command, "scan" | "extract" | "watch") {
-            optional.extend([
-                ("-v/--verbose".into(), "cli.verbose".into()),
-                ("--no-pause".into(), "cli.no_pause".into()),
-                ("--pause".into(), "cli.pause".into()),
-            ]);
-        }
-        if matches!(options.command, "scan" | "extract") {
-            positional.push(("paths".into(), format!("cli.{}.paths", options.command)));
-            optional.extend([
-                ("-R/--recursive".into(), "cli.recursive_scan".into()),
-                ("-d/--deep-detect".into(), "cli.deep_detect".into()),
-            ]);
-        }
-        if matches!(options.command, "scan" | "extract" | "passwords") {
-            optional.extend([
-                ("-p/--password PASSWORD".into(), "cli.password".into()),
-                ("-P/--pw-file PASSWORD_FILE".into(), "cli.password_file".into()),
-                ("-a/--ask-pw".into(), "cli.prompt_passwords".into()),
-                ("--no-builtin-pw/--no-bpw".into(), "cli.no_builtin_passwords".into()),
-            ]);
-        }
-        match options.command {
-            "extract" => optional.extend([
-                ("-r/--recur RECURSIVE_EXTRACT".into(), "cli.recursive_extract".into()),
-                ("-c/--cleanup ARCHIVE_CLEANUP_MODE".into(), "cli.archive_cleanup_mode".into()),
-                ("-o/--out-dir OUTPUT_DIR".into(), "cli.output_dir".into()),
-                ("-f/--flatten".into(), "cli.flatten".into()),
-                ("-F/--no-flatten".into(), "cli.no_flatten".into()),
-                ("--direct-file/--direct".into(), "cli.extract.direct_file".into()),
-            ]),
-            "watch" => match options.action.as_str() {
-                "" => {
-                    for (action, label) in [
-                        ("start", "start"), ("add", "add"), ("remove", "remove (rm)"),
-                        ("list", "list (ls)"), ("reload", "reload"), ("rebuild-log", "rebuild-log"),
-                        ("stop", "stop"), ("status", "status (st)"), ("startup", "startup"),
-                    ] {
-                        positional.push((label.into(), format!("cli.watch.{}", action.replace('-', "_"))));
-                    }
+        "scan" | "extract" => positional.push(("paths".into(), format!("cli.{}.paths", options.command))),
+        "watch" => match options.action.as_str() {
+            "" => {
+                for (action, label) in [
+                    ("start", "start"), ("add", "add"), ("remove", "remove (rm)"),
+                    ("list", "list (ls)"), ("reload", "reload"), ("rebuild-log", "rebuild-log"),
+                    ("stop", "stop"), ("status", "status (st)"), ("startup", "startup"),
+                ] {
+                    positional.push((label.into(), format!("cli.watch.{}", action.replace('-', "_"))));
                 }
-                "add" => {
-                    positional.push(("paths".into(), "cli.watch.paths".into()));
-                    optional.extend([
-                        ("-o/--out-dir OUTPUT_DIR".into(), "cli.watch.output_dir".into()),
-                        ("-s/--start".into(), "cli.watch.start_after_add".into()),
-                        ("-R/--recursive".into(), "cli.recursive_scan".into()),
-                        ("-d/--deep-detect".into(), "cli.watch.deep_detect".into()),
-                    ]);
-                }
-                "remove" => positional.push(("paths".into(), "cli.watch.paths".into())),
-                "startup" => positional.push(("action".into(), "cli.watch.startup_action".into())),
-                "start" => optional.extend([
-                    ("--once".into(), "cli.watch.once".into()),
-                    ("--no-tray".into(), "cli.watch.no_tray".into()),
-                ]),
-                _ => {}
-            },
-            "config" if options.action.is_empty() => positional.extend([
-                ("show".into(), "cli.config.show_help".into()),
-                ("validate".into(), "cli.config.validate_help".into()),
-            ]),
+            }
+            "add" | "remove" => positional.push(("paths".into(), "cli.watch.paths".into())),
+            "startup" => positional.push(("action".into(), "cli.watch.startup_action".into())),
             _ => {}
-        }
+        },
+        "config" if options.action.is_empty() => positional.extend([
+            ("show".into(), "cli.config.show_help".into()),
+            ("validate".into(), "cli.config.validate_help".into()),
+        ]),
+        _ => {}
     }
     let width = positional.iter().chain(&optional)
         .map(|(option, _)| option.chars().count()).max().unwrap_or(0) + 2;
@@ -1950,22 +1961,12 @@ fn report_scan(
             line(session, Stream::Out, &group[0].1.path.to_string_lossy())?;
         }
         for (index, (_, entry)) in group.iter().enumerate() {
-            let embedded = entry.offset != 0 || entry.end_offset.is_some();
+            let embedded = entry.scan_layout.range;
             let show_password = entry.encrypted == Some(true)
                 || entry.password.is_some()
                 || password_failure(entry);
             let plan = entry.volume_attempts.as_deref();
-            let completeness = if plan.is_some() {
-                Some(if entry.volume_completeness.as_deref() == Some("missing") {
-                    "missing"
-                } else {
-                    "pending"
-                })
-            } else {
-                entry.volume_completeness.as_deref()
-            };
-            let show_parts =
-                plan.is_none() && (entry.source_paths.len() > 1 || completeness.is_some());
+            let (show_parts, completeness) = entry.scan_layout.volumes(entry);
             if options.json {
                 let input_id = format!(
                     "{}|{}|{}",
@@ -2663,6 +2664,40 @@ mod option_tests {
         assert_eq!(password_repr("\u{4e2d}\u{6587}\u{2028}"), "'\u{4e2d}\u{6587}\\u2028'");
     }
 
+    #[test]
+    fn option_aliases_share_values_without_leaking_action_scope() {
+        let parse = |args: &[&str]| Options::parse(&args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+        for args in [
+            vec!["e", "-vRd", "-psecret", "-Ppasswords.txt", "-r1", "-ck", "-odest", "-fa", "--no-bpw", "--direct", "a.zip"],
+            vec!["extract", "--verbose", "--recursive", "--deep-detect", "--password=secret", "--pw-file=passwords.txt", "--recur=1", "--cleanup=k", "--out-dir=dest", "--flatten", "--ask-pw", "--no-builtin-pw", "--direct-file", "a.zip"],
+        ] {
+            let value = parse(&args).unwrap();
+            assert!(value.verbose && value.recursive && value.deep && value.direct);
+            assert!(value.prompt_passwords && value.no_builtins);
+            assert_eq!(value.flatten, Some(true));
+            assert_eq!(value.depth.as_deref(), Some("1"));
+            assert_eq!(value.cleanup.as_deref(), Some("k"));
+            assert_eq!(value.output.as_deref(), Some("dest"));
+            assert_eq!(value.password_file.as_deref(), Some("passwords.txt"));
+            assert_eq!(value.passwords[0].as_ref(), "secret");
+            assert_eq!(value.paths, ["a.zip"]);
+        }
+        let added = parse(&["w", "add", "-sRd", "-odest", "root"]).unwrap();
+        assert!(added.start && added.recursive && added.deep);
+        assert_eq!(added.output.as_deref(), Some("dest"));
+        for args in [
+            vec!["scan", "--out-dir", "dest", "a.zip"],
+            vec!["passwords", "--recursive"],
+            vec!["watch", "--start", "add", "root"],
+            vec!["watch", "start", "--start"],
+            vec!["watch", "add", "--once", "root"],
+            vec!["watch", "remove", "-R", "root"],
+            vec!["config", "show", "--scan-rule-stdin"],
+            vec!["doctor", "--verbose"],
+            vec!["version", "--json"],
+        ] { assert!(parse(&args).is_err(), "{args:?}"); }
+    }
+
     // One parser-level regression covers resolution, value consumption and
     // subparser boundaries; no worker/filesystem is needed for these failures.
     #[test]
@@ -3008,7 +3043,7 @@ mod recursive_prompt_tests {
                 volume_completeness: None, volume_attempts: None, source_paths: vec![],
                 password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
                 damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
-                promoted: false, promotion_original_path: None,
+                promoted: false, promotion_original_path: None, scan_layout: Default::default(),
             }
         }
         let mut all = ReceiptOrder::new();
@@ -3054,7 +3089,7 @@ mod recursive_prompt_tests {
                 end_offset: None, volume_completeness: None, volume_attempts: None,
                 source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
                 damage_flags: None, partial, retained: false, recovered_complete_files: 0,
-                promoted: false, promotion_original_path: None,
+                promoted: false, promotion_original_path: None, scan_layout: Default::default(),
             };
             progress.finish_scope(7, &[archive]).unwrap();
             let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
@@ -3076,7 +3111,7 @@ mod recursive_prompt_tests {
             end_offset: None, volume_completeness: None, volume_attempts: None,
             source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
             damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None,
+            promoted: false, promotion_original_path: None, scan_layout: crate::pipeline::ScanLayout { range: offset != 0, volumes: false },
         }
     }
 
@@ -3322,6 +3357,62 @@ mod recursive_prompt_tests {
         assert_eq!(item["error_kind"], "damaged");
         assert_eq!(item["error"], Language::En.text("failure.damaged"));
         assert_eq!(item["discovery_source"], "direct");
+    }
+
+    // Both renderers consume descriptor facts, not a guessed meaning for a
+    // finite end or an internal completeness value. Each row distinguishes a
+    // public sparse-field boundary that the ordinary file case cannot cover.
+    #[test]
+    fn scan_sparse_layout_is_shared_by_text_and_json() {
+        use crate::io::archive_state::{AnalysisOrigin, ArchiveInput, InputExtent, InputPart, InputRole, OpenMode};
+        for (mode, origin, start, complete, show_range, show_parts, public_complete) in [
+            (OpenMode::FileRange, AnalysisOrigin::Embedded, 64, "complete", true, false, None),
+            (OpenMode::FileRange, AnalysisOrigin::Embedded, 0, "complete", true, false, None),
+            (OpenMode::ConcatRanges, AnalysisOrigin::Embedded, 0, "complete", true, false, None),
+            (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, "complete", false, true, Some("complete")),
+            (OpenMode::NativeVolumes, AnalysisOrigin::Relations, 0, "unknown", false, true, None),
+            (OpenMode::File, AnalysisOrigin::Plain, 0, "missing", false, true, Some("missing")),
+        ] {
+            let mut descriptor = ArchiveInput::file("carrier.bin".into(), "zip".into(), "carrier".into());
+            descriptor.mode = mode;
+            descriptor.analysis.origin = origin;
+            descriptor.parts = vec![InputPart {
+                role: InputRole::Main, extent: InputExtent { path: "carrier.bin".into(), start, end: Some(100) },
+                volume_number: None, canonical_name: String::new(),
+            }].into_boxed_slice();
+            for json in [false, true] {
+                let mut archive = report_archive("carrier.bin", start);
+                archive.end_offset = Some(100);
+                archive.source_paths.push("carrier.bin".into());
+                archive.volume_completeness = Some(complete.into());
+                archive.scan_layout = crate::pipeline::ScanLayout::from_input(&descriptor);
+                let mut outcome = Outcome::default();
+                outcome.archives.push(archive);
+                let mut options = Options::parse(&["scan".into(), "carrier.bin".into()]).unwrap();
+                options.json = json;
+                let session = Input::default();
+                let (_, result) = report_scan(outcome, vec![], &options, &session, Language::En).unwrap();
+                if json {
+                    let item = &result.items[0];
+                    assert_eq!(item.get("offset").is_some(), show_range, "{mode:?}");
+                    assert_eq!(item.get("end_offset").is_some(), show_range, "{mode:?}");
+                    assert_eq!(item.get("all_parts").is_some(), show_parts, "{mode:?}");
+                    assert_eq!(item.get("volume_completeness").and_then(Value::as_str), public_complete, "{mode:?}");
+                } else {
+                    let text = String::from_utf8(session.stdout.lock().unwrap().clone()).unwrap();
+                    let range = Language::En.translate("cli.scan.range", &[("start", &start.to_string()), ("end", "100")]);
+                    let parts = Language::En.translate("cli.scan.parts", &[("parts", "carrier.bin")]);
+                    assert_eq!(text.contains(&range), show_range, "{mode:?}: {text}");
+                    assert_eq!(text.contains(&parts), show_parts, "{mode:?}: {text}");
+                    assert!(!text.contains("unknown"), "{text}");
+                    if let Some(value) = public_complete {
+                        let state = Language::En.text(&format!("cli.scan.volumes.{value}")).to_owned();
+                        let line = Language::En.translate("cli.scan.volumes", &[("state", &state)]);
+                        assert!(text.contains(&line), "{text}");
+                    }
+                }
+            }
+        }
     }
 
     // Rendering must not consume a native call frame per nesting level. The

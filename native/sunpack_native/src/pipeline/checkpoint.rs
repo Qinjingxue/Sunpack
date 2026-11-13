@@ -201,6 +201,18 @@ impl InputCheckpoint {
         })
     }
 
+    pub(super) fn settle_result(&mut self, result: &ArchiveResult) {
+        self.output = result.output.clone().unwrap_or_default();
+        match (&mut self.failure, &result.failure) {
+            (Some(receipt), Some(failure)) => Arc::make_mut(receipt).failure = failure.clone(),
+            (slot @ None, Some(failure)) => *slot = Some(Arc::new(FailureReceipt {
+                partial: result.partial, password_signature: None, failure: failure.clone(),
+                complete_files: result.recovered_complete_files,
+            })),
+            (_, None) => self.failure = None,
+        }
+    }
+
     pub(super) fn install_report(&mut self, state: Option<ReportState>) { self.report = state; }
 
     /// Replacement preserves the old checkpoint only when the new logical ID
@@ -466,7 +478,7 @@ impl InputCheckpoint {
                 .as_ref()
                 .map_or(0, |receipt| receipt.complete_files),
             promoted: false,
-            promotion_original_path: None,
+            promotion_original_path: None, scan_layout: super::ScanLayout::from_input(&self.input),
         }
     }
 }
@@ -572,7 +584,7 @@ mod tests {
             volume_completeness: None, volume_attempts: None, source_paths: vec![source.clone()],
             password: None, discovery_source: DiscoverySource::Direct, damage_flags: None,
             partial: false, retained: false, recovered_complete_files: 0, promoted: false,
-            promotion_original_path: None,
+            promotion_original_path: None, scan_layout: Default::default(),
         };
         result.failure = Some(Failure::new(FailureKind::Damaged, "damaged").with_context(super::super::FailureContext::Extraction));
         result.output = Some(output.clone()); result.files = 3; result.bytes = 17;

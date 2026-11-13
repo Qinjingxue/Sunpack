@@ -2026,6 +2026,42 @@ mod tests {
         }
     }
 
+    // A real parsed ENDARC before carrier EOF reaches NativeVolumes with a
+    // finite head extent. That physical bound must not invent a scan range.
+    #[test]
+    fn parsed_rar_head_extent_keeps_native_volume_scan_layout() {
+        use crate::analysis_native::volume_anchor::upgrade_relation_rar_end;
+        let mut bytes = b"Rar!\x1a\x07\x00".to_vec();
+        for (kind, flags, body) in [(0x73, 0x111u16, vec![0; 6]), (0x7b, 1, vec![])] {
+            let mut header = vec![0, 0, kind];
+            header.extend(flags.to_le_bytes());
+            header.extend(((7 + body.len()) as u16).to_le_bytes());
+            header.extend(body);
+            let crc = crc32fast::hash(&header[2..]) as u16;
+            header[..2].copy_from_slice(&crc.to_le_bytes());
+            bytes.extend(header);
+        }
+        let end = bytes.len() as u64;
+        bytes.extend([0; 128]);
+        let path = crate::test_support::temp_file("scan_native_head", &bytes);
+        let path_string = path.to_string_lossy().into_owned();
+        let anchor = probe_volume_anchor_paths_cheap(&[path_string.clone()], None).remove(0);
+        let anchor = upgrade_relation_rar_end(&anchor, None);
+        assert_eq!(anchor.proven_extent_end(), Some(end));
+        let mut validation = validation_with_owned_paths(ProposalStatus::Valid, &[&path_string]);
+        Arc::make_mut(&mut validation.facts).anchors.insert(path_key(&path_string), anchor);
+        let mut input = ArchiveInput::file(path_string, "rar".into(), "test".into());
+        input.analysis.origin = AnalysisOrigin::Relations;
+        project_proposal(&validation, &mut input);
+        assert_eq!(input.mode, OpenMode::NativeVolumes);
+        assert_eq!(input.parts[0].extent.start, 0);
+        assert_eq!(input.parts[0].extent.end, Some(end));
+        let layout = crate::pipeline::ScanLayout::from_input(&input);
+        assert!(!layout.range);
+        assert!(layout.volumes);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn encrypted_relations_require_readable_anchors_even_with_existing_failure() {
         for reason in [None, Some(RelationFailureReason::MissingVolume)] {

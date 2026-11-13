@@ -1276,17 +1276,19 @@ impl RootObserver {
     }
 }
 
-// Retirement and scanning acknowledge separate parts of a durable policy
-// change. Publishing roots must not erase either obligation on partial failure.
+// Retirement, scanning and recovery acknowledge separate parts of a durable
+// policy change. Publishing roots must not erase obligations on partial failure.
 #[derive(Default)]
 struct RootPolicyProgress {
     retirement: bool,
     checkpoint: bool,
+    recovery: bool,
 }
 
 impl RootPolicyProgress {
     fn observe(&mut self, policy_changed: bool, initialize: bool) -> bool {
         self.checkpoint |= policy_changed;
+        self.recovery |= policy_changed;
         self.retirement |= policy_changed || initialize;
         self.retirement
     }
@@ -1625,6 +1627,16 @@ impl ClaimedSources {
     }
 }
 
+// Final request retirement owns every captured physical claim, including
+// ambiguous shared aliases intentionally absent from result projection.
+fn completion_claims<'a>(
+    task: Option<crate::pipeline::TaskId>,
+    groups: &'a HashMap<String, Arc<SourceGroup>>,
+    claimed: &'a ClaimedSources,
+) -> impl Iterator<Item = &'a String> {
+    groups.keys().chain(task.is_none().then_some(&claimed.candidates).into_iter().flat_map(HashMap::keys))
+}
+
 struct Active {
     root: String,
     recovery: Option<Arc<Recovery>>,
@@ -1633,7 +1645,7 @@ struct Active {
     quiet: HashMap<String, quiet::Quiet>,
     dirty: HashSet<String>,
     cancel: Cancellation,
-    groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
+    groups: Arc<Mutex<SourceGroups>>,
     claimed: Arc<Mutex<ClaimedSources>>,
     toast: Option<super::toast::Activity>,
     request: crate::pipeline::RequestHandle<Completed>,
@@ -1695,6 +1707,60 @@ struct SourceGroup {
     name: String,
     members: Vec<String>,
     multipart: bool,
+}
+
+// Logical tasks own groups; physical members may have several live consumers.
+#[derive(Default)]
+struct SourceGroups {
+    planned: HashSet<String>,
+    roots: HashMap<String, Arc<SourceGroup>>,
+    members: HashMap<String, usize>,
+}
+
+impl SourceGroups {
+    fn insert(&mut self, group: Arc<SourceGroup>) {
+        let root = key(&group.path);
+        if let Some(previous) = self.roots.remove(&root) { self.release(&previous); }
+        for member in &group.members { *self.members.entry(watch_path_key(member)).or_default() += 1; }
+        self.roots.insert(root, group);
+    }
+
+    fn into_aliases(self) -> HashMap<String, Arc<SourceGroup>> {
+        let mut aliases = self.roots;
+        let groups = aliases.values().cloned().collect::<Vec<_>>();
+        for group in groups {
+            for member in &group.members {
+                let id = watch_path_key(member);
+                // A physical alias with multiple consumers has an aggregate
+                // result, not an arbitrary head chosen by HashMap iteration.
+                if self.members.get(&id) == Some(&1) {
+                    aliases.entry(id).or_insert_with(|| Arc::clone(&group));
+                }
+            }
+        }
+        aliases
+    }
+
+    fn release(&mut self, group: &SourceGroup) {
+        for member in &group.members {
+            let id = watch_path_key(member);
+            if let Some(count) = self.members.get_mut(&id) {
+                *count -= 1;
+                if *count == 0 { self.members.remove(&id); }
+            }
+        }
+    }
+
+    fn take(&mut self, root: &str) -> HashMap<String, Arc<SourceGroup>> {
+        self.planned.remove(root);
+        let Some(group) = self.roots.remove(root) else { return HashMap::new(); };
+        self.release(&group);
+        group.members.iter().map(|member| watch_path_key(member))
+            // A discovered task retains its durable owner even before claim.
+            // An admitted tail with no independent task belongs to its head.
+            .filter(|member| member == root || (!self.planned.contains(member) && !self.members.contains_key(member)))
+            .map(|member| (member, Arc::clone(&group))).collect()
+    }
 }
 
 struct Scheduler {
@@ -1827,6 +1893,7 @@ impl Scheduler {
         scheduler.checkpoint(&HashMap::new(), true, true)?;
         scheduler.root_progress.checkpoint = false;
         scheduler.retry_missing_volumes(None)?;
+        scheduler.root_progress.recovery = false;
         scheduler
             .hub
             .pending_count
@@ -1893,6 +1960,7 @@ impl Scheduler {
                 match diagnostic.and_then(|path| {
                     super::toast::Toast::start(
                         &self.cwd,
+                        Arc::clone(&self.engine),
                         path,
                         self.settings.watch.toast_report_retention_days,
                         move |event, error| {
@@ -1956,7 +2024,7 @@ impl Scheduler {
         }
     }
 
-    fn reconcile_roots(&mut self) -> io::Result<bool> {
+    fn reconcile_roots(&mut self) -> io::Result<(bool, bool)> {
         let engine = Arc::clone(&self.engine);
         let (entries, next, policy_changed) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
         let (entries, rejected) = {
@@ -2083,7 +2151,7 @@ impl Scheduler {
         self.rearm_root_observers(None);
         retirement?;
         self.root_progress.retirement = false;
-        Ok(self.root_progress.checkpoint)
+        Ok((self.root_progress.checkpoint, self.root_progress.recovery))
         })
     }
 
@@ -2151,7 +2219,7 @@ impl Scheduler {
             self.drain_active(&mut Ok(0))?;
             if let Some(toast) = &self.toast { toast.reset_batches(); }
         }
-        let roots_changed = match self.reconcile_roots() {
+        let (roots_changed, root_policy_changed) = match self.reconcile_roots() {
             Ok(changed) => changed,
             Err(error) => {
                 // Reconciliation can fail after publishing durable root edits.
@@ -2161,6 +2229,10 @@ impl Scheduler {
                 return Err(error);
             }
         };
+        if root_policy_changed && !scheduler_changed {
+            if let Some(toast) = &self.toast { toast.reset_batches(); }
+        }
+        let scheduler_changed = scheduler_changed || root_policy_changed;
         let previous = config_changed.then(|| {
             self.user_password_signature = user_password_signature(&snapshot.config.user_passwords);
             std::mem::replace(&mut self.settings, Arc::new(snapshot.config))
@@ -2179,6 +2251,7 @@ impl Scheduler {
                 // main restarts its scheduler on semantic policy changes,
                 // including reconciliation of existing missing-volume blockers.
                 self.retry_missing_volumes(None)?;
+                self.root_progress.recovery = false;
             }
             if config_changed { self.password_update(false)?; }
             Ok(())
@@ -2192,10 +2265,19 @@ impl Scheduler {
             // ordinary settings against the latest root file, like main.
             let rollback: io::Result<()> = (|| {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
-                let latest_roots_changed = self.reconcile_roots()?;
+                let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots()?;
                 self.activate_scan_options()?;
-                if scheduler_changed { self.recover_pending(None)?; }
-                self.checkpoint_reload(scheduler_changed || roots_changed || latest_roots_changed)
+                let restart = scheduler_changed || latest_policy_changed;
+                if restart {
+                    if let Some(toast) = &self.toast { toast.reset_batches(); }
+                    self.recover_pending(None)?;
+                }
+                self.checkpoint_reload(restart || roots_changed || latest_roots_changed)?;
+                if restart {
+                    self.retry_missing_volumes(None)?;
+                    self.root_progress.recovery = false;
+                }
+                Ok(())
             })();
             if let Err(rollback_error) = rollback {
                 self.journal.log(json!({"event":"config_reload_rollback_failed", "error":rollback_error.to_string()}));
@@ -4116,7 +4198,7 @@ impl Scheduler {
             .as_ref()
             .and_then(|_| candidates.first())
             .map(|candidate| PathBuf::from(&candidate.path));
-        let groups = Arc::new(Mutex::new(HashMap::new()));
+        let groups = Arc::new(Mutex::new(SourceGroups::default()));
         let worker_groups = Arc::clone(&groups);
         let claimed = Arc::new(Mutex::new(ClaimedSources::default()));
         let worker_claimed = Arc::clone(&claimed);
@@ -4139,10 +4221,11 @@ impl Scheduler {
         let request_handle = engine.submit(request, Arc::clone(&observer), move |result| {
             let cancelled = worker_cancel.cancelled();
             if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
-                let outputs = observer.outputs.lock().unwrap();
+                let claimed = observer.claimed.lock().unwrap();
                 let groups = observer.groups.lock().unwrap();
+                let groups = &groups.roots;
+                let outputs = observer.outputs.lock().unwrap();
                 if result.is_err() {
-                    let claimed = observer.claimed.lock().unwrap();
                     let mut reported = HashSet::new();
                     for (source_key, source) in &observer.owners {
                         if claimed.finished.contains(source_key) { continue; }
@@ -4304,7 +4387,7 @@ impl Scheduler {
         let mut completed = active.request.join()
             .map_err(|_| io::Error::other("Watch extraction request failed"))?;
         completed.cancelled |= active.cancel.cancelled();
-        let groups = std::mem::take(&mut *active.groups.lock().unwrap());
+        let groups = std::mem::take(&mut *active.groups.lock().unwrap()).into_aliases();
         self.apply_completion(batch, CompletionContext {
             root: active.root, recovery: active.recovery, passwords: active.passwords,
             inputs: active.inputs.into_values().collect(), quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
@@ -4366,24 +4449,29 @@ impl Scheduler {
             );
         }
         {
+            let claimed = active.claimed.lock().unwrap();
+            let remaining = self.active.get(batch).map(|active| active.groups.lock().unwrap());
             let mut claims = self.hub.claims.lock().unwrap();
-            for path in groups.keys().chain(completed.promoted.keys()) {
-                if claims
-                    .get(path)
-                    .is_some_and(|owner| owner.as_ref() == batch)
-                {
+            let mut release = |path: &str| {
+                if remaining.as_ref().is_some_and(|groups| groups.members.contains_key(path)) { return; }
+                if claims.get(path).is_some_and(|owner| owner.as_ref() == batch) {
                     claims.remove(path);
                 }
-            }
+            };
+            for path in completion_claims(active.task, &groups, &claimed).chain(completed.promoted.keys()) { release(path); }
+            for input in &active.inputs { release(&watch_path_key(&input.path)); }
             crate::collections::trim_map(&mut claims);
         }
         // Changes observed during ownership are the next generation, not
         // members of the completed request. Restore only their admission keys.
-        for path in groups.keys().chain(completed.promoted.keys()).cloned()
-            .chain(active.inputs.iter().map(|candidate| watch_path_key(&candidate.path)))
         {
-            if let Some(pending) = self.pending.get(&path) {
-                self.due.insert((pending.due, path), ());
+            let claimed = active.claimed.lock().unwrap();
+            for path in completion_claims(active.task, &groups, &claimed).chain(completed.promoted.keys()).cloned()
+                .chain(active.inputs.iter().map(|candidate| watch_path_key(&candidate.path)))
+            {
+                if let Some(pending) = self.pending.get(&path) {
+                    self.due.insert((pending.due, path), ());
+                }
             }
         }
         for candidate in &active.inputs {
@@ -5109,17 +5197,15 @@ struct WatchObserver {
     batch: Arc<str>,
     toast: Option<super::toast::Activity>,
     hub: Arc<Hub>,
-    groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
+    groups: Arc<Mutex<SourceGroups>>,
     claimed: Arc<Mutex<ClaimedSources>>,
     promoted: Mutex<HashMap<String, Option<WatchCandidateRow>>>,
 }
 
 impl WatchObserver {
     fn owner<'a>(&'a self, archive: &'a ArchiveResult) -> Option<String> {
-        archive
-            .source_paths
-            .iter()
-            .chain(std::iter::once(&archive.path))
+        std::iter::once(&archive.path)
+            .chain(archive.source_paths.iter())
             .find_map(|path| self.owners.get(&key(path)).cloned())
             .or_else(|| self.owner_for_path(&archive.path))
     }
@@ -5130,24 +5216,22 @@ impl WatchObserver {
 }
 
 impl Observer for WatchObserver {
+    fn roots_planned<'a>(&self, paths: impl Iterator<Item = &'a str>) {
+        self.groups.lock().unwrap().planned.extend(paths.map(watch_path_key));
+    }
+
     async fn root_finished(&self, id: crate::pipeline::TaskId, path: &Path, outcome: Outcome) -> io::Result<Outcome> {
-        // Seal completion before report backpressure. Cancellation uses the
-        // same gate while writing interrupted entries, including all volumes.
-        {
-            let mut claimed = self.claimed.lock().unwrap();
-            let groups = self.groups.lock().unwrap();
-            claimed.finished.insert(key(path));
-            if let Some(group) = groups.get(&key(path)) {
-                claimed.finished.extend(group.members.iter().map(|path| watch_path_key(path)));
-            }
-        }
+        // One admitted tail can discover several independent heads. Its WAL
+        // owner and outputs must retain their aggregate until request finish.
+        if !self.owners.contains_key(&key(path)) { return Ok(outcome); }
+        // Move only this logical owner's state. A shared member stays claimed
+        // until its final consumer settles; another admitted root never moves.
         let (groups, outputs, promoted) = {
-        let mut shared_groups = self.groups.lock().unwrap();
-        let members: HashSet<_> = shared_groups.get(&key(path))
-            .map(|group| group.members.iter().map(|path| watch_path_key(path)).collect())
-            .unwrap_or_else(|| HashSet::from([key(path)]));
-        let groups = members.iter().filter_map(|key| shared_groups.remove(key).map(|group| (key.clone(), group))).collect();
-        drop(shared_groups);
+        let mut claimed = self.claimed.lock().unwrap();
+        let groups = self.groups.lock().unwrap().take(&key(path));
+        let members: HashSet<_> = groups.keys().cloned().chain(std::iter::once(key(path))).collect();
+        claimed.finished.extend(members.iter().cloned());
+        drop(claimed);
         let mut shared_outputs = self.outputs.lock().unwrap();
         let outputs = shared_outputs.take_owners(&members);
         drop(shared_outputs);
@@ -5344,10 +5428,10 @@ impl Observer for WatchObserver {
             // Seal the original generations, never resample on cancellation.
             claimed.capture(&group.members)?;
             let mut aliases = self.groups.lock().unwrap();
+            aliases.insert(Arc::clone(&group));
             let mut claims = self.hub.claims.lock().unwrap();
             for member in &group.members {
                 let key = watch_path_key(member);
-                aliases.insert(key.clone(), Arc::clone(&group));
                 claims.insert(key, Arc::clone(&self.batch));
             }
         }
@@ -6036,7 +6120,10 @@ mod tests {
         assert!(progress.checkpoint);
         progress.checkpoint_finished(&Ok(()));
         assert!(!progress.checkpoint);
+        assert!(progress.recovery); // a scan does not acknowledge pending/blocker recovery
+        progress.recovery = false;
         assert!(!progress.observe(false, false));
+        assert!(!progress.recovery);
     }
 
     #[test]
@@ -6248,7 +6335,7 @@ mod tests {
             volume_completeness: None, volume_attempts: None, source_paths: vec![path.into()],
             password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
             damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
-            promoted: false, promotion_original_path: None,
+            promoted: false, promotion_original_path: None, scan_layout: Default::default(),
         }
     }
 
@@ -6812,7 +6899,53 @@ mod tests {
     }
 
     #[test]
-    fn settled_root_handoff_moves_receipts_and_all_volume_owners_without_waiting_for_siblings() {
+    fn shared_tail_completion_preserves_other_logical_and_not_yet_claimed_owners() {
+        let a = Path::new(r"C:\watch\a.001");
+        let b = Path::new(r"C:\watch\b.001");
+        let tail = Path::new(r"C:\watch\shared.002");
+        let group = |head: &Path| Arc::new(SourceGroup { path: head.into(), name: "head".into(),
+            multipart: true, members: vec![head.to_string_lossy().into_owned(), tail.to_string_lossy().into_owned()] });
+        let mut groups = SourceGroups::default();
+        groups.insert(group(a));
+        groups.insert(group(b));
+        groups.planned.extend([key(a), key(b), key(tail)]);
+        let completed = groups.take(&key(a));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[&key(a)].path, a);
+        assert_eq!(groups.roots[&key(b)].path, b);
+        assert_eq!(groups.members[&key(tail)], 1);
+
+        // The independently admitted tail hasn't reached discovery yet. B
+        // cannot retire its pending owner either, despite being last consumer.
+        let completed = groups.take(&key(b));
+        assert_eq!(completed.len(), 1);
+        assert!(!completed.contains_key(&key(tail)));
+        assert!(groups.members.is_empty());
+        // An unadmitted physical sibling is transferred only by the final
+        // consumer; it is never projected through the other head's group.
+        groups.planned = HashSet::from([key(a), key(b)]);
+        groups.insert(group(a)); groups.insert(group(b));
+        assert!(!groups.take(&key(a)).contains_key(&key(tail)));
+        assert_eq!(groups.take(&key(b))[&key(tail)].path, b);
+        assert!(groups.roots.is_empty());
+        assert!(groups.members.is_empty());
+        groups.insert(group(a)); groups.insert(group(b));
+        let aliases = groups.into_aliases();
+        assert!(!aliases.contains_key(&key(tail)));
+        assert_eq!(aliases[&key(a)].path, a);
+        assert_eq!(aliases[&key(b)].path, b);
+        let claimed = ClaimedSources {
+            candidates: [(key(a), None), (key(b), None), (key(tail), None)].into_iter().collect(),
+            ..Default::default()
+        };
+        // The shared tail is absent from logical projection, but final
+        // retirement must release its claim and rearm any parked generation.
+        assert!(completion_claims(None, &aliases, &claimed).any(|path| path == &key(tail)));
+        assert!(!completion_claims(Some(1), &aliases, &claimed).any(|path| path == &key(tail)));
+    }
+
+    #[test]
+    fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
         use std::future::Future;
         use std::task::{Context, Poll, Wake, Waker};
         struct NoWake;
@@ -6828,14 +6961,14 @@ mod tests {
         let group = Arc::new(SourceGroup { path: head.into(), name: "a".into(), multipart: true,
             members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
         let hub = Arc::new(Hub::new());
-        let observer = WatchObserver {
+        let mut observer = WatchObserver {
             journal: Arc::new(journal::Journal::open(&directory, 7).unwrap()),
             owners: HashMap::from([(key(alias), alias.to_string_lossy().into_owned())]),
             output_scopes: Arc::from([]),
             outputs: Mutex::new(ObservedOutputs::from(BTreeMap::from([(key(output), alias.to_string_lossy().into_owned()),
                 (key(other_output), other.to_string_lossy().into_owned())]))),
             batch: Arc::from("batch"), toast: None, hub: Arc::clone(&hub),
-            groups: Arc::new(Mutex::new(HashMap::from([(key(head), Arc::clone(&group)), (key(alias), group)]))),
+            groups: Arc::new(Mutex::new({ let mut groups = SourceGroups::default(); groups.insert(group); groups })),
             claimed: Arc::default(), promoted: Mutex::new(HashMap::from([(key(promoted), None)])),
         };
         // Cancellation winning the mutex first must not turn an already
@@ -6847,18 +6980,41 @@ mod tests {
         child.promoted = true;
         outcome.archives.push(child);
         let allocation = outcome.archives.as_ptr();
-        let mut future = Box::pin(observer.root_finished(1, head, outcome));
         let waker = Waker::from(Arc::new(NoWake));
+        // Tail-only admission can discover several heads. Preserve the whole
+        // result for request aggregation rather than retiring that alias early.
+        let mut deferred = Box::pin(observer.root_finished(1, head, outcome));
+        let Poll::Ready(Ok(outcome)) = deferred.as_mut().poll(&mut Context::from_waker(&waker)) else {
+            panic!("alias-owned roots must return their aggregate without a handoff");
+        };
+        assert_eq!(outcome.archives.as_ptr(), allocation);
+        drop(deferred);
+        assert_eq!(observer.outputs.lock().unwrap().paths.len(), 2);
+        assert!(observer.claimed.lock().unwrap().finished.is_empty());
+        // Directly admitted roots still settle independently of their peers.
+        observer.owners.insert(key(head), head.to_string_lossy().into_owned());
+        observer.owners.insert(key(other), other.to_string_lossy().into_owned());
+        observer.roots_planned([head.to_str().unwrap(), other.to_str().unwrap()].into_iter());
+        observer.groups.lock().unwrap().insert(Arc::new(SourceGroup {
+            path: other.into(), name: "b".into(), multipart: true,
+            members: vec![other.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()],
+        }));
+        *observer.outputs.lock().unwrap() = ObservedOutputs::from(BTreeMap::from([
+            (key(output), head.to_string_lossy().into_owned()),
+            (key(other_output), other.to_string_lossy().into_owned()),
+        ]));
+        let mut future = Box::pin(observer.root_finished(1, head, outcome));
         assert!(future.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
         let signals = hub.wait(None);
         let root = signals.roots.into_iter().next().unwrap();
         assert_eq!(root.completed.result.as_ref().unwrap().archives.as_ptr(), allocation);
-        assert_eq!(root.groups.len(), 2);
+        assert_eq!(root.groups.len(), 1);
+        assert_eq!(root.groups[&key(head)].path, head);
         assert_eq!(root.completed.outputs.len(), 1);
         assert_eq!(root.completed.promoted.len(), 1);
-        assert!(observer.groups.lock().unwrap().is_empty());
+        assert_eq!(observer.groups.lock().unwrap().roots[&key(other)].path, other);
         assert_eq!(observer.outputs.lock().unwrap().paths.len(), 1);
-        assert!(observer.claimed.lock().unwrap().finished.contains(&key(alias)));
+        assert!(!observer.claimed.lock().unwrap().finished.contains(&key(alias)));
         assert!(observer.claimed.lock().unwrap().finished.contains(&key(head)));
         root.reply.complete(root.completed.result);
         let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) else {
@@ -6998,7 +7154,7 @@ mod tests {
                 source_paths: vec![nested.clone()], password: None,
                 discovery_source: crate::pipeline::DiscoverySource::Direct, damage_flags: None,
                 partial: false, retained: false, recovered_complete_files: 0,
-                promoted: false, promotion_original_path: None,
+                promoted: false, promotion_original_path: None, scan_layout: Default::default(),
             };
             observer.register_output(&archive, &nested_output).unwrap();
             assert!(nested_output.is_dir());
