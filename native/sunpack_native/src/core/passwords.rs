@@ -27,7 +27,7 @@ use std::{
 };
 
 pub(crate) const FILENAME: &str = "builtin_passwords.json";
-const DEFAULT_DOCUMENT: &str = "{\n  \"passwords\": [{\"value\":\"123456\"},{\"value\":\"123\"},{\"value\":\"0000\"},{\"value\":\"789\"}],\n  \"clipboard_history\": []\n}\n";
+const DEFAULT_DOCUMENT: &str = "{\n  \"passwords\": [],\n  \"clipboard_history\": []\n}\n";
 
 #[derive(Clone)]
 struct Bucket {
