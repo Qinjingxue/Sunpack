@@ -2359,8 +2359,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
                             if let Ok(_exclusive) = cleanup.engine.leases.acquire(keys, &cleanup.request.cancel).await {
                                 let mut shell = cleanup.engine.shell.branch();
-                                cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut failures, &mut shell);
-                                cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut failures, &mut shell);
+                                cleanup.cleanup_sources(&recycles, CleanupMode::Recycle, &mut failures, &mut shell);
+                                cleanup.cleanup_sources(&deletes, CleanupMode::Delete, &mut failures, &mut shell);
                             }
                         }
                         cleanup.cleanup_tasks.lock().unwrap().retire(id, failures)
@@ -3398,7 +3398,6 @@ impl<'run, O: Observer> Run<'run, O> {
     fn cleanup_sources(
         &self,
         paths: &[PathBuf],
-        generations: &HashMap<String, PhysicalFileGeneration>,
         cleanup: CleanupMode,
         failures: &mut Vec<CleanupResult>,
         shell: &mut ShellUpdates<'_>,
@@ -3408,33 +3407,25 @@ impl<'run, O: Observer> Run<'run, O> {
             CleanupMode::Delete => "delete",
             CleanupMode::Recycle => "recycle",
         };
-        let mut valid = Vec::new();
+        let mut existing = Vec::new();
         for path in paths {
-            match capture_file_generation(path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            match path.try_exists() {
+                Ok(true) => existing.push(path),
+                Ok(false) => {}
                 Err(error) => failures.extend(cleanup_failure(path, mode, Err(error))),
-                Ok(current) => {
-                    let key = path_key(&path.to_string_lossy());
-                    if generations
-                        .get(&key)
-                        .is_some_and(|before| before == &current)
-                    {
-                        valid.push(path);
-                    }
-                }
             }
         }
-        if valid.is_empty() {
+        if existing.is_empty() {
             return;
         }
-        let keys = valid
+        let keys = existing
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
         let _promotion = match Promotion::begin(keys) {
             Ok(promotion) => promotion,
             Err(error) => {
-                for path in valid {
+                for path in existing {
                     let copy = error.raw_os_error().map(io::Error::from_raw_os_error)
                         .unwrap_or_else(|| io::Error::new(error.kind(), error.to_string()));
                     failures.extend(cleanup_failure(path, mode, Err(copy)));
@@ -3442,7 +3433,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 return;
             }
         };
-        for path in valid {
+        for path in existing {
             let removed = match cleanup {
                 CleanupMode::Delete => remove_owned_file(path),
                 CleanupMode::Recycle => super::cleanup::recycle(std::iter::once(path.as_path())),
