@@ -825,9 +825,9 @@ struct Shared {
 }
 
 impl Shared {
-    fn present(&self, show: impl FnOnce()) -> bool {
+    fn present(&self, batch: &str, show: impl FnOnce()) -> bool {
         let state = self.state.lock().unwrap();
-        if state.stopping {
+        if state.stopping || state.groups.front().is_none_or(|group| group.id.as_ref() != batch) {
             return false;
         }
         drop(state);
@@ -889,6 +889,19 @@ impl Publisher {
         let group = state.groups.back_mut().unwrap();
         group.requests.insert(Arc::clone(&request), RequestProgress::default());
         Activity { publisher: self.clone(), request }
+    }
+
+    fn reset_batches(&self) {
+        let retired = {
+            let mut state = self.shared.state.lock().unwrap();
+            let retired = (std::mem::take(&mut state.groups), std::mem::take(&mut state.completed));
+            state.clear = true;
+            self.mark_dirty(&mut state);
+            retired
+        };
+        // Old activities can no longer publish; release their report drafts
+        // outside the state gate. In-flight presenter copies fail the same gate.
+        drop(retired);
     }
 
     fn stop_group(&self, id: &str) -> Vec<Arc<str>> {
@@ -1549,7 +1562,7 @@ impl Toast {
                     };
                     let shown = match completion.as_ref() {
                         Some(completed) => presenter_shared.present_completed(completed, show),
-                        None => presenter_shared.present(show),
+                        None => presenter_shared.present(&snapshot.batch, show),
                     };
                     if let Some((event, error)) = failure {
                         report_error(event, &error);
@@ -1593,6 +1606,10 @@ impl Toast {
 
     pub(super) fn stop_group(&self, id: &str) -> Vec<Arc<str>> {
         self.publisher.stop_group(id)
+    }
+
+    pub(super) fn reset_batches(&self) {
+        self.publisher.reset_batches();
     }
 
     pub(super) fn set_report_retention(&self, days: u64) {
@@ -2325,7 +2342,7 @@ mod tests {
             assert!(worker.reports.append("81", Language::En, &completed.report,
                 Path::new("b.zip"), &result, &one_root, None).is_err());
             assert!(worker.reports.publish(&completed, &worker.shared).is_err());
-            assert!(!worker.shared.present(|| panic!("stale toast after disable")));
+            assert!(!worker.shared.present("81", || panic!("stale toast after disable")));
             drop(completed);
             done.send(()).unwrap();
         });
@@ -2349,12 +2366,46 @@ mod tests {
         }));
     }
     #[test]
+    fn semantic_reload_retires_debouncing_and_in_flight_batches() {
+        for in_flight in [false, true] {
+            let directory = TestDirectory::new();
+            let publisher = publisher(directory.0.clone());
+            let old = publisher.register(Arc::from("old"), Language::En);
+            old.event(queued(1, "old.zip", None, 0));
+            let stale_progress = current(&publisher);
+            let failure = Err(io::Error::other("old failure"));
+            old.record(Path::new("old.zip"), &failure, false, one_root);
+            old.finish(&failure, false, false, one_root);
+            let completed = if in_flight {
+                finish_debounce(&publisher);
+                publisher.shared.state.lock().unwrap().completed.pop_front()
+            } else { None };
+            publisher.reset_batches();
+            assert!(publisher.shared.state.lock().unwrap().clear);
+            let new = publisher.register(Arc::from("new"), Language::Zh);
+            new.event(queued(2, "new.zip", None, 0));
+            assert!(!publisher.shared.present(&stale_progress.batch, || panic!("stale progress")));
+            if let Some(completed) = completed {
+                assert!(!publisher.shared.present_completed(&completed, || panic!("stale completion")));
+            }
+            let state = publisher.shared.state.lock().unwrap();
+            assert_eq!(state.groups.len(), 1);
+            assert!(state.completed.is_empty());
+            let group = state.groups.front().unwrap();
+            assert_eq!(group.id.as_ref(), "new");
+            assert_eq!(group.language, Language::Zh);
+            assert_eq!(group.summary.failed, 0);
+            assert!(group.report.lock().unwrap().path.is_none());
+        }
+    }
+
+    #[test]
     fn native_presentation_releases_state_before_sending_progress_and_completion() {
         let directory = TestDirectory::new();
         let publisher = publisher(directory.0.clone());
         let first = publisher.register(Arc::from("01"), Language::En);
         first.event(queued(1, "first.zip", None, 0));
-        assert!(publisher.shared.present(|| {
+        assert!(publisher.shared.present("01", || {
             assert!(publisher.shared.state.try_lock().is_ok());
             progress(&first, 1, "first.zip", 1, 2);
         }));

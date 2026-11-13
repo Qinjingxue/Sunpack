@@ -172,6 +172,16 @@ impl ArchiveInput {
             .chain(use_entry.then_some(self.entry_path.as_str()))
     }
 
+    pub(crate) fn execution_evidence(&self) -> Option<&str> {
+        let facts = &self.analysis;
+        // Relation discovery emits its confirmed missing-volume fact directly.
+        // Advisory planning only exports it for a structured multi-part input;
+        // a single-file internal hint is not confirmed missing-volume evidence.
+        let eligible = !facts.planning_applied && facts.origin == AnalysisOrigin::Relations
+            || self.mode.structured() && self.parts.len() > 1;
+        eligible.then_some(facts.missing_volume_evidence.as_deref()).flatten()
+    }
+
     pub(crate) fn worker_input(&self) -> WorkerInput<'_> {
         let attempts = self.volume_attempts.as_deref();
         WorkerInput {
@@ -182,9 +192,7 @@ impl ArchiveInput {
             ranges: &self.ranges,
             volume_attempts: attempts,
             analysis: self
-                .analysis
-                .missing_volume_evidence
-                .as_deref()
+                .execution_evidence()
                 .filter(|_| attempts.is_none())
                 .map(|missing_volume_evidence| WireAnalysis {
                     execution: WireExecution {
@@ -311,24 +319,13 @@ impl Serialize for AttemptReport<'_> {
 
 struct AnalysisReport<'a>(&'a ArchiveInput);
 impl AnalysisReport<'_> {
-    fn execution_evidence(&self) -> Option<&str> {
-        let input = self.0;
-        let facts = &input.analysis;
-        // Relation discovery emits its confirmed missing-volume fact directly.
-        // Advisory planning only exports it for a structured multi-part input;
-        // a single-file internal hint is not a public execution descriptor.
-        let eligible = !facts.planning_applied && facts.origin == AnalysisOrigin::Relations
-            || input.mode.structured() && input.parts.len() > 1;
-        eligible.then_some(facts.missing_volume_evidence.as_deref()).flatten()
-    }
-
     fn has_fields(&self) -> bool {
         let facts = &self.0.analysis;
         if facts.origin == AnalysisOrigin::RelationsFallback && !facts.planning_applied { return false; }
         facts.origin == AnalysisOrigin::Planned || facts.origin != AnalysisOrigin::Plain && facts.volume_completeness.is_some()
             || (self.0.format_hint == "lz4" && facts.structure_complete)
             || (facts.origin != AnalysisOrigin::Embedded || facts.planning_applied) && facts.zip_eocd_offset.is_some()
-            || self.execution_evidence().is_some()
+            || self.0.execution_evidence().is_some()
             || facts.origin == AnalysisOrigin::Embedded && facts.password_required
     }
 }
@@ -356,7 +353,7 @@ impl Serialize for AnalysisReport<'_> {
                 if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
             }
             if facts.origin != AnalysisOrigin::Embedded {
-                if let Some(evidence) = self.execution_evidence() {
+                if let Some(evidence) = self.0.execution_evidence() {
                     map.serialize_entry("execution", &WireExecution { missing_volume_evidence: evidence })?;
                 }
             }
@@ -792,13 +789,17 @@ mod tests {
         input.analysis.planning_applied = true;
         input.analysis.missing_volume_evidence = Some("seven_zip_start_header_length".into());
         assert!(serde_json::to_value(input.report()).unwrap().get("analysis").is_none());
+        assert!(serde_json::to_value(input.worker_input()).unwrap().get("analysis").is_none());
         input.mode = OpenMode::NativeVolumes;
         input.parts = Box::new([InputPart::range(InputExtent { path: input.entry_path.clone(), start: 0, end: None })]);
         assert!(serde_json::to_value(input.report()).unwrap().get("analysis").is_none());
+        assert!(serde_json::to_value(input.worker_input()).unwrap().get("analysis").is_none());
         input.parts = vec![input.parts[0].clone(), InputPart::range(InputExtent {
             path: "truncated.7z.002".into(), start: 0, end: None,
         })].into_boxed_slice();
         assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
+            "seven_zip_start_header_length");
+        assert_eq!(serde_json::to_value(input.worker_input()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
             "seven_zip_start_header_length");
         // A relation conclusion is a different producer: main exports this
         // fact before planning even when only the first known volume exists.
@@ -807,6 +808,8 @@ mod tests {
         input.analysis.planning_applied = false;
         input.analysis.missing_volume_evidence = Some("relation_missing_volume".into());
         assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
+            "relation_missing_volume");
+        assert_eq!(serde_json::to_value(input.worker_input()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
             "relation_missing_volume");
     }
 

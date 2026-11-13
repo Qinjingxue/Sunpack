@@ -471,7 +471,7 @@ impl CandidateSet {
                     if input.volume_attempts.is_none() =>
                 {
                     let kind = if result.status == "missing_volume"
-                        || input.analysis.missing_volume_evidence.is_some()
+                        || input.execution_evidence().is_some()
                     {
                         FailureKind::MissingVolume
                     } else if result.message.starts_with("resource_unavailable:") {
@@ -784,6 +784,17 @@ mod tests {
         assert_eq!(fault["actual"], 5);
         assert_eq!(fault["possible_missing_volume"], false);
         assert!(!failure.message.is_empty());
+        // An advisory tail hint does not turn this same damaged file into a
+        // confirmed missing volume. Relation discovery may confirm it.
+        let mut hinted = input.clone();
+        hinted.analysis.planning_applied = true;
+        hinted.analysis.missing_volume_evidence = Some("seven_zip_start_header_length".into());
+        assert_eq!(candidates.plan(&hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
+            FailureKind::Damaged);
+        hinted.analysis.planning_applied = false;
+        hinted.analysis.origin = crate::io::archive_state::AnalysisOrigin::Relations;
+        assert_eq!(candidates.plan(&hinted, None, &Cancellation::new()).unwrap().err().unwrap().kind,
+            FailureKind::MissingVolume);
         let _ = std::fs::remove_file(path);
     }
 

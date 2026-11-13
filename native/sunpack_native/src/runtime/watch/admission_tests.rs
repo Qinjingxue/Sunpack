@@ -246,6 +246,77 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
 }
 
 #[test]
+fn semantic_reload_recovers_pending_after_output_unlock() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const CHILD: &str = "SUNPACK_RELOAD_PENDING_RECOVERY_TEST";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        let configuration = base.join("sunpack_advanced_config.json");
+        fs::write(&configuration, b"{}").unwrap();
+        let directory = base.join("recovery");
+        let watched = directory.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let source = watched.join("owner.zip");
+        fs::write(&source, b"outer archive").unwrap();
+            let root_id = key(&watched);
+            let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
+            let settings = Arc::new(config::load_snapshot(&base).unwrap().config);
+            let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
+            let mut scheduler = Scheduler {
+                admission_checkpoint: None,
+                candidate_diagnostics: CandidateDiagnostics::default(),
+                cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
+                roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
+                    recursive: true, deep: false, scanned: true }, scope))]),
+                available_roots: HashSet::from([root_id.clone()]),
+                user_password_signature: user_password_signature(&settings.user_passwords),
+                settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+                options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
+                deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
+                passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
+                root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+                parent_observers: HashMap::new(), config_observers: Vec::new(),
+                pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+                active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+                tray: None, monitor: None, toast: None, cache_deadline: None,
+                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+            };
+            let owner = source.to_str().unwrap();
+            let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
+            scheduler.journal.commit(true, |state| {
+                Ok(state.pending_operations(
+                    [(PendingObservation(owner.into(), candidate.size as i64, candidate.mtime,
+                        candidate.observation.file_id.clone(), candidate.observation.change_usn),
+                        watched.to_string_lossy().into_owned(), None)],
+                    false, watched.to_str().unwrap(), false, true, None,
+                )?.0)
+            }).unwrap();
+
+        write_roots(&scheduler.root_file, &[scheduler.roots[&root_id].0.clone()]).unwrap();
+        let output = watched.join("interrupted-output");
+        scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
+            output.to_string_lossy().into_owned(), output.to_string_lossy().into_owned(),
+            None, None)?.unwrap())).unwrap();
+        let member = output.join("locked.txt");
+        fs::write(&member, b"unfinished extraction").unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(&member).unwrap();
+        scheduler.recover_pending(None).unwrap();
+        assert!(scheduler.pending.is_empty());
+        assert!(scheduler.journal.state().pending(owner).is_some());
+        drop(lock);
+        fs::write(&configuration, br#"{"cli":{"language":"zh"}}"#).unwrap();
+        assert!(scheduler.reload().unwrap());
+        assert!(!output.exists(), "semantic restart must retry interrupted cleanup");
+        assert!(scheduler.pending.contains_key(&key(&source)), "unchanged durable work must be admitted again");
+        return;
+    }
+    run_isolated("semantic_reload_recovers_pending_after_output_unlock", CHILD);
+}
+
+#[test]
 fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
     use std::time::Duration;
     const CHILD: &str = "SUNPACK_PASSWORD_RETRY_QUIET_TEST";

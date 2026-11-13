@@ -187,3 +187,38 @@ def test_failed_first_segment_keeps_its_output_name_for_password_retry(package, 
     assert ordinary.read_bytes() == b"ordinary"
     assert ordinary.parent.name == secret.parent.name + "(1)"
     assert ordinary.parent.parent == secret.parent.parent == output / "carrier"
+
+
+def test_direct_truncated_single_7z_tail_is_not_confirmed_missing_volume(package, tmp_path):
+    # Preserve a valid start header whose next-header range exceeds EOF. The
+    # opaque prefix bypasses Relations' offset-zero anchor; disabled Embedded
+    # leaves this explicit file to the same Direct advisory/worker path.
+    (tmp_path / "payload.txt").write_bytes(b"payload" * 256)
+    complete = tmp_path / "complete.7z"
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", str(complete), "payload.txt"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    data = complete.read_bytes()
+    next_header = 32 + int.from_bytes(data[12:20], "little")
+    assert next_header >= 32 and next_header < len(data)
+    source = tmp_path / "carrier.bin"
+    source.write_bytes(b"opaque-prefix\0" + data[:next_header])
+    package.configure(embedded_scan={"enabled": False})
+    report = package.json(
+        "extract", "--direct-file", "--no-builtin-pw", "-r", "1", "-c", "k",
+        "-o", tmp_path / "out", source, code=1,
+    )
+    assert report["summary"]["failed_count"] == 1, report
+    assert report["tasks"][0]["failures"][0]["kind"] != "missing_volume", report
+
+    def check_blockers(value):
+        if isinstance(value, dict):
+            assert "missing_volume" not in value.get("blockers", []), report
+            for child in value.values():
+                check_blockers(child)
+        elif isinstance(value, list):
+            for child in value:
+                check_blockers(child)
+
+    check_blockers(report)

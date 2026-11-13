@@ -290,6 +290,7 @@ impl Engine {
             promoted_sources,
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
+            cleanup_refs: Arc::default(),
         }))
     }
 
@@ -405,6 +406,62 @@ struct Run<'a, O> {
     promoted_sources: HashMap<String, usize>,
     scan_errors: Mutex<DirectoryReadErrors>,
     cleanup_tasks: Mutex<CleanupTasks>,
+    cleanup_refs: Arc<Mutex<CleanupRefs>>,
+}
+
+// Request-local cleanup ownership follows the planned consumers, not the
+// duration of an individual worker lease. A failed owner vetoes shared deletion.
+#[derive(Default)]
+struct CleanupRefs {
+    paths: HashMap<String, (usize, bool)>,
+}
+
+struct CleanupOwner {
+    registry: Arc<Mutex<CleanupRefs>>,
+    paths: HashSet<String>,
+}
+
+impl CleanupOwner {
+    fn new(registry: Arc<Mutex<CleanupRefs>>, paths: &[String]) -> Self {
+        let mut owner = Self { registry, paths: HashSet::new() };
+        owner.refresh(paths);
+        owner
+    }
+
+    fn refresh(&mut self, paths: &[String]) {
+        let paths: HashSet<_> = paths.iter().map(|path| namespace_key(Path::new(path))).collect();
+        let mut refs = self.registry.lock().unwrap();
+        for key in self.paths.difference(&paths) {
+            let entry = refs.paths.get_mut(key).expect("registered cleanup owner");
+            entry.0 -= 1;
+            if entry.0 == 0 { refs.paths.remove(key); }
+        }
+        for key in paths.difference(&self.paths) {
+            refs.paths.entry(key.clone()).or_default().0 += 1;
+        }
+        self.paths = paths;
+    }
+
+    fn release(&mut self, eligible: bool) -> HashSet<String> {
+        let mut allowed = HashSet::new();
+        let mut refs = self.registry.lock().unwrap();
+        for key in self.paths.drain() {
+            let entry = refs.paths.get_mut(&key).expect("registered cleanup owner");
+            entry.0 -= 1;
+            entry.1 |= !eligible;
+            if entry.0 == 0 {
+                if !entry.1 { allowed.insert(key.clone()); }
+                refs.paths.remove(&key);
+            }
+        }
+        allowed
+    }
+}
+
+impl Drop for CleanupOwner {
+    fn drop(&mut self) {
+        if !self.paths.is_empty() { self.release(false); }
+    }
 }
 
 #[derive(Default)]
@@ -1092,7 +1149,7 @@ impl<'run, O: Observer> Run<'run, O> {
         if self.resolve_aliases { dedup_resolved_plans(&mut discovered.tasks); }
         // Request admission covers only the user's original selections, as in
         // main. Discovery may resolve different selections to one volume family;
-        // claim_task serializes that family without rejecting either request.
+        // claim_task shares reads within a request and serializes other requests.
         let executed = self.execute_batch(discovered, 1, None, None, spawner).await;
         self.finish(executed).await.map(PublicOutcome::from)
     }
@@ -1214,7 +1271,9 @@ impl<'run, O: Observer> Run<'run, O> {
         let has_root_errors = !root_errors.is_empty();
         let root_errors = Mutex::new(root_errors);
         let task_count = batch.tasks.len();
-        let executed = spawner.bounded_map(batch.tasks, move |task| {
+        // Register every planned consumer before any one of them can finish.
+        let tasks = batch.tasks.into_iter().map(|task| self.register_task(task)).collect();
+        let executed = spawner.bounded_map(tasks, move |(task, sources)| {
             let root_errors = has_root_errors
                 .then(|| root_errors.lock().unwrap().remove(&task.entry().entry_path))
                 .flatten();
@@ -1228,7 +1287,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 let ready = stage("report", &Cancellation::new()).await;
                 let id = owner.queue_task(task.entry(), depth, parent_id, None);
                 let mut result = match ready {
-                    Ok(()) => owner.execute_task(task, id, depth, scope, children).await,
+                    Ok(()) => owner.execute_task((task, sources), id, depth, scope, children).await,
                     Err(error) => Err(error),
                 };
                 let unowned_errors = match (&mut result, root_errors) {
@@ -1389,9 +1448,14 @@ impl<'run, O: Observer> Run<'run, O> {
         true
     }
 
+    fn register_task(&self, task: Task) -> (Task, CleanupOwner) {
+        let sources = CleanupOwner::new(Arc::clone(&self.cleanup_refs), &task.owned_paths);
+        (task, sources)
+    }
+
     fn execute_task(
         self: &Arc<Self>,
-        mut task: Task,
+        (mut task, mut sources): (Task, CleanupOwner),
         task_id: TaskId,
         depth: usize,
         inherited_scope: Option<Arc<RecursiveScope>>,
@@ -1494,6 +1558,11 @@ impl<'run, O: Observer> Run<'run, O> {
                         failure.is_password_retry() || failure.contains(FailureKind::MissingVolume)))
                 {
                     let destination = this.promotion_directory(&owner_path, inherited_scope.as_deref());
+                    drop(lease);
+                    lease = this.engine.leases.acquire(
+                        task.owned_paths.iter().map(|path| resolved_key(Path::new(path))).collect(),
+                        cancel,
+                    ).await?;
                     this.promote_blocked(&task.owned_paths, &destination, &generations,
                         &mut completed, &mut outcome, &mut shell).await?;
                 }
@@ -1739,6 +1808,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             had_checkpoints |= replacement_checkpoint.is_some();
                             executed.result.output = None;
                             this.observer.after_output(&executed.result)?;
+                            sources.refresh(&replacement.owned_paths);
                             drop(lease);
                             lease = this.claim_task(&replacement).await?;
                             stage("preflight", cancel).await?;
@@ -2079,6 +2149,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     !superseded_candidates.contains(&path_key(path))
                         || retained.contains(&path_key(path))
                 });
+                sources.refresh(&promotion_sources);
             }
             if let Some(root) = &carrier {
                 if completed.iter().all(|entry| entry.output.is_none()) {
@@ -2111,6 +2182,13 @@ impl<'run, O: Observer> Run<'run, O> {
                 })
             {
                 let destination = this.promotion_directory(&owner_path, inherited_scope.as_deref());
+                // Release this task's read pin before upgrading. Sibling readers
+                // may finish concurrently; publishing a moved source is exclusive.
+                drop(lease);
+                lease = this.engine.leases.acquire(
+                    promotion_sources.iter().map(|path| resolved_key(Path::new(path))).collect(),
+                    cancel,
+                ).await?;
                 this.promote_blocked(
                     &promotion_sources,
                     &destination,
@@ -2161,12 +2239,14 @@ impl<'run, O: Observer> Run<'run, O> {
                     stage("output_state", &Cancellation::new()).await?;
                     this.observer.sources_processed(&completed, &generations)?;
                 }
+                let cleanup_paths = sources.release(true);
                 let mode = if depth > 1 { CleanupMode::Delete }
                     else { this.request.config.post_extract.archive_cleanup_mode };
                 let generated: HashSet<_> = admitted_promoted.iter().map(|(path, _)| (*path).clone()).collect();
                 let mut deletes = Vec::new();
                 let mut recycles = Vec::new();
                 for path in &promotion_sources {
+                    if !cleanup_paths.contains(&namespace_key(Path::new(path))) { continue; }
                     if mode == CleanupMode::Delete || generated.contains(path) {
                         deletes.push(PathBuf::from(path));
                     } else if mode == CleanupMode::Recycle {
@@ -2186,12 +2266,16 @@ impl<'run, O: Observer> Run<'run, O> {
                     let id = tasks.next_id;
                     tasks.next_id += 1;
                     let task = spawner.spawn(Box::pin(async move {
-                        let _lease = lease;
+                        // Read pins can be shared within a request; mutation cannot.
+                        let keys = recycles.iter().chain(&deletes).map(|path| resolved_key(path)).collect();
+                        drop(lease);
                         let mut outcome = Outcome::default();
                         if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
-                            let mut shell = cleanup.engine.shell.branch();
-                            cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut outcome, &mut shell);
-                            cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut outcome, &mut shell);
+                            if let Ok(_exclusive) = cleanup.engine.leases.acquire(keys, &cleanup.request.cancel).await {
+                                let mut shell = cleanup.engine.shell.branch();
+                                cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut outcome, &mut shell);
+                                cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut outcome, &mut shell);
+                            }
                         }
                         let mut tasks = cleanup.cleanup_tasks.lock().unwrap();
                         tasks.retire(id);
@@ -2564,7 +2648,7 @@ impl<'run, O: Observer> Run<'run, O> {
             .iter()
             .map(|path| resolved_key(Path::new(path)))
             .collect();
-        self.engine.leases.acquire(keys, &self.request.cancel).await
+        self.engine.leases.acquire_shared(keys, self.output_names.owner, &self.request.cancel).await
     }
 
     fn capture_generations(&self, task: &Task) -> (HashMap<String, PhysicalFileGeneration>, Vec<PathBuf>) {
@@ -3967,7 +4051,7 @@ struct Leases {
 
 #[derive(Default)]
 struct LeaseState {
-    active: HashSet<String>,
+    active: HashMap<String, (Option<u64>, usize)>,
     requests: HashMap<u64, RequestClaim>,
     next_waiter: u64,
     waiters: HashMap<u64, LeaseWaiter>,
@@ -4219,7 +4303,13 @@ impl Leases {
         keys: HashSet<String>,
         cancel: &Cancellation,
     ) -> io::Result<Lease> {
-        self.acquire_absent(keys, &[], cancel).await
+        self.acquire_paths(keys, &[], None, cancel).await
+    }
+
+    async fn acquire_shared(
+        self: &Arc<Self>, keys: HashSet<String>, request: u64, cancel: &Cancellation,
+    ) -> io::Result<Lease> {
+        self.acquire_paths(keys, &[], Some(request), cancel).await
     }
 
     async fn acquire_absent(
@@ -4227,6 +4317,13 @@ impl Leases {
         keys: HashSet<String>,
         absent: &[(PathBuf, PathBuf)],
         cancel: &Cancellation,
+    ) -> io::Result<Lease> {
+        self.acquire_paths(keys, absent, None, cancel).await
+    }
+
+    async fn acquire_paths(
+        self: &Arc<Self>, keys: HashSet<String>, absent: &[(PathBuf, PathBuf)],
+        request: Option<u64>, cancel: &Cancellation,
     ) -> io::Result<Lease> {
         let mut waiting = LeaseWait {
             owner: self,
@@ -4250,16 +4347,19 @@ impl Leases {
             if let Err(error) = cancel.check_io() {
                 return Poll::Ready(Err(error));
             }
-            if keys.is_disjoint(&state.active) {
-                state.active.extend(keys.iter().cloned());
+            let blockers: HashSet<_> = keys.iter().filter(|key| {
+                state.active.get(*key).is_some_and(|(owner, _)| request.is_none() || *owner != request)
+            }).cloned().map(LeaseBlocker::Path).collect();
+            if blockers.is_empty() {
+                for key in &keys {
+                    state.active.entry(key.clone()).or_insert((request, 0)).1 += 1;
+                }
                 return Poll::Ready(Ok(()));
             }
             let id = *waiting.id.get_or_insert_with(|| {
                 state.next_waiter += 1;
                 state.next_waiter
             });
-            let blockers = keys.intersection(&state.active)
-                .cloned().map(LeaseBlocker::Path).collect();
             state.wait(id, blockers, cx.waker());
             drop(state);
             if subscription.is_none() {
@@ -4302,14 +4402,17 @@ impl Drop for Lease {
     fn drop(&mut self) {
         let mut state = self.owner.state.lock().unwrap();
         let active = &mut state.active;
+        let mut released = Vec::new();
         for key in &self.keys {
-            active.remove(key);
+            let (_, count) = active.get_mut(key).expect("lease owns its path");
+            *count -= 1;
+            if *count == 0 { active.remove(key); released.push(key); }
         }
         if active.capacity() > 256.max(active.len().saturating_mul(4)) {
             let target = active.len().saturating_mul(2);
             active.shrink_to(target);
         }
-        let waiters: Vec<_> = self.keys.iter()
+        let waiters: Vec<_> = released.into_iter()
             .flat_map(|key| state.released(&LeaseBlocker::Path(key.clone()))).collect();
         drop(state);
         for waker in waiters { waker.wake(); }
@@ -4328,6 +4431,65 @@ mod tests {
             self.archives.len() - self.succeeded() + self.errors.iter()
                 .filter(|error| error.kind != InputErrorKind::Cleanup).map(InputError::count).sum::<usize>()
         }
+    }
+
+    #[test]
+    fn shared_cleanup_waits_for_every_owner_and_preserves_failed_sources() {
+        let registry = Arc::new(Mutex::new(CleanupRefs::default()));
+        let paths = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
+        let key = |path: &str| namespace_key(Path::new(path));
+        let mut first = CleanupOwner::new(Arc::clone(&registry), &paths(&["a.001", "tail.002"]));
+        let mut second = CleanupOwner::new(Arc::clone(&registry), &paths(&["b.001", "tail.002"]));
+        assert_eq!(first.release(true), HashSet::from([key("a.001")]));
+        assert_eq!(second.release(true), HashSet::from([key("b.001"), key("tail.002")]));
+        assert!(registry.lock().unwrap().paths.is_empty());
+
+        let first = CleanupOwner::new(Arc::clone(&registry), &paths(&["a.001", "tail.002"]));
+        let mut second = CleanupOwner::new(Arc::clone(&registry), &paths(&["b.001", "tail.002"]));
+        drop(first); // Includes cancelled and never-dispatched batch owners.
+        assert_eq!(second.release(true), HashSet::from([key("b.001")]));
+        assert!(registry.lock().unwrap().paths.is_empty());
+
+        let mut first = CleanupOwner::new(Arc::clone(&registry), &paths(&["a.001", "old.002"]));
+        let mut second = CleanupOwner::new(Arc::clone(&registry), &paths(&["b.001", "new.002"]));
+        first.refresh(&paths(&["a.001", "new.002"]));
+        assert!(!registry.lock().unwrap().paths.contains_key(&key("old.002")));
+        assert_eq!(second.release(true), HashSet::from([key("b.001")]));
+        assert_eq!(first.release(true), HashSet::from([key("a.001"), key("new.002")]));
+        assert!(registry.lock().unwrap().paths.is_empty());
+    }
+
+    #[test]
+    fn request_read_pins_share_sources_but_mutation_and_other_requests_wait() {
+        use std::future::Future;
+        use std::task::{Context, Wake};
+        struct Noop;
+        impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+        let leases = Arc::new(Leases::default());
+        let cancel = Cancellation::new();
+        let keys = || HashSet::from(["tail.002".to_owned()]);
+        let first = super::super::scheduling::block_on(leases.acquire_shared(keys(), 1, &cancel)).unwrap();
+        let second = super::super::scheduling::block_on(leases.acquire_shared(keys(), 1, &cancel)).unwrap();
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut other = Box::pin(leases.acquire_shared(keys(), 2, &cancel));
+        let mut mutation = Box::pin(leases.acquire(keys(), &cancel));
+        assert!(other.as_mut().poll(&mut cx).is_pending());
+        assert!(mutation.as_mut().poll(&mut cx).is_pending());
+        drop(first);
+        assert!(mutation.as_mut().poll(&mut cx).is_pending());
+        drop(second);
+        let exclusive = match mutation.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(lease)) => lease,
+            _ => panic!("all readers retired"),
+        };
+        assert!(other.as_mut().poll(&mut cx).is_pending());
+        drop(exclusive);
+        assert!(matches!(other.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        drop(other);
+        drop(mutation);
+        let state = leases.state.lock().unwrap();
+        assert!(state.active.is_empty() && state.waiters.is_empty() && state.blocked_by.is_empty());
     }
 
     #[test]
@@ -5090,6 +5252,7 @@ mod tests {
             promoted_sources: HashMap::new(),
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
+            cleanup_refs: Arc::default(),
         })
     }
 
@@ -5232,7 +5395,7 @@ mod tests {
                     }));
             }
             let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
-                run.execute_task(task, 1, 1, None, spawner)
+                run.execute_task(run.register_task(task), 1, 1, None, spawner)
             }).unwrap();
             assert_eq!(outcome.archives.len(), if mode == Mode::Scan { count } else { 1 });
             let events = events.lock().unwrap();
@@ -5310,7 +5473,7 @@ mod tests {
                     path.parent().unwrap().to_string_lossy().into_owned(), Some(0), Vec::new()))),
             };
             let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner|
-                run.execute_task(task, 1, 1, None, spawner)).unwrap();
+                run.execute_task(run.register_task(task), 1, 1, None, spawner)).unwrap();
             assert_eq!(outcome.archives.len(), count);
             for (index, result) in outcome.archives.iter().enumerate() {
                 assert_eq!(result.failure.as_ref().unwrap().kind,
@@ -5430,7 +5593,7 @@ mod tests {
                         scope: None,
                     };
                     let outcome = Scheduler::new().run(1, origin, &request.cancel, |spawner| {
-                        run.execute_task(task, 1, depth, None, spawner)
+                        run.execute_task(run.register_task(task), 1, depth, None, spawner)
                     }).unwrap();
                     assert!(outcome.archives.is_empty());
                     assert!(outcome.errors.is_empty());
@@ -5547,7 +5710,7 @@ mod tests {
             let outcome = run.recursion.serve(&request.cancel,
                 |depth, pending| observer.allow_recursive(depth, pending),
                 || scheduler.run(1, Origin::Foreground, &request.cancel, |spawner| {
-                    run.execute_task(task, 1000, 1, None, spawner)
+                    run.execute_task(run.register_task(task), 1000, 1, None, spawner)
                 }),
             ).unwrap();
             assert_eq!(observer.started.lock().unwrap().len(), if count == 1 { 1 } else { count + 1 });
@@ -5687,7 +5850,7 @@ mod tests {
         let scheduler = Scheduler::new();
         scheduler.configure_capacity(1);
         let outcome = scheduler.run(1, Origin::Foreground, &request.cancel, |spawner| Box::pin(async {
-            let outcome = run.execute_task(task, 1, 1, None, spawner).await;
+            let outcome = run.execute_task(run.register_task(task), 1, 1, None, spawner).await;
             run.finish(outcome).await
         })).unwrap();
         assert!(finished.load(Ordering::Acquire));
@@ -5743,7 +5906,7 @@ mod tests {
                     scope: None,
                 };
                 Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
-                    run.execute_task(task, 1, 2, None, spawner)
+                    run.execute_task(run.register_task(task), 1, 2, None, spawner)
                 }).unwrap()
             };
             // Permit generation reads but deny rename/removal without production hooks.
@@ -5828,7 +5991,7 @@ mod tests {
                 scope: None,
             };
             Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
-                run.execute_task(task, 1, depth, None, spawner)
+                run.execute_task(run.register_task(task), 1, depth, None, spawner)
             }).unwrap()
         }
 
@@ -6746,7 +6909,7 @@ mod tests {
                 scope: None,
             };
             let outcome = Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
-                run.execute_task(task, 1, 1, None, spawner)
+                run.execute_task(run.register_task(task), 1, 1, None, spawner)
             }).unwrap();
             assert_eq!(outcome.archives.len(), 2);
             assert_eq!(outcome.failed(), if complete_sibling { 1 } else { 2 });
@@ -6837,7 +7000,7 @@ mod tests {
                         let outcome = run.recursion.serve(&request.cancel,
                             |depth, pending| observer.allow_recursive(depth, pending),
                             || Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
-                                run.execute_task(task, 1, 1, None, spawner)
+                                run.execute_task(run.register_task(task), 1, 1, None, spawner)
                             }),
                         ).unwrap();
                         assert_eq!(observer.0.lock().unwrap().as_deref(), Some(container.as_path()),

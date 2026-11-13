@@ -2149,6 +2149,7 @@ impl Scheduler {
         ))).transpose()?;
         if scheduler_changed {
             self.drain_active(&mut Ok(0))?;
+            if let Some(toast) = &self.toast { toast.reset_batches(); }
         }
         let roots_changed = match self.reconcile_roots() {
             Ok(changed) => changed,
@@ -2172,6 +2173,7 @@ impl Scheduler {
             if config_changed {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
             }
+            if scheduler_changed { self.recover_pending(None)?; }
             self.checkpoint_reload(scheduler_changed || roots_changed)?;
             if scheduler_changed {
                 // main restarts its scheduler on semantic policy changes,
@@ -2192,6 +2194,7 @@ impl Scheduler {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
                 let latest_roots_changed = self.reconcile_roots()?;
                 self.activate_scan_options()?;
+                if scheduler_changed { self.recover_pending(None)?; }
                 self.checkpoint_reload(scheduler_changed || roots_changed || latest_roots_changed)
             })();
             if let Err(rollback_error) = rollback {

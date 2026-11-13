@@ -500,7 +500,7 @@ impl InputRecovery {
             let mut blockers = Vec::new();
             if let Some(error) = error {
                 if error.contains(FailureKind::MissingVolume)
-                    || checkpoint.input.analysis.missing_volume_evidence.is_some()
+                    || checkpoint.input.execution_evidence().is_some()
                     || checkpoint.input.analysis.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing)
                     || error.evidence.as_deref().is_some_and(|e| e.classification_evidence.as_deref() == Some("password_or_volume_inconclusive"))
                 { blockers.push("missing_volume"); }
@@ -605,6 +605,19 @@ mod tests {
         assert_eq!(report["inputs"][0]["archive_input"]["logical_name"], "original");
         assert_eq!(report["inputs"][0]["generation"], serde_json::to_value(&checkpoint.sources).unwrap());
         assert!(recovery.aggregated());
+        let mut hinted = checkpoint.clone();
+        let facts = &mut Arc::make_mut(&mut hinted.input).analysis;
+        facts.planning_applied = true;
+        facts.missing_volume_evidence = Some("seven_zip_start_header_length".into());
+        let hinted_report = InputRecovery::capture(&[hinted.clone()], &source, None, None, 1, false, true)
+            .unwrap().report(render);
+        assert_eq!(hinted_report["inputs"][0]["blockers"], serde_json::json!([]));
+        let facts = &mut Arc::make_mut(&mut hinted.input).analysis;
+        facts.planning_applied = false;
+        facts.origin = crate::io::archive_state::AnalysisOrigin::Relations;
+        let confirmed_report = InputRecovery::capture(&[hinted], &source, None, None, 1, false, true)
+            .unwrap().report(render);
+        assert_eq!(confirmed_report["inputs"][0]["blockers"], serde_json::json!(["missing_volume"]));
         // Same-request replacement keeps the first checkpoint until a result
         // with the same logical ID overwrites it. Name/mode changes alone do
         // not invent another logical input; a different format does.
