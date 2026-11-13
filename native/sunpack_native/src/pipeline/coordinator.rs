@@ -2256,9 +2256,10 @@ impl<'run, O: Observer> Run<'run, O> {
                 })
                 .collect();
             if sources_complete && this.request.mode == Mode::Extract {
-                if watch_root && complete {
+                if watch_root {
                     stage("output_state", &Cancellation::new()).await?;
-                    this.observer.sources_processed(&completed, &generations)?;
+                    this.observer.sources_processed(&completed, &generations,
+                        carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())), complete)?;
                 }
                 let cleanup_paths = sources.release(true);
                 let mode = if depth > 1 { CleanupMode::Delete }

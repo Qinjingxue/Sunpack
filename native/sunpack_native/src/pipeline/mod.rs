@@ -840,6 +840,8 @@ pub(crate) trait Observer: Send + Sync {
         &self,
         _archives: &[ArchiveResult],
         _generations: &HashMap<String, PhysicalFileGeneration>,
+        _output: Option<&Path>,
+        _subtree_complete: bool,
     ) -> io::Result<()> {
         Ok(())
     }

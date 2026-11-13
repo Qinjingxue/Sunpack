@@ -325,7 +325,8 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         scheduler.hub.claims.lock().unwrap().extend(groups.keys().map(|path| (path.clone(), Arc::<str>::from("owner"))));
         let dirty = HashSet::from([key(&source), key(&sibling)]);
         scheduler.apply_completion("owner", CompletionContext {
-            root: key(&watched), recovery: None, passwords: Arc::default(),
+            deep: false,
+            root: key(&watched), recovery: None, password_scope: watched.clone(), passwords: Arc::default(),
             inputs: vec![old, same], quiet: HashMap::new(), dirty, claimed: captured, groups, toast: None, task: None,
         }, Completed { cancelled: true, result: Err(io::Error::other("cancelled owner")),
             promoted: HashMap::new(), outputs: BTreeMap::new() }).unwrap();
@@ -337,6 +338,54 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         scheduler.enqueue(&key(&watched), sibling.to_string_lossy().into_owned(), CandidateAdmission::Observe).unwrap();
         assert_eq!(scheduler.pending.len(), 1);
         assert_eq!(scheduler.due.len(), 1);
+
+        // The old request is already released and awaiting its root report.
+        // A later complete family is recorded through the production observer
+        // before the old result reaches the actual completion/WAL path.
+        for kind in [FailureKind::MissingVolume, FailureKind::WrongPassword] {
+            let head = watched.join(format!("late-{kind:?}.001"));
+            let tail = watched.join(format!("late-{kind:?}.002"));
+            let output = watched.join(format!("late-{kind:?}-output"));
+            fs::write(&head, b"same head retained after successful extraction").unwrap();
+            let candidate = watch_candidate_for_path(&head, None).unwrap().unwrap();
+            let old = super::tests::completion_archive(head.to_str().unwrap(), 1, Some(kind));
+            fs::write(&tail, b"new complete tail").unwrap();
+            fs::create_dir(&output).unwrap();
+            let mut success = super::tests::completion_archive(head.to_str().unwrap(), 1, None);
+            success.source_paths.push(tail.clone());
+            success.output = Some(output.clone());
+            let generations = [&head, &tail].into_iter().map(|path|
+                (key(path), capture_file_generation(path).unwrap())).collect();
+            let observer = WatchObserver {
+                deep: false, journal: Arc::clone(&scheduler.journal),
+                owners: HashMap::new(), output_scopes: Arc::from([]),
+                outputs: Mutex::new(ObservedOutputs::from(BTreeMap::new())),
+                batch: Arc::from("new-success"), toast: None, hub: Arc::clone(&scheduler.hub),
+                groups: Arc::default(), claimed: Arc::default(), promoted: Mutex::default(),
+            };
+            // Main remembers complete source output even if a child failed.
+            observer.sources_processed(&[success], &generations, Some(&output), false).unwrap();
+            let mut outcome = Outcome::default();
+            outcome.archives.push(old);
+            scheduler.apply_completion("late-old-failure", CompletionContext {
+                deep: false, root: key(&watched), recovery: None, password_scope: watched.clone(), passwords: Arc::default(),
+                inputs: vec![candidate.clone()], quiet: HashMap::new(), dirty: HashSet::new(),
+                claimed: Arc::default(), groups: HashMap::new(), toast: None, task: None,
+            }, Completed { cancelled: false, result: Ok(outcome),
+                promoted: HashMap::new(), outputs: BTreeMap::new() }).unwrap();
+            assert!(scheduler.journal.state().entry(&candidate.path).is_none());
+            assert!(scheduler.journal.state().pending(&candidate.path).is_none());
+            assert!(!scheduler.pending.contains_key(&key(&head)));
+        }
+        // Reopen the durable journal: this assertion is not just live-map state.
+        let state = base.join("state");
+        drop(scheduler);
+        let reopened = journal::Journal::open(&state, 7).unwrap();
+        for kind in [FailureKind::MissingVolume, FailureKind::WrongPassword] {
+            let head = watched.join(format!("late-{kind:?}.001"));
+            assert!(reopened.state().entry(&head.to_string_lossy()).is_none());
+            assert!(reopened.state().pending(&head.to_string_lossy()).is_none());
+        }
         return;
     }
     let base = std::env::temp_dir().join(format!("sunpack-claim-release-{}-{}", std::process::id(),

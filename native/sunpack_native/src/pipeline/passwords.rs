@@ -738,6 +738,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_watch_scope_survives_family_resolution_and_recursion_but_cli_still_uses_path() {
+        let cache = AttemptCache::default();
+        let a = Path::new(r"C:\watch\A");
+        let b = Path::new(r"C:\watch\B");
+        let watch = CandidateSet::new(Arc::from([]), None, &cache, Some(b));
+        let cli = CandidateSet::new(Arc::from([]), None, &cache, None);
+        for name in ["single.zip", "family.part1.rar", "family.7z.001", "family.zip", "wrapped.enc"] {
+            let head = a.join(name);
+            assert_eq!(watch.scope(head.to_str().unwrap()), b);
+            assert_eq!(cli.scope(head.to_str().unwrap()), a);
+        }
+        let nested = watch.with_scope(Some(a));
+        assert_eq!(nested.scope(r"C:\output\inner.zip"), b);
+        let cli_nested = cli.with_scope(Some(a));
+        assert_eq!(cli_nested.scope(r"C:\output\inner.zip"), a);
+        assert!(Arc::ptr_eq(watch.inherited_scope.as_ref().unwrap(), nested.inherited_scope.as_ref().unwrap()));
+    }
+
+    #[test]
     fn failure_signatures_share_lazy_explicit_digest_without_changing_candidates() {
         let cache = AttemptCache::default();
         let values = Arc::from([Arc::from(""), Arc::from("first"), Arc::from("second")]);

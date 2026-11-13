@@ -823,11 +823,41 @@ impl VolumeChanges {
     }
 }
 
+// Only ordinary native notifications carry provenance. Recovery/checkpoint
+// observations must not inherit an unrelated event from an earlier burst.
+#[derive(Debug, PartialEq, Eq)]
+enum CandidateEvent {
+    Created,
+    Modified,
+    Moved(PathBuf),
+}
+
+impl CandidateEvent {
+    fn native(action: u32, path: &Path, rename_source: &mut Option<PathBuf>) -> Option<Self> {
+        match action {
+            1 => Some(Self::Created),
+            3 => Some(Self::Modified),
+            4 => { *rename_source = Some(path.to_owned()); None }
+            5 => rename_source.take().map(Self::Moved),
+            _ => None,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self { Self::Created => "created", Self::Modified => "modified", Self::Moved(_) => "moved" }
+    }
+
+    fn source(&self) -> std::borrow::Cow<'_, str> {
+        match self { Self::Moved(path) => path.to_string_lossy(), _ => "".into() }
+    }
+}
+
 #[derive(Default)]
 struct Signals {
     changed_roots: HashMap<String, HashSet<PathBuf>>,
     topology_roots: HashSet<String>,
     modified_paths: HashSet<PathBuf>,
+    candidate_events: HashMap<PathBuf, CandidateEvent>,
     reload: bool,
     reload_waiters: Vec<CommandReply<bool>>,
     once: Vec<CommandReply<()>>,
@@ -874,10 +904,60 @@ struct Hub {
     wake: std::sync::Condvar,
     claims: Mutex<HashMap<String, Arc<str>>>,
     seeds: Mutex<HashMap<String, Seed>>,
+    completed_families: Mutex<CompletedFamilies>,
     pending_count: AtomicUsize,
 }
 
 type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
+
+// Like main's completed Watch family cache, this outlives seed admission but
+// remains bounded. Receipt publication can lag behind source lease release.
+const COMPLETED_FAMILY_LIMIT: usize = 4096;
+type CompletedFamilyKey = (Arc<[String]>, bool);
+
+#[derive(Default)]
+struct CompletedFamilies {
+    sequence: u64,
+    by_family: HashMap<CompletedFamilyKey, u64>,
+    ordered: BTreeMap<u64, (CompletedFamilyKey, Arc<SourceGenerations>, PathBuf)>,
+}
+
+impl CompletedFamilies {
+    fn remember(&mut self, generations: Arc<SourceGenerations>, deep: bool, output: &Path) {
+        if generations.is_empty() { return; }
+        let mut members: Vec<_> = generations.keys().cloned().collect();
+        members.sort_unstable();
+        let family = (Arc::from(members), deep);
+        if let Some(previous) = self.by_family.remove(&family) { self.ordered.remove(&previous); }
+        self.sequence += 1;
+        self.by_family.insert(family.clone(), self.sequence);
+        self.ordered.insert(self.sequence, (family, generations, output.to_owned()));
+        while self.ordered.len() > COMPLETED_FAMILY_LIMIT {
+            let (_, (family, _, _)) = self.ordered.pop_first().unwrap();
+            self.by_family.remove(&family);
+        }
+    }
+
+    fn covers(&mut self, path: &Path, deep: bool) -> bool {
+        let path = key(path);
+        let matched = self.ordered.iter().find_map(|(sequence, (family, generations, output))| {
+            if family.1 != deep || !generations.contains_key(&path) { return None; }
+            // Require the entire current family, not only the old request's head.
+            let same = generations.iter().all(|(member, previous)| {
+                crate::io::reader::capture_file_generation(Path::new(member))
+                    .is_ok_and(|current| current.matches_input(&previous.persisted()))
+            });
+            (same).then_some((*sequence, output.is_dir()))
+        });
+        let Some((sequence, live)) = matched else { return false; };
+        let (family, generations, output) = self.ordered.remove(&sequence).unwrap();
+        if !live { self.by_family.remove(&family); return false; }
+        self.sequence += 1;
+        self.by_family.insert(family.clone(), self.sequence);
+        self.ordered.insert(self.sequence, (family, generations, output));
+        true
+    }
+}
 
 struct Seed {
     owners: u8,
@@ -893,6 +973,7 @@ impl Hub {
             wake: std::sync::Condvar::new(),
             claims: Mutex::default(),
             seeds: Mutex::default(),
+            completed_families: Mutex::default(),
             pending_count: AtomicUsize::new(0),
         }
     }
@@ -1236,9 +1317,12 @@ impl RootObserver {
             let mut modified = HashSet::new();
             let mut topology = HashSet::new();
             let mut password_changed = false;
+            let mut events = HashMap::new();
+            let mut rename_source = None;
             let mut paths = names.map(|names| names.into_iter()
                 .filter_map(|change| {
                     let path = watched_dir.join(change.name);
+                    let event = CandidateEvent::native(change.action, &path, &mut rename_source);
                     if path.file_name().is_some_and(|name| {
                         name.to_string_lossy().eq_ignore_ascii_case(&password_name)
                     }) && key(&path) == password_path {
@@ -1247,6 +1331,7 @@ impl RootObserver {
                     }
                     if change.action == 3 { modified.insert(path.clone()); }
                     else { topology.insert(path.clone()); }
+                    if let Some(event) = event { events.entry(path.clone()).or_insert(event); }
                     Some(path)
                 })
                 .filter(|path| scope.contains(&path.to_string_lossy())).collect::<Vec<_>>());
@@ -1260,6 +1345,9 @@ impl RootObserver {
                     if !root_changed { return; }
                     if let Some(paths) = &paths {
                         for path in paths {
+                            if let Some(event) = events.remove(path) {
+                                signals.candidate_events.entry(path.clone()).or_insert(event);
+                            }
                             if topology.contains(path) {
                                 signals.modified_paths.remove(path);
                             } else if modified.contains(path)
@@ -1423,12 +1511,13 @@ struct Pending {
     recovery: Option<Arc<Recovery>>,
 }
 
-// Match WatchLogStore's per-event/path 30-second history, including when a
-// candidate leaves and re-enters pending. Fixed intervals keep expiry FIFO.
+// One bounded history for both admission waits (30s) and observation errors
+// (300s), matching main's event/path diagnostic ownership and expiry.
 #[derive(Default)]
 struct CandidateDiagnostics {
-    paths: HashMap<Arc<str>, [Option<Instant>; 2]>,
+    paths: HashMap<Arc<str>, [Option<Instant>; 3]>,
     order: VecDeque<(Instant, Arc<str>, usize)>,
+    next_expiry: Option<Instant>,
 }
 
 impl CandidateDiagnostics {
@@ -1436,50 +1525,71 @@ impl CandidateDiagnostics {
         if let Some((_, path, event)) = self.order.pop_front() {
             let slots = self.paths.get_mut(&path).unwrap();
             slots[event] = None;
-            if slots.iter().all(Option::is_none) {
-                self.paths.remove(&path);
-            }
+            if slots.iter().all(Option::is_none) { self.paths.remove(&path); }
         }
     }
 
     fn clear_expired(&mut self, now: Instant) {
-        while self.deadline().is_some_and(|deadline| deadline <= now) {
-            self.retire_first();
-        }
+        if self.next_expiry.is_none_or(|expiry| expiry > now) { return; }
+        let paths = &mut self.paths;
+        self.order.retain(|(expiry, path, event)| {
+            if *expiry > now { return true; }
+            let slots = paths.get_mut(path).unwrap();
+            slots[*event] = None;
+            if slots.iter().all(Option::is_none) { paths.remove(path); }
+            false
+        });
+        self.next_expiry = self.order.iter().map(|(expiry, _, _)| *expiry).min();
         if self.order.is_empty() {
             self.paths = HashMap::new();
             self.order = VecDeque::new();
         }
     }
 
-    fn deadline(&self) -> Option<Instant> {
-        self.order.front().map(|(expiry, _, _)| *expiry)
+    fn deadline(&self) -> Option<Instant> { self.next_expiry }
+
+    fn admit(&mut self, now: Instant, id: &str, event: usize, seconds: u64) -> bool {
+        self.clear_expired(now);
+        if self.paths.get(id).is_some_and(|slots| slots[event].is_some()) { return false; }
+        if self.order.len() == 2048 { self.retire_first(); }
+        let id = self.paths.get_key_value(id).map(|(id, _)| Arc::clone(id))
+            .unwrap_or_else(|| Arc::from(id));
+        let expiry = now + std::time::Duration::from_secs(seconds);
+        self.paths.entry(Arc::clone(&id)).or_insert([None; 3])[event] = Some(expiry);
+        self.order.push_back((expiry, id, event));
+        self.next_expiry = Some(self.next_expiry.map_or(expiry, |next| next.min(expiry)));
+        true
+    }
+
+    fn error_type(error: &io::Error) -> &'static str {
+        match error.kind() {
+            io::ErrorKind::PermissionDenied => "PermissionError",
+            io::ErrorKind::NotFound => "FileNotFoundError",
+            _ => "OSError",
+        }
+    }
+
+    fn log_observation(&mut self, journal: &journal::Journal, now: Instant,
+        id: &str, path: &str, error: &io::Error, event: Option<&CandidateEvent>) {
+        if !self.admit(now, id, 2, 300) { return; }
+        journal.log(Self::observation_record(path, error, event));
+    }
+
+    fn observation_record(path: &str, error: &io::Error, event: Option<&CandidateEvent>) -> Value {
+        json!({"event":"candidate_ignored", "path":path,
+            "reason":"observation_error", "event_type":event.map_or("unknown", CandidateEvent::kind),
+            "src_path":event.map_or_else(|| "".into(), CandidateEvent::source),
+            "error":format!("{}: {error}", Self::error_type(error)),
+        })
     }
 
     fn log_wait(&mut self, journal: &journal::Journal, now: Instant, id: &str,
                 path: &str, error: Option<&io::Error>) {
-        self.clear_expired(now);
-        let event = usize::from(error.is_some());
-        if self.paths.get(id).is_some_and(|slots| slots[event].is_some()) {
-            return;
-        }
-        if self.order.len() == 2048 {
-            self.retire_first();
-        }
-        let id = self.paths.get_key_value(id).map(|(id, _)| Arc::clone(id))
-            .unwrap_or_else(|| Arc::from(id));
-        let expiry = now + std::time::Duration::from_secs(30);
-        self.paths.entry(Arc::clone(&id)).or_insert([None; 2])[event] = Some(expiry);
-        self.order.push_back((expiry, id, event));
+        if !self.admit(now, id, usize::from(error.is_some()), 30) { return; }
         match error {
             Some(error) => journal.log(json!({
                 "event":"candidate_error", "path":path,
-                "error":error.to_string(),
-                "error_type":match error.kind() {
-                    io::ErrorKind::PermissionDenied => "PermissionError",
-                    io::ErrorKind::NotFound => "FileNotFoundError",
-                    _ => "OSError",
-                },
+                "error":error.to_string(), "error_type":Self::error_type(error),
             })),
             None => journal.log(json!({"event":"candidate_busy","path":path})),
         }
@@ -1638,8 +1748,10 @@ fn completion_claims<'a>(
 }
 
 struct Active {
+    deep: bool,
     root: String,
     recovery: Option<Arc<Recovery>>,
+    password_scope: PathBuf,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: HashMap<String, WatchCandidateRow>,
     quiet: HashMap<String, quiet::Quiet>,
@@ -1682,8 +1794,10 @@ struct RootCompleted {
 }
 
 struct CompletionContext {
+    deep: bool,
     root: String,
     recovery: Option<Arc<Recovery>>,
+    password_scope: PathBuf,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
     quiet: HashMap<String, quiet::Quiet>,
@@ -2504,7 +2618,7 @@ impl Scheduler {
                 let result = (if recovery {
                     self.checkpoint(&signals.changed_roots, all_roots, false)
                 } else {
-                    self.observe_file_changes(&signals.changed_roots)
+                    self.observe_file_changes(&signals.changed_roots, &signals.candidate_events)
                 }).and_then(|_| {
                         if signals.once.is_empty() {
                             Ok(())
@@ -2580,12 +2694,12 @@ impl Scheduler {
         self.journal.commit(true, |state| Ok(retirement.operations(state)))
     }
 
-    fn observe_file_changes(&mut self, changed: &HashMap<String, HashSet<PathBuf>>) -> io::Result<()> {
+    fn observe_file_changes(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_directory", Origin::Watch, || self.observe_file_changes_blocking(changed))
+        engine.run_stage("watch_directory", Origin::Watch, || self.observe_file_changes_blocking(changed, events))
     }
 
-    fn observe_file_changes_blocking(&mut self, changed: &HashMap<String, HashSet<PathBuf>>) -> io::Result<()> {
+    fn observe_file_changes_blocking(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
         // Match main's ordinary file-event path: enqueue in memory without
         // refreshing the durable inventory or advancing its USN stamp. The
@@ -2594,10 +2708,11 @@ impl Scheduler {
             let Some((_, scope)) = self.roots.get(id) else { continue };
             let scope = scope.clone();
             for path in paths {
+                let event = events.get(path);
                 let path = path.to_string_lossy();
                 if !scope.contains(&path) || self.catalog.is_owned(&path) { continue; }
                 let peers = self.catalog.bucket_paths(&scope, &path);
-                self.enqueue(id, path.to_string(), CandidateAdmission::Observe)?;
+                self.observe_candidate_with_event(id, path.to_string(), CandidateAdmission::Observe, None, None, None, event)?;
                 for peer in peers.into_iter().filter(|peer| peer.as_str() != path.as_ref()) {
                     if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
                         entry.failure_payload.get("blockers").and_then(Value::as_array)
@@ -3109,6 +3224,14 @@ impl Scheduler {
         recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
         tracker: Option<quiet::Quiet>,
     ) -> io::Result<()> {
+        self.observe_candidate_with_event(root_id, path, admission, recovery, captured, tracker, None)
+    }
+
+    fn observe_candidate_with_event(
+        &mut self, root_id: &str, path: String, admission: CandidateAdmission,
+        recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
+        tracker: Option<quiet::Quiet>, event: Option<&CandidateEvent>,
+    ) -> io::Result<()> {
         let Some((_, scope)) = self.roots.get(root_id) else {
             return Ok(());
         };
@@ -3136,8 +3259,8 @@ impl Scheduler {
             Ok(None) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
-                self.journal
-                    .log(json!({"event":"candidate_error","path":path,"error":error.to_string()}));
+                self.candidate_diagnostics.log_observation(
+                    &self.journal, Instant::now(), &id, &path, &error, event);
                 return Ok(());
             }
         };
@@ -3468,16 +3591,12 @@ impl Scheduler {
             if roots.is_some_and(|roots| !roots.contains(&root)) {
                 continue;
             }
-            let path = Path::new(&entry.path);
-            let directory = recovery.as_ref().map_or_else(
-                || path.parent().unwrap_or(Path::new("")),
-                |recovery| recovery.password_dir(path),
-            );
+            let directory = candidate_password_scope(self.journal.state(), &entry.path, recovery.as_deref());
             if entry
                 .failure_payload
                 .get("password_signature")
                 .and_then(Value::as_str)
-                .is_some_and(|before| before == password_source_signature(&self.user_password_signature, &snapshot.scope_signature(directory)))
+                .is_some_and(|before| before == password_source_signature(&self.user_password_signature, &snapshot.scope_signature(&directory)))
             {
                 continue;
             }
@@ -4043,21 +4162,22 @@ impl Scheduler {
                     recovery.scope.root.clone(),
                     recovery.scope.max_depth,
                     excluded,
-                    recovery.password_scope.clone(),
                 )
             });
+            let password_scope = candidate_password_scope(self.journal.state(),
+                &pending.candidate.path, pending.recovery.as_deref());
             let (_, candidates) = groups
-                .entry((pending.root, recovery_key))
+                .entry((pending.root, recovery_key, password_scope))
                 .or_insert_with(|| (pending.recovery, Vec::new()));
             candidates.push((pending.candidate, pending.quiet));
         }
-        for ((root, _), (recovery, candidates)) in groups {
+        for ((root, _, password_scope), (recovery, candidates)) in groups {
             if self.hub.stopped.load(Ordering::Acquire) {
                 // These candidates still have durable pending intent. A stop
                 // between readiness and submit must not start more requests.
                 break;
             }
-            self.start_batch(root, candidates, recovery)?;
+            self.start_batch(root, candidates, recovery, password_scope)?;
         }
         Ok(())
     }
@@ -4090,9 +4210,9 @@ impl Scheduler {
         self.pending.insert(id, pending);
     }
 
-    fn start_batch(&mut self, root_id: String, candidates: Vec<(WatchCandidateRow, quiet::Quiet)>, recovery: Option<Arc<Recovery>>) -> io::Result<()> {
+    fn start_batch(&mut self, root_id: String, candidates: Vec<(WatchCandidateRow, quiet::Quiet)>, recovery: Option<Arc<Recovery>>, password_scope: PathBuf) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery))
+        engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery, password_scope))
     }
 
     fn start_batch_blocking(
@@ -4100,6 +4220,7 @@ impl Scheduler {
         id: String,
         candidates: Vec<(WatchCandidateRow, quiet::Quiet)>,
         recovery: Option<Arc<Recovery>>,
+        password_scope: PathBuf,
     ) -> io::Result<()> {
         let Some((root, scope)) = self.roots.get(&id) else {
             return Ok(());
@@ -4154,10 +4275,7 @@ impl Scheduler {
         let passwords = self.passwords.snapshot();
         request.passwords = self.settings.user_passwords.iter().map(|value| Arc::from(value.as_str())).collect();
         request.password_snapshot = Some(Arc::clone(&passwords));
-        if let Some(recovery) = &recovery {
-            request.password_scope = (!recovery.password_scope.as_os_str().is_empty())
-                .then(|| recovery.password_scope.clone());
-        }
+        request.password_scope = Some(password_scope.clone());
         if let Some(recovery) = local_recovery {
             request.discovery_scope = Some(recovery.scope.clone());
         } else {
@@ -4207,6 +4325,7 @@ impl Scheduler {
             .log(json!({"event":"pipeline_request_started","owner":batch,
             "path":candidates.first().map(|entry| &entry.path),"count":candidates.len()}));
         let observer = Arc::new(WatchObserver {
+            deep: root.deep,
             journal,
             owners,
             output_scopes,
@@ -4267,8 +4386,10 @@ impl Scheduler {
         self.active.insert(
             batch,
             Active {
+                deep: root.deep,
                 root: id,
                 recovery,
+                password_scope,
                 passwords,
                 inputs: candidates.into_iter().map(|candidate| (watch_path_key(&candidate.path), candidate)).collect(),
                 quiet,
@@ -4373,7 +4494,8 @@ impl Scheduler {
         }
         let quiet = members.iter().filter_map(|path| active.quiet.remove(path).map(|tracker| (path.clone(), tracker))).collect();
         let context = CompletionContext {
-            root: active.root.clone(), recovery: active.recovery.clone(), passwords: Arc::clone(&active.passwords),
+            deep: active.deep,
+            root: active.root.clone(), recovery: active.recovery.clone(), password_scope: active.password_scope.clone(), passwords: Arc::clone(&active.passwords),
             inputs, quiet, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
         };
         let result = self.apply_completion(&root.batch, context, root.completed);
@@ -4389,7 +4511,8 @@ impl Scheduler {
         completed.cancelled |= active.cancel.cancelled();
         let groups = std::mem::take(&mut *active.groups.lock().unwrap()).into_aliases();
         self.apply_completion(batch, CompletionContext {
-            root: active.root, recovery: active.recovery, passwords: active.passwords,
+            deep: active.deep,
+            root: active.root, recovery: active.recovery, password_scope: active.password_scope, passwords: active.passwords,
             inputs: active.inputs.into_values().collect(), quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
         }, completed).map(|_| ())
     }
@@ -4572,6 +4695,10 @@ impl Scheduler {
             if self.active_paths.contains_key(&id) {
                 continue;
             }
+            if self.hub.completed_families.lock().unwrap().covers(&archive.path, active.deep) {
+                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&candidate.path, None));
+                continue;
+            }
             let regroup = failure.kind == FailureKind::MissingVolume;
             if let Some(pending) = self.pending.get(&id) {
                 if quiet::changed(&candidate, &pending.candidate) {
@@ -4605,10 +4732,7 @@ impl Scheduler {
             // inherited from that source.
             let recovery = Recovery {
                 scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), Some(0), Vec::new()),
-                password_scope: active.recovery.as_ref().map_or_else(
-                    || directory.to_path_buf(),
-                    |recovery| recovery.password_dir(&archive.path).to_path_buf(),
-                ),
+                password_scope: active.password_scope.clone(),
             };
             let mut entry = make_entry(
                 &candidate,
@@ -4619,6 +4743,7 @@ impl Scheduler {
                 &self.user_password_signature,
                 Some(&group),
                 Some(&recovery),
+                &active.password_scope,
             );
             let payload = &mut Arc::make_mut(&mut entry).failure_payload;
             payload.insert("details".into(), json!({"promoted_nested_input":true}));
@@ -4753,6 +4878,11 @@ impl Scheduler {
                 ));
                 continue;
             }
+            if (retryable || discovery_failure.is_some_and(|failure| failure.kind == FailureKind::MissingVolume || failure.is_password_retry()))
+                && self.hub.completed_families.lock().unwrap().covers(Path::new(&canonical), active.deep) {
+                operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(&candidate.path, None));
+                continue;
+            }
             let record = if completed.cancelled {
                 // Only the cancelled generation is retired. A generation
                 // queued while the batch was in flight is left in the WAL.
@@ -4777,6 +4907,7 @@ impl Scheduler {
                         &self.user_password_signature,
                         group.map(Arc::as_ref),
                         active.recovery.as_deref(),
+                        &active.password_scope,
                     );
                     Arc::make_mut(&mut entry).failure_payload.insert("input_checkpoints".into(),
                         serde_json::to_value(promoted_checkpoints(&outcome.checkpoints,
@@ -4792,11 +4923,7 @@ impl Scheduler {
                 })
             };
             if let Some(record) = &record {
-                let path = Path::new(&candidate.path);
-                let directory = active.recovery.as_ref().map_or_else(
-                    || path.parent().unwrap_or(Path::new("")),
-                    |recovery| recovery.password_dir(path),
-                );
+                let directory = &active.password_scope;
                 if record
                     .failure_payload
                     .get("password_signature")
@@ -5071,6 +5198,24 @@ fn completion_failed_archive<'a>(
         .or_else(|| failures().next())
 }
 
+// Main fixes the request password directory before discovery can replace a
+// tail-volume candidate with the family's head. A saved retry keeps that scope.
+fn candidate_password_scope(
+    state: &crate::watch_store::NativeWatchState, path: &str, recovery: Option<&Recovery>,
+) -> PathBuf {
+    if let Some(recovery) = recovery { return recovery.password_dir(Path::new(path)).to_owned(); }
+    let entry = state.entry(path);
+    let scope = if let Some(entry) = entry.as_ref().filter(|entry|
+        matches!(entry.status.as_str(), "failed_password" | "suspended_missing_volume")) {
+        entry.failure_payload.get("password_scope_dir").and_then(Value::as_str)
+            .filter(|scope| !scope.is_empty()).map(PathBuf::from)
+    } else {
+        state.pending(path).filter(|pending| !pending.password_scope_dir.is_empty())
+            .map(|pending| PathBuf::from(&pending.password_scope_dir))
+    };
+    scope.unwrap_or_else(|| Path::new(path).parent().unwrap_or(Path::new("")).to_owned())
+}
+
 fn make_entry(
     candidate: &WatchCandidateRow,
     error: &str,
@@ -5080,6 +5225,7 @@ fn make_entry(
     user_signature: &str,
     group: Option<&SourceGroup>,
     recovery: Option<&Recovery>,
+    password_scope: &Path,
 ) -> Arc<crate::watch_store::EntryRecord> {
     let kind = failure.and_then(InputFailure::failure).map(|failure| failure.kind);
     let password = failure.is_some_and(|input| input.failed && input.password.is_some());
@@ -5095,16 +5241,10 @@ fn make_entry(
     }
     if let Some(recovery) = recovery {
         payload["discovery_scope"] = Value::Object(scope_record(&recovery.scope));
-        payload["password_scope_dir"] = json!(recovery.password_scope);
     }
+    payload["password_scope_dir"] = json!(password_scope);
     if password {
-        let path = Path::new(&candidate.path);
-        let dir = recovery.map_or_else(
-            || path.parent().unwrap_or(Path::new("")),
-            |recovery| recovery.password_dir(path),
-        );
-        payload["password_scope_dir"] = json!(dir);
-        payload["password_signature"] = json!(password_source_signature(user_signature, &passwords.scope_signature(dir)));
+        payload["password_signature"] = json!(password_source_signature(user_signature, &passwords.scope_signature(password_scope)));
     }
     let kind = serde_json::to_value(kind)
         .ok()
@@ -5190,6 +5330,7 @@ impl ObservedOutputs {
 }
 
 struct WatchObserver {
+    deep: bool,
     journal: Arc<journal::Journal>,
     owners: HashMap<String, String>,
     output_scopes: Arc<[NativeDiscoveryScope]>,
@@ -5312,24 +5453,28 @@ impl Observer for WatchObserver {
         &self,
         archives: &[ArchiveResult],
         generations: &SourceGenerations,
+        output: Option<&Path>,
+        subtree_complete: bool,
     ) -> io::Result<()> {
-        if generations.len() < 2 {
-            return Ok(());
-        }
-        let processed = archives
+        let Some(processed) = archives
             .iter()
             .flat_map(|archive| &archive.source_paths)
-            .filter_map(|source| {
+            .map(|source| {
                 let path = key(source);
                 generations
                     .get(&path)
                     .map(|generation| (path, generation.clone()))
             })
-            .collect::<SourceGenerations>();
-        if processed.len() < 2 {
-            return Ok(());
-        }
+            .collect::<Option<SourceGenerations>>() else {
+                // A metadata read failure must not turn a subset into a
+                // completed physical family. Main has no version in this case.
+                return Ok(());
+            };
         let processed = Arc::new(processed);
+        if let Some(output) = output {
+            self.hub.completed_families.lock().unwrap().remember(Arc::clone(&processed), self.deep, output);
+        }
+        if !subtree_complete || processed.len() < 2 { return Ok(()); }
         let mut seeds = self.hub.seeds.lock().unwrap();
         for path in processed.keys() {
             if let Some(seed) = seeds.get_mut(path) {
@@ -5781,6 +5926,62 @@ fn spawn_error_dialog(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn completed_family_requires_full_generation_mode_and_live_output() {
+        let directory = std::env::temp_dir().join(format!("sunpack-completed-family-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&directory).unwrap();
+        let head = directory.join("archive.001");
+        let tail = directory.join("archive.002");
+        let output = directory.join("output");
+        fs::write(&head, b"head").unwrap();
+        fs::write(&tail, b"tail").unwrap();
+        fs::create_dir(&output).unwrap();
+        let generations = Arc::new([&head, &tail].into_iter().map(|path|
+            (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect());
+        let mut cache = CompletedFamilies::default();
+        cache.remember(Arc::clone(&generations), false, &output);
+        assert!(cache.covers(&head, false));
+        assert!(cache.covers(&tail, false));
+        assert!(!cache.covers(&head, true));
+        fs::rename(&tail, directory.join("away")).unwrap();
+        assert!(!cache.covers(&head, false));
+        fs::rename(directory.join("away"), &tail).unwrap();
+        assert!(cache.covers(&head, false));
+        fs::write(&tail, b"changed tail generation").unwrap();
+        assert!(!cache.covers(&head, false));
+        let refreshed = Arc::new([&head, &tail].into_iter().map(|path|
+            (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect());
+        cache.remember(refreshed, false, &output);
+        fs::remove_dir(&output).unwrap();
+        assert!(!cache.covers(&head, false));
+        assert!(cache.by_family.is_empty());
+        assert!(cache.ordered.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completed_family_cache_is_bounded_and_refreshes_lru() {
+        let directory = std::env::temp_dir().join(format!("sunpack-family-lru-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&directory).unwrap();
+        let head = directory.join("head");
+        fs::write(&head, b"head").unwrap();
+        let generation = crate::io::reader::capture_file_generation(&head).unwrap();
+        let mut cache = CompletedFamilies::default();
+        cache.remember(Arc::new(HashMap::from([(key(&head), generation.clone())])), false, &directory);
+        for n in 1..COMPLETED_FAMILY_LIMIT {
+            cache.remember(Arc::new(HashMap::from([(format!("other-{n}"), generation.clone())])), false, &directory);
+        }
+        assert!(cache.covers(&head, false));
+        cache.remember(Arc::new(HashMap::from([("new".into(), generation)])), false, &directory);
+        assert_eq!(cache.ordered.len(), COMPLETED_FAMILY_LIMIT);
+        assert_eq!(cache.by_family.len(), COMPLETED_FAMILY_LIMIT);
+        assert!(cache.covers(&head, false));
+        assert!(!cache.by_family.keys().any(|(members, _)| members.iter().any(|path| path == "other-1")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn recovery_scan_preserves_readable_files_with_local_errors() {
         let marker = crate::test_support::temp_file("recovery_scan_errors", b"archive");
         let directory = marker.with_extension("state");
@@ -5846,6 +6047,42 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_observation_diagnostics_preserve_native_event_provenance() {
+        let path = Path::new("destination.zip");
+        let mut source = None;
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "locked");
+        for (action, expected) in [(1, "created"), (3, "modified")] {
+            let event = CandidateEvent::native(action, path, &mut source).unwrap();
+            let record = CandidateDiagnostics::observation_record("destination.zip", &error, Some(&event));
+            assert_eq!(record["event_type"], expected);
+            assert_eq!(record["src_path"], "");
+            assert_eq!(record["event"], "candidate_ignored");
+            assert_eq!(record["reason"], "observation_error");
+            assert_eq!(record["error"], "PermissionError: locked");
+        }
+        assert_eq!(CandidateEvent::native(4, Path::new("source.zip"), &mut source), None);
+        let moved = CandidateEvent::native(5, path, &mut source).unwrap();
+        let record = CandidateDiagnostics::observation_record("destination.zip", &error, Some(&moved));
+        assert_eq!(record["event_type"], "moved");
+        assert_eq!(record["src_path"], "source.zip");
+        assert_eq!(record["path"], "destination.zip");
+        // An unmatched new-name record cannot supply an invented source.
+        assert_eq!(CandidateEvent::native(5, path, &mut source), None);
+        let recovery = CandidateDiagnostics::observation_record("destination.zip", &error, None);
+        assert_eq!(recovery["event_type"], "unknown");
+        assert_eq!(recovery["src_path"], "");
+        // Coalescing retains the first actual ordinary event, as main's
+        // diagnostic throttle would, until this Signals burst is consumed.
+        let mut signals = Signals::default();
+        signals.candidate_events.entry(path.to_owned()).or_insert(moved);
+        signals.candidate_events.entry(path.to_owned()).or_insert(CandidateEvent::Modified);
+        assert_eq!(signals.candidate_events[path].kind(), "moved");
+        let captured = std::mem::take(&mut signals);
+        assert!(signals.candidate_events.is_empty());
+        assert_eq!(captured.candidate_events[path].source(), "source.zip");
+    }
+
+    #[test]
     fn candidate_wait_history_survives_pending_retirement_and_expires_with_a_bound() {
         let marker = crate::test_support::temp_file("candidate_diagnostics", b"");
         let directory = marker.with_extension("state");
@@ -5864,7 +6101,20 @@ mod tests {
             &fs::read(directory.join("events.json")).unwrap(),
         ).unwrap();
         assert_eq!(manifest.runs.iter().map(|run| run.count - run.head).sum::<u64>(), 4);
-        let at = now + std::time::Duration::from_secs(31);
+        // Observation and readiness errors have independent main intervals.
+        // A long-lived observation entry must not hide a later 30s expiry.
+        let observation_at = now + std::time::Duration::from_secs(31);
+        history.log_observation(&journal, observation_at, "observe", "observe", &error, None);
+        history.log_wait(&journal, observation_at, "later", "later", Some(&error));
+        history.clear_expired(now + std::time::Duration::from_secs(61));
+        assert_eq!(history.order.len(), 1);
+        assert!(history.paths["observe"][2].is_some());
+        assert!(!history.paths.contains_key("later"));
+        history.log_observation(&journal, now + std::time::Duration::from_secs(330), "observe", "observe", &error, None);
+        assert_eq!(history.order.len(), 1);
+        let at = now + std::time::Duration::from_secs(331);
+        history.log_observation(&journal, at, "observe", "observe", &error, None);
+        assert_eq!(history.deadline(), Some(at + std::time::Duration::from_secs(300)));
         for index in 0..2048 {
             let path = index.to_string();
             history.log_wait(&journal, at, &path, &path, None);
@@ -6327,7 +6577,7 @@ mod tests {
         assert_eq!(errors[0].scan_count, Some(2));
     }
 
-    fn completion_archive(path: &str, depth: usize, kind: Option<FailureKind>) -> ArchiveResult {
+    pub(super) fn completion_archive(path: &str, depth: usize, kind: Option<FailureKind>) -> ArchiveResult {
         ArchiveResult {
             path: path.into(), format: "zip".into(), output: None,
             failure: kind.map(|kind| crate::pipeline::Failure::new(kind, format!("{kind:?}"))),
@@ -6369,6 +6619,72 @@ mod tests {
     }
 
     #[test]
+    fn admitted_password_scope_survives_family_head_retry_and_promoted_recovery() {
+        use crate::watch_store::{NativeWatchState, NativeWatchOperations, PendingObservation};
+        let state = NativeWatchState::new();
+        let a = Path::new(r"C:\watch\A");
+        let b = Path::new(r"C:\watch\B");
+        // The admitted path, not the eventual family head, fixes all Watch
+        // input forms. Different directories cannot share the dispatch key.
+        for filename in ["single.zip", "family.part2.rar", "family.7z.002", "family.z01", "wrapped.enc"] {
+            let tail = b.join(filename);
+            let head = a.join(filename);
+            assert_eq!(candidate_password_scope(&state, tail.to_str().unwrap(), None), b);
+            assert_eq!(candidate_password_scope(&state, head.to_str().unwrap(), None), a);
+        }
+        let path = r"C:\watch\A\family.part1.rar";
+        let candidate = WatchCandidateRow {
+            path: path.into(), size: 42, mtime: 1.0,
+            observation: crate::filesystem::WatchFileObservation {
+                file_id: String::new(), change_usn: 0, change_reasons: 0,
+                change_reasons_without_close: 0, change_reasons_known: false,
+                change_reason_error: String::new(),
+            },
+        };
+        let passwords = crate::core::passwords::PasswordSnapshot::default();
+        let user_signature = user_password_signature(&[]);
+        for kind in [FailureKind::PasswordRequired, FailureKind::MissingVolume] {
+            let mut outcome = Outcome::default();
+            outcome.archives.push(completion_archive(path, 1, Some(kind)));
+            let failures = outcome.input_failures();
+            let failure = &failures[&crate::path_keys::path_key(path)];
+            let entry = make_entry(&candidate, "blocked", Some(failure), None,
+                &passwords, &user_signature, None, None, b);
+            assert_eq!(entry.failure_payload["password_scope_dir"], json!(b));
+            if failure.password.is_some() {
+                assert_eq!(entry.failure_payload["password_signature"],
+                    json!(password_source_signature(&user_signature, &passwords.scope_signature(b))));
+            }
+            let mut operations = NativeWatchOperations::empty();
+            operations.put_entry(entry);
+            state.apply(&operations);
+            // A directory-password update must compare B's signature, and
+            // the subsequent retry must retain B even though its path is A.
+            assert_eq!(candidate_password_scope(&state, path, None), b);
+        }
+        let promoted = Recovery {
+            scope: NativeDiscoveryScope::new(r"C:\output\nested".into(), Some(0), Vec::new()),
+            password_scope: b.to_owned(),
+        };
+        assert_eq!(candidate_password_scope(&state, r"C:\output\nested\inner.zip", Some(&promoted)), b);
+        let pending_path = r"C:\watch\A\pending.zip";
+        let (operations, _) = state.pending_operations([(
+            PendingObservation(pending_path.into(), 42, 1.0, String::new(), 0),
+            r"C:\watch".into(), None,
+        )], false, b.to_str().unwrap(), false, true, None).unwrap();
+        state.apply(&operations);
+        assert_eq!(candidate_password_scope(&state, pending_path, None), b);
+        // An existing retry entry takes precedence over pending, as in main.
+        let mut entry = observed_entry(&candidate, "failed_password", None);
+        entry.path = pending_path.into();
+        entry.failure_payload.insert("password_scope_dir".into(), json!(a));
+        let mut operations = NativeWatchOperations::empty();
+        operations.put_entry(Arc::new(entry));
+        state.apply(&operations);
+        assert_eq!(candidate_password_scope(&state, pending_path, None), a);
+    }
+
+    #[test]
     fn promoted_carrier_segments_share_blockers_without_hiding_independent_terminal_children() {
         let owner = Path::new(r"C:\Watch\outer.zip");
         let promoted_path = r"C:\Watch\carrier.bin";
@@ -6400,7 +6716,7 @@ mod tests {
         };
         let passwords = crate::core::passwords::PasswordSnapshot::default();
         let entry = make_entry(&candidate, "carrier blocked", Some(carrier), None,
-            &passwords, &user_password_signature(&[]), None, None);
+            &passwords, &user_password_signature(&[]), None, None, Path::new(promoted_path).parent().unwrap());
         assert_eq!(entry.status, "suspended_missing_volume");
         assert_eq!(entry.failure_payload["blockers"], json!(["missing_volume", "password"]));
         assert_eq!(entry.failure_payload["password_signature"],
@@ -6962,6 +7278,7 @@ mod tests {
             members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
         let hub = Arc::new(Hub::new());
         let mut observer = WatchObserver {
+            deep: false,
             journal: Arc::new(journal::Journal::open(&directory, 7).unwrap()),
             owners: HashMap::from([(key(alias), alias.to_string_lossy().into_owned())]),
             output_scopes: Arc::from([]),
@@ -7130,6 +7447,7 @@ mod tests {
             let checkpoints = restore_checkpoints(journal.state(), owner, &mut outputs).unwrap();
             assert_eq!(checkpoints.len(), 1);
             let observer = WatchObserver {
+                deep: false,
                 journal: Arc::clone(&journal),
                 owners: HashMap::from([(key(&source), owner.to_owned())]),
                 output_scopes: Arc::from([NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new())]),
