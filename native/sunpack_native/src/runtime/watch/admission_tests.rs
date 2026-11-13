@@ -412,3 +412,99 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
     }
     run_isolated("password_retry_keeps_existing_quiet_and_checks_failure_snapshot", CHILD);
 }
+
+#[path = "../../../examples/support/display_events.rs"]
+mod display_events;
+
+#[test]
+fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
+    const CHILD: &str = "SUNPACK_WATCH_EVENT_PROVENANCE_TEST";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
+        let directory = base.join("events");
+        let watched = directory.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let root_id = key(&watched);
+        let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
+        let settings = Arc::new(Config::default());
+        let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
+        let mut scheduler = Scheduler {
+            candidate_diagnostics: CandidateDiagnostics::default(),
+            admission_checkpoint: None,
+            cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
+            roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
+                recursive: true, deep: false, scanned: true }, scope))]),
+            available_roots: HashSet::from([root_id.clone()]),
+            user_password_signature: user_password_signature(&settings.user_passwords),
+            settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
+            catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+            options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
+            deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
+            passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
+            root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+            parent_observers: HashMap::new(), config_observers: Vec::new(),
+            pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+            active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+            tray: None, monitor: None, toast: None, cache_deadline: None,
+            external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+        };
+
+        let mut expected = Vec::new();
+        for (name, event) in [("created.zip", CandidateEvent::Created), ("modified.zip", CandidateEvent::Modified)] {
+            let path = watched.join(name);
+            fs::write(&path, b"archive").unwrap();
+            let kind = event.kind();
+            let mut signals = Signals::default();
+            signals.root_changed(&root_id, Some(vec![path.clone()]));
+            if kind == "modified" { signals.modified_paths.insert(path.clone()); }
+            signals.candidate_events.insert(path.clone(), event);
+            scheduler.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
+                &signals.modified_paths, &signals.candidate_events, false).unwrap();
+            assert!(scheduler.pending.contains_key(&key(&path)));
+            expected.push((path, "candidate_active", kind, String::new()));
+        }
+        for fail in [false, true] {
+            let old = watched.join(if fail { "failed-old.zip" } else { "old.zip" });
+            let new = watched.join(if fail { "failed-new.zip" } else { "new.zip" });
+            fs::write(&old, b"archive").unwrap();
+            fs::rename(&old, &new).unwrap();
+            // Native rename supplies both old (now missing) and new paths,
+            // selecting the actual checkpoint branch rather than ordinary enqueue.
+            let mut signals = Signals::default();
+            signals.root_changed(&root_id, Some(vec![old.clone(), new.clone()]));
+            signals.candidate_events.insert(new.clone(), CandidateEvent::Moved(old.clone()));
+            assert!(Signals::prepare_root_changes(&mut signals.changed_roots,
+                &signals.topology_roots, &signals.modified_paths, false));
+            if fail { *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(new.clone()); }
+            scheduler.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
+                &signals.modified_paths, &signals.candidate_events, false).unwrap();
+            *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = None;
+            assert_eq!(scheduler.pending.contains_key(&key(&new)), !fail);
+            expected.push((new, if fail { "candidate_ignored" } else { "candidate_active" },
+                "moved", old.to_string_lossy().into_owned()));
+        }
+        // A catalog/USN-only discovery keeps its business origin, not a native event.
+        let recovery = watched.join("recovery.zip");
+        fs::write(&recovery, b"archive").unwrap();
+        scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
+        expected.push((recovery, "candidate_active", "usn_recovery", String::new()));
+        scheduler.journal.flush().unwrap();
+        let records = display_events::read(&directory.join("state/events.json")).unwrap();
+        let history = records["history"].as_array().unwrap();
+        for (path, action, kind, source) in expected {
+            let record = history.iter().find(|record| record["event"] == action
+                && record["path"].as_str().is_some_and(|value| Path::new(value) == path)).unwrap();
+            assert_eq!(record["event_type"], kind);
+            assert_eq!(record["src_path"], source);
+            if action == "candidate_ignored" {
+                assert_eq!(record["reason"], "observation_error");
+                assert!(record["error"].as_str().unwrap().starts_with("PermissionError:"));
+            }
+        }
+        return;
+    }
+    run_isolated("native_event_provenance_survives_ordinary_and_checkpoint_admission", CHILD);
+}

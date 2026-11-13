@@ -830,6 +830,7 @@ enum CandidateEvent {
     Created,
     Modified,
     Moved(PathBuf),
+    Business(&'static str),
 }
 
 impl CandidateEvent {
@@ -844,7 +845,7 @@ impl CandidateEvent {
     }
 
     fn kind(&self) -> &'static str {
-        match self { Self::Created => "created", Self::Modified => "modified", Self::Moved(_) => "moved" }
+        match self { Self::Created => "created", Self::Modified => "modified", Self::Moved(_) => "moved", Self::Business(kind) => kind }
     }
 
     fn source(&self) -> std::borrow::Cow<'_, str> {
@@ -903,14 +904,13 @@ struct Hub {
     signals: Mutex<Signals>,
     wake: std::sync::Condvar,
     claims: Mutex<HashMap<String, Arc<str>>>,
-    seeds: Mutex<HashMap<String, Seed>>,
     completed_families: Mutex<CompletedFamilies>,
     pending_count: AtomicUsize,
 }
 
 type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
 
-// Like main's completed Watch family cache, this outlives seed admission but
+// Like main's completed Watch family cache, this outlives candidate admission but
 // remains bounded. Receipt publication can lag behind source lease release.
 const COMPLETED_FAMILY_LIMIT: usize = 4096;
 type CompletedFamilyKey = (Arc<[String]>, bool);
@@ -919,11 +919,11 @@ type CompletedFamilyKey = (Arc<[String]>, bool);
 struct CompletedFamilies {
     sequence: u64,
     by_family: HashMap<CompletedFamilyKey, u64>,
-    ordered: BTreeMap<u64, (CompletedFamilyKey, Arc<SourceGenerations>, PathBuf)>,
+    ordered: BTreeMap<u64, (CompletedFamilyKey, SourceGenerations, PathBuf)>,
 }
 
 impl CompletedFamilies {
-    fn remember(&mut self, generations: Arc<SourceGenerations>, deep: bool, output: &Path) {
+    fn remember(&mut self, generations: SourceGenerations, deep: bool, output: &Path) {
         if generations.is_empty() { return; }
         let mut members: Vec<_> = generations.keys().cloned().collect();
         members.sort_unstable();
@@ -938,30 +938,38 @@ impl CompletedFamilies {
         }
     }
 
+    fn output(&mut self, generations: &SourceGenerations, deep: bool) -> Option<PathBuf> {
+        let mut members: Vec<_> = generations.keys().cloned().collect();
+        members.sort_unstable();
+        let sequence = *self.by_family.get(&(Arc::from(members), deep))?;
+        let (_, previous, _) = &self.ordered[&sequence];
+        if !generations.iter().all(|(path, current)| current.matches_input(&previous[path].persisted())) {
+            return None;
+        }
+        self.refresh_output(sequence).map(Path::to_path_buf)
+    }
+
     fn covers(&mut self, path: &Path, deep: bool) -> bool {
         let path = key(path);
-        let matched = self.ordered.iter().find_map(|(sequence, (family, generations, output))| {
+        let matched = self.ordered.iter().find_map(|(sequence, (family, generations, _))| {
             if family.1 != deep || !generations.contains_key(&path) { return None; }
             // Require the entire current family, not only the old request's head.
-            let same = generations.iter().all(|(member, previous)| {
+            generations.iter().all(|(member, previous)| {
                 crate::io::reader::capture_file_generation(Path::new(member))
                     .is_ok_and(|current| current.matches_input(&previous.persisted()))
-            });
-            (same).then_some((*sequence, output.is_dir()))
+            }).then_some(*sequence)
         });
-        let Some((sequence, live)) = matched else { return false; };
-        let (family, generations, output) = self.ordered.remove(&sequence).unwrap();
-        if !live { self.by_family.remove(&family); return false; }
+        matched.is_some_and(|sequence| self.refresh_output(sequence).is_some())
+    }
+
+    fn refresh_output(&mut self, sequence: u64) -> Option<&Path> {
+        let (family, generations, output) = self.ordered.remove(&sequence)?;
+        if !output.is_dir() { self.by_family.remove(&family); return None; }
         self.sequence += 1;
         self.by_family.insert(family.clone(), self.sequence);
         self.ordered.insert(self.sequence, (family, generations, output));
-        true
+        Some(self.ordered[&self.sequence].2.as_path())
     }
-}
-
-struct Seed {
-    owners: u8,
-    processed: Option<Arc<SourceGenerations>>,
 }
 
 impl Hub {
@@ -972,35 +980,8 @@ impl Hub {
             signals: Mutex::default(),
             wake: std::sync::Condvar::new(),
             claims: Mutex::default(),
-            seeds: Mutex::default(),
             completed_families: Mutex::default(),
             pending_count: AtomicUsize::new(0),
-        }
-    }
-
-    fn track_seed(&self, path: &str) {
-        let mut seeds = self.seeds.lock().unwrap();
-        if let Some(seed) = seeds.get_mut(path) {
-            seed.owners += 1;
-        } else {
-            seeds.insert(
-                path.to_owned(),
-                Seed {
-                    owners: 1,
-                    processed: None,
-                },
-            );
-        }
-    }
-
-    fn retire_seed(&self, path: &str) {
-        let mut seeds = self.seeds.lock().unwrap();
-        if let Some(seed) = seeds.get_mut(path) {
-            seed.owners -= 1;
-            if seed.owners == 0 {
-                seeds.remove(path);
-                crate::collections::trim_map(&mut seeds);
-            }
         }
     }
 
@@ -1626,7 +1607,7 @@ fn park_claimed_deadlines(
 
 // Claimed siblings cannot be admitted while the owner runs. Transfer their old
 // queued observations into its completion. Events during ownership are only
-// dirty names, re-observed after completion. Seed ownership moves with them.
+// dirty names, re-observed after completion.
 fn consume_claimed_pending(
     pending: &mut HashMap<String, Pending>,
     due: &mut BTreeMap<(Instant, String), ()>,
@@ -2006,7 +1987,7 @@ impl Scheduler {
         scheduler.password_update(true)?;
         scheduler.checkpoint(&HashMap::new(), true, true)?;
         scheduler.root_progress.checkpoint = false;
-        scheduler.retry_missing_volumes(None)?;
+        scheduler.retry_missing_volumes_with_event(None, "startup_missing_volume_reconcile")?;
         scheduler.root_progress.recovery = false;
         scheduler
             .hub
@@ -2237,7 +2218,6 @@ impl Scheduler {
                     self.pending.get_mut(&id).unwrap().root = root;
                     self.unpublished.insert(id);
                 } else if let Some(pending) = self.pending.remove(&id) {
-                    self.hub.retire_seed(&id);
                     self.due.remove(&(pending.due, id.clone()));
                     self.unpublished.remove(&id);
                 }
@@ -2497,7 +2477,6 @@ impl Scheduler {
         }
         *self.external.lock().unwrap() = None;
         *self.hub.claims.lock().unwrap() = HashMap::new();
-        *self.hub.seeds.lock().unwrap() = HashMap::new();
         self.engine.run_stage("watch_close", Origin::Watch, || {
             self.catalog.commit(true);
             self.catalog.close();
@@ -2612,14 +2591,8 @@ impl Scheduler {
                 if self.options.is_some() && (all_roots || !signals.topology_roots.is_empty()) {
                     self.rearm_root_observers((!all_roots).then_some(&signals.topology_roots));
                 }
-                let recovery = self.engine.run_stage("watch_directory", Origin::Watch, || {
-                    Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, all_roots)
-                });
-                let result = (if recovery {
-                    self.checkpoint(&signals.changed_roots, all_roots, false)
-                } else {
-                    self.observe_file_changes(&signals.changed_roots, &signals.candidate_events)
-                }).and_then(|_| {
+                let result = self.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
+                    &signals.modified_paths, &signals.candidate_events, all_roots).and_then(|_| {
                         if signals.once.is_empty() {
                             Ok(())
                         } else {
@@ -2658,7 +2631,6 @@ impl Scheduler {
                         self.unpublished.shrink_to_fit();
                         self.active.shrink_to_fit();
                         self.active_paths.shrink_to_fit();
-                        self.hub.seeds.lock().unwrap().shrink_to_fit();
                     }));
                     maintenance?;
                 }
@@ -2729,9 +2701,27 @@ impl Scheduler {
         Ok(())
     }
 
+    fn observe_root_changes(&mut self, changed: &mut HashMap<String, HashSet<PathBuf>>,
+        topology: &HashSet<String>, modified: &HashSet<PathBuf>,
+        events: &HashMap<PathBuf, CandidateEvent>, all_roots: bool) -> io::Result<()> {
+        let recovery = self.engine.run_stage("watch_directory", Origin::Watch, || {
+            Signals::prepare_root_changes(changed, topology, modified, all_roots)
+        });
+        if recovery {
+            self.checkpoint_with_events(changed, all_roots, false, events)
+        } else {
+            self.observe_file_changes(changed, events)
+        }
+    }
+
     fn checkpoint(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, all_roots: bool, startup: bool) -> io::Result<()> {
+        self.checkpoint_with_events(changed, all_roots, startup, &HashMap::new())
+    }
+
+    fn checkpoint_with_events(&mut self, changed: &HashMap<String, HashSet<PathBuf>>,
+        all_roots: bool, startup: bool, events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_usn_checkpoint", Origin::Watch, || self.checkpoint_blocking(changed, all_roots, startup))
+        engine.run_stage("watch_usn_checkpoint", Origin::Watch, || self.checkpoint_blocking(changed, all_roots, startup, events))
     }
 
     fn checkpoint_blocking(
@@ -2739,6 +2729,7 @@ impl Scheduler {
         changed: &HashMap<String, HashSet<PathBuf>>,
         all_roots: bool,
         startup: bool,
+        events: &HashMap<PathBuf, CandidateEvent>,
     ) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
         let selected = self
@@ -2960,7 +2951,10 @@ impl Scheduler {
                 let path_id = watch_path_key(&path);
                 if admitted.insert(path_id) {
                     let peers = self.catalog.bucket_paths(&scope, &path);
-                    self.enqueue(&id, path.clone(), admission)?;
+                    self.observe_candidate_with_event(&id, path.clone(), admission,
+                        None, None, None, Some(events.get(Path::new(&path)).unwrap_or(&CandidateEvent::Business(
+                            if index >= recovered_paths { "initial_scan" }
+                            else if startup { "startup_usn_recovery" } else { "usn_recovery" }))))?;
                     for peer in peers.into_iter().filter(|peer| peer != &path) {
                         if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
                             entry
@@ -3162,7 +3156,6 @@ impl Scheduler {
         };
         for id in removed {
             if let Some(pending) = self.pending.remove(&id) {
-                self.hub.retire_seed(&id);
                 self.due.remove(&(pending.due, id.clone()));
                 self.unpublished.remove(&id);
                 self.retire_departed_owner(&id, &pending.candidate.path)?;
@@ -3195,6 +3188,7 @@ impl Scheduler {
         })
     }
 
+    #[cfg(test)]
     fn enqueue(&mut self, root_id: &str, path: String, admission: CandidateAdmission) -> io::Result<()> {
         self.observe_candidate_with_quiet(root_id, path, admission, None, None, None)
     }
@@ -3216,15 +3210,22 @@ impl Scheduler {
         path: String,
         recovery: Option<Arc<Recovery>>,
     ) -> io::Result<()> {
-        self.observe_candidate_with_quiet(root_id, path, CandidateAdmission::Retry, recovery, None, None)
+        self.observe_candidate_with_event(root_id, path, CandidateAdmission::Retry, recovery, None, None,
+            Some(&CandidateEvent::Business("volume_changed")))
     }
 
+    #[cfg(test)]
     fn observe_candidate_with_quiet(
         &mut self, root_id: &str, path: String, admission: CandidateAdmission,
         recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
         tracker: Option<quiet::Quiet>,
     ) -> io::Result<()> {
-        self.observe_candidate_with_event(root_id, path, admission, recovery, captured, tracker, None)
+        let event = match admission {
+            CandidateAdmission::PasswordRetry => Some(CandidateEvent::Business("password_retry")),
+            CandidateAdmission::CrashRecovery => Some(CandidateEvent::Business("crash_recovery")),
+            _ => None,
+        };
+        self.observe_candidate_with_event(root_id, path, admission, recovery, captured, tracker, event.as_ref())
     }
 
     fn observe_candidate_with_event(
@@ -3368,9 +3369,6 @@ impl Scheduler {
         }
         let now = Instant::now();
         let prior = self.pending.remove(&id);
-        if prior.is_none() {
-            self.hub.track_seed(&id);
-        }
         let became_active = prior.is_none();
         let new_identity = prior.as_ref().map_or_else(
             || {
@@ -3415,6 +3413,8 @@ impl Scheduler {
         if became_active {
             self.journal.log(json!({
                 "event":"candidate_active", "path":candidate.path, "force":force,
+                "event_type":event.map_or("unknown", CandidateEvent::kind),
+                "src_path":event.map_or_else(|| "".into(), CandidateEvent::source),
                 "size":candidate.size, "mtime":candidate.mtime,
                 "quiet_seconds":quiet.seconds, "pending":self.pending.len() + 1,
             }));
@@ -3560,7 +3560,8 @@ impl Scheduler {
             // A prior runtime can publish the password generation before
             // scheduling every affected blocker. Reconcile entries once when
             // taking ownership, even if the global generation is current.
-            self.retry_password_failures(&snapshot, None)?;
+            self.retry_password_failures_with_event(&snapshot, None,
+                if startup { "startup_password_reconcile" } else { "password_retry" })?;
             self.persist_candidates(BTreeMap::new(), !changed)?;
         }
         if !changed {
@@ -3584,6 +3585,13 @@ impl Scheduler {
         snapshot: &crate::core::passwords::PasswordSnapshot,
         roots: Option<&HashSet<String>>,
     ) -> io::Result<()> {
+        self.retry_password_failures_with_event(snapshot, roots, "password_retry")
+    }
+
+    fn retry_password_failures_with_event(&mut self,
+        snapshot: &crate::core::passwords::PasswordSnapshot,
+        roots: Option<&HashSet<String>>, event: &'static str,
+    ) -> io::Result<()> {
         for entry in self.journal.state().entry_items(Some("password")) {
             let Some((root, recovery)) = self.blocker_route(&entry) else {
                 continue;
@@ -3600,8 +3608,8 @@ impl Scheduler {
             {
                 continue;
             }
-            self.observe_candidate_with_quiet(&root, entry.path.clone(),
-                CandidateAdmission::PasswordRetry, recovery, None, None)?;
+            self.observe_candidate_with_event(&root, entry.path.clone(),
+                CandidateAdmission::PasswordRetry, recovery, None, None, Some(&CandidateEvent::Business(event)))?;
             self.journal
                 .log(json!({"event":"retry_password_failure","path":entry.path}));
         }
@@ -3609,6 +3617,10 @@ impl Scheduler {
     }
 
     fn retry_missing_volumes(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
+        self.retry_missing_volumes_with_event(roots, "volume_changed")
+    }
+
+    fn retry_missing_volumes_with_event(&mut self, roots: Option<&HashSet<String>>, event: &'static str) -> io::Result<()> {
         for entry in self.journal.state().entry_items(Some("missing_volume")) {
             let Some((root, recovery)) = self.blocker_route(&entry) else {
                 continue;
@@ -3618,7 +3630,8 @@ impl Scheduler {
             }
             let id = watch_path_key(&entry.path);
             if !self.pending.contains_key(&id) {
-                self.enqueue_with_recovery(&root, entry.path.clone(), recovery)?;
+                self.observe_candidate_with_event(&root, entry.path.clone(), CandidateAdmission::Retry,
+                    recovery, None, None, Some(&CandidateEvent::Business(event)))?;
             }
         }
         self.persist_candidates(BTreeMap::new(), true)
@@ -3885,7 +3898,12 @@ impl Scheduler {
                     };
                     Some(Arc::new(recovery))
                 };
-                self.observe_candidate_with_quiet(&root, path.clone(), admission, recovery, None, None)?;
+                self.observe_candidate_with_event(&root, path.clone(), admission, recovery, None, None,
+                    Some(&CandidateEvent::Business(if pending.active_outputs.is_empty()
+                        && pending.committed_roots.iter().next().is_none()
+                        && pending.promoted_destinations.iter().next().is_none() {
+                        "recovery"
+                    } else { "crash_recovery" })))?;
                 if !self.pending.contains_key(&id) && !NativePresence::at(&path).is_absent() {
                     rebase = false;
                 }
@@ -3950,7 +3968,7 @@ fn output_identity(path: &str) -> io::Result<String> {
     Ok(format!("{volume}|{identity}"))
 }
 
-fn user_password_signature(user: &[String]) -> String {
+fn user_password_signature(user: &[Arc<str>]) -> String {
     let mut hash = crate::fast_hash_core::Hash128::new();
     hash.update(serde_json::to_string(user).unwrap().as_bytes());
     hash.hexdigest()
@@ -3985,11 +4003,13 @@ fn recovery_output_matches(
 impl Scheduler {
     fn admission_available(&self) -> usize {
         if self.options.is_none() { return 0; }
-        // Match main's bounded request window. Suspended batches share the
-        // pipeline driver rather than retaining caller threads. Keep batching:
-        // a slow sibling must not reserve a slot for every completed input.
+        // Main admits one request per candidate. Batching must not turn that
+        // candidate window into a batch window. This existing index contains
+        // admitted inputs, not discovered claims, and completion removes each
+        // settled owner (including aliases) before its siblings finish. Failure
+        // while retiring indexes stops admission rather than reusing them.
         crate::pipeline::MAX_PENDING_JOBS.max(rayon::current_num_threads())
-            .saturating_sub(self.active.len())
+            .saturating_sub(self.active_paths.len())
     }
 
     fn next_admission(&self) -> Option<Instant> {
@@ -4183,7 +4203,6 @@ impl Scheduler {
     }
 
     fn retire_admission(&mut self, id: &str, pending: &Pending) -> io::Result<()> {
-        self.hub.retire_seed(id);
         self.unpublished.remove(id);
         let path = &pending.candidate.path;
         if self
@@ -4273,7 +4292,7 @@ impl Scheduler {
         request.max_depth = cli::depth(self.settings.recursive_extract);
         request.deep = root.deep;
         let passwords = self.passwords.snapshot();
-        request.passwords = self.settings.user_passwords.iter().map(|value| Arc::from(value.as_str())).collect();
+        request.passwords = Arc::clone(&self.settings.user_passwords);
         request.password_snapshot = Some(Arc::clone(&passwords));
         request.password_scope = Some(password_scope.clone());
         if let Some(recovery) = local_recovery {
@@ -4454,7 +4473,6 @@ impl Scheduler {
             if let Some(pending) = self.pending.get(&id) {
                 if !quiet::changed(input, &pending.candidate) {
                     let pending = self.pending.remove(&id).unwrap();
-                    self.hub.retire_seed(&id);
                     self.due.remove(&(pending.due, id.clone()));
                     self.unpublished.remove(&id);
                 }
@@ -4536,7 +4554,8 @@ impl Scheduler {
                 if !self.pending.contains_key(&path) {
                     let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
                     let tracker = quiet.remove(&path);
-                    self.observe_candidate_with_quiet(&root, path, CandidateAdmission::Observe, recovery.clone(), captured.as_ref(), tracker)?;
+                    self.observe_candidate_with_event(&root, path, CandidateAdmission::Observe, recovery.clone(), captured.as_ref(), tracker,
+                        Some(&CandidateEvent::Business("pipeline_claim_released")))?;
                 }
             }
             Ok(result)
@@ -4600,7 +4619,6 @@ impl Scheduler {
         for candidate in &active.inputs {
             let id = watch_path_key(&candidate.path);
             self.active_paths.remove(&id);
-            self.hub.retire_seed(&id);
         }
         let outcome = match completed.result {
             Ok(outcome) => outcome,
@@ -4629,9 +4647,9 @@ impl Scheduler {
                     // violation), unlike an extraction Outcome failure.
                     self.journal.log(json!({"event":"failed_terminal","path":candidate.path,
                         "owner":batch,"error":error.to_string()}));
-                    self.observe_candidate_with_quiet(
+                    self.observe_candidate_with_event(
                         &active.root, candidate.path.clone(), CandidateAdmission::ExplicitRetry, active.recovery.clone(),
-                        None, quiet.remove(&id),
+                        None, quiet.remove(&id), Some(&CandidateEvent::Business("pipeline_completion_error")),
                     )?;
                 }
                 self.journal.commit(true, |_| Ok(absent))?;
@@ -4706,7 +4724,6 @@ impl Scheduler {
                 }
                 if !regroup {
                     let pending = self.pending.remove(&id).unwrap();
-                    self.hub.retire_seed(&id);
                     self.due.remove(&(pending.due, id.clone()));
                     self.unpublished.remove(&id);
                 }
@@ -5001,7 +5018,10 @@ impl Scheduler {
                 .and_then(|entry| self.blocker_route(&entry))
             {
                 let tracker = quiet.remove(&watch_path_key(&path));
-                self.observe_candidate_with_quiet(&root, path, admission, recovery, None, tracker)?;
+                self.observe_candidate_with_event(&root, path, admission, recovery, None, tracker,
+                    Some(&CandidateEvent::Business(if admission == CandidateAdmission::PasswordRetry {
+                        "password_retry"
+                    } else { "volume_changed" })))?;
             }
         }
         self.persist_candidates(BTreeMap::new(), false)?;
@@ -5421,32 +5441,8 @@ impl Observer for WatchObserver {
             .map(|receipt| (*receipt).clone())
     }
 
-    fn should_process_sources(
-        &self,
-        _path: &Path,
-        data_paths: &[&str],
-        generations: &SourceGenerations,
-    ) -> io::Result<bool> {
-        if data_paths.len() < 2 {
-            return Ok(true);
-        }
-        let paths = data_paths
-            .iter()
-            .map(|path| watch_path_key(path))
-            .collect::<HashSet<_>>();
-        let seeds = self.hub.seeds.lock().unwrap();
-        let covered = paths
-            .iter()
-            .filter_map(|path| seeds.get(path).and_then(|seed| seed.processed.as_deref()))
-            .any(|processed| {
-                processed.len() == paths.len()
-                    && paths.iter().all(|path| {
-                        processed
-                            .get(path)
-                            .is_some_and(|previous| generations.get(path) == Some(previous))
-                    })
-            });
-        Ok(!covered)
+    fn completed_sources(&self, generations: &SourceGenerations) -> io::Result<Option<PathBuf>> {
+        Ok(self.hub.completed_families.lock().unwrap().output(generations, self.deep))
     }
 
     fn sources_processed(
@@ -5454,7 +5450,6 @@ impl Observer for WatchObserver {
         archives: &[ArchiveResult],
         generations: &SourceGenerations,
         output: Option<&Path>,
-        subtree_complete: bool,
     ) -> io::Result<()> {
         let Some(processed) = archives
             .iter()
@@ -5470,16 +5465,10 @@ impl Observer for WatchObserver {
                 // completed physical family. Main has no version in this case.
                 return Ok(());
             };
-        let processed = Arc::new(processed);
+        // main only installs source_generation for top-level multi-source Watch jobs.
+        if processed.len() < 2 { return Ok(()); }
         if let Some(output) = output {
-            self.hub.completed_families.lock().unwrap().remember(Arc::clone(&processed), self.deep, output);
-        }
-        if !subtree_complete || processed.len() < 2 { return Ok(()); }
-        let mut seeds = self.hub.seeds.lock().unwrap();
-        for path in processed.keys() {
-            if let Some(seed) = seeds.get_mut(path) {
-                seed.processed = Some(Arc::clone(&processed));
-            }
+            self.hub.completed_families.lock().unwrap().remember(processed, self.deep, output);
         }
         Ok(())
     }
@@ -5936,10 +5925,14 @@ mod tests {
         fs::write(&head, b"head").unwrap();
         fs::write(&tail, b"tail").unwrap();
         fs::create_dir(&output).unwrap();
-        let generations = Arc::new([&head, &tail].into_iter().map(|path|
-            (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect());
+        let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
+            (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
         let mut cache = CompletedFamilies::default();
-        cache.remember(Arc::clone(&generations), false, &output);
+        cache.remember(generations.clone(), false, &output);
+        assert_eq!(cache.output(&generations, false), Some(output.clone()));
+        assert_eq!(cache.output(&generations, true), None);
+        let subset = HashMap::from([(key(&head), generations[&key(&head)].clone())]);
+        assert_eq!(cache.output(&subset, false), None);
         assert!(cache.covers(&head, false));
         assert!(cache.covers(&tail, false));
         assert!(!cache.covers(&head, true));
@@ -5949,10 +5942,13 @@ mod tests {
         assert!(cache.covers(&head, false));
         fs::write(&tail, b"changed tail generation").unwrap();
         assert!(!cache.covers(&head, false));
-        let refreshed = Arc::new([&head, &tail].into_iter().map(|path|
-            (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect());
-        cache.remember(refreshed, false, &output);
+        let refreshed: SourceGenerations = [&head, &tail].into_iter().map(|path|
+            (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
+        assert_eq!(cache.output(&refreshed, false), None);
+        cache.remember(refreshed.clone(), false, &output);
+        assert_eq!(cache.output(&refreshed, false), Some(output.clone()));
         fs::remove_dir(&output).unwrap();
+        assert_eq!(cache.output(&refreshed, false), None);
         assert!(!cache.covers(&head, false));
         assert!(cache.by_family.is_empty());
         assert!(cache.ordered.is_empty());
@@ -5968,12 +5964,12 @@ mod tests {
         fs::write(&head, b"head").unwrap();
         let generation = crate::io::reader::capture_file_generation(&head).unwrap();
         let mut cache = CompletedFamilies::default();
-        cache.remember(Arc::new(HashMap::from([(key(&head), generation.clone())])), false, &directory);
+        cache.remember(HashMap::from([(key(&head), generation.clone())]), false, &directory);
         for n in 1..COMPLETED_FAMILY_LIMIT {
-            cache.remember(Arc::new(HashMap::from([(format!("other-{n}"), generation.clone())])), false, &directory);
+            cache.remember(HashMap::from([(format!("other-{n}"), generation.clone())]), false, &directory);
         }
         assert!(cache.covers(&head, false));
-        cache.remember(Arc::new(HashMap::from([("new".into(), generation)])), false, &directory);
+        cache.remember(HashMap::from([("new".into(), generation)]), false, &directory);
         assert_eq!(cache.ordered.len(), COMPLETED_FAMILY_LIMIT);
         assert_eq!(cache.by_family.len(), COMPLETED_FAMILY_LIMIT);
         assert!(cache.covers(&head, false));
@@ -7186,6 +7182,94 @@ mod tests {
         park_claimed_deadlines(&pending, &mut due, &HashMap::new(), HashSet::from([changed.clone()]));
         assert_eq!(due.len(), 1);
         assert_eq!(due.keys().next().unwrap().1, changed);
+    }
+
+    #[test]
+    fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
+        let marker = crate::test_support::temp_file("watch_candidate_budget", b"");
+        let base = marker.with_extension("dir");
+        fs::create_dir_all(&base).unwrap();
+        let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
+        let settings = Arc::new(Config::default());
+        let mut scheduler = Scheduler {
+            candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
+            cwd: base.clone(), root_file: base.join(ROOTS_FILE),
+            roots: BTreeMap::new(), available_roots: HashSet::new(),
+            user_password_signature: user_password_signature(&settings.user_passwords), settings,
+            engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
+            catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+            options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
+            deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
+            passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
+            root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+            parent_observers: HashMap::new(), config_observers: Vec::new(),
+            pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+            active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+            tray: None, monitor: None, toast: None, cache_deadline: None,
+            external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+        };
+        let limit = scheduler.admission_available();
+        let driver = crate::pipeline::Scheduler::new();
+        let batch = |id, names: Vec<String>, failed: bool| {
+            let cancel = Cancellation::new();
+            let request = driver.submit(id, Origin::Watch, &cancel, move |_| Box::pin(async move {
+                Completed { cancelled: !failed,
+                    result: Err(io::Error::other("test request settled")),
+                    promoted: HashMap::new(), outputs: BTreeMap::new() }
+            }));
+            Active {
+                deep: false, root: String::new(), recovery: None, password_scope: base.clone(),
+                passwords: Arc::default(),
+                inputs: names.into_iter().map(|path| (watch_path_key(&path), WatchCandidateRow {
+                    path, size: 1, mtime: 1.0,
+                    observation: crate::filesystem::WatchFileObservation {
+                        file_id: String::new(), change_usn: 0, change_reasons: 0,
+                        change_reasons_without_close: 0, change_reasons_known: false,
+                        change_reason_error: String::new(),
+                    },
+                })).collect(),
+                quiet: HashMap::new(), dirty: HashSet::new(), cancel,
+                groups: Arc::default(), claimed: Arc::default(), toast: None, request,
+            }
+        };
+        let names = (0..limit).map(|index| base.join(format!("{index}.zip")).to_string_lossy().into_owned()).collect::<Vec<_>>();
+        scheduler.active_paths.extend(names.iter().map(|path| (watch_path_key(path), Arc::from("first"))));
+        scheduler.active.insert("first".into(), batch(1, names.clone(), false));
+        assert_eq!(scheduler.admission_available(), 0, "one full batch occupies the whole candidate window");
+        assert!(scheduler.next_admission().is_none());
+        // A completed head owns two admitted aliases; a third discovered
+        // member never consumed an admission slot. Remaining siblings stay live.
+        let head = Path::new(&names[0]);
+        let discovered = base.join("not-admitted.002");
+        scheduler.hub.claims.lock().unwrap().insert(key(&discovered), Arc::from("first"));
+        assert_eq!(scheduler.admission_available(), 0, "discovered physical claims do not consume candidate slots");
+        let group = Arc::new(SourceGroup { path: head.into(), name: "family".into(), multipart: true,
+            members: vec![names[0].clone(), names[1].clone(), discovered.to_string_lossy().into_owned()] });
+        let root = || RootCompleted {
+            reply: Arc::default(), batch: "first".into(), id: 1, path: head.into(),
+            groups: group.members.iter().map(|member| (watch_path_key(member), Arc::clone(&group))).collect(),
+            completed: Completed { cancelled: false, result: Ok(Outcome::default()),
+                promoted: HashMap::new(), outputs: BTreeMap::new() },
+        };
+        scheduler.complete_root(root()).unwrap();
+        assert_eq!(scheduler.admission_available(), 2);
+        assert_eq!(scheduler.active["first"].inputs.len(), limit - 2);
+        scheduler.complete_root(root()).unwrap();
+        assert_eq!(scheduler.admission_available(), 2, "repeated root notification cannot refund twice");
+        scheduler.active_paths.extend(names[..2].iter().map(|path| (watch_path_key(path), Arc::from("second"))));
+        scheduler.active.insert("second".into(), batch(2, vec![names[0].clone(), names[1].clone()], true));
+        assert_eq!(scheduler.admission_available(), 0, "second batch consumes only the freed candidate slots");
+        scheduler.complete("first").unwrap();
+        assert_eq!(scheduler.admission_available(), limit - 2, "cancellation returns only unfinished siblings");
+        scheduler.complete("second").unwrap();
+        assert_eq!(scheduler.admission_available(), limit, "failed batch returns all remaining owners");
+        scheduler.complete("second").unwrap();
+        assert_eq!(scheduler.admission_available(), limit);
+        scheduler.options = None;
+        assert_eq!(scheduler.admission_available(), 0);
+        drop(scheduler);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_file(marker).unwrap();
     }
 
     #[test]

@@ -827,13 +827,11 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn should_process_sources(
+    fn completed_sources(
         &self,
-        _path: &Path,
-        _data_paths: &[&str],
         _generations: &HashMap<String, PhysicalFileGeneration>,
-    ) -> io::Result<bool> {
-        Ok(true)
+    ) -> io::Result<Option<PathBuf>> {
+        Ok(None)
     }
 
     fn sources_processed(
@@ -841,7 +839,6 @@ pub(crate) trait Observer: Send + Sync {
         _archives: &[ArchiveResult],
         _generations: &HashMap<String, PhysicalFileGeneration>,
         _output: Option<&Path>,
-        _subtree_complete: bool,
     ) -> io::Result<()> {
         Ok(())
     }

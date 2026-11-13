@@ -24,7 +24,7 @@ pub struct Config {
     pub output: OutputConfig,
     pub watch: WatchConfig,
     pub passwords: PasswordConfig,
-    pub user_passwords: Vec<String>,
+    pub user_passwords: Arc<[Arc<str>]>,
     pub recursive_extract: Recursion,
     pub recursive_authorization: AuthorizationConfig,
     pub embedded_scan: EmbeddedConfig,
@@ -822,7 +822,7 @@ impl Config {
                 })
             })
             .collect();
-        let mut user_passwords: Vec<String> = match value.get("user_passwords") {
+        let mut user_passwords: Vec<Arc<str>> = match value.get("user_passwords") {
             None | Some(Value::Null) => Vec::new(),
             Some(value) => serde_json::from_value(value.clone())
                 .map_err(|_| invalid("user_passwords must be an array of strings"))?,
@@ -830,7 +830,7 @@ impl Config {
         let mut seen = std::collections::HashSet::new();
         user_passwords.retain(|password| seen.insert(password.clone()));
         Ok(Self {
-            user_passwords,
+            user_passwords: user_passwords.into(),
             cli: CliConfig {
                 language: raw_language(value),
             },
@@ -1308,7 +1308,17 @@ mod filter_runtime_tests {
         let mut raw = defaults().clone();
         raw["user_passwords"] = serde_json::json!([" first ", "", " first ", "second\0"]);
         let config = Config::parse(&raw).unwrap();
-        assert_eq!(config.user_passwords, [" first ", "", "second\0"]);
+        assert_eq!(config.user_passwords.iter().map(AsRef::as_ref).collect::<Vec<_>>(), [" first ", "", "second\0"]);
+        let old = Arc::clone(&config.user_passwords);
+        let second_batch = Arc::clone(&config.user_passwords);
+        assert!(Arc::ptr_eq(&old, &second_batch));
+        let copied_config = config.clone();
+        assert!(Arc::ptr_eq(&old, &copied_config.user_passwords));
+        raw["user_passwords"] = serde_json::json!(["new", " first "]);
+        let updated = Config::parse(&raw).unwrap();
+        assert!(!Arc::ptr_eq(&old, &updated.user_passwords));
+        assert_eq!(old[0].as_ref(), " first ");
+        assert_eq!(updated.user_passwords[0].as_ref(), "new");
     }
 
     #[test]

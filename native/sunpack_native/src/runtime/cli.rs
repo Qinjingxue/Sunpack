@@ -2035,7 +2035,7 @@ fn report_scan(
                     line(session, Stream::Out, &format!("{prefix}{text}"))?;
                 }
                 if let Some(failure) = &entry.failure {
-                    if !(password_failure(entry) && entry.password.is_none())
+                    if !(matches!(failure.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword) && entry.password.is_none())
                         && !(failure.kind == FailureKind::MissingVolume
                             && entry.volume_completeness.as_deref() == Some("missing"))
                     {
@@ -3112,6 +3112,37 @@ mod recursive_prompt_tests {
             source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
             damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
             promoted: false, promotion_original_path: None, scan_layout: crate::pipeline::ScanLayout { range: offset != 0, volumes: false },
+        }
+    }
+
+    #[test]
+    fn scan_keeps_inconclusive_errors_without_changing_retry_or_json() {
+        for kind in [FailureKind::PasswordRequired, FailureKind::WrongPassword, FailureKind::PasswordInconclusive] {
+            for language in [Language::En, Language::Zh] {
+                for json in [false, true] {
+                    let mut archive = report_archive("encrypted.zip", 0);
+                    let mut failure = crate::pipeline::Failure::new(kind, "probe failed");
+                    failure.password_retry = true;
+                    let message = failure_message(&failure, language).into_owned();
+                    archive.failure = Some(failure);
+                    archive.encrypted = Some(true);
+                    assert!(password_failure(&archive));
+                    let mut outcome = Outcome::default();
+                    outcome.archives.push(archive);
+                    let mut options = Options::parse(&["scan".into(), "encrypted.zip".into()]).unwrap();
+                    options.json = json;
+                    let session = Input::default();
+                    let (_, result) = report_scan(outcome, vec![], &options, &session, language).unwrap();
+                    if json {
+                        assert_eq!(result.items[0]["error"], message);
+                        assert_eq!(result.items[0]["error_kind"], serde_json::to_value(kind).unwrap());
+                    } else {
+                        let text = String::from_utf8(session.combined.lock().unwrap().clone()).unwrap();
+                        let error_line = language.translate("cli.scan.error", &[("error", &message)]);
+                        assert_eq!(text.contains(&error_line), kind == FailureKind::PasswordInconclusive, "{text}");
+                    }
+                }
+            }
         }
     }
 

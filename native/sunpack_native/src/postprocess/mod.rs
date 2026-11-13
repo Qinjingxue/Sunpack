@@ -256,6 +256,10 @@ pub(crate) fn remove_owned_tree(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
+// Inject after successful metadata, at the identity/USN observation boundary.
+pub(crate) static WATCH_OBSERVATION_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 pub(crate) fn watch_candidate_for_path(
     path: &Path,
     since_usn: Option<i64>,
@@ -279,6 +283,10 @@ fn watch_candidate_from_metadata(
 ) -> io::Result<Option<WatchCandidateRow>> {
     if metadata.len() == 0 {
         return Ok(None);
+    }
+    #[cfg(test)]
+    if WATCH_OBSERVATION_FAILURE.lock().unwrap().as_deref() == Some(path) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected identity observation failure"));
     }
     let observation = watch_file_observation_known_kind(path, since_usn, false)?;
     Ok(Some(WatchCandidateRow {

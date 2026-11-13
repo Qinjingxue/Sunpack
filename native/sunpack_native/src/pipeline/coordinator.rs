@@ -387,6 +387,12 @@ impl<O> std::ops::Deref for ObserverRef<'_, O> {
 type RecoveryCheckpointIndex = HashMap<Arc<str>, HashMap<CheckpointKey, usize>>;
 type RecoveryAnchorIndex = HashMap<String, HashMap<(String, u64), Vec<(Arc<str>, usize)>>>;
 
+enum TaskAdmission {
+    Execute,
+    Departed,
+    Completed(PathBuf),
+}
+
 struct Run<'a, O> {
     engine: Engine,
     request: Arc<Request>,
@@ -1470,6 +1476,10 @@ impl<'run, O: Observer> Run<'run, O> {
             let cancel = &this.request.cancel;
             cancel.check_io()?;
             stage("preflight", cancel).await?;
+            let watch_root = depth == 1
+                && this.request.origin == Origin::Watch
+                && this.request.mode == Mode::Extract;
+            let requested = this.requested_generation(&task, watch_root);
             let mut lease = this.claim_task(&task).await?;
             stage("preflight", cancel).await?;
             let mut outcome = Outcome::default();
@@ -1477,12 +1487,18 @@ impl<'run, O: Observer> Run<'run, O> {
             let (mut generations, missing) = this.capture_generations(&task);
             let discovered = task.source != DiscoverySource::Direct;
             let discovery_scope = task.scope.clone();
-            let watch_root = depth == 1
-                && this.request.origin == Origin::Watch
-                && this.request.mode == Mode::Extract;
-            if !this.should_process_task(&task, &generations, &missing, discovered, watch_root)? {
-                this.observer.notify(Event::Skipped { id: task_id });
-                return Ok(outcome);
+            let admission = this.task_admission(&task, &generations, &missing, discovered, watch_root, requested.as_ref())?;
+            drop(requested);
+            match admission {
+                TaskAdmission::Execute => {},
+                TaskAdmission::Departed => {
+                    this.observer.notify(Event::Skipped { id: task_id });
+                    return Ok(outcome);
+                }
+                TaskAdmission::Completed(output) => {
+                    this.reuse_completed_task(&task, task_id, depth, output, &mut outcome);
+                    return Ok(outcome);
+                }
             }
             this.observer.notify(Event::Started {
                 id: task_id,
@@ -1813,13 +1829,23 @@ impl<'run, O: Observer> Run<'run, O> {
                             this.observer.after_output(&executed.result)?;
                             sources.refresh(&replacement.owned_paths);
                             drop(lease);
+                            let requested = this.requested_generation(&replacement, watch_root);
                             lease = this.claim_task(&replacement).await?;
                             stage("preflight", cancel).await?;
                             let (current_generations, missing) = this.capture_generations(&replacement);
                             generations = current_generations;
-                            if !this.should_process_task(&replacement, &generations, &missing, discovered, watch_root)? {
-                                this.observer.notify(Event::Skipped { id: task_id });
-                                return Ok(outcome);
+                            let admission = this.task_admission(&replacement, &generations, &missing, discovered, watch_root, requested.as_ref())?;
+                            drop(requested);
+                            match admission {
+                                TaskAdmission::Execute => {},
+                                TaskAdmission::Departed => {
+                                    this.observer.notify(Event::Skipped { id: task_id });
+                                    return Ok(outcome);
+                                }
+                                TaskAdmission::Completed(output) => {
+                                    this.reuse_completed_task(&replacement, task_id, depth, output, &mut outcome);
+                                    return Ok(outcome);
+                                }
                             }
                             this.admit_missing_inputs(&mut replacement, &missing, discovered);
                             this.observer.claim_sources(
@@ -2245,7 +2271,6 @@ impl<'run, O: Observer> Run<'run, O> {
                 .iter()
                 .all(|result| result.failure.is_none() && !result.partial)
                 && !cancel.cancelled();
-            let complete = sources_complete && subtree_complete(&children);
             // A Watch request may have been admitted before another batch moved
             // these members. The source leases now cover the actual resolved family.
             let admitted_promoted: Vec<_> = promotion_sources
@@ -2259,7 +2284,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 if watch_root {
                     stage("output_state", &Cancellation::new()).await?;
                     this.observer.sources_processed(&completed, &generations,
-                        carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())), complete)?;
+                        carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
                 }
                 let cleanup_paths = sources.release(true);
                 let mode = if depth > 1 { CleanupMode::Delete }
@@ -2706,41 +2731,51 @@ impl<'run, O: Observer> Run<'run, O> {
         }
     }
 
-    fn should_process_task(
+    fn requested_generation(&self, task: &Task, watch_root: bool) -> Option<HashMap<String, PhysicalFileGeneration>> {
+        if !watch_root || task.owned_paths.len() < 2 { return None; }
+        let (generations, _) = self.capture_generations(task);
+        (generations.len() == task.owned_paths.len()).then_some(generations)
+    }
+
+    fn task_admission(
         &self,
         task: &Task,
         generations: &HashMap<String, PhysicalFileGeneration>,
         missing: &[PathBuf],
         discovered: bool,
         watch_root: bool,
-    ) -> io::Result<bool> {
-        // A discovered proposal can depart while waiting for its physical lease.
-        // Explicit direct inputs still take the ordinary open/failure path.
-        // Keep the original proposal's eligibility through volume replacement;
-        // finding a relation later does not turn a Direct task into discovery.
+        requested: Option<&HashMap<String, PhysicalFileGeneration>>,
+    ) -> io::Result<TaskAdmission> {
+        // Check the resolved physical family only after its lease is acquired.
+        // Departed discovery proposals are not successful output reuse.
         if discovered && !missing.is_empty() && missing.len() == task.owned_paths.len() {
-            return Ok(false);
+            return Ok(TaskAdmission::Departed);
         }
-        if !watch_root {
-            return Ok(true);
+        if watch_root && task.owned_paths.len() > 1 {
+            // main retains the complete pre-wait generation when a prior owner
+            // consumed members, but only while every surviving member is unchanged.
+            let version = if generations.len() == task.owned_paths.len() { Some(generations) }
+                else { requested.filter(|before| before.len() == task.owned_paths.len()
+                    && generations.iter().all(|(path, current)| before.get(path)
+                        .is_some_and(|previous| current.matches_input(&previous.persisted())))) };
+            if let Some(output) = version.map(|version| self.observer.completed_sources(version)).transpose()?.flatten() {
+                return Ok(TaskAdmission::Completed(output));
+            }
         }
-        let data_paths: Vec<_> = task
-            .inputs
-            .iter()
-            .flat_map(|logical| {
-                let input = &logical.input;
-                let whole_file = input.parts.is_empty() && input.ranges.is_empty();
-                input
-                    .physical_extents()
-                    .map(|extent| extent.path.as_str())
-                    .chain(whole_file.then_some(input.entry_path.as_str()))
-            })
-            .collect();
-        self.observer.should_process_sources(
-            Path::new(&task.entry().entry_path),
-            &data_paths,
-            generations,
-        )
+        Ok(TaskAdmission::Execute)
+    }
+
+    fn reuse_completed_task(&self, task: &Task, id: TaskId, depth: usize,
+        output: PathBuf, outcome: &mut Outcome) {
+        // main returns one successful target with the existing output. It does
+        // not re-extract/recurse, schedule source cleanup, or publish that
+        // existing directory as a newly owned output operation.
+        let mut result = receipt(task.entry(), task.source, depth);
+        result.source_paths = task.owned_paths.iter().map(PathBuf::from).collect();
+        result.output = Some(output);
+        self.observer.notify(Event::Finished { id, path: result.path.clone(), depth,
+            result: super::TaskCompletion::from_result(&result) });
+        outcome.archives.push(result);
     }
 
     fn plan_inputs(&self, task: &mut Task) -> io::Result<()> {
@@ -5283,6 +5318,91 @@ mod tests {
     }
 
     #[test]
+    fn completed_watch_family_returns_existing_success_without_extracting_or_reowning_output() {
+        struct Reuse {
+            output: PathBuf,
+            events: Mutex<Vec<Event>>,
+            queries: std::sync::atomic::AtomicUsize,
+        }
+        impl Observer for Reuse {
+            fn notify(&self, event: Event) { self.events.lock().unwrap().push(event); }
+            fn completed_sources(&self, generations: &HashMap<String, PhysicalFileGeneration>) -> io::Result<Option<PathBuf>> {
+                assert_eq!(generations.len(), 2);
+                self.queries.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(self.output.clone()))
+            }
+            fn before_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
+                panic!("completed output must not be created again")
+            }
+            fn reuse_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
+                panic!("completed output must not acquire a second durable owner")
+            }
+            fn after_output(&self, _: &ArchiveResult) -> io::Result<()> {
+                panic!("completed output must not be republished")
+            }
+        }
+        let head = crate::test_support::temp_file("completed_family_head", b"head");
+        let tail = crate::test_support::temp_file("completed_family_tail", b"tail");
+        let output = head.with_extension("existing-output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("damaged-inner.zip"), b"retained terminal inner failure").unwrap();
+        let engine = Engine::new(PathBuf::from("must-not-start-worker.exe"));
+        let mut request = Request::new(vec![tail.clone()], Mode::Extract);
+        request.origin = Origin::Watch;
+        let observer = Reuse { output: output.clone(), events: Mutex::default(), queries: 0.into() };
+        let run = test_run(&engine, &request, &observer);
+        let task = Task {
+            primary: None, owned_paths: vec![head.to_string_lossy().into_owned(), tail.to_string_lossy().into_owned()],
+            inputs: vec![LogicalInput { password_probe: None,
+                input: ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
+                password: None, failure: None }],
+            source: DiscoverySource::Relations, retry: None, scope: None,
+        };
+        let (generations, missing) = run.capture_generations(&task);
+        // Foreground/nested tasks and incomplete observations do not consume
+        // the Watch-only completed family fact.
+        assert!(matches!(run.task_admission(&task, &generations, &[], true, false, None).unwrap(), TaskAdmission::Execute));
+        let mut partial = generations.clone();
+        partial.remove(&path_key(&tail.to_string_lossy()));
+        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, None).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true, None).unwrap(), TaskAdmission::Departed));
+        let single = Task { primary: None, owned_paths: vec![head.to_string_lossy().into_owned()],
+            inputs: vec![LogicalInput { password_probe: None, input: task.entry().clone(), password: None, failure: None }],
+            source: DiscoverySource::Relations, retry: None, scope: None };
+        assert!(matches!(run.task_admission(&single, &partial, &[], true, true, None).unwrap(), TaskAdmission::Execute));
+        assert_eq!(observer.queries.load(Ordering::SeqCst), 0);
+        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, Some(&generations)).unwrap(),
+            TaskAdmission::Completed(ref path) if path == &output));
+        assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true,
+            Some(&generations)).unwrap(), TaskAdmission::Departed));
+        let changed = HashMap::from([(path_key(&head.to_string_lossy()), generations[&path_key(&tail.to_string_lossy())].clone())]);
+        assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, true, Some(&generations)).unwrap(), TaskAdmission::Execute));
+        assert_eq!(observer.queries.swap(0, Ordering::SeqCst), 1);
+        assert!(missing.is_empty());
+        let outcome = Scheduler::new().run(1, Origin::Watch, &request.cancel, |spawner| {
+            run.execute_task(run.register_task(task), 1, 1, None, spawner)
+        }).unwrap();
+        assert_eq!(observer.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.archives.len(), 1);
+        let reused = &outcome.archives[0];
+        assert_eq!(reused.path, head);
+        assert_eq!(reused.output.as_ref(), Some(&output));
+        assert_eq!(reused.source_paths, [head.clone(), tail.clone()]);
+        assert!(reused.failure.is_none() && !reused.partial);
+        assert_eq!(reused.files, 0); // No invented member inventory/count.
+        assert!(outcome.cleanup_results.is_empty());
+        assert!(outcome.checkpoints.is_empty());
+        assert!(run.created_outputs.lock().unwrap().0.is_empty());
+        assert!(run.cleanup_refs.lock().unwrap().paths.is_empty());
+        assert!(matches!(observer.events.lock().unwrap().as_slice(),
+            [Event::Finished { id: 1, result, .. }] if result.output.as_ref() == Some(&output)));
+        assert_eq!(fs::read(output.join("damaged-inner.zip")).unwrap(), b"retained terminal inner failure");
+        fs::remove_dir_all(output).unwrap();
+        fs::remove_file(head).unwrap();
+        fs::remove_file(tail).unwrap();
+    }
+
+    #[test]
     fn advisory_planning_read_error_preserves_the_original_input() {
         // The analysis open fails, but the later extraction path must still
         // receive the original input rather than a fabricated terminal failure.
@@ -5394,7 +5514,7 @@ mod tests {
             assert_eq!(absent, vec![missing.clone()]);
             assert_eq!(generations.len(), 1);
             assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
-            assert!(run.should_process_task(&task, &generations, &absent, true, false).unwrap());
+            assert!(matches!(run.task_admission(&task, &generations, &absent, true, false, None).unwrap(), TaskAdmission::Execute));
             run.admit_missing_inputs(&mut task, &absent, false);
             assert!(task.inputs[0].failure.is_none());
             task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
@@ -5633,13 +5753,13 @@ mod tests {
                         retry: None,
                         scope: None,
                     };
-                    assert!(run.should_process_task(&direct, &HashMap::new(), &[path.clone()], false, false).unwrap());
+                    assert!(matches!(run.task_admission(&direct, &HashMap::new(), &[path.clone()], false, false, None).unwrap(), TaskAdmission::Execute));
                     // A replacement can be classified Relations while retaining
                     // the original Direct task's no-silent-skip boundary.
                     let mut replacement = direct;
                     replacement.source = DiscoverySource::Relations;
-                    assert!(run.should_process_task(&replacement, &HashMap::new(), &[path.clone()], false, false).unwrap());
-                    assert!(!run.should_process_task(&replacement, &HashMap::new(), &[path.clone()], true, false).unwrap());
+                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], false, false, None).unwrap(), TaskAdmission::Execute));
+                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], true, false, None).unwrap(), TaskAdmission::Departed));
                 }
             }
         }

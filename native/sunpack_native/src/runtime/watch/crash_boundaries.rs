@@ -363,8 +363,14 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 batch: Arc::from("new-success"), toast: None, hub: Arc::clone(&scheduler.hub),
                 groups: Arc::default(), claimed: Arc::default(), promoted: Mutex::default(),
             };
+            // A single-source success must not acquire a completed-family fact.
+            let single = super::tests::completion_archive(head.to_str().unwrap(), 1, None);
+            observer.sources_processed(&[single], &generations, Some(&output)).unwrap();
+            let subset = HashMap::from([(key(&head), generations[&key(&head)].clone())]);
+            assert_eq!(observer.completed_sources(&subset).unwrap(), None);
             // Main remembers complete source output even if a child failed.
-            observer.sources_processed(&[success], &generations, Some(&output), false).unwrap();
+            observer.sources_processed(&[success], &generations, Some(&output)).unwrap();
+            assert_eq!(observer.completed_sources(&generations).unwrap(), Some(output.clone()));
             let mut outcome = Outcome::default();
             outcome.archives.push(old);
             scheduler.apply_completion("late-old-failure", CompletionContext {
