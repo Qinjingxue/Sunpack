@@ -6,7 +6,7 @@
 use crate::analysis_native::structure::{
     has_compression_stream_header, inspect_compression_stream_reader, StreamObservation,
 };
-use crate::io::archive_state::{AnalysisFacts, ArchiveInput, OpenMode, VolumeCompleteness};
+use crate::io::archive_state::{AnalysisFacts, AnalysisStatus, ArchiveInput, OpenMode, VolumeCompleteness};
 use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::reader::FileIdentity;
 use crate::scan::embedded::{EmbeddedCandidate, NativeScanResult};
@@ -259,6 +259,7 @@ struct ReportContext<'a> {
 }
 
 pub(crate) struct AnalysisSegment {
+    pub(crate) status: Option<AnalysisStatus>,
     pub(crate) format_hint: String,
     pub(crate) start: u64,
     pub(crate) end: Option<u64>,
@@ -381,6 +382,7 @@ impl AnalysisBinaryView {
             let evidence = &evidences[evidence];
             let segment = &evidence.segments[index];
             AnalysisSegment {
+                status: AnalysisStatus::from_evidence(evidence.status),
                 format_hint: evidence.format.clone(),
                 start: segment.start,
                 end: segment.end,

@@ -1,4 +1,4 @@
-use super::checkpoint::{CheckpointKey, InputCheckpoint, PromotedSource};
+use super::checkpoint::{CheckpointKey, InputCheckpoint, InputRecovery, PromotedSource, ReportState};
 use super::discovery::{self, Discovered, LogicalInput, Task};
 use super::passwords::{AttemptCache, CandidateSet};
 use super::scheduling::{stage, Scheduler, Spawner};
@@ -255,9 +255,9 @@ impl Engine {
                     .take()
                     .or_else(|| common_output_base(&request.inputs))
             });
-        let mut checkpoints: HashMap<CheckpointKey, Vec<usize>> = HashMap::new();
+        let mut checkpoints: RecoveryCheckpointIndex = HashMap::new();
         for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-            checkpoints.entry(checkpoint.key()).or_default().push(index);
+            checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
         }
         let promoted_sources = request
             .promoted_sources
@@ -279,6 +279,7 @@ impl Engine {
             created_outputs: Mutex::default(),
             output_base,
             checkpoints,
+            checkpoint_anchors: OnceLock::new(),
             promoted_sources,
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
@@ -371,6 +372,9 @@ impl<O> std::ops::Deref for ObserverRef<'_, O> {
     }
 }
 
+type RecoveryCheckpointIndex = HashMap<Arc<str>, HashMap<CheckpointKey, usize>>;
+type RecoveryAnchorIndex = HashMap<String, HashMap<(String, u64), Vec<(Arc<str>, usize)>>>;
+
 struct Run<'a, O> {
     engine: Engine,
     request: Arc<Request>,
@@ -384,7 +388,8 @@ struct Run<'a, O> {
     output_names: OutputReservationGuard,
     created_outputs: Mutex<CreatedOutputs>,
     output_base: Option<PathBuf>,
-    checkpoints: HashMap<CheckpointKey, Vec<usize>>,
+    checkpoints: RecoveryCheckpointIndex,
+    checkpoint_anchors: OnceLock<RecoveryAnchorIndex>,
     promoted_sources: HashMap<String, usize>,
     scan_errors: Mutex<DirectoryReadErrors>,
     cleanup_tasks: Mutex<Vec<PendingCleanup>>,
@@ -742,7 +747,7 @@ impl OutputNames {
                         continue;
                     }
                     if !creation_error { return Err(error); }
-                    return Ok(Err(file_failure(error)));
+                    return Ok(Err(output_create_failure(error, &path)));
                 }
             }
         }
@@ -961,6 +966,8 @@ impl CreatedOutputs {
     }
 }
 
+type ParentOutput = (ArchiveResult, Option<NativeOutputInventory>, ArchiveInput, TaskId, bool, usize);
+
 struct Executed {
     planned_output: Option<PathBuf>,
     result: ArchiveResult,
@@ -1162,6 +1169,67 @@ impl<'run, O: Observer> Run<'run, O> {
         id
     }
 
+    fn queue_inputs(&self, task: &Task, task_id: TaskId, depth: usize,
+        previous: &[Option<&InputCheckpoint>], report_count: usize, has_retained: bool) -> Vec<TaskId> {
+        let count = task.inputs.len();
+        let position = |index: usize| previous.get(index).copied().flatten()
+            .and_then(InputCheckpoint::report_position).unwrap_or(index + 1);
+        let register = |index: usize| {
+            if count == 1 { return task_id; }
+            let input = &task.inputs[index].input;
+            let extent = input.physical_extents().next();
+            self.queue_task(input, depth, Some(task_id), Some(Segment {
+                format: input.format_hint.clone(), index: position(index), count: report_count,
+                offset: extent.map_or(0, |extent| extent.start),
+                end_offset: extent.and_then(|extent| extent.end),
+            }))
+        };
+        // Main merges unchanged siblings into the selected display plan and
+        // orders that merged plan by its stable positions. Those siblings are
+        // already in our task.inputs: only registration order changes, never
+        // input execution order. Ordinary and already ordered plans allocate no
+        // extra ordering buffer.
+        if has_retained && (1..count).any(|index| position(index - 1) > position(index)) {
+            let mut order: Vec<_> = (0..count).collect();
+            order.sort_by_key(|&index| position(index));
+            let mut ids = vec![task_id; count];
+            for index in order { ids[index] = register(index); }
+            ids
+        } else {
+            (0..count).map(register).collect()
+        }
+    }
+
+    fn replan_input(&self, task_id: TaskId, depth: usize, input: &ArchiveInput,
+        previous: Option<&InputCheckpoint>) -> (TaskId, Option<TaskId>) {
+        self.observer.notify(Event::Replanned {
+            id: task_id, path: PathBuf::from(&input.entry_path),
+        });
+        let Some(previous) = previous.filter(|checkpoint| !checkpoint.same_report_input(input)) else {
+            return (task_id, None);
+        };
+        // main task_replanned registers the current input, then merges the
+        // retained first attempt by stable position. No execution is queued.
+        let segment = |input: &ArchiveInput, index| {
+            let extent = input.physical_extents().next();
+            Segment { format: input.format_hint.clone(), index, count: 2,
+                offset: extent.map_or(0, |extent| extent.start),
+                end_offset: extent.and_then(|extent| extent.end) }
+        };
+        let active = self.queue_task(input, depth, Some(task_id), Some(segment(input, 1)));
+        let retained = self.queue_task(previous.input(), depth, Some(task_id),
+            Some(segment(previous.input(), previous.report_position().unwrap_or(1))));
+        if let Some(failure) = previous.failure() {
+            let mut result = super::TaskCompletion::failed(failure);
+            result.output = previous.has_output().then(|| previous.output().to_path_buf());
+            self.observer.notify(Event::Finished {
+                id: retained, path: previous.entry().to_path_buf(), depth, result,
+            });
+        }
+        self.observer.notify(Event::Started { id: active, path: PathBuf::from(&input.entry_path), depth });
+        (active, Some(retained))
+    }
+
     fn record_scan_errors(&self, errors: DirectoryReadErrors) -> bool {
         if errors.is_empty() {
             return false;
@@ -1203,7 +1271,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 path: PathBuf::from(&task.entry().entry_path),
                 depth,
             });
-            let scan_discovery_failures = if this.request.mode == Mode::Scan && task.inputs.len() > 1
+            let preflight_failures = if task.inputs.len() > 1
                 && discovered && !missing.is_empty() {
                 task.inputs.iter().map(|logical| logical.failure.clone()).collect::<Vec<_>>()
             } else { Vec::new() };
@@ -1227,6 +1295,24 @@ impl<'run, O: Observer> Run<'run, O> {
                 .is_some_and(|failure| failure.contains(FailureKind::MissingVolume));
             if !single_volume_retry && (admission || discovery_blocked) {
                 let failure = task.inputs[0].failure.as_ref().expect("task preflight failure");
+                // task_started in main registers segment rows even when task
+                // preflight prevents execution. Queued here only registers the
+                // observer row; no segment is submitted to the scheduler.
+                if task.inputs.len() > 1 {
+                    for (index, id) in this.queue_inputs(&task, task_id, depth, &[], task.inputs.len(), false).into_iter().enumerate() {
+                        let logical = &task.inputs[index];
+                        let original = if discovery_blocked { logical.failure.as_ref() }
+                            else { preflight_failures.get(index).and_then(Option::as_ref) };
+                        let completion = if let Some(failure) = original {
+                            super::TaskCompletion::failed(failure)
+                        } else { super::TaskCompletion { discovery: None,
+                            status: super::TaskStatus::Skipped, failure: None, output: None,
+                        } };
+                        this.observer.notify(Event::Finished {
+                            id, path: PathBuf::from(&logical.input.entry_path), depth, result: completion,
+                        });
+                    }
+                }
                 let mut completed: Vec<_> = if this.request.mode == Mode::Scan || discovery_blocked {
                     // main scan_items still projects every original descriptor.
                     task.inputs.iter().enumerate().map(|(index, logical)| {
@@ -1236,7 +1322,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         // scan_items gives the original node failure precedence
                         // over the terminal task's admission failure.
                         result.failure = if discovery_blocked { logical.failure.clone() }
-                            else { scan_discovery_failures.get(index).cloned().flatten() };
+                            else { preflight_failures.get(index).cloned().flatten() };
                         result
                     }).collect()
                 } else {
@@ -1279,44 +1365,28 @@ impl<'run, O: Observer> Run<'run, O> {
             }
             let candidates = this.candidates.with_scope(source_scope);
             let preferred_carrier = this.preferred_output(task.entry(), depth);
+            let report_previous = this.select_checkpoints(&owner_path, &task.inputs);
             let mut retained: Vec<_> = task
                 .inputs
-                .iter()
-                .map(|logical| {
+                .iter().zip(&report_previous)
+                .map(|(logical, previous)| {
                     if logical.failure.as_ref().is_some_and(|failure|
                         matches!(failure.context.as_deref(), Some(super::FailureContext::InputAdmission { .. })))
                     { None } else {
-                        this.checkpoint_for(&logical.input, &generations, &preferred_carrier, depth, &candidates)
+                        this.checkpoint_for(&logical.input, *previous, &generations, &preferred_carrier, depth, &candidates)
                     }
                 })
                 .collect();
             let mut split_input = task.entry().mode.structured() || task.entry().physical_paths().nth(1).is_some();
             let multi = task.inputs.len() > 1;
             let count = task.inputs.len();
-            let ids: Vec<_> = task
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(index, logical)| {
-                    if multi {
-                        let extent = logical.input.physical_extents().next();
-                        this.queue_task(
-                            &logical.input,
-                            depth,
-                            Some(task_id),
-                            Some(Segment {
-                                format: logical.input.format_hint.clone(),
-                                index: index + 1,
-                                count,
-                                offset: extent.map_or(0, |extent| extent.start),
-                                end_offset: extent.and_then(|extent| extent.end),
-                            }),
-                        )
-                    } else {
-                        task_id
-                    }
-                })
-                .collect();
+            let mut had_checkpoints = report_previous.iter().any(Option::is_some);
+            let continued_output = retained.iter().flatten().any(|checkpoint| checkpoint.continuable_output());
+            let report_count = if continued_output {
+                report_previous.iter().flatten().map(|checkpoint| checkpoint.report_input_count())
+                    .max().unwrap_or(0).max(count)
+            } else { count };
+            let ids = this.queue_inputs(&task, task_id, depth, &report_previous, report_count, retained.iter().any(Option::is_some));
             let mut carrier = if this.request.mode == Mode::Extract && multi {
                 let existing = retained
                     .iter()
@@ -1349,10 +1419,10 @@ impl<'run, O: Observer> Run<'run, O> {
             // A retry can invalidate the old result without invalidating its
             // output slot. Main keeps those slots only inside a carrier whose
             // unchanged siblings already justified retaining the root.
-            let retry_slots: Vec<_> = task.inputs.iter().zip(&retained)
-                .map(|(logical, checkpoint)| {
+            let retry_slots: Vec<_> = task.inputs.iter().zip(&retained).zip(&report_previous)
+                .map(|((logical, checkpoint), previous)| {
                     checkpoint.is_none().then(|| carrier.as_deref()
-                        .and_then(|root| this.retry_slot_for(&logical.input, root))).flatten()
+                        .and_then(|root| this.retry_slot_for(&logical.input, *previous, root))).flatten()
                 })
                 .collect();
             // Reserve logical names in input order before discovery/password
@@ -1385,12 +1455,18 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut carrier_children_complete = true;
             let mut children = Outcome::default();
             let mut parent_outputs = Vec::with_capacity(count);
+            let report_enabled = this.request.mode == Mode::Extract && task.owned_paths.iter()
+                .all(|path| generations.contains_key(&path_key(path)));
+            let mut report_states = Vec::with_capacity(count);
+            let mut replacement_retained = None;
+            let mut replacement_rows = None;
             let retry = task.retry.filter(|_| task.inputs.len() == 1);
             let mut promotion_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
-            for (index, (((logical, checkpoint), retry_slot), &id)) in
+            for (index, (((logical, checkpoint), retry_slot), &original_id)) in
                 task.inputs.into_iter().zip(retained.drain(..)).zip(retry_slots).zip(&ids).enumerate()
             {
+                let mut id = original_id;
                 if multi {
                     this.observer.notify(Event::Started {
                         id,
@@ -1476,6 +1552,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     )
                     .await?
                 };
+                let mut replacement_checkpoint = None;
                 if let Some(context) = retry.as_deref().filter(|_| {
                     !cancel.cancelled()
                         && !multi
@@ -1498,11 +1575,27 @@ impl<'run, O: Observer> Run<'run, O> {
                         // after resolving a usable physical family. Until then,
                         // its damaged payload remains available for recovery.
                         let retry_output = executed.planned_output.clone();
+                        // checkpoint_inputs runs before the replacement callback
+                        // in main. Capture the first attempt with its own lease
+                        // generation, not the generation of the replacement.
+                        let first_checkpoint = if report_enabled && !before_worker {
+                            InputCheckpoint::create(&owner_path, &executed.input, &executed.result,
+                                &generations, carrier.as_deref(), false, remaining_depth)
+                                .and_then(|mut checkpoint| {
+                                    let state = InputCheckpoint::report_state(&executed.input,
+                                        &executed.result, retry_output.as_deref(),
+                                        report_previous[index], index + 1, report_count)?;
+                                    checkpoint.install_report(Some(state));
+                                    Some(checkpoint)
+                                })
+                        } else { None };
                         let cleaned = match retry_output.as_deref() {
                             Some(output) => this.discard_failed_output(&executed.result, output, &mut outcome)?,
                             None => true,
                         };
                         if cleaned {
+                            replacement_checkpoint = first_checkpoint;
+                            had_checkpoints |= replacement_checkpoint.is_some();
                             executed.result.output = None;
                             this.observer.after_output(&executed.result)?;
                             drop(lease);
@@ -1530,6 +1623,10 @@ impl<'run, O: Observer> Run<'run, O> {
                             split_input = replacement.entry().mode.structured()
                                 || replacement.entry().physical_paths().nth(1).is_some();
                             promotion_sources = std::mem::take(&mut replacement.owned_paths);
+                            let (active, retained) = this.replan_input(task_id, depth,
+                                replacement.entry(), replacement_checkpoint.as_ref());
+                            id = active;
+                            replacement_rows = retained.map(|retained| (active, retained));
                             let logical = replacement
                                 .inputs
                                 .into_iter()
@@ -1552,7 +1649,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 }
                 let Executed {
-                    planned_output: _,
+                    planned_output,
                     mut result,
                     inventory,
                     mut input,
@@ -1571,10 +1668,31 @@ impl<'run, O: Observer> Run<'run, O> {
                 if result.failure.is_none() {
                     superseded_candidates.extend(attempted.into_iter().flatten());
                 }
+                let replacement_matches = replacement_checkpoint.as_ref()
+                    .is_some_and(|previous| previous.same_report_input(&input));
+                let report_previous = if replacement_checkpoint.is_some() {
+                    replacement_checkpoint.as_ref().filter(|_| replacement_matches)
+                } else { report_previous[index].or(checkpoint).or(retry_slot) };
+                report_states.push(if report_enabled {
+                    // Capture before content cleanup and recursion, using the
+                    // exact input and counters returned by this execution.
+                    InputCheckpoint::report_state(&input, &result,
+                        planned_output.as_deref().or(planned_slots[index].as_deref()),
+                        report_previous, index + 1, report_count)
+                } else { None });
+                if let Some(previous) = replacement_checkpoint.filter(|_| !replacement_matches) {
+                    // adopt_detection_plan does not erase old checkpoints. A
+                    // different logical ID leaves that failed sibling in the
+                    // carrier result even if the replacement itself succeeds.
+                    replacement_retained = Some(previous);
+                }
+                if result.retained && result.output.is_none() && checkpoint.is_some_and(|checkpoint| checkpoint.has_output()) {
+                    InputCheckpoint::clear_report_output(&mut report_states[index]);
+                }
                 // Segment progress ends with its own extraction, as main's
                 // input_finished does. Physical root completion still waits
                 // for every recursive subtree and the final source cleanup.
-                if multi {
+                if multi || replacement_rows.is_some() {
                     this.observer.notify(Event::Finished {
                         id,
                         path: result.path.clone(),
@@ -1584,24 +1702,15 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 parent_outputs.push((result, inventory, input, id, children_already_complete, remaining_depth));
             }
-            // Main retains best-effort bytes per input before applying the
-            // physical carrier's content policy. A complete sibling keeps
-            // failed siblings' salvage, without accepting them for recursion.
-            if this.request.config.extraction.content_requirement == ContentRequirement::Complete
-                && !parent_outputs.iter().any(|(result, ..)| result.failure.is_none())
-            {
-                for (result, inventory, ..) in &mut parent_outputs {
-                    if let Some(output) = result.output.clone() {
-                        if this.discard_failed_output(result, &output, &mut outcome)? {
-                            result.output = None;
-                            result.files = 0;
-                            result.bytes = 0;
-                            result.recovered_complete_files = 0;
-                        }
-                    }
-                    *inventory = None;
-                }
-            }
+            // Preserve checkpoint insertion order without moving later child
+            // receipts: the first attempt precedes its replacement in main.
+            let replacement_retained = replacement_retained.map(|previous| {
+                let index = outcome.checkpoints.len();
+                outcome.checkpoints.push(previous);
+                index
+            });
+            this.apply_complete_content_policy(&mut parent_outputs, &mut report_states,
+                replacement_retained, &mut outcome)?;
             // Finish every logical parent before prompting or descending into
             // any segment. Independent output trees share the existing request
             // consumer budget rather than serializing behind the first subtree.
@@ -1708,6 +1817,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     None
                 };
                 if let Some(checkpoint) = &mut checkpoint {
+                    checkpoint.install_report(report_states[index].take());
                     checkpoint.set_planned_output(planned_slots[index].as_deref());
                     checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
                 }
@@ -1743,6 +1853,16 @@ impl<'run, O: Observer> Run<'run, O> {
                     .cleanup_results
                     .append(&mut descendants.cleanup_results);
                 completed.push(result);
+            }
+            if let Some(index) = replacement_retained {
+                let mut retained = outcome.checkpoints[index].result(depth);
+                // These are two logical input IDs of the same replanned carrier,
+                // not two independent top-level paths in the result tree.
+                if let Some(current) = completed.first() { retained.path = current.path.clone(); }
+                retained.partial = retained.failure.as_ref().is_some_and(|failure|
+                    accepts_partial_content(this.request.config.extraction.content_requirement,
+                        failure.kind, retained.recovered_complete_files));
+                completed.push(retained);
             }
             // Only the final carrier namespace is flattened. Individual segment
             // layouts remain intact while any input or recursive subtree may resume.
@@ -1853,6 +1973,24 @@ impl<'run, O: Observer> Run<'run, O> {
                 )
                 .await?;
             }
+            if this.request.mode == Mode::Extract && completed.iter().any(|result| result.failure.is_some()) {
+                // Receipts have already followed promotion/flatten. Preserve the
+                // pre-cleanup facts, but do not reconstruct them from final IO.
+                let retry_output = continued_output || ((multi || had_checkpoints) && completed.iter().any(|result|
+                    result.output.is_some() && (result.failure.is_none() || result.partial)));
+                if let Some(recovery) = InputRecovery::capture(&outcome.checkpoints,
+                    &owner_path, completed.first().map(|result| result.path.as_path()),
+                    carrier.as_deref(), report_count, had_checkpoints, retry_output)
+                {
+                    for failure in completed.iter_mut().filter_map(|result| result.failure.as_mut()) {
+                        if matches!(failure.context.as_deref(), Some(super::FailureContext::Postprocess { .. })) && !failure.causes.is_empty() {
+                            failure.causes[0].recovery = Some(Arc::clone(&recovery));
+                        } else {
+                            failure.recovery = Some(Arc::clone(&recovery));
+                        }
+                    }
+                }
+            }
             // Cleanup belongs to this physical source family, not its output
             // descendants. A failed/partial inner archive must keep its own
             // source, but does not revoke a fully extracted outer source.
@@ -1921,6 +2059,14 @@ impl<'run, O: Observer> Run<'run, O> {
                         id, path: result.path.clone(), depth,
                         result: super::TaskCompletion::from_result(result),
                     });
+                }
+            }
+            if let Some((active, retained)) = replacement_rows {
+                // The execution result stays first and the retained first
+                // attempt is appended to the physical result group.
+                for (id, result) in [active, retained].into_iter().zip(&completed) {
+                    this.observer.notify(Event::Finished { id, path: result.path.clone(), depth,
+                        result: super::TaskCompletion::from_result(result) });
                 }
             }
             if let Some(result) = completed.first() {
@@ -2124,72 +2270,126 @@ impl<'run, O: Observer> Run<'run, O> {
             })
     }
 
-    fn checkpoint_for(
+    fn checkpoint_for<'b>(
         &self,
         input: &ArchiveInput,
+        previous: Option<&'b InputCheckpoint>,
         generations: &HashMap<String, PhysicalFileGeneration>,
         preferred_carrier: &Path,
         depth: usize,
         candidates: &CandidateSet,
-    ) -> Option<&InputCheckpoint> {
+    ) -> Option<&'b InputCheckpoint> {
         if self.request.mode != Mode::Extract {
             return None;
         }
         let preferred = self.preferred_output(input, depth);
-        self.checkpoints
-            .get(&CheckpointKey::for_input(input))?
-            .iter()
-            .find_map(|&index| {
-                let checkpoint = &self.request.checkpoints[index];
-                if !checkpoint.valid_for(input, generations)
-                    || !checkpoint.password_unchanged(|| candidates.signature(&input.entry_path)) {
-                    return None;
-                }
-                if !checkpoint.has_output() { return Some(checkpoint); }
-                let destination_matches = match checkpoint.container() {
-                    Some(container) => {
-                        output_candidate(preferred_carrier, container)
-                            || (depth == 1
-                                && self
-                                    .admitted_promotion(
-                                        &input.entry_path,
-                                        generations,
-                                        self.request.origin == Origin::Watch,
-                                    )
-                                    .is_some())
-                    }
-                    None => output_candidate(&preferred, checkpoint.output()),
-                };
-                if !destination_matches {
-                    return None;
-                }
-                let mut names = self.output_names.registry.lock().unwrap();
-                let source = Path::new(&input.entry_path);
-                let nested = (depth > 1).then_some(source);
-                if let Some(container) = checkpoint.container() {
-                    // The physical task owns the container even when its logical
-                    // segments start in different files of the volume family.
-                    if !names.retain(container, self.output_names.owner, checkpoint.carrier(), nested) {
-                        return None;
-                    }
-                }
-                names.retain(checkpoint.output(), self.output_names.owner, source,
-                    checkpoint.container().or(nested)).then_some(checkpoint)
-            })
+        let checkpoint = previous?;
+        if !checkpoint.valid_for(input, generations)
+            || !checkpoint.password_unchanged(|| candidates.signature(&input.entry_path)) {
+            return None;
+        }
+        if !checkpoint.has_output() { return Some(checkpoint); }
+        let destination_matches = match checkpoint.container() {
+            Some(container) => {
+                output_candidate(preferred_carrier, container)
+                    || (depth == 1
+                        && self
+                            .admitted_promotion(
+                                &input.entry_path,
+                                generations,
+                                self.request.origin == Origin::Watch,
+                            )
+                            .is_some())
+            }
+            None => output_candidate(&preferred, checkpoint.output()),
+        };
+        if !destination_matches {
+            return None;
+        }
+        let mut names = self.output_names.registry.lock().unwrap();
+        let source = Path::new(&input.entry_path);
+        let nested = (depth > 1).then_some(source);
+        if let Some(container) = checkpoint.container() {
+            // The physical task owns the container even when its logical
+            // segments start in different files of the volume family.
+            if !names.retain(container, self.output_names.owner, checkpoint.carrier(), nested) {
+                return None;
+            }
+        }
+        names.retain(checkpoint.output(), self.output_names.owner, source,
+            checkpoint.container().or(nested)).then_some(checkpoint)
     }
 
-    fn retry_slot_for(&self, input: &ArchiveInput, carrier: &Path) -> Option<&InputCheckpoint> {
-        self.checkpoints.get(&CheckpointKey::for_input(input))?
-            .iter().find_map(|&index| {
-                let checkpoint = &self.request.checkpoints[index];
-                if !checkpoint.output_slot_for(input, carrier) { return None; }
-                // The root was retained through an unchanged sibling above.
-                // Claim only this logical child, never delete the carrier root.
-                self.output_names.registry.lock().unwrap().retain(
-                    checkpoint.output_slot().expect("matching output slot"), self.output_names.owner,
-                    Path::new(&input.entry_path), Some(carrier),
-                ).then_some(checkpoint)
-            })
+    fn checkpoint_anchor_index(&self) -> &RecoveryAnchorIndex {
+        self.checkpoint_anchors.get_or_init(|| {
+            let mut index: HashMap<String, HashMap<_, Vec<(Arc<str>, usize)>>> = HashMap::new();
+            for (owner, group) in &self.checkpoints {
+                for &position in group.values() {
+                    let input = self.request.checkpoints[position].input();
+                    if !index.contains_key(&input.format_hint) {
+                        index.insert(input.format_hint.clone(), HashMap::new());
+                    }
+                    let anchors = index.get_mut(&input.format_hint).unwrap();
+                    for anchor in recovery_anchors(input) {
+                        anchors.entry(anchor).or_default().push((Arc::clone(owner), position));
+                    }
+                }
+            }
+            index
+        })
+    }
+
+    /// Recovery belongs to one physical task, not the whole request. A newly
+    /// arrived first volume can change its carrier; only a unique old carrier
+    /// reached by its physical sources supplies that task's recovery scope.
+    fn select_checkpoints(&self, carrier: &Path, inputs: &[LogicalInput]) -> Vec<Option<&InputCheckpoint>> {
+        if self.checkpoints.is_empty() { return vec![None; inputs.len()]; }
+        let carrier = path_key(&carrier.to_string_lossy());
+        let group = self.checkpoints.get_key_value(carrier.as_str()).or_else(|| {
+            let index = self.checkpoint_anchor_index();
+            let mut owner = None;
+            for logical in inputs {
+                let input = &logical.input;
+                let Some(anchors) = index.get(&input.format_hint) else { continue; };
+                for anchor in recovery_anchors(input) {
+                    for (candidate_owner, _) in anchors.get(&anchor).into_iter().flatten() {
+                        if owner.is_some_and(|owner| owner != candidate_owner) { return None; }
+                        owner = Some(candidate_owner);
+                    }
+                }
+            }
+            owner.and_then(|owner| self.checkpoints.get_key_value(owner.as_ref()))
+        });
+        let Some((owner, group)) = group else { return vec![None; inputs.len()]; };
+        let mut used = HashSet::new();
+        inputs.iter().map(|logical| {
+            let input = &logical.input;
+            let previous = group.get(&CheckpointKey::for_input(input)).copied().or_else(|| {
+                let anchors = self.checkpoint_anchor_index().get(&input.format_hint)?;
+                let mut matched = None;
+                for anchor in recovery_anchors(input) {
+                    for (candidate_owner, candidate) in anchors.get(&anchor).into_iter().flatten() {
+                        let candidate = *candidate;
+                        if used.contains(&candidate) || candidate_owner != owner { continue; }
+                        if matched.is_some_and(|previous| previous != candidate) { return None; }
+                        matched = Some(candidate);
+                    }
+                }
+                matched
+            });
+            if let Some(index) = previous { used.insert(index); }
+            previous.map(|index| &self.request.checkpoints[index])
+        }).collect()
+    }
+
+    fn retry_slot_for<'b>(&self, input: &ArchiveInput, previous: Option<&'b InputCheckpoint>, carrier: &Path) -> Option<&'b InputCheckpoint> {
+        let checkpoint = previous?;
+        if !checkpoint.output_slot_for(input, carrier) { return None; }
+        // The root was retained through an unchanged sibling above.
+        self.output_names.registry.lock().unwrap().retain(
+            checkpoint.output_slot().expect("matching output slot"), self.output_names.owner,
+            Path::new(&input.entry_path), Some(carrier),
+        ).then_some(checkpoint)
     }
 
     async fn claim_task(&self, task: &Task) -> io::Result<Lease> {
@@ -2291,7 +2491,19 @@ impl<'run, O: Observer> Run<'run, O> {
         if !report.format_hint.is_empty() {
             original.input.format_hint = report.format_hint.to_string();
         }
-        original.input.analysis = report.facts;
+        let previous = &original.input.analysis;
+        let mut facts = report.facts;
+        facts.origin = previous.origin;
+        facts.planning_applied = true;
+        // Main keeps the descriptor's discovery facts while updating advisory
+        // execution/format facts; planning is not a new discovery receipt.
+        facts.volume_completeness = previous.volume_completeness;
+        facts.zip_eocd_offset = facts.zip_eocd_offset.or(previous.zip_eocd_offset);
+        facts.password_required |= previous.password_required;
+        facts.structure_complete |= previous.structure_complete;
+        facts.status = previous.status;
+        facts.damage_flags = previous.damage_flags.clone();
+        original.input.analysis = facts;
         let mut selected = report.extractable_segments;
         if selected.is_empty() {
             selected.extend(report.password_segment);
@@ -2309,6 +2521,8 @@ impl<'run, O: Observer> Run<'run, O> {
             .zip(selected)
             .filter_map(|(input, segment)| {
                 let mut input = input?;
+                input.analysis.origin = crate::io::archive_state::AnalysisOrigin::Planned;
+                input.analysis.status = segment.status;
                 input.analysis.zip_eocd_offset = segment.zip_eocd_offset;
                 input.analysis.password_required = segment.password_required;
                 input.analysis.damage_flags = segment.damage_flags;
@@ -2359,46 +2573,6 @@ impl<'run, O: Observer> Run<'run, O> {
             return Ok(Executed { planned_output: None, result, inventory: None, input });
         }
         stage("preflight", &self.request.cancel).await?;
-        let plan = match candidates.plan(&input, password, &self.request.cancel) {
-            Ok(Ok(plan)) => plan,
-            Ok(Err(failure)) => {
-                result.failure = Some(failure.with_context(super::FailureContext::PasswordResolution));
-                return Ok(Executed {
-                    planned_output: None,
-                    result,
-                    inventory: None,
-                    input,
-                });
-            }
-            Err(error) => {
-                result.failure = Some(
-                    if input.mode.structured() && error.kind() == io::ErrorKind::NotFound {
-                        Failure::new(FailureKind::MissingVolume, error.to_string())
-                    } else {
-                        self.process_or_file_failure(error, false)
-                    },
-                );
-                return Ok(Executed {
-                    planned_output: None,
-                    result,
-                    inventory: None,
-                    input,
-                });
-            }
-        };
-        if plan.verified {
-            result.password = plan.selected.as_deref().map(str::to_owned);
-        }
-        let codepage = if self.request.mode == Mode::Extract
-            && input.format_hint == "zip"
-            && input.volume_attempts.is_none()
-        {
-            crate::formats::zip::analyze_zip_filename_encoding(&input)
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
         let output = if self.request.mode == Mode::Extract {
             let preferred = carrier.map_or_else(
                 || self.preferred_output(&input, depth),
@@ -2416,7 +2590,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             Ok(path.to_owned())
                         }
                         Err(error) if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) => {
-                            Err(file_failure(error))
+                            Err(output_create_failure(error, path))
                         }
                         Err(error) => return Err(error),
                     }
@@ -2429,15 +2603,65 @@ impl<'run, O: Observer> Run<'run, O> {
                     Some(path)
                 }
                 Err(failure) => {
+                    let planned_output = match failure.context.as_deref() {
+                        Some(super::FailureContext::OutputCreate { path, .. }) => path.clone(),
+                        _ => None,
+                    };
                     result.failure = Some(failure);
                     return Ok(Executed {
-                    planned_output: None,
+                        planned_output,
                         result,
                         inventory: None,
                         input,
                     });
                 }
             }
+        } else {
+            None
+        };
+        let plan = match candidates.plan(&input, password, &self.request.cancel) {
+            Ok(Ok(plan)) => plan,
+            Ok(Err(failure)) => {
+                result.failure = Some(failure.with_context(super::FailureContext::PasswordResolution));
+                if let Some(path) = output.as_deref() {
+                    if !self.discard_failed_output(&result, path, outcome)? { result.output = Some(path.to_owned()); }
+                }
+                return Ok(Executed {
+                    planned_output: output,
+                    result,
+                    inventory: None,
+                    input,
+                });
+            }
+            Err(error) => {
+                result.failure = Some(
+                    if input.mode.structured() && error.kind() == io::ErrorKind::NotFound {
+                        Failure::new(FailureKind::MissingVolume, error.to_string())
+                    } else {
+                        self.process_or_file_failure(error, false)
+                    },
+                );
+                if let Some(path) = output.as_deref() {
+                    if !self.discard_failed_output(&result, path, outcome)? { result.output = Some(path.to_owned()); }
+                }
+                return Ok(Executed {
+                    planned_output: output,
+                    result,
+                    inventory: None,
+                    input,
+                });
+            }
+        };
+        if plan.verified {
+            result.password = plan.selected.as_deref().map(str::to_owned);
+        }
+        let codepage = if self.request.mode == Mode::Extract
+            && input.format_hint == "zip"
+            && input.volume_attempts.is_none()
+        {
+            crate::formats::zip::analyze_zip_filename_encoding(&input)
+                .ok()
+                .flatten()
         } else {
             None
         };
@@ -2626,6 +2850,42 @@ impl<'run, O: Observer> Run<'run, O> {
         })
     }
 
+    fn apply_complete_content_policy(
+        &self, parent_outputs: &mut [ParentOutput], report_states: &mut [Option<ReportState>],
+        replacement_retained: Option<usize>, outcome: &mut Outcome,
+    ) -> io::Result<()> {
+        // Main retains best-effort bytes per input before applying the
+        // physical carrier's content policy. A complete sibling keeps
+        // failed siblings' salvage, without accepting them for recursion.
+        if self.request.config.extraction.content_requirement == ContentRequirement::Complete
+            && !parent_outputs.iter().any(|(result, ..)| result.failure.is_none())
+        {
+            // A replacement can have no output after password/open failure,
+            // while main still counts the first attempt's retained complete
+            // members as partial output. Do not let its deleted slot survive
+            // a Complete-policy rejection in the recovery report.
+            let rejected_output = parent_outputs.iter().any(|(result, ..)| result.output.is_some())
+                || replacement_retained.is_some_and(|index| outcome.checkpoints[index].has_recovered_members());
+            for (index, (result, inventory, ..)) in parent_outputs.iter_mut().enumerate() {
+                if let Some(output) = result.output.clone() {
+                    if self.discard_failed_output(result, &output, outcome)? {
+                        result.output = None;
+                        result.files = 0;
+                        result.bytes = 0;
+                        result.recovered_complete_files = 0;
+                        InputCheckpoint::clear_report_output(&mut report_states[index]);
+                    }
+                }
+                *inventory = None;
+            }
+            if rejected_output && parent_outputs.iter().all(|(result, ..)| result.output.is_none()) {
+                for state in report_states.iter_mut() { InputCheckpoint::clear_report_output(state); }
+                if let Some(index) = replacement_retained { outcome.checkpoints[index].clear_recovery_output(); }
+            }
+        }
+        Ok(())
+    }
+
     fn discard_failed_output(
         &self, result: &ArchiveResult, path: &Path, outcome: &mut Outcome,
     ) -> io::Result<bool> {
@@ -2722,7 +2982,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 Ok(Ok(path.to_owned()))
             }
             Err(error) if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) => {
-                Ok(Err(file_failure(error)))
+                Ok(Err(output_create_failure(error, path)))
             }
             Err(error) => Err(error),
         }
@@ -2865,7 +3125,21 @@ fn flatten_result(
             checkpoint.relocate_flatten(&old, &new);
             observer.checkpoint(checkpoint)?;
         }
+        let mut relocated_recoveries = HashMap::new();
         for child in &mut children.archives {
+            let mut failures: Vec<_> = child.failure.iter_mut().collect();
+            while let Some(failure) = failures.pop() {
+                if let Some(recovery) = &mut failure.recovery {
+                    let key = Arc::as_ptr(recovery);
+                    let relocated = relocated_recoveries.entry(key).or_insert_with(|| {
+                        let mut snapshot = recovery.as_ref().clone();
+                        snapshot.relocate_flatten(&old, &new);
+                        Arc::new(snapshot)
+                    });
+                    *recovery = Arc::clone(relocated);
+                }
+                failures.extend(&mut failure.causes);
+            }
             if let Some(path) = child.output.as_mut() {
                 super::relocate_flatten_output(path, &old, &new);
             }
@@ -2970,6 +3244,25 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
     }
 }
 
+fn recovery_anchors(input: &ArchiveInput) -> impl Iterator<Item = (String, u64)> + '_ {
+    let plan = input.volume_attempts.as_ref();
+    let extents = plan.into_iter().flat_map(|plan| plan.sources.iter())
+        .chain(input.ranges.iter().filter(move |_| plan.is_none()))
+        .chain(input.parts.iter().filter(move |_| plan.is_none() && input.ranges.is_empty())
+            .map(|part| &part.extent));
+    let empty = plan.map_or(input.parts.is_empty() && input.ranges.is_empty(), |plan| plan.sources.is_empty());
+    extents.map(|extent| (path_key(&extent.path), extent.start))
+        .chain(empty.then(|| (path_key(&input.entry_path), 0)))
+}
+
+fn output_create_failure(error: io::Error, path: &Path) -> Failure {
+    let mut failure = file_failure(error);
+    if let Some(super::FailureContext::OutputCreate { path: attempted, .. }) = failure.context.as_deref_mut() {
+        *attempted = Some(path.to_owned());
+    }
+    failure
+}
+
 fn file_failure(error: io::Error) -> Failure {
     let original = error.get_ref().and_then(|inner| inner.downcast_ref::<super::OutputCreateError>())
         .map_or(&error, |created| &created.0);
@@ -2980,7 +3273,7 @@ fn file_failure(error: io::Error) -> Failure {
     };
     let failure = Failure::new(kind, error.to_string());
     if error.get_ref().is_some_and(|inner| inner.is::<super::OutputCreateError>()) {
-        failure.with_context(super::FailureContext::OutputCreate { error: original.to_string() })
+        failure.with_context(super::FailureContext::OutputCreate { error: original.to_string(), path: None })
     } else {
         failure
     }
@@ -4392,6 +4685,114 @@ mod tests {
         fs::remove_file(source).unwrap();
     }
 
+    #[test]
+    fn recovery_selection_uses_unique_physical_anchors_without_io() {
+        let source = crate::test_support::temp_file("recovery_anchor", b"existing second volume");
+        let mut old = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "old".into());
+        let generations = HashMap::from([(path_key(&old.entry_path), capture_file_generation(&source).unwrap())]);
+        let result = receipt(&old, DiscoverySource::Relations, 1);
+        let mut checkpoint = InputCheckpoint::create(&source, &old, &result, &generations, None, false, 0).unwrap();
+        checkpoint.install_report(InputCheckpoint::report_state(&old, &result, None, None, 4, 7));
+        let mut arrived = old.clone();
+        // Relations can choose an arriving first volume as the new entry while
+        // retaining the previous second volume as a physical source anchor.
+        arrived.entry_path = source.with_extension("first").to_string_lossy().into_owned();
+        arrived.parts = Box::new([crate::io::archive_state::InputPart::range(
+            crate::io::archive_state::InputExtent { path: old.entry_path.clone(), start: 0, end: None })]);
+        let logical = |input| LogicalInput { input, password: None, failure: None };
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let observer = |_: Event| {};
+        let mut request = Request::new(Vec::new(), Mode::Extract);
+        request.checkpoints.push(checkpoint);
+        let mut run = test_run(&engine, &request, &observer);
+        Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&source.to_string_lossy()))).or_default().insert(request.checkpoints[0].key(), 0);
+        let exact = run.select_checkpoints(&source, &[logical(old.clone())]);
+        assert_eq!(exact[0].unwrap().report_position(), Some(4));
+        assert!(run.checkpoint_anchors.get().is_none(), "exact identity must not build an anchor index");
+        let matched = run.select_checkpoints(&source, &[logical(arrived.clone())]);
+        assert_eq!(matched[0].unwrap().report_position(), Some(4));
+        assert!(!matched[0].unwrap().valid_for(&arrived, &generations), "identity must not bypass layout validation");
+        let consumed = run.select_checkpoints(&source, &[logical(old.clone()), logical(arrived.clone())]);
+        assert!(consumed[0].is_some() && consumed[1].is_none());
+        let mut different_format = arrived.clone(); different_format.format_hint = "zip".into();
+        assert!(run.select_checkpoints(&source, &[logical(different_format)])[0].is_none());
+        let mut different_offset = arrived.clone(); different_offset.parts[0].extent.start = 1;
+        assert!(run.select_checkpoints(&source, &[logical(different_offset)])[0].is_none());
+        old.mode = crate::io::archive_state::OpenMode::FileRange;
+        assert!(run.select_checkpoints(&source, &[logical(old.clone())])[0].is_some(), "mode is not logical identity");
+        // Remapping the descriptor does not replace its stable logical ID.
+        let mut remapped_result = receipt(&arrived, DiscoverySource::Relations, 1);
+        remapped_result.source_paths = vec![source.clone()];
+        let mut remapped = InputCheckpoint::create(&source, &arrived, &remapped_result, &generations, None, false, 0).unwrap();
+        remapped.install_report(InputCheckpoint::report_state(&arrived, &remapped_result, None,
+            Some(&request.checkpoints[0]), 1, 1));
+        let mut remapped_request = Request::new(Vec::new(), Mode::Extract);
+        remapped_request.checkpoints.push(remapped);
+        let mut remapped_run = test_run(&engine, &remapped_request, &observer);
+        Arc::get_mut(&mut remapped_run).unwrap().checkpoints.entry(Arc::from(path_key(&source.to_string_lossy()))).or_default().insert(remapped_request.checkpoints[0].key(), 0);
+        assert_eq!(remapped_run.select_checkpoints(&source, &[logical(old.clone())])[0].unwrap().report_position(), Some(4));
+        assert!(remapped_run.checkpoint_anchors.get().is_none());
+        let changed_carrier = source.with_extension("arrived-carrier");
+        assert_eq!(run.select_checkpoints(&changed_carrier, &[logical(arrived.clone())])[0].unwrap().report_position(), Some(4));
+        // Watch batches carry several owners' receipts. Shared bytes never
+        // authorize taking another physical task's identity or output slot.
+        let other_carrier = source.with_extension("other-carrier");
+        let other_result = receipt(&old, DiscoverySource::Relations, 1);
+        let mut other_group = InputCheckpoint::create(&other_carrier, &old, &other_result, &generations, None, false, 0).unwrap();
+        other_group.install_report(InputCheckpoint::report_state(&old, &other_result, None, None, 9, 9));
+        let mut grouped_request = request.clone();
+        grouped_request.checkpoints.push(other_group);
+        let mut grouped = test_run(&engine, &grouped_request, &observer);
+        for (index, checkpoint) in grouped_request.checkpoints.iter().enumerate() {
+            Arc::get_mut(&mut grouped).unwrap().checkpoints
+                .entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy())))
+                .or_default().insert(checkpoint.key(), index);
+        }
+        assert_eq!(grouped.select_checkpoints(&source, &[logical(arrived.clone())])[0].unwrap().report_position(), Some(4));
+        assert_eq!(grouped.select_checkpoints(&other_carrier, &[logical(arrived.clone())])[0].unwrap().report_position(), Some(9));
+        assert!(grouped.select_checkpoints(&changed_carrier, &[logical(arrived.clone())])[0].is_none(),
+            "ambiguous prior carrier must not be guessed");
+        // Two distinct old logical identities sharing this anchor are ambiguous.
+        let mut other = arrived.clone(); other.entry_path.push_str("-other");
+        let mut other_result = receipt(&other, DiscoverySource::Relations, 1);
+        other_result.source_paths = vec![source.clone()];
+        let other = InputCheckpoint::create(&source, &other, &other_result, &generations, None, false, 0).unwrap();
+        request.checkpoints.push(other);
+        let mut ambiguous = test_run(&engine, &request, &observer);
+        for (index, checkpoint) in request.checkpoints.iter().enumerate() {
+            Arc::get_mut(&mut ambiguous).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
+        }
+        assert!(ambiguous.select_checkpoints(&source, &[logical(arrived)])[0].is_none());
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn password_failure_keeps_real_planned_output_after_cleanup() {
+        let source = crate::test_support::temp_file("password_output_order", &encrypted_rar_fixture());
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let request = Request::new(Vec::new(), Mode::Extract);
+        let observer = |_: Event| {};
+        let run = test_run(&engine, &request, &observer);
+        let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "encrypted".into());
+        input.analysis.password_required = true;
+        let logical = LogicalInput { input, password: None, failure: None };
+        let mut shell = engine.shell.branch();
+        let mut outcome = Outcome::default();
+        let executed = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
+            Box::pin(run.execute_input(logical, 1, DiscoverySource::Direct,
+                1, None, None, &run.candidates, &mut shell, &mut outcome))
+        }).unwrap();
+        assert!(matches!(executed.result.failure.as_ref().unwrap().context.as_deref(),
+            Some(super::super::FailureContext::PasswordResolution)));
+        let output = executed.planned_output.as_ref().expect("output reserved before password resolution");
+        assert!(!output.exists(), "failed password output was not cleaned");
+        assert!(executed.result.output.is_none());
+        assert!(InputCheckpoint::report_state(&executed.input, &executed.result,
+            Some(output), None, 1, 1).is_some());
+        release_reader_resources_under_roots(vec![source.to_string_lossy().into_owned()]).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
     fn test_run<'a, O: Observer>(
         engine: &'a Engine,
         request: &'a Request,
@@ -4411,6 +4812,7 @@ mod tests {
             created_outputs: Mutex::default(),
             output_base: None,
             checkpoints: HashMap::new(),
+            checkpoint_anchors: OnceLock::new(),
             promoted_sources: HashMap::new(),
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
@@ -4509,6 +4911,7 @@ mod tests {
         for (mode, count) in [Mode::Scan, Mode::Extract].into_iter()
             .flat_map(|mode| [1, 2].map(|count| (mode, count))) {
             let engine = Engine::new(PathBuf::from("unused-worker"));
+            assert_eq!(engine.next_id(), 1); // Reserve the parent observer ID.
             let request = Request::new(vec![path.clone()], mode);
             let events = Mutex::new(Vec::new());
             let observer = |event: Event| { events.lock().unwrap().push(event); };
@@ -4560,10 +4963,18 @@ mod tests {
             assert_eq!(outcome.archives.len(), if mode == Mode::Scan { count } else { 1 });
             let events = events.lock().unwrap();
             assert_eq!(events.iter().filter(|event| matches!(event, Event::Started { .. })).count(), 1);
-            assert_eq!(events.iter().filter(|event| matches!(event, Event::Finished { .. })).count(), 1);
-            assert!(!events.iter().any(|event| matches!(event, Event::Queued { .. })));
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Finished { .. })).count(), if count > 1 { count + 1 } else { 1 });
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Queued { .. })).count(), if count > 1 { count } else { 0 });
             assert!(events.iter().any(|event| matches!(event, Event::Finished { result, .. }
                 if result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::MissingVolume))));
+            if count == 2 {
+                // main keeps a discovery-blocked segment visible and marks
+                // the otherwise unexecuted sibling skipped after admission.
+                assert!(events.iter().any(|event| matches!(event, Event::Finished { id, result, .. }
+                    if *id != 1 && result.status == super::super::TaskStatus::Skipped)));
+                assert!(events.iter().any(|event| matches!(event, Event::Finished { id, result, .. }
+                    if *id != 1 && result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::Unsupported))));
+            }
             if mode == Mode::Scan && count == 2 {
                 assert_eq!(outcome.archives[0].failure.as_ref().unwrap().kind, FailureKind::Unsupported);
                 assert_eq!(outcome.archives[1].password.as_deref(), Some("known"));
@@ -4578,11 +4989,33 @@ mod tests {
     }
 
     #[test]
-    fn discovery_blocked_tasks_finish_before_segment_queueing() {
+    fn carrier_completion_keeps_postprocess_but_suppresses_segment_aggregate_detail() {
+        let input = ArchiveInput::file("carrier.bin".into(), "zip".into(), "archive".into());
+        let mut results = vec![receipt(&input, DiscoverySource::Embedded, 1), receipt(&input, DiscoverySource::Embedded, 1)];
+        results[0].failure = Some(Failure::new(FailureKind::Damaged, "segment damaged"));
+        results[1].failure = Some(Failure::new(FailureKind::Unsupported, "segment unsupported"));
+        let completion = super::super::TaskCompletion::from_group(&results);
+        assert_eq!(completion.status, super::super::TaskStatus::Failed);
+        assert!(completion.failure.is_none());
+        results[1].failure.as_mut().unwrap().evidence = Some(Box::new(super::super::FailureEvidence {
+            possible_missing_volume: true, ..Default::default()
+        }));
+        let completion = super::super::TaskCompletion::from_group(&results);
+        assert!(completion.failure.as_ref().unwrap().evidence.as_ref().unwrap().possible_missing_volume);
+        results[0].failure = Some(Failure::new(FailureKind::FilesystemError, "promotion denied")
+            .with_context(super::super::FailureContext::Postprocess { destination: "out".into() }));
+        let completion = super::super::TaskCompletion::from_group(&results);
+        assert_eq!(completion.failure.as_ref().unwrap().kind, FailureKind::FilesystemError);
+        assert_eq!(completion.failure.as_ref().unwrap().message, "promotion denied");
+    }
+
+    #[test]
+    fn discovery_blocked_tasks_register_display_segments_without_executing_them() {
         let path = crate::test_support::temp_file("discovery_preflight", b"carrier");
         for (mode, count) in [Mode::Scan, Mode::Extract].into_iter()
             .flat_map(|mode| [1, 2].map(|count| (mode, count))) {
             let engine = Engine::new(PathBuf::from("unused-worker"));
+            assert_eq!(engine.next_id(), 1); // Reserve the parent observer ID.
             let request = Request::new(vec![path.clone()], mode);
             let events = Mutex::new(Vec::new());
             let observer = |event: Event| { events.lock().unwrap().push(event); };
@@ -4614,12 +5047,89 @@ mod tests {
             }
             let events = events.lock().unwrap();
             assert_eq!(events.iter().filter(|event| matches!(event, Event::Started { .. })).count(), 1);
-            assert_eq!(events.iter().filter(|event| matches!(event, Event::Finished { .. })).count(), 1);
-            assert!(!events.iter().any(|event| matches!(event, Event::Queued { .. })));
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Finished { .. })).count(), if count > 1 { count + 1 } else { 1 });
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Queued { .. })).count(), if count > 1 { count } else { 0 });
             assert!(events.iter().any(|event| matches!(event, Event::Finished { result, .. }
                 if result.status == super::super::TaskStatus::Failed)));
         }
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn replacement_display_reuses_parent_or_registers_retained_failure_without_execution() {
+        let source = crate::test_support::temp_file("replacement_display", &[0; 16]);
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "carrier".into());
+        let generations = HashMap::from([(path_key(&input.entry_path), capture_file_generation(&source).unwrap())]);
+        let mut result = receipt(&input, DiscoverySource::Detection, 1);
+        result.failure = Some(Failure::new(FailureKind::MissingVolume, "first attempt"));
+        let mut checkpoint = InputCheckpoint::create(&source, &input, &result, &generations, None, false, 0).unwrap();
+        checkpoint.install_report(InputCheckpoint::report_state(&input, &result, None, None, 1, 1));
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        assert_eq!(engine.next_id(), 1);
+        let request = Request::new(vec![source.clone()], Mode::Extract);
+        let events = Mutex::new(Vec::new());
+        let observer = |event: Event| { events.lock().unwrap().push(event); };
+        let run = test_run(&engine, &request, &observer);
+        assert_eq!(run.replan_input(1, 1, &input, Some(&checkpoint)), (1, None));
+        assert!(matches!(events.lock().unwrap().as_slice(), [Event::Replanned { id: 1, .. }]));
+        events.lock().unwrap().clear();
+        let mut replacement = input.clone();
+        replacement.entry_path = source.with_extension("first").to_string_lossy().into_owned();
+        let (active, retained) = run.replan_input(1, 1, &replacement, Some(&checkpoint));
+        let retained = retained.unwrap();
+        assert_ne!(active, 1);
+        assert_ne!(active, retained);
+        let events = events.lock().unwrap();
+        assert!(matches!(&events[0], Event::Replanned { id: 1, .. }));
+        assert!(matches!(&events[1], Event::Queued { id, parent: Some(1), .. } if *id == active));
+        assert!(matches!(&events[2], Event::Queued { id, parent: Some(1), .. } if *id == retained));
+        assert!(matches!(&events[3], Event::Finished { id, result, .. } if *id == retained
+            && result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::MissingVolume)));
+        assert!(matches!(&events[4], Event::Started { id, .. } if *id == active));
+        assert_eq!(events.len(), 5);
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn retry_panel_uses_checkpoint_positions_without_creating_execution_work() {
+        let source = crate::test_support::temp_file("panel_retry_positions", &[0; 16]);
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "carrier".into());
+        let inputs: Vec<_> = archive_input_slices(&input, &[
+            ("zip", 0, Some(8)), ("zip", 8, Some(16)),
+        ]).unwrap().0.into_iter().map(Option::unwrap).collect();
+        let generations = HashMap::from([
+            (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
+        ]);
+        let mut result = receipt(&inputs[0], DiscoverySource::Embedded, 1);
+        let output = source.with_extension("out");
+        result.output = Some(output.clone());
+        let mut checkpoint = InputCheckpoint::create(&source, &inputs[0], &result,
+            &generations, None, true, 0).unwrap();
+        checkpoint.install_report(InputCheckpoint::report_state(&inputs[0], &result,
+            Some(&output), None, 4, 7));
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let request = Request::new(vec![source.clone()], Mode::Extract);
+        let events = Mutex::new(Vec::new());
+        let observer = |event: Event| { events.lock().unwrap().push(event); };
+        let run = test_run(&engine, &request, &observer);
+        let task = Task {
+            primary: None, owned_paths: vec![input.entry_path.clone()],
+            inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
+            source: DiscoverySource::Embedded, retry: None, scope: None,
+        };
+        let ids = run.queue_inputs(&task, 1000, 1, &[Some(&checkpoint), None], 7, true);
+        assert_eq!(ids.len(), 2);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for (event, position) in events.iter().zip([2, 4]) {
+            assert!(matches!(event, Event::Queued { parent: Some(1000), segment: Some(segment), .. }
+                if segment.index == position && segment.count == 7));
+        }
+        assert!(matches!(&events[0], Event::Queued { id, .. } if *id == ids[1]));
+        assert!(matches!(&events[1], Event::Queued { id, .. } if *id == ids[0]));
+        // Both retained and retry candidates have display rows; queue_inputs
+        // emits no Started/Finished and never creates worker/scheduler tasks.
+        fs::remove_file(source).unwrap();
     }
 
     #[test]
@@ -4777,7 +5287,7 @@ mod tests {
             };
             let mut run = test_run(&engine, &request, &observer);
             for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+                Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
             }
             let task = Task {
                 primary: None,
@@ -4862,14 +5372,14 @@ mod tests {
                 let observer = |_: Event| {};
                 let mut run = test_run(&engine, &request, &observer);
                 for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                    Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+                    Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
                 }
-                let kept = run.checkpoint_for(&inputs[0], &generations, &container, 1, &run.candidates).unwrap();
+                let kept = run.checkpoint_for(&inputs[0], Some(&run.request.checkpoints[0]), &generations, &container, 1, &run.candidates).unwrap();
                 assert_eq!(kept.retained_container(), Some(container.as_path()));
-                assert!(run.checkpoint_for(&changed, &generations, &container, 1, &run.candidates).is_none());
-                let previous = run.retry_slot_for(&changed, &container).unwrap();
+                assert!(run.checkpoint_for(&changed, Some(&run.request.checkpoints[1]), &generations, &container, 1, &run.candidates).is_none());
+                let previous = run.retry_slot_for(&changed, Some(&run.request.checkpoints[1]), &container).unwrap();
                 assert_eq!(previous.output(), slot);
-                assert!(run.retry_slot_for(&changed, &source.with_extension("unrelated")).is_none());
+                assert!(run.retry_slot_for(&changed, Some(&run.request.checkpoints[1]), &source.with_extension("unrelated")).is_none());
                 assert!(!previous.output_slot_for(&changed, &slot), "carrier root is never a child retry slot");
                 let held = cleanup_locked.then(|| fs::OpenOptions::new().read(true).share_mode(3)
                     .open(slot.join("old")).unwrap());
@@ -4929,7 +5439,7 @@ mod tests {
         };
         let mut run = test_run(&engine, &request, &observer);
         for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-            Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+            Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
         }
         let task = Task {
             primary: None, inputs: vec![LogicalInput { input, password: None, failure: None }],
@@ -5062,7 +5572,7 @@ mod tests {
             let observer = |_: Event| {};
             let mut run = test_run(engine, request, &observer);
             for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+                Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
             }
             Arc::get_mut(&mut run).unwrap().promoted_sources = request.promoted_sources.iter().enumerate().map(|(index, source)| {
                 (path_key(&source.path().to_string_lossy()), index)
@@ -5135,6 +5645,8 @@ mod tests {
                 let mut checkpoint = InputCheckpoint::create(
                     &source, input, &result, &generations, Some(&container), true, 0,
                 ).unwrap();
+                checkpoint.install_report(InputCheckpoint::report_state(
+                    input, &result, result.output.as_deref(), None, index + 1, 3));
                 checkpoint.set_password_signature(|| CandidateSet::new(
                     Arc::from([]), None, &AttemptCache::default(), None,
                 ).signature(&input.entry_path));
@@ -5155,6 +5667,15 @@ mod tests {
                 assert_eq!(result.source_paths, [current.clone()]);
                 assert_eq!(result.promoted, promoted);
                 assert_eq!(result.promotion_original_path.as_ref(), promoted.then_some(&source));
+            }
+            let recovery = outcome.archives.iter().filter_map(|result| result.failure.as_ref())
+                .find_map(|failure| failure.recovery.as_deref()).expect("executed failure retains recovery report");
+            let report = recovery.report(|failure| json!({"kind": format!("{:?}", failure.kind)}));
+            assert_eq!(report["input_count"], 3);
+            assert_eq!(report["inputs"].as_array().unwrap().len(), 3);
+            for (index, row) in report["inputs"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(row["position"], index + 1);
+                assert_eq!(row["archive_input"]["entry_path"], json!(current));
             }
             let rediscovered = ArchiveInput::file(
                 current.to_string_lossy().into_owned(), "zip".into(),
@@ -5666,8 +6187,10 @@ mod tests {
         let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
         let result = receipt(&input, DiscoverySource::Direct, 1);
         let names = Mutex::new(OutputNames::default());
-        assert!(OutputNames::reserve(&names, preferred.clone(), &result, &Register(&names), 1, None)
-            .unwrap().is_err());
+        let failure = OutputNames::reserve(&names, preferred.clone(), &result, &Register(&names), 1, None)
+            .unwrap().unwrap_err();
+        assert!(matches!(failure.context.as_deref(),
+            Some(super::super::FailureContext::OutputCreate { path: Some(path), .. }) if path == &preferred));
         let mut names = names.lock().unwrap();
         assert!(!names.owners.contains_key(&1));
         assert_eq!(names.claimed.len(), 1);
@@ -5940,7 +6463,7 @@ mod tests {
             let observer = |_: Event| {};
             let mut run = test_run(&engine, &request, &observer);
             for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+                Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
             }
             let task = Task {
                 primary: None,
@@ -6017,7 +6540,7 @@ mod tests {
                         let observer = |_: Event| {};
                         let mut run = test_run(&engine, &request, &observer);
                         for (index, checkpoint) in request.checkpoints.iter().enumerate() {
-                            Arc::get_mut(&mut run).unwrap().checkpoints.entry(checkpoint.key()).or_default().push(index);
+                            Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
                         }
                         let task = Task {
                             primary: None,
@@ -6087,6 +6610,67 @@ mod tests {
         project_possible_missing_volume(&mut results, true);
         assert!(results.iter().all(|r| !r.failure.as_ref().unwrap().evidence.as_ref()
             .is_some_and(|e| e.possible_missing_volume)));
+    }
+
+    #[test]
+    fn changed_id_replacement_without_output_clears_rejected_recovery() {
+        let source = crate::test_support::temp_file("replacement_rejected_recovery", b"archive");
+        let output = source.with_extension("recovery-output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("complete.txt"), b"complete").unwrap();
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let request = Request::new(vec![source.clone()], Mode::Extract);
+        let observer = |_: Event| {};
+        let run = test_run(&engine, &request, &observer);
+        let first = ArchiveInput::file(source.to_string_lossy().into_owned(), "".into(), "original".into());
+        let generation = crate::io::reader::capture_file_generation(&source).unwrap();
+        let generations = HashMap::from([(path_key(&first.entry_path), generation)]);
+        let mut failed = receipt(&first, DiscoverySource::Detection, 1);
+        failed.failure = Some(Failure::new(FailureKind::MissingVolume, "missing")
+            .with_context(super::super::FailureContext::Extraction));
+        failed.output = Some(output.clone());
+        failed.files = 1;
+        failed.bytes = 8;
+        failed.recovered_complete_files = 1;
+        let mut checkpoint = InputCheckpoint::create(&source, &first, &failed,
+            &generations, None, false, 0).unwrap();
+        checkpoint.install_report(InputCheckpoint::report_state(&first, &failed,
+            Some(&output), None, 1, 1));
+        run.created_outputs.lock().unwrap().register(&output, &failed);
+        let mut outcome = Outcome::default();
+        // Exercise real retry cleanup. The second input then fails before
+        // writing output, while the original checkpoint still has partial facts.
+        assert!(run.discard_failed_output(&failed, &output, &mut outcome).unwrap());
+        assert!(!output.exists());
+        let mut replacement = first;
+        replacement.format_hint = "7z".into();
+        assert!(!checkpoint.same_report_input(&replacement));
+        let mut second = receipt(&replacement, DiscoverySource::Relations, 1);
+        second.failure = Some(Failure::new(FailureKind::WrongPassword, "password")
+            .with_context(super::super::FailureContext::PasswordResolution));
+        let mut states = vec![InputCheckpoint::report_state(&replacement, &second,
+            Some(&output), None, 1, 1)];
+        let mut parent_outputs = vec![(second, None, replacement, 1, true, 0)];
+        outcome.checkpoints.push(checkpoint);
+        run.apply_complete_content_policy(&mut parent_outputs, &mut states, Some(0), &mut outcome).unwrap();
+        assert!(!outcome.checkpoints[0].has_recovered_members());
+        assert!(!outcome.checkpoints[0].has_output());
+        let (second, _, input, ..) = &parent_outputs[0];
+        let mut checkpoint = InputCheckpoint::create(&source, input, second,
+            &generations, None, false, 0).unwrap();
+        checkpoint.install_report(states[0].take());
+        outcome.checkpoints.push(checkpoint);
+        let recovery = InputRecovery::capture(&outcome.checkpoints, &source, None,
+            None, 1, true, true).unwrap();
+        let report = recovery.report(|failure| json!({"kind": format!("{:?}", failure.kind)}));
+        assert_eq!(report["output_dir"], "");
+        assert!(recovery.retry_output().is_none());
+        for checkpoint in report["inputs"].as_array().unwrap() {
+            assert_eq!(checkpoint["output_dir"], "");
+            assert_eq!(checkpoint["recovered_complete_files"], 0);
+            assert_eq!(checkpoint["complete"], false);
+        }
+        fs::remove_file(source).unwrap();
     }
 
     #[test]

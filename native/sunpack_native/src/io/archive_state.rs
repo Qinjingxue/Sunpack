@@ -1,6 +1,7 @@
 //! Canonical physical layout shared by discovery, analysis, and execution.
 
 use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -32,6 +33,8 @@ pub(crate) struct InputExtent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InputPart {
+    #[serde(default)]
+    pub role: InputRole,
     #[serde(flatten)]
     pub extent: InputExtent,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,10 +43,21 @@ pub(crate) struct InputPart {
     pub canonical_name: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InputRole {
+    #[default]
+    Main,
+    First,
+    Member,
+    Terminal,
+}
+
 impl InputPart {
     pub(crate) fn range(extent: InputExtent) -> Self {
         Self {
             extent,
+            role: InputRole::Main,
             volume_number: None,
             canonical_name: String::new(),
         }
@@ -67,8 +81,37 @@ impl VolumeCompleteness {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum AnalysisOrigin {
+    #[default]
+    Plain,
+    Relations,
+    RelationsFallback,
+    Embedded,
+    Planned,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AnalysisStatus { Error, Weak, Damaged, Extractable }
+
+impl AnalysisStatus {
+    pub(crate) fn from_evidence(status: &str) -> Option<Self> {
+        match status {
+            "error" => Some(Self::Error), "weak" => Some(Self::Weak),
+            "damaged" => Some(Self::Damaged), "extractable" => Some(Self::Extractable),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AnalysisFacts {
+    #[serde(default)]
+    pub origin: AnalysisOrigin,
+    #[serde(default)]
+    pub planning_applied: bool,
+    pub status: Option<AnalysisStatus>,
     pub zip_eocd_offset: Option<u64>,
     pub volume_completeness: Option<VolumeCompleteness>,
     pub missing_volume_evidence: Option<String>,
@@ -78,11 +121,13 @@ pub(crate) struct AnalysisFacts {
     pub damage_flags: Option<Arc<Vec<String>>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ArchiveInput {
     pub entry_path: String,
     pub logical_name: String,
     pub format_hint: String,
+    #[serde(default)]
+    pub volume_style: String,
     pub mode: OpenMode,
     pub parts: Box<[InputPart]>,
     pub ranges: Box<[InputExtent]>,
@@ -96,6 +141,7 @@ impl ArchiveInput {
             entry_path: path,
             logical_name,
             format_hint: format,
+            volume_style: String::new(),
             mode: OpenMode::File,
             parts: Box::new([]),
             ranges: Box::new([]),
@@ -163,6 +209,172 @@ impl ArchiveInput {
     }
 }
 
+/// Main's public archive_input receipt, distinct from the compact worker wire.
+/// All values borrow the canonical input; rendering does not clone a descriptor.
+pub(crate) struct ArchiveInputReport<'a> { input: &'a ArchiveInput, logical_name: &'a str }
+
+impl ArchiveInput {
+    #[cfg(test)]
+    pub(crate) fn report(&self) -> ArchiveInputReport<'_> { self.report_with_name(&self.logical_name) }
+    pub(crate) fn report_with_name<'a>(&'a self, logical_name: &'a str) -> ArchiveInputReport<'a> {
+        ArchiveInputReport { input: self, logical_name }
+    }
+}
+
+impl Serialize for ArchiveInputReport<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let input = self.input;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("kind", "archive_input")?;
+        map.serialize_entry("entry_path", &input.entry_path)?;
+        map.serialize_entry("open_mode", &input.mode)?;
+        if !input.format_hint.is_empty() { map.serialize_entry("format_hint", &input.format_hint)?; }
+        if let Some(plan) = input.volume_attempts.as_deref() {
+            map.serialize_entry("volume_attempts", &AttemptReport(plan))?;
+        }
+        if !input.parts.is_empty() || (input.mode == OpenMode::File && input.ranges.is_empty()) {
+            map.serialize_entry("parts", &PartsReport(input))?;
+        }
+        if input.mode == OpenMode::ConcatRanges { map.serialize_entry("ranges", &input.ranges)?; }
+        if !self.logical_name.is_empty() { map.serialize_entry("logical_name", self.logical_name)?; }
+        if !input.volume_style.is_empty() { map.serialize_entry("volume_style", &input.volume_style)?; }
+        let analysis = AnalysisReport(input);
+        if analysis.has_fields() { map.serialize_entry("analysis", &analysis)?; }
+        map.end()
+    }
+}
+
+struct PartsReport<'a>(&'a ArchiveInput);
+impl Serialize for PartsReport<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let implicit_file = self.0.parts.is_empty();
+        let mut seq = serializer.serialize_seq(Some(if implicit_file { 1 } else { self.0.parts.len() }))?;
+        if implicit_file {
+            // Main's from_parts/from_source creates this canonical whole-file part.
+            seq.serialize_element(&PartReport { path: &self.0.entry_path, role: InputRole::Main,
+                volume_number: (self.0.analysis.origin != AnalysisOrigin::RelationsFallback).then_some(1), canonical_name: "", start: 0, end: None })?;
+        } else {
+            for part in &self.0.parts {
+                seq.serialize_element(&PartReport { path: &part.extent.path, role: part.role,
+                    volume_number: part.volume_number, canonical_name: &part.canonical_name,
+                    start: part.extent.start, end: part.extent.end })?;
+            }
+        }
+        seq.end()
+    }
+}
+
+struct PartReport<'a> {
+    path: &'a str, role: InputRole, volume_number: Option<u32>, canonical_name: &'a str,
+    start: u64, end: Option<u64>,
+}
+impl Serialize for PartReport<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("path", self.path)?;
+        map.serialize_entry("role", &self.role)?;
+        if let Some(number) = self.volume_number { map.serialize_entry("volume_number", &number)?; }
+        if !self.canonical_name.is_empty() { map.serialize_entry("canonical_name", self.canonical_name)?; }
+        if self.start != 0 { map.serialize_entry("start", &self.start)?; }
+        if let Some(end) = self.end { map.serialize_entry("end", &end)?; }
+        map.end()
+    }
+}
+
+struct AttemptReport<'a>(&'a VolumeAttemptPlan);
+impl Serialize for AttemptReport<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let plan = self.0;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("sources", &plan.sources)?;
+        map.serialize_entry("domains", &plan.domains)?;
+        struct Layouts<'a>(&'a [VolumeLayout]);
+        impl Serialize for Layouts<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                for layout in self.0 {
+                    #[derive(Serialize)]
+                    struct Layout<'a> { slots: &'a [VolumeSlot], #[serde(skip_serializing_if = "is_zero")] minimum_slots: usize }
+                    fn is_zero(value: &usize) -> bool { *value == 0 }
+                    seq.serialize_element(&Layout { slots: &layout.slots, minimum_slots: layout.minimum_slots })?;
+                }
+                seq.end()
+            }
+        }
+        map.serialize_entry("layouts", &Layouts(&plan.layouts))?;
+        if let Some(value) = plan.head_size_from_total { map.serialize_entry("head_size_from_total", &value)?; }
+        if let Some(value) = plan.minimum_size { map.serialize_entry("minimum_size", &value)?; }
+        if !plan.tail_totals.is_empty() { map.serialize_entry("tail_totals", &plan.tail_totals)?; }
+        map.end()
+    }
+}
+
+struct AnalysisReport<'a>(&'a ArchiveInput);
+impl AnalysisReport<'_> {
+    fn execution_evidence(&self) -> Option<&str> {
+        let input = self.0;
+        let facts = &input.analysis;
+        // Relation discovery emits its confirmed missing-volume fact directly.
+        // Advisory planning only exports it for a structured multi-part input;
+        // a single-file internal hint is not a public execution descriptor.
+        let eligible = !facts.planning_applied && facts.origin == AnalysisOrigin::Relations
+            || input.mode.structured() && input.parts.len() > 1;
+        eligible.then_some(facts.missing_volume_evidence.as_deref()).flatten()
+    }
+
+    fn has_fields(&self) -> bool {
+        let facts = &self.0.analysis;
+        if facts.origin == AnalysisOrigin::RelationsFallback && !facts.planning_applied { return false; }
+        facts.origin == AnalysisOrigin::Planned || facts.origin != AnalysisOrigin::Plain && facts.volume_completeness.is_some()
+            || (self.0.format_hint == "lz4" && facts.structure_complete)
+            || (facts.origin != AnalysisOrigin::Embedded || facts.planning_applied) && facts.zip_eocd_offset.is_some()
+            || self.execution_evidence().is_some()
+            || facts.origin == AnalysisOrigin::Embedded && facts.password_required
+    }
+}
+impl Serialize for AnalysisReport<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let facts = &self.0.analysis;
+        let mut map = serializer.serialize_map(None)?;
+        if facts.origin == AnalysisOrigin::Relations && self.0.volume_attempts.is_some() && !facts.planning_applied {
+            map.serialize_entry("volume_completeness", "unknown")?;
+            return map.end();
+        }
+        if facts.origin == AnalysisOrigin::Planned {
+            if let Some(status) = facts.status { map.serialize_entry("status", &status)?; }
+            map.serialize_entry("damage_flags", facts.damage_flags.as_deref().map(Vec::as_slice).unwrap_or(&[]))?;
+            if self.0.format_hint == "lz4" && facts.structure_complete { map.serialize_entry("structure_complete", &true)?; }
+            if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
+            if facts.password_required { map.serialize_entry("password_required", &true)?; }
+        } else {
+            if let Some(completeness) = facts.volume_completeness {
+                // Only discovery installs this public fact; an advisory planning
+                // conclusion is represented by execution.missing_volume_evidence.
+                if facts.origin != AnalysisOrigin::Plain { map.serialize_entry("volume_completeness", completeness.as_str())?; }
+            }
+            if matches!(facts.origin, AnalysisOrigin::Relations | AnalysisOrigin::RelationsFallback) {
+                if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
+            }
+            if facts.origin != AnalysisOrigin::Embedded {
+                if let Some(evidence) = self.execution_evidence() {
+                    map.serialize_entry("execution", &WireExecution { missing_volume_evidence: evidence })?;
+                }
+            }
+            if self.0.format_hint == "lz4" && facts.structure_complete { map.serialize_entry("structure_complete", &true)?; }
+            if facts.origin == AnalysisOrigin::Plain {
+                if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
+            }
+            if facts.origin == AnalysisOrigin::Embedded {
+                if facts.password_required { map.serialize_entry("password_required", &true)?; }
+                if facts.planning_applied {
+                    if let Some(offset) = facts.zip_eocd_offset { map.serialize_entry("zip_eocd_offset", &offset)?; }
+                }
+            }
+        }
+        map.end()
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct WorkerInput<'a> {
     entry_path: &'a str,
@@ -192,7 +404,7 @@ struct WireExecution<'a> {
     missing_volume_evidence: &'a str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VolumeAttemptPlan {
     pub sources: Box<[InputExtent]>,
     pub layouts: Box<[VolumeLayout]>,
@@ -201,7 +413,7 @@ pub(crate) struct VolumeAttemptPlan {
     pub head_size_from_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum_size: Option<u64>,
-    #[serde(skip_serializing_if = "<[TailTotal]>::is_empty")]
+    #[serde(default, skip_serializing_if = "<[TailTotal]>::is_empty")]
     pub tail_totals: Box<[TailTotal]>,
 }
 
@@ -254,6 +466,7 @@ impl VolumeAttemptPlan {
                 return Err(invalid("worker selected an unplanned volume"));
             }
             parts.push(InputPart {
+                role: if slot.number == 1 { InputRole::First } else { InputRole::Member },
                 extent: self.sources.get(source)
                     .ok_or_else(|| invalid("unknown volume source"))?.clone(),
                 volume_number: Some(slot.number),
@@ -371,25 +584,25 @@ impl VolumeAttemptPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VolumeLayout {
     pub slots: Box<[VolumeSlot]>,
     pub minimum_slots: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VolumeSlot {
     pub number: u32,
     pub canonical_name: String,
     pub domain: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VolumeDomain {
     pub choices: Arc<Vec<usize>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TailTotal {
     pub source: usize,
     pub total: u64,
@@ -548,6 +761,84 @@ fn invalid(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn recovery_descriptor_uses_main_contract_without_worker_projection_fields() {
+        let mut input = ArchiveInput::file("archive.zip".into(), "zip".into(), "archive".into());
+        assert_eq!(serde_json::to_string(&input.report()).unwrap(),
+            r#"{"kind":"archive_input","entry_path":"archive.zip","open_mode":"file","format_hint":"zip","parts":[{"path":"archive.zip","role":"main","volume_number":1}],"logical_name":"archive"}"#);
+        input.analysis.origin = AnalysisOrigin::Embedded;
+        input.analysis.volume_completeness = Some(VolumeCompleteness::Complete);
+        input.analysis.password_required = true;
+        // Embedded's execution-only ZIP offset does not occur in main's
+        // descriptor until planning installs it into the existing analysis.
+        input.analysis.zip_eocd_offset = Some(8);
+        assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"],
+            serde_json::json!({"volume_completeness":"complete", "password_required":true}));
+        input.analysis.planning_applied = true;
+        assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"]["zip_eocd_offset"], 8);
+        input.analysis.origin = AnalysisOrigin::Planned;
+        input.analysis.status = Some(AnalysisStatus::Damaged);
+        assert!(serde_json::to_string(&input.report()).unwrap().ends_with(
+            r#""analysis":{"status":"damaged","damage_flags":[],"zip_eocd_offset":8,"password_required":true}}"#));
+        let persisted = serde_json::to_vec(&input).unwrap();
+        let restored: ArchiveInput = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(serde_json::to_string(&input.report()).unwrap(), serde_json::to_string(&restored.report()).unwrap());
+    }
+
+    #[test]
+    fn recovery_descriptor_does_not_export_single_file_planning_hints() {
+        let mut input = ArchiveInput::file("truncated.7z".into(), "7z".into(), "truncated".into());
+        input.analysis.planning_applied = true;
+        input.analysis.missing_volume_evidence = Some("seven_zip_start_header_length".into());
+        assert!(serde_json::to_value(input.report()).unwrap().get("analysis").is_none());
+        input.mode = OpenMode::NativeVolumes;
+        input.parts = Box::new([InputPart::range(InputExtent { path: input.entry_path.clone(), start: 0, end: None })]);
+        assert!(serde_json::to_value(input.report()).unwrap().get("analysis").is_none());
+        input.parts = vec![input.parts[0].clone(), InputPart::range(InputExtent {
+            path: "truncated.7z.002".into(), start: 0, end: None,
+        })].into_boxed_slice();
+        assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
+            "seven_zip_start_header_length");
+        // A relation conclusion is a different producer: main exports this
+        // fact before planning even when only the first known volume exists.
+        input.parts = Box::new([input.parts[0].clone()]);
+        input.analysis.origin = AnalysisOrigin::Relations;
+        input.analysis.planning_applied = false;
+        input.analysis.missing_volume_evidence = Some("relation_missing_volume".into());
+        assert_eq!(serde_json::to_value(input.report()).unwrap()["analysis"]["execution"]["missing_volume_evidence"],
+            "relation_missing_volume");
+    }
+
+    #[test]
+    fn recovery_volume_descriptor_preserves_style_roles_and_plan_order() {
+        let mut input = ArchiveInput::file("first.zip".into(), "zip".into(), "archive".into());
+        input.mode = OpenMode::NativeVolumes;
+        input.volume_style = "zip_spanned".into();
+        input.parts = Box::new([InputPart { role: InputRole::Terminal,
+            extent: InputExtent { path: "first.zip".into(), start: 0, end: Some(12) },
+            volume_number: Some(1), canonical_name: "archive.zip".into() }]);
+        input.analysis.origin = AnalysisOrigin::Relations;
+        input.analysis.volume_completeness = Some(VolumeCompleteness::Unknown);
+        input.volume_attempts = Some(Box::new(VolumeAttemptPlan {
+            sources: Box::new([input.parts[0].extent.clone()]),
+            domains: Box::new([VolumeDomain { choices: Arc::new(vec![0]) }]),
+            layouts: Box::new([VolumeLayout { slots: Box::new([VolumeSlot {
+                number: 1, canonical_name: "archive.zip".into(), domain: 0,
+            }]), minimum_slots: 0 }]),
+            head_size_from_total: None, minimum_size: None, tail_totals: Box::new([]),
+        }));
+        let text = serde_json::to_string(&input.report()).unwrap();
+        assert!(text.contains(r#""domains":[{"choices":[0]}],"layouts":[{"slots":[{"number":1,"canonical_name":"archive.zip","domain":0}]}]"#));
+        assert!(!text.contains("minimum_slots"));
+        assert!(text.contains(r#""role":"terminal","volume_number":1,"canonical_name":"archive.zip","end":12"#));
+        let decoded: ArchiveInput = serde_json::from_slice(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(text, serde_json::to_string(&decoded.report()).unwrap());
+        input.select_volumes(&VolumeSelection { layout: 0, sources: vec![0] }).unwrap();
+        assert_eq!(input.parts[0].role, InputRole::First);
+        assert!(input.volume_attempts.is_none());
+        assert_eq!(input.volume_style, "zip_spanned");
+    }
     use super::*;
 
     #[test]

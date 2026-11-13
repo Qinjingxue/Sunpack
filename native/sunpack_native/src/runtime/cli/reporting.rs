@@ -62,6 +62,7 @@ impl Reports {
     pub(crate) fn notify(&self, event: Event) {
         let key = match &event {
             Event::Queued { id, .. } => (*id, 0),
+            Event::Replanned { id, .. } => (*id, 5),
             Event::Progress { id, .. } => (*id, 2),
             Event::ResourceWait { id, .. } => (*id, 3),
             Event::Started { id, .. } | Event::Working { id } => (*id, 1),
@@ -72,6 +73,10 @@ impl Reports {
         };
         let mut state = self.state.lock().unwrap();
         if !state.closed {
+            if key.1 == 5 {
+                // Keep initial registration but discard the previous attempt.
+                for kind in 1..=4 { state.events.remove(&(key.0, kind)); }
+            }
             if key.1 == 1 {
                 // Started/Working clear progress in Panel, even if a later
                 // phase replaces them before the progress task can run.
@@ -157,6 +162,24 @@ mod tests {
     use super::*;
     use crate::pipeline::{Cancellation, Origin, Scheduler};
     use std::sync::mpsc;
+
+    #[test]
+    fn replan_discards_pending_old_attempt_but_keeps_registration_and_new_progress() {
+        let reports = Reports::default();
+        reports.notify(Event::Queued { id: 7, parent: None, path: "old.002".into(), depth: 1, segment: None });
+        reports.notify(Event::Working { id: 7 });
+        reports.notify(Event::Progress { id: 7, path: "old.002".into(), completed_bytes: 9, total_bytes: 10 });
+        reports.notify(Event::ResourceWait { id: 7, path: "old.002".into(), state: Default::default() });
+        reports.notify(Event::Replanned { id: 7, path: "new.001".into() });
+        reports.notify(Event::Working { id: 7 });
+        reports.notify(Event::Progress { id: 7, path: "new.001".into(), completed_bytes: 1, total_bytes: 10 });
+        let events = reports.take_events();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], Event::Queued { .. }));
+        assert!(matches!(&events[1], Event::Replanned { path, .. } if path == std::path::Path::new("new.001")));
+        assert!(matches!(&events[2], Event::Working { .. }));
+        assert!(matches!(&events[3], Event::Progress { completed_bytes: 1, .. }));
+    }
 
     #[test]
     fn shared_progress_service_coalesces_events_and_wakes_without_a_private_thread() {

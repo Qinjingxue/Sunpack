@@ -28,6 +28,10 @@ fn read_error(fault: &crate::pipeline::ArchiveReadFault) -> Value {
     })
 }
 
+fn recovery(failure: &Failure) -> Option<&crate::pipeline::InputRecovery> {
+    failure.recovery.as_deref().or_else(|| failure.causes.iter().find_map(recovery))
+}
+
 fn kind_name(kind: FailureKind) -> &'static str {
     match kind {
         FailureKind::Cancelled => "cancelled",
@@ -47,6 +51,14 @@ fn kind_name(kind: FailureKind) -> &'static str {
 }
 
 impl Report {
+    fn attach_recovery(&mut self, recovery: &crate::pipeline::InputRecovery, language: Language) {
+        self.details["input_recovery"] = recovery.report(|failure|
+            serde_json::to_value(Self::from_failure(failure, language)).expect("failure report is serializable"));
+        if let Some(output) = recovery.retry_output() {
+            self.details["retry_output_dir"] = json!(output);
+        }
+    }
+
     fn from_cause(failure: &Failure, language: Language) -> Self {
         let mut report = Self::from_failure(failure, language);
         if let Some(scope) = failure.discovery_scope.as_deref() {
@@ -130,7 +142,7 @@ impl Report {
                     if let Some(value) = &evidence.backend_operation_result { details["backend_operation_result"] = json!(value); }
                 }
             }
-            Some(FailureContext::OutputCreate { error }) => {
+            Some(FailureContext::OutputCreate { error, .. }) => {
                 stage = "preflight";
                 spec = super::super::failure::Message::error("extract.dir_create_failed", error);
             }
@@ -231,6 +243,9 @@ pub(super) fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Rep
         let mut causes: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
             .map(|failure| Report::from_failure(failure, language)).collect();
         if causes.is_empty() { return None; }
+        let recovery = entries.iter().filter_map(|entry| entry.failure.as_ref()).find_map(recovery);
+        let report_count = recovery.map_or(entries.len(), |recovery| recovery.input_count());
+        let aggregated = entries.len() > 1 || recovery.is_some_and(|recovery| recovery.aggregated());
         let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
             .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
         // Admission inspects the physical task before per-input execution.
@@ -249,27 +264,34 @@ pub(super) fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Rep
                 let admission = original.iter().all(|failure|
                     matches!(failure.context.as_deref(), Some(FailureContext::InputAdmission { .. })));
                 let mut reports: Vec<_> = original.iter().map(|failure| Report::from_failure(failure, language)).collect();
-                let mut original_report = if !admission && entries.len() > 1 {
-                    aggregate(reports, entries.len(), language)
+                let mut original_report = if !admission && aggregated {
+                    aggregate(reports, report_count, language)
                 } else { reports.remove(0) };
                 if let Some(scope) = original.iter().find_map(|failure| failure.discovery_scope.as_deref()) {
                     original_report.details["discovery_scope"] = json!(scope);
                 }
+                if let Some(recovery) = recovery { original_report.attach_recovery(recovery, language); }
                 outer.causes = vec![original_report];
             }
             outer
-        } else if entries.len() > 1 {
-            aggregate(causes, entries.len(), language)
+        } else if aggregated {
+            aggregate(causes, report_count, language)
         } else { causes.remove(0) };
+        if postprocess.is_none() {
+            if let Some(recovery) = recovery { report.attach_recovery(recovery, language); }
+        }
         let warning = entries.iter().filter_map(|entry| entry.failure.as_ref())
             .any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume));
         if warning && postprocess.is_none() {
             let partial = entries.iter().any(|entry| entry.partial)
                 && entries.iter().all(|entry| entry.failure.is_none() || entry.partial);
             let key = "failure.possible_missing_volume";
-            let details = json!({"missing_volume_confirmed": false,
+            let mut details = json!({"missing_volume_confirmed": false,
                 "evidence": if partial { "partial_recovery_on_split_input" } else { "backend_possible_missing_volume" },
                 "partial_recovery": partial, "original_failure_kind": report.kind});
+            for key in ["input_recovery", "retry_output_dir"] {
+                if let Some(value) = report.details.get(key) { details[key] = value.clone(); }
+            }
             report = Report { kind: "damaged", stage: "extraction_report",
                 message: language.text(key).to_owned(), message_key: key.into(),
                 message_params: json!({}), user_action: "", causes: vec![report], details };

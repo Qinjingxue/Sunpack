@@ -2,7 +2,7 @@ use super::passwords::CandidateSet;
 use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Origin, Request};
 use crate::core::config::{Config, ScanFilterKind};
 use crate::io::archive_state::{
-    ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
+    AnalysisOrigin, ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
 };
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use crate::password::rar::resolve_embedded_rar_boundaries;
@@ -1040,6 +1040,7 @@ fn project_segments(
                 end,
             })]);
         }
+        input.analysis.origin = AnalysisOrigin::Embedded;
         input.analysis.password_required = password_required(item);
         input.analysis.structure_complete = item.format == "lz4";
         input.analysis.volume_completeness = Some(if end.is_some() {

@@ -1047,7 +1047,17 @@ impl Progress {
 
     fn flush_events(&self) {
         let mut display = self.display.lock().unwrap();
-        for event in self.reporting.take_events() { self.display_event(event, &mut display); }
+        self.apply_events(&mut display, true);
+    }
+
+    fn apply_events(&self, display: &mut Display, render: bool) {
+        let events = self.reporting.take_events();
+        if events.is_empty() { return; }
+        display.panel.get_or_insert_with(|| live::Panel::new(self.verbose)).begin_batch();
+        for event in events { self.display_event(event, display); }
+        if let Some(panel) = &mut display.panel {
+            panel.end_batch(self.session.as_ref(), self.language, render && !display.prompting);
+        }
     }
 
     fn display_event(&self, event: Event, display: &mut Display) {
@@ -1078,28 +1088,33 @@ impl Progress {
         if self.cancel.cancelled() {
             return Ok(());
         }
-        for event in self.reporting.take_events() { self.display_event(event, &mut display); }
-        let latest = display.panel.as_ref().map(|panel| panel.scope_progress(id)).unwrap_or_default();
-        let report = (!archives.is_empty()).then(|| ScopeReport::new(archives, self, latest));
-        if let Some(panel) = &mut display.panel {
-            panel.remove(id);
-        }
+        // Do not render the completion events only to immediately clear them.
+        self.apply_events(&mut display, false);
+        // main flushes its existing task rows. In particular, skipped preflight
+        // segments are display facts, not synthetic successful ArchiveResults.
+        let retained_display = !archives.is_empty() && display.panel.as_ref().is_some_and(|panel| panel.retains_scope(id));
+        let report = (!retained_display && !archives.is_empty()).then(|| {
+            let latest = display.panel.as_ref().map(|panel| panel.scope_progress(id)).unwrap_or_default();
+            ScopeReport::new(archives, self, latest)
+        });
         if display.prompting {
-            if let Some(report) = report {
-                report.write(&mut display.deferred)?;
-            }
+            let Display { panel, deferred, .. } = &mut *display;
+            if retained_display {
+                panel.as_ref().unwrap().write_scope(id, self.session.unicode(), self.language, deferred)?;
+            } else if let Some(report) = report { report.write(deferred)?; }
         } else {
-            if let Some(panel) = &mut display.panel {
-                panel.clear(self.session.as_ref())?;
-            }
-            if let Some(report) = report {
+            if let Some(panel) = &mut display.panel { panel.clear(self.session.as_ref())?; }
+            if retained_display || report.is_some() {
                 let mut writer = BufWriter::new(SessionWriter(self.session.as_ref()));
-                report.write(&mut writer)?;
+                if retained_display {
+                    display.panel.as_ref().unwrap().write_scope(id, self.session.unicode(), self.language, &mut writer)?;
+                } else if let Some(report) = report { report.write(&mut writer)?; }
                 writer.flush()?;
             }
-            if let Some(panel) = &mut display.panel {
-                panel.redraw(self.session.as_ref(), self.language, true);
-            }
+        }
+        if let Some(panel) = &mut display.panel { panel.remove(id); }
+        if !display.prompting {
+            if let Some(panel) = &mut display.panel { panel.redraw(self.session.as_ref(), self.language, true); }
         }
         Ok(())
     }
@@ -1288,14 +1303,14 @@ impl<'a> ScopeReport<'a> {
         enum Visit {
             Group(usize, Option<bool>),
             Segment(usize, usize, bool),
-            Archive(usize),
+            Archive(usize, bool),
             Restore(usize),
         }
         let mut prefix = String::new();
         let mut pending = Vec::new();
         if self.archives.len() == 1 {
             Self::title(writer, "", "", &Self::name(&self.archives[0]))?;
-            pending.push(Visit::Archive(0));
+            pending.push(Visit::Archive(0, false));
         } else {
             pending.extend(self.roots.iter().rev().map(|&root| Visit::Group(root, None)));
         }
@@ -1309,12 +1324,15 @@ impl<'a> ScopeReport<'a> {
                     pending.push(Visit::Restore(prefix.len()));
                     prefix.push_str(continuation);
                     if range.len() == 1 {
-                        pending.push(Visit::Archive(range.start));
+                        pending.push(Visit::Archive(range.start, false));
                     } else {
                         let result = crate::pipeline::TaskCompletion::from_group(&self.archives[range.clone()]);
                         if result.status == TaskStatus::Failed {
                             let status = live::status_text(self.language.text(task_status_key(result.status)), None, "", None);
                             writeln!(writer, "{prefix}  {status}")?;
+                            if let Some(detail) = task_detail(result.status, result.failure.as_ref(), None, false, self.verbose, self.language) {
+                                Self::title(writer, &prefix, "  ", &detail)?;
+                            }
                         }
                         let end = range.end;
                         for (number, position) in range.enumerate().rev() {
@@ -1330,10 +1348,10 @@ impl<'a> ScopeReport<'a> {
                     Self::title(writer, &prefix, edge, &label)?;
                     pending.push(Visit::Restore(prefix.len()));
                     prefix.push_str(continuation);
-                    pending.push(Visit::Archive(position));
+                    pending.push(Visit::Archive(position, true));
                 }
-                Visit::Archive(position) => {
-                    self.status(writer, position, &prefix)?;
+                Visit::Archive(position, segment) => {
+                    self.status(writer, position, &prefix, segment)?;
                     if let Some(children) = self.children.get(position) {
                         for (index, &child) in children.iter().enumerate().rev() {
                             pending.push(Visit::Group(child, Some(index + 1 == children.len())));
@@ -1354,11 +1372,7 @@ impl<'a> ScopeReport<'a> {
     }
 
     fn title(writer: &mut impl Write, prefix: &str, edge: &str, label: &str) -> io::Result<()> {
-        let label = if label.contains(['\r', '\n']) {
-            Cow::Owned(label.replace(['\r', '\n'], " "))
-        } else {
-            Cow::Borrowed(label)
-        };
+        let label = single_line(label);
         writeln!(writer, "{prefix}{edge}{label}")
     }
 
@@ -1367,6 +1381,7 @@ impl<'a> ScopeReport<'a> {
         writer: &mut impl Write,
         position: usize,
         prefix: &str,
+        segment: bool,
     ) -> io::Result<()> {
         let item = &self.archives[position];
         let status = task_status_key(TaskStatus::of(item));
@@ -1378,7 +1393,7 @@ impl<'a> ScopeReport<'a> {
         } else { Some((1, 1)) };
         let status = live::status_text(self.language.text(status), last, "", None);
         writeln!(writer, "{prefix}  {status}")?;
-        if let Some(detail) = task_detail(TaskStatus::of(item), item.failure.as_ref(), self.verbose, self.language) {
+        if let Some(detail) = task_detail(TaskStatus::of(item), item.failure.as_ref(), None, segment, self.verbose, self.language) {
             Self::title(writer, prefix, "  ", &detail)?;
         }
         if let Some(output) = item.output.as_ref().filter(|_| self.verbose) {
@@ -1392,18 +1407,39 @@ impl<'a> ScopeReport<'a> {
     }
 }
 
+fn single_line(value: &str) -> Cow<'_, str> {
+    if value.contains(['\r', '\n']) { value.replace(['\r', '\n'], " ").into() }
+    else { value.into() }
+}
+
 fn task_status_key(status: TaskStatus) -> &'static str {
     match status {
+        TaskStatus::Skipped => "report.status.skipped",
         TaskStatus::Complete => "report.status.complete",
         TaskStatus::Partial => "report.status.partial",
         TaskStatus::Failed => "report.status.error",
     }
 }
 
-fn task_detail<'a>(status: TaskStatus, failure: Option<&'a crate::pipeline::Failure>, verbose: bool, language: Language) -> Option<Cow<'a, str>> {
-    failure.filter(|failure| (status == TaskStatus::Failed || verbose)
-        && (failure.kind == crate::pipeline::FailureKind::FilesystemError || !failure.is_password_retry()))
-        .map(|failure| failure_message(failure, language))
+fn task_detail<'a>(
+    status: TaskStatus, failure: Option<&'a crate::pipeline::Failure>,
+    discovery: Option<(crate::pipeline::DiscoverySource, &'a Path)>,
+    segment: bool, verbose: bool, language: Language,
+) -> Option<Cow<'a, str>> {
+    let failure = failure?;
+    let discovery = discovery.or_else(|| match failure.context.as_deref() {
+        Some(crate::pipeline::FailureContext::Discovery { discovery, path, .. }) => Some((*discovery, path.as_path())),
+        _ => None,
+    });
+    if status != TaskStatus::Failed && !verbose { return None; }
+    if segment && discovery.is_none() && failure.kind != crate::pipeline::FailureKind::FilesystemError && failure.is_password_retry() {
+        return None;
+    }
+    let detail = failure_message(failure, language);
+    Some(match discovery {
+        Some((crate::pipeline::DiscoverySource::Embedded, path)) => format!("{}: {detail}", path.display()).into(),
+        _ => detail,
+    })
 }
 
 fn command_error(

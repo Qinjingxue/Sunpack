@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 pub(crate) use crate::io::cancellation::Cancellation;
 pub use checkpoint::InputCheckpoint;
-pub(crate) use checkpoint::PromotedSource;
+pub(crate) use checkpoint::{InputRecovery, PromotedSource};
 pub use coordinator::Engine;
 pub(crate) use coordinator::{common_ancestor, common_output_base};
 pub(crate) use discovery::scan_options;
@@ -156,7 +156,7 @@ pub enum FailureContext {
     InputAdmission { missing_paths: Vec<PathBuf> },
     PasswordResolution,
     Extraction,
-    OutputCreate { error: String },
+    OutputCreate { error: String, #[serde(default)] path: Option<PathBuf> },
     Postprocess { destination: PathBuf },
 }
 
@@ -183,6 +183,8 @@ pub struct Failure {
     pub context: Option<Box<FailureContext>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_scope: Option<Box<FailureScope>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery: Option<Arc<checkpoint::InputRecovery>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub causes: Vec<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +223,7 @@ impl Failure {
             message: message.into(),
             context: None,
             discovery_scope: None,
+            recovery: None,
             causes: Vec::new(),
             evidence: None,
             password_retry: false,
@@ -579,6 +582,7 @@ pub struct Segment {
 /// recovery inventories. The final report uses the same status projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
+    Skipped,
     Complete,
     Partial,
     Failed,
@@ -594,6 +598,7 @@ impl TaskStatus {
 
 #[derive(Debug, Clone)]
 pub struct TaskCompletion {
+    pub discovery: Option<DiscoverySource>,
     pub status: TaskStatus,
     pub failure: Option<Failure>,
     pub output: Option<PathBuf>,
@@ -602,24 +607,41 @@ pub struct TaskCompletion {
 impl TaskCompletion {
     pub fn from_result(result: &ArchiveResult) -> Self {
         Self {
+            discovery: result.failure.as_ref().and_then(Self::discovery_source),
             status: TaskStatus::of(result),
-            failure: result.failure.as_ref().map(|failure| Failure {
-                kind: failure.kind,
-                message: failure.message.clone(),
-                context: None,
-                discovery_scope: None,
-                causes: failure.causes.clone(),
-                password_retry: failure.password_retry,
-                // Only the fields used by the common human-facing projection.
-                evidence: failure.evidence.as_deref().map(|e| Box::new(FailureEvidence {
-                    possible_missing_volume: e.possible_missing_volume,
-                    archive_read_fault: e.archive_read_fault.clone(),
-                    native_kind: e.native_kind.clone(),
-                    stage: e.stage.clone(),
-                    ..FailureEvidence::default()
-                })),
-            }),
+            failure: result.failure.as_ref().map(Self::display_failure),
             output: result.output.clone(),
+        }
+    }
+
+    pub(crate) fn failed(failure: &Failure) -> Self {
+        Self { discovery: Self::discovery_source(failure), status: TaskStatus::Failed, failure: Some(Self::display_failure(failure)), output: None }
+    }
+
+    fn discovery_source(failure: &Failure) -> Option<DiscoverySource> {
+        match failure.context.as_deref() {
+            Some(FailureContext::Discovery { discovery, .. }) => Some(*discovery),
+            _ => None,
+        }
+    }
+
+    fn display_failure(failure: &Failure) -> Failure {
+        Failure {
+            kind: failure.kind,
+            message: failure.message.clone(),
+            context: None,
+            discovery_scope: None,
+            recovery: None,
+            causes: failure.causes.clone(),
+            password_retry: failure.password_retry,
+            // Only the fields used by the common human-facing projection.
+            evidence: failure.evidence.as_deref().map(|e| Box::new(FailureEvidence {
+                possible_missing_volume: e.possible_missing_volume,
+                archive_read_fault: e.archive_read_fault.clone(),
+                native_kind: e.native_kind.clone(),
+                stage: e.stage.clone(),
+                ..FailureEvidence::default()
+            })),
         }
     }
 
@@ -635,7 +657,17 @@ impl TaskCompletion {
             TaskStatus::Failed
         } else if results.iter().any(|r| r.partial) { TaskStatus::Partial }
         else { TaskStatus::Complete };
-        Self { status, failure: None, output: common_ancestor(results.iter().filter_map(|r| r.output.as_deref())) }
+        // main suppresses the ordinary INPUTS_FAILED parent detail because
+        // each segment has its own row. A task-level postprocess error is not
+        // that aggregate: retain its real failure for the carrier's detail.
+        // Likewise a split-recovery warning wraps (rather than duplicates)
+        // INPUTS_FAILED in main, and keeps its own carrier message.
+        let failure = results.iter().filter_map(|result| result.failure.as_ref())
+            .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })))
+            .or_else(|| results.iter().filter_map(|result| result.failure.as_ref())
+                .find(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume)))
+            .map(Self::display_failure);
+        Self { discovery: None, status, failure, output: common_ancestor(results.iter().filter_map(|r| r.output.as_deref())) }
     }
 }
 
@@ -661,6 +693,11 @@ pub enum Event {
         id: TaskId,
         path: PathBuf,
         depth: usize,
+    },
+    /// A physical retry replaces the display plan, not the execution task.
+    Replanned {
+        id: TaskId,
+        path: PathBuf,
     },
     Waiting {
         id: TaskId,

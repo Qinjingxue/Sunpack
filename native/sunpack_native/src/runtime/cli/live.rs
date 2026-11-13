@@ -24,6 +24,7 @@ struct TaskRow {
     children: BTreeSet<TaskId>,
     label: String,
     carrier: bool,
+    retain_display: bool,
     phase: Phase,
     wait: ResourceWait,
     progress: Option<(u64, u64)>,
@@ -48,6 +49,8 @@ pub(super) struct Panel {
     cursor_unknown: bool,
     last_render: Option<Instant>,
     verbose: bool,
+    // Outer None is immediate mode; inner None means a batch has no redraw yet.
+    batch_redraw: Option<Option<bool>>,
 }
 
 impl Panel {
@@ -76,44 +79,14 @@ impl Panel {
                 segment,
                 ..
             } => {
-                let is_segment = segment.is_some();
-                let offset = segment.as_ref().map(|segment| segment.offset);
-                let label = if let Some(segment) = segment {
-                    let label = language
-                        .translate("cli.scan.segment", &[("index", &segment.index.to_string())]);
-                    let end = segment
-                        .end_offset
-                        .map_or_else(|| "?".into(), |end| end.to_string());
-                    format!("{label} ({}) [{}, {end})", segment.format, segment.offset)
-                } else {
-                    path.file_name()
-                        .unwrap_or(path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                let parent = parent.filter(|parent| self.tasks.contains_key(parent));
-                if let Some(parent) = parent {
-                    let parent = self.tasks.get_mut(&parent).unwrap();
-                    parent.children.insert(id);
-                    parent.carrier |= is_segment;
-                } else {
-                    self.roots.insert(id);
-                }
-                self.tasks.insert(
-                    id,
-                    TaskRow {
-                        path, offset,
-                        parent,
-                        label,
-                        children: BTreeSet::new(),
-                        carrier: false,
-                        phase: Phase::Queued,
-                        wait: ResourceWait::default(),
-                        progress: None,
-                        result: None,
-                    },
-                );
+                self.register(language, id, parent, path, segment);
                 (id, None)
+            }
+            Event::Replanned { id, path } => {
+                let Some(parent) = self.tasks.get(&id).map(|task| task.parent) else { return; };
+                self.remove(id);
+                self.register(language, id, parent, path, None);
+                (id, Some(Phase::Preparing))
             }
             Event::Started { id, .. } => (id, Some(Phase::Preparing)),
             Event::Waiting { id } => (id, Some(Phase::Queued)),
@@ -122,6 +95,14 @@ impl Panel {
             Event::Finalizing { .. } => return,
             Event::Finished { id, result, .. } => {
                 let status = result.status;
+                if status == TaskStatus::Skipped {
+                    let mut ancestor = Some(id);
+                    while let Some(id) = ancestor {
+                        let Some(task) = self.tasks.get_mut(&id) else { break; };
+                        task.retain_display = true;
+                        ancestor = task.parent;
+                    }
+                }
                 if let Some(task) = self.tasks.get_mut(&id) {
                     if status == TaskStatus::Complete { task.progress = Some((1, 1)); }
                     task.result = Some(result);
@@ -184,7 +165,52 @@ impl Panel {
         }
     }
 
+    fn register(&mut self, language: Language, id: TaskId, parent: Option<TaskId>,
+        path: PathBuf, segment: Option<crate::pipeline::Segment>) {
+        let is_segment = segment.is_some();
+        let offset = segment.as_ref().map(|segment| segment.offset);
+        let label = if let Some(segment) = segment {
+            let label = language
+                .translate("cli.scan.segment", &[("index", &segment.index.to_string())]);
+            let end = segment
+                .end_offset
+                .map_or_else(|| "?".into(), |end| end.to_string());
+            format!("{label} ({}) [{}, {end})", segment.format, segment.offset)
+        } else {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let parent = parent.filter(|parent| self.tasks.contains_key(parent));
+        if let Some(parent) = parent {
+            let parent = self.tasks.get_mut(&parent).unwrap();
+            parent.children.insert(id);
+            parent.carrier |= is_segment;
+        } else {
+            self.roots.insert(id);
+        }
+        self.tasks.insert(
+            id,
+            TaskRow {
+                path, offset,
+                parent,
+                label,
+                children: BTreeSet::new(),
+                carrier: false,
+                retain_display: false,
+                phase: Phase::Queued,
+                wait: ResourceWait::default(),
+                progress: None,
+                result: None,
+            },
+        );
+    }
+
     fn should_show(&self, id: TaskId) -> bool {
+        // Semantic batches correspond to main's forced task update. Avoid a
+        // viewport scan for each registered segment; render the batch once.
+        if self.batch_redraw.is_some() { return true; }
         self.frame.as_ref().is_some_and(|frame| {
             frame.rows.last().is_none_or(|row| row.id.is_some())
                 || frame.rows.iter().any(|row| row.id == Some(id))
@@ -256,7 +282,19 @@ impl Panel {
         result
     }
 
+    pub(super) fn begin_batch(&mut self) { self.batch_redraw = Some(None); }
+
+    pub(super) fn end_batch(&mut self, session: &dyn Session, language: Language, render: bool) {
+        if let Some(force) = self.batch_redraw.take().flatten().filter(|_| render) {
+            self.redraw(session, language, force);
+        }
+    }
+
     pub(super) fn redraw(&mut self, session: &dyn Session, language: Language, force: bool) {
+        if let Some(pending) = &mut self.batch_redraw {
+            *pending = Some(force || pending.unwrap_or(false));
+            return;
+        }
         if !session.interactive() { return; }
         let now = Instant::now();
         if !force
@@ -313,19 +351,36 @@ impl Panel {
             .then_some(Frame { size, rows });
     }
 
-    fn rows(
+    pub(super) fn retains_scope(&self, id: TaskId) -> bool {
+        self.roots.contains(&id) && self.tasks.get(&id).is_some_and(|task| task.retain_display)
+    }
+
+    pub(super) fn write_scope(&self, id: TaskId, unicode: bool, language: Language, writer: &mut impl io::Write) -> io::Result<()> {
+        self.rows_scope((usize::MAX, usize::MAX), unicode, language, Some(id), Some(writer))?;
+        Ok(())
+    }
+
+    fn rows(&self, size: (usize, usize), unicode: bool, language: Language) -> Vec<Row> {
+        self.rows_scope(size, unicode, language, None, None).expect("viewport collection cannot fail")
+    }
+
+    fn rows_scope(
         &self,
         (columns, lines): (usize, usize),
         unicode: bool,
         language: Language,
-    ) -> Vec<Row> {
+        scope: Option<TaskId>,
+        mut writer: Option<&mut dyn io::Write>,
+    ) -> io::Result<Vec<Row>> {
         let (width, height) = (columns.saturating_sub(1), lines.saturating_sub(1));
         let mut rows = Vec::new();
         if height == 0 || width == 0 || self.roots.is_empty() {
-            return rows;
+            return Ok(rows);
         }
         let mut prefix = String::new();
-        let mut stack = vec![(self.roots.iter().peekable(), 0, true)];
+        use std::ops::Bound::{Included, Unbounded};
+        let bounds = scope.map_or((Unbounded, Unbounded), |id| (Included(id), Included(id)));
+        let mut stack = vec![(self.roots.range(bounds).peekable(), 0, true)];
         while let Some((siblings, prefix_len, is_root)) = stack.last_mut() {
             let Some(&id) = siblings.next() else {
                 stack.pop();
@@ -334,10 +389,7 @@ impl Panel {
             let task = &self.tasks[&id];
             if rows.len() == height {
                 rows.pop();
-                rows.push(Row {
-                    id: None,
-                    text: clipped(ellipsis(unicode), width, unicode),
-                });
+                emit_row(&mut rows, &mut writer, None, width, unicode, format_args!("{}", ellipsis(unicode)))?;
                 break;
             }
             prefix.truncate(*prefix_len);
@@ -346,45 +398,52 @@ impl Panel {
             } else {
                 tree_edge(unicode, siblings.peek().is_none())
             };
-            rows.push(Row {
-                id: Some(id),
-                text: clipped(&format!("{prefix}{edge}{}", task.label), width, unicode),
-            });
+            let label = if writer.is_some() { super::single_line(&task.label) }
+                else { std::borrow::Cow::Borrowed(task.label.as_str()) };
+            emit_row(&mut rows, &mut writer, Some(id), width, unicode, format_args!("{prefix}{edge}{label}"))?;
             let detail_prefix = format!("{prefix}{continuation}  ");
             if !task.carrier || matches!(task.phase, Phase::Finished(TaskStatus::Failed)) {
                 if rows.len() == height {
                     rows.pop();
-                    rows.push(Row { id: None, text: clipped(ellipsis(unicode), width, unicode) });
-                    return rows;
+                    emit_row(&mut rows, &mut writer, None, width, unicode, format_args!("{}", ellipsis(unicode)))?;
+                    return Ok(rows);
                 }
-                rows.push(Row {
-                    id: Some(id),
-                    text: clipped(&format!("{detail_prefix}{}", row_status(
-                        task, width.saturating_sub(display_width(&detail_prefix)), language,
-                    )), width, unicode),
-                });
+                emit_row(&mut rows, &mut writer, Some(id), width, unicode, format_args!("{detail_prefix}{}", row_status(
+                    task, width.saturating_sub(display_width(&detail_prefix)), language,
+                )))?;
                 if let Some(result) = &task.result {
-                    let detail = super::task_detail(result.status, result.failure.as_ref(), self.verbose, language);
+                    let detail = super::task_detail(result.status, result.failure.as_ref(), result.discovery.map(|source| (source, task.path.as_path())), task.offset.is_some(), self.verbose, language);
                     let output = result.output.as_ref().filter(|_| self.verbose).map(|output| language.translate(
                         "report.detail.output", &[("output", &output.to_string_lossy())],
                     ));
-                    for text in detail.as_deref().into_iter().chain(output.as_deref()) {
+                    for (text, normalize) in detail.as_deref().map(|text| (text, true)).into_iter()
+                        .chain(output.as_deref().map(|text| (text, false))) {
                         if rows.len() == height {
                             rows.pop();
-                            rows.push(Row { id: None, text: clipped(ellipsis(unicode), width, unicode) });
-                            return rows;
+                            emit_row(&mut rows, &mut writer, None, width, unicode, format_args!("{}", ellipsis(unicode)))?;
+                            return Ok(rows);
                         }
-                        rows.push(Row { id: Some(id), text: clipped(&format!("{detail_prefix}{text}"), width, unicode) });
+                        let text = if normalize && writer.is_some() { super::single_line(text) }
+                            else { std::borrow::Cow::Borrowed(text) };
+                        emit_row(&mut rows, &mut writer, Some(id), width, unicode, format_args!("{detail_prefix}{text}"))?;
                     }
                 }
             }
             if !task.children.is_empty() {
                 prefix.push_str(continuation);
-                stack.push((task.children.iter().peekable(), prefix.len(), false));
+                stack.push((task.children.range(..).peekable(), prefix.len(), false));
             }
         }
-        rows
+        Ok(rows)
     }
+}
+
+fn emit_row(
+    rows: &mut Vec<Row>, writer: &mut Option<&mut dyn io::Write>, id: Option<TaskId>,
+    width: usize, unicode: bool, text: std::fmt::Arguments<'_>,
+) -> io::Result<()> {
+    if let Some(writer) = writer { writeln!(writer, "{text}") }
+    else { rows.push(Row { id, text: clipped(&text.to_string(), width, unicode) }); Ok(()) }
 }
 
 pub(super) fn wait_status(state: ResourceWait, language: Language) -> (&'static str, String) {
@@ -452,6 +511,10 @@ fn append_progress(text: &mut String, progress: Option<(u64, u64)>, bar: bool) {
 }
 
 fn row_status(task: &TaskRow, available: usize, language: Language) -> String {
+    if matches!(task.phase, Phase::Finished(TaskStatus::Skipped)) {
+        // main never gives skipped rows a progress bar or a known percentage.
+        return status_text(language.text("report.status.skipped"), None, "", Some(0));
+    }
     let (status, hint) = if task.wait.disk || task.wait.memory {
         wait_status(task.wait, language)
     } else {
@@ -583,6 +646,32 @@ mod tests {
     }
 
     #[test]
+    fn physical_replan_replaces_rows_without_carrying_old_progress_or_waits() {
+        let terminal = Terminal { size: (80, 30), output: Mutex::default() };
+        let mut panel = Panel::default();
+        panel.update(&terminal, Language::En, queued(1, None, "outer.zip", None), true);
+        panel.update(&terminal, Language::En, queued(2, Some(1), "old.002", None), true);
+        panel.update(&terminal, Language::En, queued(3, Some(2), "old segment", None), true);
+        panel.update(&terminal, Language::En, Event::Progress {
+            id: 2, path: "old.002".into(), completed_bytes: 90, total_bytes: 100,
+        }, true);
+        panel.update(&terminal, Language::En, Event::ResourceWait {
+            id: 2, path: "old.002".into(), state: ResourceWait { disk: true, ..Default::default() },
+        }, true);
+        panel.update(&terminal, Language::En, Event::Replanned { id: 2, path: "new.001".into() }, true);
+        let row = &panel.tasks[&2];
+        assert_eq!(row.label, "new.001");
+        assert_eq!(row.parent, Some(1));
+        assert!(row.children.is_empty());
+        assert!(row.progress.is_none() && row.result.is_none());
+        assert!(!row.wait.disk && !row.wait.memory);
+        assert!(matches!(row.phase, Phase::Preparing));
+        assert!(!panel.tasks.contains_key(&3));
+        assert_eq!(panel.tasks[&1].children.iter().copied().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(panel.roots.iter().copied().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
     fn progress_rounding_and_post_worker_phase_match_main() {
         assert_eq!(status_text("X", Some((29, 100)), "", Some(10)), "[X]  28%");
         assert_eq!(status_text("X", Some((58, 100)), "", None), "[X] [###########---------]  57%");
@@ -672,12 +761,12 @@ mod tests {
                            (4, "root/wrapper"), (5, "elsewhere/output")] {
             panel.update(&terminal, Language::En, Event::Finished {
                 id, path: "nested.zip".into(), depth: 1,
-                result: TaskCompletion { status: TaskStatus::Complete, failure: None, output: Some(path.into()) },
+                result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None, output: Some(path.into()) },
             }, false);
         }
         reports.notify(Event::Finished {
             id: 2, path: "nested.zip".into(), depth: 1,
-            result: TaskCompletion { status: TaskStatus::Complete, failure: None,
+            result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
                 output: Some("root/wrapper/leaf/nested".into()) },
         });
         let (old, new) = (std::path::Path::new("root/wrapper/leaf"), std::path::Path::new("root"));
@@ -693,6 +782,90 @@ mod tests {
         let rows = panel.rows(terminal.size, true, Language::En);
         assert!(rows.iter().all(|row| !row.text.contains("wrapper")));
         assert!(rows.iter().any(|row| row.text.contains("elsewhere")));
+    }
+
+    #[test]
+    fn event_batch_renders_once_without_rebuilding_intermediate_viewports() {
+        let terminal = Terminal { size: (140, 40), output: Mutex::default() };
+        let mut panel = Panel::new(false);
+        panel.begin_batch();
+        for id in 1..=5 {
+            panel.update(&terminal, Language::En, queued(id, None, "archive.zip", None), false);
+            panel.update(&terminal, Language::En, Event::Started { id, path: "archive.zip".into(), depth: 1 }, false);
+        }
+        assert!(terminal.output.lock().unwrap().is_empty());
+        assert!(panel.frame.is_none());
+        panel.end_batch(&terminal, Language::En, true);
+        assert!(!terminal.output.lock().unwrap().is_empty());
+        assert_eq!(panel.frame.as_ref().unwrap().rows.len(), 10);
+        // Normal completed scopes keep the established ScopeReport path.
+        assert!(!panel.retains_scope(1));
+    }
+
+    #[test]
+    fn task_preflight_keeps_failed_segments_and_marks_unexecuted_rows_skipped() {
+        use crate::pipeline::{Failure, FailureKind};
+        let terminal = Terminal { size: (140, 40), output: Mutex::default() };
+        let mut panel = Panel::new(false);
+        panel.update(&terminal, Language::En, queued(1, None, "carrier.bin", None), true);
+        for id in [2, 3] {
+            panel.update(&terminal, Language::En, queued(id, Some(1), "carrier.bin", Some(Segment {
+                format: "zip".into(), index: id as usize - 1, count: 2,
+                offset: 0, end_offset: None,
+            })), true);
+            let result = if id == 2 {
+                TaskCompletion::failed(&Failure::new(FailureKind::Damaged, "damaged"))
+            } else { TaskCompletion { discovery: None, status: TaskStatus::Skipped, failure: None, output: None } };
+            panel.update(&terminal, Language::En, Event::Finished {
+                id, path: "carrier.bin".into(), depth: 1, result,
+            }, true);
+        }
+        panel.update(&terminal, Language::En, Event::Finished {
+            id: 1, path: "carrier.bin".into(), depth: 1,
+            result: TaskCompletion::failed(&Failure::new(FailureKind::MissingVolume, "missing volume")),
+        }, true);
+        let rows = panel.rows(terminal.size, true, Language::En);
+        assert!(rows.iter().any(|row| row.id == Some(2) && row.text.contains(Language::En.text("failure.damaged"))));
+        let skipped: Vec<_> = rows.iter().filter(|row| row.id == Some(3)).collect();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped[1].text.ends_with("[Skipped]  --%"));
+        assert!(!skipped[1].text.contains("----"));
+        let mut settled = Vec::new();
+        panel.write_scope(1, true, Language::En, &mut settled).unwrap();
+        assert!(String::from_utf8(settled).unwrap().lines().any(|line| line.ends_with("[Skipped]  --%")));
+        panel.tasks.get_mut(&1).unwrap().label = "carrier\r\nname".into();
+        panel.tasks.get_mut(&2).unwrap().result = Some(TaskCompletion::failed(
+            &Failure::new(FailureKind::FilesystemError, "first\nsecond")));
+        let mut text = Vec::new();
+        panel.write_scope(1, true, Language::En, &mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.starts_with("carrier  name\n"));
+        assert!(text.contains("first second"));
+        assert!(!text.contains('\r'));
+        let failure = Failure::new(FailureKind::PasswordRequired, "password")
+            .with_context(crate::pipeline::FailureContext::Discovery {
+                discovery: crate::pipeline::DiscoverySource::Embedded,
+                reason: "needs_password".into(), path: "carrier.bin".into(), error: String::new(),
+            });
+        panel.update(&terminal, Language::En, Event::Finished {
+            id: 2, path: "carrier.bin".into(), depth: 1, result: TaskCompletion::failed(&failure),
+        }, true);
+        assert!(panel.rows(terminal.size, true, Language::En).iter().any(|row|
+            row.id == Some(2) && row.text.contains(&format!("carrier.bin: {}", Language::En.text("failure.password_not_in_list")))));
+        // Ordinary input aggregation does not repeat segment details at the carrier.
+        panel.update(&terminal, Language::En, Event::Finished {
+            id: 1, path: "carrier.bin".into(), depth: 1,
+            result: TaskCompletion { discovery: None, status: TaskStatus::Failed, failure: None, output: None },
+        }, true);
+        assert_eq!(panel.rows(terminal.size, true, Language::En).iter().filter(|row| row.id == Some(1)).count(), 2);
+        // Parent task_finished formats an otherwise empty password error;
+        // only executor segment rows retain the no-detail password convention.
+        panel.update(&terminal, Language::En, Event::Finished {
+            id: 1, path: "carrier.bin".into(), depth: 1,
+            result: TaskCompletion::failed(&Failure::new(FailureKind::WrongPassword, "password")),
+        }, true);
+        assert!(panel.rows(terminal.size, true, Language::En).iter().any(|row|
+            row.id == Some(1) && row.text.contains(Language::En.text("failure.password_not_in_list"))));
     }
 
     #[test]
@@ -714,7 +887,7 @@ mod tests {
                 }, false);
                 panel.update(&terminal, Language::En, Event::Finished {
                     id, path: "carrier".into(), depth: 1,
-                    result: TaskCompletion { status,
+                    result: TaskCompletion { discovery: None, status,
                         failure: (status == TaskStatus::Partial).then(|| Failure::new(FailureKind::Damaged, "raw")),
                         output: Some(format!("output-{id}").into()),
                     },
@@ -722,7 +895,7 @@ mod tests {
             }
             panel.update(&terminal, Language::En, Event::Finished {
                 id: 3, path: "cancelled.zip".into(), depth: 1,
-                result: TaskCompletion { status: TaskStatus::Failed,
+                result: TaskCompletion { discovery: None, status: TaskStatus::Failed,
                     failure: Some(Failure::new(FailureKind::Cancelled, "raw")), output: None },
             }, false);
             let rows = panel.rows(terminal.size, true, Language::En);
@@ -738,7 +911,7 @@ mod tests {
             // Authoritative carrier finalization can change a segment's output.
             panel.update(&terminal, Language::En, Event::Finished {
                 id: 4, path: "carrier".into(), depth: 1,
-                result: TaskCompletion { status: TaskStatus::Failed,
+                result: TaskCompletion { discovery: None, status: TaskStatus::Failed,
                     failure: Some(Failure::new(FailureKind::Damaged, "raw")), output: None },
             }, false);
             let text = panel.rows(terminal.size, true, Language::En).into_iter()

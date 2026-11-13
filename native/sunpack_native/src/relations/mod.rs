@@ -3,7 +3,7 @@ use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_reader_at_offset, CheapAnchorCell, VolumeAnchor,
 };
 use crate::io::archive_state::{
-    ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
+    AnalysisOrigin, ArchiveInput, InputExtent, InputPart, InputRole, OpenMode, VolumeCompleteness,
 };
 use crate::path_keys::{case_key, path_key};
 use crate::scan::directory::NativeDirectorySnapshot;
@@ -235,9 +235,11 @@ impl NativeRelationGroup {
             data.logical_name().into_owned(),
         );
         input.analysis.password_required = data.needs_password;
+        input.analysis.origin = AnalysisOrigin::Relations;
         let failure_reason = match self {
             Self::Proposal(validation) => project_proposal(validation, &mut input),
             Self::Ordinary(..) => {
+                if !data.relation_confirmed { input.analysis.origin = AnalysisOrigin::RelationsFallback; }
                 if let Some(anchor) = anchor {
                     let start = anchor.structure_offset.unwrap_or(0);
                     if start > 0 && (anchor.sfx || data.needs_password) {
@@ -1058,6 +1060,7 @@ fn project_proposal(
             let terminal = proposal.style == "zip_spanned"
                 && anchor.is_some_and(|anchor| anchor.anchor_roles.contains(&"terminal"));
             InputPart {
+                role: if terminal { InputRole::Terminal } else if *number == 1 { InputRole::First } else { InputRole::Member },
                 extent: InputExtent {
                     path: path.clone(),
                     start: anchor.and_then(|a| a.structure_offset).unwrap_or(0),
@@ -1078,6 +1081,7 @@ fn project_proposal(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    input.volume_style = style;
     input.parts.sort_unstable_by_key(|part| part.volume_number);
     if proposal.format == "zip" && input.volume_attempts.is_none() {
         let mut logical_start = 0u64;

@@ -2,7 +2,9 @@
 //! archive file tables, analysis caches, password lists, or native reader handles.
 
 use super::{ArchiveResult, DiscoverySource, Failure, FailureKind};
-use crate::io::archive_state::{AnalysisFacts, ArchiveInput, InputExtent, InputPart, OpenMode};
+use crate::io::archive_state::ArchiveInput;
+#[cfg(test)]
+use crate::io::archive_state::OpenMode;
 use crate::io::reader::{
     capture_file_generation, PersistedFileGeneration, PhysicalFileGeneration,
 };
@@ -12,6 +14,7 @@ use std::{
     collections::HashMap,
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 const SCHEMA_VERSION: u8 = 1;
@@ -20,8 +23,10 @@ const SCHEMA_VERSION: u8 = 1;
 pub struct InputCheckpoint {
     schema_version: u8,
     carrier: PathBuf,
-    input: LogicalLayout,
-    sources: Box<[SourceGeneration]>,
+    input: Arc<ArchiveInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<ReportState>,
+    sources: Arc<[SourceGeneration]>,
     output: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     planned_output: Option<PathBuf>,
@@ -33,7 +38,7 @@ pub struct InputCheckpoint {
     children_complete: bool,
     remaining_depth: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    failure: Option<FailureReceipt>,
+    failure: Option<Arc<FailureReceipt>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,25 +47,31 @@ struct FailureReceipt {
     password_signature: Option<String>,
     failure: Failure,
     complete_files: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    retry_facts: Option<RetryFacts>,
 }
 
-/// Retry dependencies only: no inventory, reader, or retained candidate plan.
+/// Facts captured before content cleanup/recursion. Execution output ownership
+/// remains separate: a diagnostic output name need not name retained bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RetryFacts {
+pub(super) struct ReportState {
+    input_id: String,
     logical_name: String,
-    analysis: AnalysisFacts,
-    plan_signature: Option<String>,
+    position: usize,
+    input_count: usize,
+    output: PathBuf,
+    files: u64,
+    bytes: u64,
+    recovered_complete_files: u64,
 }
 
+/// A bounded failure report references the same input descriptors as the durable
+/// receipts. It owns no handles, inventories, or additional filesystem probes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct LogicalLayout {
-    entry: PathBuf,
-    mode: OpenMode,
-    format: String,
-    parts: Box<[InputPart]>,
-    ranges: Box<[InputExtent]>,
+pub(crate) struct InputRecovery {
+    inputs: Vec<InputCheckpoint>,
+    output: PathBuf,
+    input_count: usize,
+    had_checkpoints: bool,
+    retry_output: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,7 +113,7 @@ impl InputCheckpoint {
     }
 
     pub fn entry(&self) -> &Path {
-        &self.input.entry
+        Path::new(&self.input.entry_path)
     }
     pub fn carrier(&self) -> &Path {
         &self.carrier
@@ -114,17 +125,12 @@ impl InputCheckpoint {
         self.sources.iter().map(|source| source.path.as_path())
     }
 
+    pub(super) fn input(&self) -> &ArchiveInput { &self.input }
+    pub(super) fn failure(&self) -> Option<&Failure> { self.failure.as_ref().map(|receipt| &receipt.failure) }
+
     pub(super) fn key(&self) -> CheckpointKey {
-        CheckpointKey::new(
-            &self.input.entry.to_string_lossy(),
-            self.input.mode,
-            &self.input.format,
-            self.input
-                .parts
-                .first()
-                .map(|part| part.extent.start)
-                .or_else(|| self.input.ranges.first().map(|range| range.start)),
-        )
+        self.report.as_ref().map_or_else(|| CheckpointKey::for_input(&self.input),
+            |report| CheckpointKey(report.input_id.clone()))
     }
 
     pub(super) fn create(
@@ -155,14 +161,9 @@ impl InputCheckpoint {
         Some(Self {
             schema_version: SCHEMA_VERSION,
             carrier: carrier.to_path_buf(),
-            input: LogicalLayout {
-                entry: PathBuf::from(&input.entry_path),
-                mode: input.mode,
-                format: input.format_hint.clone(),
-                parts: input.parts.clone(),
-                ranges: input.ranges.clone(),
-            },
-            sources: sources.into_boxed_slice(),
+            input: Arc::new(input.clone()),
+            report: None,
+            sources: sources.into(),
             output: result.output.clone().unwrap_or_default(),
             planned_output: None,
             container: container.map(Path::to_path_buf),
@@ -172,18 +173,76 @@ impl InputCheckpoint {
             discovery_source: result.discovery_source,
             children_complete,
             remaining_depth,
-            failure: result.failure.as_ref().map(|failure| FailureReceipt {
+            failure: result.failure.as_ref().map(|failure| Arc::new(FailureReceipt {
                 partial: result.partial,
                 password_signature: None,
                 failure: failure.clone(),
                 complete_files: result.recovered_complete_files,
-                retry_facts: Some(RetryFacts {
-                    logical_name: input.logical_name.clone(),
-                    analysis: input.analysis.clone(),
-                    plan_signature: plan_signature(input),
-                }),
-            }),
+            })),
         })
+    }
+
+    pub(super) fn report_state(
+        input: &ArchiveInput, result: &ArchiveResult, planned: Option<&Path>,
+        previous: Option<&Self>, position: usize, input_count: usize,
+    ) -> Option<ReportState> {
+        if result.failure.as_ref().is_some_and(|failure| matches!(failure.context.as_deref(),
+            Some(super::FailureContext::InputAdmission { .. }))) {
+            return None;
+        }
+        let old = previous.and_then(|checkpoint| checkpoint.report.as_ref());
+        if result.retained {
+            if let Some(old) = old {
+                let mut state = old.clone(); state.input_count = input_count; return Some(state);
+            }
+        }
+        Some(ReportState {
+            input_id: old.map(|old| old.input_id.clone())
+                .unwrap_or_else(|| CheckpointKey::for_input(input).0),
+            logical_name: input.logical_name.clone(),
+            position: old.map_or(position, |old| old.position), input_count,
+            output: result.output.as_deref().or(planned).unwrap_or(Path::new("")).to_path_buf(),
+            files: result.files, bytes: result.bytes,
+            recovered_complete_files: result.recovered_complete_files,
+        })
+    }
+
+    pub(super) fn install_report(&mut self, state: Option<ReportState>) { self.report = state; }
+
+    /// Replacement preserves the old checkpoint only when the new logical ID
+    /// differs. Main's ID deliberately excludes display name and open mode.
+    pub(super) fn same_report_input(&self, input: &ArchiveInput) -> bool {
+        let Some(report) = &self.report else { return false; };
+        let start = input.physical_extents().next().map_or(0, |extent| extent.start);
+        report.input_id == format!("{}|{}|{}", path_key(&input.entry_path), input.format_hint, start)
+    }
+
+    pub(super) fn has_recovered_members(&self) -> bool {
+        self.failure.as_ref().is_some_and(|failure| failure.complete_files > 0)
+    }
+
+    pub(super) fn clear_recovery_output(&mut self) {
+        Self::clear_report_output(&mut self.report);
+        self.output.clear();
+        self.planned_output = None;
+        if let Some(failure) = &mut self.failure {
+            Arc::make_mut(failure).complete_files = 0;
+        }
+    }
+
+    pub(super) fn report_position(&self) -> Option<usize> {
+        self.report.as_ref().map(|report| report.position)
+    }
+
+    pub(super) fn report_input_count(&self) -> usize {
+        self.report.as_ref().map_or(0, |report| report.input_count)
+    }
+
+    pub(super) fn clear_report_output(state: &mut Option<ReportState>) {
+        if let Some(state) = state {
+            state.output.clear();
+            state.recovered_complete_files = 0;
+        }
     }
 
     pub(super) fn valid_for(
@@ -192,20 +251,17 @@ impl InputCheckpoint {
         generations: &HashMap<String, PhysicalFileGeneration>,
     ) -> bool {
         self.schema_version == SCHEMA_VERSION
-            && self.failure.as_ref().is_none_or(|partial| {
-                // Failed logical inputs wake only when retry dependencies
-                // change; successful outputs admit their proven volume winner.
-                partial.retry_facts.as_ref().is_some_and(|facts| {
-                        facts.logical_name == input.logical_name
-                            && facts.analysis == input.analysis
-                            && facts.plan_signature == plan_signature(input)
-                    })
-            })
+            && (self.failure.is_none() || (
+                self.input.logical_name == input.logical_name
+                    && self.input.volume_style == input.volume_style
+                    && self.input.analysis == input.analysis
+                    && self.input.volume_attempts == input.volume_attempts
+            ))
             && (if self.failure.is_some() {
-                self.input.entry == Path::new(&input.entry_path)
-                    && self.input.mode == input.mode && self.input.format == input.format_hint
+                self.input.entry_path == input.entry_path
+                    && self.input.mode == input.mode && self.input.format_hint == input.format_hint
                     && self.input.parts == input.parts && self.input.ranges == input.ranges
-            } else { self.input.matches(input) })
+            } else { layout_matches(&self.input, input) })
             && self.sources.iter().all(|source| {
                 generations
                     .get(&path_key(&source.path.to_string_lossy()))
@@ -223,17 +279,13 @@ impl InputCheckpoint {
     }
 
     pub(super) fn output_slot_for(&self, input: &ArchiveInput, container: &Path) -> bool {
-        // Dependency generations and retry facts decide whether the result can
-        // be reused, not whether the same logical segment keeps its old slot.
-        let start = self.input.parts.first().map(|part| part.extent.start)
-            .or_else(|| self.input.ranges.first().map(|range| range.start)).unwrap_or(0);
+        // The caller has selected this logical identity (including a unique
+        // source-anchor match). Generation changes do not revoke its old slot.
         self.schema_version == SCHEMA_VERSION
             && self.container() == Some(container)
             && self.output_slot().is_some_and(|output| output.strip_prefix(container)
                 .is_ok_and(|relative| !relative.as_os_str().is_empty()))
-            && path_key(&self.input.entry.to_string_lossy()) == path_key(&input.entry_path)
-            && self.input.format == input.format_hint
-            && start == input.physical_extents().next().map_or(0, |extent| extent.start)
+            && self.input.format_hint == input.format_hint
     }
 
     pub(crate) fn container(&self) -> Option<&Path> {
@@ -243,17 +295,17 @@ impl InputCheckpoint {
     }
     pub(crate) fn retained_container(&self) -> Option<&Path> {
         let container = self.container.as_ref()?;
-        (self.has_output() && self.failure.as_ref().is_none_or(|receipt| receipt.complete_files > 0))
-            .then_some(container.as_path())
+        self.continuable_output().then_some(container.as_path())
+    }
+    pub(super) fn continuable_output(&self) -> bool {
+        self.has_output() && self.failure.as_ref().is_none_or(|receipt| receipt.complete_files > 0)
     }
     pub(super) fn children_complete(&self, remaining_depth: usize) -> bool {
         self.children_complete && self.remaining_depth >= remaining_depth
     }
 
     pub(super) fn restore_input(&self, input: &mut ArchiveInput) {
-        input.mode = self.input.mode;
-        input.parts = self.input.parts.clone();
-        input.ranges = self.input.ranges.clone();
+        *input = self.input.as_ref().clone();
         if self.failure.is_none() { input.volume_attempts = None; }
     }
 
@@ -276,24 +328,41 @@ impl InputCheckpoint {
         let has_output = self.has_output();
         mapped(&mut self.carrier);
         if let Some(planned) = &mut self.planned_output { mapped(planned); }
-        mapped(&mut self.input.entry);
+        if let Some(report) = &mut self.report { mapped(&mut report.output); }
         if has_output { mapped(&mut self.output); }
-        if let Some(container) = &mut self.container {
-            mapped(container);
+        if let Some(container) = &mut self.container { mapped(container); }
+        if self.sources.iter().any(|generation| generation.path.starts_with(source)) {
+            for generation in Arc::make_mut(&mut self.sources) { mapped(&mut generation.path); }
         }
-        for generation in &mut self.sources {
-            mapped(&mut generation.path);
+        drop(mapped);
+        // Output flattening usually does not move the archive descriptor.
+        // Do not copy a shared plan unless one of its physical paths changes.
+        if !Path::new(&self.input.entry_path).starts_with(source)
+            && !self.input.physical_extents().any(|extent| Path::new(&extent.path).starts_with(source))
+            && !self.input.volume_attempts.as_ref().is_some_and(|plan|
+                plan.sources.iter().any(|extent| Path::new(&extent.path).starts_with(source)))
+        { return changed; }
+        let input = Arc::make_mut(&mut self.input);
+        if let Some(target) = relocate(Path::new(&input.entry_path)) {
+            input.entry_path = target.to_string_lossy().into_owned();
+            changed = true;
         }
-        for extent in self
-            .input
+        for extent in input
             .parts
             .iter_mut()
             .map(|part| &mut part.extent)
-            .chain(&mut self.input.ranges)
+            .chain(&mut input.ranges)
         {
             if let Some(target) = relocate(Path::new(&extent.path)) {
                 extent.path = target.to_string_lossy().into_owned();
                 changed = true;
+            }
+        }
+        if let Some(plan) = &mut input.volume_attempts {
+            for extent in &mut plan.sources {
+                if let Some(target) = relocate(Path::new(&extent.path)) {
+                    extent.path = target.to_string_lossy().into_owned(); changed = true;
+                }
             }
         }
         changed
@@ -303,6 +372,11 @@ impl InputCheckpoint {
         let wrapper = self.has_output() && leaf.starts_with(&self.output) && self.output.starts_with(root);
         let changed = self.relocate(leaf, root);
         if wrapper { self.output = root.to_path_buf(); }
+        if let Some(report) = &mut self.report {
+            if !report.output.as_os_str().is_empty() && leaf.starts_with(&report.output) && report.output.starts_with(root) {
+                report.output = root.to_path_buf();
+            }
+        }
         changed || wrapper
     }
 
@@ -316,13 +390,13 @@ impl InputCheckpoint {
 
     pub(crate) fn storage_key(&self) -> String {
         if self.has_output() { return self.output.to_string_lossy().into_owned(); }
-        let key = self.key();
-        format!("input|{}|{:?}|{}|{}", key.entry, key.mode, key.format, key.start)
+        format!("input|{}|{:?}|{}|{}", path_key(&self.input.entry_path), self.input.mode,
+            self.input.format_hint, self.input.physical_extents().next().map_or(0, |extent| extent.start))
     }
 
     pub(super) fn set_password_signature(&mut self, signature: impl FnOnce() -> String) {
         if let Some(receipt) = self.failure.as_mut().filter(|receipt| receipt.failure.is_password_retry()) {
-            receipt.password_signature = Some(signature());
+            Arc::make_mut(receipt).password_signature = Some(signature());
         }
     }
 
@@ -337,27 +411,34 @@ impl InputCheckpoint {
         if !self.sources.iter().any(|source| paths.target(&source.path).is_some()) {
             return Ok(false);
         }
-        if let Some(destination) = paths.target(&self.input.entry) {
-            if let Some(facts) = self.failure.as_mut().and_then(|receipt| receipt.retry_facts.as_mut()) {
-                let logical_name = crate::scan::directory::filesystem_logical_name;
-                if facts.logical_name == logical_name(&self.input.entry.to_string_lossy()) {
-                    facts.logical_name = logical_name(&destination.to_string_lossy());
-                }
+        let has_output = self.has_output();
+        let input = Arc::make_mut(&mut self.input);
+        if let Some(destination) = paths.target(Path::new(&input.entry_path)) {
+            let logical_name = crate::scan::directory::filesystem_logical_name;
+            if input.logical_name == logical_name(&input.entry_path) {
+                input.logical_name = logical_name(&destination.to_string_lossy());
             }
+            input.entry_path = destination.to_string_lossy().into_owned();
         }
         paths.remap(&mut self.carrier);
-        paths.remap(&mut self.input.entry);
-        if let Some(receipt) = &mut self.failure { paths.remap_failure(&mut receipt.failure); }
         if let Some(planned) = &mut self.planned_output { paths.remap(planned); }
-        if self.has_output() { paths.remap(&mut self.output); }
+        if has_output { paths.remap(&mut self.output); }
+        if let Some(report) = &mut self.report { paths.remap(&mut report.output); }
         if let Some(container) = &mut self.container { paths.remap(container); }
-        for source in &mut self.sources {
+        for source in Arc::make_mut(&mut self.sources) {
             paths.remap(&mut source.path);
             source.generation = capture_file_generation(&source.path)?.persisted();
         }
-        for extent in self.input.parts.iter_mut().map(|part| &mut part.extent).chain(&mut self.input.ranges) {
+        for extent in input.parts.iter_mut().map(|part| &mut part.extent).chain(&mut input.ranges) {
             if let Some(target) = paths.target(Path::new(&extent.path)) {
                 extent.path = target.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(plan) = &mut input.volume_attempts {
+            for extent in &mut plan.sources {
+                if let Some(target) = paths.target(Path::new(&extent.path)) {
+                    extent.path = target.to_string_lossy().into_owned();
+                }
             }
         }
         Ok(true)
@@ -372,8 +453,8 @@ impl InputCheckpoint {
             .map(|part| &part.extent)
             .or(self.input.ranges.first());
         ArchiveResult {
-            path: self.input.entry.clone(),
-            format: self.input.format.clone(),
+            path: PathBuf::from(&self.input.entry_path),
+            format: self.input.format_hint.clone(),
             output: self.has_output().then(|| self.output.clone()),
             volume_completeness: self.input.mode.structured().then(|| {
                 if failure
@@ -413,67 +494,181 @@ impl InputCheckpoint {
     }
 }
 
-fn plan_signature(input: &ArchiveInput) -> Option<String> {
-    input.volume_attempts.as_ref().map(|plan| {
-        let mut hash = crate::fast_hash_core::Hash128::new();
-        hash.update(&serde_json::to_vec(plan).expect("volume plan is serializable"));
-        hash.hexdigest()
-    })
+impl InputRecovery {
+    pub(super) fn capture(
+        checkpoints: &[InputCheckpoint], carrier: &Path, relocated_carrier: Option<&Path>, output: Option<&Path>,
+        input_count: usize, had_checkpoints: bool, retry_output: bool,
+    ) -> Option<Arc<Self>> {
+        let inputs: Vec<_> = checkpoints.iter()
+            .filter(|checkpoint| (checkpoint.carrier() == carrier || relocated_carrier == Some(checkpoint.carrier())) && checkpoint.report.is_some())
+            .cloned().collect();
+        if inputs.is_empty() { return None; }
+        let cleared = inputs.iter().all(|checkpoint| checkpoint.report.as_ref().unwrap().output.as_os_str().is_empty());
+        let output = if cleared { PathBuf::new() } else { output.map(Path::to_path_buf).unwrap_or_else(||
+            inputs[0].report.as_ref().unwrap().output.clone()) };
+        Some(Arc::new(Self { inputs, output, input_count, had_checkpoints, retry_output: retry_output && !cleared }))
+    }
+
+    pub(crate) fn aggregated(&self) -> bool { self.had_checkpoints || self.input_count > 1 }
+    pub(crate) fn input_count(&self) -> usize { self.input_count }
+    pub(crate) fn retry_output(&self) -> Option<&Path> {
+        self.retry_output.then_some(self.output.as_path())
+    }
+
+    pub(crate) fn report(&self, failure: impl Fn(&Failure) -> serde_json::Value) -> serde_json::Value {
+        use serde_json::{json, Value};
+        let inputs: Vec<_> = self.inputs.iter().map(|checkpoint| {
+            let state = checkpoint.report.as_ref().expect("captured report state");
+            let error = checkpoint.failure.as_ref().map(|receipt| &receipt.failure);
+            let mut blockers = Vec::new();
+            if let Some(error) = error {
+                if error.contains(FailureKind::MissingVolume)
+                    || checkpoint.input.analysis.missing_volume_evidence.is_some()
+                    || checkpoint.input.analysis.volume_completeness == Some(crate::io::archive_state::VolumeCompleteness::Missing)
+                    || error.evidence.as_deref().is_some_and(|e| e.classification_evidence.as_deref() == Some("password_or_volume_inconclusive"))
+                { blockers.push("missing_volume"); }
+                if error.is_password_retry() { blockers.push("password"); }
+            }
+            // Preserve the native, lossless generation representation. No stat
+            // or legacy identity conversion is performed for diagnostics.
+            let generation = &checkpoint.sources;
+            json!({"input_id": state.input_id, "position": state.position,
+                "archive_input": checkpoint.input.report_with_name(&state.logical_name), "generation": generation,
+                "output_dir": state.output, "complete": error.is_none(), "blockers": blockers,
+                "failure": error.map(&failure).unwrap_or(Value::Null),
+                "files_written": state.files, "bytes_written": state.bytes,
+                "recovered_complete_files": state.recovered_complete_files})
+        }).collect();
+        json!({"inputs": inputs, "output_dir": self.output, "input_count": self.input_count})
+    }
+
+    pub(super) fn relocate_flatten(&mut self, leaf: &Path, root: &Path) {
+        if let Ok(relative) = self.output.strip_prefix(leaf) { self.output = root.join(relative); }
+        else if leaf.starts_with(&self.output) && self.output.starts_with(root) { self.output = root.to_path_buf(); }
+        for checkpoint in &mut self.inputs {
+            if let Some(state) = &mut checkpoint.report {
+                if !state.output.as_os_str().is_empty() {
+                    super::relocate_flatten_output(&mut state.output, leaf, root);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
-pub(super) struct CheckpointKey {
-    entry: String,
-    mode: OpenMode,
-    format: String,
-    start: u64,
-}
+pub(super) struct CheckpointKey(String);
 
 impl CheckpointKey {
-    fn new(entry: &str, mode: OpenMode, format: &str, start: Option<u64>) -> Self {
-        Self {
-            entry: path_key(entry),
-            mode,
-            format: format.to_owned(),
-            start: if mode.structured() {
-                0
-            } else {
-                start.unwrap_or(0)
-            },
-        }
-    }
-
     pub(super) fn for_input(input: &ArchiveInput) -> Self {
-        Self::new(
-            &input.entry_path,
-            input.mode,
-            &input.format_hint,
-            input.physical_extents().next().map(|extent| extent.start),
-        )
+        Self(format!("{}|{}|{}", path_key(&input.entry_path), input.format_hint,
+            input.physical_extents().next().map_or(0, |extent| extent.start)))
     }
 }
 
-impl LogicalLayout {
-    fn matches(&self, input: &ArchiveInput) -> bool {
-        if path_key(&self.entry.to_string_lossy()) != path_key(&input.entry_path)
-            || self.mode != input.mode
-            || self.format != input.format_hint
-            || self.ranges != input.ranges
+fn layout_matches(saved: &ArchiveInput, input: &ArchiveInput) -> bool {
+        if saved.mode != input.mode
+            || saved.format_hint != input.format_hint
+            || saved.ranges != input.ranges
         {
             return false;
         }
         match &input.volume_attempts {
-            Some(plan) => plan.admits_parts(&self.parts),
-            None => self.parts == input.parts,
+            Some(plan) => saved.volume_attempts.is_none() && saved.volume_style == input.volume_style && plan.admits_parts(&saved.parts),
+            None => saved.parts == input.parts,
         }
     }
-}
-
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
     use std::{fs, sync::Arc};
+
+    #[test]
+    fn recovery_receipts_preserve_pre_cleanup_facts_and_relocate_only_outputs() {
+        let source = crate::test_support::temp_file("recovery_report", b"archive");
+        let output = source.with_extension("out");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "original".into());
+        let generations = HashMap::from([(path_key(&input.entry_path), capture_file_generation(&source).unwrap())]);
+        let mut result = ArchiveResult {
+            path: source.clone(), format: "zip".into(), output: None, failure: None,
+            files: 0, bytes: 0, encrypted: None, depth: 1, offset: 0, end_offset: None,
+            volume_completeness: None, volume_attempts: None, source_paths: vec![source.clone()],
+            password: None, discovery_source: DiscoverySource::Direct, damage_flags: None,
+            partial: false, retained: false, recovered_complete_files: 0, promoted: false,
+            promotion_original_path: None,
+        };
+        result.failure = Some(Failure::new(FailureKind::Damaged, "damaged").with_context(super::super::FailureContext::Extraction));
+        result.output = Some(output.clone()); result.files = 3; result.bytes = 17;
+        result.recovered_complete_files = 2;
+        let state = InputCheckpoint::report_state(&input, &result, Some(&output), None, 4, 7);
+        let mut checkpoint = InputCheckpoint::create(&source, &input, &result, &generations, None, false, 0).unwrap();
+        checkpoint.install_report(state.clone());
+        let checkpoint: InputCheckpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let mut resumed = input.clone(); resumed.logical_name = "changed display".into();
+        let state = InputCheckpoint::report_state(&resumed, &result, Some(&output), Some(&checkpoint), 1, 7).unwrap();
+        assert_eq!(state.position, 4);
+        assert_eq!(state.input_id, checkpoint.report.as_ref().unwrap().input_id);
+        let recovery = InputRecovery::capture(&[checkpoint.clone()], &source, None, None, 7, true, true).unwrap();
+        assert!(Arc::ptr_eq(&checkpoint.input, &recovery.inputs[0].input));
+        assert!(Arc::ptr_eq(&checkpoint.sources, &recovery.inputs[0].sources));
+        assert!(Arc::ptr_eq(checkpoint.failure.as_ref().unwrap(), recovery.inputs[0].failure.as_ref().unwrap()));
+        let mut output_only = checkpoint.clone();
+        output_only.relocate_flatten(&output, output.parent().unwrap());
+        assert!(Arc::ptr_eq(&checkpoint.input, &output_only.input));
+        assert!(Arc::ptr_eq(&checkpoint.sources, &output_only.sources));
+        let render = |failure: &Failure| serde_json::json!({"kind": format!("{:?}", failure.kind)});
+        let report = recovery.report(render);
+        assert_eq!(report["inputs"][0]["position"], 4);
+        assert_eq!(report["inputs"][0]["files_written"], 3);
+        assert_eq!(report["inputs"][0]["bytes_written"], 17);
+        assert_eq!(report["inputs"][0]["recovered_complete_files"], 2);
+        assert_eq!(report["inputs"][0]["complete"], false);
+        assert_eq!(report["inputs"][0]["archive_input"]["logical_name"], "original");
+        assert_eq!(report["inputs"][0]["generation"], serde_json::to_value(&checkpoint.sources).unwrap());
+        assert!(recovery.aggregated());
+        // Same-request replacement keeps the first checkpoint until a result
+        // with the same logical ID overwrites it. Name/mode changes alone do
+        // not invent another logical input; a different format does.
+        assert!(checkpoint.same_report_input(&resumed));
+        let mut replacement = resumed.clone();
+        replacement.format_hint = "7z".into();
+        assert!(!checkpoint.same_report_input(&replacement));
+        let mut success = result.clone();
+        success.failure = None;
+        success.format = "7z".into();
+        success.recovered_complete_files = 0;
+        let mut replaced = InputCheckpoint::create(&source, &replacement, &success,
+            &generations, None, true, 0).unwrap();
+        replaced.install_report(InputCheckpoint::report_state(&replacement, &success,
+            Some(&output), None, 1, 1));
+        let retained = checkpoint.result(1);
+        assert_eq!(super::super::TaskCompletion::from_group(&[success, retained]).status,
+            super::super::TaskStatus::Failed);
+        let changed_id = InputRecovery::capture(&[checkpoint.clone(), replaced],
+            &source, None, None, 1, true, true).unwrap();
+        let changed_report = changed_id.report(render);
+        assert_eq!(changed_report["input_count"], 1);
+        assert_eq!(changed_report["inputs"].as_array().unwrap().len(), 2);
+        assert_eq!(changed_report["inputs"][0]["complete"], false);
+        assert_eq!(changed_report["inputs"][1]["complete"], true);
+        assert_ne!(changed_report["inputs"][0]["input_id"], changed_report["inputs"][1]["input_id"]);
+        let mut relocated = recovery.as_ref().clone();
+        let parent = output.parent().unwrap();
+        relocated.relocate_flatten(&output, parent);
+        let relocated_report = relocated.report(render);
+        assert_eq!(relocated_report["inputs"][0]["output_dir"], serde_json::json!(parent));
+        assert_eq!(relocated_report["inputs"][0]["archive_input"]["entry_path"], input.entry_path);
+        // Content rejection must not revive an old partial continuation path.
+        let mut cleared = checkpoint;
+        InputCheckpoint::clear_report_output(&mut cleared.report);
+        cleared.output.clear();
+        let cleared = InputRecovery::capture(&[cleared], &source, None, Some(&output), 7, true, true).unwrap();
+        assert!(cleared.retry_output().is_none());
+        assert_eq!(cleared.report(render)["output_dir"], "");
+        assert_eq!(cleared.report(render)["inputs"][0]["files_written"], 3);
+        assert_eq!(cleared.report(render)["inputs"][0]["recovered_complete_files"], 0);
+        fs::remove_file(source).unwrap();
+    }
 
     #[test]
     fn bulk_promotion_remaps_all_layout_fields_once() {
@@ -491,6 +686,7 @@ mod tests {
                 path: source.clone(), generation: capture_file_generation(source).unwrap().persisted(),
             });
             parts.push(InputPart {
+                role: if index == 0 { crate::io::archive_state::InputRole::First } else { crate::io::archive_state::InputRole::Member },
                 extent: InputExtent { path: source.to_string_lossy().into_owned(), start: 0, end: Some(4) },
                 volume_number: Some(index as u32 + 1), canonical_name: format!("archive.7z.{:03}", index + 1),
             });
@@ -499,12 +695,13 @@ mod tests {
         let retained = root.join("retained-output");
         let mut checkpoint = InputCheckpoint {
             schema_version: SCHEMA_VERSION, carrier: moves[0].0.clone(),
-            input: LogicalLayout {
-                entry: moves[0].0.clone(), mode: OpenMode::NativeVolumes, format: "7z".into(),
+            input: Arc::new(ArchiveInput {
+                mode: OpenMode::NativeVolumes,
                 ranges: parts.iter().map(|part| part.extent.clone()).collect::<Vec<_>>().into_boxed_slice(),
                 parts: parts.into_boxed_slice(),
-            },
-            sources: sources.into_boxed_slice(), output: retained.clone(),
+                ..ArchiveInput::file(moves[0].0.to_string_lossy().into_owned(), "7z".into(), String::new())
+            }), report: None,
+            sources: sources.into(), output: retained.clone(),
             planned_output: Some(retained.clone()), container: Some(root.clone()),
             files: 1, bytes: 4, encrypted: None, discovery_source: DiscoverySource::Embedded,
             children_complete: true, remaining_depth: 0, failure: None,
@@ -512,7 +709,7 @@ mod tests {
         let paths = super::super::coordinator::PromotionPaths::new(&moves);
         assert!(checkpoint.promoted(&paths).unwrap());
         assert_eq!(checkpoint.carrier, moves[0].1);
-        assert_eq!(checkpoint.input.entry, moves[0].1);
+        assert_eq!(Path::new(&checkpoint.input.entry_path), moves[0].1);
         assert_eq!(checkpoint.output, retained);
         assert_eq!(checkpoint.planned_output.as_ref(), Some(&retained));
         assert_eq!(checkpoint.container.as_ref(), Some(&root));
@@ -553,31 +750,28 @@ mod tests {
                     .unwrap().0.remove(0).unwrap()
             };
             let input = discover(&source);
-            let failure = Failure::new(FailureKind::Damaged, "accepted partial");
+            let failure = Failure::new(FailureKind::Damaged, "accepted partial")
+                .with_context(super::super::FailureContext::Discovery {
+                    discovery: DiscoverySource::Embedded, path: source.clone(),
+                    reason: "damaged".into(), error: "original diagnostic".into(),
+                });
             let mut checkpoint = InputCheckpoint {
                 schema_version: SCHEMA_VERSION,
                 carrier: source.clone(),
-                input: LogicalLayout {
-                    entry: source.clone(), mode: input.mode, format: input.format_hint.clone(),
-                    parts: input.parts.clone(), ranges: input.ranges.clone(),
-                },
+                input: Arc::new(input.clone()), report: None,
                 sources: vec![SourceGeneration {
                     path: source.clone(), generation: capture_file_generation(&source).unwrap().persisted(),
-                }].into_boxed_slice(),
+                }].into(),
                 output: output.clone(),
                 planned_output: None,
                 container: Some(container.clone()),
                 files: 1, bytes: 4, encrypted: None,
                 discovery_source: DiscoverySource::Embedded, children_complete: true,
                 remaining_depth: 0,
-                failure: Some(FailureReceipt {
+                failure: Some(Arc::new(FailureReceipt {
                     partial: true, password_signature: None,
                     failure, complete_files: 1,
-                    retry_facts: Some(RetryFacts {
-                        logical_name: input.logical_name.clone(), analysis: input.analysis.clone(),
-                    plan_signature: plan_signature(&input),
-                    }),
-                }),
+                })),
             };
             let plan = NativeBlockedInputPromotion::new(
                 vec![source.to_string_lossy().into_owned()], root.clone(),
@@ -586,7 +780,11 @@ mod tests {
             assert_ne!(destination, root.join(filename));
             let (_, _, _, error, _) = plan.execute(|| Ok(()));
             assert!(error.is_empty(), "{error}");
+            let diagnostic = Arc::clone(checkpoint.failure.as_ref().unwrap());
             checkpoint.promoted(&super::super::coordinator::PromotionPaths::new(plan.moves())).unwrap();
+            assert!(Arc::ptr_eq(&diagnostic, checkpoint.failure.as_ref().unwrap()));
+            assert!(matches!(checkpoint.failure.as_ref().unwrap().failure.context.as_deref(),
+                Some(super::super::FailureContext::Discovery { path, .. }) if path == &source));
             let checkpoint: InputCheckpoint = serde_json::from_value(
                 serde_json::to_value(checkpoint).unwrap(),
             ).unwrap();
@@ -619,6 +817,7 @@ mod tests {
         );
         input.mode = OpenMode::NativeVolumes;
         input.parts = vec![InputPart {
+            role: crate::io::archive_state::InputRole::First,
             extent: InputExtent { path: input.entry_path.clone(), start: 0, end: Some(7) },
             volume_number: Some(1),
             canonical_name: "archive.7z.001".into(),
@@ -630,13 +829,10 @@ mod tests {
         let complete = InputCheckpoint {
             schema_version: SCHEMA_VERSION,
             carrier: source.clone(),
-            input: LogicalLayout {
-                entry: source.clone(), mode: input.mode, format: input.format_hint.clone(),
-                parts: input.parts.clone(), ranges: input.ranges.clone(),
-            },
+            input: Arc::new(input.clone()), report: None,
             sources: vec![SourceGeneration {
                 path: source.clone(), generation: generations[&key].persisted(),
-            }].into_boxed_slice(),
+            }].into(),
             output: output.clone(),
             planned_output: None,
             container: None, files: 1, bytes: 7, encrypted: None,
@@ -682,16 +878,6 @@ mod tests {
             &source, &alternatives, &result, &generations, None, true, 0,
         ).is_some());
 
-        let mut legacy = serde_json::to_value(&partial).unwrap();
-        legacy["failure"].as_object_mut().unwrap().remove("retry_facts");
-        let legacy: InputCheckpoint = serde_json::from_value(legacy).unwrap();
-        assert!(!legacy.valid_for(&input, &generations));
-        assert!(!legacy.valid_for(&alternatives, &generations));
-        let legacy_complete: InputCheckpoint = serde_json::from_value(
-            serde_json::to_value(&complete).unwrap(),
-        ).unwrap();
-        assert!(legacy_complete.valid_for(&input, &generations));
-        assert!(legacy_complete.valid_for(&alternatives, &generations));
         // A failed input reserves its name without advertising recoverable
         // content. Persist and relocate that namespace independently of output.
         let mut failed = partial.clone();

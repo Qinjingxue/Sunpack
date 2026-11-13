@@ -858,6 +858,7 @@ mod tests {
         let tail = crate::test_support::temp_file("password_compound_tail", b"tail");
         let mut input = ArchiveInput::file(head.to_string_lossy().into_owned(), "rar".into(), "archive".into());
         input.parts = vec![head.clone(), tail.clone()].into_iter().enumerate().map(|(index, path)| InputPart {
+            role: if index == 0 { crate::io::archive_state::InputRole::First } else { crate::io::archive_state::InputRole::Member },
             extent: InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: Some(4) },
             volume_number: Some(index as u32 + 1), canonical_name: format!("part{}.rar", index + 1),
         }).collect();
