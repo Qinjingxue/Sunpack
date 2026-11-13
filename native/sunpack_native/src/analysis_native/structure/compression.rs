@@ -771,7 +771,6 @@ mod xz_bounds_tests {
 }
 
 fn inspect_xz(reader: &ManagedReader) -> std::io::Result<StreamObservation> {
-    let file_size = reader.len();
     let data = (reader.read_all()).map_err(crate::io::resource_error::to_io_error)?;
     let mut d = compression_base("xz", data.starts_with(XZ_MAGIC));
     let mut damage_flags = Vec::new();

@@ -148,7 +148,7 @@ pub(super) struct RunOutcome {
 impl RunOutcome {
     pub fn settled(&self) -> bool { !self.uncommitted && self.archives.cancelled == 0 }
     pub fn subtree_complete(&self) -> bool {
-        !self.scan_incomplete && self.archives.incomplete == 0
+        !self.uncommitted && !self.scan_incomplete && self.archives.incomplete == 0
             && self.errors.incomplete == 0 && self.cleanup_results.incomplete == 0
     }
 }
@@ -215,6 +215,18 @@ mod tests {
         assert_eq!(results.len(), 5);
         assert_eq!(results.iter().map(|item| item as *const String).collect::<Vec<_>>(), addresses);
         assert_eq!(results.into_vec(), ["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn undispatched_cancelled_subtree_remains_incomplete_through_result_conversion() {
+        let mut root = RunOutcome::default();
+        assert!(root.subtree_complete());
+        root.uncommitted = true;
+        assert!(!root.subtree_complete());
+        assert!(!root.settled());
+        let restored = RunOutcome::from(Outcome::from(root));
+        assert!(!restored.subtree_complete());
+        assert!(!restored.settled());
     }
 
     #[test]

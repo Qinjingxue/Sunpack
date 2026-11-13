@@ -34,6 +34,7 @@ pub(crate) struct StructureValidation {
     pub(crate) stream_count: usize,
     #[cfg(test)]
     pub(crate) block_count: usize,
+    #[cfg(test)]
     pub(crate) decoded_size: Option<u64>,
     pub(crate) integrity: IntegrityStatus,
 }
@@ -1082,6 +1083,7 @@ fn walk_gzip_structure(
         stream_count: members,
         #[cfg(test)]
         block_count: blocks,
+        #[cfg(test)]
         decoded_size: Some(decoded_size),
         integrity,
     })
@@ -1343,6 +1345,7 @@ pub(crate) fn validate_bzip2_structure_observed(
         stream_count: streams,
         #[cfg(test)]
         block_count: total_blocks,
+        #[cfg(test)]
         decoded_size: None,
         integrity: IntegrityStatus::Deferred,
     })
@@ -1655,6 +1658,7 @@ pub(crate) fn validate_xz_structure_exact(
     let mut streams_reversed = 0usize;
     #[cfg(test)]
     let mut total_blocks = 0usize;
+    #[cfg(test)]
     let mut decoded_size = Some(0u64);
     let mut checksum_present = false;
     while reverse_end > offset {
@@ -1683,7 +1687,8 @@ pub(crate) fn validate_xz_structure_exact(
         for _ in 0..index.record_count {
             let unpadded = read_vli(|| index.records.read_byte())?;
             let uncompressed = read_vli(|| index.records.read_byte())?;
-            decoded_size = decoded_size.and_then(|total| total.checked_add(uncompressed));
+            #[cfg(test)]
+            { decoded_size = decoded_size.and_then(|total| total.checked_add(uncompressed)); }
             let size_byte = reader.read_cached_at(block_cursor, 1)?;
             if size_byte.len() != 1 || size_byte[0] == 0 {
                 return invalid("xz_block_header_missing");
@@ -1738,6 +1743,7 @@ pub(crate) fn validate_xz_structure_exact(
         stream_count: streams_reversed,
         #[cfg(test)]
         block_count: total_blocks,
+        #[cfg(test)]
         decoded_size,
         integrity: if checksum_present {
             IntegrityStatus::Deferred
@@ -1881,6 +1887,7 @@ pub(crate) fn validate_zstd_structure_observed(
         stream_count: frames,
         #[cfg(test)]
         block_count: blocks,
+        #[cfg(test)]
         decoded_size: None,
         integrity: if checksum_present {
             IntegrityStatus::Deferred

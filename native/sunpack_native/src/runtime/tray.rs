@@ -200,6 +200,9 @@ fn run_tray(
     }
 }
 
+#[cfg(test)]
+thread_local! { static ICON_UPDATE_FAILURE: Cell<bool> = const { Cell::new(false) }; }
+
 fn icon_data(window: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -252,6 +255,8 @@ impl Context {
     }
 
     fn update_icon(&self, window: HWND, add: bool) -> io::Result<()> {
+        #[cfg(test)]
+        if ICON_UPDATE_FAILURE.get() { return Err(io::Error::from_raw_os_error(1400)); }
         let (icon, owned) = load_icon();
         if icon.is_null() { return Err(io::Error::last_os_error()); }
         let mut data = icon_data(window);
@@ -448,6 +453,13 @@ mod tests {
         context.allow_taskbar_message(null_mut());
         assert_eq!(*errors.lock().unwrap(), [None]);
         errors.lock().unwrap().clear();
+        // Explorer can accept invalid HWND and even malformed icon data.
+        // Inject failure only at the API boundary; exercise the real install
+        // fallback/reporting logic deterministically without changing production.
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { ICON_UPDATE_FAILURE.set(false); } }
+        let _reset = Reset;
+        ICON_UPDATE_FAILURE.set(true);
         context.install_icon(null_mut(), None);
         assert!(!context.icon_registered.get());
         assert_eq!(*errors.lock().unwrap(), [None]);

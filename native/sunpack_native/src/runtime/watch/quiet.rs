@@ -3,6 +3,186 @@ use crate::scan::catalog::NativeWatchObservation;
 use std::collections::VecDeque;
 use std::time::Instant;
 
+
+// The observer and scheduler share one bounded tracker. Notifications may be
+// coalesced for wakeup/catalog work, never for cadence learning.
+#[derive(Default)]
+pub(super) struct Activities(std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<ActivityInner>>>);
+
+#[derive(Clone)]
+pub(super) struct Activity(std::sync::Arc<ActivityInner>);
+
+struct ActivityInner {
+    state: std::sync::Mutex<ActivityState>,
+    registration: std::sync::OnceLock<(String, std::sync::Weak<Activities>)>,
+}
+
+#[derive(Default)]
+struct ActivityState {
+    quiet: Quiet,
+    baseline: Option<(u64, f64, String, i64)>,
+    due: Option<Instant>,
+    observed: Option<Instant>,
+}
+
+impl Drop for ActivityInner {
+    fn drop(&mut self) {
+        if let Some((key, registry)) = self.registration.get() {
+            if let Some(registry) = registry.upgrade() {
+                let mut entries = registry.0.lock().unwrap();
+                if entries.get(key).is_some_and(|value| std::ptr::eq(value.as_ptr(), self)) {
+                    entries.remove(key);
+                    if entries.is_empty() { entries.shrink_to_fit(); }
+                }
+            }
+        }
+    }
+}
+
+impl Activities {
+    pub(super) fn bind(self: &std::sync::Arc<Self>, key: String, make: impl FnOnce() -> Activity) -> Activity {
+        let mut entries = self.0.lock().unwrap();
+        if let Some(inner) = entries.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Activity(inner);
+        }
+        let activity = make();
+        activity.0.registration.get_or_init(|| (key.clone(), std::sync::Arc::downgrade(self)));
+        entries.insert(key, std::sync::Arc::downgrade(&activity.0));
+        activity
+    }
+}
+
+impl Default for Activity {
+    fn default() -> Self { Self::from_state(ActivityState::default()) }
+}
+
+impl Activity {
+    fn from_state(state: ActivityState) -> Self {
+        Self(std::sync::Arc::new(ActivityInner {
+            state: std::sync::Mutex::new(state), registration: std::sync::OnceLock::new(),
+        }))
+    }
+
+    pub(super) fn saved(value: &NativeWatchObservation) -> Self {
+        Self::from_state(ActivityState {
+            quiet: Quiet::saved(value),
+            baseline: Some((value.size, value.mtime, value.file_id(), value.change_usn)),
+            due: None, observed: None,
+        })
+    }
+
+    // Probe and timestamp on the collection thread, before WAL/catalog work.
+    // Serializing this small per-path operation also prevents an older probe
+    // from replacing a newer sample collected by the scheduler.
+    pub(super) fn capture(&self, path: &std::path::Path, claims: &std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<str>>>, key: &str) -> std::io::Result<bool> {
+        let mut state = self.0.state.lock().unwrap();
+        let baseline = state.baseline.as_ref().map(|value| value.3);
+        if let Some(candidate) = crate::postprocess::watch_candidate_for_path(path, baseline)? {
+            let now = Instant::now();
+            let at = super::windows::monotonic_seconds();
+            let claims = claims.lock().unwrap();
+            if claims.contains_key(key) { return Ok(false); }
+            state.record(&candidate, now, at, false, false);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(super) fn probe(&self, path: &std::path::Path, baseline: Option<i64>)
+        -> std::io::Result<(Option<WatchCandidateRow>, Instant, f64)> {
+        let _state = self.0.state.lock().unwrap();
+        let candidate = crate::postprocess::watch_candidate_for_path(path, baseline)?;
+        Ok((candidate, Instant::now(), super::windows::monotonic_seconds()))
+    }
+
+    pub(super) fn content_deadline(&self, candidate: &WatchCandidateRow, now: Instant,
+        at: f64, reset: bool, retry_unchanged: bool, force: bool) -> Instant {
+        let mut state = self.0.state.lock().unwrap();
+        if retry_unchanged {
+            if state.observed.is_some_and(|previous| previous > now) {
+                return state.due.unwrap_or(now);
+            }
+            state.due = Some(now);
+            return now;
+        }
+        // A native capture already accounted for this generation and its
+        // original timestamp. Only actual new/forced observations learn here.
+        state.record(candidate, now, at, reset, force);
+        state.due.unwrap_or(now)
+    }
+
+    pub(super) fn observation(&self, candidate: &WatchCandidateRow) -> (bool, Option<Instant>) {
+        let state = self.0.state.lock().unwrap();
+        (state.baseline.as_ref().is_some_and(|(size, mtime, id, usn)|
+            *size == candidate.size && *mtime == candidate.mtime && *id == candidate.observation.file_id
+                && *usn == candidate.observation.change_usn), state.due)
+    }
+    #[cfg(test)]
+    pub(super) fn sample_count(&self) -> usize {
+        self.0.state.lock().unwrap().quiet.samples.as_ref().map_or(0, |samples| samples.len())
+    }
+    pub(super) fn deadline(&self) -> Option<Instant> { self.0.state.lock().unwrap().due }
+    pub(super) fn summary(&self) -> (f64, Option<f64>, f64, f64) {
+        let state = self.0.state.lock().unwrap();
+        (state.quiet.seconds, state.quiet.last, state.quiet.cadence, state.quiet.tentative)
+    }
+    pub(super) fn boundary_deadline(&self, now: Instant, confirmation: f64) -> Instant {
+        self.0.state.lock().unwrap().quiet.boundary_deadline(now, confirmation)
+    }
+    pub(super) fn accelerate(&self, observed: Instant, due: Instant) {
+        let mut state = self.0.state.lock().unwrap();
+        if state.observed.is_none_or(|current| current <= observed) { state.due = Some(due); }
+    }
+    pub(super) fn metadata(&self, candidate: &WatchCandidateRow, now: Instant) {
+        let mut state = self.0.state.lock().unwrap();
+        if state.observed.is_some_and(|previous| previous > now) { return; }
+        state.observed = Some(now);
+        if is_boundary(candidate) { state.quiet.end_phase(); }
+        state.baseline = Some((candidate.size, candidate.mtime,
+            candidate.observation.file_id.clone(), candidate.observation.change_usn));
+    }
+    pub(super) fn boundary_observation(&self, candidate: &WatchCandidateRow,
+        now: Instant, at: f64, confirmation: f64) {
+        let mut state = self.0.state.lock().unwrap();
+        if state.observed.is_some_and(|previous| previous > now) { return; }
+        let reset = state.baseline.as_ref().is_some_and(|(size, _, id, _)|
+            *size > candidate.size || *id != candidate.observation.file_id);
+        state.quiet.observe(at, is_boundary(candidate), reset, false);
+        state.observed = Some(now);
+        state.baseline = Some((candidate.size, candidate.mtime,
+            candidate.observation.file_id.clone(), candidate.observation.change_usn));
+        state.due = Some(state.quiet.boundary_deadline(now, confirmation));
+    }
+    #[cfg(test)]
+    pub(super) fn end_phase(&self) { self.0.state.lock().unwrap().quiet.end_phase(); }
+    #[cfg(test)]
+    pub(super) fn observe(&self, now: f64, boundary: bool, reset: bool, learn: bool) {
+        self.0.state.lock().unwrap().quiet.observe(now, boundary, reset, learn);
+    }
+    #[cfg(test)]
+    pub(super) fn set_seconds(&self, seconds: f64) { self.0.state.lock().unwrap().quiet.seconds = seconds; }
+}
+
+impl ActivityState {
+    fn record(&mut self, candidate: &WatchCandidateRow, now: Instant, at: f64, reset: bool, force: bool) {
+        if self.observed.is_some_and(|previous| previous > now) { return; }
+        self.observed = Some(now);
+        let changed = self.baseline.as_ref().is_none_or(|(size, mtime, id, usn)|
+            content_changed(*size, *mtime, id, *usn, candidate));
+        let reset = self.baseline.as_ref().map_or(reset, |(size, _, id, _)|
+            *size > candidate.size || *id != candidate.observation.file_id);
+        let boundary = is_boundary(candidate);
+        if changed || force {
+            self.quiet.observe(at, boundary, reset, true);
+            self.due = Some(after(now, self.quiet.seconds));
+        } else if boundary {
+            self.quiet.end_phase();
+        }
+        self.baseline = Some((candidate.size, candidate.mtime,
+            candidate.observation.file_id.clone(), candidate.observation.change_usn));
+    }
+}
+
 const WINDOW: usize = 12;
 const CLOSE: u32 = 0x8000_0000;
 
@@ -30,6 +210,7 @@ impl Quiet {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn content_deadline(
         &mut self, now: Instant, observed_at: f64, boundary: bool, reset: bool,
         retry_unchanged: bool,
@@ -171,6 +352,67 @@ pub(super) fn after(now: Instant, seconds: f64) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_samples_survive_coalescing_and_retire_with_the_last_owner() {
+        use std::sync::Arc;
+        let registry = Arc::new(Activities::default());
+        let owner = registry.bind("path".into(), Activity::default);
+        let signal = registry.bind("path".into(), Activity::default);
+        let now = Instant::now();
+        let mut candidate = WatchCandidateRow {
+            path: "path".into(), size: 100, mtime: 0.0,
+            observation: crate::filesystem::WatchFileObservation {
+                file_id: "one".into(), change_usn: 1, change_reasons: 1,
+                change_reasons_without_close: 1, change_reasons_known: true,
+                change_reason_error: String::new(),
+            },
+        };
+        for index in 0..20 {
+            candidate.size += 1;
+            candidate.mtime = index as f64 * 0.2;
+            candidate.observation.change_usn += 1;
+            signal.0.state.lock().unwrap().record(&candidate,
+                after(now, candidate.mtime), candidate.mtime, false, false);
+        }
+        let before = owner.summary();
+        assert!((before.0 - 0.30950540136780874).abs() < 1e-9);
+        assert_eq!(owner.sample_count(), WINDOW);
+        let deadline = owner.deadline().unwrap();
+        assert_eq!(owner.content_deadline(&candidate, after(now, 100.0), 100.0,
+            false, false, false), deadline);
+        assert_eq!(owner.summary(), before); // scheduler drain does not relearn
+        // An older scheduler probe cannot overwrite a newer callback sample.
+        candidate.size -= 1;
+        candidate.observation.change_usn -= 1;
+        owner.content_deadline(&candidate, now, 0.0, false, false, false);
+        assert_eq!(owner.summary(), before);
+        candidate.observation.change_reasons = CLOSE;
+        owner.metadata(&candidate, now);
+        owner.boundary_observation(&candidate, now, 0.0, 0.5);
+        assert_eq!(owner.summary(), before); // delayed CLOSE/probe cannot reset newer samples
+        // Metadata-only CLOSE may shorten an existing content deadline, but
+        // cannot erase a later write observed while the readiness probe ran.
+        owner.metadata(&candidate, after(now, 101.0));
+        owner.accelerate(after(now, 101.0), after(now, 101.0));
+        assert_eq!(owner.deadline(), Some(after(now, 101.0)));
+        candidate.size += 2;
+        candidate.observation.change_usn += 2;
+        candidate.observation.change_reasons = 1;
+        owner.content_deadline(&candidate, after(now, 102.0), 102.0, false, false, false);
+        let latest = owner.deadline();
+        owner.accelerate(after(now, 101.0), after(now, 101.0));
+        assert_eq!(owner.deadline(), latest);
+        let cadence = owner.summary();
+        assert_eq!(owner.content_deadline(&candidate, after(now, 103.0), 103.0,
+            false, true, true), after(now, 103.0));
+        assert_eq!(owner.deadline(), Some(after(now, 103.0)));
+        assert_eq!(owner.summary(), cadence);
+        drop(signal);
+        assert_eq!(registry.0.lock().unwrap().len(), 1);
+        drop(owner);
+        assert!(registry.0.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn unchanged_retries_do_not_change_saved_or_future_cadence() {

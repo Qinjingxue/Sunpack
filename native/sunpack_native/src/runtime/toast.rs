@@ -10,7 +10,9 @@ use serde::{ser::SerializeSeq, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
@@ -67,6 +69,7 @@ impl Snapshot {
 
     fn progress(group: &Group) -> Self {
         let language = group.language;
+        let stopping = group.stopping();
         let totals = &group.totals;
         let completed = totals.done_bytes + totals.written;
         let total = totals.done_bytes + totals.planned;
@@ -74,7 +77,7 @@ impl Snapshot {
         let count = finished + group.active_roots;
         let disk = totals.disk != 0;
         let memory = totals.memory != 0;
-        let progress = if disk || memory || group.stopping {
+        let progress = if disk || memory || stopping {
             None
         } else if group.active_roots == 0 && total == 0 {
             Some(1.0)
@@ -83,7 +86,7 @@ impl Snapshot {
         } else {
             None
         };
-        let (title, status) = if group.stopping {
+        let (title, status) = if stopping {
             (
                 "interrupt.stopping_title",
                 language.text("interrupt.stopping").to_owned(),
@@ -127,7 +130,7 @@ impl Snapshot {
                 ),
             )
         };
-        let value = if group.stopping {
+        let value = if stopping {
             String::new()
         } else if disk || memory {
             language.text(if disk && memory {
@@ -156,7 +159,7 @@ impl Snapshot {
             batch: group.id.to_string(),
             kind: 1,
             title: language.text(title).to_owned(),
-            body: if group.stopping {
+            body: if stopping {
                 language.text("interrupt.stopping").to_owned()
             } else { language.translate(
                 "toast.progress.body",
@@ -321,7 +324,7 @@ fn push_text(output: &mut Vec<u8>, value: &str) {
 
 #[derive(Default)]
 struct State {
-    groups: VecDeque<Group>,
+    group: Option<Group>,
     completed: VecDeque<Completed>,
     published: VecDeque<(Completed, Option<PathBuf>)>,
     dirty: bool,
@@ -335,7 +338,6 @@ struct Group {
     language: Language,
     began: Instant,
     visible: bool,
-    stopping: bool,
     requests: HashMap<Arc<str>, RequestProgress>,
     active_roots: usize,
     finalize_at: Option<Instant>,
@@ -392,6 +394,7 @@ impl Completed {
 
 #[derive(Default)]
 struct RequestProgress {
+    stopping: bool,
     tasks: HashMap<TaskId, TaskProgress>,
     paths: HashMap<TaskId, PathBuf>,
     started: HashMap<TaskId, HashSet<PathBuf>>,
@@ -457,6 +460,11 @@ impl Totals {
 }
 
 impl Group {
+    fn stopping(&self) -> bool {
+        self.requests.values().any(|request| request.stopping)
+            && self.requests.values().filter(|request| request.visible).all(|request| request.stopping)
+    }
+
     fn new(request: &str, language: Language) -> Self {
         // Reserve the upper token space for UI activations. A fresh suffix
         // also distinguishes batches seeded by the same still-invisible scan,
@@ -472,7 +480,6 @@ impl Group {
             name: None,
             began: Instant::now(),
             visible: false,
-            stopping: false,
             requests: HashMap::new(),
             active_roots: 0,
             finalize_at: None,
@@ -630,34 +637,33 @@ impl Group {
 
     fn pending(&self) -> bool {
         self.active_roots != 0 || self.requests.values().any(|request| !request.pending_reports.is_empty())
-            || (self.stopping && !self.requests.is_empty())
+            || self.requests.values().any(|request| request.stopping)
     }
 }
 
 impl State {
-    fn retire_front(&mut self) {
-        let mut group = self.groups.pop_front().unwrap();
+    fn retire_batch(&mut self) {
+        let mut group = self.group.take().unwrap();
         if !group.requests.is_empty() {
             // Invisible scans neither postpone completion nor lose their
             // activity when the completed batch is retired.
-            if self.groups.is_empty() {
-                let request = group.requests.keys().next().unwrap();
-                self.groups.push_back(Group::new(request, group.language));
-            }
+            let request = group.requests.keys().next().unwrap();
+            let mut next = Group::new(request, group.language);
             for request in group.requests.values_mut() {
                 if request.visible_roots.iter().all(|id| request.settled_tasks.contains(id)) {
                     request.visible = false;
                     request.name = None;
                 }
             }
-            self.groups.front_mut().unwrap().requests.extend(group.requests);
+            next.requests = group.requests;
+            self.group = Some(next);
         }
         self.dirty = true;
     }
 
     fn settle(&mut self, now: Instant) -> bool {
         let mut changed = false;
-        while let Some(group) = self.groups.front_mut() {
+        while let Some(group) = self.group.as_mut() {
             if group.pending() || group.finalizing {
                 break;
             }
@@ -684,7 +690,7 @@ impl State {
                 break;
             }
             self.clear |= group.visible;
-            self.retire_front();
+            self.retire_batch();
             changed = true;
         }
         changed
@@ -840,7 +846,7 @@ impl Shared {
     fn discard_batches(&self) {
         let (groups, completed, published) = {
             let mut state = self.state.lock().unwrap();
-            (std::mem::take(&mut state.groups), std::mem::take(&mut state.completed),
+            (std::mem::take(&mut state.group), std::mem::take(&mut state.completed),
                 std::mem::take(&mut state.published))
         };
         // Unpresented reports are invalid, like main's detached finalize result.
@@ -853,7 +859,7 @@ impl Shared {
 
     fn present(&self, batch: &str, show: impl FnOnce()) -> bool {
         let state = self.state.lock().unwrap();
-        if state.stopping || state.groups.front().is_none_or(|group| group.id.as_ref() != batch) {
+        if state.stopping || state.group.as_ref().is_none_or(|group| group.id.as_ref() != batch) {
             return false;
         }
         drop(state);
@@ -866,7 +872,7 @@ impl Shared {
         if state.stopping {
             return false;
         }
-        let Some(group) = state.groups.front_mut()
+        let Some(group) = state.group.as_mut()
             .filter(|group| group.id == completed.id && group.finalizing)
         else {
             return false;
@@ -880,7 +886,7 @@ impl Shared {
         }
         // Accept this generation before releasing the snapshot. New work
         // can publish independently while the sole presenter sends it.
-        state.retire_front();
+        state.retire_batch();
         state.settle(Instant::now());
         drop(state);
         show();
@@ -922,7 +928,7 @@ impl Publisher {
                 }
             };
             let mut state = shared.state.lock().unwrap();
-            if state.stopping || !state.groups.iter().any(|group| group.id == completed.id) {
+            if state.stopping || !state.group.iter().any(|group| group.id == completed.id) {
                 drop(state);
                 if let Some(path) = report { let _ = fs::remove_file(path); }
             } else {
@@ -940,10 +946,10 @@ impl Publisher {
         if state.settle(Instant::now()) {
             self.shared.changed.notify_one();
         }
-        if state.groups.back().is_none_or(|group| group.stopping) {
-            state.groups.push_back(Group::new(&request, language));
+        if state.group.is_none() {
+            state.group = Some(Group::new(&request, language));
         }
-        let group = state.groups.back_mut().unwrap();
+        let group = state.group.as_mut().unwrap();
         group.requests.insert(Arc::clone(&request), RequestProgress::default());
         Activity { publisher: self.clone(), request }
     }
@@ -951,8 +957,8 @@ impl Publisher {
     fn reset_batches(&self) {
         let retired = {
             let mut state = self.shared.state.lock().unwrap();
-            for group in &state.groups { group.cancellation.cancel(); }
-            let retired = (std::mem::take(&mut state.groups), std::mem::take(&mut state.completed));
+            if let Some(group) = &state.group { group.cancellation.cancel(); }
+            let retired = (std::mem::take(&mut state.group), std::mem::take(&mut state.completed));
             state.clear = true;
             self.mark_dirty(&mut state);
             retired
@@ -965,16 +971,16 @@ impl Publisher {
     fn stop_group(&self, id: &str) -> Vec<Arc<str>> {
         let mut state = self.shared.state.lock().unwrap();
         let Some(group) = state
-            .groups
-            .front_mut()
+            .group
+            .as_mut()
             .filter(|group| group.id.as_ref() == id && group.visible
-                && !group.stopping && !group.requests.is_empty())
+                && !group.requests.is_empty())
         else {
             return Vec::new();
         };
         // Stopping extraction keeps this batch valid: earlier failures still
         // need their final report. Only reset/disable invalidates report I/O.
-        group.stopping = true;
+        for request in group.requests.values_mut() { request.stopping = true; }
         group.generation = group.generation.wrapping_add(1);
         group.finalize_at = None;
         let requests = group.requests.keys().cloned().collect();
@@ -998,13 +1004,12 @@ impl Activity {
         if state.settle(Instant::now()) {
             self.publisher.shared.changed.notify_one();
         }
-        if let Some((index, group)) = state
-            .groups
+        if let Some(group) = state
+            .group
             .iter_mut()
-            .enumerate()
-            .find(|(_, group)| group.requests.contains_key(&self.request))
+            .find(|group| group.requests.contains_key(&self.request))
         {
-            if group.event(&self.request, event) && group.visible && index == 0 {
+            if group.event(&self.request, event) && group.visible {
                 self.publisher.mark_dirty(&mut state);
             }
         }
@@ -1012,7 +1017,7 @@ impl Activity {
 
     pub(super) fn needs_root_report(&self, id: TaskId) -> bool {
         let state = self.publisher.shared.state.lock().unwrap();
-        !state.stopping && state.groups.iter()
+        !state.stopping && state.group.iter()
             .filter_map(|group| group.requests.get(&self.request))
             .any(|request| request.pending_reports.contains(&id))
     }
@@ -1021,7 +1026,7 @@ impl Activity {
         let (group_id, language, report) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping { return; }
-            let Some(group) = state.groups.iter().find(|group| group.requests.contains_key(&self.request))
+            let Some(group) = state.group.iter().find(|group| group.requests.contains_key(&self.request))
                 else { return; };
             if !group.requests[&self.request].visible_roots.contains(&id) { return; }
             (Arc::clone(&group.id), group.language, Arc::clone(&group.report))
@@ -1039,7 +1044,7 @@ impl Activity {
     pub(super) fn root_finished(&self, id: TaskId, outcome: &Outcome) {
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping { return; }
-        let Some(group) = state.groups.iter_mut()
+        let Some(group) = state.group.iter_mut()
             .find(|group| group.requests.contains_key(&self.request)) else { return; };
         let request = group.requests.get_mut(&self.request).unwrap();
         let Some(path) = request.roots.get(&id) else { return; };
@@ -1060,7 +1065,7 @@ impl Activity {
     pub(super) fn report_finished(&self, id: TaskId, failed: bool) {
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping { return; }
-        if let Some(group) = state.groups.iter_mut()
+        if let Some(group) = state.group.iter_mut()
             .find(|group| group.requests.contains_key(&self.request))
         {
             let request = group.requests.get_mut(&self.request).unwrap();
@@ -1096,7 +1101,7 @@ impl Activity {
             if state.stopping {
                 return;
             }
-            let Some(group) = state.groups.iter()
+            let Some(group) = state.group.iter()
                 .find(|group| group.requests.contains_key(&self.request))
             else {
                 return;
@@ -1115,7 +1120,7 @@ impl Activity {
         if state.stopping {
             return;
         }
-        let Some(group) = state.groups.iter_mut()
+        let Some(group) = state.group.iter_mut()
             .find(|group| group.requests.contains_key(&self.request))
         else {
             return;
@@ -1145,7 +1150,7 @@ impl Activity {
             if state.stopping || ignore_request_error {
                 return;
             }
-            let Some(group) = state.groups.iter()
+            let Some(group) = state.group.iter()
                 .find(|group| group.requests.contains_key(&self.request))
             else {
                 return;
@@ -1440,7 +1445,7 @@ impl Reports {
                     .and_then(|name| name.strip_suffix(".tmp"))
                 {
                     let state = shared.state.lock().unwrap();
-                    if state.groups.iter().any(|group| group.id.as_ref() == id)
+                    if state.group.iter().any(|group| group.id.as_ref() == id)
                         || state.completed.iter().any(|group| group.id.as_ref() == id)
                     {
                         continue;
@@ -1505,27 +1510,13 @@ impl Toast {
         let shared = Arc::new(Shared::default());
         let presenter_shared = Arc::clone(&shared);
         let presenter_reports = Arc::clone(&reports);
-        let (send, receive) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("sunpack-toast".into())
             .stack_size(512 * 1024)
             .spawn(move || {
-                let library = match ToastLibrary::load(&cwd) {
-                    Ok(library) => library,
-                    Err(error) => {
-                        let _ = send.send(Err(error));
-                        return;
-                    }
-                };
-                let presenter = match library.presenter(&diagnostic) {
-                    Ok(presenter) => presenter,
-                    Err(error) => {
-                        let _ = send.send(Err(error));
-                        return;
-                    }
-                };
-                let mut presenter = Some(presenter);
-                let _ = send.send(Ok(()));
+                // Main initializes the DLL/presenter only for the first snapshot.
+                let library = std::cell::OnceCell::new();
+                let mut presenter: Option<super::windows::ToastPresenter<'_>> = None;
                 let mut sequence = 0u64;
                 let mut last_update: Option<Instant> = None;
                 let minimum_interval = Duration::from_millis(50);
@@ -1550,7 +1541,7 @@ impl Toast {
                                 else { Display::Published(completed, None) };
                         }
                         if state.dirty {
-                            let group = state.groups.front().filter(|group| group.visible);
+                            let group = state.group.as_ref().filter(|group| group.visible);
                             if group.is_none() {
                                 state.dirty = false;
                                 continue;
@@ -1563,7 +1554,7 @@ impl Toast {
                                 state.dirty = false;
                                 break Display::Progress(snapshot);
                             }
-                            let remaining = state.groups.front()
+                            let remaining = state.group.as_ref()
                                 .and_then(|group| group.finalize_at)
                                 .map_or(remaining, |deadline| remaining.min(
                                     deadline.saturating_duration_since(Instant::now())));
@@ -1572,7 +1563,7 @@ impl Toast {
                                 .wait_timeout(state, remaining)
                                 .unwrap()
                                 .0;
-                        } else if let Some(deadline) = state.groups.front()
+                        } else if let Some(deadline) = state.group.as_ref()
                             .and_then(|group| group.finalize_at)
                         {
                             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1610,7 +1601,10 @@ impl Toast {
                         sequence = sequence.wrapping_add(1);
                         available = show_snapshot(
                             &mut presenter,
-                            || library.presenter(&diagnostic),
+                            || match library.get_or_init(|| ToastLibrary::load(&cwd)) {
+                                Ok(library) => library.presenter(&diagnostic),
+                                Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+                            },
                             |presenter| presenter.show(&payload, sequence),
                             &mut |event, error| failure = Some((event, error)),
                         );
@@ -1632,7 +1626,7 @@ impl Toast {
                         {
                             let mut state = presenter_shared.state.lock().unwrap();
                             state.stopping = true;
-                            for group in &state.groups { group.cancellation.cancel(); }
+                            if let Some(group) = &state.group { group.cancellation.cancel(); }
                         }
                         presenter_reports.cancellation.cancel();
                         break;
@@ -1643,16 +1637,10 @@ impl Toast {
                 // alive after the presenter exits, but cannot own stale files.
                 presenter_shared.discard_batches();
             })?;
-        match receive.recv().map_err(io::Error::other)? {
-            Ok(()) => Ok(Self {
-                publisher: Publisher { shared, reports },
-                thread: Some(thread),
-            }),
-            Err(error) => {
-                let _ = thread.join();
-                Err(error)
-            }
-        }
+        Ok(Self {
+            publisher: Publisher { shared, reports },
+            thread: Some(thread),
+        })
     }
 
     pub(super) fn register(&self, request: Arc<str>, language: Language) -> Activity {
@@ -1687,14 +1675,13 @@ impl Drop for Toast {
         {
             let mut state = self.publisher.shared.state.lock().unwrap();
             state.stopping = true;
-            for group in &state.groups { group.cancellation.cancel(); }
+            if let Some(group) = &state.group { group.cancellation.cancel(); }
         }
         self.publisher.reports.cancellation.cancel();
         self.publisher.shared.changed.notify_one();
-        // The worker owns presenter and draft cleanup. An already accepted
-        // native send may finish; stopping prevents consuming later snapshots.
-        // Never synchronously join its file or WinRT IO from Watch's thread.
-        drop(self.thread.take());
+        // Release presenter/COM before reload starts another activator.
+        // Cancel and wake first, then join without holding the state lock.
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
     }
 }
 
@@ -1738,7 +1725,7 @@ mod tests {
 
     fn current(publisher: &Publisher) -> Snapshot {
         let state = publisher.shared.state.lock().unwrap();
-        Snapshot::progress(state.groups.front().unwrap())
+        Snapshot::progress(state.group.as_ref().unwrap())
     }
 
     #[test]
@@ -1775,6 +1762,7 @@ mod tests {
     #[test]
     fn terminal_progress_and_rollback_failure_keep_main_presentation() {
         let mut group = Group::new("00000000000000000000000000000001", Language::En);
+        group.requests.insert(Arc::from("request"), RequestProgress::default());
         group.summary.succeeded = 1;
         let snapshot = Snapshot::progress(&group);
         assert_eq!(snapshot.progress, Some(1.0));
@@ -1789,12 +1777,12 @@ mod tests {
         assert_eq!(snapshot.value, Language::En.text("toast.progress.indeterminate"));
         // Stopping extraction keeps this batch valid: earlier failures still
         // need their final report. Only reset/disable invalidates report I/O.
-        group.stopping = true;
+        for request in group.requests.values_mut() { request.stopping = true; }
         let snapshot = Snapshot::progress(&group);
         assert_eq!(snapshot.body, Language::En.text("interrupt.stopping"));
         assert_eq!(snapshot.status, snapshot.body);
         assert!(snapshot.value.is_empty());
-        group.stopping = false;
+        for request in group.requests.values_mut() { request.stopping = false; }
         group.totals.unknown = 0;
         for (disk, memory, key) in [
             (0, 1, "report.status.memory_paused"),
@@ -1919,25 +1907,15 @@ mod tests {
         let later = publisher.register(Arc::from("00000000000000000000000000000003"), Language::En);
         later.event(queued(5, "later.zip", None, 0));
         progress(&later, 5, "later.zip", 5, 10);
-        assert_eq!(
-            current(&publisher).title,
-            Language::En.text("interrupt.stopping_title")
-        );
-
+        assert_eq!(current(&publisher).title, Language::En.text("toast.progress.title"));
+        // Earlier requests remain in cancellation cleanup; new work is visible
+        // immediately and another Stop captures it in the same batch.
+        let stopped_again = publisher.stop_group(&initial.batch);
+        assert!(stopped_again.contains(&later.request));
+        assert_eq!(stopped_again.len(), 3);
         a.finish(&Err(io::Error::other("output deletion failed")), true, true, one_root);
         b.finish(&Ok(Outcome::default()), true, false, one_root);
-        assert!(publisher.stop_group(&initial.batch).is_empty());
         assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
-        finish_debounce(&publisher);
-        let interrupted = Snapshot::completed(&take_completed(&publisher), None);
-        assert_eq!(current(&publisher).label, "later.zip");
-        let state = publisher.shared.state.lock().unwrap();
-        assert_eq!(
-            interrupted.body,
-            Language::En.text("interrupt.cleanup_failed")
-        );
-        assert!(state.completed.is_empty());
-        drop(state);
 
         let mut outcome = Outcome::default();
         outcome.archives.push(archive("later.zip", None));
@@ -1953,7 +1931,7 @@ mod tests {
         let completed = Snapshot::completed(&take_completed(&publisher), None);
         let state = publisher.shared.state.lock().unwrap();
         assert!(completed.body.contains(&Language::En.translate("cleanup.incomplete", &[("count", "1")])));
-        assert!(state.groups.is_empty());
+        assert!(state.group.is_none());
     }
     fn publisher(directory: PathBuf) -> Publisher {
         Publisher {
@@ -1988,7 +1966,7 @@ mod tests {
 
     fn finish_debounce(publisher: &Publisher) {
         let mut state = publisher.shared.state.lock().unwrap();
-        let deadline = state.groups.front().unwrap().finalize_at.unwrap();
+        let deadline = state.group.as_ref().unwrap().finalize_at.unwrap();
         state.settle(deadline);
     }
 
@@ -2028,9 +2006,9 @@ mod tests {
         let mut outcome = Outcome::default();
         outcome.archives.push(archive("a.zip", Some(FailureKind::Damaged)));
         activity.root_finished(1, &outcome);
-        assert!(publisher.shared.state.lock().unwrap().groups.front().unwrap().pending());
+        assert!(publisher.shared.state.lock().unwrap().group.as_ref().unwrap().pending());
         activity.report_finished(1, true);
-        assert!(!publisher.shared.state.lock().unwrap().groups.front().unwrap().pending());
+        assert!(!publisher.shared.state.lock().unwrap().group.as_ref().unwrap().pending());
         activity.finish(&Ok(Outcome::default()), false, false, |_| Some("a.zip".into()));
         finish_debounce(&publisher);
         let completed = take_completed(&publisher);
@@ -2084,12 +2062,12 @@ mod tests {
             activity.report_finished(1, false);
             {
                 let state = publisher.shared.state.lock().unwrap();
-                let request = &state.groups.front().unwrap().requests[&activity.request];
+                let request = &state.group.as_ref().unwrap().requests[&activity.request];
                 assert!(!request.roots.contains_key(&1));
                 assert!(!request.task_roots.values().any(|root| *root == 1));
                 assert!(!request.started.contains_key(&1));
                 assert!(!request.visible_roots.contains(&1));
-                let report = state.groups.front().unwrap().report.lock().unwrap();
+                let report = state.group.as_ref().unwrap().report.lock().unwrap();
                 assert_eq!(report.failures, 0);
                 assert!(report.path.as_ref().is_none_or(|path| !path.exists()));
             }
@@ -2113,7 +2091,7 @@ mod tests {
             activity.record(Path::new("b.zip"), &result, cancelled, &owner);
             activity.finish(&result, cancelled, false, &owner);
             let state = publisher.shared.state.lock().unwrap();
-            let group = state.groups.front().unwrap();
+            let group = state.group.as_ref().unwrap();
             assert_eq!(group.summary.succeeded, 1);
             assert_eq!(group.summary.failed, if cancelled { 1 } else { 2 });
             assert_eq!(group.summary.interrupted, usize::from(cancelled));
@@ -2231,7 +2209,7 @@ mod tests {
             activity.record(Path::new("retry.zip"), &result, false, one_root);
             activity.finish(&result, false, false, one_root);
             let mut state = publisher.shared.state.lock().unwrap();
-            assert!(state.groups.is_empty());
+            assert!(state.group.is_none());
             assert!(state.completed.is_empty());
             assert!(std::mem::take(&mut state.clear));
             assert!(!directory.0.exists());
@@ -2253,7 +2231,7 @@ mod tests {
             let result = Ok(outcome);
             activity.record(Path::new("carrier.bin"), &result, false, one_root);
             activity.finish(&result, false, false, one_root);
-            assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
+            assert!(publisher.shared.state.lock().unwrap().group.is_none());
             assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
             assert!(!directory.0.exists());
 
@@ -2315,17 +2293,17 @@ mod tests {
         progress(&a, 1, "outer.zip", 2, 2);
         a.finish(&success(), false, false, one_root);
         let first_deadline = publisher.shared.state.lock().unwrap()
-            .groups.front().unwrap().finalize_at.unwrap();
+            .group.as_ref().unwrap().finalize_at.unwrap();
         let b = publisher.register(Arc::from("02"), Language::En);
         b.event(queued(2, "next.zip", None, 0));
         {
             let mut state = publisher.shared.state.lock().unwrap();
-            assert_eq!(state.groups.front().unwrap().finalize_at, Some(first_deadline));
+            assert_eq!(state.group.as_ref().unwrap().finalize_at, Some(first_deadline));
             state.settle(first_deadline - Duration::from_millis(1));
             assert!(state.completed.is_empty());
         }
         progress(&b, 2, "next.zip", 1, 2);
-        assert!(publisher.shared.state.lock().unwrap().groups.front().unwrap().finalize_at.is_none());
+        assert!(publisher.shared.state.lock().unwrap().group.as_ref().unwrap().finalize_at.is_none());
         assert_eq!(current(&publisher).status, "1/2 finished");
         b.finish(&success(), false, false, one_root);
         finish_debounce(&publisher);
@@ -2333,8 +2311,8 @@ mod tests {
             let completed = take_completed(&publisher);
             let state = publisher.shared.state.lock().unwrap();
             assert_eq!(completed.summary.succeeded, 2);
-            assert_eq!(state.groups.front().unwrap().requests.len(), 1);
-            assert_ne!(state.groups.front().unwrap().id, completed.id);
+            assert_eq!(state.group.as_ref().unwrap().requests.len(), 1);
+            assert_ne!(state.group.as_ref().unwrap().id, completed.id);
         }
         progress(&c, 3, "slow-scan.zip", 1, 2);
         assert_eq!(current(&publisher).label, "slow-scan.zip");
@@ -2342,7 +2320,7 @@ mod tests {
         c.finish(&success(), false, false, one_root);
         finish_debounce(&publisher);
         assert_eq!(take_completed(&publisher).summary.succeeded, 1);
-        assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
+        assert!(publisher.shared.state.lock().unwrap().group.is_none());
     }
 
     #[test]
@@ -2376,10 +2354,23 @@ mod tests {
     }
 
     #[test]
-    fn disabling_toasts_cancels_and_detaches_an_active_report_writer() {
+    fn idle_toast_start_stop_does_not_require_a_native_presenter() {
+        let directory = TestDirectory::new();
+        let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Arc::new(crate::pipeline::Engine::new(directory.0.join("unused-worker.exe")));
+        for _ in 0..3 {
+            let reported = Arc::clone(&errors);
+            let host = Toast::start(&directory.0, Arc::clone(&engine), directory.0.join("toast.log"), 7,
+                move |_, _| { reported.fetch_add(1, Ordering::Relaxed); }).unwrap();
+            drop(host);
+        }
+        assert_eq!(errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disabling_toasts_cancels_then_joins_an_active_report_writer() {
         // Hold a writer on a channel rather than timing large disk writes.
-        // Drop must return before release, and both the report IO and the
-        // presentation gate must reject the writer's late completion.
+        // Cancellation is immediate; stop must still await owner teardown.
         let directory = TestDirectory::new();
         let publisher = publisher(directory.0.clone());
         let draft = Arc::new(Mutex::new(ReportDraft::default()));
@@ -2415,12 +2406,19 @@ mod tests {
             drop(toast);
             stopped.send(()).unwrap();
         });
-        let returned = stop_complete.recv_timeout(Duration::from_secs(5));
+        let mut state = publisher.shared.state.lock().unwrap();
+        while !state.stopping { state = publisher.shared.changed.wait(state).unwrap(); }
+        drop(state);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !publisher.reports.cancellation.cancelled() && Instant::now() < deadline { thread::yield_now(); }
+        assert!(publisher.reports.cancellation.cancelled());
+        let returned = stop_complete.try_recv();
         // Always release before asserting, so a regression cannot leak a
         // blocked test thread or leave the temporary report locked.
         release.send(()).unwrap();
         stop.join().unwrap();
-        assert!(returned.is_ok(), "disable synchronously joined the active writer");
+        assert!(matches!(returned, Err(mpsc::TryRecvError::Empty)), "disable returned before owner exit");
+        stop_complete.recv_timeout(Duration::from_secs(5)).unwrap();
         finished.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!path.exists());
         assert!(!fs::read_dir(&directory.0).unwrap().any(|entry| {
@@ -2432,8 +2430,9 @@ mod tests {
         for in_flight in [false, true] {
             let directory = TestDirectory::new();
             let publisher = publisher(directory.0.clone());
-            let old = publisher.register(Arc::from("old"), Language::En);
+            let old = publisher.register(Arc::from("01"), Language::En);
             old.event(queued(1, "old.zip", None, 0));
+            progress(&old, 1, "old.zip", 1, 2);
             let stale_progress = current(&publisher);
             let failure = Err(io::Error::other("old failure"));
             old.record(Path::new("old.zip"), &failure, false, one_root);
@@ -2444,17 +2443,19 @@ mod tests {
             } else { None };
             publisher.reset_batches();
             assert!(publisher.shared.state.lock().unwrap().clear);
-            let new = publisher.register(Arc::from("new"), Language::Zh);
+            let new = publisher.register(Arc::from("02"), Language::Zh);
             new.event(queued(2, "new.zip", None, 0));
+            progress(&new, 2, "new.zip", 1, 2);
             assert!(!publisher.shared.present(&stale_progress.batch, || panic!("stale progress")));
             if let Some(completed) = completed {
                 assert!(!publisher.shared.present_completed(&completed, || panic!("stale completion")));
             }
             let state = publisher.shared.state.lock().unwrap();
-            assert_eq!(state.groups.len(), 1);
+            assert_eq!(state.group.iter().count(), 1);
             assert!(state.completed.is_empty());
-            let group = state.groups.front().unwrap();
-            assert_eq!(group.id.as_ref(), "new");
+            let group = state.group.as_ref().unwrap();
+            assert!(group.requests.contains_key("02"));
+            assert_ne!(group.id.as_ref(), stale_progress.batch);
             assert_eq!(group.language, Language::Zh);
             assert_eq!(group.summary.failed, 0);
             assert!(group.report.lock().unwrap().path.is_none());
@@ -2467,6 +2468,7 @@ mod tests {
         let publisher = publisher(directory.0.clone());
         let activity = publisher.register(Arc::from("01"), Language::En);
         activity.event(queued(1, "failed.zip", None, 0));
+        progress(&activity, 1, "failed.zip", 1, 2);
         let failure = Err(io::Error::other("failure"));
         activity.record(Path::new("failed.zip"), &failure, false, one_root);
         activity.finish(&failure, false, false, one_root);
@@ -2486,7 +2488,7 @@ mod tests {
         assert!(!report_path.exists());
         assert!(!draft_path.exists());
         let state = activity.publisher.shared.state.lock().unwrap();
-        assert!(state.groups.is_empty());
+        assert!(state.group.is_none());
         assert!(state.completed.is_empty());
         assert!(state.published.is_empty());
     }
@@ -2498,7 +2500,9 @@ mod tests {
         let failed = publisher.register(Arc::from("01"), Language::En);
         let running = publisher.register(Arc::from("02"), Language::En);
         failed.event(queued(1, "failed.zip", None, 0));
+        progress(&failed, 1, "failed.zip", 1, 2);
         running.event(queued(2, "running.zip", None, 0));
+        progress(&running, 2, "running.zip", 1, 2);
         let failure = Err(io::Error::other("archive failure before user stop"));
         failed.record(Path::new("failed.zip"), &failure, false, one_root);
         failed.finish(&failure, false, false, one_root);
@@ -2525,6 +2529,7 @@ mod tests {
         let publisher = publisher(directory.0.clone());
         let first = publisher.register(Arc::from("01"), Language::En);
         first.event(queued(1, "first.zip", None, 0));
+        progress(&first, 1, "first.zip", 1, 2);
         let failure = Err(io::Error::other("first failure"));
         first.record(Path::new("first.zip"), &failure, false, one_root);
         first.finish(&failure, false, false, one_root);
@@ -2539,6 +2544,7 @@ mod tests {
         let publication = publisher.publish(&engine, completed);
         let next = publisher.register(Arc::from("02"), Language::En);
         next.event(queued(2, "next.zip", None, 0));
+        progress(&next, 2, "next.zip", 1, 2);
         progress(&next, 2, "next.zip", 1, 2);
         let snapshot = current(&publisher);
         assert!(publisher.shared.present(&snapshot.batch, || {}));
@@ -2560,7 +2566,8 @@ mod tests {
         let publisher = publisher(directory.0.clone());
         let first = publisher.register(Arc::from("01"), Language::En);
         first.event(queued(1, "first.zip", None, 0));
-        assert!(publisher.shared.present("01", || {
+        progress(&first, 1, "first.zip", 1, 2);
+        assert!(publisher.shared.present(&current(&publisher).batch, || {
             assert!(publisher.shared.state.try_lock().is_ok());
             progress(&first, 1, "first.zip", 1, 2);
         }));
@@ -2572,9 +2579,10 @@ mod tests {
             let next = publisher.register(Arc::from("02"), Language::En);
             next.event(queued(2, "next.zip", None, 0));
             progress(&next, 2, "next.zip", 1, 2);
+            progress(&next, 2, "next.zip", 1, 2);
             assert_ne!(current(&publisher).batch, completed.id.as_ref());
         }));
-        assert_eq!(publisher.shared.state.lock().unwrap().groups.len(), 1);
+        assert_eq!(publisher.shared.state.lock().unwrap().group.iter().count(), 1);
     }
 
     #[test]
@@ -2616,12 +2624,12 @@ mod tests {
         release.send(()).unwrap();
         thread.join().unwrap();
         assert!(!stale_report.exists());
-        assert_eq!(publisher.shared.state.lock().unwrap().groups.front().unwrap().summary.failed, 2);
+        assert_eq!(publisher.shared.state.lock().unwrap().group.as_ref().unwrap().summary.failed, 2);
         finish_debounce(&publisher);
         let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
         let report = publisher.reports.publish(&completed, &publisher.shared).unwrap().unwrap();
         assert!(publisher.shared.present_completed(&completed, || {}));
-        assert!(publisher.shared.state.lock().unwrap().groups.is_empty());
+        assert!(publisher.shared.state.lock().unwrap().group.is_none());
         let text = fs::read_to_string(report).unwrap();
         assert!(text.contains("first failure"));
         assert!(text.contains("second failure"));

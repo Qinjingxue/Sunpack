@@ -641,6 +641,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn encrypted_empty_rar_crc_failure_uses_verified_direct_password_plan() {
+        // Real RAR5 from Rar.exe -ma5 -pfixture-secret, empty.txt. Only the
+        // file CRC is damaged; its enclosing header CRC has been recomputed.
+        let source = crate::test_support::temp_file("crc_empty_rar", &[82, 97, 114, 33, 26, 7, 1, 0, 51, 146, 181, 229, 10, 1, 5, 6, 0, 5, 1, 1, 128, 128, 0, 138, 98, 34, 111, 86, 2, 3, 60, 144, 0, 4, 128, 0, 32, 243, 251, 157, 52, 128, 3, 0, 9, 101, 109, 112, 116, 121, 46, 116, 120, 116, 48, 1, 0, 3, 15, 193, 88, 249, 247, 42, 138, 96, 222, 172, 113, 197, 80, 56, 137, 60, 185, 108, 179, 130, 137, 125, 195, 143, 174, 207, 163, 1, 120, 21, 154, 87, 254, 248, 185, 39, 15, 144, 111, 233, 62, 123, 127, 192, 14, 10, 3, 2, 164, 7, 232, 133, 136, 115, 221, 1, 51, 121, 211, 16, 206, 151, 73, 238, 124, 252, 221, 165, 125, 51, 144, 88, 29, 119, 86, 81, 3, 5, 4, 0]);
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "archive".into());
+        let cache = AttemptCache::default();
+        let candidates = CandidateSet::new(Arc::from([Arc::from("fixture-secret")]), None, &cache, None);
+        let plan = candidates.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
+        assert!(plan.verified);
+        assert_eq!(plan.selected.as_deref(), Some("fixture-secret"));
+        assert!(plan.candidates.is_empty(), "must not use the all-rejected candidate fallback");
+        std::fs::remove_file(source).unwrap();
+    }
+
+    #[test]
     fn cache_order_reuses_slots_and_matches_lru_on_hits_and_replacements() {
         // Compare mixed middle/head/tail touches and overwritten values with a
         // simple ordered-list model; also catch leaked eviction slots.

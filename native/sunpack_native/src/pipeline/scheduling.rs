@@ -58,7 +58,7 @@ pub(crate) const MAX_PENDING_JOBS: usize = 4096;
 pub(crate) struct Scheduler {
     capacity: usize,
     next_id: AtomicU64,
-    pool: rayon::ThreadPool,
+    pool: OnceLock<rayon::ThreadPool>,
     state: Mutex<Admission>,
     driver: OnceLock<mpsc::Sender<DriverEvent>>,
 }
@@ -207,12 +207,16 @@ impl Scheduler {
         Arc::new(Self {
             capacity,
             next_id: AtomicU64::new(1),
-            pool: rayon::ThreadPoolBuilder::new().num_threads(capacity)
-                .thread_name(|id| format!("sunpack-stage-{id}"))
-                .build().expect("start shared stage executor"),
+            pool: OnceLock::new(),
             state: Mutex::default(),
             driver: OnceLock::new(),
         })
+    }
+
+    fn pool(&self) -> &rayon::ThreadPool {
+        self.pool.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(self.capacity)
+            .thread_name(|id| format!("sunpack-stage-{id}"))
+            .build().expect("start shared stage executor"))
     }
 
     pub(crate) fn next_id(&self) -> u64 { self.next_id.fetch_add(1, Ordering::Relaxed) }
@@ -286,7 +290,17 @@ impl Scheduler {
     ) -> T {
         let (spawner, mut state) = RequestState::new(self, request, origin, cancel.clone(), None);
         let mut result = spawner.spawn(run(spawner.clone()));
-        self.pool.in_place_scope(|scope| {
+        // Poll lightweight roots on the caller until real stage work is admitted.
+        let first = loop {
+            let Ok(signal) = state.ready.recv() else { break None; };
+            if let Some(job) = state.handle(signal) {
+                if job.slot.is_some() { break Some(job); }
+                job.poll();
+            }
+            if state.finished() { break None; }
+        };
+        if let Some(first) = first { self.pool().in_place_scope(|scope| {
+            scope.spawn(move |_| first.poll());
             while let Ok(signal) = state.ready.recv() {
                 if let Some(job) = state.handle(signal) {
                     if job.slot.is_some() { scope.spawn(move |_| job.poll()); }
@@ -295,6 +309,7 @@ impl Scheduler {
                 if state.finished() { break; }
             }
         });
+        }
         result.take().expect("root poll produced a result")
     }
 
@@ -392,7 +407,7 @@ fn drive_owned(rx: mpsc::Receiver<DriverEvent>) {
 
 fn dispatch_owned(state: &mut RequestState<'static>, signal: Signal) {
     if let Some(job) = state.handle(signal) {
-        if job.slot.is_some() { state.scheduler.pool.spawn(move || job.poll()); }
+        if job.slot.is_some() { state.scheduler.pool().spawn(move || job.poll()); }
         else { job.poll(); }
     }
 }
@@ -788,6 +803,38 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_stage_initializes_one_shared_pool() {
+        let scheduler = Scheduler::new();
+        let addresses = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8).map(|_| {
+                let scheduler = &scheduler;
+                scope.spawn(move || scheduler.pool() as *const rayon::ThreadPool as usize)
+            }).collect();
+            jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert!(addresses.iter().all(|address| *address == addresses[0]));
+        assert_eq!(scheduler.pool().current_num_threads(), scheduler.capacity);
+    }
+
+    #[test]
+    fn lightweight_root_does_not_initialize_stage_pool() {
+        let scheduler = Scheduler::new();
+        assert!(scheduler.pool.get().is_none());
+        let result = scheduler.run(1, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async { 42 }));
+        assert_eq!(result, 42);
+        assert!(scheduler.pool.get().is_none());
+        let error: Result<(), &str> = scheduler.run(2, Origin::Foreground, &Cancellation::new(),
+            |_| Box::pin(async { Err("parse failure") }));
+        assert_eq!(error, Err("parse failure"));
+        assert!(scheduler.pool.get().is_none());
+        let result = scheduler.run(2, Origin::Foreground, &Cancellation::new(), |_| Box::pin(async {
+            stage("test", &Cancellation::new()).await.unwrap(); 43
+        }));
+        assert_eq!(result, 43);
+        assert!(scheduler.pool.get().is_some());
+    }
+
+    #[test]
     fn owned_requests_park_without_holding_host_slots() {
         let scheduler = single_slot();
         let gate = Arc::new(Mutex::new((false, Vec::<Waker>::new())));
@@ -1095,7 +1142,7 @@ mod tests {
     fn stage_pool_keeps_main_minimum_capacity_and_nested_rayon_progress() {
         let small_host = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let scheduler = small_host.install(|| Scheduler::with_capacity(4));
-        assert_eq!(scheduler.pool.current_num_threads(), 4);
+        assert_eq!(scheduler.pool().current_num_threads(), 4);
         let (entered, entered_rx) = mpsc::channel();
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let held = Arc::clone(&gate);

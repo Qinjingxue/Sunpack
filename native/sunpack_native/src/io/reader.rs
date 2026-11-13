@@ -179,6 +179,7 @@ pub(crate) struct ReaderConfig {
     pub(crate) cache_bytes: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ReaderStats {
     pub(crate) read_bytes: u64,
@@ -309,6 +310,7 @@ impl ByteSource for ProbeSource {
 struct ReaderState {
     config: ReaderConfig,
     inner: Mutex<ReaderInner>,
+    #[cfg(test)]
     uncached_read_bytes: AtomicU64,
 }
 
@@ -317,6 +319,7 @@ struct ReaderInner {
     cache: HashMap<(u64, usize), CachedSlice>,
     order: VecDeque<(u64, usize)>,
     cache_size: usize,
+    #[cfg(test)]
     stats: ReaderStats,
 }
 
@@ -328,6 +331,7 @@ impl ManagedReader {
             state: Arc::new(ReaderState {
                 config,
                 inner: Mutex::new(ReaderInner::default()),
+                #[cfg(test)]
                 uncached_read_bytes: AtomicU64::new(0),
             }),
         }
@@ -432,6 +436,7 @@ impl ManagedReader {
                 ReadFault::physical("read_at", offset, read_len, 0, self.len(), &error)
                     .into_io_error()
             })?;
+            #[cfg(test)]
             self.state
                 .uncached_read_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -452,6 +457,7 @@ impl ManagedReader {
         }
         let read_len = len.min((self.len() - offset) as usize);
         let data = self.source.read_direct_at(offset, read_len)?;
+        #[cfg(test)]
         self.state
             .uncached_read_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -507,6 +513,7 @@ impl ManagedReader {
                 ReadFault::physical("read_into_at", offset, read_len, 0, self.len(), &error)
                     .into_io_error()
             })?;
+            #[cfg(test)]
             self.state
                 .uncached_read_bytes
                 .fetch_add(count as u64, Ordering::Relaxed);
@@ -551,7 +558,9 @@ impl ManagedReader {
                 ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
                     .into_io_error()
             })?;
+            #[cfg(test)]
             let count = slices.iter().map(|slice| slice.len()).sum::<usize>();
+            #[cfg(test)]
             self.state
                 .uncached_read_bytes
                 .fetch_add(count as u64, Ordering::Relaxed);
@@ -598,9 +607,12 @@ impl ManagedReader {
     ) -> io::Result<CachedSlice> {
         let key = (offset, read_len);
         {
-            let mut inner = self.lock_inner()?;
+            let inner = self.lock_inner()?;
+            #[cfg(test)]
+            let mut inner = inner;
             if let Some(data) = inner.cache.get(&key).cloned() {
-                inner.stats.cache_hits += 1;
+                #[cfg(test)]
+                { inner.stats.cache_hits += 1; }
                 return Ok(data);
             }
         }
@@ -618,7 +630,9 @@ impl ManagedReader {
         read_len: usize,
     ) -> io::Result<Vec<CachedSlice>> {
         // Account concurrent reads atomically; IO volume never limits correctness.
+        #[cfg(test)]
         let reserved = read_len as u64;
+        #[cfg(test)]
         {
             let mut inner = self.lock_inner()?;
             inner.stats.read_bytes += reserved;
@@ -628,10 +642,12 @@ impl ManagedReader {
             ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
                 .into_io_error()
         });
+        #[cfg(test)]
         let count = result
             .as_ref()
             .map(|slices| slices.iter().map(|slice| slice.len()).sum::<usize>() as u64)
             .unwrap_or(0);
+        #[cfg(test)]
         if count < reserved {
             let mut inner = self.lock_inner()?;
             inner.stats.read_bytes = inner.stats.read_bytes.saturating_sub(reserved - count);
@@ -651,6 +667,7 @@ impl ManagedReader {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> io::Result<ReaderStats> {
         let mut stats = self.lock_inner()?.stats;
         stats.read_bytes = stats

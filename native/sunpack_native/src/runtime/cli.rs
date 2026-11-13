@@ -715,6 +715,25 @@ pub(super) fn run_console(
     crate::pipeline::block_on(run(host, cwd, args, session, cancel))
 }
 
+fn trim_password_retry_recovery(paths: &[PathBuf], checkpoints: &mut Vec<crate::pipeline::InputCheckpoint>,
+    promoted: &mut Vec<crate::pipeline::PromotedSource>) {
+    let candidates: HashSet<_> = paths.iter().map(|path| path_key(path)).collect();
+    // Preserve all logical siblings of the failed physical carrier and its
+    // relocation anchors, not unrelated successful ancestors or descendants.
+    let carriers: HashSet<_> = checkpoints.iter().filter(|checkpoint|
+        candidates.contains(&path_key(checkpoint.carrier()))
+        || checkpoint.source_paths().any(|path| candidates.contains(&path_key(path))))
+        .map(|checkpoint| path_key(checkpoint.carrier())).collect();
+    checkpoints.retain(|checkpoint| carriers.contains(&path_key(checkpoint.carrier())));
+    let mut sources = candidates;
+    sources.extend(checkpoints.iter().flat_map(|checkpoint| checkpoint.source_paths()).map(path_key));
+    promoted.retain(|source| sources.contains(&path_key(source.path())));
+    // The prompt can remain open indefinitely: release discarded inline slots,
+    // not only the layouts formerly owned by those slots.
+    if checkpoints.capacity() > checkpoints.len().saturating_mul(4) { checkpoints.shrink_to_fit(); }
+    if promoted.capacity() > promoted.len().saturating_mul(4) { promoted.shrink_to_fit(); }
+}
+
 pub(super) async fn run(
     host: &Host,
     cwd: &Path,
@@ -723,7 +742,6 @@ pub(super) async fn run(
     cancel: Cancellation,
 ) -> io::Result<i32> {
     let session = owned_session.as_ref();
-    crate::pipeline::stage("cli", &Cancellation::new()).await?;
     if args
         .first()
         .is_some_and(|arg| arg == "--cancel-watch-batch")
@@ -744,6 +762,7 @@ pub(super) async fn run(
         help(&options, config::load_language(cwd), session)?;
         return Ok(0);
     }
+    crate::pipeline::stage("cli", &Cancellation::new()).await?;
     if options.json && options.prompt_passwords {
         let language = config::load_language(cwd);
         let mut result = CommandResult::new(options.command);
@@ -1646,6 +1665,7 @@ async fn archives(
                 candidate_paths.push(archive.path.clone());
             }
         }
+        trim_password_retry_recovery(&candidate_paths, &mut checkpoints, &mut promoted_sources);
         record_archives(&mut all_archives, retries, current.archives);
         for error in current.errors {
             let omitted = error.scan_operation.as_deref() == Some("report_omitted");
@@ -2816,6 +2836,44 @@ mod option_tests {
 
 #[cfg(test)]
 mod recursive_prompt_tests {
+    #[test]
+    fn password_retry_keeps_only_failed_carrier_siblings_and_promoted_anchors() {
+        let marker = crate::test_support::temp_file("cli_retry_scope", b"source");
+        let generation = crate::io::reader::capture_file_generation(&marker).unwrap().persisted();
+        let checkpoint = |carrier: &str, source: &str, failed: bool| {
+            let input = crate::io::archive_state::ArchiveInput::file(source.into(), "zip".into(), source.into());
+            let failure = failed.then(|| json!({"partial":false,"password_signature":null,
+                "failure":crate::pipeline::Failure::new(FailureKind::PasswordRequired,"password"),"complete_files":0}));
+            serde_json::from_value::<crate::pipeline::InputCheckpoint>(json!({
+                "schema_version":1,"carrier":carrier,"input":input,"sources":[{"path":source,"generation":generation}],
+                "output":format!("{carrier}-output"),"container":null,"files":1,"bytes":1,
+                "encrypted":false,"discovery_source":"direct","failure":failure
+            })).unwrap()
+        };
+        let promoted = |source: &str| serde_json::from_value::<crate::pipeline::PromotedSource>(
+            json!({"path":source,"generation":generation})).unwrap();
+        let mut checkpoints = vec![checkpoint("outer.zip", "outer.zip", false)];
+        for index in 0..1000 { let path = format!("outer/success-{index}.zip");
+            checkpoints.push(checkpoint(&path, &path, false)); }
+        // The selected promoted source can identify an old carrier through its
+        // physical anchor; keep its successful logical sibling as well.
+        checkpoints.push(checkpoint("old-carrier.bin", "promoted-failed.zip", true));
+        checkpoints.push(checkpoint("old-carrier.bin", "same-carrier-good.zip", false));
+        let mut promotions = vec![promoted("promoted-failed.zip"), promoted("same-carrier-good.zip"),
+            promoted("outer/success-1.zip")];
+        trim_password_retry_recovery(&[PathBuf::from("promoted-failed.zip")], &mut checkpoints, &mut promotions);
+        assert_eq!(checkpoints.len(), 2);
+        assert!(checkpoints.capacity() <= 8);
+        assert!(checkpoints.iter().all(|entry| entry.carrier() == Path::new("old-carrier.bin")));
+        assert_eq!(promotions.iter().map(|source| source.path()).collect::<Vec<_>>(),
+            [Path::new("promoted-failed.zip"), Path::new("same-carrier-good.zip")]);
+        trim_password_retry_recovery(&[], &mut checkpoints, &mut promotions);
+        assert!(checkpoints.is_empty() && promotions.is_empty());
+        assert_eq!(checkpoints.capacity(), 0);
+        assert_eq!(promotions.capacity(), 0);
+        std::fs::remove_file(marker).unwrap();
+    }
+
     use super::*;
 
     #[derive(Default)]
@@ -2853,8 +2911,8 @@ mod recursive_prompt_tests {
     fn interrupted_cleanup_details_reach_stderr_once_in_both_modes() {
         for json in [false, true] {
             let input = Input::default();
-            let args = if json { vec!["extract".into(), "--json".into()] }
-                else { vec!["extract".into()] };
+            let args = if json { vec!["extract".into(), "--json".into(), "input.zip".into()] }
+                else { vec!["extract".into(), "input.zip".into()] };
             let options = Options::parse(&args).unwrap();
             let error = "C:\\output: access denied".to_owned();
             let (code, mut result) = interrupted(&options, &input, Language::En, None, vec![error.clone()]).unwrap();
@@ -3091,6 +3149,9 @@ mod recursive_prompt_tests {
                 damage_flags: None, partial, retained: false, recovered_complete_files: 0,
                 promoted: false, promotion_original_path: None, scan_layout: Default::default(),
             };
+            // Production publishes the terminal task fact before scope reporting.
+            progress.notify(Event::Finished { id: 7, path: archive.path.clone(), depth: 1,
+                result: crate::pipeline::TaskCompletion::from_result(&archive) });
             progress.finish_scope(7, &[archive]).unwrap();
             let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
             let status = Language::En.text(if partial { "report.status.partial" } else { "report.status.error" });

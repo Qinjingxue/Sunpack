@@ -859,6 +859,7 @@ struct Signals {
     topology_roots: HashSet<String>,
     modified_paths: HashSet<PathBuf>,
     candidate_events: HashMap<PathBuf, CandidateEvent>,
+    activities: HashMap<PathBuf, quiet::Activity>,
     reload: bool,
     reload_waiters: Vec<CommandReply<bool>>,
     once: Vec<CommandReply<()>>,
@@ -905,6 +906,7 @@ struct Hub {
     wake: std::sync::Condvar,
     claims: Mutex<HashMap<String, Arc<str>>>,
     completed_families: Mutex<CompletedFamilies>,
+    activities: Arc<quiet::Activities>,
     pending_count: AtomicUsize,
 }
 
@@ -981,6 +983,7 @@ impl Hub {
             wake: std::sync::Condvar::new(),
             claims: Mutex::default(),
             completed_families: Mutex::default(),
+            activities: Arc::default(),
             pending_count: AtomicUsize::new(0),
         }
     }
@@ -1007,6 +1010,12 @@ impl Hub {
         drop(signals);
         self.wake.notify_one();
         true
+    }
+
+    fn clear_idle_completed_families(&self) {
+        // Drop both entries and their allocated tables at the existing idle
+        // maintenance boundary, as main clears completed Watch generations.
+        *self.completed_families.lock().unwrap() = CompletedFamilies::default();
     }
 
     fn root_completed(&self, root: RootCompleted) {
@@ -1280,6 +1289,7 @@ impl RootObserver {
         passwords: &Path,
         hub: &Arc<Hub>,
         journal: &Arc<journal::Journal>,
+        catalog: &Arc<NativeWatchCatalog>,
     ) -> io::Result<Self> {
         let identity = output_identity(&directory.to_string_lossy())?;
         let id = key(&root.path);
@@ -1289,6 +1299,7 @@ impl RootObserver {
         let password_path = key(passwords);
         let hub = Arc::clone(hub);
         let journal = Arc::clone(journal);
+        let catalog = Arc::clone(catalog);
         // Match watchdog's business-root notifications, including ACL and
         // attributes-only changes that can make an unreadable candidate usable.
         // Use watchdog 6.0.0's exact 64,000-byte business-root buffer; small
@@ -1316,12 +1327,27 @@ impl RootObserver {
                     Some(path)
                 })
                 .filter(|path| scope.contains(&path.to_string_lossy())).collect::<Vec<_>>());
+            let mut activities = HashMap::new();
             if let Some(paths) = paths.as_mut() {
+                for path in paths.iter() {
+                    let key = key(path);
+                    if hub.claims.lock().unwrap().contains_key(&key) || catalog.is_owned(&path.to_string_lossy()) { continue; }
+                    let activity = hub.activities.bind(key.clone(), || {
+                        catalog.observation(&path.to_string_lossy())
+                            .as_ref().map_or_else(quiet::Activity::default, quiet::Activity::saved)
+                    });
+                    if activity.capture(path, &hub.claims, &key).unwrap_or(false) {
+                        activities.insert(path.clone(), activity);
+                    }
+                }
                 journal.filter_owned_events(paths, &watched_dir);
+                let retained: HashSet<_> = paths.iter().collect();
+                activities.retain(|path, _| retained.contains(path));
             }
             let root_changed = paths.as_ref().is_none_or(|paths| !paths.is_empty());
             if password_changed || root_changed {
                 hub.update(|signals| {
+                    signals.activities.extend(activities);
                     signals.password_changed |= password_changed;
                     if !root_changed { return; }
                     if let Some(paths) = &paths {
@@ -1447,6 +1473,7 @@ impl RootObservers {
         passwords: &Path,
         hub: &Arc<Hub>,
         journal: &Arc<journal::Journal>,
+        catalog: &Arc<NativeWatchCatalog>,
     ) -> (bool, Vec<io::Error>) {
         let mut errors = Vec::new();
         // A root can grant access even when its parent only permits traversal.
@@ -1456,7 +1483,7 @@ impl RootObservers {
             self.root.take();
         }
         if self.root.is_none() && root.path.is_dir() {
-            match RootObserver::start(&root.path, root, scope.clone(), passwords, hub, journal) {
+            match RootObserver::start(&root.path, root, scope.clone(), passwords, hub, journal, catalog) {
                 Ok(observer) => self.root = Some(observer),
                 Err(error) => errors.push(error),
             }
@@ -1486,7 +1513,7 @@ struct Pending {
     admission_ready: bool,
     root: String,
     candidate: WatchCandidateRow,
-    quiet: quiet::Quiet,
+    quiet: quiet::Activity,
     due: Instant,
     force: bool,
     recovery: Option<Arc<Recovery>>,
@@ -1615,7 +1642,7 @@ fn consume_claimed_pending(
     groups: &HashMap<String, Arc<SourceGroup>>,
     captured: &HashMap<String, Option<WatchCandidateRow>>,
     inputs: &mut Vec<WatchCandidateRow>,
-    quiet: &mut HashMap<String, quiet::Quiet>,
+    quiet: &mut HashMap<String, quiet::Activity>,
 ) {
     for path in groups.keys() {
         if captured.get(path).and_then(Option::as_ref).is_some_and(|before|
@@ -1735,7 +1762,7 @@ struct Active {
     password_scope: PathBuf,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: HashMap<String, WatchCandidateRow>,
-    quiet: HashMap<String, quiet::Quiet>,
+    quiet: HashMap<String, quiet::Activity>,
     dirty: HashSet<String>,
     cancel: Cancellation,
     groups: Arc<Mutex<SourceGroups>>,
@@ -1781,7 +1808,7 @@ struct CompletionContext {
     password_scope: PathBuf,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
-    quiet: HashMap<String, quiet::Quiet>,
+    quiet: HashMap<String, quiet::Activity>,
     dirty: HashSet<String>,
     claimed: Arc<Mutex<ClaimedSources>>,
     groups: HashMap<String, Arc<SourceGroup>>,
@@ -2286,7 +2313,7 @@ impl Scheduler {
             .filter(|(id, _)| changed.is_none_or(|changed| changed.contains(*id)))
         {
             let (replaced, errors) = self.root_observers.entry(id.clone()).or_default()
-                .rearm(root, scope, self.passwords.path(), &self.hub, &self.journal);
+                .rearm(root, scope, self.passwords.path(), &self.hub, &self.journal, &self.catalog);
             if replaced {
                 self.available_roots.remove(id);
             }
@@ -2626,6 +2653,7 @@ impl Scheduler {
                         self.catalog.commit(true);
                         let _ = crate::io::reader::clear_reader_resources();
                         self.engine.clear_idle_passwords();
+                        self.hub.clear_idle_completed_families();
                         self.journal.state().trim_idle_storage();
                         self.pending.shrink_to_fit();
                         self.unpublished.shrink_to_fit();
@@ -3218,7 +3246,7 @@ impl Scheduler {
     fn observe_candidate_with_quiet(
         &mut self, root_id: &str, path: String, admission: CandidateAdmission,
         recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
-        tracker: Option<quiet::Quiet>,
+        tracker: Option<quiet::Activity>,
     ) -> io::Result<()> {
         let event = match admission {
             CandidateAdmission::PasswordRetry => Some(CandidateEvent::Business("password_retry")),
@@ -3231,7 +3259,7 @@ impl Scheduler {
     fn observe_candidate_with_event(
         &mut self, root_id: &str, path: String, admission: CandidateAdmission,
         recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
-        tracker: Option<quiet::Quiet>, event: Option<&CandidateEvent>,
+        tracker: Option<quiet::Activity>, event: Option<&CandidateEvent>,
     ) -> io::Result<()> {
         let Some((_, scope)) = self.roots.get(root_id) else {
             return Ok(());
@@ -3255,9 +3283,14 @@ impl Scheduler {
             .or_else(|| captured.map(|value| value.observation.change_usn))
             .or_else(|| previous.as_ref().map(|value| value.change_usn))
             .or_else(|| blocked.as_ref().map(|value| value.change_usn));
-        let candidate = match watch_candidate_for_path(Path::new(&path), baseline) {
-            Ok(Some(candidate)) => candidate,
-            Ok(None) => return Ok(()),
+        let activity = self.hub.activities.bind(id.clone(), || {
+            self.pending.get(&id).map(|pending| pending.quiet.clone())
+                .or_else(|| tracker.clone()).unwrap_or_else(|| previous.as_ref()
+                    .map_or_else(quiet::Activity::default, quiet::Activity::saved))
+        });
+        let (candidate, observed_now, observed_at) = match activity.probe(Path::new(&path), baseline) {
+            Ok((Some(candidate), now, at)) => (candidate, now, at),
+            Ok((None, _, _)) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 self.candidate_diagnostics.log_observation(
@@ -3339,13 +3372,14 @@ impl Scheduler {
             if let Some(pending) = self.pending.get_mut(&id) {
                 let now = Instant::now();
                 if boundary && baseline != Some(candidate.observation.change_usn) {
-                    pending.quiet.end_phase();
+                    pending.quiet.metadata(&candidate, observed_now);
                     // CLOSE is a useful hint only if a writer hasn't reopened
                     // the file. Keep short existing waits on their cadence.
                     if pending.due.saturating_duration_since(now).as_millis() >= 100
                         && filesystem::watch_file_is_ready(&candidate.path).unwrap_or(false)
                     {
                         self.due.remove(&(pending.due, id.clone()));
+                        pending.quiet.accelerate(observed_now, now);
                         pending.due = now;
                         if !self.active_paths.contains_key(&id)
                             && !self.hub.claims.lock().unwrap().contains_key(&id)
@@ -3367,7 +3401,6 @@ impl Scheduler {
                 })
             })?;
         }
-        let now = Instant::now();
         let prior = self.pending.remove(&id);
         let became_active = prior.is_none();
         let new_identity = prior.as_ref().map_or_else(
@@ -3382,23 +3415,15 @@ impl Scheduler {
                     || old.candidate.size > candidate.size
             },
         );
-        let mut quiet = if let Some(old) = prior {
-            self.due.remove(&(old.due, id.clone()));
-            old.quiet
-        } else if let Some(tracker) = tracker {
-            tracker
-        } else {
-            previous
-                .as_ref()
-                .map_or_else(quiet::Quiet::default, quiet::Quiet::saved)
-        };
+        if let Some(old) = prior { self.due.remove(&(old.due, id.clone())); }
+        let quiet = activity;
         let retry_unchanged = became_active && match admission {
             CandidateAdmission::PasswordRetry => blocked_unchanged,
             CandidateAdmission::CrashRecovery => unchanged,
             _ => false,
         };
         let due = quiet.content_deadline(
-            now, windows::monotonic_seconds(), boundary, new_identity, retry_unchanged,
+            &candidate, observed_now, observed_at, new_identity, retry_unchanged, force,
         );
         if recovery.is_none() {
             self.catalog.remember_observation(
@@ -3416,7 +3441,7 @@ impl Scheduler {
                 "event_type":event.map_or("unknown", CandidateEvent::kind),
                 "src_path":event.map_or_else(|| "".into(), CandidateEvent::source),
                 "size":candidate.size, "mtime":candidate.mtime,
-                "quiet_seconds":quiet.seconds, "pending":self.pending.len() + 1,
+                "quiet_seconds":quiet.summary().0, "pending":self.pending.len() + 1,
             }));
         }
         self.due.insert((due, id.clone()), ());
@@ -4046,15 +4071,21 @@ impl Scheduler {
                 continue;
             };
             self.due.remove(&(due, id.clone()));
+            if let Some(deadline) = pending.quiet.deadline().filter(|deadline| *deadline > now && *deadline > pending.due) {
+                pending.due = deadline;
+                self.due.insert((deadline, id.clone()), ());
+                self.pending.insert(id, pending);
+                continue;
+            }
             if pending.admission_ready {
                 prepared.push((id, pending));
                 continue;
             }
             let path = Path::new(&pending.candidate.path);
             let previous_usn = pending.candidate.observation.change_usn;
-            let current = match watch_candidate_for_path(path, Some(previous_usn)) {
-                Ok(Some(current)) => current,
-                Ok(None) => {
+            let (current, observed_now, observed_at) = match pending.quiet.probe(path, Some(previous_usn)) {
+                Ok((Some(current), observed_now, observed_at)) => (current, observed_now, observed_at),
+                Ok((None, _, _)) => {
                     self.retire_admission(&id, &pending)?;
                     continue;
                 }
@@ -4068,13 +4099,20 @@ impl Scheduler {
                     continue;
                 }
             };
-            if quiet::changed(&pending.candidate, &current) {
+            // A callback can arrive while the filesystem readiness probe runs.
+            // Read its generation and deadline atomically, not as independent
+            // matches/deadline checks that could accept a just-written file.
+            let (captured, deadline) = pending.quiet.observation(&current);
+            if let Some(deadline) = deadline.filter(|deadline| *deadline > now && *deadline > pending.due) {
+                pending.due = deadline;
+                self.due.insert((deadline, id.clone()), ());
+                self.pending.insert(id, pending);
+                continue;
+            }
+            if quiet::changed(&pending.candidate, &current) && !captured {
                 let boundary = quiet::is_boundary(&current);
-                let reset = pending.candidate.size > current.size
-                    || pending.candidate.observation.file_id != current.observation.file_id;
-                pending
-                    .quiet
-                    .observe(windows::monotonic_seconds(), boundary, reset, false);
+                pending.quiet.boundary_observation(&current, observed_now, observed_at,
+                    self.settings.watch.boundary_confirmation_seconds);
                 self.catalog.remember_observation(
                     &current.path,
                     current.size,
@@ -4089,7 +4127,7 @@ impl Scheduler {
                 continue;
             }
             if quiet::is_boundary(&current) {
-                pending.quiet.end_phase();
+                pending.quiet.metadata(&current, observed_now);
             }
             if pending.recovery.is_none()
                 && (current.mtime != pending.candidate.mtime
@@ -4164,15 +4202,16 @@ impl Scheduler {
         for (_, pending) in prepared {
             self.journal.log(json!({
                 "event":"candidate_quiet", "path":pending.candidate.path,
-                "quiet_seconds":pending.quiet.seconds,
+                "quiet_seconds":pending.quiet.summary().0,
             }));
             if pending.recovery.is_none() {
+                let (seconds, last, cadence, tentative) = pending.quiet.summary();
                 self.catalog.retire_observation(
                     &pending.candidate.path,
-                    Some(pending.quiet.seconds),
-                    pending.quiet.last,
-                    pending.quiet.cadence,
-                    pending.quiet.tentative,
+                    Some(seconds),
+                    last,
+                    cadence,
+                    tentative,
                 );
             }
             let recovery_key = pending.recovery.as_ref().map(|recovery| {
@@ -4229,7 +4268,7 @@ impl Scheduler {
         self.pending.insert(id, pending);
     }
 
-    fn start_batch(&mut self, root_id: String, candidates: Vec<(WatchCandidateRow, quiet::Quiet)>, recovery: Option<Arc<Recovery>>, password_scope: PathBuf) -> io::Result<()> {
+    fn start_batch(&mut self, root_id: String, candidates: Vec<(WatchCandidateRow, quiet::Activity)>, recovery: Option<Arc<Recovery>>, password_scope: PathBuf) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery, password_scope))
     }
@@ -4237,7 +4276,7 @@ impl Scheduler {
     fn start_batch_blocking(
         &mut self,
         id: String,
-        candidates: Vec<(WatchCandidateRow, quiet::Quiet)>,
+        candidates: Vec<(WatchCandidateRow, quiet::Activity)>,
         recovery: Option<Arc<Recovery>>,
         password_scope: PathBuf,
     ) -> io::Result<()> {
@@ -4562,7 +4601,7 @@ impl Scheduler {
         })
     }
 
-    fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, mut completed: Completed, quiet: &mut HashMap<String, quiet::Quiet>) -> io::Result<Outcome> {
+    fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, mut completed: Completed, quiet: &mut HashMap<String, quiet::Activity>) -> io::Result<Outcome> {
         let mut unfinished = HashSet::new();
         if completed.cancelled {
             let state = self.journal.state();
@@ -5956,6 +5995,28 @@ mod tests {
     }
 
     #[test]
+    fn idle_completed_families_release_old_output_but_live_requests_reuse_it() {
+        let head = crate::test_support::temp_file("idle_family_head", b"head");
+        let tail = crate::test_support::temp_file("idle_family_tail", b"tail");
+        let output = head.with_extension("output");
+        fs::create_dir(&output).unwrap();
+        let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
+            (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
+        let hub = Hub::new();
+        hub.completed_families.lock().unwrap().remember(generations.clone(), false, &output);
+        assert_eq!(hub.completed_families.lock().unwrap().output(&generations, false), Some(output.clone()));
+        hub.clear_idle_completed_families();
+        let mut cache = hub.completed_families.lock().unwrap();
+        assert_eq!(cache.output(&generations, false), None);
+        assert!(cache.by_family.is_empty());
+        assert!(cache.ordered.is_empty());
+        drop(cache);
+        fs::remove_dir(output).unwrap();
+        fs::remove_file(head).unwrap();
+        fs::remove_file(tail).unwrap();
+    }
+
+    #[test]
     fn completed_family_cache_is_bounded_and_refreshes_lru() {
         let directory = std::env::temp_dir().join(format!("sunpack-family-lru-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -6275,6 +6336,56 @@ mod tests {
     }
 
     #[test]
+    fn native_burst_learns_before_scheduler_drains_its_coalesced_signal() {
+        use std::io::Write;
+        use std::time::Duration;
+        let marker = crate::test_support::temp_file("watch_capture", b"");
+        let directory = marker.with_extension("work");
+        let watched = directory.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let root = Root { path: watched.clone(), output: None, recursive: true, deep: false, scanned: true };
+        let state = directory.join("state");
+        let journal = Arc::new(journal::Journal::open(&state, 7).unwrap());
+        let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
+        let hub = Arc::new(Hub::new());
+        let source = watched.join("growing.zip");
+        let activity = hub.activities.bind(key(&source), quiet::Activity::default);
+        let observer = RootObserver::start(&watched, &root, root.scope(&[], &state),
+            &watched.join("builtin_passwords.json"), &hub, &journal, &catalog).unwrap();
+        let mut file = fs::File::create(&source).unwrap();
+        // Keep the writer open: these are content samples, not CLOSE epochs.
+        for _ in 0..4 {
+            let last = activity.summary().1;
+            file.write_all(b"x").unwrap();
+            file.flush().unwrap();
+            file.sync_data().unwrap();
+            let limit = Instant::now() + Duration::from_secs(5);
+            while activity.summary().1 == last && Instant::now() < limit {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_ne!(activity.summary().1, last);
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(activity.summary().2 > 0.0);
+        assert!(activity.sample_count() >= 2);
+        let deadline = activity.deadline().unwrap();
+        // No scheduler tick has run, so all wakes still occupy one path slot.
+        let signals = std::mem::take(&mut *hub.signals.lock().unwrap());
+        assert_eq!(signals.changed_roots[&key(&watched)].len(), 1);
+        let (candidate, _, _) = activity.probe(&source, None).unwrap();
+        assert_eq!(activity.content_deadline(&candidate.unwrap(),
+            Instant::now() + Duration::from_secs(60), windows::monotonic_seconds() + 60.0,
+            false, false, false), deadline);
+        drop(file);
+        drop(observer);
+        drop(signals);
+        drop(catalog);
+        drop(journal);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
     fn business_root_routes_password_file_notification_only_to_password_reload() {
         let marker = crate::test_support::temp_file("watch_password_event", b"");
         let directory = marker.with_extension("work");
@@ -6286,7 +6397,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let passwords = watched.join("builtin_passwords.json");
         let observer = RootObserver::start(
-            &watched, &root, root.scope(&[], &state), &passwords, &hub, &journal,
+            &watched, &root, root.scope(&[], &state), &passwords, &hub, &journal, &Arc::new(NativeWatchCatalog::new(journal.state(), None)),
         ).unwrap();
         fs::write(&passwords, b"{}").unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -6495,7 +6606,7 @@ mod tests {
         let mut pending = Pending {
             admission_ready: false,
             root: watch_path_key(r"C:\watch\old"), candidate,
-            quiet: quiet::Quiet::default(), due: Instant::now(), force: true, recovery: None,
+            quiet: quiet::Activity::default(), due: Instant::now(), force: true, recovery: None,
         };
         let due = pending.due;
         // Old A was removed; current B covers the promoted file. This is the
@@ -7134,7 +7245,7 @@ mod tests {
                         change_reasons_without_close: 0, change_reasons_known: false,
                         change_reason_error: String::new(),
                     } },
-                quiet: quiet::Quiet::default(), due: deadline, force: false, recovery: None,
+                quiet: quiet::Activity::default(), due: deadline, force: false, recovery: None,
             });
             due.insert((deadline, id.clone()), ());
             unpublished.insert(id);
@@ -7159,12 +7270,12 @@ mod tests {
         let mut inputs = Vec::new();
         let mut trackers = HashMap::new();
         consume_claimed_pending(&mut pending, &mut due, &mut unpublished, &groups, &captured, &mut inputs, &mut trackers);
-        let mut tracker = trackers.remove(&watch_path_key("split.002")).unwrap();
-        let learned = tracker.seconds;
+        let tracker = trackers.remove(&watch_path_key("split.002")).unwrap();
+        let learned = tracker.summary().0;
         tracker.observe(23.5, false, false, true);
         tracker.observe(24.5, false, false, true);
-        assert_eq!(tracker.cadence, 5.0);
-        assert_eq!(tracker.seconds, learned);
+        assert_eq!(tracker.summary().2, 5.0);
+        assert_eq!(tracker.summary().0, learned);
         assert!(trackers.is_empty());
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].path, "split.002");

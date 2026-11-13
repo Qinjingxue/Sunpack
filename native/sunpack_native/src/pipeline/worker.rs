@@ -1079,7 +1079,10 @@ fn dispatch_stdin(mut input: impl Write, shared: &Shared, failed: impl FnOnce(&i
             // Even a partial write may have admitted a native job. The owner
             // reaps the child before any caller can release its output lease.
             failed(error);
-            write.completion.finish(result);
+            // Publish the same reaped-worker classification to this sender as
+            // to queued writes and admitted jobs, not the raw pipe error.
+            let classified = shared.state.lock().unwrap().closed.as_ref().map(WorkerExit::error);
+            write.completion.finish(classified.map_or(result, Err));
             return;
         }
         write.completion.finish(result);

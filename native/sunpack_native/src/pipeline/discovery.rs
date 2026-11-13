@@ -489,6 +489,11 @@ impl OutputDiscovery {
             request,
             true,
         )?;
+        Self::authorize(root, raw, request, result);
+        Ok(())
+    }
+
+    fn authorize(root: String, raw: NativeDirectorySnapshot, request: &Request, result: &mut Discovered) {
         let policy = request.config.recursive_authorization;
         if policy.enabled && !result.tasks.is_empty() {
             let allowed = authorize_nested_candidates(
@@ -515,7 +520,19 @@ impl OutputDiscovery {
                 bucket: String::new(),
             })],
         );
-        Ok(())
+    }
+
+    pub(super) fn discover_many(outputs: Vec<Self>, candidates: &CandidateSet, request: &Request) -> io::Result<Vec<Discovered>> {
+        let mut verified = HashMap::new();
+        let mut tables = outputs.iter().map(|output|
+            directory_table(&output.filtered, &output.raw, None, candidates, &mut verified, request)
+        ).collect::<io::Result<Vec<_>>>()?;
+        let mut results = Vec::with_capacity(outputs.len());
+        Discovered::project_into(&mut tables, candidates, &verified, request, true, |scoped| results.push(scoped))?;
+        for (Self { root, raw, .. }, result) in outputs.into_iter().zip(&mut results) {
+            Self::authorize(root, raw, request, result);
+        }
+        Ok(results)
     }
 }
 
@@ -728,6 +745,9 @@ fn directory_table(
     Ok(table)
 }
 
+#[cfg(test)]
+thread_local! { static MEASURED_EMBEDDED_PAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 impl Discovered {
     fn project(
         &mut self,
@@ -736,6 +756,21 @@ impl Discovered {
         verified: &VerifiedPasswords,
         request: &Request,
         recursive: bool,
+    ) -> io::Result<()> {
+        Self::project_into(tables, candidates, verified, request, recursive, |scoped| {
+            self.tasks.extend(scoped.tasks);
+            self.blocked_paths.extend(scoped.blocked_paths);
+            self.errors.extend(scoped.errors);
+        })
+    }
+
+    fn project_into(
+        tables: &mut [NativeCandidateTable],
+        candidates: &CandidateSet,
+        verified: &VerifiedPasswords,
+        request: &Request,
+        recursive: bool,
+        mut emit: impl FnMut(Self),
     ) -> io::Result<()> {
         // Keep relation ownership local, but fill each bounded Embedded page
         // across scopes, as main's discover_many_native does.
@@ -758,6 +793,8 @@ impl Discovered {
             })
             .collect();
         for offset in (0..total).step_by(PAGE_SIZE) {
+            #[cfg(test)]
+            MEASURED_EMBEDDED_PAGES.with(|pages| pages.set(pages.get() + 1));
             request.cancel.check_io()?;
             let first = ends.partition_point(|&end| end <= offset);
             let last = ends.partition_point(|&end| end < (offset + PAGE_SIZE).min(total));
@@ -775,9 +812,7 @@ impl Discovered {
         }
         for (table, (mut scoped, mut batch, mut embedded_tasks)) in tables.iter_mut().zip(scopes) {
             scoped.finish(table, &mut batch, &mut embedded_tasks, candidates, verified)?;
-            self.tasks.extend(scoped.tasks);
-            self.blocked_paths.extend(scoped.blocked_paths);
-            self.errors.extend(scoped.errors);
+            emit(scoped);
         }
         Ok(())
     }
@@ -1305,6 +1340,73 @@ mod tests {
             );
         }
         assert!(expected.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual actual-scope batching measurement"]
+    fn measure_many_small_output_scopes() {
+        let root = std::env::temp_dir().join(format!(
+            "sunpack-pages-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut carrier = vec![0x41; 17];
+        carrier.extend_from_slice(b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00");
+        let mut inputs = Vec::new();
+        let mut expected = HashSet::new();
+        // A page crosses roots and then splits inside the last root; the empty
+        // middle root must not shift the group IDs used for result projection.
+        for (scope, count) in [4; 32].into_iter().enumerate() {
+            let directory = root.join(scope.to_string());
+            std::fs::create_dir_all(&directory).unwrap();
+            for index in 0..count {
+                let path = directory.join(format!("archive{index}.bin"));
+                std::fs::write(&path, &carrier).unwrap();
+                expected.insert(path_key(&path.to_string_lossy()));
+            }
+            inputs.push(directory);
+        }
+        let options =
+            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
+        let candidates = CandidateSet::new(
+            Arc::from([]),
+            None,
+            &super::super::passwords::AttemptCache::default(),
+            None,
+        );
+        let mut request = Request::new(inputs, super::super::Mode::Scan);
+        request.deep = true;
+        let config = Arc::make_mut(&mut request.config);
+        config.recursive_authorization.enabled = false;
+        config.embedded_scan.enabled = true;
+        config.embedded_scan.recursive_candidate_ratio = 0.2;
+        let separate = std::env::var_os("SUNPACK_MEASURE_SEPARATE").is_some();
+        MEASURED_EMBEDDED_PAGES.with(|pages| pages.set(0));
+        let began = std::time::Instant::now();
+        for _ in 0..10 {
+            let outputs = request.inputs.iter().map(|path| OutputDiscovery::prepare(
+                crate::scan::directory::scan_output_inventory_impl(&path.to_string_lossy()), &options
+            ).unwrap()).collect::<Vec<_>>();
+            let results = if separate {
+                outputs.into_iter().map(|output| {
+                    let mut result = Discovered::default();
+                    output.discover(&candidates, &request, &mut result).unwrap(); result
+                }).collect()
+            } else { OutputDiscovery::discover_many(outputs, &candidates, &request).unwrap() };
+            let mut actual = HashSet::new();
+            for result in results {
+                assert!(result.errors.is_empty());
+                for task in result.tasks { assert!(actual.insert(path_key(&task.entry().entry_path))); }
+            }
+            assert_eq!(actual, expected);
+        }
+        eprintln!("scope_measure separate={separate} outputs=32 files=128 iterations=10 pages={} wall_ms={}",
+            MEASURED_EMBEDDED_PAGES.with(|pages| pages.get()), began.elapsed().as_millis());
         std::fs::remove_dir_all(root).unwrap();
     }
 

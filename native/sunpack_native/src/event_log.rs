@@ -139,8 +139,16 @@ fn event_value(value: Value) -> std::io::Result<Value> {
             }
         }
     }
-    for (i, (key, item)) in fields.into_iter().enumerate() {
-        if i == 64 {
+    // main's call sites put locating/classifying facts before free-form
+    // diagnostics. serde_json's sorted map must not give a large errors array
+    // the budget intended for those facts. Keep the same shared budget.
+    let priority = [
+        (event == "catalog_rebuilt").then(|| fields.remove_entry("root")).flatten(),
+        (event == "catalog_rebuilt").then(|| fields.remove_entry("reason")).flatten(),
+        fields.remove_entry("error_kind"),
+    ];
+    for (i, (key, item)) in priority.into_iter().flatten().chain(fields).enumerate() {
+        if i == 64 || budget == 0 {
             truncated = true;
             break;
         }
@@ -998,6 +1006,28 @@ impl NativeEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_budget_keeps_catalog_location_and_failure_classification() {
+        let rebuilt = event_value(json!({"event":"catalog_rebuilt", "root":"C:/downloads",
+            "reason":"incremental_failed", "errors":vec!["access denied".repeat(300); 64],
+            "zzz":"after exhausted diagnostics"})).unwrap();
+        assert_eq!(rebuilt["root"], "C:/downloads");
+        assert_eq!(rebuilt["reason"], "incremental_failed");
+        assert_eq!(rebuilt["truncated"], true);
+        assert!(rebuilt.get("").is_none());
+        assert!(rebuilt.get("zzz").is_none());
+        assert!(serde_json::to_vec(&rebuilt).unwrap().len() < DIAGNOSTIC_TEXT_BYTES + 256);
+
+        let failed = event_value(json!({"event":"failed_terminal", "path":"C:/archive.zip",
+            "error_kind":"damaged", "error":"failure details".repeat(1000), "zzz":1})).unwrap();
+        assert_eq!(failed["path"], "C:/archive.zip");
+        assert_eq!(failed["error_kind"], "damaged");
+        assert!(failed["error"].as_str().unwrap().len() < DIAGNOSTIC_TEXT_BYTES);
+        assert_eq!(failed["truncated"], true);
+        assert!(failed.get("").is_none());
+        assert!(failed.get("zzz").is_none());
+    }
 
     // Hold a writer snapshot across member retirement and completion. Existing
     // disk tests cannot force this overlap; this checks snapshot isolation and

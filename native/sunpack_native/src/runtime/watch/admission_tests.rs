@@ -254,7 +254,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         fs::create_dir_all(base.join("native")).unwrap();
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         let configuration = base.join("sunpack_advanced_config.json");
-        fs::write(&configuration, b"{}").unwrap();
+        fs::write(&configuration, br#"{"cli":{"language":"en"}}"#).unwrap();
         let directory = base.join("recovery");
         let watched = directory.join("watched");
         fs::create_dir_all(&watched).unwrap();
@@ -366,7 +366,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         scheduler.enqueue(&root_id, path.into(), CandidateAdmission::Observe).unwrap();
         let pending = scheduler.pending.get_mut(&id).unwrap();
         scheduler.due.remove(&(pending.due, id.clone()));
-        pending.quiet.seconds = 10.0;
+        pending.quiet.set_seconds(10.0);
         pending.due = Instant::now() + Duration::from_secs(10);
         scheduler.due.insert((pending.due, id.clone()), ());
         let before = Instant::now();

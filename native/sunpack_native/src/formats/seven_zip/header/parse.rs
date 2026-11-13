@@ -89,7 +89,6 @@ fn parse_seven_zip_encoded_header_ast(
 
 pub(crate) struct SevenZipEncryptionFacts {
     pub(crate) password_required: bool,
-    pub(crate) encrypted_header: bool,
     pub(crate) encrypted_payload: bool,
     pub(crate) scan_complete: bool,
 }
@@ -98,7 +97,6 @@ pub(crate) fn seven_zip_encryption_facts_from_next_header(raw: &[u8]) -> SevenZi
     let Some(&next_header_nid) = raw.first() else {
         return SevenZipEncryptionFacts {
             password_required: false,
-            encrypted_header: false,
             encrypted_payload: false,
             scan_complete: true,
         };
@@ -115,7 +113,6 @@ pub(crate) fn seven_zip_encryption_facts_from_next_header(raw: &[u8]) -> SevenZi
     } else {
         return SevenZipEncryptionFacts {
             password_required: false,
-            encrypted_header: false,
             encrypted_payload: false,
             scan_complete: false,
         };
@@ -123,7 +120,6 @@ pub(crate) fn seven_zip_encryption_facts_from_next_header(raw: &[u8]) -> SevenZi
     let Ok(ast) = ast else {
         return SevenZipEncryptionFacts {
             password_required: false,
-            encrypted_header: false,
             encrypted_payload: false,
             scan_complete: false,
         };
@@ -147,7 +143,6 @@ pub(crate) fn seven_zip_encryption_facts_from_next_header(raw: &[u8]) -> SevenZi
     let scan_complete = next_header_nid != SZ_ENCODED_HEADER;
     SevenZipEncryptionFacts {
         password_required: encrypted_header || encrypted_payload,
-        encrypted_header,
         encrypted_payload,
         scan_complete: ast.diagnostics.is_empty() && scan_complete,
     }

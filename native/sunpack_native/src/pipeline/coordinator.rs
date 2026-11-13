@@ -2040,7 +2040,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut descendants = Vec::with_capacity(count);
             for (index, (result, inventory, id)) in parent_outputs.enumerate() {
                 if inventory.is_some() && depth <= this.request.max_depth && !cancel.cancelled() {
-                    recursive.push((index, result, inventory, id));
+                    recursive.push((index, result, inventory, id, None));
                 } else {
                     descendants.push((index, Ok((result, Outcome::default(), false))));
                 }
@@ -2056,8 +2056,16 @@ impl<'run, O: Observer> Run<'run, O> {
                     ),
                 })))
             };
+            if recursive.len() > 1 {
+                let candidates = this.candidates.with_scope(scope.as_ref().and_then(|scope| scope.password.as_deref()));
+                let inventories = recursive.iter_mut().map(|(index, _, inventory, _, _)| (*index, inventory.take().unwrap())).collect();
+                let mut discovered_outputs = this.discover_children_many(inventories, depth, &candidates).await?;
+                for (index, _, _, _, discovered) in &mut recursive {
+                    *discovered = discovered_outputs.remove(index);
+                }
+            }
             let descendant_owner = Arc::clone(this);
-            let descend = move |(index, result, inventory, id): (usize, ArchiveResult, Option<NativeOutputInventory>, TaskId)| -> super::scheduling::Task<'_, _> {
+            let descend = move |(index, result, inventory, id, discovered): (usize, ArchiveResult, Option<NativeOutputInventory>, TaskId, Option<(Discovered, bool)>)| -> super::scheduling::Task<'_, _> {
                 let descendant_owner = Arc::clone(&descendant_owner);
                 let spawner = recursive_spawner.clone();
                 let scope = scope.clone();
@@ -2069,9 +2077,11 @@ impl<'run, O: Observer> Run<'run, O> {
                         );
                         let mut descendants = Outcome::default();
                         let mut ran_recursive_children = false;
-                        if let Some(inventory) = inventory {
-                            let (nested, scanned) =
-                                this.discover_children(inventory, depth, &candidates).await?;
+                        let discovered = match discovered {
+                            Some(discovered) => Some(discovered),
+                            None => match inventory { Some(inventory) => Some(this.discover_children(inventory, depth, &candidates).await?), None => None },
+                        };
+                        if let Some((nested, scanned)) = discovered {
                             ran_recursive_children = scanned;
                             if scanned {
                                 descendants = this.execute_batch(
@@ -3108,7 +3118,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         inventory = Some(stats);
                     }
                 } else if result.failure.is_none() {
-                    let split = input.mode.structured() || input.physical_paths().nth(1).is_some();
+                    let split = input.mode.structured() || input.physical_paths().nth(1).is_some()
+                        || looks_like_split_archive_name(&input.entry_path);
                     let mut failure = classify_worker_failure(value, plan.evidence, split);
                     if failure.kind == FailureKind::WrongPassword && !plan.has_candidates {
                         failure = Failure::password_required();
@@ -3246,6 +3257,36 @@ impl<'run, O: Observer> Run<'run, O> {
         } else {
             file_failure(error)
         }
+    }
+
+    async fn discover_children_many(&self, inventories: Vec<(usize, NativeOutputInventory)>, depth: usize,
+        candidates: &CandidateSet) -> io::Result<HashMap<usize, (Discovered, bool)>> {
+        let mut results = HashMap::new();
+        let mut selected = Vec::new();
+        let mut outputs = Vec::new();
+        let mut prepared = Vec::with_capacity(inventories.len());
+        for (index, inventory) in inventories {
+            stage("nested_scan", &self.request.cancel).await?;
+            prepared.push((index, discovery::OutputDiscovery::prepare(inventory, self.filtered_options()?)?));
+        }
+        for (index, output) in prepared {
+            let mut nested = Discovered::default(); nested.scan_errors.extend(output.scan_errors());
+            let scan = output.has_files() && self.allow_recursive(depth + 1, 1).await;
+            results.insert(index, (nested, scan));
+            if scan { selected.push(index); outputs.push(output); }
+        }
+        if !outputs.is_empty() {
+            stage("discovery", &self.request.cancel).await?;
+            match discovery::OutputDiscovery::discover_many(outputs, candidates, &self.request) {
+                Ok(discovered) => for (index, nested) in selected.into_iter().zip(discovered) {
+                    let current = &mut results.get_mut(&index).unwrap().0;
+                    current.tasks = nested.tasks; current.blocked_paths = nested.blocked_paths; current.errors = nested.errors;
+                },
+                Err(error) if is_cancellation(&error) => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(results)
     }
 
     async fn discover_children(
@@ -3697,6 +3738,15 @@ fn weak_password_failure(result: &Value, evidence: Option<&str>) -> bool {
         && (matches!(worker::string(result, "operation_result_name"), "wrong_password" | "data_error" | "crc_error")
             || matches!(worker::string(result, "failure_kind"),
                 "encrypted_or_wrong_password" | "data_error" | "checksum_error" | "crc_error"))
+}
+
+// main also recognizes a split-style filename for conflicting native damage
+// and password evidence, even when relation discovery proved a standalone file.
+fn looks_like_split_archive_name(path: &str) -> bool {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let name = Path::new(path).file_name().unwrap_or_default().to_string_lossy();
+    PATTERN.get_or_init(|| regex::Regex::new(
+        r"(?i)(\.part\d+\.rar(?:\.[^.]+)?|\.z\d{2}|\.\d{3}(?:\.[^.]+)?)$").unwrap()).is_match(&name)
 }
 
 fn classify_worker_failure(
@@ -6266,6 +6316,56 @@ mod tests {
         let hex = "526172211a07010074de7b1c21040000010f7b64253244702e2a32eb93579555a37d38b616cb97898c463d3682920551724ed0c1c974029cc2b8ef8491fc816311daa1b0410f6115608170466e4948a8c6d4f17e28b08c727b4acfc116d3d075ce011963dc0c72e50a803d9036619810e92352e809830c9463ab4a0abdaab61e008218673e9c51409f76b2064bf7982e56d8173f1e387329bd5aca3bac49063545fcbfc19547d2be214b4fe1dae172b250e168f2a258548930b1763fb500c7869d70f2539d86fd19214dcc3bca1363154b0a0f2b0bba7dcc224ec1893cbc31cfa95158ccf5e96d74921de6f268ea4429e2ddf63d49220005742fef059f868372345f071322a7e690d56d5ac17b563fa9e923076fa2c58aa8e88e9843df17b7e79a30ca936d8215c92f6832f86887c3c3160ecfddfcdf7712382f84f39eb8";
         (0..hex.len()).step_by(2)
             .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn recursive_many_outputs_preserve_parent_index_and_prompt_boundary() {
+        let source = crate::test_support::temp_file("recursive_many", b"source");
+        let root = source.with_extension("outputs");
+        fs::create_dir(&root).unwrap();
+        let rar = encrypted_rar_fixture();
+        for answer in [false, true] {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let mut request = Request::new(Vec::new(), Mode::Extract);
+            request.max_depth = usize::MAX;
+            let config = Arc::make_mut(&mut request.config);
+            config.recursive_extract = Recursion::Prompt;
+            config.recursive_authorization.enabled = false;
+            config.filesystem.scan_filters_enabled = false;
+            let observer = |_: Event| {};
+            let mut run = test_run(&engine, &request, &observer);
+            Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
+                Arc::from([Arc::from("secret")]), None, &engine.password_attempts, None);
+            let mut inventories = Vec::new();
+            let mut manifests = Vec::new();
+            for index in [3, 7, 15] {
+                let output = root.join(index.to_string()); fs::create_dir_all(&output).unwrap();
+                fs::write(output.join("encrypted.bin"), &rar).unwrap();
+                let manifest = output_manifest(&[("encrypted.bin", &rar)]);
+                manifests.push(Arc::downgrade(manifest.records()));
+                inventories.push((index, manifest.to_output_inventory(output.to_string_lossy().into_owned())));
+            }
+            let scheduler = Scheduler::new();
+            let results = run.recursion.serve(&request.cancel, |depth, _| {
+                assert_eq!(depth, 2);
+                assert!(manifests.iter().all(|manifest| manifest.upgrade().is_none()));
+                assert!(engine.recent_passwords().is_empty());
+                answer
+            }, || scheduler.run(1, Origin::Foreground, &request.cancel, |_| {
+                Box::pin(run.discover_children_many(inventories, 1, &run.candidates))
+            })).unwrap();
+            assert_eq!(results.len(), 3);
+            for index in [3, 7, 15] {
+                let (nested, scanned) = &results[&index]; assert_eq!(*scanned, answer);
+                if answer { assert!(!nested.tasks.is_empty()); }
+                else { assert!(nested.tasks.is_empty()); }
+                for task in &nested.tasks {
+                    assert!(Path::new(&task.entry().entry_path).starts_with(root.join(index.to_string())));
+                }
+            }
+        }
+        release_reader_resources_under_roots(vec![root.to_string_lossy().into_owned()]).unwrap();
+        fs::remove_dir_all(root).unwrap(); fs::remove_file(source).unwrap();
     }
 
     #[test]
