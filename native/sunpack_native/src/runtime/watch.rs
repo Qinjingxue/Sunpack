@@ -24,7 +24,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[cfg(test)]
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -1027,10 +1027,7 @@ impl Hub {
     }
 }
 
-pub(super) fn observe_files(
-    paths: &[PathBuf], passwords: &Path,
-    notify: impl Fn(bool, bool) + Send + Sync + 'static,
-) -> io::Result<Vec<FileObserver>> {
+fn configuration_targets(paths: &[PathBuf], passwords: &Path) -> io::Result<HashMap<PathBuf, HashMap<String, (bool, bool)>>> {
     let mut targets: HashMap<PathBuf, HashMap<String, (bool, bool)>> = HashMap::new();
     for path in paths.iter().map(PathBuf::as_path).chain([passwords])
     {
@@ -1052,14 +1049,85 @@ pub(super) fn observe_files(
         target.0 |= path != passwords || parent.join(name.as_os_str()) != path;
         target.1 |= path == passwords;
     }
+    Ok(targets)
+}
+
+pub(super) fn observes_files(paths: &[PathBuf], passwords: &Path, observers: &[ConfigSubscription]) -> bool {
+    let Ok(targets) = configuration_targets(paths, passwords) else { return false; };
+    targets.len() == observers.len() && observers.iter().all(|subscription| {
+        subscription.alive() && targets.get(&subscription.directory.observer.path).is_some_and(|files| {
+            subscription.directory.listeners.lock().unwrap().get(&subscription.id)
+                .is_some_and(|listener| listener.files == *files)
+        })
+    })
+}
+
+pub(super) fn observe_files(
+    paths: &[PathBuf], passwords: &Path,
+    notify: impl Fn(bool, bool) + Send + Sync + 'static,
+) -> io::Result<Vec<ConfigSubscription>> {
+    let targets = configuration_targets(paths, passwords)?;
     let notify = Arc::new(notify);
     targets.into_iter().map(|(dir, files)| {
         let notify = Arc::clone(&notify);
-        FileObserver::start(&dir, false, move |names| {
-            let (reload, passwords) = configuration_changes(&files, names.as_deref());
-            if reload || passwords { notify(reload, passwords); }
-        })
+        ConfigSubscription::start(&dir, files, notify)
     }).collect()
+}
+
+// Configuration readers share native subscriptions by directory. File filters
+// remain per reader, so a Watch reload and a CLI cache invalidation use their
+// existing notification paths without duplicating threads and handles.
+type ConfigNotify = Arc<dyn Fn(bool, bool) + Send + Sync>;
+struct ConfigListener {
+    files: HashMap<String, (bool, bool)>,
+    notify: ConfigNotify,
+}
+struct ConfigDirectory {
+    observer: FileObserver,
+    listeners: Arc<Mutex<HashMap<u64, ConfigListener>>>,
+}
+pub(super) struct ConfigSubscription {
+    directory: Arc<ConfigDirectory>,
+    id: u64,
+}
+impl ConfigSubscription {
+    pub(super) fn alive(&self) -> bool { self.directory.observer.alive() }
+
+    fn start(path: &Path, files: HashMap<String, (bool, bool)>, notify: ConfigNotify) -> io::Result<Self> {
+        static DIRECTORIES: OnceLock<Mutex<HashMap<String, Weak<ConfigDirectory>>>> = OnceLock::new();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut directories = DIRECTORIES.get_or_init(Mutex::default).lock().unwrap();
+        directories.retain(|_, entry| entry.strong_count() != 0);
+        let path_key = key(path);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let listener = ConfigListener { files, notify };
+        let directory = match directories.get(&path_key).and_then(Weak::upgrade)
+            .filter(|entry| entry.observer.alive()) {
+            Some(directory) => {
+                directory.listeners.lock().unwrap().insert(id, listener);
+                directory
+            }
+            None => {
+                let listeners = Arc::new(Mutex::new(HashMap::from([(id, listener)])));
+                let events = Arc::clone(&listeners);
+                let observer = FileObserver::start(path, false, move |names| {
+                    for listener in events.lock().unwrap().values() {
+                        let (config, passwords) = configuration_changes(&listener.files, names.as_deref());
+                        if config || passwords { (listener.notify)(config, passwords); }
+                    }
+                })?;
+                let directory = Arc::new(ConfigDirectory { observer, listeners });
+                directories.insert(path_key, Arc::downgrade(&directory));
+                directory
+            }
+        };
+        Ok(Self { directory, id })
+    }
+}
+impl Drop for ConfigSubscription {
+    fn drop(&mut self) {
+        self.directory.listeners.lock().unwrap().remove(&self.id);
+    }
 }
 
 pub(super) struct FileObserver {
@@ -1139,7 +1207,7 @@ struct RootObserver {
 impl RootObserver {
     fn matches(&self, path: &Path) -> bool {
         key(path) == key(&self.observer.path)
-            && !self.observer.stopping.load(Ordering::Acquire)
+            && self.observer.alive()
             && output_identity(&path.to_string_lossy()).is_ok_and(|identity| identity == self.identity)
     }
 
@@ -1420,6 +1488,8 @@ impl CandidateDiagnostics {
 enum CandidateAdmission {
     Observe,
     Retry,
+    CrashRecovery,
+    PasswordRetry,
     // Startup USN recovery and pipeline completion errors may clear an
     // interrupted generation even when the content is unchanged.
     ExplicitRetry,
@@ -1647,8 +1717,7 @@ struct Scheduler {
     root_observers: HashMap<String, RootObservers>,
     root_progress: RootPolicyProgress,
     parent_observers: HashMap<String, ParentObserver>,
-    config_observers: Vec<FileObserver>,
-    config_sources: config::ConfigSources,
+    config_observers: Vec<ConfigSubscription>,
     pending: HashMap<String, Pending>,
     unpublished: HashSet<String>,
     due: BTreeMap<(Instant, String), ()>,
@@ -1729,7 +1798,6 @@ impl Scheduler {
             root_progress: RootPolicyProgress::default(),
             parent_observers: HashMap::new(),
             config_observers,
-            config_sources: snapshot.sources,
             pending: HashMap::new(),
             unpublished: HashSet::new(),
             due: BTreeMap::new(),
@@ -1775,7 +1843,7 @@ impl Scheduler {
         roots: &Path,
         passwords: &Path,
         hub: &Arc<Hub>,
-    ) -> io::Result<Vec<FileObserver>> {
+    ) -> io::Result<Vec<ConfigSubscription>> {
         let mut paths = config::watch_paths(cwd, &snapshot.sources);
         paths.push(roots.to_owned());
         let hub = Arc::clone(hub);
@@ -2070,8 +2138,10 @@ impl Scheduler {
         let snapshot = self.engine.run_stage("watch_config_reload", Origin::Watch, || config::reload_snapshot(&self.cwd))?;
         let config_changed = *self.settings != snapshot.config;
         let scheduler_changed = scheduler_configuration_changed(&self.settings, &snapshot.config);
-        let observers_changed = self.config_sources != snapshot.sources
-            || self.config_observers.iter().any(|observer| observer.stopping.load(Ordering::Acquire));
+        let mut observed_paths = config::watch_paths(&self.cwd, &snapshot.sources);
+        observed_paths.push(self.root_file.clone());
+        let observers_changed = self.continuous
+            && !observes_files(&observed_paths, self.passwords.path(), &self.config_observers);
         // Keep the previous subscriptions alive until apply succeeds. A failed
         // apply must not publish sources or lose the old recovery notifications.
         let observers = observers_changed.then(|| self.engine.run_stage("watch_rearm", Origin::Watch, || Self::observe_config(
@@ -2135,7 +2205,6 @@ impl Scheduler {
             return Err(error);
         }
         if let Some(observers) = observers { self.config_observers = observers; }
-        self.config_sources = snapshot.sources;
         super::diagnostics::retention(self.settings.watch.event_log_retention_days);
         windows::configure_priority(&self.engine, self.settings.runtime.process_mode);
         self.reconcile_shell();
@@ -2315,7 +2384,7 @@ impl Scheduler {
                 if let Err(error) = &reload {
                     self.journal
                         .log(json!({"event":"watch_reload_failed","error":error.to_string()}));
-                    if self.config_observers.iter().any(|observer| observer.stopping.load(Ordering::Acquire)) {
+                    if self.config_observers.iter().any(|observer| !observer.alive()) {
                         // Do not advertise a healthy Watch after a failed event
                         // subscription. Startup/restart can report the real error.
                         return Err(io::Error::other(format!("Configuration observer recovery failed: {error}")));
@@ -3117,8 +3186,13 @@ impl Scheduler {
                 .as_ref()
                 .map_or_else(quiet::Quiet::default, quiet::Quiet::saved)
         };
+        let retry_unchanged = became_active && match admission {
+            CandidateAdmission::PasswordRetry => blocked_unchanged,
+            CandidateAdmission::CrashRecovery => unchanged,
+            _ => false,
+        };
         let due = quiet.content_deadline(
-            now, windows::monotonic_seconds(), boundary, new_identity, force && unchanged,
+            now, windows::monotonic_seconds(), boundary, new_identity, retry_unchanged,
         );
         if recovery.is_none() {
             self.catalog.remember_observation(
@@ -3322,7 +3396,8 @@ impl Scheduler {
             {
                 continue;
             }
-            self.enqueue_with_recovery(&root, entry.path.clone(), recovery)?;
+            self.observe_candidate_with_quiet(&root, entry.path.clone(),
+                CandidateAdmission::PasswordRetry, recovery, None, None)?;
             self.journal
                 .log(json!({"event":"retry_password_failure","path":entry.path}));
         }
@@ -3525,8 +3600,11 @@ impl Scheduler {
             for output in &verified {
                 let output_scope =
                     NativeDiscoveryScope::new((*output).clone(), None, Vec::new());
-                match crate::scan::directory::scope_file_paths(&output_scope) {
-                    Ok((paths, errors)) if errors.is_empty() => {
+                match recovery_scan_paths(
+                    &self.journal, &pending.path, output,
+                    crate::scan::directory::scope_file_paths(&output_scope),
+                ) {
+                    Ok(paths) => {
                         for path in paths {
                             let path = path.to_string_lossy().into_owned();
                             if !pending.completed_sources.contains(&path)
@@ -3556,6 +3634,12 @@ impl Scheduler {
             }
             let owner = watch_path_key(&pending.path);
             let mut rebase = !revisit.contains_key(&owner);
+            let admission = if pending.internal_recovery || !pending.active_outputs.is_empty()
+                || pending.committed_roots.iter().next().is_some() || pending.promoted_destinations.iter().next().is_some() {
+                CandidateAdmission::CrashRecovery
+            } else {
+                CandidateAdmission::Retry
+            };
             for (id, path) in revisit {
                 if state.entry(&path).is_some_and(|entry| {
                     matches!(
@@ -3597,7 +3681,7 @@ impl Scheduler {
                     };
                     Some(Arc::new(recovery))
                 };
-                self.enqueue_with_recovery(&root, path.clone(), recovery)?;
+                self.observe_candidate_with_quiet(&root, path.clone(), admission, recovery, None, None)?;
                 if !self.pending.contains_key(&id) && !NativePresence::at(&path).is_absent() {
                     rebase = false;
                 }
@@ -4480,7 +4564,9 @@ impl Scheduler {
                 ));
             }
             if (regroup && !self.pending.contains_key(&id)) || password_updated {
-                retry.push(candidate.path.clone());
+                retry.push((candidate.path.clone(), if password_updated {
+                    CandidateAdmission::PasswordRetry
+                } else { CandidateAdmission::Retry }));
             }
         }
         let output_containers: HashMap<&Path, &Path> = outcome.checkpoints.iter()
@@ -4626,7 +4712,7 @@ impl Scheduler {
                     .and_then(Value::as_str)
                     .is_some_and(|before| before != password_source_signature(&self.user_password_signature, &current_passwords.scope_signature(directory)))
                 {
-                    retry.push(candidate.path.clone());
+                    retry.push((candidate.path.clone(), CandidateAdmission::PasswordRetry));
                 }
             }
             let event = if completed.cancelled {
@@ -4692,12 +4778,12 @@ impl Scheduler {
             Ok(operations)
         })?;
         self.release_display_claims(batch, &groups);
-        for path in retry {
+        for (path, admission) in retry {
             if let Some((root, recovery)) = self.journal.state().entry(&path)
                 .and_then(|entry| self.blocker_route(&entry))
             {
                 let tracker = quiet.remove(&watch_path_key(&path));
-                self.observe_candidate_with_quiet(&root, path, CandidateAdmission::Retry, recovery, None, tracker)?;
+                self.observe_candidate_with_quiet(&root, path, admission, recovery, None, tracker)?;
             }
         }
         self.persist_candidates(BTreeMap::new(), false)?;
@@ -5083,8 +5169,10 @@ impl Observer for WatchObserver {
             let mut completion = RootReportCompletion { activity: toast.clone(), id, failed: true };
             // Match main's broker-backed failure report: synchronous report
             // writes use the shared stage pool, not one thread per batch.
-            crate::pipeline::stage("watch_failure_report", &Cancellation::new()).await?;
-            toast.record_root(id, path, &outcome);
+            if toast.needs_root_report(id) {
+                crate::pipeline::stage("watch_failure_report", &Cancellation::new()).await?;
+                toast.record_root(id, path, &outcome);
+            }
             completion.failed = false;
         }
         Ok(Outcome::default())
@@ -5315,7 +5403,7 @@ impl Observer for WatchObserver {
         Ok(())
     }
 
-    fn after_flatten(&self, _old: &Path, output: &Path) -> io::Result<()> {
+    fn after_flatten(&self, _id: crate::pipeline::TaskId, _old: &Path, output: &Path) -> io::Result<()> {
         finish_flatten(&self.journal, &output.to_string_lossy())
     }
 
@@ -5550,6 +5638,24 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
     Ok(())
 }
 
+// Directory enumeration can return readable files alongside local errors.
+// Only a whole-scan failure postpones the owner's recovery.
+fn recovery_scan_paths(
+    journal: &journal::Journal,
+    owner: &str,
+    root: &str,
+    result: io::Result<(Vec<PathBuf>, Vec<crate::io::directory_errors::DirectoryReadError>)>,
+) -> io::Result<Vec<PathBuf>> {
+    match result {
+        Ok((paths, _errors)) => Ok(paths),
+        Err(error) => {
+            journal.log(json!({"event":"crash_resume_scan_failed", "owner_path":owner,
+                "root":root, "error":error.to_string()}));
+            Err(error)
+        }
+    }
+}
+
 // A refresh publishes successful rows even when another row failed. Preserve
 // its arrivals before fallback: the full refresh may see them as unchanged.
 fn collect_catalog_arrivals(
@@ -5587,6 +5693,71 @@ fn spawn_error_dialog(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_scan_preserves_readable_files_with_local_errors() {
+        let marker = crate::test_support::temp_file("recovery_scan_errors", b"archive");
+        let directory = marker.with_extension("state");
+        let journal = journal::Journal::open(&directory, 7).unwrap();
+        let paths = recovery_scan_paths(&journal, "owner.zip", "output",
+            Ok((vec![marker.clone()], vec![("read_dir".into(), "output/locked".into(),
+                "access denied".into())]))).unwrap();
+        assert_eq!(paths, [marker.clone()]);
+        let failure = recovery_scan_paths(&journal, "owner.zip", "output",
+            Err(io::ErrorKind::PermissionDenied.into())).unwrap_err();
+        assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
+        journal.flush().unwrap();
+        let manifest: crate::io::display_store::Manifest = serde_json::from_slice(
+            &fs::read(directory.join("events.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(manifest.runs.iter().map(|run| run.count - run.head).sum::<u64>(), 1);
+        drop(journal);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn configuration_subscriptions_share_directory_and_preserve_live_intersections() {
+        let marker = crate::test_support::temp_file("shared_config_observer", b"");
+        let directory = marker.with_extension("directory");
+        fs::create_dir(&directory).unwrap();
+        let config = directory.join("config.json");
+        let passwords = directory.join("passwords.json");
+        let first = observe_files(&[config.clone()], &passwords, |_, _| {}).unwrap();
+        let second = observe_files(&[config.clone(), directory.join("roots.txt")], &passwords, |_, _| {}).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(Arc::ptr_eq(&first[0].directory, &second[0].directory));
+        assert!(observes_files(&[config.clone()], &passwords, &first));
+        assert!(!observes_files(&[config.clone()], &passwords, &second));
+        let weak = Arc::downgrade(&first[0].directory);
+        assert_eq!(first[0].directory.listeners.lock().unwrap().len(), 2);
+        drop(first);
+        assert!(second[0].alive());
+        assert_eq!(second[0].directory.listeners.lock().unwrap().len(), 1);
+        // Re-arming a changed file set adds a listener, not a native observer.
+        let third = observe_files(&[config], &passwords, |_, _| {}).unwrap();
+        assert!(Arc::ptr_eq(&second[0].directory, &third[0].directory));
+        drop(second);
+        drop(third);
+        assert!(weak.upgrade().is_none());
+
+        let child = directory.join("new");
+        let paths = [child.join("config.json")];
+        let ancestor = observe_files(&paths, &passwords, |_, _| {}).unwrap();
+        assert!(observes_files(&paths, &passwords, &ancestor));
+        fs::create_dir(&child).unwrap();
+        assert!(!observes_files(&paths, &passwords, &ancestor));
+        let moved = observe_files(&paths, &passwords, |_, _| {}).unwrap();
+        assert_eq!(moved.len(), 2);
+        assert!(moved.iter().any(|subscription| Arc::ptr_eq(&ancestor[0].directory, &subscription.directory)));
+        drop(ancestor);
+        assert!(observes_files(&paths, &passwords, &moved));
+        drop(moved);
+        fs::remove_dir(child).unwrap();
+        fs::remove_dir(directory).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
     #[test]
     fn candidate_wait_history_survives_pending_retirement_and_expires_with_a_bound() {
         let marker = crate::test_support::temp_file("candidate_diagnostics", b"");

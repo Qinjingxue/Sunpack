@@ -21,6 +21,8 @@ struct State {
     // Keep creation, latest reset/phase, progress and resource state per task.
     // Sorting their sequence numbers preserves ordering without a progress backlog.
     events: HashMap<(TaskId, u8), (u64, Event)>,
+    // Relocations compose and cannot be coalesced like progress updates.
+    relocations: Vec<(u64, Event)>,
 }
 
 #[derive(Default)]
@@ -60,6 +62,15 @@ fn unavailable() -> io::Error {
 
 impl Reports {
     pub(crate) fn notify(&self, event: Event) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed { return; }
+        if matches!(event, Event::OutputsRelocated { .. }) {
+            state.sequence += 1;
+            let sequence = state.sequence;
+            state.relocations.push((sequence, event));
+            if let Some(waker) = state.waker.take() { waker.wake(); }
+            return;
+        }
         let key = match &event {
             Event::Queued { id, .. } => (*id, 0),
             Event::Replanned { id, .. } => (*id, 5),
@@ -72,28 +83,26 @@ impl Reports {
             | Event::Finalizing { id }
             | Event::Finished { id, .. }
             | Event::Skipped { id } => (*id, 4),
+            Event::OutputsRelocated { .. } => unreachable!(),
         };
-        let mut state = self.state.lock().unwrap();
-        if !state.closed {
-            if key.1 == 5 {
-                // Keep initial registration but discard the previous attempt.
-                for kind in 1..=4 { state.events.remove(&(key.0, kind)); }
-                state.events.remove(&(key.0, 6));
-            }
-            if key.1 == 1 {
-                // Started/Working clear progress in Panel, even if a later
-                // phase replaces them before the progress task can run.
-                state.events.remove(&(key.0, 2));
-                state.events.remove(&(key.0, 4));
-            }
-            if key.1 == 1 || key.1 == 4 {
-                state.events.remove(&(key.0, 3));
-            }
-            state.sequence += 1;
-            let sequence = state.sequence;
-            state.events.insert(key, (sequence, event));
-            if let Some(waker) = state.waker.take() { waker.wake(); }
+        if key.1 == 5 {
+            // Keep initial registration but discard the previous attempt.
+            for kind in 1..=4 { state.events.remove(&(key.0, kind)); }
+            state.events.remove(&(key.0, 6));
         }
+        if key.1 == 1 {
+            // Started/Working clear progress in Panel, even if a later
+            // phase replaces them before the progress task can run.
+            state.events.remove(&(key.0, 2));
+            state.events.remove(&(key.0, 4));
+        }
+        if key.1 == 1 || key.1 == 4 {
+            state.events.remove(&(key.0, 3));
+        }
+        state.sequence += 1;
+        let sequence = state.sequence;
+        state.events.insert(key, (sequence, event));
+        if let Some(waker) = state.waker.take() { waker.wake(); }
     }
 
     pub(crate) async fn serve_async(
@@ -104,7 +113,7 @@ impl Reports {
         loop {
             let closed = poll_fn(|cx| {
                 let mut state = self.state.lock().unwrap();
-                if state.closed || !state.events.is_empty() {
+                if state.closed || !state.events.is_empty() || !state.relocations.is_empty() {
                     Poll::Ready(state.closed)
                 } else {
                     state.waker = Some(cx.waker().clone());
@@ -118,16 +127,12 @@ impl Reports {
         }
     }
 
-    pub(crate) fn relocate_outputs(&self, old: &std::path::Path, new: &std::path::Path) {
-        for (_, event) in self.state.lock().unwrap().events.values_mut() {
-            if let Event::Finished { result, .. } = event {
-                result.relocate_output(old, new);
-            }
-        }
-    }
-
     pub(crate) fn take_events(&self) -> Vec<Event> {
-        let mut events: Vec<_> = self.state.lock().unwrap().events.drain().map(|(_, event)| event).collect();
+        let mut state = self.state.lock().unwrap();
+        let mut events = Vec::with_capacity(state.events.len() + state.relocations.len());
+        events.extend(state.events.drain().map(|(_, event)| event));
+        events.append(&mut state.relocations);
+        drop(state);
         events.sort_unstable_by_key(|(sequence, _)| *sequence);
         events.into_iter().map(|(_, event)| event).collect()
     }

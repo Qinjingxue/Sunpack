@@ -65,7 +65,7 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
                 root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-                parent_observers: HashMap::new(), config_observers: Vec::new(), config_sources: Default::default(),
+                parent_observers: HashMap::new(), config_observers: Vec::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
@@ -200,7 +200,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                 deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
                 passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
                 root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
-                parent_observers: HashMap::new(), config_observers: Vec::new(), config_sources: Default::default(),
+                parent_observers: HashMap::new(), config_observers: Vec::new(),
                 pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
                 active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
                 tray: None, monitor: None, toast: None, cache_deadline: None,
@@ -243,4 +243,101 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
         return;
     }
     run_isolated("recovery_scans_surviving_outputs_while_requeueing_missing_output_owner", CHILD);
+}
+
+#[test]
+fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
+    use std::time::Duration;
+    const CHILD: &str = "SUNPACK_PASSWORD_RETRY_QUIET_TEST";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
+        let directory = base.join("password");
+        let watched = directory.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        let source = watched.join("input.zip");
+        fs::write(&source, b"old archive").unwrap();
+        let id = watch_path_key(source.to_str().unwrap());
+        let root_id = key(&watched);
+        let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
+        let settings = Arc::new(Config::default());
+        let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
+        let mut scheduler = Scheduler {
+            candidate_diagnostics: CandidateDiagnostics::default(),
+            admission_checkpoint: None,
+            cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
+            roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
+                recursive: true, deep: false, scanned: true }, scope))]),
+            available_roots: HashSet::from([root_id.clone()]),
+            user_password_signature: user_password_signature(&settings.user_passwords),
+            settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
+            catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+            options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
+            deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
+            passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
+            root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+            parent_observers: HashMap::new(), config_observers: Vec::new(),
+            pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+            active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+            tray: None, monitor: None, toast: None, cache_deadline: None,
+            external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+        };
+        let path = source.to_str().unwrap();
+        let failed = watch_candidate_for_path(&source, None).unwrap().unwrap();
+        scheduler.journal.commit(true, |_| {
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            operations.put_entry(Arc::new(observed_entry(&failed, "password", None)));
+            Ok(operations)
+        }).unwrap();
+        fs::write(&source, b"archive still being downloaded").unwrap();
+        scheduler.enqueue(&root_id, path.into(), CandidateAdmission::Observe).unwrap();
+        let pending = scheduler.pending.get_mut(&id).unwrap();
+        scheduler.due.remove(&(pending.due, id.clone()));
+        pending.quiet.seconds = 10.0;
+        pending.due = Instant::now() + Duration::from_secs(10);
+        scheduler.due.insert((pending.due, id.clone()), ());
+        let before = Instant::now();
+        scheduler.retry_password_failures(&scheduler.passwords.snapshot(), None).unwrap();
+        assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9));
+
+        // A new pending also must not use the old password failure shortcut
+        // when only its latest catalog observation matches the input.
+        let pending = scheduler.pending.remove(&id).unwrap();
+        scheduler.due.remove(&(pending.due, id.clone()));
+        let before = Instant::now();
+        scheduler.observe_candidate_with_quiet(&root_id, path.into(),
+            CandidateAdmission::PasswordRetry, None, None, Some(pending.quiet)).unwrap();
+        assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9));
+
+        // A stable, matching password failure with no pending remains immediate.
+        let candidate = scheduler.pending[&id].candidate.clone();
+        scheduler.journal.commit(true, |_| {
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            operations.put_entry(Arc::new(observed_entry(&candidate, "password", None)));
+            Ok(operations)
+        }).unwrap();
+        let pending = scheduler.pending.remove(&id).unwrap();
+        scheduler.due.remove(&(pending.due, id.clone()));
+        scheduler.observe_candidate_with_quiet(&root_id, path.into(),
+            CandidateAdmission::PasswordRetry, None, None, Some(pending.quiet)).unwrap();
+        assert!(scheduler.pending[&id].due <= Instant::now());
+
+        // A volume-change retry is forced, but is not crash recovery. It must
+        // still respect the learned quiet window even with no current pending.
+        let pending = scheduler.pending.remove(&id).unwrap();
+        scheduler.due.remove(&(pending.due, id.clone()));
+        let before = Instant::now();
+        scheduler.observe_candidate_with_quiet(&root_id, path.into(),
+            CandidateAdmission::Retry, None, None, Some(pending.quiet)).unwrap();
+        assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9));
+        let pending = scheduler.pending.remove(&id).unwrap();
+        scheduler.due.remove(&(pending.due, id.clone()));
+        scheduler.observe_candidate_with_quiet(&root_id, path.into(),
+            CandidateAdmission::CrashRecovery, None, None, Some(pending.quiet)).unwrap();
+        assert!(scheduler.pending[&id].due <= Instant::now());
+        return;
+    }
+    run_isolated("password_retry_keeps_existing_quiet_and_checks_failure_snapshot", CHILD);
 }

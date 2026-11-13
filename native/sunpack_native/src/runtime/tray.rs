@@ -59,7 +59,7 @@ impl Tray {
         cwd: &Path,
         language: Language,
         notify: impl Fn(Action) + Send + 'static,
-        report_error: impl Fn(u32, &io::Error) + Send + 'static,
+        report_error: impl Fn(Option<u32>, &io::Error) + Send + 'static,
     ) -> io::Result<Self> {
         let stop = Arc::new(windows::Event::new(true)?);
         let event = stop.clone();
@@ -123,7 +123,7 @@ struct Context {
     cwd: PathBuf,
     chinese: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
-    report_error: Box<dyn Fn(u32, &io::Error) + Send>,
+    report_error: Box<dyn Fn(Option<u32>, &io::Error) + Send>,
     taskbar_created: u32,
     icon_registered: Cell<bool>,
 }
@@ -132,7 +132,7 @@ fn run_tray(
     cwd: PathBuf,
     chinese: Arc<AtomicBool>,
     notify: Box<dyn Fn(Action) + Send>,
-    report_error: Box<dyn Fn(u32, &io::Error) + Send>,
+    report_error: Box<dyn Fn(Option<u32>, &io::Error) + Send>,
     stop: &windows::Event,
     ready: &mut Option<mpsc::SyncSender<io::Result<usize>>>,
 ) -> io::Result<()> {
@@ -185,9 +185,9 @@ fn run_tray(
             UnregisterClassW(class_name.as_ptr(), module);
             return Err(error);
         }
-        ChangeWindowMessageFilterEx(window, taskbar_created, MSGFLT_ALLOW, null_mut());
+        context.allow_taskbar_message(window);
         // Explorer might not be ready. TaskbarCreated will retry registration.
-        context.install_icon(window);
+        context.install_icon(window, None);
         let _ = ready
             .take()
             .expect("one tray startup notification")
@@ -245,8 +245,15 @@ impl Context {
         }
     }
 
-    fn update_icon(&self, window: HWND, add: bool) -> bool {
+    fn allow_taskbar_message(&self, window: HWND) {
+        if unsafe { ChangeWindowMessageFilterEx(window, self.taskbar_created, MSGFLT_ALLOW, null_mut()) } == 0 {
+            (self.report_error)(None, &io::Error::last_os_error());
+        }
+    }
+
+    fn update_icon(&self, window: HWND, add: bool) -> io::Result<()> {
         let (icon, owned) = load_icon();
+        if icon.is_null() { return Err(io::Error::last_os_error()); }
         let mut data = icon_data(window);
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = TRAY_EVENT;
@@ -260,17 +267,31 @@ impl Context {
             *dst = src;
         }
         unsafe {
-            let updated = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &data) != 0;
-            if owned {
-                DestroyIcon(icon);
+            let result = if Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &data) != 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            if owned && DestroyIcon(icon) == 0 {
+                (self.report_error)(None, &io::Error::last_os_error());
             }
-            updated
+            result
         }
     }
 
-    fn install_icon(&self, window: HWND) {
-        self.icon_registered
-            .set(self.update_icon(window, true) || self.update_icon(window, false));
+    fn install_icon(&self, window: HWND, message: Option<u32>) {
+        self.icon_registered.set(false);
+        match self.update_icon(window, true) {
+            Ok(()) => { self.icon_registered.set(true); return; }
+            Err(error) => (self.report_error)(message, &error),
+        }
+        // Only Explorer's TaskbarCreated recovery has main's modify fallback.
+        if message.is_some() {
+            match self.update_icon(window, false) {
+                Ok(()) => self.icon_registered.set(true),
+                Err(error) => (self.report_error)(message, &error),
+            }
+        }
     }
 
     fn command(&self, id: i32) -> io::Result<()> {
@@ -385,14 +406,15 @@ unsafe extern "system" fn window_proc(
     if let Some(context) = context {
         let result = match message {
             message if message == context.taskbar_created => {
-                context.install_icon(window);
+                context.install_icon(window, Some(message));
                 Ok(())
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
                 if context.icon_registered.get() {
-                    context.update_icon(window, false);
+                    context.update_icon(window, false)
+                } else {
+                    Ok(())
                 }
-                Ok(())
             }
             TRAY_EVENT if lparam as u32 == WM_RBUTTONUP => context.menu(window),
             TRAY_EVENT if matches!(lparam as u32, WM_LBUTTONUP | WM_LBUTTONDBLCLK) => {
@@ -401,9 +423,39 @@ unsafe extern "system" fn window_proc(
             _ => return unsafe { DefWindowProcW(window, message, wparam, lparam) },
         };
         if let Err(error) = result {
-            (context.report_error)(message, &error);
+            (context.report_error)(Some(message), &error);
         }
         return 0;
     }
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn invalid_window_reports_filter_and_icon_failures_without_stopping_tray() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&errors);
+        let context = Context {
+            cwd: PathBuf::new(), chinese: Arc::new(AtomicBool::new(false)),
+            notify: Box::new(|_| {}),
+            report_error: Box::new(move |message, _| recorded.lock().unwrap().push(message)),
+            taskbar_created: WM_USER + 21, icon_registered: Cell::new(false),
+        };
+        context.allow_taskbar_message(null_mut());
+        assert_eq!(*errors.lock().unwrap(), [None]);
+        errors.lock().unwrap().clear();
+        context.install_icon(null_mut(), None);
+        assert!(!context.icon_registered.get());
+        assert_eq!(*errors.lock().unwrap(), [None]);
+        errors.lock().unwrap().clear();
+        context.install_icon(null_mut(), Some(context.taskbar_created));
+        assert!(!context.icon_registered.get());
+        assert_eq!(*errors.lock().unwrap(), [Some(context.taskbar_created); 2]);
+        // Display refresh returns its error to the existing window callback.
+        assert!(context.update_icon(null_mut(), false).is_err());
+    }
 }

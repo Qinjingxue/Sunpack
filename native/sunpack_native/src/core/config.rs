@@ -1,4 +1,3 @@
-pub(crate) mod order;
 use super::{i18n::Language, resources};
 use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
 use crate::scan::path_filter::{NativePathRule, RuleEntry};
@@ -220,15 +219,29 @@ pub(crate) fn default_idle_seconds() -> f64 {
 
 // Include absent candidates: a deletion must not unsubscribe its recreation,
 // and a new higher-priority config must supersede the current source.
+fn source_candidates(roots: &[PathBuf], name: &str, selected: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for root in roots {
+        let path = root.join(name);
+        let selected = selected == Some(path.as_path());
+        paths.push(path);
+        if selected { break; }
+    }
+    paths
+}
+
 pub(crate) fn watch_paths(cwd: &Path, sources: &ConfigSources) -> Vec<PathBuf> {
     let roots = resources::resource_roots(cwd);
-    let mut paths: Vec<_> = roots.iter().map(|root| root.join(ADVANCED)).collect();
+    // Lower-priority request directories cannot change the selected source.
+    // Keep the selected file and absent higher-priority candidates so deletion,
+    // recreation and a newly overriding configuration still wake readers.
+    let mut paths = source_candidates(&roots, ADVANCED, sources.advanced.as_deref());
     if resources::package_root().is_some() {
         if let Ok(root) = resources::program_data_dir() {
             paths.push(root.join(SIMPLE));
         }
     } else {
-        paths.extend(roots.iter().map(|root| root.join(SIMPLE)));
+        paths.extend(source_candidates(&roots, SIMPLE, sources.simple.as_deref()));
     }
     paths.extend(sources.simple.iter().cloned());
     paths.extend(sources.advanced.iter().cloned());
@@ -266,7 +279,7 @@ pub(crate) fn resolve_sources(cwd: &Path) -> ConfigSources {
         .filter(|value| !value.is_empty());
     if let Some(path) = inline
         .as_deref()
-        .map(|value| cwd.join(value))
+        .and_then(|value| std::path::absolute(value).ok())
         .filter(|path| path.is_file())
     {
         sources.override_file = Some(path);
@@ -386,65 +399,32 @@ impl Layers {
     }
 
     fn parse(&self) -> io::Result<Value> {
-        self.parse_ordered(false).map(|(value, _)| value)
-    }
-
-    fn parse_ordered(&self, capture: bool) -> io::Result<(Value, order::Order)> {
-        let parse = |text: &str, path: &Path| -> io::Result<(Value, order::Order)> {
-            if !capture { return parse_json(text, path).map(|value| (value, order::Order::Scalar)); }
-            let order::Captured(value, order) = serde_json::from_str(text)
-                .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
-            if !value.is_object() {
-                return Err(invalid(format!("Config file must contain a JSON object: {}", path.display())));
-            }
-            Ok((value, order))
-        };
-        let (mut value, mut order) = match self
-            .sources
-            .advanced
-            .as_deref()
-            .zip(self.advanced.as_deref())
-        {
-            Some((path, text)) => parse(text, path)?,
-            None => (Value::Object(Map::new()), order::Order::Object(Vec::new())),
+        let mut value = match self.sources.advanced.as_deref().zip(self.advanced.as_deref()) {
+            Some((path, text)) => parse_json(text, path)?,
+            None => Value::Object(Map::new()),
         };
         if let Some((path, text)) = self.sources.simple.as_deref().zip(self.simple.as_deref()) {
-            let (layer, layer_order) = parse(text, path)?;
-            if capture { order.merge(layer_order, false); }
-            merge(&mut value, layer, false);
+            merge(&mut value, parse_json(text, path)?, false);
         }
         if let Some(text) = self.overrides.as_deref() {
-            let (layer, layer_order) = match self.sources.override_file.as_deref() {
-                Some(path) => parse(text, path)?,
-                None => {
-                    let parsed: Result<_, serde_json::Error> = if capture {
-                        serde_json::from_str::<order::Captured>(text).map(|order::Captured(value, order)| (value, order))
-                    } else { serde_json::from_str(text).map(|value| (value, order::Order::Scalar)) };
-                    parsed.map_err(|error| invalid(if text.starts_with(['{', '[']) {
-                        format!("{OVERRIDES} contains invalid JSON: {error}")
-                    } else {
-                        format!("{OVERRIDES} must be an inline JSON object or an existing JSON file: {text}")
-                    }))?
-                }
+            let layer = match self.sources.override_file.as_deref() {
+                Some(path) => parse_json(text, path)?,
+                None => serde_json::from_str::<Value>(text).map_err(|error| invalid(if text.starts_with(['{', '[']) {
+                    format!("{OVERRIDES} contains invalid JSON: {error}")
+                } else {
+                    format!("{OVERRIDES} must be an inline JSON object or an existing JSON file: {text}")
+                }))?,
             };
-            let object = layer
-                .as_object()
+            let object = layer.as_object()
                 .ok_or_else(|| invalid(format!("{OVERRIDES} must contain a JSON object")))?;
-            let unknown: Vec<_> = object
-                .keys()
-                .filter(|key| defaults().get(*key).is_none())
-                .map(String::as_str)
-                .collect();
+            let unknown: Vec<_> = object.keys()
+                .filter(|key| defaults().get(*key).is_none()).map(String::as_str).collect();
             if !unknown.is_empty() {
-                return Err(invalid(format!(
-                    "{OVERRIDES} contains unknown config sections: {}",
-                    unknown.join(", ")
-                )));
+                return Err(invalid(format!("{OVERRIDES} contains unknown config sections: {}", unknown.join(", "))));
             }
-            if capture { order.merge(layer_order, false); }
             merge(&mut value, layer, false);
         }
-        Ok((value, order))
+        Ok(value)
     }
 }
 
@@ -454,11 +434,6 @@ pub fn load_raw(cwd: &Path) -> io::Result<(PathBuf, Value)> {
     Ok((layers.sources.primary().to_path_buf(), value))
 }
 
-pub(crate) fn load_raw_ordered(cwd: &Path) -> io::Result<(PathBuf, Value, order::Order)> {
-    let layers = Layers::read(resolve_sources(cwd), cwd)?;
-    let (value, order) = layers.parse_ordered(true)?;
-    Ok((layers.sources.primary().to_path_buf(), value, order))
-}
 
 struct Generation {
     stamp: Option<[Option<PhysicalFileGeneration>; 3]>,
@@ -1245,8 +1220,55 @@ fn utc_minute(value: &str) -> Option<i128> {
 }
 
 #[cfg(test)]
+mod layer_merge_tests {
+    use super::*;
+
+    #[test]
+    fn one_config_value_preserves_layer_precedence_and_named_filter_order() {
+        let layers = Layers {
+            sources: ConfigSources {
+                advanced: Some("advanced.json".into()), simple: Some("simple.json".into()),
+                ..ConfigSources::default()
+            },
+            advanced: Some(r#"{"cli":{"language":"en","language":"zh"},"user_passwords":["old"],"filesystem":{"scan_filters":[{"name":"a","z":0,"a":1},{"name":"b","keep":true},{"name":"c","untouched":7}]}}"#.into()),
+            simple: Some(r#"{"filesystem":{"scan_filters":[{"name":"b","extra":7},{"name":"a","a":2,"new":3}]},"user_passwords":["second","first"]}"#.into()),
+            overrides: Some(r#"{"filesystem":{"scan_filters":[{"name":"a","last":1},{"free":true},{"name":"a","later":2}]},"cli":{"verbose":true}}"#.into()),
+        };
+        let value = layers.parse().unwrap();
+        let expected = serde_json::json!({
+            "cli":{"language":"zh","verbose":true},
+            "user_passwords":["second","first"],
+            "filesystem":{"scan_filters":[
+                {"name":"a","z":0,"a":2,"new":3,"last":1,"later":2},
+                {"name":"a","z":0,"a":2,"new":3,"last":1,"later":2},
+                {"name":"b","keep":true,"extra":7},
+                {"name":"c","untouched":7},
+                {"free":true}
+            ]}
+        });
+        assert_eq!(value, expected);
+        // Both show encodings now serialize this same authoritative document,
+        // without a parallel shape that can omit keys or truncate arrays.
+        let encoded = serde_json::to_string_pretty(&value).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), expected);
+    }
+}
+
+#[cfg(test)]
 mod filter_runtime_tests {
     use super::*;
+
+    #[test]
+    fn observed_config_candidates_stop_at_selected_priority() {
+        let roots = [PathBuf::from(r"C:\application"), PathBuf::from(r"C:\request")];
+        let application = roots[0].join(ADVANCED);
+        let request = roots[1].join(ADVANCED);
+        assert_eq!(source_candidates(&roots, ADVANCED, Some(&application)), [application.clone()]);
+        // Missing sources and a lower-priority selection retain the higher
+        // candidate so its later creation can take precedence.
+        assert_eq!(source_candidates(&roots, ADVANCED, None), [application.clone(), request.clone()]);
+        assert_eq!(source_candidates(&roots, ADVANCED, Some(&request)), [application, request]);
+    }
 
     #[test]
     fn filter_validation_errors_match_public_main_messages() {

@@ -754,6 +754,8 @@ pub enum Event {
     Skipped {
         id: TaskId,
     },
+    /// Ordered display update after a task's output subtree was flattened.
+    OutputsRelocated { id: TaskId, old: PathBuf, new: PathBuf },
 }
 
 /// Publication callbacks form the durable boundary for Watch. A failed callback
@@ -856,7 +858,7 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn after_flatten(&self, _old: &Path, _output: &Path) -> io::Result<()> {
+    fn after_flatten(&self, _id: TaskId, _old: &Path, _output: &Path) -> io::Result<()> {
         Ok(())
     }
 

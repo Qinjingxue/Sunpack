@@ -259,7 +259,7 @@ impl InputCheckpoint {
             && self.sources.iter().all(|source| {
                 generations
                     .get(&path_key(&source.path.to_string_lossy()))
-                    .is_some_and(|generation| generation.persisted() == source.generation)
+                    .is_some_and(|generation| generation.matches_input(&source.generation))
             })
 
     }
@@ -827,6 +827,12 @@ mod tests {
             &serde_json::to_vec(&partial).unwrap(),
         ).unwrap();
         assert!(partial.valid_for(&input, &generations));
+        let mut metadata_only = serde_json::to_value(&partial).unwrap();
+        metadata_only["sources"][0]["generation"]["created"] = serde_json::json!([false, 1, 0]);
+        #[cfg(windows)]
+        { metadata_only["sources"][0]["generation"]["windows"]["change_time"] = serde_json::json!(1); }
+        let metadata_only: InputCheckpoint = serde_json::from_value(metadata_only).unwrap();
+        assert!(metadata_only.valid_for(&input, &generations));
         let mut changed = input.clone();
         changed.analysis.password_required = true;
         assert!(!partial.valid_for(&changed, &generations));

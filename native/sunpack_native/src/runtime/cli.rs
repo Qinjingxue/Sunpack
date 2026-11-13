@@ -33,7 +33,7 @@ pub(super) struct Host {
 #[derive(Default)]
 struct SourceObservers {
     paths: Vec<PathBuf>,
-    observers: Vec<watch::FileObserver>,
+    observers: Vec<watch::ConfigSubscription>,
     passwords: Arc<Mutex<Option<std::sync::Weak<passwords::BuiltinStore>>>>,
     changed: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -102,7 +102,7 @@ impl Host {
         let store = self.passwords(cwd)?;
         let sources = self.sources.lock().unwrap();
         let observed = sources.paths.contains(&store.path().to_path_buf())
-            && !sources.observers.is_empty() && sources.observers.iter().all(watch::FileObserver::alive);
+            && !sources.observers.is_empty() && sources.observers.iter().all(watch::ConfigSubscription::alive);
         drop(sources);
         Ok(if observed { store.observed_snapshot() } else { store.snapshot_for_request() })
     }
@@ -113,9 +113,13 @@ impl Host {
         let password_path = resources::writable_data_dir(cwd).map(|dir| dir.join(passwords::FILENAME));
         let Ok(password_path) = password_path else { return config::generation(cwd); };
         paths.push(password_path.clone());
+        let mut retired = Vec::new();
         let mut sources = self.sources.lock().unwrap();
-        if sources.changed.swap(false, std::sync::atomic::Ordering::AcqRel)
-            || sources.paths != paths || sources.observers.iter().any(|observer| !observer.alive()) {
+        let unobserved = sources.observers.is_empty() || sources.observers.iter().any(|observer| !observer.alive());
+        let new_sources = sources.paths != paths;
+        let changed = sources.changed.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if unobserved || new_sources
+            || (changed && !watch::observes_files(&paths, &password_path, &sources.observers)) {
             let passwords = Arc::clone(&sources.passwords);
             let changed = Arc::clone(&sources.changed);
             match watch::observe_files(&paths, &password_path, move |config, changed_passwords| {
@@ -130,16 +134,26 @@ impl Host {
                 }
             }) {
                 Ok(observers) => {
-                    sources.observers = observers;
+                    retired = std::mem::replace(&mut sources.observers, observers);
                     sources.paths = paths;
-                    config::invalidate_sources();
-                    if let Some(store) = sources.passwords.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
-                        store.invalidate();
+                    if unobserved || new_sources {
+                        config::invalidate_sources();
+                        if let Some(store) = sources.passwords.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
+                            store.invalidate();
+                        }
                     }
                 }
-                Err(_) => return config::generation(cwd),
+                Err(_) => {
+                    sources.changed.store(true, std::sync::atomic::Ordering::Release);
+                    drop(sources);
+                    return config::generation(cwd);
+                },
             }
         }
+        drop(sources);
+        // The last reader of a removed directory joins its native observer.
+        // Never do that while holding the request source registry lock.
+        drop(retired);
         config::observed_generation(cwd)
     }
 }
@@ -640,7 +654,6 @@ struct CommandResult {
     items: Vec<Value>,
     tasks: Vec<Value>,
     logs: Vec<String>,
-    config_order: Option<config::order::Order>,
     emitted_errors: usize,
 }
 
@@ -654,7 +667,6 @@ impl CommandResult {
             items: Vec::new(),
             tasks: Vec::new(),
             logs: Vec::new(),
-            config_order: None,
             emitted_errors: 0,
         }
     }
@@ -809,6 +821,9 @@ fn interrupted(
         "interrupt.cleanup_failed"
     };
     line(session, Stream::Err, language.text(message))?;
+    if options.json {
+        for error in &cleanup_errors { line(session, Stream::Err, error)?; }
+    }
     let mut result = CommandResult::new(options.command);
     if let Some(paths) = inputs {
         result.inputs = json!({"paths": paths});
@@ -1051,13 +1066,8 @@ impl ArchiveSummary {
                     })
                     .sum::<u64>();
                 let mut recovery = json!({"archive": entries[0].path, "out_dir": output, "complete_files": complete});
-                if let Some(warning) = entries
-                    .iter()
-                    .filter_map(|entry| entry.failure.as_ref())
-                    .find(|failure| failure.kind == FailureKind::MissingVolume
-                        || failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume))
-                {
-                    recovery["warning"] = json!({"kind": warning.kind, "message": failure_message(warning, language)});
+                if let Some(warning) = failures::recovery_warning(entries, language) {
+                    recovery["warning"] = serde_json::to_value(warning).expect("failure report is serializable");
                 }
                 summary.recovered.push(recovery);
             } else {
@@ -1298,16 +1308,14 @@ impl Observer for Progress {
         self.watch.prepare_external_flatten(output, work, leaf)
     }
 
-    fn after_flatten(&self, old: &Path, output: &Path) -> io::Result<()> {
+    fn after_flatten(&self, id: TaskId, old: &Path, output: &Path) -> io::Result<()> {
         self.watch.finish_external_flatten(output)?;
         if self.visible {
-            // Use the same lock order as flush_events. A queued Finished must
-            // not restore its old path after the visible rows were relocated.
-            let mut display = self.display.lock().unwrap();
-            self.reporting.relocate_outputs(old, output);
-            if let Some(panel) = &mut display.panel {
-                panel.relocate_outputs(old, output);
-            }
+            // Keep relocation in the same ordered stream as registration and
+            // Finished, so buffered results cannot restore stale output paths.
+            self.reporting.notify(Event::OutputsRelocated {
+                id, old: old.to_owned(), new: output.to_owned(),
+            });
         }
         Ok(())
     }
@@ -2353,22 +2361,15 @@ async fn show_config(
         return Ok((0, result));
     }
     crate::pipeline::stage("cli", &Cancellation::new()).await?;
-    let (path, payload, order) = if options.action == "show" {
-        let (path, payload, order) = config::load_raw_ordered(cwd)?;
-        (path, payload, Some(order))
-    } else {
-        let (path, payload) = config::load_raw(cwd)?;
-        (path, payload, None)
-    };
+    let (path, payload) = config::load_raw(cwd)?;
     result.summary = json!({"config_path": path, "changed": false});
     let errors = match Config::parse(&payload)? {
         _ if options.action == "show" => {
             // The persistent runtime validates configuration before dispatch,
             // even when show returns the original, unnormalized document.
             if !options.json {
-                write_json(session, &config::order::Ordered(&payload, order.as_ref().unwrap()))?;
+                write_json(session, &payload)?;
             }
-            result.config_order = order;
             result.items.push(payload);
             return Ok((0, result));
         }
@@ -2813,6 +2814,28 @@ mod recursive_prompt_tests {
         fn terminal_size(&self) -> (usize, usize) { (80, 25) }
     }
 
+    #[test]
+    fn interrupted_cleanup_details_reach_stderr_once_in_both_modes() {
+        for json in [false, true] {
+            let input = Input::default();
+            let args = if json { vec!["extract".into(), "--json".into()] }
+                else { vec!["extract".into()] };
+            let options = Options::parse(&args).unwrap();
+            let error = "C:\\output: access denied".to_owned();
+            let (code, mut result) = interrupted(&options, &input, Language::En, None, vec![error.clone()]).unwrap();
+            if json { write_json(&input, &result).unwrap(); }
+            else { result.emit_errors(&input).unwrap(); }
+            assert_eq!(code, 130);
+            let stderr = String::from_utf8(input.stderr.lock().unwrap().clone()).unwrap();
+            assert_eq!(stderr.matches(&error).count(), 1);
+            if json {
+                let value: Value = serde_json::from_slice(&input.stdout.lock().unwrap()).unwrap();
+                assert_eq!(value["errors"][0], error);
+                assert_eq!(value["summary"]["cleanup_complete"], false);
+            }
+        }
+    }
+
     // Covers localized help grouping and the noninteractive disk warning, which
     // final archive-tree tests cannot observe.
     #[test]
@@ -3187,6 +3210,47 @@ mod recursive_prompt_tests {
         assert!(text[..prompt].contains("good.zip: locked"));
         assert!(!text[prompt..].contains("good.zip: locked"));
         assert!(text[..prompt].contains("carrier-output"));
+    }
+
+    #[test]
+    fn partial_recovery_warning_reuses_full_carrier_report_and_omits_confirmed_missing() {
+        let mut archive = report_archive("split.7z.001", 0);
+        archive.partial = true;
+        archive.output = Some("recovered".into());
+        archive.recovered_complete_files = 2;
+        let mut failure = crate::pipeline::Failure::new(FailureKind::Damaged, "damaged")
+            .with_context(crate::pipeline::FailureContext::Extraction);
+        failure.evidence = Some(Box::new(crate::pipeline::FailureEvidence {
+            possible_missing_volume: true, ..Default::default()
+        }));
+        failure.recovery = Some(Arc::new(serde_json::from_value(json!({
+            "inputs":[], "output":"recovered", "input_count":1,
+            "had_checkpoints":false, "retry_output":true,
+        })).unwrap()));
+        archive.failure = Some(failure);
+        let summary = ArchiveSummary::collect([&archive], Language::En, true);
+        let warning = &summary.recovered[0]["warning"];
+        assert_eq!(warning.as_object().unwrap().len(), 8);
+        assert_eq!(warning, &serde_json::to_value(failures::archive_report(&[&archive], Language::En).unwrap()).unwrap());
+        assert_eq!(warning["stage"], "extraction_report");
+        assert_eq!(warning["message_key"], "failure.possible_missing_volume");
+        assert_eq!(warning["details"]["missing_volume_confirmed"], false);
+        assert_eq!(warning["details"]["partial_recovery"], true);
+        assert_eq!(warning["details"]["retry_output_dir"], "recovered");
+        assert!(warning["details"].get("input_recovery").is_some());
+        assert_eq!(warning["causes"][0]["kind"], "damaged");
+        let message = warning["message"].as_str().unwrap().to_owned();
+        let mut outcome = Outcome::default();
+        outcome.archives.push(archive);
+        for confirmed in [false, true] {
+            if confirmed { outcome.archives[0].failure.as_mut().unwrap().kind = FailureKind::MissingVolume; }
+            let summary = ArchiveSummary::collect(&outcome.archives, Language::En, true);
+            assert_eq!(summary.recovered[0].get("warning").is_some(), !confirmed);
+            let input = Input::default();
+            report_extract_round(&outcome, &[], 0, &input, Language::En).unwrap();
+            let text = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
+            assert_eq!(text.contains(&Language::En.translate("report.partial_warning", &[("warning", &message)])), !confirmed);
+        }
     }
 
     #[test]

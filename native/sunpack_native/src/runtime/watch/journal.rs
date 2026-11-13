@@ -294,7 +294,10 @@ impl Journal {
                 let publication = (|| {
                     drop(File::create(&temp)?);
                     checkpoint.write(temp.to_string_lossy().into_owned())?;
-                    crate::io::atomic_file::replace_once(&temp, &snapshot)
+                    crate::io::atomic_file::replace_once(&temp, &snapshot)?;
+                    // Publication must be durable before retiring its WAL prefix.
+                    // Windows requires a writable handle for FlushFileBuffers.
+                    OpenOptions::new().read(true).write(true).open(&snapshot)?.sync_all()
                 })();
                 let _ = fs::remove_file(&temp);
                 if let Err(error) = publication {

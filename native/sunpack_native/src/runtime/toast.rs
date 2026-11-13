@@ -937,6 +937,13 @@ impl Activity {
         }
     }
 
+    pub(super) fn needs_root_report(&self, id: TaskId) -> bool {
+        let state = self.publisher.shared.state.lock().unwrap();
+        !state.stopping && state.groups.iter()
+            .filter_map(|group| group.requests.get(&self.request))
+            .any(|request| request.pending_reports.contains(&id))
+    }
+
     pub(super) fn record_root(&self, id: TaskId, path: &Path, outcome: &Outcome) {
         let (group_id, language, report) = {
             let state = self.publisher.shared.state.lock().unwrap();
@@ -1993,6 +2000,7 @@ mod tests {
                 error_code: 5, message: "source busy".into(),
             });
             activity.root_finished(1, &done);
+            assert!(!activity.needs_root_report(1));
             activity.record_root(1, Path::new("a.zip"), &done);
             activity.report_finished(1, false);
             {
@@ -2011,8 +2019,10 @@ mod tests {
             failed.archives.push(archive("c.zip", Some(FailureKind::Damaged)));
             activity.event(Event::Finished { id: 3, path: "c.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { discovery: None, status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
             activity.root_finished(3, &failed);
+            assert!(activity.needs_root_report(3));
             activity.record_root(3, Path::new("c.zip"), &failed);
             activity.report_finished(3, false);
+            assert!(!activity.needs_root_report(3));
             assert_eq!(current(&publisher).status, "2/3 finished");
             let owner = |path: &Path| {
                 let path = path.to_string_lossy();

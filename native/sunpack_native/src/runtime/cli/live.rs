@@ -57,10 +57,12 @@ pub(super) struct Panel {
 impl Panel {
     pub(super) fn new(verbose: bool) -> Self { Self { verbose, ..Self::default() } }
 
-    pub(super) fn relocate_outputs(&mut self, old: &std::path::Path, new: &std::path::Path) {
-        for task in self.tasks.values_mut() {
-            if let Some(result) = &mut task.result {
-                result.relocate_output(old, new);
+    fn relocate_outputs(&mut self, id: TaskId, old: &std::path::Path, new: &std::path::Path) {
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            if let Some(task) = self.tasks.get_mut(&id) {
+                pending.extend(task.children.iter().copied());
+                if let Some(result) = &mut task.result { result.relocate_output(old, new); }
             }
         }
     }
@@ -73,6 +75,11 @@ impl Panel {
         prompting: bool,
     ) {
         let (id, phase) = match event {
+            Event::OutputsRelocated { id, old, new } => {
+                self.relocate_outputs(id, &old, &new);
+                if !prompting { self.redraw(session, language, true); }
+                return;
+            }
             Event::Queued {
                 id,
                 parent,
@@ -477,26 +484,8 @@ pub(super) fn wait_status(state: ResourceWait, language: Language) -> (&'static 
     (language.text(status), hint)
 }
 
-// Python's int/int division rounds the exact quotient once. Casting both
-// operands first can change percent boundaries above the exact-integer range.
 fn progress_ratio(completed: u64, total: u64) -> f64 {
-    if completed >= total { return 1.0; }
-    if completed == 0 { return 0.0; }
-    if total <= (1_u64 << 53) { return completed as f64 / total as f64; }
-    let mut exponent = total.leading_zeros() as i32 - completed.leading_zeros() as i32;
-    if (completed as u128) << (-exponent as u32) < total as u128 { exponent -= 1; }
-    let numerator = (completed as u128) << (52 - exponent) as u32;
-    let divisor = total as u128;
-    let mut significand = numerator / divisor;
-    let remainder = numerator % divisor;
-    if remainder * 2 > divisor || (remainder * 2 == divisor && significand & 1 != 0) {
-        significand += 1;
-    }
-    if significand == (1_u128 << 53) {
-        significand >>= 1;
-        exponent += 1;
-    }
-    f64::from_bits(((exponent + 1023) as u64) << 52 | (significand as u64 - (1_u64 << 52)))
+    if completed >= total { 1.0 } else { completed as f64 / total as f64 }
 }
 
 fn append_progress(text: &mut String, progress: Option<(u64, u64)>, bar: bool) {
@@ -686,16 +675,12 @@ mod tests {
         assert_eq!(status_text("X", Some((58, 100)), "", None), "[X] [###########---------]  57%");
         assert_eq!(status_text("X", Some((101, 100)), "", None), "[X] [####################] 100%");
         assert_eq!(status_text("X", Some((1, 0)), "", Some(10)), "[X]  --%");
-        // Golden ratios from Python's integer true division, including values
-        // that would round differently if each operand were converted first.
-        for (completed, total, expected) in [
-            (9_007_199_254_740_991, 9_007_199_254_740_993, 0.9999999999999998),
-            (2_612_087_783_874_887, 9_007_199_254_740_993, 0.28999999999999987),
-            (5_349_555_781_375_769_968, u64::MAX, 0.29),
-            (1, u64::MAX, 5.421010862427522e-20),
-        ] {
-            assert_eq!(progress_ratio(completed, total), expected);
-        }
+        // Huge logical byte counts remain bounded and monotonic without
+        // reproducing another language's integer-division rounding.
+        let half = progress_ratio(u64::MAX / 2, u64::MAX);
+        assert!(half > 0.0 && half < 1.0);
+        assert!(progress_ratio(1, u64::MAX) <= half);
+        assert_eq!(progress_ratio(u64::MAX, u64::MAX), 1.0);
         let terminal = Terminal { size: (80, 30), output: Mutex::default() };
         let mut panel = Panel::default();
         panel.update(&terminal, Language::En, queued(1, None, "archive.zip", None), true);
@@ -773,21 +758,33 @@ mod tests {
                 result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None, output: Some(path.into()) },
             }, false);
         }
+        reports.notify(queued(6, Some(1), "queued.zip", None));
+        reports.notify(Event::Finished {
+            id: 6, path: "queued.zip".into(), depth: 1,
+            result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
+                output: Some("root/wrapper/leaf/queued".into()) },
+        });
         reports.notify(Event::Finished {
             id: 2, path: "nested.zip".into(), depth: 1,
             result: TaskCompletion { discovery: None, status: TaskStatus::Complete, failure: None,
                 output: Some("root/wrapper/leaf/nested".into()) },
         });
         let (old, new) = (std::path::Path::new("root/wrapper/leaf"), std::path::Path::new("root"));
-        reports.relocate_outputs(old, new);
-        panel.relocate_outputs(old, new);
+        reports.notify(Event::OutputsRelocated { id: 1, old: old.to_owned(), new: new.to_owned() });
         for event in reports.take_events() {
             panel.update(&terminal, Language::En, event, false);
         }
         for (id, expected) in [(2, "root/nested"), (3, "root/nested/deep"),
-                               (4, "root"), (5, "elsewhere/output")] {
+                               (4, "root"), (5, "elsewhere/output"), (6, "root/queued")] {
             assert_eq!(panel.tasks[&id].result.as_ref().unwrap().output.as_deref(), Some(std::path::Path::new(expected)));
         }
+        // Task topology, not the number of unrelated rows or even their path
+        // spelling, determines the relocation's visit set.
+        panel.tasks.get_mut(&5).unwrap().result.as_mut().unwrap().output = Some("root/wrapper/leaf/unrelated".into());
+        panel.relocate_outputs(1, old, new);
+        assert_eq!(panel.tasks[&5].result.as_ref().unwrap().output.as_deref(),
+            Some(std::path::Path::new("root/wrapper/leaf/unrelated")));
+        panel.tasks.get_mut(&5).unwrap().result.as_mut().unwrap().output = Some("elsewhere/output".into());
         let rows = panel.rows(terminal.size, true, Language::En);
         assert!(rows.iter().all(|row| !row.text.contains("wrapper")));
         assert!(rows.iter().any(|row| row.text.contains("elsewhere")));

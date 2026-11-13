@@ -219,3 +219,19 @@ def test_saved_output_mapping_and_cli_override(package, tmp_path, mapping):
     if mapping == "cli":
         assert not saved.exists()
         assert not (override / "set").exists()
+
+
+def test_relative_override_file_uses_service_cwd_not_request_cwd(package, tmp_path):
+    service = package.launcher.parent.parent
+    request = tmp_path / "request"
+    request.mkdir()
+    name = "relative-override.json"
+    (service / name).write_text(json.dumps({"runtime": {"process_mode": "NORMAL"}}), encoding="utf-8")
+    (request / name).write_text(json.dumps({"runtime": {"process_mode": "BACKGROUND"}}), encoding="utf-8")
+    package.env["SUNPACK_CONFIG_OVERRIDES"] = name
+    assert package.json("config", "show", cwd=request)["items"][0]["runtime"]["process_mode"] == "NORMAL"
+    (request / name).unlink()
+    assert package.json("config", "show", cwd=request)["items"][0]["runtime"]["process_mode"] == "NORMAL"
+    (service / name).unlink()
+    (request / name).write_text("{}", encoding="utf-8")
+    assert package.json("config", "show", cwd=request, code=2)["errors"]

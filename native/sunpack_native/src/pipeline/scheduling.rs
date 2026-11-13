@@ -702,6 +702,7 @@ impl<'a> Spawner<'a> {
     {
         let spawner = self.clone();
         Box::pin(async move {
+            if spawner.cancel.cancelled() { return Vec::new(); }
             let available = spawner.consumers.fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -715,6 +716,7 @@ impl<'a> Spawner<'a> {
             if count == 0 {
                 let mut results = Vec::with_capacity(items.len());
                 for item in items {
+                    if spawner.cancel.cancelled() { break; }
                     results.push(operation(item).await);
                 }
                 return results;
@@ -729,8 +731,12 @@ impl<'a> Spawner<'a> {
                 let remaining = Arc::clone(&remaining);
                 let operation = Arc::clone(&operation);
                 let results = Arc::clone(&results);
+                let cancel = spawner.cancel.clone();
                 consumers.push(spawner.spawn(Box::pin(async move {
                     loop {
+                        // Cancellation stops claiming the tail, but already
+                        // started operations still run to their cleanup barrier.
+                        if cancel.cancelled() { break; }
                         // Never hold the iterator mutex across an await.
                         let next = remaining.lock().unwrap().next();
                         let Some((index, item)) = next else { break };
@@ -744,9 +750,10 @@ impl<'a> Spawner<'a> {
             }
             // Keep discovery-order aggregation and first-error behavior in
             // linear time, without retaining a result vector for each worker.
-            // Every consumer has joined, so all indexed slots are initialized.
+            // Every consumer has joined. Cancelled batches leave unclaimed
+            // slots empty; retain only dispatched results, in discovery order.
             let results = std::mem::take(&mut *results.lock().unwrap());
-            results.into_iter().map(|result| result.expect("consumer produced a result")).collect()
+            results.into_iter().flatten().collect()
         })
     }
 
@@ -1018,6 +1025,44 @@ mod tests {
             })
         });
         assert_eq!(results, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cancelled_batches_stop_the_tail_and_join_started_consumers() {
+        for capacity in [0, 2] {
+            let scheduler = single_slot();
+            let cancel = Cancellation::new();
+            let token = cancel.clone();
+            let results = scheduler.run(1, Origin::Foreground, &cancel, |spawner| {
+                Box::pin(async move {
+                    spawner.consumers.store(capacity, Ordering::Release);
+                    let gate = Arc::new(Mutex::new((false, None::<Waker>)));
+                    let results = spawner.bounded_map((0..100).collect(), move |item| {
+                        let gate = Arc::clone(&gate);
+                        let token = token.clone();
+                        Box::pin(async move {
+                            if capacity == 2 && item == 0 {
+                                poll_fn(|cx| {
+                                    let mut gate = gate.lock().unwrap();
+                                    if gate.0 { Poll::Ready(()) } else {
+                                        gate.1 = Some(cx.waker().clone()); Poll::Pending
+                                    }
+                                }).await;
+                            } else {
+                                token.cancel();
+                                let mut gate = gate.lock().unwrap();
+                                gate.0 = true;
+                                if let Some(waker) = gate.1.take() { waker.wake(); }
+                            }
+                            item
+                        })
+                    }).await;
+                    assert_eq!(spawner.consumers.load(Ordering::Acquire), capacity);
+                    results
+                })
+            });
+            assert_eq!(results, if capacity == 0 { vec![0] } else { vec![0, 1] });
+        }
     }
 
     #[test]

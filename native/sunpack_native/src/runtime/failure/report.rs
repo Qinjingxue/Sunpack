@@ -272,14 +272,28 @@ pub(in crate::runtime) fn archive_groups<'a>(archives: impl IntoIterator<Item = 
 }
 
 pub(in crate::runtime) fn archive_report(entries: &[&ArchiveResult], language: Language) -> Option<Report> {
+    archive_projection(entries, language, false)
+}
+
+pub(in crate::runtime) fn recovery_warning(entries: &[&ArchiveResult], language: Language) -> Option<Report> {
+    archive_projection(entries, language, true)
+}
+
+fn archive_projection(entries: &[&ArchiveResult], language: Language, warning_only: bool) -> Option<Report> {
+    let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
+        .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
+    let warning = postprocess.is_none()
+        && !entries.iter().filter_map(|entry| entry.failure.as_ref())
+            .any(|failure| failure.contains(FailureKind::MissingVolume))
+        && entries.iter().filter_map(|entry| entry.failure.as_ref())
+            .any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume));
+    if warning_only && !warning { return None; }
     let mut causes: Vec<_> = entries.iter().filter_map(|entry| entry.failure.as_ref())
         .map(|failure| Report::from_failure(failure, language)).collect();
     if causes.is_empty() { return None; }
     let recovery = entries.iter().filter_map(|entry| entry.failure.as_ref()).find_map(recovery);
     let report_count = recovery.map_or(entries.len(), |recovery| recovery.input_count());
     let aggregated = entries.len() > 1 || recovery.is_some_and(|recovery| recovery.aggregated());
-    let postprocess = entries.iter().filter_map(|entry| entry.failure.as_ref())
-        .find(|failure| matches!(failure.context.as_deref(), Some(FailureContext::Postprocess { .. })));
     // Admission inspects the physical task before per-input execution.
     // Its repeated receipts are one task failure, not failed segments.
     let admission = entries.iter().all(|entry| entry.failure.as_ref().is_some_and(|failure|
@@ -312,9 +326,7 @@ pub(in crate::runtime) fn archive_report(entries: &[&ArchiveResult], language: L
     if postprocess.is_none() {
         if let Some(recovery) = recovery { report.attach_recovery(recovery, language); }
     }
-    let warning = entries.iter().filter_map(|entry| entry.failure.as_ref())
-        .any(|failure| failure.evidence.as_deref().is_some_and(|e| e.possible_missing_volume));
-    if warning && postprocess.is_none() {
+    if warning {
         let partial = entries.iter().any(|entry| entry.partial)
             && entries.iter().all(|entry| entry.failure.is_none() || entry.partial);
         let key = "failure.possible_missing_volume";

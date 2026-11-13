@@ -870,6 +870,21 @@ impl PhysicalFileGeneration {
             None
         }
     }
+    /// Input recovery follows the source identity, size and last-write time.
+    /// Cache and mutation receipts keep the stronger full-generation equality.
+    pub(crate) fn matches_input(&self, saved: &PersistedFileGeneration) -> bool {
+        self.len == saved.len
+            && self.modified.map(persisted_file_time) == saved.modified
+            && {
+                #[cfg(windows)]
+                { self.windows.volume == saved.windows.volume
+                    && self.windows.file_id == saved.windows.file_id
+                    && self.windows.write_time == saved.windows.write_time }
+                #[cfg(not(windows))]
+                { true }
+            }
+    }
+
     pub(crate) fn persisted(&self) -> PersistedFileGeneration {
         PersistedFileGeneration {
             len: self.len,
@@ -2085,6 +2100,34 @@ fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<us
 mod tests {
     use super::*;
     use crate::test_support::temp_file;
+
+    #[test]
+    fn input_recovery_ignores_metadata_only_changes_but_receipts_do_not() {
+        let path = temp_file("input_generation", b"archive");
+        let original = capture_file_generation(&path).unwrap();
+        let saved = original.persisted();
+        let mut changed = original.clone();
+        changed.created = Some(std::time::UNIX_EPOCH);
+        #[cfg(windows)]
+        { changed.windows.change_time = changed.windows.change_time.wrapping_add(1); }
+        assert!(changed.matches_input(&saved));
+        assert_ne!(changed.persisted(), saved);
+        changed.len += 1;
+        assert!(!changed.matches_input(&saved));
+        changed = original.clone();
+        changed.modified = Some(std::time::UNIX_EPOCH);
+        assert!(!changed.matches_input(&saved));
+        #[cfg(windows)]
+        {
+            changed = original.clone();
+            changed.windows.file_id[0] ^= 1;
+            assert!(!changed.matches_input(&saved));
+            changed = original.clone();
+            changed.windows.volume = changed.windows.volume.wrapping_add(1);
+            assert!(!changed.matches_input(&saved));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn short_and_exact_reads_preserve_eof_semantics() {

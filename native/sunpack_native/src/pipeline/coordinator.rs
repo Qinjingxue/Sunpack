@@ -1213,6 +1213,7 @@ impl<'run, O: Observer> Run<'run, O> {
         let owner = Arc::clone(self);
         let has_root_errors = !root_errors.is_empty();
         let root_errors = Mutex::new(root_errors);
+        let task_count = batch.tasks.len();
         let executed = spawner.bounded_map(batch.tasks, move |task| {
             let root_errors = has_root_errors
                 .then(|| root_errors.lock().unwrap().remove(&task.entry().entry_path))
@@ -1242,6 +1243,7 @@ impl<'run, O: Observer> Run<'run, O> {
             })
         }).await;
         stage("report", &Cancellation::new()).await?;
+        outcome.uncommitted |= executed.len() != task_count;
         let mut first_error = None;
         for (id, mut cancelled, branch, unowned_errors) in executed {
             if let Some(errors) = unowned_errors {
@@ -1854,6 +1856,7 @@ impl<'run, O: Observer> Run<'run, O> {
             // Finish every logical parent before prompting or descending into
             // any segment. Independent output trees share the existing request
             // consumer budget rather than serializing behind the first subtree.
+            let parent_output_count = parent_outputs.len();
             let mut recursive = Vec::new();
             let mut descendants = Vec::with_capacity(count);
             for (index, (result, inventory, input, id)) in parent_outputs.into_iter().enumerate() {
@@ -1913,6 +1916,10 @@ impl<'run, O: Observer> Run<'run, O> {
             } else if !recursive.is_empty() {
                 descendants.extend(spawner.bounded_map(recursive, descend).await);
             }
+            // Cancellation may leave recursive outputs undispatched. Their
+            // existing carrier receipts must stay owned for request rollback.
+            outputs_committed &= descendants.len() == parent_output_count;
+            carrier_children_complete &= descendants.len() == parent_output_count;
             // Join every writer before committing or cleaning up, then restore
             // logical segment order, including segments with no recursive work.
             descendants.sort_unstable_by_key(|(index, _)| *index);
@@ -1948,7 +1955,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                     stage("postprocess", cancel).await?;
                     flatten_result(
-                        &*this.observer, &mut result, &mut descendants, Some(&this.created_outputs),
+                        &*this.observer, task_id, &mut result, &mut descendants, Some(&this.created_outputs),
                     )?;
                     children_complete &= subtree_complete(&descendants);
                 }
@@ -2021,7 +2028,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     let input = ArchiveInput::file(owner_path.to_string_lossy().into_owned(), String::new(), String::new());
                     let mut container = receipt(&input, task.source, depth);
                     container.output = Some(root.clone());
-                    let flattened = flatten_result(&*this.observer, &mut container, &mut children, Some(&this.created_outputs));
+                    let flattened = flatten_result(&*this.observer, task_id, &mut container, &mut children, Some(&this.created_outputs));
                     completed = children.archives.take_tail();
                     outcome.checkpoints.append(&mut children.checkpoints);
                     carrier = container.output;
@@ -3251,6 +3258,7 @@ impl<'run, O: Observer> Run<'run, O> {
 
 fn flatten_result(
     observer: &impl Observer,
+    id: TaskId,
     result: &mut ArchiveResult,
     children: &mut Outcome,
     created: Option<&Mutex<CreatedOutputs>>,
@@ -3297,7 +3305,7 @@ fn flatten_result(
     }
     if let (Some(old), Some(new)) = (stats.source_dir, stats.output_dir) {
         // Settle the durable pre-move receipts before publishing rebased ones.
-        observer.after_flatten(&old, &new)?;
+        observer.after_flatten(id, &old, &new)?;
         // Successful flatten commonly keeps the root spelling unchanged while
         // moving its leaf's descendants. Rebase rollback receipts with the same
         // mapping as checkpoints, before any fallible durable publication.
@@ -6208,7 +6216,9 @@ mod tests {
                 if panic {
                     assert!(result.is_err());
                 } else {
-                    assert_eq!(result.unwrap(), vec![false; 8]);
+                    let results = result.unwrap();
+                    assert!(!results.is_empty() && results.len() <= 8);
+                    assert!(results.iter().all(|allowed| !allowed));
                 }
                 for decision in prompts.decisions.lock().unwrap().values() {
                     assert!(decision.0.lock().unwrap().waiters.is_empty());
@@ -7312,6 +7322,23 @@ mod tests {
         assert_eq!(outcome.archives[0].failure.as_ref().unwrap().kind, FailureKind::Cancelled);
         assert!(!subtree_complete(&outcome));
         assert!(!is_cancellation(&io::Error::other("journal failure")));
+        // A fully undispatched recursive batch still carries incompleteness;
+        // an empty result cannot authorize a parent/carrier commit.
+        let input = ArchiveInput::file("parent/unstarted.zip".into(), "zip".into(), "unstarted".into());
+        let batch = Discovered {
+            tasks: vec![Task {
+                primary: None,
+                inputs: vec![LogicalInput { password_probe: None, input, password: None, failure: None }],
+                owned_paths: Vec::new(), source: DiscoverySource::Direct, retry: None, scope: None,
+            }],
+            errors: Vec::new(), scan_errors: DirectoryReadErrors::report(), blocked_paths: HashSet::new(),
+        };
+        let outcome = Scheduler::new().run(2, Origin::Foreground, &request.cancel, |spawner| {
+            Box::pin(run.execute_batch(batch, 2, None, Some((1, &parent)), spawner))
+        }).unwrap();
+        assert!(outcome.archives.is_empty());
+        assert!(outcome.uncommitted);
+        assert!(!subtree_complete(&outcome));
     }
 
     #[test]
@@ -7357,7 +7384,7 @@ mod tests {
         let mut children = Outcome::default();
         children.archives.push(nested);
         let observer = Discards(Mutex::default());
-        flatten_result(&observer, &mut archive, &mut children, Some(&created)).unwrap();
+        flatten_result(&observer, 1, &mut archive, &mut children, Some(&created)).unwrap();
         assert_eq!(archive.output.as_ref(), Some(&output));
         assert_eq!(created.lock().unwrap().0.get(&output_key(&output)).unwrap().1.path, source);
         let published_child = output.join("child");
@@ -7393,7 +7420,7 @@ mod tests {
         // failure, distinct from ordinary source-cleanup warnings.
         let held = fs::OpenOptions::new().access_mode(0x1).share_mode(3)
             .custom_flags(0x0200_0000).open(&output).unwrap();
-        let result = flatten_result(&|_: Event| {}, &mut archive, &mut outcome, None);
+        let result = flatten_result(&|_: Event| {}, 1, &mut archive, &mut outcome, None);
         let payload = fs::read(wrapper.join("payload.txt"));
         drop(held);
         fs::remove_dir_all(&output).unwrap();
