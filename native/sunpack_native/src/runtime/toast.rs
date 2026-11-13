@@ -136,30 +136,22 @@ impl Snapshot {
                     ("total_bytes", &format_bytes(total)),
                 ],
             )
-        } else if total != 0 {
-            language.translate(
-                "toast.progress.known_bytes",
-                &[
-                    ("completed_bytes", &format_bytes(completed)),
-                    ("total_bytes", &format_bytes(total)),
-                ],
-            )
-        } else if !disk && !memory {
-            language.text("toast.progress.indeterminate").to_owned()
         } else {
-            String::new()
+            language.text("toast.progress.indeterminate").to_owned()
         };
         Self {
             batch: group.id.to_string(),
             kind: 1,
             title: language.text(title).to_owned(),
-            body: language.translate(
+            body: if group.stopping {
+                language.text("interrupt.stopping").to_owned()
+            } else { language.translate(
                 "toast.progress.body",
                 &[
                     ("completed", &finished.to_string()),
                     ("total", &count.to_string()),
                 ],
-            ),
+            ) },
             progress,
             label: if count == 1 {
                 group.requests.values()
@@ -217,6 +209,10 @@ impl Snapshot {
                 ("duration", &duration),
             ],
         );
+        if !summary.cleanup_warnings.is_empty() {
+            body.push('\n');
+            body.push_str(&summary.cleanup_warnings);
+        }
         if summary.interrupted != 0 {
             let interrupted = language.text(if summary.rollback_failed {
                 "interrupt.cleanup_failed"
@@ -231,13 +227,6 @@ impl Snapshot {
                 body.push('\n');
                 body.push_str(interrupted);
             }
-        }
-        if summary.cleanup_failed != 0 {
-            body.push('\n');
-            body.push_str(&language.translate(
-                "toast.final.cleanup_warning",
-                &[("count", &summary.cleanup_failed.to_string())],
-            ));
         }
         let action = summary.output.as_ref().map(|path| {
             (
@@ -350,6 +339,21 @@ struct Group {
     report: Arc<Mutex<ReportDraft>>,
 }
 
+// Match main's bounded per-request warning lines; completed batches never
+// retain an unbounded list of request receipts.
+fn append_warning(warnings: &mut String, warning: &str) {
+    if warning.is_empty() { return; }
+    let remaining = 2048usize.saturating_sub(warnings.chars().count() + usize::from(!warnings.is_empty()));
+    if remaining == 0 { return; }
+    if !warnings.is_empty() { warnings.push('\n'); }
+    if warning.chars().count() >= remaining {
+        warnings.extend(warning.chars().take(remaining - 1));
+        warnings.push('…');
+    } else {
+        warnings.push_str(warning);
+    }
+}
+
 #[derive(Clone, Default)]
 struct Summary {
     succeeded: usize,
@@ -357,7 +361,7 @@ struct Summary {
     interrupted: usize,
     rollback_failed: bool,
     report_failed: bool,
-    cleanup_failed: usize,
+    cleanup_warnings: String,
     output: Option<PathBuf>,
 }
 
@@ -673,6 +677,7 @@ impl Summary {
     }
 
     fn for_result(
+        language: Language,
         result: &io::Result<Outcome>,
         cancelled: bool,
         output_cleanup_failed: bool,
@@ -692,14 +697,17 @@ impl Summary {
         }
         let mut summary = Self::default();
         match result {
-            Ok(outcome) => return Self::for_outcome(outcome, output_cleanup_failed, visible, owner, started),
+            Ok(outcome) => return Self::for_outcome(language, outcome, output_cleanup_failed, visible, owner, started),
             Err(_) => summary.failed = started.map_or(1, HashSet::len),
         }
-        summary.cleanup_failed += usize::from(output_cleanup_failed);
+        if output_cleanup_failed {
+            summary.cleanup_warnings = language.translate("cleanup.incomplete", &[("count", "1")]);
+        }
         summary
     }
 
     fn for_outcome(
+        language: Language,
         outcome: &Outcome,
         output_cleanup_failed: bool,
         visible: bool,
@@ -730,10 +738,12 @@ impl Summary {
             summary.output = crate::pipeline::common_ancestor(outputs.clone())
                 .or_else(|| outputs.next().map(Path::to_owned));
         }
-        summary.cleanup_failed = outcome.cleanup_results.iter()
+        let cleanup_failed = outcome.cleanup_results.iter()
             .filter(|result| result.status == CleanupStatus::Failed
-                && started.is_none_or(|started| started.contains(&result_owner(&result.path, owner)))).count();
-        summary.cleanup_failed += usize::from(output_cleanup_failed);
+                && started.is_none_or(|started| started.contains(&result_owner(&result.path, owner)))).count() + usize::from(output_cleanup_failed);
+        if cleanup_failed != 0 {
+            summary.cleanup_warnings = language.translate("cleanup.incomplete", &[("count", &cleanup_failed.to_string())]);
+        }
         summary
     }
 
@@ -743,7 +753,7 @@ impl Summary {
         self.interrupted += other.interrupted;
         self.rollback_failed |= other.rollback_failed;
         self.report_failed |= other.report_failed;
-        self.cleanup_failed += other.cleanup_failed;
+        append_warning(&mut self.cleanup_warnings, &other.cleanup_warnings);
         if let Some(output) = other.output {
             self.output = match self.output.take() {
                 Some(previous) => {
@@ -947,7 +957,7 @@ impl Activity {
         let visible = request.visible_roots.contains(&id);
         request.settled_tasks.insert(id);
         if visible { group.active_roots -= 1; }
-        let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
+        let summary = Summary::for_outcome(group.language, outcome, false, visible, &|_| Some(key.clone()), None);
         if summary.failed != 0 { request.pending_reports.insert(id); }
         group.summary.merge(summary);
         group.generation = group.generation.wrapping_add(1);
@@ -977,23 +987,24 @@ impl Activity {
         output_cleanup_failed: bool,
         owner: impl Fn(&Path) -> Option<String>,
     ) {
-        let (visible, started, settled) = {
+        let (language, visible, started, settled) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping {
                 return;
             }
-            let Some(request) = state.groups.iter()
-                .find_map(|group| group.requests.get(&self.request))
+            let Some(group) = state.groups.iter()
+                .find(|group| group.requests.contains_key(&self.request))
             else {
                 return;
             };
-            (request.visible, if cancelled { request.roots.values().cloned().collect() } else { request.started.clone() }, request.settled.clone())
+            let request = &group.requests[&self.request];
+            (group.language, request.visible, if cancelled { request.roots.values().cloned().collect() } else { request.started.clone() }, request.settled.clone())
         };
         // Receipt projection can be large. It must not hold the presentation
         // gate or prevent disable from cancelling an active report writer.
         let started = started.iter().map(|path| result_owner(path, &owner))
             .filter(|root| !settled.contains(root)).collect();
-        let summary = Summary::for_result(result, cancelled, output_cleanup_failed, visible,
+        let summary = Summary::for_result(language, result, cancelled, output_cleanup_failed, visible,
             &owner, Some(&started));
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping {
@@ -1592,6 +1603,17 @@ mod tests {
         assert_eq!(Snapshot::progress(&group).progress, None);
         group.totals.planned = 100;
         group.totals.written = 50;
+        group.totals.unknown = 1;
+        let snapshot = Snapshot::progress(&group);
+        assert_eq!(snapshot.progress, None);
+        assert_eq!(snapshot.value, Language::En.text("toast.progress.indeterminate"));
+        group.stopping = true;
+        let snapshot = Snapshot::progress(&group);
+        assert_eq!(snapshot.body, Language::En.text("interrupt.stopping"));
+        assert_eq!(snapshot.status, snapshot.body);
+        assert!(snapshot.value.is_empty());
+        group.stopping = false;
+        group.totals.unknown = 0;
         for (disk, memory, key) in [
             (0, 1, "report.status.memory_paused"),
             (1, 0, "report.status.disk_paused"),
@@ -1618,11 +1640,24 @@ mod tests {
         // Ordinary source cleanup is only a warning, not a rollback failure.
         completed.summary.interrupted = 0;
         completed.summary.rollback_failed = false;
-        completed.summary.cleanup_failed = 1;
+        completed.summary.cleanup_warnings = Language::En.translate("cleanup.incomplete", &[("count", "1")]);
         let snapshot = Snapshot::completed(&completed, None);
         assert_eq!(snapshot.kind, 2);
         assert_eq!(snapshot.title, Language::En.text("toast.final.success.title"));
-        assert!(snapshot.body.contains("Paths with cleanup errors: 1."));
+        assert!(snapshot.body.ends_with(&completed.summary.cleanup_warnings));
+        let warning = Language::En.translate("cleanup.incomplete", &[("count", "2")]);
+        completed.summary.merge(Summary { cleanup_warnings: warning.clone(), ..Summary::default() });
+        let snapshot = Snapshot::completed(&completed, None);
+        assert!(snapshot.body.ends_with(&format!("{}\n{}",
+            Language::En.translate("cleanup.incomplete", &[("count", "1")]), warning)));
+        // Match main's Unicode-character bound, including its ellipsis.
+        let mut warnings = "界".repeat(2046);
+        append_warning(&mut warnings, "两个警告");
+        assert_eq!(warnings.chars().count(), 2048);
+        assert!(warnings.ends_with("\n…"));
+        let full = warnings.clone();
+        append_warning(&mut warnings, "more");
+        assert_eq!(warnings, full);
     }
 
     #[test]
@@ -1878,7 +1913,7 @@ mod tests {
             assert_eq!(group.summary.succeeded, 1);
             assert_eq!(group.summary.failed, if cancelled { 1 } else { 2 });
             assert_eq!(group.summary.interrupted, usize::from(cancelled));
-            assert_eq!(group.summary.cleanup_failed, 1);
+            assert_eq!(group.summary.cleanup_warnings, Language::En.translate("cleanup.incomplete", &[("count", "1")]));
             // Only failed roots belong in the report; A's source cleanup
             // remains a warning and must not add a failure entry.
             assert_eq!(group.report.lock().unwrap().failures, if cancelled { 1 } else { 2 });
@@ -1948,7 +1983,7 @@ mod tests {
         outcome.archives.push(archive("a.zip", None));
         outcome.archives.push(archive("A.ZIP", None));
         outcome.archives.push(archive("b.zip", None));
-        let summary = Summary::for_result(&Ok(outcome), false, false, true, &|_| None, None);
+        let summary = Summary::for_result(Language::En, &Ok(outcome), false, false, true, &|_| None, None);
         assert_eq!((summary.succeeded, summary.failed), (2, 0));
 
         // Cancellation can precede receipts or Working events entirely.
@@ -2017,7 +2052,7 @@ mod tests {
             accepted.partial = true;
             let mut outcome = Outcome::default();
             outcome.archives.push(accepted);
-            let summary = Summary::for_result(&Ok(outcome), false, false, true, &one_root, None);
+            let summary = Summary::for_result(Language::En, &Ok(outcome), false, false, true, &one_root, None);
             assert_eq!((summary.succeeded, summary.failed), (1, 0));
         }
 

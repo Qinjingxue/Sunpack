@@ -670,7 +670,10 @@ pub(super) async fn run(
         write_json(session, &result)?;
         return Ok(2);
     }
-    drop(args);
+    // main's archive dispatch errors retain argv, but config/password handlers
+    // catch their own failures and return an empty command-input envelope.
+    let error_argv = (options.json && matches!(options.command, "scan" | "extract")
+        && options.passwords.is_empty()).then_some(args);
     let generation = config::generation(cwd);
     let language = generation.language();
     let execution = match options.command {
@@ -699,6 +702,9 @@ pub(super) async fn run(
         }
         Err(error) => {
             let mut result = CommandResult::new(options.command);
+            if let Some(argv) = error_argv {
+                result.inputs = json!({"argv": argv});
+            }
             let (code, message) = match options.command {
                 "version" | "scan" | "extract" => (3, "cli.runtime_failure"),
                 "watch" => (1, "cli.operation_failed"),
@@ -1068,8 +1074,8 @@ impl Progress {
         // Noninteractive sessions only update the model; no terminal frame is made.
         let interactive = self.session.interactive();
         if !interactive {
-            if let Event::ResourceWait { path, state, .. } = &event {
-                if state.disk {
+            if let Event::ResourceWait { id, path, state } = &event {
+                if state.disk && !display.panel.as_ref().is_some_and(|panel| panel.disk_waiting(*id, state.disk_episode)) {
                     let (_, hint) = live::wait_status(
                         crate::pipeline::ResourceWait { memory: false, ..*state }, self.language,
                     );
@@ -1093,6 +1099,12 @@ impl Progress {
         // main flushes its existing task rows. In particular, skipped preflight
         // segments are display facts, not synthetic successful ArchiveResults.
         let retained_display = !archives.is_empty() && display.panel.as_ref().is_some_and(|panel| panel.retains_scope(id));
+        if retained_display {
+            // This path writes the retained task tree instead of ScopeReport,
+            // but the completed scope still owns and releases its branch links.
+            let mut branches = self.branches.lock().unwrap();
+            for archive in archives { branches.remove(&archive.path); }
+        }
         let report = (!retained_display && !archives.is_empty()).then(|| {
             let latest = display.panel.as_ref().map(|panel| panel.scope_progress(id)).unwrap_or_default();
             ScopeReport::new(archives, self, latest)
@@ -1526,7 +1538,11 @@ async fn archives(
     let mut user = match cli_passwords(cwd, options, session, language).await {
         Ok(passwords) => passwords,
         Err(error) if is_cancellation(&error) => return Err(error),
-        Err(error) => return Ok(command_error(options.command, 2, "cli.operation_failed", error, language)),
+        Err(error) => {
+            let (code, mut result) = command_error(options.command, 2, "cli.operation_failed", error, language);
+            result.inputs = json!({"paths": options.paths});
+            return Ok((code, result));
+        }
     };
     crate::pipeline::stage("password_reload", cancel).await?;
     let builtin = if options.no_builtins {
@@ -2408,8 +2424,8 @@ async fn show_config(
         (path, payload, None)
     };
     result.summary = json!({"config_path": path, "changed": false});
-    let errors = match Config::parse(&payload) {
-        Ok(_) if options.action == "show" => {
+    let errors = match Config::parse(&payload)? {
+        _ if options.action == "show" => {
             // The persistent runtime validates configuration before dispatch,
             // even when show returns the original, unnormalized document.
             if !options.json {
@@ -2419,8 +2435,7 @@ async fn show_config(
             result.items.push(payload);
             return Ok((0, result));
         }
-        Ok(settings) => settings.validate_scan_filters(),
-        Err(error) => vec![error.to_string()],
+        settings => settings.validate_scan_filters(),
     };
     if !errors.is_empty() {
         result.summary["valid"] = Value::Bool(false);
@@ -2870,9 +2885,10 @@ mod recursive_prompt_tests {
                     display: Mutex::default(), reporting: reporting::Reports::default(),
                     branches: Mutex::default(), prompt: false, visible: true, verbose: false,
                 };
+                progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), depth: 1, segment: None });
                 progress.notify(Event::ResourceWait {
                     id: 1, path: "input.zip".into(),
-                    state: crate::pipeline::ResourceWait { disk: true, memory: true, volume_error },
+                    state: crate::pipeline::ResourceWait { disk: true, memory: true, volume_error, ..Default::default() },
                 });
                 progress.flush_events();
                 let text = String::from_utf8(input.stderr.lock().unwrap().clone()).unwrap();
@@ -2881,7 +2897,58 @@ mod recursive_prompt_tests {
                     None => language.text("report.status.disk_resume_hint").into(),
                 };
                 assert_eq!(text, format!("input.zip: {hint}\n"));
+                for memory in [false, true, false] {
+                    progress.notify(Event::ResourceWait { id: 1, path: "input.zip".into(),
+                        state: crate::pipeline::ResourceWait { disk: true, memory, volume_error, ..Default::default() }, });
+                    progress.flush_events();
+                }
+                assert_eq!(String::from_utf8(input.stderr.lock().unwrap().clone()).unwrap(), text);
+                progress.notify(Event::ResourceWait { id: 1, path: "input.zip".into(), state: Default::default() });
+                progress.flush_events();
+                progress.notify(Event::ResourceWait { id: 1, path: "input.zip".into(),
+                    state: crate::pipeline::ResourceWait { disk: true, memory: false, volume_error, ..Default::default() }, });
+                progress.flush_events();
+                assert_eq!(String::from_utf8(input.stderr.lock().unwrap().clone()).unwrap(), text.repeat(2));
             }
+        }
+    }
+
+    #[test]
+    fn disk_episode_survives_worker_and_reporting_coalescing() {
+        let frames = crate::pipeline::coalesced_wait_batches(&[
+            vec![json!({"type":"progress", "event":"space_blocked", "episode_id":1})],
+            vec![json!({"type":"progress", "event":"space_resumed", "episode_id":1}),
+                 json!({"type":"progress", "event":"space_blocked", "episode_id":2})],
+            vec![json!({"type":"progress", "event":"space_resumed", "episode_id":2})],
+            vec![json!({"type":"progress", "event":"space_blocked", "episode_id":3})],
+            vec![json!({"type":"native_memory", "event":"memory_blocked", "episode_id":7})],
+        ]);
+        for language in [Language::En, Language::Zh] {
+            let input = Arc::new(Input::default());
+            let progress = Progress {
+                session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+                cancel: Cancellation::new(), language,
+                display: Mutex::default(), reporting: reporting::Reports::default(),
+                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+            };
+            progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), depth: 1, segment: None });
+            let emit = |state| progress.notify(Event::ResourceWait { id: 1, path: "input.zip".into(), state });
+            let expected = format!("input.zip: {}\n", language.text("report.status.disk_resume_hint"));
+            emit(frames[0]);
+            progress.flush_events();
+            assert_eq!(*input.stderr.lock().unwrap(), expected.as_bytes());
+            // Resume and new wait were already merged inside the worker mailbox.
+            emit(frames[1]);
+            progress.flush_events();
+            assert_eq!(*input.stderr.lock().unwrap(), expected.repeat(2).as_bytes());
+            // Reports overwrites resume before display, while retaining episode 3.
+            emit(frames[2]);
+            emit(frames[3]);
+            progress.flush_events();
+            assert_eq!(*input.stderr.lock().unwrap(), expected.repeat(3).as_bytes());
+            emit(frames[4]);
+            progress.flush_events();
+            assert_eq!(*input.stderr.lock().unwrap(), expected.repeat(3).as_bytes());
         }
     }
 
@@ -3173,6 +3240,37 @@ mod recursive_prompt_tests {
         input.stdout.lock().unwrap().clear();
         progress.flush_events();
         assert!(input.stdout.lock().unwrap().is_empty(), "a queued old event must not resurrect a completed scope");
+    }
+
+    #[test]
+    fn retained_skipped_scope_releases_only_its_branch_links() {
+        for prompting in [false, true] {
+            let session = Arc::new(Input::default());
+            let progress = Progress {
+                session, watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+                cancel: Cancellation::new(), language: Language::En,
+                display: Mutex::default(), reporting: reporting::Reports::default(),
+                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+            };
+            progress.display.lock().unwrap().prompting = prompting;
+            let parent = report_archive("parent.zip", 0);
+            let mut child = report_archive("child.zip", 0);
+            child.depth = 2;
+            let other = report_archive("other.zip", 0);
+            progress.archive_branch(&parent, &child);
+            progress.archive_branch(&parent, &other);
+            progress.notify(Event::Queued { id: 1, parent: None, path: parent.path.clone(), depth: 1, segment: None });
+            progress.notify(Event::Queued { id: 2, parent: Some(1), path: child.path.clone(), depth: 2, segment: None });
+            progress.notify(Event::Finished { id: 2, path: child.path.clone(), depth: 2,
+                result: crate::pipeline::TaskCompletion { discovery: None, status: TaskStatus::Skipped,
+                    failure: None, output: None } });
+            progress.finish_scope(1, &[parent, child]).unwrap();
+            let branches = progress.branches.lock().unwrap();
+            assert_eq!(branches.len(), 1);
+            assert!(branches.contains_key(&other.path));
+            let display = progress.display.lock().unwrap();
+            assert!(!display.panel.as_ref().unwrap().retains_scope(1));
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import subprocess
 import shutil
 from pathlib import Path
 
@@ -158,3 +160,56 @@ def get_optional_rar_sfx() -> Path | None:
 def get_optional_winrar() -> Path | None:
     winrar = get_test_tools()["winrar_exe"]
     return winrar if winrar and winrar.is_file() else None
+
+
+def acceptance_generator_errors() -> list[str]:
+    """The mandatory real-format matrix, shared by setup and acceptance.
+
+    Resolve the same overrides as the fixture writers. Optional private corpora
+    remain optional; only generators required by the public matrix are checked.
+    """
+    tools = get_test_tools()
+    seven_zip = tools["seven_zip"]
+    rar = tools["rar_exe"]
+    lz4 = tools["seven_zip_zstd"]
+    requirements = (
+        ("7-Zip", seven_zip, ("i",), None),
+        ("7-Zip DLL", seven_zip.parent / "7z.dll" if seven_zip else None, None, None),
+        ("7-Zip SFX", tools["seven_zip_sfx"], None, None),
+        # Match setup's pinned writer: later WinRAR releases removed -ma4.
+        ("RAR4/RAR5 (WinRAR 6.22 x64)", rar, ("iver",), r"RAR 6\.22 x64"),
+        ("RAR SFX", rar.parent / "Default.SFX" if rar else None, None, None),
+        ("WinRAR", tools["winrar_exe"], None, None),
+        ("Zstandard", tools["zstd_exe"], ("--version",), None),
+        ("7-Zip-Zstandard LZ4", lz4, ("i",), r"(?m)^\s*\d+\s+ED\s+\S+\s+LZ4\s*$"),
+        ("7-Zip-Zstandard DLL", lz4.parent / "7z.dll" if lz4 else None, None, None),
+    )
+    errors = []
+    for label, path, arguments, pattern in requirements:
+        if path is None or not path.is_file():
+            errors.append(f"{label} generator is missing: {path}")
+            continue
+        if arguments is None:
+            continue
+        try:
+            result = subprocess.run(
+                [str(path), *arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", check=False,
+            )
+        except OSError as error:
+            errors.append(f"{label} generator cannot run: {path}: {error}")
+            continue
+        # Rar's informational iver command returns 7 even when it succeeds.
+        valid_exit = arguments == ("iver",) or result.returncode == 0
+        if not valid_exit or (pattern is not None and re.search(pattern, result.stdout) is None):
+            errors.append(f"{label} generator lacks the required capability: {path}")
+    return errors
+
+
+if __name__ == "__main__":
+    errors = acceptance_generator_errors()
+    if errors:
+        print("Acceptance generator preflight failed:\n  - " + "\n  - ".join(errors))
+        print("Run scripts\\setup_windows_dev.ps1 or configure tests/test_tools.json / sunpack_TEST_*.")
+        raise SystemExit(1)
+    print("Acceptance generators are ready (7-Zip/SFX, RAR4/RAR5/SFX, Zstandard, LZ4).")

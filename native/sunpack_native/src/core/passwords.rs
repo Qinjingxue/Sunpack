@@ -482,7 +482,7 @@ impl BuiltinStore {
                 (end, end, ", \"clipboard_history\": ")
             }
         };
-        publish(&self.path, atomic_file::replace, |file| {
+        publish(&self.path, atomic_file::replace_once, |file| {
             file.write_all(original[..start].as_bytes())?;
             file.write_all(prefix.as_bytes())?;
             serde_json::to_writer(&mut *file, updated).map_err(invalid_json)?;
@@ -507,7 +507,7 @@ fn publish(
             Err(error) => return Err(error),
         }
     };
-    let result = write(&mut file).and_then(|()| file.sync_all());
+    let result = write(&mut file);
     drop(file);
     let result = result.and_then(|()| commit(&temp, path));
     if result.is_err() {
@@ -591,6 +591,27 @@ fn clipboard_text() -> Option<String> {
 mod tests {
     use super::{atomic_file, fs, io, publish, Document, IndexBuilder, PasswordSnapshot, Write};
     use std::path::Path;
+
+    #[test]
+    fn clipboard_save_reports_share_conflict_without_waiting_for_reader() {
+        use std::{os::windows::fs::OpenOptionsExt, sync::{mpsc, Mutex}, time::Duration};
+        let path = crate::test_support::temp_file("clipboard_share_conflict", br#"{"passwords":[],"clipboard_history":[]}"#);
+        let reader = fs::OpenOptions::new().read(true).share_mode(3).open(&path).unwrap();
+        let store = super::BuiltinStore { path: path.clone(), state: Mutex::default() };
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(store.merge_clipboard(&["new-password".into()], 30)).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(5));
+        // Release before asserting so the former retry loop cannot leak a
+        // worker or keep the test process alive on a regression.
+        drop(reader);
+        worker.join().unwrap();
+        let error = result.expect("clipboard save waited for an external reader").unwrap_err();
+        assert!(matches!(error.raw_os_error(), Some(32 | 33)));
+        assert_eq!(fs::read(&path).unwrap(), br#"{"passwords":[],"clipboard_history":[]}"#);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn default_password_publication_preserves_concurrent_edit() {

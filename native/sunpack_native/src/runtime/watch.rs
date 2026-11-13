@@ -34,6 +34,8 @@ mod journal;
 mod quiet;
 #[cfg(test)]
 mod crash_boundaries;
+#[cfg(test)]
+mod admission_tests;
 
 const ROOTS_FILE: &str = "sunpack_watch_roots.txt";
 const WATCH_METADATA: &str = ".sunpack_watch";
@@ -658,7 +660,8 @@ impl Watch {
         }
         stage("catalog_maintenance", &Cancellation::new()).await?;
         let dir = state_dir(cwd)?;
-        let state = journal::Journal::open(&dir)?;
+        let snapshot = config::load_snapshot(cwd)?;
+        let state = journal::Journal::open(&dir, snapshot.config.watch.event_log_retention_days)?;
         state.rebuild_log()
     }
 
@@ -809,7 +812,6 @@ struct Signals {
     password_changed: bool,
     foreground_finished: bool,
     maintenance: bool,
-    clipboard: Option<Vec<String>>,
     volumes: VolumeChanges,
     rebuild: Vec<CommandReply<bool>>,
     cancel: Vec<(String, CommandReply<bool>)>,
@@ -979,7 +981,6 @@ impl Hub {
                 && !value.password_changed
                 && !value.maintenance
                 && !value.foreground_finished
-                && value.clipboard.is_none()
                 && value.volumes.is_empty()
                 && value.rebuild.is_empty()
                 && value.cancel.is_empty()
@@ -1269,6 +1270,8 @@ fn due_admissions(
 }
 
 struct Pending {
+    // Readiness is reusable only across the current admission checkpoint.
+    admission_ready: bool,
     root: String,
     candidate: WatchCandidateRow,
     quiet: quiet::Quiet,
@@ -1304,6 +1307,7 @@ fn consume_claimed_pending(
     groups: &HashMap<String, Arc<SourceGroup>>,
     captured: &HashMap<String, Option<WatchCandidateRow>>,
     inputs: &mut Vec<WatchCandidateRow>,
+    quiet: &mut HashMap<String, quiet::Quiet>,
 ) {
     for path in groups.keys() {
         if captured.get(path).and_then(Option::as_ref).is_some_and(|before|
@@ -1313,6 +1317,7 @@ fn consume_claimed_pending(
         if let Some(queued) = pending.remove(path) {
             due.remove(&(queued.due, path.clone()));
             unpublished.remove(path);
+            quiet.insert(path.clone(), queued.quiet);
             inputs.push(queued.candidate);
         }
     }
@@ -1410,6 +1415,7 @@ struct Active {
     recovery: Option<Arc<Recovery>>,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
+    quiet: HashMap<String, quiet::Quiet>,
     dirty: HashSet<String>,
     cancel: Cancellation,
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
@@ -1453,6 +1459,7 @@ struct CompletionContext {
     recovery: Option<Arc<Recovery>>,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
+    quiet: HashMap<String, quiet::Quiet>,
     dirty: HashSet<String>,
     claimed: Arc<Mutex<ClaimedSources>>,
     groups: HashMap<String, Arc<SourceGroup>>,
@@ -1476,6 +1483,8 @@ struct SourceGroup {
 }
 
 struct Scheduler {
+    #[cfg(test)]
+    admission_checkpoint: Option<Box<dyn FnOnce(&mut Self) -> io::Result<()> + Send>>,
     cwd: PathBuf,
     root_file: PathBuf,
     roots: BTreeMap<String, (Root, NativeDiscoveryScope)>,
@@ -1532,8 +1541,7 @@ impl Scheduler {
         let lease = BrokerLease::acquire()?;
         let root_file = roots_path(&cwd)?;
         let dir = state_dir(&cwd)?;
-        let journal = Arc::new(journal::Journal::open(&dir)?);
-        journal.set_retention(snapshot.config.watch.event_log_retention_days)?;
+        let journal = Arc::new(journal::Journal::open(&dir, snapshot.config.watch.event_log_retention_days)?);
         let maintenance_hub = Arc::downgrade(&hub);
         journal.set_maintenance(Arc::new(move || {
             if let Some(hub) = maintenance_hub.upgrade() {
@@ -1556,6 +1564,8 @@ impl Scheduler {
             Vec::new()
         };
         let mut scheduler = Self {
+            #[cfg(test)]
+            admission_checkpoint: None,
             cwd,
             root_file,
             roots: BTreeMap::new(),
@@ -1728,27 +1738,27 @@ impl Scheduler {
             })
         {
             let hub = Arc::clone(&self.hub);
+            let passwords = Arc::clone(&self.passwords);
+            let journal = Arc::clone(&self.journal);
             self.monitor.take();
             let monitor =
                 crate::core::clipboard_monitor::Monitor::start(clipboard, true, move |change| {
-                    hub.update(|signals| match change {
+                    match change {
                         crate::core::clipboard_monitor::Notification::Clipboard(values) => {
-                            let pending = signals.clipboard.get_or_insert_with(Vec::new);
-                            for value in values {
-                                if let Some(index) = pending.iter().position(|item| item == &value)
-                                {
-                                    pending.remove(index);
-                                }
-                                pending.push(value);
-                            }
-                            if pending.len() > clipboard_limit {
-                                pending.drain(..pending.len() - clipboard_limit);
+                            // The window thread owns clipboard persistence, as in main.
+                            // Only publish an invalidation to the scheduler after saving.
+                            match passwords.merge_clipboard(&values, clipboard_limit) {
+                                Ok(true) => hub.update(|signals| signals.password_changed = true),
+                                Ok(false) => {},
+                                Err(error) => journal.log(json!({
+                                    "event":"watch_clipboard_password_save_failed", "error":error.to_string(),
+                                })),
                             }
                         }
                         crate::core::clipboard_monitor::Notification::VolumeChanged { unitmask, arrived } => {
-                            signals.volumes.add(unitmask, arrived);
+                            hub.update(|signals| signals.volumes.add(unitmask, arrived));
                         }
-                    });
+                    }
                 });
             match monitor {
                 Ok(monitor) => self.monitor = Some((monitor, clipboard, clipboard_limit)),
@@ -2044,9 +2054,6 @@ impl Scheduler {
             self.root_observers.clear();
             self.parent_observers.clear();
             self.monitor.take();
-            // A stopped monitor's burst belongs to the retired scheduler. A
-            // newly enabled monitor reads the current clipboard on startup.
-            self.hub.signals.lock().unwrap().clipboard = None;
         }
         let mut cancellation_observed = false;
         let mut failure_observed = false;
@@ -2171,9 +2178,6 @@ impl Scheduler {
             for waiter in signals.rebuild {
                 let result = self.engine.run_stage("catalog_maintenance", Origin::Watch, || self.journal.rebuild_log());
                 let _ = waiter.send(result);
-            }
-            if let Some(clipboard) = signals.clipboard {
-                self.merge_clipboard(&clipboard)?;
             }
             if signals.password_changed || !signals.reload_waiters.is_empty() {
                 self.password_update(false)?;
@@ -2790,6 +2794,14 @@ impl Scheduler {
         &mut self, root_id: &str, path: String, force: bool,
         recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
     ) -> io::Result<()> {
+        self.observe_candidate_with_quiet(root_id, path, force, recovery, captured, None)
+    }
+
+    fn observe_candidate_with_quiet(
+        &mut self, root_id: &str, path: String, force: bool,
+        recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
+        tracker: Option<quiet::Quiet>,
+    ) -> io::Result<()> {
         let Some((_, scope)) = self.roots.get(root_id) else {
             return Ok(());
         };
@@ -2921,9 +2933,10 @@ impl Scheduler {
         }
         let new_identity = prior.as_ref().map_or_else(
             || {
-                previous.as_ref().is_some_and(|old| {
-                    old.file_id() != candidate.observation.file_id || old.size > candidate.size
-                })
+                previous.as_ref().map_or_else(
+                    || captured.is_some_and(|old| old.observation.file_id != candidate.observation.file_id || old.size > candidate.size),
+                    |old| old.file_id() != candidate.observation.file_id || old.size > candidate.size,
+                )
             },
             |old| {
                 old.candidate.observation.file_id != candidate.observation.file_id
@@ -2933,6 +2946,8 @@ impl Scheduler {
         let mut quiet = if let Some(old) = prior {
             self.due.remove(&(old.due, id.clone()));
             old.quiet
+        } else if let Some(tracker) = tracker {
+            tracker
         } else {
             previous
                 .as_ref()
@@ -2956,6 +2971,7 @@ impl Scheduler {
         self.pending.insert(
             id,
             Pending {
+                admission_ready: false,
                 root: root_id.to_owned(),
                 candidate,
                 quiet,
@@ -3578,6 +3594,10 @@ impl Scheduler {
                 continue;
             };
             self.due.remove(&(due, id.clone()));
+            if pending.admission_ready {
+                prepared.push((id, pending));
+                continue;
+            }
             let path = Path::new(&pending.candidate.path);
             let previous_usn = pending.candidate.observation.change_usn;
             let current = match watch_candidate_for_path(path, Some(previous_usn)) {
@@ -3660,15 +3680,31 @@ impl Scheduler {
         let now = Instant::now();
         let prepared = self.prepare_ready(now, available)?;
         if prepared.is_empty() { return Ok(()); }
-        // Readiness, not merely an expired deadline, is the admission
-        // boundary. Restore owners while checkpoint atomically publishes the
-        // burst; then re-probe because recovery may change generation/deadline.
-        for (id, pending) in prepared {
+        // Keep the already-probed owners available for atomic publication.
+        // Checkpoint replaces Pending on a content/forced-recovery change, so
+        // only those changed candidates need a new filesystem readiness probe.
+        let mut prepared_ids = Vec::with_capacity(prepared.len());
+        for (id, mut pending) in prepared {
+            pending.admission_ready = true;
             self.due.insert((pending.due, id.clone()), ());
-            self.pending.insert(id, pending);
+            self.pending.insert(id.clone(), pending);
+            prepared_ids.push(id);
         }
-        self.checkpoint(&HashMap::new(), true, false)?;
-        let prepared = self.prepare_ready(now, available)?;
+        let checkpoint = self.checkpoint(&HashMap::new(), true, false);
+        #[cfg(test)]
+        let checkpoint = checkpoint.and_then(|()| match self.admission_checkpoint.take() {
+            Some(check) => check(self),
+            None => Ok(()),
+        });
+        let prepared = checkpoint.and_then(|()| self.prepare_ready(now, available));
+        // A new foreground claim can leave a prepared owner parked. Never
+        // retain its readiness into a later tick, including checkpoint errors.
+        for id in prepared_ids {
+            if let Some(pending) = self.pending.get_mut(&id) {
+                pending.admission_ready = false;
+            }
+        }
+        let prepared = prepared?;
         let mut groups = BTreeMap::new();
         for (_, pending) in prepared {
             if pending.recovery.is_none() {
@@ -3693,7 +3729,7 @@ impl Scheduler {
             let (_, candidates) = groups
                 .entry((pending.root, recovery_key))
                 .or_insert_with(|| (pending.recovery, Vec::new()));
-            candidates.push(pending.candidate);
+            candidates.push((pending.candidate, pending.quiet));
         }
         for ((root, _), (recovery, candidates)) in groups {
             if self.hub.stopped.load(Ordering::Acquire) {
@@ -3734,7 +3770,7 @@ impl Scheduler {
         self.pending.insert(id, pending);
     }
 
-    fn start_batch(&mut self, root_id: String, candidates: Vec<WatchCandidateRow>, recovery: Option<Arc<Recovery>>) -> io::Result<()> {
+    fn start_batch(&mut self, root_id: String, candidates: Vec<(WatchCandidateRow, quiet::Quiet)>, recovery: Option<Arc<Recovery>>) -> io::Result<()> {
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery))
     }
@@ -3742,12 +3778,17 @@ impl Scheduler {
     fn start_batch_blocking(
         &mut self,
         id: String,
-        candidates: Vec<WatchCandidateRow>,
+        candidates: Vec<(WatchCandidateRow, quiet::Quiet)>,
         recovery: Option<Arc<Recovery>>,
     ) -> io::Result<()> {
         let Some((root, scope)) = self.roots.get(&id) else {
             return Ok(());
         };
+        let mut quiet = HashMap::with_capacity(candidates.len());
+        let candidates: Vec<_> = candidates.into_iter().map(|(candidate, tracker)| {
+            quiet.insert(watch_path_key(&candidate.path), tracker);
+            candidate
+        }).collect();
         let mut token = windows::random_bytes::<16>()?;
         // The other half of the token space is reserved for Toast groups.
         token[0] &= 0x7f;
@@ -3909,6 +3950,7 @@ impl Scheduler {
                 recovery,
                 passwords,
                 inputs: candidates,
+                quiet,
                 dirty: HashSet::new(),
                 cancel,
                 groups,
@@ -4017,9 +4059,10 @@ impl Scheduler {
         for (index, input) in active.inputs.iter().enumerate() {
             if let Some((_, slot)) = self.active_paths.get_mut(&watch_path_key(&input.path)) { *slot = index; }
         }
+        let quiet = members.iter().filter_map(|path| active.quiet.remove(path).map(|tracker| (path.clone(), tracker))).collect();
         let context = CompletionContext {
             root: active.root.clone(), recovery: active.recovery.clone(), passwords: Arc::clone(&active.passwords),
-            inputs, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
+            inputs, quiet, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
         };
         let result = self.apply_completion(&root.batch, context, root.completed);
         let error = result.as_ref().err().map(|error| io::Error::new(error.kind(), error.to_string()));
@@ -4035,35 +4078,37 @@ impl Scheduler {
         let groups = std::mem::take(&mut *active.groups.lock().unwrap());
         self.apply_completion(batch, CompletionContext {
             root: active.root, recovery: active.recovery, passwords: active.passwords,
-            inputs: active.inputs, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
+            inputs: active.inputs, quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
         }, completed).map(|_| ())
     }
 
     fn apply_completion(&mut self, batch: &str, mut active: CompletionContext, completed: Completed) -> io::Result<Outcome> {
         let engine = Arc::clone(&self.engine);
         engine.run_stage("watch_complete_state", Origin::Watch, || {
+            consume_claimed_pending(
+                &mut self.pending, &mut self.due, &mut self.unpublished,
+                &active.groups, &active.claimed.lock().unwrap().candidates, &mut active.inputs, &mut active.quiet,
+            );
+            let mut quiet = std::mem::take(&mut active.quiet);
             let dirty = std::mem::take(&mut active.dirty);
             let root = active.root.clone();
             let recovery = active.recovery.clone();
             let claimed = Arc::clone(&active.claimed);
-            let result = self.apply_completion_blocking(batch, active, completed)?;
+            let result = self.apply_completion_blocking(batch, active, completed, &mut quiet)?;
             // Publish the old generation first. An interrupted blocker then
             // suppresses only that generation, not a replacement during claim.
             for path in dirty {
                 if !self.pending.contains_key(&path) {
                     let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
-                    self.observe_candidate(&root, path, false, recovery.clone(), captured.as_ref())?;
+                    let tracker = quiet.remove(&path);
+                    self.observe_candidate_with_quiet(&root, path, false, recovery.clone(), captured.as_ref(), tracker)?;
                 }
             }
             Ok(result)
         })
     }
 
-    fn apply_completion_blocking(&mut self, batch: &str, mut active: CompletionContext, mut completed: Completed) -> io::Result<Outcome> {
-        consume_claimed_pending(
-            &mut self.pending, &mut self.due, &mut self.unpublished,
-            &active.groups, &active.claimed.lock().unwrap().candidates, &mut active.inputs,
-        );
+    fn apply_completion_blocking(&mut self, batch: &str, active: CompletionContext, mut completed: Completed, quiet: &mut HashMap<String, quiet::Quiet>) -> io::Result<Outcome> {
         let mut unfinished = HashSet::new();
         if completed.cancelled {
             let state = self.journal.state();
@@ -4144,8 +4189,9 @@ impl Scheduler {
                     // violation), unlike an extraction Outcome failure.
                     self.journal.log(json!({"event":"failed_terminal","path":candidate.path,
                         "owner":batch,"error":error.to_string()}));
-                    self.enqueue_with_recovery(
+                    self.observe_candidate_with_quiet(
                         &active.root, candidate.path.clone(), true, active.recovery.clone(),
+                        None, quiet.remove(&id),
                     )?;
                 }
                 self.journal.commit(true, |_| Ok(absent))?;
@@ -4478,7 +4524,8 @@ impl Scheduler {
             if let Some((root, recovery)) = self.journal.state().entry(&path)
                 .and_then(|entry| self.blocker_route(&entry))
             {
-                self.enqueue_with_recovery(&root, path, true, recovery)?;
+                let tracker = quiet.remove(&watch_path_key(&path));
+                self.observe_candidate_with_quiet(&root, path, true, recovery, None, tracker)?;
             }
         }
         self.persist_candidates(BTreeMap::new(), false)?;
@@ -4492,7 +4539,9 @@ impl Scheduler {
     fn arm_idle_cleanup(&mut self) {
         if self.active.is_empty() && self.pending.is_empty() && !windows::foreground_active() {
             let idle = self.settings.watch.runtime_cache_cleanup_idle_seconds;
-            self.cache_deadline = Some(quiet::after(Instant::now(), idle));
+            // main's +infinity deadline never expires. Do not pass it to
+            // Duration conversion, where an invalid duration becomes zero.
+            self.cache_deadline = idle.is_finite().then(|| quiet::after(Instant::now(), idle));
         }
     }
 
@@ -5485,7 +5534,7 @@ mod tests {
     fn open_error_dialog_does_not_retain_watch_state_across_restart() {
         let marker = crate::test_support::temp_file("watch_dialog_restart", b"");
         let directory = marker.with_extension("state");
-        let journal = Arc::new(journal::Journal::open(&directory).unwrap());
+        let journal = Arc::new(journal::Journal::open(&directory, 7).unwrap());
         let (opened_tx, opened_rx) = mpsc::channel();
         let (dismiss_tx, dismiss_rx) = mpsc::channel();
         let dialog = spawn_error_dialog(&journal, move || {
@@ -5497,7 +5546,7 @@ mod tests {
         let old = Arc::downgrade(&journal);
         drop(journal); // scheduler has stopped, but the modal dialog is still open
         let released = old.upgrade().is_none();
-        let restarted = journal::Journal::open(&directory);
+        let restarted = journal::Journal::open(&directory, 7);
         // Release the simulated dialog even if reopening failed.
         dismiss_tx.send(()).unwrap();
         dialog.join().unwrap();
@@ -5645,6 +5694,7 @@ mod tests {
         payload.insert("password_scope_dir".into(), json!(recovery.password_scope));
         payload.insert("details".into(), json!({"promoted_nested_input":true}));
         let mut pending = Pending {
+            admission_ready: false,
             root: watch_path_key(r"C:\watch\old"), candidate,
             quiet: quiet::Quiet::default(), due: Instant::now(), force: true, recovery: None,
         };
@@ -5660,7 +5710,7 @@ mod tests {
         let (current, _) = &roots[&pending.root];
         let recovery = pending.recovery.as_ref().unwrap();
         {
-            let journal = journal::Journal::open(&directory).unwrap();
+            let journal = journal::Journal::open(&directory, 7).unwrap();
             journal.commit(true, |state| {
                 let candidate = &pending.candidate;
                 let (mut operations, _) = state.pending_operations([(
@@ -5674,7 +5724,7 @@ mod tests {
             }).unwrap();
         }
         {
-            let journal = journal::Journal::open(&directory).unwrap();
+            let journal = journal::Journal::open(&directory, 7).unwrap();
             let record = journal.state().pending(&pending.candidate.path).unwrap();
             assert_eq!(watch_path_key(&record.source_input_root), root_id);
             assert_eq!(record.change_usn, 9);
@@ -5859,7 +5909,7 @@ mod tests {
         let owner_text = owner.to_str().unwrap();
         let carrier_text = carrier.to_str().unwrap();
         {
-            let journal = journal::Journal::open(&root).unwrap();
+            let journal = journal::Journal::open(&root, 7).unwrap();
             journal.commit(true, |state| {
                 let (mut operations, _) = state.pending_operations(
                     [(PendingObservation(owner_text.into(), 13, 1.0, String::new(), 0), String::new(), None)],
@@ -5892,7 +5942,7 @@ mod tests {
             journal.flush().unwrap();
         }
         {
-            let journal = journal::Journal::open(&root).unwrap();
+            let journal = journal::Journal::open(&root, 7).unwrap();
             assert!(input_checkpoints(journal.state(), owner_text).next().is_none());
             let retained = input_checkpoints(journal.state(), carrier_text).collect::<io::Result<Vec<_>>>().unwrap();
             assert_eq!(retained.len(), 2);
@@ -6022,18 +6072,15 @@ mod tests {
         hub.update(|signals| {
             signals.root_changed("old-root", Some(vec![PathBuf::from("archive.zip")]));
             signals.password_changed = true;
-            signals.clipboard = Some(vec!["password".into()]);
         });
         hub.batch_completed("old-request".into());
         let drained = hub.wait_drain(false);
         assert_eq!(drained.completed, ["old-request"]);
         assert!(!drained.password_changed);
-        assert!(drained.clipboard.is_none());
         assert!(!hub.stopped.load(Ordering::Acquire));
         let pending = hub.wait(None);
         assert!(pending.reload);
         assert!(pending.password_changed);
-        assert_eq!(pending.clipboard.unwrap(), ["password"]);
         assert!(pending.changed_roots.contains_key("old-root"));
         assert!(reload_result.try_recv().is_err());
         assert!(once_result.try_recv().is_err());
@@ -6216,7 +6263,7 @@ mod tests {
         for (index, path) in group.members.iter().enumerate().skip(1) {
             let id = watch_path_key(path);
             let deadline = now + std::time::Duration::from_secs(index as u64);
-            pending.insert(id.clone(), Pending { root: "root".into(),
+            pending.insert(id.clone(), Pending { admission_ready: false, root: "root".into(),
                 candidate: WatchCandidateRow { path: path.clone(), size: 42, mtime: 1.0,
                     observation: crate::filesystem::WatchFileObservation {
                         file_id: String::new(), change_usn: index as i64, change_reasons: 0,
@@ -6227,6 +6274,12 @@ mod tests {
             });
             due.insert((deadline, id.clone()), ());
             unpublished.insert(id);
+        }
+        for pending in pending.values_mut() {
+            for at in [0.0, 5.0, 10.0, 15.0, 20.0] {
+                pending.quiet.observe(at, false, false, true);
+            }
+            pending.quiet.end_phase();
         }
         let changed = watch_path_key("split.003");
         let claims = groups.keys().map(|path| (path.clone(), Arc::<str>::from("owner"))).collect();
@@ -6240,7 +6293,15 @@ mod tests {
         pending.get_mut(&changed).unwrap().candidate.observation.change_usn += 1;
         pending.get_mut(&changed).unwrap().candidate.size += 1;
         let mut inputs = Vec::new();
-        consume_claimed_pending(&mut pending, &mut due, &mut unpublished, &groups, &captured, &mut inputs);
+        let mut trackers = HashMap::new();
+        consume_claimed_pending(&mut pending, &mut due, &mut unpublished, &groups, &captured, &mut inputs, &mut trackers);
+        let mut tracker = trackers.remove(&watch_path_key("split.002")).unwrap();
+        let learned = tracker.seconds;
+        tracker.observe(23.5, false, false, true);
+        tracker.observe(24.5, false, false, true);
+        assert_eq!(tracker.cadence, 5.0);
+        assert_eq!(tracker.seconds, learned);
+        assert!(trackers.is_empty());
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].path, "split.002");
         assert_eq!(pending.len(), 1);
@@ -6303,7 +6364,7 @@ mod tests {
             members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
         let hub = Arc::new(Hub::new());
         let observer = WatchObserver {
-            journal: Arc::new(journal::Journal::open(&directory).unwrap()),
+            journal: Arc::new(journal::Journal::open(&directory, 7).unwrap()),
             owners: HashMap::from([(key(alias), alias.to_string_lossy().into_owned())]),
             output_scopes: Arc::from([]),
             outputs: Mutex::new(BTreeMap::from([(key(output), alias.to_string_lossy().into_owned()),
@@ -6410,7 +6471,7 @@ mod tests {
         fs::create_dir_all(&output).unwrap();
         let owner = source.to_str().unwrap();
         {
-            let journal = journal::Journal::open(&directory).unwrap();
+            let journal = journal::Journal::open(&directory, 7).unwrap();
             journal.commit(true, |state| {
                 state.pending_operations(
                     [(PendingObservation(owner.to_owned(), 13, 1.0, String::new(), 0),
@@ -6439,7 +6500,7 @@ mod tests {
             journal.flush().unwrap();
         }
         {
-            let journal = Arc::new(journal::Journal::open(&directory).unwrap());
+            let journal = Arc::new(journal::Journal::open(&directory, 7).unwrap());
             let mut outputs = BTreeMap::new();
             let checkpoints = restore_checkpoints(journal.state(), owner, &mut outputs).unwrap();
             assert_eq!(checkpoints.len(), 1);
@@ -6491,7 +6552,7 @@ mod tests {
             assert!(!pending.committed_roots.contains(failed_output.to_str().unwrap()));
         }
         {
-            let journal = journal::Journal::open(&directory).unwrap();
+            let journal = journal::Journal::open(&directory, 7).unwrap();
             let failed_output = directory.join("failed-output");
             let pending = journal.state().pending(owner).unwrap();
             assert!(!pending.committed_roots.contains(failed_output.to_str().unwrap()));
@@ -6525,7 +6586,7 @@ mod tests {
         fs::write(leaf.join("nested/payload"), b"extracted").unwrap();
 
         {
-            let journal = journal::Journal::open(&directory).unwrap();
+            let journal = journal::Journal::open(&directory, 7).unwrap();
             journal
                 .commit(true, |state| {
                     let (operations, _) = state.pending_operations(
@@ -6583,7 +6644,7 @@ mod tests {
         }
 
         {
-            let journal = journal::Journal::open(&directory).unwrap();
+            let journal = journal::Journal::open(&directory, 7).unwrap();
             recover_flattens(&journal, |_| true).unwrap();
             assert_eq!(fs::read(root.join("nested/payload")).unwrap(), b"extracted");
             assert!(!work.exists());
@@ -6641,7 +6702,7 @@ mod tests {
         let junction = std::process::Command::new("cmd.exe")
             .args(["/d", "/c", "mklink", "/J"]).arg(&alias).arg(&real).output().unwrap();
         assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
-        let journal = journal::Journal::open(&base.join("state")).unwrap();
+        let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
         prepare_flatten(&journal, "", &root, &work, &leaf).unwrap();
         // Older intents had no path list. Their persisted owned aliases must
         // still prevent a detached literal path from discarding physical work.

@@ -399,6 +399,10 @@ function Get-EnvironmentRefreshReasons {
     foreach ($reason in @(Get-ArchiveFixtureToolRefreshReasons -RepoRoot $RepoRoot -Arch $Arch)) {
         $reasons.Add($reason)
     }
+    $generatorErrors = & $VenvPython -m tests.helpers.tool_config 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $reasons.Add(($generatorErrors | Out-String).Trim())
+    }
     return $reasons
 }
 
@@ -494,6 +498,9 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     throw "uv sync completed without creating the project virtual environment: $venvPython"
 }
 $python = $venvPython
+# Never let SkipEnvironmentRefresh turn a reduced real-format matrix into a pass.
+# This is the same configured-tool capability check used by setup.
+Invoke-Native -FilePath $python -Arguments @("-m", "tests.helpers.tool_config")
 $env:PYTHONPATH = $repoRoot
 
 $brokerPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $Arch -BuildProfile $BuildProfile

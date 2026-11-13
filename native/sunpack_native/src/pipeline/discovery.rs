@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(super) struct LogicalInput {
+    // Password evidence may have a bounded view without a proven extraction end.
+    pub password_probe: Option<Box<ArchiveInput>>,
     pub input: ArchiveInput,
     pub password: Option<Arc<str>>,
     pub failure: Option<Failure>,
@@ -48,6 +50,7 @@ impl Task {
         Self {
             inputs: vec![LogicalInput {
                 input,
+                password_probe: None,
                 password: None,
                 failure,
             }],
@@ -1060,6 +1063,7 @@ fn project_segments(
         }
         inputs.push(LogicalInput {
             input,
+            password_probe: None,
             password: resolution.and_then(|result| result.password),
             failure,
         });
@@ -1389,7 +1393,7 @@ mod tests {
         assert!(tasks[0].retry.is_none());
         assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());
         let input = tasks[0].entry().clone();
-        tasks[0].inputs.push(LogicalInput { input, password: None, failure: None });
+        tasks[0].inputs.push(LogicalInput { password_probe: None, input, password: None, failure: None });
         assign_retry_scopes(&mut tasks, &scopes);
         assert!(tasks[0].retry.is_none());
         assert_eq!(tasks[0].scope.as_ref().unwrap().key(), inner.key());

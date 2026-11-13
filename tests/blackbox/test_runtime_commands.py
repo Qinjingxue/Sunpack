@@ -48,7 +48,22 @@ def test_invalid_config_diagnostics_preserve_last_good_request_settings(package,
     path.write_text(invalid, encoding="utf-8")
 
     for action in ("show", "validate"):
-        assert package.json("config", action, code=2)["errors"]
+        result = package.json("config", action, code=2)
+        # Schema/normalization errors use main's command exception envelope,
+        # not the richer scan-filter validation report, even with warm cache.
+        assert result["inputs"] == {}
+        assert result["summary"] == {}
+        assert result["items"] == []
+        assert len(result["errors"]) == 1
+        assert result["errors"][0].startswith("Operation failed: ")
+        if '"process_mode":42' in invalid:
+            assert result["errors"] == [
+                "Operation failed: runtime.process_mode must be background, normal, or high",
+            ]
+        if '"content_requirement":true' in invalid:
+            assert result["errors"] == [
+                "Operation failed: extraction.content_requirement must be 'complete' or 'allow_partial'",
+            ]
     doctor = package.json("doctor", code=1)
     assert next(row for row in doctor["items"] if row["name"] == "config")["status"] == "fail"
     assert package.json("scan", archive)["summary"]["archive_count"] == 1

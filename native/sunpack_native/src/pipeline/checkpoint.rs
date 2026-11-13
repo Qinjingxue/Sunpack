@@ -35,8 +35,6 @@ pub struct InputCheckpoint {
     bytes: u64,
     encrypted: Option<bool>,
     discovery_source: DiscoverySource,
-    children_complete: bool,
-    remaining_depth: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failure: Option<Arc<FailureReceipt>>,
 }
@@ -135,12 +133,10 @@ impl InputCheckpoint {
 
     pub(super) fn create(
         carrier: &Path,
-        input: &ArchiveInput,
+        input: Arc<ArchiveInput>,
         result: &ArchiveResult,
         generations: &HashMap<String, PhysicalFileGeneration>,
         container: Option<&Path>,
-        children_complete: bool,
-        remaining_depth: usize,
     ) -> Option<Self> {
         if result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::Cancelled) {
             return None;
@@ -161,7 +157,7 @@ impl InputCheckpoint {
         Some(Self {
             schema_version: SCHEMA_VERSION,
             carrier: carrier.to_path_buf(),
-            input: Arc::new(input.clone()),
+            input,
             report: None,
             sources: sources.into(),
             output: result.output.clone().unwrap_or_default(),
@@ -171,8 +167,6 @@ impl InputCheckpoint {
             bytes: result.bytes,
             encrypted: result.encrypted,
             discovery_source: result.discovery_source,
-            children_complete,
-            remaining_depth,
             failure: result.failure.as_ref().map(|failure| Arc::new(FailureReceipt {
                 partial: result.partial,
                 password_signature: None,
@@ -300,13 +294,8 @@ impl InputCheckpoint {
     pub(super) fn continuable_output(&self) -> bool {
         self.has_output() && self.failure.as_ref().is_none_or(|receipt| receipt.complete_files > 0)
     }
-    pub(super) fn children_complete(&self, remaining_depth: usize) -> bool {
-        self.children_complete && self.remaining_depth >= remaining_depth
-    }
-
-    pub(super) fn restore_input(&self, input: &mut ArchiveInput) {
-        *input = self.input.as_ref().clone();
-        if self.failure.is_none() { input.volume_attempts = None; }
+    pub(super) fn shared_input(&self) -> Arc<ArchiveInput> {
+        Arc::clone(&self.input)
     }
 
     pub(super) fn relocate(&mut self, source: &Path, destination: &Path) -> bool {
@@ -495,11 +484,11 @@ impl InputCheckpoint {
 }
 
 impl InputRecovery {
-    pub(super) fn capture(
-        checkpoints: &[InputCheckpoint], carrier: &Path, relocated_carrier: Option<&Path>, output: Option<&Path>,
+    pub(super) fn capture<'a>(
+        checkpoints: impl IntoIterator<Item = &'a InputCheckpoint>, carrier: &Path, relocated_carrier: Option<&Path>, output: Option<&Path>,
         input_count: usize, had_checkpoints: bool, retry_output: bool,
     ) -> Option<Arc<Self>> {
-        let inputs: Vec<_> = checkpoints.iter()
+        let inputs: Vec<_> = checkpoints.into_iter()
             .filter(|checkpoint| (checkpoint.carrier() == carrier || relocated_carrier == Some(checkpoint.carrier())) && checkpoint.report.is_some())
             .cloned().collect();
         if inputs.is_empty() { return None; }
@@ -601,7 +590,9 @@ mod tests {
         result.output = Some(output.clone()); result.files = 3; result.bytes = 17;
         result.recovered_complete_files = 2;
         let state = InputCheckpoint::report_state(&input, &result, Some(&output), None, 4, 7);
-        let mut checkpoint = InputCheckpoint::create(&source, &input, &result, &generations, None, false, 0).unwrap();
+        let shared_input = Arc::new(input.clone());
+        let mut checkpoint = InputCheckpoint::create(&source, Arc::clone(&shared_input), &result, &generations, None).unwrap();
+        assert!(Arc::ptr_eq(&shared_input, &checkpoint.shared_input()));
         checkpoint.install_report(state.clone());
         let checkpoint: InputCheckpoint = serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
         let mut resumed = input.clone(); resumed.logical_name = "changed display".into();
@@ -637,8 +628,7 @@ mod tests {
         success.failure = None;
         success.format = "7z".into();
         success.recovered_complete_files = 0;
-        let mut replaced = InputCheckpoint::create(&source, &replacement, &success,
-            &generations, None, true, 0).unwrap();
+        let mut replaced = InputCheckpoint::create(&source, Arc::new(replacement.clone()), &success, &generations, None).unwrap();
         replaced.install_report(InputCheckpoint::report_state(&replacement, &success,
             Some(&output), None, 1, 1));
         let retained = checkpoint.result(1);
@@ -704,7 +694,7 @@ mod tests {
             sources: sources.into(), output: retained.clone(),
             planned_output: Some(retained.clone()), container: Some(root.clone()),
             files: 1, bytes: 4, encrypted: None, discovery_source: DiscoverySource::Embedded,
-            children_complete: true, remaining_depth: 0, failure: None,
+            failure: None,
         };
         let paths = super::super::coordinator::PromotionPaths::new(&moves);
         assert!(checkpoint.promoted(&paths).unwrap());
@@ -766,9 +756,7 @@ mod tests {
                 planned_output: None,
                 container: Some(container.clone()),
                 files: 1, bytes: 4, encrypted: None,
-                discovery_source: DiscoverySource::Embedded, children_complete: true,
-                remaining_depth: 0,
-                failure: Some(Arc::new(FailureReceipt {
+                discovery_source: DiscoverySource::Embedded, failure: Some(Arc::new(FailureReceipt {
                     partial: true, password_signature: None,
                     failure, complete_files: 1,
                 })),
@@ -836,16 +824,13 @@ mod tests {
             output: output.clone(),
             planned_output: None,
             container: None, files: 1, bytes: 7, encrypted: None,
-            discovery_source: DiscoverySource::Direct, children_complete: true,
-            remaining_depth: 0, failure: None,
+            discovery_source: DiscoverySource::Direct, failure: None,
         };
         let mut result = complete.result(1);
         result.failure = Some(Failure::new(FailureKind::MissingVolume, "missing volume"));
         result.partial = true;
         result.recovered_complete_files = 1;
-        let partial = InputCheckpoint::create(
-            &source, &input, &result, &generations, None, true, 0,
-        ).unwrap();
+        let partial = InputCheckpoint::create(&source, Arc::new(input.clone()), &result, &generations, None).unwrap();
         // Exercise the persisted representation, not just in-memory equality.
         let partial: InputCheckpoint = serde_json::from_slice(
             &serde_json::to_vec(&partial).unwrap(),
@@ -874,9 +859,7 @@ mod tests {
         }));
         assert!(complete.valid_for(&alternatives, &generations));
         assert!(!partial.valid_for(&alternatives, &generations));
-        assert!(InputCheckpoint::create(
-            &source, &alternatives, &result, &generations, None, true, 0,
-        ).is_some());
+        assert!(InputCheckpoint::create(&source, Arc::new(alternatives.clone()), &result, &generations, None).is_some());
 
         // A failed input reserves its name without advertising recoverable
         // content. Persist and relocate that namespace independently of output.

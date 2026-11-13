@@ -5,6 +5,7 @@ use crate::scan::path_filter::{NativePathRule, RuleEntry};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     env, io,
     path::{Path, PathBuf},
@@ -614,15 +615,14 @@ fn string_field(value: &Value, path: &[&str]) -> String {
         .to_ascii_lowercase()
 }
 
-fn selection_field(value: &Value, path: &[&str], default: &str) -> io::Result<String> {
+fn selection_field(value: &Value, path: &[&str], default: &str) -> String {
     let value = field(value, path);
     if !json_truthy(value) {
-        return Ok(default.into());
+        return default.into();
     }
-    value
-        .as_str()
-        .map(|name| name.trim().to_ascii_lowercase())
-        .ok_or_else(|| invalid(format!("{} must be a string", path.join("."))))
+    // Python stringifies truthy non-strings before checking the enum. None
+    // can match these string choices; let the enum emit its normal diagnostic.
+    value.as_str().unwrap_or_default().trim().to_ascii_lowercase()
 }
 
 fn number_field(value: &Value, path: &[&str]) -> io::Result<f64> {
@@ -630,12 +630,38 @@ fn number_field(value: &Value, path: &[&str]) -> io::Result<f64> {
         .ok_or_else(|| invalid(format!("{} must be a number", path.join("."))))
 }
 
+// Normalize only Python's decimal digits and digit separators; leave the
+// numeric grammar to Rust. Ordinary ASCII settings need no allocation.
+fn numeric_string(value: &str) -> Option<Cow<'_, str>> {
+    let value = value.trim();
+    if value.is_ascii() && !value.contains('_') {
+        return Some(Cow::Borrowed(value));
+    }
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    let mut digit_before = false;
+    while let Some(character) = characters.next() {
+        if character == '_' {
+            if !digit_before || characters.peek().and_then(|&next| decimal_digit(next)).is_none() {
+                return None;
+            }
+            digit_before = false;
+        } else if let Some(digit) = decimal_digit(character) {
+            normalized.push((b'0' + digit as u8) as char);
+            digit_before = true;
+        } else {
+            normalized.push(character);
+            digit_before = false;
+        }
+    }
+    Some(Cow::Owned(normalized))
+}
+
 fn number_value(value: &Value) -> Option<f64> {
     value
         .as_f64()
-        .or_else(|| value.as_str()?.trim().parse().ok())
+        .or_else(|| numeric_string(value.as_str()?)?.parse().ok())
         .or_else(|| value.as_bool().map(|value| f64::from(u8::from(value))))
-        .filter(|value| value.is_finite())
 }
 
 fn integer_field(value: &Value, path: &[&str], min: u64) -> io::Result<u64> {
@@ -651,12 +677,14 @@ fn integer_value(value: &Value) -> Option<u64> {
         .or_else(|| value.as_u64())
         .or_else(|| value.as_bool().map(u64::from))
         .or_else(|| {
-            value
-                .as_str()?
-                .trim()
-                .parse::<i64>()
-                .ok()
-                .map(|n| n.max(0) as u64)
+            let number = numeric_string(value.as_str()?)?;
+            if let Some(negative) = number.strip_prefix('-') {
+                // The field clamps negatives to zero, including Python ints
+                // whose magnitude is larger than the native unsigned field.
+                return (!negative.is_empty() && negative.bytes().all(|byte| byte.is_ascii_digit()))
+                    .then_some(0);
+            }
+            number.parse::<u64>().ok()
         })
         .or_else(|| value.as_f64().map(|n| n.max(0.0) as u64))
 }
@@ -737,34 +765,29 @@ impl Config {
             value,
             &["runtime", "process_mode"],
             "normal",
-        )?)?;
+        ))?;
         let recursive_extract = Recursion::parse(
             &field(value, &["recursive_extract"])
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| field(value, &["recursive_extract"]).to_string()),
         )?;
+        let authorization_number = |name| {
+            number_field(value, &["recursive_authorization", name])
+                .map_err(|_| invalid("recursive_authorization thresholds must be numeric"))
+        };
         let recursive_authorization = AuthorizationConfig {
             enabled: bool_field(value, &["recursive_authorization", "enabled"])?,
-            byte_ratio_exponent: number_field(
-                value,
-                &["recursive_authorization", "byte_ratio_exponent"],
-            )?,
-            project_ratio_exponent: number_field(
-                value,
-                &["recursive_authorization", "project_ratio_exponent"],
-            )?,
-            minimum_authorization_score: number_field(
-                value,
-                &["recursive_authorization", "minimum_authorization_score"],
-            )?,
+            byte_ratio_exponent: authorization_number("byte_ratio_exponent")?,
+            project_ratio_exponent: authorization_number("project_ratio_exponent")?,
+            minimum_authorization_score: authorization_number("minimum_authorization_score")?,
         };
-        if recursive_authorization.byte_ratio_exponent <= 0.0 {
+        if !recursive_authorization.byte_ratio_exponent.is_finite() || recursive_authorization.byte_ratio_exponent <= 0.0 {
             return Err(invalid(
                 "recursive_authorization.byte_ratio_exponent must be positive",
             ));
         }
-        if recursive_authorization.project_ratio_exponent <= 0.0 {
+        if !recursive_authorization.project_ratio_exponent.is_finite() || recursive_authorization.project_ratio_exponent <= 0.0 {
             return Err(invalid(
                 "recursive_authorization.project_ratio_exponent must be positive",
             ));
@@ -838,7 +861,7 @@ impl Config {
                     value,
                     &["extraction", "content_requirement"],
                     "complete",
-                )?)?,
+                ))?,
             },
             post_extract: PostExtractConfig {
                 archive_cleanup_mode: CleanupMode::parse(&string_field(
@@ -860,6 +883,7 @@ impl Config {
                     &["performance", "persistent_server_idle_seconds"],
                 )
                 .and_then(number_value)
+                .filter(|seconds| seconds.is_finite())
                 .map(|seconds| seconds.max(0.0)),
                 worker: WorkerConfig {
                     space_poll_interval_ms: at(
@@ -1264,8 +1288,65 @@ mod filter_runtime_tests {
 }
 
 #[cfg(test)]
-mod recursion_lexical_tests {
+mod numeric_lexical_tests {
     use super::*;
+
+    #[test]
+    fn python_numeric_config_strings_normalize_without_widening_grammar() {
+        let mut strings = defaults().clone();
+        strings["watch"]["clipboard_builtin_max_entries"] = Value::String("  +１_０００  ".into());
+        strings["watch"]["boundary_confirmation_seconds"] = Value::String("0_5".into());
+        strings["watch"]["runtime_cache_cleanup_idle_seconds"] = Value::String("١.２e+१".into());
+        strings["recursive_authorization"]["byte_ratio_exponent"] = Value::String("1_0".into());
+        let mut numbers = defaults().clone();
+        numbers["watch"]["clipboard_builtin_max_entries"] = Value::from(1000);
+        numbers["watch"]["boundary_confirmation_seconds"] = Value::from(5.0);
+        numbers["watch"]["runtime_cache_cleanup_idle_seconds"] = Value::from(12.0);
+        numbers["recursive_authorization"]["byte_ratio_exponent"] = Value::from(10.0);
+        assert!(Config::parse(&strings).unwrap() == Config::parse(&numbers).unwrap());
+        assert!(matches!(numeric_string(" 12.5 "), Some(Cow::Borrowed("12.5"))));
+        for input in ["_1", "1_", "1__0", "+_1", "1_.0", "1._0", "1_e2", "1e_2", "1e+_2", "²", "0x10"] {
+            assert!(number_value(&Value::String(input.into())).is_none(), "{input}");
+            assert!(integer_value(&Value::String(input.into())).is_none(), "{input}");
+        }
+        for input in ["１.０", "1e２", "1_0.0"] {
+            assert!(number_value(&Value::String(input.into())).is_some(), "{input}");
+            assert!(integer_value(&Value::String(input.into())).is_none(), "{input}");
+        }
+        assert_eq!(integer_value(&Value::String("-１_２".into())), Some(0));
+    }
+
+    #[test]
+    fn numeric_normalization_keeps_field_specific_bounds_and_diagnostics() {
+        for (text, expected) in [("nan", 0.0), ("-inf", 0.0), ("inf", f64::INFINITY), ("1e9999", f64::INFINITY)] {
+            let mut raw = defaults().clone();
+            raw["watch"]["boundary_confirmation_seconds"] = Value::String(text.into());
+            raw["watch"]["runtime_cache_cleanup_idle_seconds"] = Value::String(text.into());
+            let settings = Config::parse(&raw).unwrap();
+            assert_eq!(settings.watch.boundary_confirmation_seconds, expected);
+            assert_eq!(settings.watch.runtime_cache_cleanup_idle_seconds, expected);
+        }
+        for (text, expected) in [("9223372036854775808", 1u64 << 63), ("18446744073709551615", u64::MAX), ("-18446744073709551615", 1)] {
+            let mut raw = defaults().clone();
+            raw["watch"]["event_log_retention_days"] = Value::String(text.into());
+            assert_eq!(Config::parse(&raw).unwrap().watch.event_log_retention_days, expected);
+        }
+        for name in ["byte_ratio_exponent", "project_ratio_exponent", "minimum_authorization_score"] {
+            for text in ["nan", "inf", "-inf", "not numeric"] {
+                let mut raw = defaults().clone();
+                raw["recursive_authorization"][name] = Value::String(text.into());
+                let error = Config::parse(&raw).err().unwrap().to_string();
+                let expected = if text == "not numeric" {
+                    "recursive_authorization thresholds must be numeric".to_owned()
+                } else if name == "minimum_authorization_score" {
+                    format!("recursive_authorization.{name} must be between 0 and 1")
+                } else {
+                    format!("recursive_authorization.{name} must be positive")
+                };
+                assert_eq!(error, expected);
+            }
+        }
+    }
 
     #[test]
     fn python_positive_decimal_recursion_contract() {

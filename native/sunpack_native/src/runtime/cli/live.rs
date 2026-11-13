@@ -217,6 +217,10 @@ impl Panel {
         })
     }
 
+    pub(super) fn disk_waiting(&self, id: TaskId, episode: u64) -> bool {
+        self.tasks.get(&id).is_some_and(|row| row.wait.disk && row.wait.disk_episode == episode)
+    }
+
     pub(super) fn scope_progress(&self, id: TaskId) -> HashMap<(PathBuf, Option<u64>), (u64, u64)> {
         let mut progress = HashMap::new();
         let mut pending = vec![id];

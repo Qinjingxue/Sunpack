@@ -373,6 +373,7 @@ function Ensure-AcceptanceTestTools {
         (Test-CommandRuns -FilePath $zstdPath -Arguments @("--version"))
     $sevenZipZstdReady = Test-SevenZipZstdGenerator -FilePath $sevenZipZstdPath
     if ($rarReady -and $zstdReady -and $sevenZipZstdReady) {
+        Invoke-Native -FilePath $venvPython -Arguments @("-m", "tests.helpers.tool_config")
         Write-Host "Acceptance archive generator tools are already present" -ForegroundColor Green
         return
     }
@@ -488,20 +489,8 @@ function Ensure-AcceptanceTestTools {
         Remove-IfExists -LiteralPath $tempRoot
     }
 
-    if (-not (Test-Path -LiteralPath $rarPath) -or
-        -not (Test-Path -LiteralPath $rarSfxPath) -or
-        -not (Test-Path -LiteralPath $winrarPath) -or
-        -not (Test-RarGeneratorVersion -FilePath $rarPath -RequiredVersion $requiredRarVersion)) {
-        throw "Acceptance RAR generator installation is incomplete under $rarRoot"
-    }
-    if (-not (Test-Path -LiteralPath $zstdPath) -or
-        -not (Test-CommandRuns -FilePath $zstdPath -Arguments @("--version"))) {
-        throw "Acceptance zstd generator installation is incomplete under $zstdRoot"
-    }
-    if (-not (Test-SevenZipZstdGenerator -FilePath $sevenZipZstdPath)) {
-        throw "Acceptance 7-Zip-Zstandard generator installation is incomplete under $sevenZipZstdRoot"
-    }
-    Write-Host "Acceptance archive generator tools are ready: $rarPath, $zstdPath, $sevenZipZstdPath" -ForegroundColor Green
+    Invoke-Native -FilePath $venvPython -Arguments @("-m", "tests.helpers.tool_config")
+    Write-Host "Acceptance archive generator tools are ready" -ForegroundColor Green
 }
 
 function Invoke-Native {

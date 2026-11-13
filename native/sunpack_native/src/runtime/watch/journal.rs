@@ -59,7 +59,7 @@ pub(super) struct Journal {
 }
 
 impl Journal {
-    pub(super) fn open(dir: &Path) -> io::Result<Self> {
+    pub(super) fn open(dir: &Path, retention_days: u64) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -115,7 +115,7 @@ impl Journal {
         let stream_id = key(&snapshot);
         let stream = watch_journal_open(stream_id.clone())?;
         watch_journal_seed(&stream_id, frontier.seq)?;
-        let log = NativeEventLog::new(dir.join("events.json"), 7, true)?;
+        let log = NativeEventLog::new(dir.join("events.json"), retention_days.min(u32::MAX.into()) as u32, true)?;
         state.attach_events(&log)?;
         log.recover(Some(&state))?;
         Ok(Self {
@@ -421,6 +421,30 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn configured_retention_applies_before_first_writer_pass() {
+        use crate::io::display_store::{utc_us, Store, Manifest, DAY_US};
+        let marker = crate::test_support::temp_file("configured_watch_retention", b"");
+        let dir = marker.with_extension("state");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("events.json");
+        let old = utc_us() - 10 * DAY_US;
+        {
+            let mut store = Store::open(path.clone()).unwrap();
+            store.append(&serde_json::json!({"event":"done", "path":"old.zip", "ts":old as f64 / 1_000_000.0}), old).unwrap();
+            store.publish().unwrap();
+        }
+        for (days, expected) in [(30, 1), (7, 0)] {
+            let journal = Journal::open(&dir, days).unwrap();
+            journal.flush().unwrap();
+            let manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(manifest.runs.iter().map(|run| run.count - run.head).sum::<u64>(), expected);
+            drop(journal);
+        }
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
     // Unlike dropping Journal, killing a separate owner cannot finish a
     // checkpoint, flush the stream or run destructors on the way out. Cover
     // the three durable representations with one coarse recovery scenario.
@@ -439,7 +463,7 @@ mod tests {
             let dir = marker.with_extension("state");
             let owned = marker.with_extension("owned");
             fs::create_dir(&owned).unwrap();
-            let journal = Journal::open(&dir).unwrap();
+            let journal = Journal::open(&dir, 7).unwrap();
             journal.commit(true, |_| {
                 let mut operations = NativeWatchOperations::password_generation(1, "one".into());
                 let (volume, id, _) = crate::filesystem::watch_path_identity(owned.to_str().unwrap())?;
@@ -510,7 +534,7 @@ mod tests {
             killed.unwrap();
             assert!(!status.success());
             for _ in 0..2 {
-                let journal = Journal::open(&dir).unwrap();
+                let journal = Journal::open(&dir, 7).unwrap();
                 assert_eq!(journal.state().password_generation(), 3, "{phase}");
                 assert!(!journal.state().promoted_source(marker.to_str().unwrap()).unwrap().is_replaced());
                 assert_eq!(journal.state().runtime_keys("owned|").len(), 1);
@@ -533,7 +557,7 @@ mod tests {
     fn snapshot_failure_keeps_wal_live_until_retry_or_safety_limit() {
         let marker = crate::test_support::temp_file("snapshot_retry", b"");
         let dir = marker.with_extension("state");
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         let temp = dir.join("state.snapshot.tmp");
         fs::create_dir(&temp).unwrap(); // Fail only snapshot creation, not WAL.
         journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
@@ -546,7 +570,7 @@ mod tests {
         assert!(journal.frontier.lock().unwrap().records >= CHECKPOINT_RECORDS);
         assert!(!segments(&dir).unwrap().is_empty());
         drop(journal);
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         assert_eq!(journal.state().password_generation(), 2);
         fs::remove_dir(&temp).unwrap();
         journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
@@ -557,7 +581,7 @@ mod tests {
         journal.flush().unwrap();
         assert!(journal.frontier.lock().unwrap().checkpoint_error.is_none());
         drop(journal);
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         assert_eq!(journal.state().password_generation(), 3);
         {
             let mut frontier = journal.frontier.lock().unwrap();
@@ -585,7 +609,7 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         let marker = crate::test_support::temp_file("retirement_retry", b"");
         let dir = marker.with_extension("state");
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         let notifications = Arc::new(AtomicUsize::new(0));
         let notified = Arc::clone(&notifications);
         journal.set_maintenance(Arc::new(move || { notified.fetch_add(1, Ordering::Relaxed); }));
@@ -618,7 +642,7 @@ mod tests {
         journal.wait_for_checkpoint().unwrap();
         drop(journal);
         drop(reader);
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         assert_eq!(journal.state().password_generation(), 2);
         assert!(!wal.exists());
         drop(journal);
@@ -630,7 +654,7 @@ mod tests {
     fn display_flush_failure_does_not_replace_durable_journal_result() {
         let marker = crate::test_support::temp_file("display_flush", b"");
         let dir = marker.with_extension("state");
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         journal.flush().unwrap();
         // A directory at the manifest path causes a terminal display error,
         // unlike a sharing handle that atomic publication waits to release.
@@ -651,7 +675,7 @@ mod tests {
         fs::rename(&saved, &manifest).unwrap();
         journal.flush().unwrap();
         drop(journal);
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         assert_eq!(journal.state().password_generation(), 2);
         drop(journal);
         fs::remove_dir_all(dir).unwrap();
@@ -664,7 +688,7 @@ mod tests {
         use std::time::Duration;
         let marker = crate::test_support::temp_file("snapshot_sharing", b"");
         let dir = marker.with_extension("state");
-        let journal = Arc::new(Journal::open(&dir).unwrap());
+        let journal = Arc::new(Journal::open(&dir, 7).unwrap());
         journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
         journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(1, "one".into()))).unwrap();
         journal.flush().unwrap();
@@ -684,7 +708,7 @@ mod tests {
         assert!(result.expect("flush waited for an external snapshot handle").is_ok());
         journal.flush().unwrap();
         drop(journal);
-        let journal = Journal::open(&dir).unwrap();
+        let journal = Journal::open(&dir, 7).unwrap();
         assert_eq!(journal.state().password_generation(), 2);
         drop(journal);
         fs::remove_dir_all(dir).unwrap();
@@ -707,7 +731,7 @@ mod tests {
             .args(["/d", "/c", "mklink", "/J"])
             .arg(&alias).arg(&directory).output().unwrap();
         assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
-        let journal = Arc::new(Journal::open(&state_directory).unwrap());
+        let journal = Arc::new(Journal::open(&state_directory, 7).unwrap());
         let (start, ready) = mpsc::sync_channel(1);
         let (attempt, entered) = mpsc::sync_channel(1);
         let (finish, filtered) = mpsc::sync_channel(1);
@@ -739,7 +763,7 @@ mod tests {
         assert_eq!(journal.frontier.lock().unwrap().seq, 1);
         assert!(journal.state().watch_cursors().is_empty());
         drop(journal);
-        let journal = Journal::open(&state_directory).unwrap();
+        let journal = Journal::open(&state_directory, 7).unwrap();
         let mut paths = vec![output.join("nested.blob"), physical.join("nested.blob")];
         journal.filter_owned_events(&mut paths, &directory);
         assert!(paths.is_empty());
@@ -757,7 +781,7 @@ mod tests {
         let marker = crate::test_support::temp_file("active_watch_checkpoint", b"");
         let dir = marker.with_extension("state");
         {
-            let journal = Journal::open(&dir).unwrap();
+            let journal = Journal::open(&dir, 7).unwrap();
             // Position just below the threshold without doing thousands of
             // unrelated writes. Every subsequent record uses the real writer.
             journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS - 2;
@@ -784,7 +808,7 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].0, 3);
         {
-            let journal = Journal::open(&dir).unwrap();
+            let journal = Journal::open(&dir, 7).unwrap();
             assert_eq!(journal.state().password_generation(), 3);
             let receipt = journal
                 .state()

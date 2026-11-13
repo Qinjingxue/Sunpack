@@ -260,17 +260,11 @@ pub(crate) fn watch_candidate_for_path(
     path: &Path,
     since_usn: Option<i64>,
 ) -> io::Result<Option<WatchCandidateRow>> {
+    // An unobservable candidate ends this admission attempt, as in main.
+    // USN and readiness failures remain separately classified below.
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+        Err(_) => return Ok(None),
     };
     if !metadata.is_file() {
         return Ok(None);
@@ -516,6 +510,15 @@ fn mtime_seconds(metadata: &fs::Metadata) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unobservable_metadata_retires_candidate_without_retry() {
+        // An invalid native path deterministically fails metadata even under
+        // an elevated test account; it does not exercise the share-open path.
+        let path = Path::new("invalid\0candidate.zip");
+        assert!(fs::metadata(path).is_err());
+        assert!(watch_candidate_for_path(path, None).unwrap().is_none());
+    }
 
     #[test]
     fn promotion_rolls_back_preceding_members_on_move_failure() {

@@ -5,9 +5,12 @@ mod cleanup;
 mod coordinator;
 mod discovery;
 mod passwords;
+mod results;
 pub(crate) mod scheduling;
 mod shell_updates;
 mod worker;
+#[cfg(test)]
+pub(crate) use worker::coalesced_wait_batches;
 
 use crate::core::{config::Config, passwords::PasswordSnapshot};
 use crate::io::reader::PhysicalFileGeneration;
@@ -563,6 +566,8 @@ impl Outcome {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceWait {
     pub disk: bool,
+    // Preserve a new wait across mailbox/report coalescing of its resume edge.
+    pub disk_episode: u64,
     pub memory: bool,
     pub volume_error: Option<u64>,
 }

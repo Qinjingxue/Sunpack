@@ -167,15 +167,26 @@ fn machine_command(
     target: &Path,
     argument: Option<&str>,
 ) -> io::Result<String> {
-    let text = windows::registry_text(HKEY_LOCAL_MACHINE, key, name)?
-        .ok_or_else(|| io::Error::other(format!("registry value is missing: {key}")))?;
+    registration_detail(windows::registry_text(HKEY_LOCAL_MACHINE, key, name)?, target, argument)
+}
+
+fn registration_detail(text: Option<String>, target: &Path, argument: Option<&str>) -> io::Result<String> {
+    let text = text.ok_or_else(|| io::Error::other(if argument.is_some() {
+        "machine COM registration is missing"
+    } else {
+        "service is not installed"
+    }))?;
     let normalized = text.replace('/', "\\").to_lowercase();
     if !normalized.contains(&normalized_path(&target.to_string_lossy()))
         || argument.is_some_and(|argument| !text.contains(argument))
     {
-        return Err(io::Error::other(format!("registration points to: {text}")));
+        return Err(io::Error::other(format!("{}: {text}", if argument.is_some() {
+            "activation command is stale"
+        } else {
+            "service points to"
+        })));
     }
-    Ok(text)
+    Ok(if argument.is_some() { text } else { target.display().to_string() })
 }
 
 fn machine_path(root: &Path) -> io::Result<Value> {
@@ -283,4 +294,24 @@ pub(super) fn label(name: &str, language: Language) -> String {
         }
     };
     text.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_and_toast_registration_keep_their_diagnostic_contracts() {
+        let target = Path::new(r"C:\SunPack\service\sunpack-watch-broker.exe");
+        let command = format!("\"{}\" --service", target.display());
+        assert_eq!(registration_detail(Some(command), target, None).unwrap(), target.display().to_string());
+        assert_eq!(registration_detail(None, target, None).unwrap_err().to_string(), "service is not installed");
+        assert_eq!(registration_detail(Some("old.exe".into()), target, None).unwrap_err().to_string(), "service points to: old.exe");
+        let target = Path::new(r"C:\SunPack\bin\sunpack.exe");
+        let argument = Some("--toast-activated");
+        let command = format!("\"{}\" --toast-activated", target.display());
+        assert_eq!(registration_detail(Some(command.clone()), target, argument).unwrap(), command);
+        assert_eq!(registration_detail(None, target, argument).unwrap_err().to_string(), "machine COM registration is missing");
+        assert_eq!(registration_detail(Some(target.display().to_string()), target, argument).unwrap_err().to_string(), format!("activation command is stale: {}", target.display()));
+    }
 }

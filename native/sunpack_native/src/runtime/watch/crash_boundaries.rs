@@ -27,7 +27,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         fs::write(nested_output.join("payload"), b"committed payload").unwrap();
         let payload_identity = output_identity(nested_output.to_str().unwrap()).unwrap();
         fs::write(base.join("identity"), payload_identity).unwrap();
-        let journal = journal::Journal::open(&base.join("state")).unwrap();
+        let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
         let owner_text = owner.to_str().unwrap();
         journal.commit(true, |state| {
             Ok(state.pending_operations(
@@ -107,7 +107,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         let work = base.join("work");
         let leaf = root.join("wrapper/inner");
         for reopen in 0..2 {
-            let journal = journal::Journal::open(&base.join("state")).unwrap();
+            let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
             recover_flattens(&journal, |_| true).unwrap();
             if phase == "prepared" && reopen == 0 {
                 // No filesystem move occurred. Recovery retires the untouched
@@ -162,10 +162,11 @@ fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
             // Only the recovery method is under test: no worker, observers or
             // broker connection is started. This isolated process has no
             // acquired broker lease, so its empty lease Drop is a no-op.
-            let journal = Arc::new(journal::Journal::open(&base.join("state")).unwrap());
+            let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
             let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
             let settings = Arc::new(Config::parse(&json!({})).unwrap());
             let mut scheduler = Scheduler {
+                admission_checkpoint: None,
                 cwd: base.clone(), root_file: base.join(ROOTS_FILE),
                 roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,
                     recursive: true, deep: true, scanned: true }, scope))]),
@@ -220,7 +221,7 @@ fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
             fs::write(base.join(format!("generation-{index}.json")),
                 serde_json::to_vec(&capture_file_generation(source).unwrap().persisted()).unwrap()).unwrap();
         }
-        let journal = journal::Journal::open(&base.join("state")).unwrap();
+        let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
         let owner_text = owner.to_str().unwrap();
         journal.commit(true, |state| Ok(state.pending_operations(
             [(PendingObservation(owner_text.into(), 7, 1.0, String::new(), 0),
@@ -312,10 +313,11 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         let same = watch_candidate_for_path(&sibling, None).unwrap().unwrap();
         let captured = Arc::new(Mutex::new(ClaimedSources::default()));
         captured.lock().unwrap().capture(&[old.path.clone(), same.path.clone()]).unwrap();
-        let journal = Arc::new(journal::Journal::open(&base.join("state")).unwrap());
+        let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
         let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
         let settings = Arc::new(Config::default());
             let mut scheduler = Scheduler {
+                admission_checkpoint: None,
                 cwd: base.clone(), root_file: base.join(ROOTS_FILE),
                 roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,
                     recursive: true, deep: true, scanned: true }, scope))]),
@@ -345,7 +347,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         let dirty = HashSet::from([key(&source), key(&sibling)]);
         scheduler.apply_completion("owner", CompletionContext {
             root: key(&watched), recovery: None, passwords: Arc::default(),
-            inputs: vec![old, same], dirty, claimed: captured, groups, toast: None, task: None,
+            inputs: vec![old, same], quiet: HashMap::new(), dirty, claimed: captured, groups, toast: None, task: None,
         }, Completed { cancelled: true, result: Err(io::Error::other("cancelled owner")),
             promoted: HashMap::new(), outputs: BTreeMap::new() }).unwrap();
         assert_eq!(scheduler.pending.len(), 1);

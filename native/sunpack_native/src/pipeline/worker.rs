@@ -2,6 +2,8 @@
 //! assembly and coalesces byte progress and resource state independently.
 
 use super::{ResourceWait, WorkerUpdates};
+#[cfg(test)]
+pub(crate) use tests::coalesced_wait_batches;
 use crate::core::config::{ProcessMode, WorkerConfig};
 use crate::io::cancellation::Cancellation;
 use crate::scan::worker_event::{NativeWorkerResultAccumulator, WorkerFrame};
@@ -194,7 +196,7 @@ impl WorkerExit {
 
 struct Job {
     mailbox: Arc<Mailbox>,
-    accumulator: NativeWorkerResultAccumulator,
+    accumulator: Option<NativeWorkerResultAccumulator>,
     submission_epoch: u64,
     result: Option<io::Result<WorkerFrame>>,
     disk: Episode,
@@ -206,13 +208,21 @@ impl Job {
     fn new(id: &str, mailbox: Arc<Mailbox>, submission_epoch: u64) -> Self {
         Self {
             mailbox,
-            accumulator: NativeWorkerResultAccumulator::new(id.to_owned()),
+            accumulator: Some(NativeWorkerResultAccumulator::new(id.to_owned())),
             submission_epoch,
             result: None,
             disk: Episode::default(),
             memory: Episode::default(),
             resources: ResourceWait::default(),
         }
+    }
+
+    fn protocol_error(&mut self, error: io::Error) {
+        self.result = Some(Err(error));
+        self.accumulator.take();
+        // Wake the existing submission waiter to use its ordered cancel write.
+        // The result stays private until job_finished stops the native writer.
+        self.mailbox.update(|updates| updates.cancel_requested = true);
     }
 
     fn resource_event(&mut self, event: &str, summary: &Value) -> bool {
@@ -222,6 +232,7 @@ impl Job {
             "space_blocked" | "space_status" | "space_resumed" => {
                 if self.disk.update(episode, event == "space_resumed") {
                     self.resources.disk = !self.disk.resumed;
+                    self.resources.disk_episode = self.disk.id;
                     self.resources.volume_error = (self.resources.disk
                         && summary.get("volume_query_ok").and_then(Value::as_bool) == Some(false))
                     .then(|| number(summary, "volume_query_error"));
@@ -287,6 +298,7 @@ struct Updates {
     resources: Option<ResourceWait>,
     result: Option<io::Result<WorkerFrame>>,
     retry_granted: bool,
+    cancel_requested: bool,
     waker: Option<Waker>,
 }
 
@@ -517,7 +529,7 @@ impl Process {
         let mut sent_cancel = false;
         let mut cancel_write: Option<Arc<WriteCompletion>> = None;
         poll_fn(|cx| {
-            let (started, progress, resources, result) = {
+            let (started, progress, resources, result, cancel_requested) = {
                 let mut updates = mailbox.updates.lock().unwrap();
                 if updates.result.is_none() {
                     updates.waker = Some(cx.waker().clone());
@@ -527,6 +539,7 @@ impl Process {
                     updates.progress.take(),
                     updates.resources.take(),
                     updates.result.take(),
+                    updates.cancel_requested,
                 )
             };
             if started {
@@ -541,7 +554,7 @@ impl Process {
             if let Some(result) = result {
                 return Poll::Ready(result);
             }
-            if !sent_cancel && cancellation.cancelled() {
+            if !sent_cancel && (cancel_requested || cancellation.cancelled()) {
                 let cancel =
                     encode_worker_frame(&json!({"worker_command":"cancel", "job_id":job_id}))?;
                 cancel_write = Some(self.send(Arc::new(cancel)));
@@ -898,10 +911,10 @@ impl Shared {
                 job.mailbox.update(|updates| updates.started = true);
             }
             "protocol_error" => {
-                job.result = Some(Err(io::Error::new(
+                job.protocol_error(io::Error::new(
                     io::ErrorKind::InvalidData,
                     string(&frame.summary, "message"),
-                )))
+                ))
             }
             "progress" if job.mailbox.interest == WorkerUpdates::All => {
                 let update = Progress {
@@ -912,14 +925,14 @@ impl Shared {
                     .update(|updates| updates.progress = Some(update));
             }
             "progress" | "native_memory" => {}
-            _ => match job.accumulator.accept(frame) {
+            _ => match job.accumulator.as_mut().expect("active job accumulator").accept(frame) {
                 Ok(Some(frame)) if string(&frame.summary, "type") == "result" => {
                     let stderr = self.stderr.lock().unwrap().take();
                     job.mailbox.stderr.lock().unwrap().append(stderr.as_bytes());
                     job.result = Some(Ok(frame))
                 }
                 Ok(_) => {}
-                Err(error) => job.result = Some(Err(error)),
+                Err(error) => job.protocol_error(error),
             },
         }
     }
@@ -1483,6 +1496,61 @@ mod tests {
     }
 
     #[test]
+    fn job_protocol_errors_cancel_once_and_wait_for_native_completion() {
+        for malformed in [
+            // A frame boundary and job route survive a malformed event body.
+            json!({"type": "progress", "job_id": "bad", "rows": "invalid"}),
+            // A valid body can still fail accumulator sequence validation.
+            json!({"type": "manifest_chunk", "job_id": "bad", "seq": 1, "rows": []}),
+        ] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let (entered, writing) = mpsc::sync_channel(1);
+            let (release, released) = mpsc::channel();
+            let process = Process::with_test_input(GatedInput {
+                entered,
+                release: released,
+                barriers: 1,
+                bytes: Arc::clone(&bytes),
+            });
+            let mailbox = register(&process.shared, "bad");
+            let sibling = register(&process.shared, "sibling");
+            let cancellation = Cancellation::new();
+            let mut on_update = |_| {};
+            let mut waiting = Box::pin(process.wait(
+                "bad", &mailbox, &cancellation, &mut on_update,
+            ));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            dispatch(&process.shared, malformed.clone());
+            assert!(process.shared.state.lock().unwrap().jobs["bad"].accumulator.is_none());
+            assert!(mailbox.updates.lock().unwrap().result.is_none());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            let cancel = writing.recv_timeout(Duration::from_secs(10)).unwrap();
+            let expected = encode_worker_frame(
+                &json!({"worker_command": "cancel", "job_id": "bad"}),
+            ).unwrap();
+            assert_eq!(cancel, expected);
+            // Neither repeated broken events nor user cancellation duplicate it.
+            dispatch(&process.shared, malformed);
+            cancellation.cancel();
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            finish(&process.shared, "sibling", false);
+            assert!(sibling.updates.lock().unwrap().result.take().unwrap().is_ok());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            release.send(()).unwrap();
+            finish(&process.shared, "bad", false);
+            let Poll::Ready(result) = waiting.as_mut().poll(&mut cx) else {
+                panic!("job_finished did not deliver the protocol error");
+            };
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData);
+            drop(waiting);
+            drop(process);
+            let shutdown = encode_worker_frame(&json!({"worker_command": "shutdown"})).unwrap();
+            assert_eq!(*bytes.lock().unwrap(), [expected, shutdown].concat());
+        }
+    }
+
+    #[test]
     fn blocked_submit_and_cancel_release_the_only_host_slot_and_drain_in_order() {
         // Unlike a mailbox-only test, exercise Process::submit and its cancel
         // path on a real one-slot Scheduler. Neither pipe write is released
@@ -1800,6 +1868,21 @@ mod tests {
         assert!(!second.updates.lock().unwrap().retry_granted);
     }
 
+    // Feed real binary frame decoding and mailbox coalescing to CLI tests.
+    // One batch represents frames arriving before the submission is polled.
+    pub(crate) fn coalesced_wait_batches(batches: &[Vec<Value>]) -> Vec<ResourceWait> {
+        let shared = Shared::default();
+        let mailbox = register(&shared, "active");
+        batches.iter().map(|batch| {
+            for summary in batch {
+                let mut summary = summary.clone();
+                summary["job_id"] = json!("active");
+                dispatch(&shared, summary);
+            }
+            mailbox.updates.lock().unwrap().resources.take().unwrap()
+        }).collect()
+    }
+
     #[test]
     fn resource_wait_tracks_independent_episodes_through_binary_frames() {
         let shared = Shared::default();
@@ -1824,6 +1907,7 @@ mod tests {
             take_wait(),
             Some(ResourceWait {
                 disk: true,
+                disk_episode: 1,
                 memory: true,
                 volume_error: Some(21)
             }),
@@ -1847,6 +1931,7 @@ mod tests {
             take_wait(),
             Some(ResourceWait {
                 disk: false,
+                disk_episode: 1,
                 memory: true,
                 volume_error: None
             }),
@@ -1855,6 +1940,6 @@ mod tests {
             &shared,
             json!({"type": "native_memory", "event": "memory_resumed", "job_id": "active", "episode_id": 3}),
         );
-        assert_eq!(take_wait(), Some(ResourceWait::default()));
+        assert_eq!(take_wait(), Some(ResourceWait { disk_episode: 1, ..Default::default() }));
     }
 }
