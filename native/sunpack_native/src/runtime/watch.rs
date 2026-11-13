@@ -7,7 +7,7 @@ use crate::core::config::{self, Config, Snapshot};
 use crate::core::passwords::BuiltinStore;
 use crate::core::resources::{self, FileMutex};
 use crate::filesystem;
-use crate::io::config_changes::NativeConfigChanges;
+use crate::io::config_changes::{DirectoryChange, NativeConfigChanges};
 use crate::io::reader::PhysicalFileGeneration;
 use crate::pipeline::{
     ArchiveResult, Cancellation, Engine, Event, FailureKind, Mode, Observer, Origin, Outcome,
@@ -802,6 +802,7 @@ impl VolumeChanges {
 struct Signals {
     changed_roots: HashMap<String, HashSet<PathBuf>>,
     topology_roots: HashSet<String>,
+    modified_paths: HashSet<PathBuf>,
     reload: bool,
     reload_waiters: Vec<CommandReply<bool>>,
     once: Vec<CommandReply<()>>,
@@ -818,6 +819,19 @@ struct Signals {
 }
 
 impl Signals {
+    fn prepare_root_changes(changed_roots: &mut HashMap<String, HashSet<PathBuf>>,
+        topology_roots: &HashSet<String>, modified_paths: &HashSet<PathBuf>, all_roots: bool) -> bool {
+                    // Directory modified is not an arrival. Its USN progress
+                    // is merged by idle maintenance, not a named subtree scan.
+                    for paths in changed_roots.values_mut() {
+                        paths.retain(|path| !modified_paths.contains(path) || !path.is_dir());
+                    }
+                    all_roots || !topology_roots.is_empty()
+                        || changed_roots.values().any(|paths|
+                            paths.iter().any(|path| !modified_paths.contains(path) && !path.is_file()))
+
+    }
+
     fn root_changed(&mut self, id: &str, paths: Option<Vec<PathBuf>>) {
         // Overflow/failure has no path list and invalidates the subscription;
         // named content events need catalog work, not parent identity probes.
@@ -1003,7 +1017,9 @@ impl FileObserver {
         recursive: bool,
         notify: impl Fn(Option<Vec<String>>) + Send + 'static,
     ) -> io::Result<Self> {
-        Self::start_with_filter(path, recursive, 0x01 | 0x02 | 0x08 | 0x10, 4096, notify)
+        Self::start_with_filter(path, recursive, 0x01 | 0x02 | 0x08 | 0x10, 4096, move |changes| {
+            notify(changes.map(|changes| changes.into_iter().map(|change| change.name).collect()));
+        })
     }
 
     fn start_with_filter(
@@ -1011,7 +1027,7 @@ impl FileObserver {
         recursive: bool,
         filter: u32,
         buffer_bytes: usize,
-        notify: impl Fn(Option<Vec<String>>) + Send + 'static,
+        notify: impl Fn(Option<Vec<DirectoryChange>>) + Send + 'static,
     ) -> io::Result<Self> {
         let changes = Arc::new(NativeConfigChanges::observe(path.to_owned(), recursive, filter, buffer_bytes)?);
         let stopping = Arc::new(AtomicBool::new(false));
@@ -1086,14 +1102,31 @@ impl RootObserver {
         // configuration/ancestor subscriptions keep their 4 KiB allocation.
         let observer = FileObserver::start_with_filter(
             directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, 64_000, move |names| {
+            let mut modified = HashSet::new();
+            let mut topology = HashSet::new();
             let mut paths = names.map(|names| names.into_iter()
-                .map(|name| watched_dir.join(name))
+                .map(|change| {
+                    let path = watched_dir.join(change.name);
+                    if change.action == 3 { modified.insert(path.clone()); }
+                    else { topology.insert(path.clone()); }
+                    path
+                })
                 .filter(|path| scope.contains(&path.to_string_lossy())).collect::<Vec<_>>());
             if let Some(paths) = paths.as_mut() {
                 journal.filter_owned_events(paths, &watched_dir);
             }
             if paths.as_ref().is_none_or(|paths| !paths.is_empty()) {
                 hub.update(|signals| {
+                    if let Some(paths) = &paths {
+                        for path in paths {
+                            if topology.contains(path) {
+                                signals.modified_paths.remove(path);
+                            } else if modified.contains(path)
+                                && !signals.changed_roots.get(&id).is_some_and(|old| old.contains(path)) {
+                                signals.modified_paths.insert(path.clone());
+                            }
+                        }
+                    }
                     signals.root_changed(&id, paths);
                 });
             }
@@ -1173,9 +1206,10 @@ impl ParentObserver {
         let watched_members = Arc::clone(&members);
         let watched_dir = directory.to_owned();
         let hub = Arc::clone(hub);
-        let observer = FileObserver::start(directory, false, move |names| {
+        let observer = FileObserver::start_with_filter(directory, false, 0x01 | 0x02 | 0x08 | 0x10, 4096, move |names| {
             let changed = names.map(|names| names.into_iter()
-                .map(|name| key(&watched_dir.join(name))).collect::<Vec<_>>());
+                .filter(|change| change.action != 3)
+                .map(|change| key(&watched_dir.join(change.name))).collect::<Vec<_>>());
             let affected = affected_parent_roots(&watched_members.lock().unwrap(), changed.as_deref());
             if !affected.is_empty() {
                 hub.update(|signals| for root in affected {
@@ -1261,17 +1295,21 @@ fn park_claimed_deadlines(
 }
 
 // Claimed siblings cannot be admitted while the owner runs. Transfer their old
-// queued observations into its completion, but leave changes observed during
-// ownership queued for the next generation. Their seed ownership moves with them.
+// queued observations into its completion. Events during ownership are only
+// dirty names, re-observed after completion. Seed ownership moves with them.
 fn consume_claimed_pending(
     pending: &mut HashMap<String, Pending>,
     due: &mut BTreeMap<(Instant, String), ()>,
     unpublished: &mut HashSet<String>,
     groups: &HashMap<String, Arc<SourceGroup>>,
-    touched: &HashSet<String>,
+    captured: &HashMap<String, Option<WatchCandidateRow>>,
     inputs: &mut Vec<WatchCandidateRow>,
 ) {
-    for path in groups.keys().filter(|path| !touched.contains(*path)) {
+    for path in groups.keys() {
+        if captured.get(path).and_then(Option::as_ref).is_some_and(|before|
+            pending.get(path).is_some_and(|queued| quiet::changed(before, &queued.candidate))) {
+            continue;
+        }
         if let Some(queued) = pending.remove(path) {
             due.remove(&(queued.due, path.clone()));
             unpublished.remove(path);
@@ -1372,7 +1410,7 @@ struct Active {
     recovery: Option<Arc<Recovery>>,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
-    touched: HashSet<String>,
+    dirty: HashSet<String>,
     cancel: Cancellation,
     groups: Arc<Mutex<HashMap<String, Arc<SourceGroup>>>>,
     claimed: Arc<Mutex<ClaimedSources>>,
@@ -1415,7 +1453,8 @@ struct CompletionContext {
     recovery: Option<Arc<Recovery>>,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
     inputs: Vec<WatchCandidateRow>,
-    touched: HashSet<String>,
+    dirty: HashSet<String>,
+    claimed: Arc<Mutex<ClaimedSources>>,
     groups: HashMap<String, Arc<SourceGroup>>,
     toast: Option<super::toast::Activity>,
     task: Option<crate::pipeline::TaskId>,
@@ -2177,9 +2216,7 @@ impl Scheduler {
                     self.rearm_root_observers((!all_roots).then_some(&signals.topology_roots));
                 }
                 let recovery = self.engine.run_stage("watch_directory", Origin::Watch, || {
-                    all_roots || !signals.topology_roots.is_empty()
-                        || signals.changed_roots.values().any(|paths| paths.is_empty()
-                            || paths.iter().any(|path| !path.is_file()))
+                    Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, all_roots)
                 });
                 let result = (if recovery {
                     self.checkpoint(&signals.changed_roots, all_roots, false)
@@ -2728,12 +2765,30 @@ impl Scheduler {
         self.enqueue_with_recovery(root_id, path, force, None)
     }
 
+    fn defer_claimed_path(&mut self, id: &str) -> bool {
+        let claims = self.hub.claims.lock().unwrap();
+        let owner = self.active_paths.get(id).map(|(batch, _)| batch.as_ref())
+            .or_else(|| claims.get(id).map(AsRef::as_ref));
+        let Some(owner) = owner else { return false; };
+        if let Some(active) = self.active.get_mut(owner) {
+            active.dirty.insert(id.to_owned());
+        }
+        true
+    }
+
     fn enqueue_with_recovery(
         &mut self,
         root_id: &str,
         path: String,
         force: bool,
         recovery: Option<Arc<Recovery>>,
+    ) -> io::Result<()> {
+        self.observe_candidate(root_id, path, force, recovery, None)
+    }
+
+    fn observe_candidate(
+        &mut self, root_id: &str, path: String, force: bool,
+        recovery: Option<Arc<Recovery>>, captured: Option<&WatchCandidateRow>,
     ) -> io::Result<()> {
         let Some((_, scope)) = self.roots.get(root_id) else {
             return Ok(());
@@ -2745,22 +2800,17 @@ impl Scheduler {
             return Ok(());
         }
         let id = watch_path_key(&path);
+        if self.defer_claimed_path(&id) { return Ok(()); }
         let previous = self.catalog.observation(&path);
         let (blocked, promoted) = self.journal.state().observation_state(&id);
-        let pending_candidate = self.pending.get(&id).map(|entry| &entry.candidate);
-        let active_candidate = self.active_paths.get(&id).and_then(|(batch, index)| {
-            self.active
-                .get(batch.as_ref())
-                .map(|active| &active.inputs[*index])
-        });
         let interrupted = blocked
             .as_ref()
             .filter(|entry| entry.status == "interrupted");
         let baseline = interrupted
             .map(|entry| entry.change_usn)
-            .or_else(|| pending_candidate.map(|entry| entry.observation.change_usn))
+            .or_else(|| self.pending.get(&id).map(|entry| entry.candidate.observation.change_usn))
+            .or_else(|| captured.map(|value| value.observation.change_usn))
             .or_else(|| previous.as_ref().map(|value| value.change_usn))
-            .or_else(|| active_candidate.map(|input| input.observation.change_usn))
             .or_else(|| blocked.as_ref().map(|value| value.change_usn));
         let candidate = match watch_candidate_for_path(Path::new(&path), baseline) {
             Ok(Some(candidate)) => candidate,
@@ -2772,6 +2822,8 @@ impl Scheduler {
                 return Ok(());
             }
         };
+        // Workers can acquire a sibling while the filesystem probe runs.
+        if self.defer_claimed_path(&id) { return Ok(()); }
         if let Some(receipt) = promoted.filter(|receipt| receipt.is_replaced()) {
             self.journal.commit(false, |state| {
                 let mut operations = crate::watch_store::NativeWatchOperations::empty();
@@ -2787,7 +2839,9 @@ impl Scheduler {
         let blocked_unchanged = blocked
             .as_ref()
             .is_some_and(|before| !entry_changed(before, &candidate));
-        let unchanged = if let Some(before) = pending_candidate {
+        let unchanged = if let Some(before) = self.pending.get(&id).map(|entry| &entry.candidate) {
+            !quiet::changed(before, &candidate)
+        } else if let Some(before) = captured {
             !quiet::changed(before, &candidate)
         } else if let Some(before) = &previous {
             !quiet::content_changed(
@@ -2797,8 +2851,6 @@ impl Scheduler {
                 before.change_usn,
                 &candidate,
             )
-        } else if let Some(before) = active_candidate {
-            !quiet::changed(before, &candidate)
         } else {
             blocked_unchanged
         };
@@ -2826,7 +2878,7 @@ impl Scheduler {
                 })?;
             }
             if recovery.is_none()
-                && previous.as_ref().is_some_and(|before| {
+                && previous.as_ref().map_or(captured.is_some(), |before| {
                     before.mtime != candidate.mtime
                         || before.change_usn != candidate.observation.change_usn
                 })
@@ -2862,19 +2914,6 @@ impl Scheduler {
             }
             return Ok(());
         }
-        let claim = self.hub.claims.lock().unwrap();
-        let batch = self
-            .active_paths
-            .get(&id)
-            .map(|(batch, _)| batch.as_ref())
-            .or_else(|| claim.get(&id).map(AsRef::as_ref));
-        let owned = batch.is_some();
-        if let Some(active) = batch.and_then(|batch| self.active.get_mut(batch)) {
-            // Let the running request finish. A new generation of one source
-            // must never interrupt the other sources in its batch.
-            active.touched.insert(id.clone());
-        }
-        drop(claim);
         let now = Instant::now();
         let prior = self.pending.remove(&id);
         if prior.is_none() {
@@ -2912,7 +2951,7 @@ impl Scheduler {
                 boundary,
             );
         }
-        if !owned { self.due.insert((due, id.clone()), ()); }
+        self.due.insert((due, id.clone()), ());
         self.unpublished.insert(id.clone());
         self.pending.insert(
             id,
@@ -3870,7 +3909,7 @@ impl Scheduler {
                 recovery,
                 passwords,
                 inputs: candidates,
-                touched: HashSet::new(),
+                dirty: HashSet::new(),
                 cancel,
                 groups,
                 claimed,
@@ -3963,9 +4002,9 @@ impl Scheduler {
         let members: HashSet<_> = root.groups.keys().cloned()
             .chain(std::iter::once(key(&root.path))).collect();
         let mut inputs = Vec::new();
-        let mut touched = HashSet::new();
+        let mut dirty = HashSet::new();
         for member in &members {
-            if active.touched.remove(member) { touched.insert(member.clone()); }
+            if active.dirty.remove(member) { dirty.insert(member.clone()); }
         }
         let mut remaining = Vec::new();
         for input in std::mem::take(&mut active.inputs) {
@@ -3980,7 +4019,7 @@ impl Scheduler {
         }
         let context = CompletionContext {
             root: active.root.clone(), recovery: active.recovery.clone(), passwords: Arc::clone(&active.passwords),
-            inputs, touched, groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
+            inputs, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
         };
         let result = self.apply_completion(&root.batch, context, root.completed);
         let error = result.as_ref().err().map(|error| io::Error::new(error.kind(), error.to_string()));
@@ -3996,19 +4035,34 @@ impl Scheduler {
         let groups = std::mem::take(&mut *active.groups.lock().unwrap());
         self.apply_completion(batch, CompletionContext {
             root: active.root, recovery: active.recovery, passwords: active.passwords,
-            inputs: active.inputs, touched: active.touched, groups, toast: active.toast, task: None,
+            inputs: active.inputs, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
         }, completed).map(|_| ())
     }
 
-    fn apply_completion(&mut self, batch: &str, active: CompletionContext, completed: Completed) -> io::Result<Outcome> {
+    fn apply_completion(&mut self, batch: &str, mut active: CompletionContext, completed: Completed) -> io::Result<Outcome> {
         let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_complete_state", Origin::Watch, || self.apply_completion_blocking(batch, active, completed))
+        engine.run_stage("watch_complete_state", Origin::Watch, || {
+            let dirty = std::mem::take(&mut active.dirty);
+            let root = active.root.clone();
+            let recovery = active.recovery.clone();
+            let claimed = Arc::clone(&active.claimed);
+            let result = self.apply_completion_blocking(batch, active, completed)?;
+            // Publish the old generation first. An interrupted blocker then
+            // suppresses only that generation, not a replacement during claim.
+            for path in dirty {
+                if !self.pending.contains_key(&path) {
+                    let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
+                    self.observe_candidate(&root, path, false, recovery.clone(), captured.as_ref())?;
+                }
+            }
+            Ok(result)
+        })
     }
 
     fn apply_completion_blocking(&mut self, batch: &str, mut active: CompletionContext, mut completed: Completed) -> io::Result<Outcome> {
         consume_claimed_pending(
             &mut self.pending, &mut self.due, &mut self.unpublished,
-            &active.groups, &active.touched, &mut active.inputs,
+            &active.groups, &active.claimed.lock().unwrap().candidates, &mut active.inputs,
         );
         let mut unfinished = HashSet::new();
         if completed.cancelled {
@@ -4075,7 +4129,7 @@ impl Scheduler {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
                 for candidate in &active.inputs {
                     let id = watch_path_key(&candidate.path);
-                    if self.pending.contains_key(&id) || active.touched.contains(&id) {
+                    if self.pending.contains_key(&id) {
                         continue;
                     }
                     if NativePresence::at(&candidate.path).is_absent() {
@@ -4255,7 +4309,7 @@ impl Scheduler {
         for candidate in active.inputs {
             let id = watch_path_key(&candidate.path);
             if self.pending.contains_key(&id)
-                || active.touched.contains(&id)
+
                 || unfinished.contains(&id)
             {
                 continue;
@@ -4287,7 +4341,6 @@ impl Scheduler {
                     ));
                 }
                 if self.pending.contains_key(&canonical_id)
-                    || active.touched.contains(&canonical_id)
                     || !projected_groups.insert(canonical_id.clone())
                 {
                     continue;
@@ -5323,6 +5376,31 @@ fn spawn_error_dialog(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn modified_directories_wait_for_merged_maintenance_but_topology_recovers() {
+        let directory = std::env::temp_dir().join(format!("sunpack-event-action-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("input.zip");
+        std::fs::write(&file, b"archive").unwrap();
+        let missing = directory.join("departed.zip");
+        let mut signals = Signals::default();
+        signals.root_changed("root", Some(vec![directory.clone(), file.clone(), missing.clone()]));
+        signals.modified_paths.extend([directory.clone(), file.clone(), missing.clone()]);
+        assert!(!Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, false));
+        assert!(!signals.changed_roots["root"].contains(&directory));
+        assert!(signals.changed_roots["root"].contains(&file));
+        for path in [directory.clone(), missing] {
+            let mut signals = Signals::default();
+            signals.root_changed("root", Some(vec![path]));
+            assert!(Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, false));
+        }
+        let mut signals = Signals::default();
+        signals.root_changed("root", None);
+        assert!(Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, false));
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn completion_opens_physical_container_with_one_or_many_retained_segments() {
         let container = Path::new(r"C:\output\carrier");
         let a = Path::new(r"C:\output\carrier\zip");
@@ -6126,7 +6204,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_completion_consumes_old_siblings_but_preserves_changed_generations() {
+    fn physical_completion_consumes_claimed_siblings_before_release_reobservation() {
         let group = Arc::new(SourceGroup { path: "split.001".into(), name: "split".into(),
             multipart: true, members: vec!["split.001".into(), "split.002".into(), "split.003".into()] });
         let groups: HashMap<_, _> = group.members.iter()
@@ -6155,19 +6233,26 @@ mod tests {
         park_claimed_deadlines(&pending, &mut due, &claims, groups.keys().cloned().collect());
         assert!(due.is_empty());
         assert_eq!(pending.len(), 2); // observations survive until generation-safe completion
-        // A changed generation is queued while ownership continues, but is
-        // admitted only after release. Completion consumes only the old sibling.
+        // A probe may publish just before the worker claims its captured
+        // generation. Completion must not consume that newer pending value.
+        let mut captured: HashMap<_, _> = pending.iter()
+            .map(|(id, pending)| (id.clone(), Some(pending.candidate.clone()))).collect();
+        pending.get_mut(&changed).unwrap().candidate.observation.change_usn += 1;
+        pending.get_mut(&changed).unwrap().candidate.size += 1;
         let mut inputs = Vec::new();
-        consume_claimed_pending(&mut pending, &mut due, &mut unpublished, &groups,
-            &HashSet::from([changed.clone()]), &mut inputs);
+        consume_claimed_pending(&mut pending, &mut due, &mut unpublished, &groups, &captured, &mut inputs);
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].path, "split.002");
         assert_eq!(pending.len(), 1);
-        assert!(pending.contains_key(&changed));
         assert_eq!(unpublished, HashSet::from([changed.clone()]));
         assert!(due.is_empty());
-        let changed_pending = pending.get(&changed).unwrap();
-        due.insert((changed_pending.due, changed.clone()), ());
+        let queued = pending.get(&changed).unwrap();
+        // The same sealed observation is also the baseline for dirty siblings
+        // with no catalog/pending history. Same generation is not new work.
+        let sealed = captured.remove(&changed).unwrap().unwrap();
+        assert!(!quiet::changed(&sealed, &sealed));
+        assert!(quiet::changed(&sealed, &queued.candidate));
+        due.insert((queued.due, changed.clone()), ());
         // A late claim wake cannot remove the now-released new generation.
         park_claimed_deadlines(&pending, &mut due, &HashMap::new(), HashSet::from([changed.clone()]));
         assert_eq!(due.len(), 1);

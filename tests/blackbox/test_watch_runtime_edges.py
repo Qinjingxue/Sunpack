@@ -1,3 +1,4 @@
+import os
 import json
 import subprocess
 import time
@@ -299,7 +300,12 @@ if ($Restore) {
                    "-Path", str(path), "-Saved", str(saved)]
         if restore:
             command.append("-Restore")
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        # Windows PowerShell must resolve its own modules, not inherit the
+        # incompatible PowerShell 7 module path from the test runner.
+        environment = {name: value for name, value in os.environ.items()
+                       if name.lower() != "psmodulepath"}
+        result = subprocess.run(command, capture_output=True, text=True, env=environment)
+        assert result.returncode == 0, (result.stdout, result.stderr)
 
     package.configure(watch={"runtime_cache_cleanup_idle_seconds": 0.25})
     package.json("watch", "add", watched, "-R", "-o", output)

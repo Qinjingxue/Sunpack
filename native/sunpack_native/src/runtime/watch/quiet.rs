@@ -34,11 +34,12 @@ impl Quiet {
         &mut self, now: Instant, observed_at: f64, boundary: bool, reset: bool,
         retry_unchanged: bool,
     ) -> Instant {
+        if retry_unchanged { return now; }
         self.observe(observed_at, boundary, reset, true);
         // CLOSE ends the handle epoch, not the download. Content observations
         // keep the learned quiet window; metadata-only CLOSE acceleration and
         // admission boundary confirmation are handled separately by Watch.
-        after(now, if retry_unchanged { 0.0 } else { self.seconds })
+        after(now, self.seconds)
     }
 
     pub(super) fn boundary_deadline(&self, now: Instant, confirmation: f64) -> Instant {
@@ -170,6 +171,26 @@ pub(super) fn after(now: Instant, seconds: f64) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_retries_do_not_change_saved_or_future_cadence() {
+        let now = Instant::now();
+        let mut expected = Quiet::default();
+        let mut actual = Quiet::default();
+        for at in [0.0, 1.0, 2.0, 20.0] {
+            expected.content_deadline(now, at, false, false, false);
+            actual.content_deadline(now, at, false, false, false);
+        }
+        for boundary in [false, true] {
+            assert_eq!(actual.content_deadline(now, 21.0, boundary, true, true), now);
+            assert_eq!((actual.seconds, actual.cadence, actual.tentative, actual.last),
+                (expected.seconds, expected.cadence, expected.tentative, expected.last));
+        }
+        for at in [22.0, 24.0, 26.0] {
+            assert_eq!(actual.content_deadline(now, at, false, false, false),
+                expected.content_deadline(now, at, false, false, false));
+        }
+    }
 
     #[test]
     fn admission_boundary_preserves_zero_quiet_and_caps_learned_windows() {

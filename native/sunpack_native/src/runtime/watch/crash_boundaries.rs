@@ -291,3 +291,79 @@ fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
     }
 }
 
+
+// Exercise the real release/observation path in an isolated process, so the
+// existing empty BrokerLease does not affect another test's acquired lease.
+#[test]
+fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling() {
+    const CHILD: &str = "SUNPACK_CLAIM_RELEASE_CHILD";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        let watched = base.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
+        let source = watched.join("source.001");
+        let sibling = watched.join("source.002");
+        fs::write(&source, b"old generation").unwrap();
+        fs::write(&sibling, b"unchanged sibling").unwrap();
+        let old = watch_candidate_for_path(&source, None).unwrap().unwrap();
+        let same = watch_candidate_for_path(&sibling, None).unwrap().unwrap();
+        let captured = Arc::new(Mutex::new(ClaimedSources::default()));
+        captured.lock().unwrap().capture(&[old.path.clone(), same.path.clone()]).unwrap();
+        let journal = Arc::new(journal::Journal::open(&base.join("state")).unwrap());
+        let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
+        let settings = Arc::new(Config::default());
+            let mut scheduler = Scheduler {
+                cwd: base.clone(), root_file: base.join(ROOTS_FILE),
+                roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,
+                    recursive: true, deep: true, scanned: true }, scope))]),
+                available_roots: HashSet::from([key(&watched)]),
+                user_password_signature: user_password_signature(&settings.user_passwords),
+                settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+                options: None,
+                deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
+                passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
+                root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+                parent_observers: HashMap::new(), config_observers: Vec::new(), config_sources: Default::default(),
+                pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+                active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+                tray: None, monitor: None, toast: None, cache_deadline: None,
+                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+            };
+
+        let mut interrupted = NativeWatchOperations::empty();
+        interrupted.put_entry(Arc::new(observed_entry(&old, "interrupted", None)));
+        scheduler.journal.commit(true, |_| Ok(interrupted)).unwrap();
+        fs::write(&source, b"replacement generation with a different size").unwrap();
+        let group = Arc::new(SourceGroup { path: source.clone(), name: "source".into(),
+            members: vec![old.path.clone(), same.path.clone()], multipart: true });
+        let groups: HashMap<_, _> = group.members.iter().map(|path| (watch_path_key(path), Arc::clone(&group))).collect();
+        scheduler.hub.claims.lock().unwrap().extend(groups.keys().map(|path| (path.clone(), Arc::<str>::from("owner"))));
+        let dirty = HashSet::from([key(&source), key(&sibling)]);
+        scheduler.apply_completion("owner", CompletionContext {
+            root: key(&watched), recovery: None, passwords: Arc::default(),
+            inputs: vec![old, same], dirty, claimed: captured, groups, toast: None, task: None,
+        }, Completed { cancelled: true, result: Err(io::Error::other("cancelled owner")),
+            promoted: HashMap::new(), outputs: BTreeMap::new() }).unwrap();
+        assert_eq!(scheduler.pending.len(), 1);
+        assert_eq!(scheduler.pending[&key(&source)].candidate.size, fs::metadata(&source).unwrap().len());
+        assert!(!scheduler.pending.contains_key(&key(&sibling)));
+        assert!(scheduler.catalog.observation(sibling.to_str().unwrap()).is_some());
+        // A late notification no longer carries the sealed claim observation.
+        scheduler.enqueue(&key(&watched), sibling.to_string_lossy().into_owned(), false).unwrap();
+        assert_eq!(scheduler.pending.len(), 1);
+        assert_eq!(scheduler.due.len(), 1);
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("sunpack-claim-release-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&base).unwrap();
+    let test = format!("{}::claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling", module_path!().split_once("::").unwrap().1);
+    let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", &test, "--nocapture"])
+        .env(CHILD, &base).output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    fs::remove_dir_all(base).unwrap();
+}

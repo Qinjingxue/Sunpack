@@ -1571,7 +1571,7 @@ mod tests {
 
     #[test]
     fn terminal_progress_and_rollback_failure_keep_main_presentation() {
-        let mut group = Group::new("presentation", Language::En);
+        let mut group = Group::new("00000000000000000000000000000001", Language::En);
         group.summary.succeeded = 1;
         let snapshot = Snapshot::progress(&group);
         assert_eq!(snapshot.progress, Some(1.0));

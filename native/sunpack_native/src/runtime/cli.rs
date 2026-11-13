@@ -764,6 +764,17 @@ pub(super) fn depth(value: Recursion) -> usize {
     }
 }
 
+// Retry inputs are physical paths, even when a formerly nested carrier is
+// retried as a root and its successful segments collapse to a sparse summary.
+fn remove_replaced_archives(
+    archives: &mut BTreeMap<(String, u64, String), ArchiveResult>,
+    current: &[ArchiveResult],
+) {
+    let replaced: std::collections::HashSet<_> = current.iter()
+        .map(|archive| path_key(&archive.path)).collect();
+    archives.retain(|(path, _, _), _| !replaced.contains(path));
+}
+
 fn path_key(path: &Path) -> String {
     crate::watch_store::watch_path_key(&path.to_string_lossy())
 }
@@ -1288,12 +1299,8 @@ impl<'a> ScopeReport<'a> {
                     .or_else(|| self.progress.get(&(path.clone(), None))).copied()
             })
         } else { Some((1, 1)) };
-        let progress = live::progress_text(last, true);
-        writeln!(
-            writer,
-            "{prefix}  [{}]{progress}",
-            self.language.text(status)
-        )?;
+        let status = live::status_text(self.language.text(status), last, "", None);
+        writeln!(writer, "{prefix}  {status}")?;
         if let Some(detail) = task_detail(TaskStatus::of(item), item.failure.as_ref(), self.verbose, self.language) {
             Self::title(writer, prefix, "  ", &detail)?;
         }
@@ -1591,13 +1598,7 @@ async fn archives(
         for receipt in current.cleanup_results {
             cleanup.insert(path_key(&receipt.path), receipt);
         }
-        // A retry replaces the physical task's previous result. Successful
-        // carriers now have one sparse summary instead of one entry per segment.
-        let replaced: std::collections::HashSet<_> = current.archives.iter()
-            .map(|archive| (path_key(&archive.path), archive.depth)).collect();
-        all_archives.retain(|_, archive: &mut ArchiveResult| {
-            !replaced.contains(&(path_key(&archive.path), archive.depth))
-        });
+        remove_replaced_archives(&mut all_archives, &current.archives);
         for archive in current.archives {
             if !options.json
                 && !archive.partial
@@ -2785,6 +2786,38 @@ mod recursive_prompt_tests {
         assert!(matches!(received.try_recv().unwrap(), Event::Working { id: 7 }));
         assert!(received.try_recv().is_err());
         assert!(reports.take_events().is_empty());
+    }
+
+    #[test]
+    fn retry_replaces_all_carrier_segments_when_nested_input_becomes_root() {
+        fn archive(path: &str, depth: usize, offset: u64, failed: bool) -> ArchiveResult {
+            ArchiveResult {
+                path: path.into(), format: "zip".into(), output: None,
+                failure: failed.then(|| crate::pipeline::Failure::new(FailureKind::WrongPassword, "password")),
+                files: 0, bytes: 0, encrypted: None, depth, offset, end_offset: None,
+                volume_completeness: None, volume_attempts: None, source_paths: vec![],
+                password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
+                damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
+                promoted: false, promotion_original_path: None,
+            }
+        }
+        let mut all = BTreeMap::new();
+        for item in [archive("C:/data/Carrier.bin", 2, 100, true),
+                     archive("C:/data/Carrier.bin", 2, 900, true),
+                     archive("C:/data/other.zip", 1, 0, false)] {
+            all.insert((path_key(&item.path), item.offset, item.format.clone()), item);
+        }
+        let current = [archive("c:/DATA/carrier.bin", 1, 100, false)];
+        remove_replaced_archives(&mut all, &current);
+        for item in current {
+            all.insert((path_key(&item.path), item.offset, item.format.clone()), item);
+        }
+        assert_eq!(all.len(), 2);
+        let summary = ArchiveSummary::collect(all.values(), Language::En, true);
+        assert_eq!(summary.success, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.nested, 0);
+        assert!(summary.errors.is_empty());
     }
 
     #[test]

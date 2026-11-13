@@ -1,6 +1,6 @@
 use std::path::Path;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct WatchFileObservation {
     pub(crate) file_id: String,
     pub(crate) change_usn: i64,

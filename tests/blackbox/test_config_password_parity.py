@@ -196,7 +196,8 @@ def test_saved_output_mapping_and_cli_override(package, tmp_path, mapping):
         payload.writestr("member.txt", "payload")
     saved = tmp_path / "saved"
     override = tmp_path / "override"
-    args = ["extract", source]
+    # The fixture is one directory below the selected input; main requires -R.
+    args = ["extract", "-R", source]
     if mapping == "default":
         expected = parent / "a"
     else:

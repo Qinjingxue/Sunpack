@@ -332,10 +332,21 @@ impl Panel {
             };
             rows.push(Row {
                 id: Some(id),
-                text: row_text(task, &prefix, edge, width, unicode, language),
+                text: clipped(&format!("{prefix}{edge}{}", task.label), width, unicode),
             });
             let detail_prefix = format!("{prefix}{continuation}  ");
             if !task.carrier || matches!(task.phase, Phase::Finished(TaskStatus::Failed)) {
+                if rows.len() == height {
+                    rows.pop();
+                    rows.push(Row { id: None, text: clipped(ellipsis(unicode), width, unicode) });
+                    return rows;
+                }
+                rows.push(Row {
+                    id: Some(id),
+                    text: clipped(&format!("{detail_prefix}{}", row_status(
+                        task, width.saturating_sub(display_width(&detail_prefix)), language,
+                    )), width, unicode),
+                });
                 if let Some(result) = &task.result {
                     let detail = super::task_detail(result.status, result.failure.as_ref(), self.verbose, language);
                     let output = result.output.as_ref().filter(|_| self.verbose).map(|output| language.translate(
@@ -401,24 +412,7 @@ pub(super) fn progress_text(progress: Option<(u64, u64)>, bar: bool) -> String {
     text
 }
 
-fn row_text(
-    task: &TaskRow,
-    prefix: &str,
-    edge: &str,
-    width: usize,
-    unicode: bool,
-    language: Language,
-) -> String {
-    let indent = display_width(prefix) + display_width(edge);
-    if indent >= width {
-        return clipped(&format!("{prefix}{edge}"), width, unicode);
-    }
-    let available = width - indent;
-    let mut line = format!("{prefix}{edge}");
-    if task.carrier && !matches!(task.phase, Phase::Finished(TaskStatus::Failed)) {
-        line.push_str(&clipped(&task.label, available, unicode));
-        return line;
-    }
+fn row_status(task: &TaskRow, available: usize, language: Language) -> String {
     let (status, hint) = if task.wait.disk || task.wait.memory {
         wait_status(task.wait, language)
     } else {
@@ -431,31 +425,23 @@ fn row_text(
         };
         (language.text(status), String::new())
     };
-    let mut state = format!("[{status}]");
-    state.push_str(&progress_text(task.progress,
-        available >= display_width(&state) + 40 && hint.is_empty()));
-    if display_width(&state) > available {
-        line.push_str(&clipped(&state, available, unicode));
-        return line;
+    status_text(status, task.progress, &hint, Some(available))
+}
+
+// The live panel and settled tree use the same status layout. Only the live
+// viewport constrains its width; titles occupy their own row in both views.
+pub(super) fn status_text(
+    status: &str, progress: Option<(u64, u64)>, hint: &str, available: Option<usize>,
+) -> String {
+    let mut state = format!("[{status}]{}", progress_text(progress, true));
+    if available.is_some_and(|width| display_width(&state) > width) {
+        state = format!("[{status}]{}", progress_text(progress, false));
     }
-    let left = available.saturating_sub(display_width(&state) + 1);
-    // Reserve room for the pause reason where possible while keeping a visible name.
-    let hint_width = if hint.is_empty() {
-        0
-    } else {
-        (display_width(&hint) + 3).min(left.saturating_sub(18))
-    };
-    let label = clipped(&task.label, left - hint_width, unicode);
-    if !label.is_empty() {
-        line.push_str(&label);
-        line.push(' ');
+    if !hint.is_empty() {
+        state.push(' ');
+        state.push_str(hint);
     }
-    line.push_str(&state);
-    if hint_width > 3 {
-        line.push_str(" - ");
-        line.push_str(&clipped(&hint, hint_width - 3, unicode));
-    }
-    line
+    state
 }
 
 fn ellipsis(unicode: bool) -> &'static str {
@@ -554,6 +540,46 @@ mod tests {
             depth: if id == 5 { 2 } else { 1 },
             segment,
         }
+    }
+
+    #[test]
+    fn live_titles_and_status_share_settled_layout_across_widths_and_resize() {
+        let mut terminal = Terminal { size: (80, 30), output: Mutex::default() };
+        for language in [Language::En, Language::Zh] {
+            for name in ["a-very-long-archive-title-with-important-suffix.zip",
+                         "一个很长的压缩包文件名需要保持完整标题以便辨认归档.zip"] {
+                let mut panel = Panel::default();
+                panel.update(&terminal, language, queued(1, None, name, None), false);
+                for columns in [50, 80] {
+                    terminal.size = (columns, 30);
+                    panel.update(&terminal, language, Event::ResourceWait {
+                        id: 1, path: name.into(), state: ResourceWait {
+                            disk: true, memory: true, ..ResourceWait::default()
+                        },
+                    }, true);
+                    // Prompt suspension changes state without touching the terminal.
+                    terminal.output.lock().unwrap().clear();
+                    panel.update(&terminal, language, Event::Progress {
+                        id: 1, path: name.into(), completed_bytes: 60, total_bytes: 100,
+                    }, true);
+                    assert!(terminal.output.lock().unwrap().is_empty());
+                    panel.redraw(&terminal, language, true);
+                    let rows = &panel.frame.as_ref().unwrap().rows;
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0].text, clipped(name, columns - 1, true));
+                    let (status, hint) = wait_status(panel.tasks[&1].wait, language);
+                    let expected = status_text(status, Some((60, 100)), &hint, Some(columns - 3));
+                    assert_eq!(rows[1].text, clipped(&format!("  {expected}"), columns - 1, true));
+                    assert!(rows.iter().all(|row| display_width(&row.text) < columns));
+                    assert!(rows[1].text.contains("60%"));
+                    // Resize must preserve old history instead of moving up by a stale height.
+                    let bytes = terminal.output.lock().unwrap();
+                    assert!(bytes.starts_with(b"\r\n"));
+                }
+            }
+        }
+        // Narrow fallback follows main: omit only the bar, not the title or percent.
+        assert_eq!(status_text("Extracting", Some((60, 100)), "", Some(20)), "[Extracting]  60%");
     }
 
     #[test]
@@ -710,18 +736,22 @@ mod tests {
             .iter()
             .map(|row| row.text.as_str())
             .collect();
-        assert_eq!(rows.len(), 5);
-        assert!(rows[1].starts_with("├─ Segment 1 (zip) [100, 150) [Disk full]  60%"));
-        assert!(rows[2].starts_with("└─ Segment 2 (zip) [200, 250) [Waiting]"));
-        assert!(rows[3].starts_with("   └─ nested.zip [Preparing]"));
-        assert_eq!(rows[4], "other.zip [Extracting] [--------------------]  --%");
+        assert_eq!(rows.len(), 9);
+        assert_eq!(rows[1], "├─ Segment 1 (zip) [100, 150)");
+        assert!(rows[2].starts_with("│    [Disk full] [############--------]  60%"));
+        assert_eq!(rows[3], "└─ Segment 2 (zip) [200, 250)");
+        assert!(rows[4].starts_with("     [Waiting]"));
+        assert_eq!(rows[5], "   └─ nested.zip");
+        assert!(rows[6].starts_with("        [Preparing]"));
+        assert_eq!(rows[7], "other.zip");
+        assert_eq!(rows[8], "  [Extracting] [--------------------]  --%");
         assert!(String::from_utf8_lossy(&terminal.output.lock().unwrap())
-            .contains("nested.zip [Preparing]"));
+            .contains("   └─ nested.zip\r\n"));
 
         panel.remove(2);
         panel.redraw(&terminal, Language::En, true);
-        assert_eq!(panel.frame.as_ref().unwrap().rows.len(), 4);
-        assert!(panel.frame.as_ref().unwrap().rows[1]
+        assert_eq!(panel.frame.as_ref().unwrap().rows.len(), 7);
+        assert!(panel.frame.as_ref().unwrap().rows[2]
             .text
             .contains("Disk full"));
     }

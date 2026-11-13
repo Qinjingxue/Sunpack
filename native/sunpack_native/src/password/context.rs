@@ -260,12 +260,6 @@ fn input_changed() -> std::io::Error {
     std::io::Error::other(InputChanged)
 }
 
-pub(crate) fn is_input_changed(error: &std::io::Error) -> bool {
-    error
-        .get_ref()
-        .is_some_and(|error| error.is::<InputChanged>())
-}
-
 pub(crate) fn clear() {
     let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
     retain(&mut entries, |_, _| false);
@@ -325,8 +319,8 @@ mod tests {
         });
         release_tx.send(()).unwrap();
         let error = borrower.join().unwrap().unwrap_err();
-        assert!(is_input_changed(&error));
-        assert!(!is_input_changed(&std::io::Error::other(error.to_string())));
+        assert!(error.get_ref().is_some_and(|error| error.is::<InputChanged>()));
+        assert!(!std::io::Error::other(error.to_string()).get_ref().is_some_and(|error| error.is::<InputChanged>()));
         assert_eq!(new.unwrap().status, "not_required");
 
         let canonical = current.file_identity().unwrap().path.to_path_buf();

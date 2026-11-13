@@ -1258,7 +1258,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     Some(path) => Some(path),
                     None if task.inputs.iter().zip(&retained)
                         .any(|(input, checkpoint)| checkpoint.is_none() && input.failure.is_none()) => {
-                        let receipt = receipt(&task.inputs[0].input, task.source, depth);
+                        let receipt = receipt(task.entry(), task.source, depth);
                         match this.reserve_output(preferred_carrier, &receipt, None)? {
                             Ok(path) => {
                                 shell.output(&path);
@@ -2076,7 +2076,9 @@ impl<'run, O: Observer> Run<'run, O> {
                 let source = Path::new(&input.entry_path);
                 let nested = (depth > 1).then_some(source);
                 if let Some(container) = checkpoint.container() {
-                    if !names.retain(container, self.output_names.owner, source, nested) {
+                    // The physical task owns the container even when its logical
+                    // segments start in different files of the volume family.
+                    if !names.retain(container, self.output_names.owner, checkpoint.carrier(), nested) {
                         return None;
                     }
                 }
@@ -4223,7 +4225,7 @@ mod tests {
                 false
             }
         }
-        for (count, complete) in [(1, 0), (2, 0), (2, 1)] {
+        for (count, complete, split_sources) in [(1, 0, false), (2, 0, false), (2, 1, false), (2, 1, true)] {
           for stop in [false, true] {
             let source = crate::test_support::temp_file("carrier_parent_barrier", &[0; 16]);
             let container = source.with_extension("output");
@@ -4232,10 +4234,19 @@ mod tests {
             let (segments, _) = archive_input_slices(&input, &[
                 ("zip", 0, Some(8)), ("zip", 8, Some(16)),
             ]).unwrap();
-            let inputs: Vec<_> = segments.into_iter().take(count).map(Option::unwrap).collect();
-            let generations = HashMap::from([
+            let mut inputs: Vec<_> = segments.into_iter().take(count).map(Option::unwrap).collect();
+            let continuation = source.with_extension("part2");
+            if split_sources {
+                fs::write(&continuation, [0; 16]).unwrap();
+                let part = ArchiveInput::file(continuation.to_string_lossy().into_owned(), "zip".into(), "second".into());
+                inputs[1] = archive_input_slices(&part, &[("zip", 8, Some(16))]).unwrap().0.remove(0).unwrap();
+            }
+            let mut generations = HashMap::from([
                 (path_key(&input.entry_path), capture_file_generation(&source).unwrap()),
             ]);
+            if split_sources {
+                generations.insert(path_key(&continuation.to_string_lossy()), capture_file_generation(&continuation).unwrap());
+            }
             let engine = Engine::new(PathBuf::from("unused-worker"));
             let mut request = Request::new(vec![source.clone()], Mode::Extract);
             request.max_depth = 1;
@@ -4265,8 +4276,8 @@ mod tests {
             }
             let task = Task {
                 primary: None,
+                owned_paths: inputs.iter().map(|input| input.entry_path.clone()).collect(),
                 inputs: inputs.into_iter().map(|input| LogicalInput { input, password: None, failure: None }).collect(),
-                owned_paths: vec![source.to_string_lossy().into_owned()],
                 source: DiscoverySource::Embedded,
                 retry: None,
             };
@@ -4296,6 +4307,7 @@ mod tests {
             release_reader_resources_under_roots(vec![container.to_string_lossy().into_owned()]).unwrap();
             fs::remove_dir_all(container).unwrap();
             fs::remove_file(source).unwrap();
+            if split_sources { fs::remove_file(continuation).unwrap(); }
           }
         }
     }
@@ -6003,9 +6015,10 @@ mod tests {
         archive.output = Some(output.clone());
         let mut outcome = Outcome::default();
 
-        // A real directory handle without FILE_SHARE_DELETE prevents the
-        // root rename; ordinary source-cleanup warnings must remain distinct.
-        let held = fs::OpenOptions::new().access_mode(0x80).share_mode(3)
+        // FILE_LIST_DIRECTORY participates in delete sharing; an attributes-only
+        // handle does not block rename on Windows. Hold the real root rename
+        // failure, distinct from ordinary source-cleanup warnings.
+        let held = fs::OpenOptions::new().access_mode(0x1).share_mode(3)
             .custom_flags(0x0200_0000).open(&output).unwrap();
         let result = flatten_result(&|_: Event| {}, &mut archive, &mut outcome, None);
         let payload = fs::read(wrapper.join("payload.txt"));

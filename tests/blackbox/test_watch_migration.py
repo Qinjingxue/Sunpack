@@ -146,14 +146,15 @@ def test_watch_replays_changed_source_without_cancelling_its_batch_siblings(pack
             updated = replacement.read_bytes()
             assert len(updated) == (watched / "source.zip").stat().st_size
             assert source.write(updated) == len(updated)
-        _wait_for(
-            lambda: package.json("watch", "status")["summary"]["pending"] > 0,
-            "Watch did not queue the replacement while the batch was in flight",
-        )
+        # Claimed sources only become dirty until release, as in main.
+        # A pending-count barrier would require premature probing of the new
+        # generation. Validate its durable replay after the worker is released.
     finally:
         worker.resume()
 
-    # Stop drains the admitted batch. Keep the root absent during restart so
+    # Stop checkpoints all roots before joining observers, then drains the
+    # admitted batch. It therefore captures the overwrite even if its ordinary
+    # notification has not arrived yet. Keep the root absent during restart so
     # the durable deferred source can only be resumed when the root returns.
     assert package.json("watch", "stop")["summary"]["stopped"]
     assert package.run("--persistent-shutdown").returncode == 0

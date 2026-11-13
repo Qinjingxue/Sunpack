@@ -65,15 +65,22 @@ def test_carrier_keeps_each_segments_directory_tree(package, tmp_path):
     assert first.parent.parent.parent == second.parent.parent.parent == output / "carrier"
 
 
-def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, tmp_path):
+@pytest.mark.parametrize("nested", [False, True], ids=["root-carrier", "promoted-carrier"])
+def test_extract_password_retry_resumes_one_logical_input_in_a_carrier(package, tmp_path, nested):
     carrier = tmp_path / "wrapped.data"
     output = tmp_path / "out"
-    first, second = _two_payload_carrier(package, tmp_path, carrier)
+    fixture = tmp_path / "carrier.fixture" if nested else carrier
+    first, second = _two_payload_carrier(package, tmp_path, fixture)
+    source = carrier
+    if nested:
+        source = tmp_path / "outer.zip"
+        source.write_bytes(_zip_bytes({carrier.name: fixture.read_bytes(), "note.txt": b"outer"}))
+        package.configure(recursive_authorization={"enabled": False})
 
     # Both archive identities have the same physical path and format.
     result = package.run(
-        "extract", "-d", "-c", "d", "-o", output, "--no-builtin-pw", "--no-pause",
-        "-p", "first-key", carrier, input="y\nsecond-key\n\n",
+        "extract", "-d", "-r", "*", "-c", "d", "-o", output, "--no-builtin-pw", "--no-pause",
+        "-p", "first-key", source, input="y\nsecond-key\n\n",
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     first_path = _only_output(output, "first.txt", first)

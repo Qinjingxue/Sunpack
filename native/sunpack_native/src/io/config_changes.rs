@@ -51,6 +51,11 @@ fn event(manual_reset: bool) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
+pub(crate) struct DirectoryChange {
+    pub(crate) name: String,
+    pub(crate) action: u32,
+}
+
 struct Request {
     file: TrackedFile,
     _event: OwnedHandle,
@@ -90,7 +95,7 @@ impl Request {
         Ok(())
     }
 
-    fn names(&self, size: usize) -> io::Result<Vec<String>> {
+    fn names(&self, size: usize) -> io::Result<Vec<DirectoryChange>> {
         let size = size.min(self.buffer.len() * 4);
         let bytes = unsafe { std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), size) };
         let mut names = Vec::new();
@@ -110,7 +115,10 @@ impl Request {
             // FILE_NOTIFY_INFORMATION names are aligned UTF-16; decode once.
             let wide =
                 unsafe { std::slice::from_raw_parts(name.as_ptr().cast::<u16>(), length / 2) };
-            names.push(String::from_utf16_lossy(wide));
+            names.push(DirectoryChange {
+                name: String::from_utf16_lossy(wide),
+                action: u32::from_le_bytes(header[4..8].try_into().unwrap()),
+            });
             if next == 0 {
                 break;
             }
@@ -174,7 +182,7 @@ impl NativeConfigChanges {
     }
 
     // None denotes overflow: invalidate all subscribed files in this directory.
-    pub(crate) fn read(&self) -> io::Result<Option<Vec<String>>> {
+    pub(crate) fn read(&self) -> io::Result<Option<Vec<DirectoryChange>>> {
         let mut guard = self.request.lock().unwrap();
         let Some(request) = guard.as_mut() else {
             return Ok(Some(Vec::new()));
@@ -255,7 +263,7 @@ mod tests {
             assert!(overflow, "burst must exercise the recovery notification");
             std::fs::write(root.join("after-overflow"), []).unwrap();
             loop {
-                if changes.read().unwrap().is_some_and(|names| names.iter().any(|name| name == "after-overflow")) {
+                if changes.read().unwrap().is_some_and(|names| names.iter().any(|name| name.name == "after-overflow" && name.action == 1)) {
                     break;
                 }
             }

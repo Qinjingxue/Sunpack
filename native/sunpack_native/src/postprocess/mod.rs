@@ -168,6 +168,7 @@ fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 
 use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
 
+#[derive(Clone)]
 pub(crate) struct WatchCandidateRow {
     pub(crate) path: String,
     pub(crate) size: u64,

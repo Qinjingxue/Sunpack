@@ -12,7 +12,7 @@ use crate::scan::directory::{
     NativeDirectorySnapshot, NativeOutputInventory,
 };
 use crate::scan::discovery::{
-    CandidateProjection, FileTargets, NativeCandidateTable, NativeEmbeddedBatch,
+    CandidateProjection, EmbeddedPageRow, FileTargets, NativeCandidateTable, NativeEmbeddedBatch,
 };
 use crate::scan::embedded::{EmbeddedCandidate, NativeScanResult, RarInputResolution};
 use crate::scan::nested_authorization::authorize_nested_candidates;
@@ -101,7 +101,10 @@ fn scope_view(
     scope: &NativeDiscoveryScope,
 ) -> NativeDirectorySnapshot {
     snapshot.view(
-        snapshot.rows.iter().copied()
+        snapshot
+            .rows
+            .iter()
+            .copied()
             .filter(|&row| scope.contains(&snapshot.table.paths[row]))
             .collect(),
     )
@@ -228,7 +231,8 @@ pub(super) fn discover(
     drop(seen_roots);
     // Enumeration may be covered by an ancestor target; main still retains
     // every explicitly selected boundary for missing-volume replacement.
-    let mut logical_scopes: BTreeMap<_, _> = scopes.iter()
+    let mut logical_scopes: BTreeMap<_, _> = scopes
+        .iter()
         .map(|scope| (scope.key().to_owned(), scope.clone()))
         .collect();
     let share_recursive = request.recursive && options.can_share_recursive_context();
@@ -269,7 +273,9 @@ pub(super) fn discover(
                 Vec::new(),
             )
         });
-        logical_scopes.entry(logical_scope.key().to_owned()).or_insert(logical_scope);
+        logical_scopes
+            .entry(logical_scope.key().to_owned())
+            .or_insert(logical_scope);
         if !roots.is_empty() {
             let key = path_key(path);
             let parent_path = parent.to_string_lossy();
@@ -316,7 +322,11 @@ pub(super) fn discover(
         for (key, path) in file_roots
             .iter()
             .map(|(key, path)| (key.as_str(), path.as_str()))
-            .chain(scopes.iter().map(|scope| (scope.key(), scope.root.as_str())))
+            .chain(
+                scopes
+                    .iter()
+                    .map(|scope| (scope.key(), scope.root.as_str())),
+            )
         {
             if let Some((_, root)) = path_ancestors(key)
                 .filter_map(|ancestor| file_roots.get_key_value(ancestor))
@@ -328,6 +338,7 @@ pub(super) fn discover(
         }
     }
     let mut shared_snapshots = HashMap::new();
+    let mut tables = Vec::new();
     for scope in &scopes {
         request.cancel.check_io()?;
         let (filtered, raw) =
@@ -335,15 +346,8 @@ pub(super) fn discover(
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let mut table = directory_table(
-            &filtered,
-            &raw,
-            None,
-            candidates,
-            &mut verified,
-            request,
-        )?;
-        result.project_scope(&mut table, candidates, &verified, request)?;
+        let table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
+        tables.push(table);
         retry_scopes.push(Arc::new(RetryScope {
             scope: scope.clone(),
             snapshot: raw,
@@ -367,7 +371,7 @@ pub(super) fn discover(
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let mut table = directory_table(
+        let table = directory_table(
             &filtered,
             &raw,
             Some(FileTargets::new(targets)),
@@ -375,7 +379,7 @@ pub(super) fn discover(
             &mut verified,
             request,
         )?;
-        result.project_scope(&mut table, candidates, &verified, request)?;
+        tables.push(table);
         retry_scopes.push(Arc::new(RetryScope {
             scope,
             snapshot: raw,
@@ -385,7 +389,7 @@ pub(super) fn discover(
     for (filtered, _) in shared_snapshots.values() {
         result.scan_errors.extend(filtered.scan_errors());
     }
-    merge_shared_inputs(&mut result.tasks);
+    result.project(&mut tables, candidates, &verified, request, false)?;
     if request.origin == Origin::Watch {
         let admitted = |path: &str| {
             let key = path_key(path);
@@ -414,13 +418,10 @@ pub(super) fn discover(
             .iter()
             .flat_map(|task| task.owned_paths.iter().map(|path| path_key(path)))
             .collect();
-        for path in files
-            .into_iter()
-            .filter(|path| {
-                let key = path_key(path);
-                !covered.contains(&key) && !result.blocked_paths.contains(&key)
-            })
-        {
+        for path in files.into_iter().filter(|path| {
+            let key = path_key(path);
+            !covered.contains(&key) && !result.blocked_paths.contains(&key)
+        }) {
             let name = filesystem_logical_name(&path);
             result.tasks.push(Task::single(
                 ArchiveInput::file(path.clone(), String::new(), name),
@@ -470,10 +471,20 @@ impl OutputDiscovery {
         request: &Request,
         result: &mut Discovered,
     ) -> io::Result<()> {
-        let Self { root, filtered, raw } = self;
+        let Self {
+            root,
+            filtered,
+            raw,
+        } = self;
         let mut verified = HashMap::new();
         let mut table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
-        result.project(&mut table, candidates, &verified, request, true)?;
+        result.project(
+            std::slice::from_mut(&mut table),
+            candidates,
+            &verified,
+            request,
+            true,
+        )?;
         let policy = request.config.recursive_authorization;
         if policy.enabled && !result.tasks.is_empty() {
             let allowed = authorize_nested_candidates(
@@ -506,7 +517,8 @@ fn retain_logical_retry_scopes(
     logical_scopes: impl IntoIterator<Item = NativeDiscoveryScope>,
     scopes: &mut Vec<Arc<RetryScope>>,
 ) {
-    let mut by_root: HashMap<_, _> = scopes.iter()
+    let mut by_root: HashMap<_, _> = scopes
+        .iter()
         .map(|scope| (scope.scope.key().to_owned(), Arc::clone(scope)))
         .collect();
     for scope in logical_scopes {
@@ -514,7 +526,9 @@ fn retain_logical_retry_scopes(
             continue;
         }
         let Some(source) = path_ancestors(scope.key()).find_map(|key| {
-            by_root.get(key).filter(|source| source.scope.contains_key(scope.key()))
+            by_root
+                .get(key)
+                .filter(|source| source.scope.contains_key(scope.key()))
         }) else {
             continue;
         };
@@ -707,33 +721,67 @@ fn directory_table(
 }
 
 impl Discovered {
-    fn project_scope(
-        &mut self,
-        table: &mut NativeCandidateTable,
-        candidates: &CandidateSet,
-        verified: &VerifiedPasswords,
-        request: &Request,
-    ) -> io::Result<()> {
-        // Embedded Relations must use this target's boundary too, not the
-        // first ancestor snapshot in an aggregate table. Merge ownership only
-        // after each scope has finished discovery, as in main.
-        table.dedupe();
-        let mut scoped = Self::default();
-        scoped.project(table, candidates, verified, request, false)?;
-        self.tasks.extend(scoped.tasks);
-        self.blocked_paths.extend(scoped.blocked_paths);
-        self.scan_errors.merge_report(scoped.scan_errors);
-        Ok(())
-    }
-
     fn project(
         &mut self,
-        table: &mut NativeCandidateTable,
+        tables: &mut [NativeCandidateTable],
         candidates: &CandidateSet,
         verified: &VerifiedPasswords,
         request: &Request,
         recursive: bool,
     ) -> io::Result<()> {
+        // Keep relation ownership local, but fill each bounded Embedded page
+        // across scopes, as main's discover_many_native does.
+        let mut scopes = tables
+            .iter_mut()
+            .map(|table| {
+                table.dedupe();
+                let mut scoped = Self::default();
+                let batch = scoped.prepare(table, verified, request, recursive)?;
+                Ok((scoped, batch, Vec::new()))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        const PAGE_SIZE: usize = 256;
+        let mut total = 0;
+        let ends: Vec<_> = scopes
+            .iter()
+            .map(|(_, batch, _)| {
+                total += batch.len();
+                total
+            })
+            .collect();
+        for offset in (0..total).step_by(PAGE_SIZE) {
+            request.cancel.check_io()?;
+            let first = ends.partition_point(|&end| end <= offset);
+            let last = ends.partition_point(|&end| end < (offset + PAGE_SIZE).min(total));
+            let local_offset = offset - if first == 0 { 0 } else { ends[first - 1] };
+            let groups = tables[first..=last]
+                .iter()
+                .zip(scopes[first..=last].iter_mut())
+                .map(|(table, (_, batch, _))| (table, batch))
+                .collect();
+            for (group, rows) in NativeEmbeddedBatch::scan_pages(groups, local_offset, PAGE_SIZE)? {
+                let group = first + group;
+                let (scoped, _, tasks) = &mut scopes[group];
+                scoped.project_rows(&tables[group], rows, tasks, candidates, verified)?;
+            }
+        }
+        for (table, (mut scoped, mut batch, mut embedded_tasks)) in tables.iter_mut().zip(scopes) {
+            scoped.finish(table, &mut batch, &mut embedded_tasks, candidates, verified)?;
+            self.tasks.extend(scoped.tasks);
+            self.blocked_paths.extend(scoped.blocked_paths);
+            self.scan_errors.merge_report(scoped.scan_errors);
+        }
+        merge_shared_inputs(&mut self.tasks);
+        Ok(())
+    }
+
+    fn prepare(
+        &mut self,
+        table: &mut NativeCandidateTable,
+        verified: &VerifiedPasswords,
+        request: &Request,
+        recursive: bool,
+    ) -> io::Result<NativeEmbeddedBatch> {
         let mut routes = table.resolve()?;
         for &(index, status) in &routes.relation_events {
             if matches!(status, 1 | 2) {
@@ -756,61 +804,67 @@ impl Discovered {
         }
         let embedded = request.config.embedded_scan;
         let force = request.deep && !recursive;
-        let mut batch = table.prepare_embedded(
+        Ok(table.prepare_embedded(
             &mut routes,
             recursive,
             force,
             embedded.enabled || force,
             embedded.recursive_candidate_ratio,
-        );
-        if batch.len() == 0 {
-            merge_shared_inputs(&mut self.tasks);
-            return Ok(());
-        }
-        let mut embedded_tasks = Vec::new();
-        const PAGE_SIZE: usize = 256;
-        for offset in (0..batch.len()).step_by(PAGE_SIZE) {
-            request.cancel.check_io()?;
-            for (_, rows) in
-                NativeEmbeddedBatch::scan_pages(vec![(&*table, &mut batch)], offset, PAGE_SIZE)?
-            {
-                for row in rows {
-                    if let Some(error) = row.error {
-                        let (path, format) = table.summary(row.index)?;
-                        if format.is_empty() {
-                            self.blocked_paths.insert(path_key(&path));
-                            self.scan_errors.push_detail(
-                                Path::new(&path),
-                                "embedded_scan",
-                                error.to_string(),
-                            );
-                        } else {
-                            let mut task = project_task(
-                                table.project(row.index)?,
-                                DiscoverySource::Embedded,
-                                verified,
-                            );
-                            task.inputs[0].failure = Some(Failure::new(
-                                FailureKind::FilesystemError,
-                                error.to_string(),
-                            ));
-                            embedded_tasks.push(task);
-                        }
-                    } else if let Some(scan) = row.scan {
-                        let task = project_task(
-                            table.project(row.index)?,
-                            DiscoverySource::Embedded,
-                            verified,
-                        );
-                        if let Some(task) =
-                            project_segments(task, &scan, HashMap::new(), candidates)?
-                        {
-                            embedded_tasks.push(task);
-                        }
-                    }
+        ))
+    }
+
+    fn project_rows(
+        &mut self,
+        table: &NativeCandidateTable,
+        rows: Vec<EmbeddedPageRow>,
+        embedded_tasks: &mut Vec<Task>,
+        candidates: &CandidateSet,
+        verified: &VerifiedPasswords,
+    ) -> io::Result<()> {
+        for row in rows {
+            if let Some(error) = row.error {
+                let (path, format) = table.summary(row.index)?;
+                if format.is_empty() {
+                    self.blocked_paths.insert(path_key(&path));
+                    self.scan_errors.push_detail(
+                        Path::new(&path),
+                        "embedded_scan",
+                        error.to_string(),
+                    );
+                } else {
+                    let mut task = project_task(
+                        table.project(row.index)?,
+                        DiscoverySource::Embedded,
+                        verified,
+                    );
+                    task.inputs[0].failure = Some(Failure::new(
+                        FailureKind::FilesystemError,
+                        error.to_string(),
+                    ));
+                    embedded_tasks.push(task);
+                }
+            } else if let Some(scan) = row.scan {
+                let task = project_task(
+                    table.project(row.index)?,
+                    DiscoverySource::Embedded,
+                    verified,
+                );
+                if let Some(task) = project_segments(task, &scan, HashMap::new(), candidates)? {
+                    embedded_tasks.push(task);
                 }
             }
         }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        table: &mut NativeCandidateTable,
+        batch: &mut NativeEmbeddedBatch,
+        embedded_tasks: &mut Vec<Task>,
+        candidates: &CandidateSet,
+        verified: &VerifiedPasswords,
+    ) -> io::Result<()> {
         let passwords = batch
             .encrypted_volume_paths(table)
             .into_iter()
@@ -857,7 +911,7 @@ impl Discovered {
                         .iter()
                         .any(|path| replaced.contains(&path_key(path)))
             });
-            self.tasks.extend(embedded_tasks);
+            self.tasks.append(embedded_tasks);
         }
         merge_shared_inputs(&mut self.tasks);
         Ok(())
@@ -1135,27 +1189,97 @@ fn root(parents: &mut [usize], mut index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embedded_pages_cross_scope_boundaries_without_losing_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "sunpack-pages-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut carrier = vec![0x41; 17];
+        carrier.extend_from_slice(b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00");
+        let mut inputs = Vec::new();
+        let mut expected = HashSet::new();
+        // A page crosses roots and then splits inside the last root; the empty
+        // middle root must not shift the group IDs used for result projection.
+        for (scope, count) in [1, 0, 257].into_iter().enumerate() {
+            let directory = root.join(scope.to_string());
+            std::fs::create_dir_all(&directory).unwrap();
+            for index in 0..count {
+                let path = directory.join(format!("archive{index}.bin"));
+                std::fs::write(&path, &carrier).unwrap();
+                expected.insert(path_key(&path.to_string_lossy()));
+            }
+            inputs.push(directory);
+        }
+        let options =
+            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
+        let candidates = CandidateSet::new(
+            Arc::from([]),
+            None,
+            &super::super::passwords::AttemptCache::default(),
+            None,
+        );
+        let mut request = Request::new(inputs, super::super::Mode::Scan);
+        request.deep = true;
+        let result = discover(&request, &options, &candidates).unwrap();
+        assert!(result.errors.is_empty());
+        assert!(result.blocked_paths.is_empty());
+        assert_eq!(result.tasks.len(), expected.len());
+        for task in result.tasks {
+            assert_eq!(task.inputs.len(), 1);
+            assert_eq!(task.owned_paths.len(), 1);
+            assert!(expected.remove(&path_key(&task.entry().entry_path)));
+            let retry = task.retry.as_ref().unwrap();
+            assert_eq!(
+                retry.scope.key(),
+                path_key(
+                    &Path::new(&task.entry().entry_path)
+                        .parent()
+                        .unwrap()
+                        .to_string_lossy()
+                )
+            );
+        }
+        assert!(expected.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn covered_explicit_targets_keep_their_retry_boundary() {
         let root = std::env::temp_dir().join(format!(
-            "sunpack-covered-scope-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap().as_nanos(),
+            "sunpack-covered-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         let child = root.join("child");
         std::fs::create_dir_all(&child).unwrap();
         let archive = child.join("archive.zip");
         // A complete stored ZIP, so discovery needs no worker or passwords.
         std::fs::write(&archive, b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00").unwrap();
-        let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let options =
+            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
         let candidates = CandidateSet::new(
-            Arc::from([]), None, &super::super::passwords::AttemptCache::default(), None,
+            Arc::from([]),
+            None,
+            &super::super::passwords::AttemptCache::default(),
+            None,
         );
         for target in [&child, &archive] {
             for ancestor_first in [false, true] {
-                let inputs = if ancestor_first { vec![root.clone(), target.clone()] }
-                    else { vec![target.clone(), root.clone()] };
+                let inputs = if ancestor_first {
+                    vec![root.clone(), target.clone()]
+                } else {
+                    vec![target.clone(), root.clone()]
+                };
                 let mut request = Request::new(inputs, super::super::Mode::Scan);
                 request.recursive = true;
                 let result = discover(&request, &options, &candidates).unwrap();
@@ -1163,12 +1287,17 @@ mod tests {
                 assert_eq!(result.tasks.len(), 1);
                 let task = &result.tasks[0];
                 assert_eq!(task.inputs.len(), 1);
-                assert_eq!(path_key(&task.entry().entry_path), path_key(&archive.to_string_lossy()));
+                assert_eq!(
+                    path_key(&task.entry().entry_path),
+                    path_key(&archive.to_string_lossy())
+                );
                 let retry = task.retry.as_ref().unwrap();
                 assert_eq!(retry.scope.key(), path_key(&child.to_string_lossy()));
-                assert!(retry.snapshot.rows.iter().all(|&row| {
-                    retry.scope.contains(&retry.snapshot.table.paths[row])
-                }));
+                assert!(retry
+                    .snapshot
+                    .rows
+                    .iter()
+                    .all(|&row| { retry.scope.contains(&retry.snapshot.table.paths[row]) }));
             }
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -1177,9 +1306,12 @@ mod tests {
     #[test]
     fn shared_walk_keeps_child_rows_and_retry_scope_local() {
         let root = std::env::temp_dir().join(format!(
-            "sunpack-scope-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap().as_nanos(),
+            "sunpack-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         let child = root.join("child");
         let other = root.join("other");
@@ -1188,34 +1320,53 @@ mod tests {
         let head = child.join("split.7z.001");
         std::fs::write(&head, b"head").unwrap();
         std::fs::write(other.join("split.7z.002"), b"tail").unwrap();
-        let outer = NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), None, Vec::new());
-        let inner = NativeDiscoveryScope::new(child.to_string_lossy().into_owned(), None, Vec::new());
+        let outer =
+            NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), None, Vec::new());
+        let inner =
+            NativeDiscoveryScope::new(child.to_string_lossy().into_owned(), None, Vec::new());
         let roots = HashMap::from([
             (outer.key().to_owned(), outer.root.clone()),
             (inner.key().to_owned(), outer.root.clone()),
         ]);
-        let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let options =
+            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
         let mut snapshots = HashMap::new();
-        let (_, outer_raw) = scan_discovery_scope(&options, &outer, &roots, &mut snapshots).unwrap();
-        let (_, inner_raw) = scan_discovery_scope(&options, &inner, &roots, &mut snapshots).unwrap();
+        let (_, outer_raw) =
+            scan_discovery_scope(&options, &outer, &roots, &mut snapshots).unwrap();
+        let (_, inner_raw) =
+            scan_discovery_scope(&options, &inner, &roots, &mut snapshots).unwrap();
         assert_eq!(snapshots.len(), 1);
         assert!(Arc::ptr_eq(&outer_raw.table, &inner_raw.table));
-        let paths: Vec<_> = inner_raw.rows.iter().map(|&row| &inner_raw.table.paths[row]).collect();
-        assert!(paths.iter().any(|path| path_key(path) == path_key(&head.to_string_lossy())));
+        let paths: Vec<_> = inner_raw
+            .rows
+            .iter()
+            .map(|&row| &inner_raw.table.paths[row])
+            .collect();
+        assert!(paths
+            .iter()
+            .any(|path| path_key(path) == path_key(&head.to_string_lossy())));
         assert!(paths.iter().all(|path| inner.contains(path)));
         // Both an explicit child directory and a covered child file's parent
         // remain logical boundaries when only the ancestor was discovered.
         let mut scopes = vec![Arc::new(RetryScope {
-            scope: outer.clone(), snapshot: outer_raw, bucket: String::new(),
+            scope: outer.clone(),
+            snapshot: outer_raw,
+            bucket: String::new(),
         })];
         retain_logical_retry_scopes([outer, inner.clone(), inner.clone()], &mut scopes);
         assert_eq!(scopes.len(), 2);
-        assert!(Arc::ptr_eq(&scopes[0].snapshot.table, &scopes[1].snapshot.table));
+        assert!(Arc::ptr_eq(
+            &scopes[0].snapshot.table,
+            &scopes[1].snapshot.table
+        ));
         assert_eq!(*scopes[1].snapshot.rows, *inner_raw.rows);
         let head = head.to_string_lossy().into_owned();
         let mut tasks = vec![Task::single(
             ArchiveInput::file(head.clone(), "7z".into(), "split".into()),
-            vec![head], DiscoverySource::Relations, None,
+            vec![head],
+            DiscoverySource::Relations,
+            None,
         )];
         assign_retry_scopes(&mut tasks, &scopes);
         assert_eq!(tasks[0].retry.as_ref().unwrap().scope.key(), inner.key());
@@ -1230,14 +1381,21 @@ mod tests {
             let paths = vec!["sample.zzz".to_owned(), "sample.aaa.bin".to_owned()];
             let relation = Task::single(
                 ArchiveInput::file(paths[0].clone(), "rar".into(), "sample".into()),
-                paths.clone(), DiscoverySource::Relations, None,
+                paths.clone(),
+                DiscoverySource::Relations,
+                None,
             );
             let embedded = Task::single(
                 ArchiveInput::file(paths[1].clone(), "zip".into(), "sample.aaa".into()),
-                vec![paths[1].clone()], DiscoverySource::Embedded, None,
+                vec![paths[1].clone()],
+                DiscoverySource::Embedded,
+                None,
             );
-            let mut tasks = if relation_first { vec![relation, embedded] }
-                else { vec![embedded, relation] };
+            let mut tasks = if relation_first {
+                vec![relation, embedded]
+            } else {
+                vec![embedded, relation]
+            };
             merge_shared_inputs(&mut tasks);
             assert_eq!(tasks.len(), 1);
             let task = &tasks[0];
