@@ -9,7 +9,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
-use windows_sys::Win32::Foundation::{FreeLibrary, LocalFree, HANDLE};
+use windows_sys::Win32::Foundation::{LocalFree, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -294,6 +294,11 @@ pub(super) struct ToastLibrary(LibraryHandle);
 
 impl ToastLibrary {
     pub(super) fn load(cwd: &Path) -> io::Result<Self> {
+        // WinRT retains final notifications and their callbacks after a
+        // presenter exits. Match main's single process-lifetime DLL reference.
+        static MODULE: Mutex<Option<usize>> = Mutex::new(None);
+        let mut module = MODULE.lock().unwrap();
+        if let Some(raw) = *module { return Ok(Self(raw as LibraryHandle)); }
         let path = wide(resources::toast_library_path(cwd)?.as_os_str());
         let raw = unsafe {
             LoadLibraryExW(
@@ -305,6 +310,7 @@ impl ToastLibrary {
         if raw.is_null() {
             Err(io::Error::last_os_error())
         } else {
+            *module = Some(raw as usize);
             Ok(Self(raw))
         }
     }
@@ -331,12 +337,6 @@ impl ToastLibrary {
             library: self,
             context,
         })
-    }
-}
-
-impl Drop for ToastLibrary {
-    fn drop(&mut self) {
-        unsafe { FreeLibrary(self.0) };
     }
 }
 
@@ -403,8 +403,13 @@ pub(super) fn activate_toast(cwd: &Path, identity: &str) -> io::Result<i32> {
         return Ok(0);
     }
     let id = String::from_utf16_lossy(&batch[..len]);
-    let result = pipe::submit_existing(cwd, identity, &["--cancel-watch-batch".into(), id], false)?;
-    Ok(result.unwrap_or(1))
+    let result = pipe::submit_existing(cwd, identity, &["--cancel-watch-batch".into(), id.clone()], false);
+    if !matches!(result, Ok(Some(0))) {
+        let language = crate::core::config::load_language(cwd);
+        let presenter = library.presenter(Path::new(""))?;
+        presenter.show(&super::toast::Snapshot::stop_failed(&id, language).encode(), 1)?;
+    }
+    result.map(|code| code.unwrap_or(1))
 }
 
 const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";

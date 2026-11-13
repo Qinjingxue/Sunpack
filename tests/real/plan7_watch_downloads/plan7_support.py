@@ -13,7 +13,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from tests.helpers.marker_utils import marker_was_extracted
+from tests.helpers.marker_utils import marker_was_extracted, open_shared_file
 from tests.helpers.native_fixture import file_inventory, native_fixture
 from tests.helpers.real_archives import ArchiveFixtureFactory, STREAM_FORMATS
 from tests.real.archive_boundary import assert_extracted
@@ -130,7 +130,7 @@ def download(watch, source, *, mode="rename", directory=None, interrupt=False, r
     final = directory / source.name
     pending = final.with_name(f"{final.name}.downloading") if mode == "rename" else final
     offset = pending.stat().st_size if resume else 0
-    with source.open("rb") as reader, pending.open("ab" if resume else "wb") as writer:
+    with source.open("rb") as reader, open_shared_file(pending, "ab" if resume else "wb") as writer:
         reader.seek(offset)
         while data := reader.read(DOWNLOAD_CHUNK_SIZE):
             writer.write(data)
@@ -139,8 +139,10 @@ def download(watch, source, *, mode="rename", directory=None, interrupt=False, r
             if interrupt:
                 return pending
             time.sleep(0.001)
-    if pending != final:
-        pending.replace(final)
+        # Keep write ownership through publication. main's readiness probe
+        # denies rename after the writer closes, so close-then-rename races it.
+        if pending != final:
+            pending.replace(final)
     return final
 
 
@@ -153,7 +155,7 @@ def download_interleaved(watch, sources, *, mode="rename", separate=False):
             final = directory / source.name
             pending = final.with_name(f"{final.name}.downloading") if mode == "rename" else final
             reader = handles.enter_context(source.open("rb"))
-            writer = handles.enter_context(pending.open("wb"))
+            writer = handles.enter_context(open_shared_file(pending, "wb"))
             streams.append((reader, writer, pending, final))
         active = streams.copy()
         while active:
@@ -164,9 +166,9 @@ def download_interleaved(watch, sources, *, mode="rename", separate=False):
                     writer.flush()
                     os.fsync(writer.fileno())
                 else:
-                    writer.close()
                     if pending != final:
                         pending.replace(final)
+                    writer.close()
                     active.remove(stream)
             time.sleep(0.001)
         return [final for _, _, _, final in streams]

@@ -65,6 +65,8 @@ impl Reports {
             Event::Replanned { id, .. } => (*id, 5),
             Event::Progress { id, .. } => (*id, 2),
             Event::ResourceWait { id, .. } => (*id, 3),
+            Event::Extracting { id } => (*id, 6),
+            Event::ResolvingVolumes { id } => (*id, 1),
             Event::Started { id, .. } | Event::Working { id } => (*id, 1),
             Event::Waiting { id }
             | Event::Finalizing { id }
@@ -76,6 +78,7 @@ impl Reports {
             if key.1 == 5 {
                 // Keep initial registration but discard the previous attempt.
                 for kind in 1..=4 { state.events.remove(&(key.0, kind)); }
+                state.events.remove(&(key.0, 6));
             }
             if key.1 == 1 {
                 // Started/Working clear progress in Panel, even if a later

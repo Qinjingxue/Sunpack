@@ -565,7 +565,6 @@ impl Session for Connection {
         Box::pin(self.read_line_async(prompt))
     }
     fn interactive(&self) -> bool { self.flags & 2 != 0 }
-    fn input_is_terminal(&self) -> bool { self.flags & 4 != 0 }
     fn unicode(&self) -> bool { self.flags & 16 != 0 }
     fn terminal_size(&self) -> (usize, usize) {
         let size = self.terminal_size.load(Ordering::Relaxed);

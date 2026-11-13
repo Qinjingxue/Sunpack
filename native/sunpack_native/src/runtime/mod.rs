@@ -18,7 +18,7 @@ mod watch;
 mod windows;
 
 #[cfg(windows)]
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, Write};
 #[cfg(windows)]
 static RUNTIME_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -103,7 +103,6 @@ trait Session: Send + Sync {
         Box::pin(async move { self.read_line(prompt) })
     }
     fn interactive(&self) -> bool;
-    fn input_is_terminal(&self) -> bool;
     fn unicode(&self) -> bool;
     fn terminal_size(&self) -> (usize, usize);
 }
@@ -148,9 +147,6 @@ impl Session for Console {
         self.interactive
     }
 
-    fn input_is_terminal(&self) -> bool {
-        io::stdin().is_terminal()
-    }
 
     fn unicode(&self) -> bool {
         true

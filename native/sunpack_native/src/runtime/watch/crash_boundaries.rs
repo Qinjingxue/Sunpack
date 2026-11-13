@@ -6,8 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 // A normal Journal drop can finish persistence and conceal a crash ordering
-// defect. This owner is killed with real WAL, directory identities and logical
-// receipts alive. No production fault hook or timing race is involved.
+// defect. This owner is killed with real WAL, directory identities alive. No production fault hook or timing race is involved.
 #[test]
 fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
     const CHILD: &str = "SUNPACK_FLATTEN_CRASH_CHILD";
@@ -38,23 +37,6 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
         journal.commit(true, |state| {
             Ok(state.output_operation(owner_text, owner_text.into(),
                 root.to_string_lossy().into_owned(), None, None)?.unwrap())
-        }).unwrap();
-        journal.commit(true, |_| {
-            let mut operations = NativeWatchOperations::empty();
-            for (source, output) in [(&owner, &root), (&nested, &nested_output)] {
-                let value = json!({
-                    "schema_version":1,"carrier":source,
-                    "input":crate::io::archive_state::ArchiveInput::file(
-                        source.to_string_lossy().into_owned(), "zip".into(), "archive".into(),
-                    ),
-                    "sources":[{"path":source,"generation":capture_file_generation(source)?.persisted()}],
-                    "output":output,"container":root,"files":1,"bytes":17,
-                    "encrypted":false,"discovery_source":"direct",
-                });
-                operations.extend(NativeWatchOperations::checkpoint(owner_text,
-                    output.to_str().unwrap(), Some(value)));
-            }
-            Ok(operations)
         }).unwrap();
         prepare_flatten(&journal, owner_text, &root, &work, &leaf).unwrap();
         let phase = std::env::var(PHASE).unwrap();
@@ -128,13 +110,7 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
             assert!(!work.exists(), "{phase}/{reopen}");
             assert!(journal.state().runtime_keys("flatten|").is_empty());
             let pending = journal.state().pending(owner.to_str().unwrap()).unwrap();
-            assert!(recovery_output_matches(journal.state(), &pending, root.to_str().unwrap()).unwrap());
-            let receipts = input_checkpoints(journal.state(), owner.to_str().unwrap())
-                .collect::<io::Result<Vec<_>>>().unwrap();
-            assert_eq!(receipts.len(), 2);
-            assert!(receipts.iter().any(|receipt| receipt.entry() == owner && receipt.output() == root));
-            assert!(receipts.iter().any(|receipt| receipt.entry() == root.join("nested.zip")
-                && receipt.output() == root.join("nested")));
+            assert!(recovery_output_matches(journal.state(), &pending, root.to_str().unwrap()));
             assert!(journal.state().owned_root(work.to_str().unwrap()).is_none());
         }
         fs::remove_dir_all(&base).unwrap();

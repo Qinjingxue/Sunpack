@@ -238,7 +238,7 @@ pub(crate) fn watch_paths(cwd: &Path, sources: &ConfigSources) -> Vec<PathBuf> {
     paths
 }
 
-fn resolve_sources(cwd: &Path) -> ConfigSources {
+pub(crate) fn resolve_sources(cwd: &Path) -> ConfigSources {
     let roots = resources::resource_roots(cwd);
     let search = |name| {
         roots
@@ -354,12 +354,13 @@ struct Layers {
 }
 
 impl Layers {
-    fn read(sources: ConfigSources) -> io::Result<Self> {
+    fn read(sources: ConfigSources, cwd: &Path) -> io::Result<Self> {
         use crate::io::resource_lifecycle::read_shared_utf8_text;
         if sources.simple.is_none() && sources.advanced.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Missing required {SIMPLE} or {ADVANCED}"),
+                format!("Missing required {SIMPLE} or {ADVANCED}. Searched: {}",
+                    watch_paths(cwd, &sources).iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")),
             ));
         }
         let advanced = sources
@@ -419,7 +420,11 @@ impl Layers {
                     let parsed: Result<_, serde_json::Error> = if capture {
                         serde_json::from_str::<order::Captured>(text).map(|order::Captured(value, order)| (value, order))
                     } else { serde_json::from_str(text).map(|value| (value, order::Order::Scalar)) };
-                    parsed.map_err(|error| invalid(format!("{OVERRIDES} must be an inline JSON object or an existing JSON file: {error}")))?
+                    parsed.map_err(|error| invalid(if text.starts_with(['{', '[']) {
+                        format!("{OVERRIDES} contains invalid JSON: {error}")
+                    } else {
+                        format!("{OVERRIDES} must be an inline JSON object or an existing JSON file: {text}")
+                    }))?
                 }
             };
             let object = layer
@@ -444,13 +449,13 @@ impl Layers {
 }
 
 pub fn load_raw(cwd: &Path) -> io::Result<(PathBuf, Value)> {
-    let layers = Layers::read(resolve_sources(cwd))?;
+    let layers = Layers::read(resolve_sources(cwd), cwd)?;
     let value = layers.parse()?;
     Ok((layers.sources.primary().to_path_buf(), value))
 }
 
 pub(crate) fn load_raw_ordered(cwd: &Path) -> io::Result<(PathBuf, Value, order::Order)> {
-    let layers = Layers::read(resolve_sources(cwd))?;
+    let layers = Layers::read(resolve_sources(cwd), cwd)?;
     let (value, order) = layers.parse_ordered(true)?;
     Ok((layers.sources.primary().to_path_buf(), value, order))
 }
@@ -458,6 +463,13 @@ pub(crate) fn load_raw_ordered(cwd: &Path) -> io::Result<(PathBuf, Value, order:
 struct Generation {
     stamp: Option<[Option<PhysicalFileGeneration>; 3]>,
     snapshot: Snapshot,
+    revision: u64,
+}
+
+static SOURCE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn invalidate_sources() {
+    SOURCE_REVISION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 pub(crate) struct ConfigRead {
@@ -483,11 +495,16 @@ impl ConfigRead {
 }
 
 pub(crate) fn generation(cwd: &Path) -> ConfigRead {
-    read_generation(cwd, false)
+    read_generation(cwd, false, false)
 }
 
-fn read_generation(cwd: &Path, refresh: bool) -> ConfigRead {
+pub(crate) fn observed_generation(cwd: &Path) -> ConfigRead {
+    read_generation(cwd, false, true)
+}
+
+fn read_generation(cwd: &Path, refresh: bool, observed: bool) -> ConfigRead {
     static CACHE: Mutex<VecDeque<Arc<Generation>>> = Mutex::new(VecDeque::new());
+    let revision = SOURCE_REVISION.load(std::sync::atomic::Ordering::Acquire);
     let sources = resolve_sources(cwd);
     let previous = {
         let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
@@ -497,6 +514,10 @@ fn read_generation(cwd: &Path, refresh: bool) -> ConfigRead {
             .and_then(|index| cache.remove(index))
             .inspect(|entry| cache.push_front(Arc::clone(entry)))
     };
+    let refresh = refresh || previous.as_ref().is_some_and(|hit| hit.revision != revision);
+    if let Some(hit) = previous.as_ref().filter(|_| observed && !refresh) {
+        return ConfigRead { observed: Ok(Arc::clone(hit)), previous: None, language: hit.snapshot.config.cli.language };
+    }
     let stamp = sources.stamp().ok();
     if let Some(hit) = previous
         .as_ref()
@@ -510,12 +531,13 @@ fn read_generation(cwd: &Path, refresh: bool) -> ConfigRead {
     }
     let mut language = Language::Zh;
     let observed = (|| {
-        let layers = Layers::read(sources)?;
+        let layers = Layers::read(sources, cwd)?;
         let raw = layers.parse()?;
         language = raw_language(&raw);
         let config = Config::parse(&raw)?;
         let current = Arc::new(Generation {
             stamp,
+            revision,
             snapshot: Snapshot {
                 config,
                 sources: layers.sources,
@@ -567,7 +589,7 @@ pub fn load_snapshot(cwd: &Path) -> io::Result<Snapshot> {
 pub(crate) fn reload_snapshot(cwd: &Path) -> io::Result<Snapshot> {
     // File notifications are authoritative even on filesystems whose metadata
     // cannot distinguish two same-size writes within one timestamp tick.
-    snapshot(read_generation(cwd, true))
+    snapshot(read_generation(cwd, true, false))
 }
 
 fn snapshot(read: ConfigRead) -> io::Result<Snapshot> {
@@ -1121,11 +1143,15 @@ impl ScanFilter {
                     "Unknown range filter",
                 )?;
                 let parse_time = |key: &str| {
-                    optional(
-                        &value[key],
-                        |v| utc_minute(v.as_str()?),
-                        "Time bounds must be null or UTC minutes: YYYY-MM-DDTHH:mmZ",
-                    )
+                    if value[key].is_null() { return Ok(None); }
+                    let text = value[key].as_str().filter(|text| {
+                        let b = text.as_bytes();
+                        b.len() == 17 && b.iter().enumerate().all(|(index, byte)| match index {
+                            4 | 7 => *byte == b'-', 10 => *byte == b'T',
+                            13 => *byte == b':', 16 => *byte == b'Z', _ => byte.is_ascii_digit(),
+                        })
+                    }).ok_or_else(|| invalid("Time bounds must be null or UTC minutes: YYYY-MM-DDTHH:mmZ"))?;
+                    utc_minute(text).map(Some).ok_or_else(|| invalid(format!("Invalid UTC minute: {text}")))
                 };
                 let (start, end) = (parse_time("start_utc")?, parse_time("end_utc")?);
                 if start.zip(end).is_some_and(|(start, end)| start >= end) {

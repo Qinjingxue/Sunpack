@@ -14,6 +14,7 @@ enum Phase {
     Queued,
     Preparing,
     Working,
+    ResolvingVolumes,
     Finished(TaskStatus),
 }
 
@@ -29,6 +30,7 @@ struct TaskRow {
     wait: ResourceWait,
     progress: Option<(u64, u64)>,
     result: Option<TaskCompletion>,
+    detail: Option<String>,
 }
 
 struct Row {
@@ -91,6 +93,18 @@ impl Panel {
             Event::Started { id, .. } => (id, Some(Phase::Preparing)),
             Event::Waiting { id } => (id, Some(Phase::Queued)),
             Event::Working { id } => (id, Some(Phase::Working)),
+            Event::Extracting { id } => {
+                if self.verbose {
+                    if let Some(task) = self.tasks.get_mut(&id) {
+                        task.detail = Some(language.translate("extract.log.start", &[("archive", &task.path.to_string_lossy())]).trim().to_owned());
+                    }
+                }
+                (id, None)
+            }
+            Event::ResolvingVolumes { id } => {
+                if let Some(task) = self.tasks.get_mut(&id) { task.detail = None; }
+                (id, Some(Phase::ResolvingVolumes))
+            }
             // main keeps the current row until the execution result is known.
             Event::Finalizing { .. } => return,
             Event::Finished { id, result, .. } => {
@@ -106,6 +120,7 @@ impl Panel {
                 if let Some(task) = self.tasks.get_mut(&id) {
                     if status == TaskStatus::Complete { task.progress = Some((1, 1)); }
                     task.result = Some(result);
+                    task.detail = None;
                 }
                 (id, Some(Phase::Finished(status)))
             },
@@ -156,7 +171,7 @@ impl Panel {
         if let Some((phase, task)) = phase.zip(self.tasks.get_mut(&id)) {
             task.phase = phase;
             task.wait = ResourceWait::default();
-            if matches!(phase, Phase::Preparing | Phase::Working) {
+            if matches!(phase, Phase::Preparing | Phase::Working | Phase::ResolvingVolumes) {
                 task.progress = None;
             }
         }
@@ -203,6 +218,7 @@ impl Panel {
                 wait: ResourceWait::default(),
                 progress: None,
                 result: None,
+                detail: None,
             },
         );
     }
@@ -431,12 +447,23 @@ impl Panel {
                             else { std::borrow::Cow::Borrowed(text) };
                         emit_row(&mut rows, &mut writer, Some(id), width, unicode, format_args!("{detail_prefix}{text}"))?;
                     }
+                } else if let Some(detail) = &task.detail {
+                    if rows.len() == height {
+                        rows.pop();
+                        emit_row(&mut rows, &mut writer, None, width, unicode, format_args!("{}", ellipsis(unicode)))?;
+                        return Ok(rows);
+                    }
+                    emit_row(&mut rows, &mut writer, Some(id), width, unicode, format_args!("{detail_prefix}{detail}"))?;
                 }
             }
             if !task.children.is_empty() {
                 prefix.push_str(continuation);
                 stack.push((task.children.range(..).peekable(), prefix.len(), false));
             }
+        }
+        if writer.is_none() && rows.len() == height {
+            rows.pop();
+            emit_row(&mut rows, &mut writer, None, width, unicode, format_args!("{}", ellipsis(unicode)))?;
         }
         Ok(rows)
     }
@@ -447,7 +474,7 @@ fn emit_row(
     width: usize, unicode: bool, text: std::fmt::Arguments<'_>,
 ) -> io::Result<()> {
     if let Some(writer) = writer { writeln!(writer, "{text}") }
-    else { rows.push(Row { id, text: clipped(&text.to_string(), width, unicode) }); Ok(()) }
+    else { rows.push(Row { id, text: clipped(text.to_string(), width, unicode) }); Ok(()) }
 }
 
 pub(super) fn wait_status(state: ResourceWait, language: Language) -> (&'static str, String) {
@@ -526,6 +553,7 @@ fn row_status(task: &TaskRow, available: usize, language: Language) -> String {
             Phase::Queued => "report.status.waiting",
             Phase::Preparing => "report.status.preparing",
             Phase::Working => "report.status.extracting",
+            Phase::ResolvingVolumes => "report.status.resolving_volumes",
             Phase::Finished(status) => super::task_status_key(status),
         };
         (language.text(status), String::new())
@@ -575,7 +603,8 @@ fn display_width(text: &str) -> usize {
     }
 }
 
-fn clipped(text: &str, max: usize, unicode: bool) -> String {
+fn clipped(text: String, max: usize, unicode: bool) -> String {
+    if text.len() <= max && !text.chars().any(char::is_control) { return text; }
     let marker = if unicode {
         if max == 0 {
             ""
@@ -628,9 +657,6 @@ mod tests {
         fn interactive(&self) -> bool {
             true
         }
-        fn input_is_terminal(&self) -> bool {
-            true
-        }
         fn unicode(&self) -> bool {
             true
         }
@@ -652,9 +678,11 @@ mod tests {
     #[test]
     fn physical_replan_replaces_rows_without_carrying_old_progress_or_waits() {
         let terminal = Terminal { size: (80, 30), output: Mutex::default() };
-        let mut panel = Panel::default();
+        let mut panel = Panel::new(true);
         panel.update(&terminal, Language::En, queued(1, None, "outer.zip", None), true);
         panel.update(&terminal, Language::En, queued(2, Some(1), "old.002", None), true);
+        panel.update(&terminal, Language::En, Event::Extracting { id: 2 }, true);
+        assert_eq!(panel.tasks[&2].detail.as_deref(), Some("[EXTRACT] Start: old.002"));
         panel.update(&terminal, Language::En, queued(3, Some(2), "old segment", None), true);
         panel.update(&terminal, Language::En, Event::Progress {
             id: 2, path: "old.002".into(), completed_bytes: 90, total_bytes: 100,
@@ -662,6 +690,9 @@ mod tests {
         panel.update(&terminal, Language::En, Event::ResourceWait {
             id: 2, path: "old.002".into(), state: ResourceWait { disk: true, ..Default::default() },
         }, true);
+        panel.update(&terminal, Language::En, Event::ResolvingVolumes { id: 2 }, true);
+        assert!(row_status(&panel.tasks[&2], 80, Language::En).contains("Resolving split volumes"));
+        assert!(panel.tasks[&2].progress.is_none());
         panel.update(&terminal, Language::En, Event::Replanned { id: 2, path: "new.001".into() }, true);
         let row = &panel.tasks[&2];
         assert_eq!(row.label, "new.001");
@@ -734,10 +765,10 @@ mod tests {
                     panel.redraw(&terminal, language, true);
                     let rows = &panel.frame.as_ref().unwrap().rows;
                     assert_eq!(rows.len(), 2);
-                    assert_eq!(rows[0].text, clipped(name, columns - 1, true));
+                    assert_eq!(rows[0].text, clipped(name.to_owned(), columns - 1, true));
                     let (status, hint) = wait_status(panel.tasks[&1].wait, language);
                     let expected = status_text(status, Some((60, 100)), &hint, Some(columns - 3));
-                    assert_eq!(rows[1].text, clipped(&format!("  {expected}"), columns - 1, true));
+                    assert_eq!(rows[1].text, clipped(format!("  {expected}"), columns - 1, true));
                     assert!(rows.iter().all(|row| display_width(&row.text) < columns));
                     assert!(rows[1].text.contains("60%"));
                     // Resize must preserve old history instead of moving up by a stale height.

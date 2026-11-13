@@ -5,7 +5,6 @@ from ctypes import wintypes
 import msvcrt
 import os
 from pathlib import Path
-from typing import TextIO
 
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -18,21 +17,23 @@ _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
 _kernel32.CloseHandle.restype = wintypes.BOOL
 
 
-def _open_marker_text(path: Path) -> TextIO:
-    # Polling observes live output: allow concurrent writes, moves and deletion.
+def open_shared_file(path: Path, mode="r", **kwargs):
+    # Live reads and simulated downloads allow moves without closing the file.
+    writing = mode[0] in "wa"
     handle = _kernel32.CreateFileW(
-        str(path), 0x80000000, 0x1 | 0x2 | 0x4, None, 3, 0x80, None,
+        str(path), 0x40000000 if writing else 0x80000000, 0x1 | 0x2 | 0x4,
+        None, {"w": 2, "a": 4}.get(mode[0], 3), 0x80, None,
     )
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        descriptor = msvcrt.open_osfhandle(handle, (os.O_WRONLY if writing else os.O_RDONLY) | os.O_BINARY)
     except BaseException:
         _kernel32.CloseHandle(handle)
         raise
-    # Ownership passes to the descriptor, then to the returned text stream.
+    # Ownership passes to the descriptor, then to the returned stream.
     try:
-        return os.fdopen(descriptor, "r", encoding="utf-8")
+        return os.fdopen(descriptor, mode, **kwargs)
     except BaseException:
         os.close(descriptor)
         raise
@@ -60,7 +61,7 @@ def marker_scan_state(root: Path, marker_name: str, marker_text: str) -> str:
 
     for path in safe_rglob(root, marker_name):
         try:
-            with _open_marker_text(path) as reader:
+            with open_shared_file(path, encoding="utf-8") as reader:
                 if reader.read(read_length) == marker_text:
                     return "found"
         except UnicodeDecodeError:
@@ -76,7 +77,7 @@ def marker_scan_state(root: Path, marker_name: str, marker_text: str) -> str:
             candidate_exists = True
             continue
         try:
-            with _open_marker_text(path) as reader:
+            with open_shared_file(path, encoding="utf-8") as reader:
                 if reader.read(read_length) == marker_text:
                     return "found"
         except UnicodeDecodeError:

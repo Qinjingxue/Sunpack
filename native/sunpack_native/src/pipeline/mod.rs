@@ -725,6 +725,12 @@ pub enum Event {
     Working {
         id: TaskId,
     },
+    Extracting {
+        id: TaskId,
+    },
+    ResolvingVolumes {
+        id: TaskId,
+    },
     Finalizing {
         id: TaskId,
     },
@@ -821,22 +827,6 @@ pub(crate) trait Observer: Send + Sync {
     }
 
     fn after_output(&self, _archive: &ArchiveResult) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn checkpoint(&self, _checkpoint: &InputCheckpoint) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn commit_output(
-        &self,
-        archive: &ArchiveResult,
-        checkpoint: Option<&InputCheckpoint>,
-    ) -> io::Result<()> {
-        self.after_output(archive)?;
-        if let Some(checkpoint) = checkpoint {
-            self.checkpoint(checkpoint)?;
-        }
         Ok(())
     }
 

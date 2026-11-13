@@ -26,7 +26,7 @@ use std::{
     },
 };
 
-const FILENAME: &str = "builtin_passwords.json";
+pub(crate) const FILENAME: &str = "builtin_passwords.json";
 const DEFAULT_DOCUMENT: &str = "{\n  \"passwords\": [{\"value\":\"123456\"},{\"value\":\"123\"},{\"value\":\"0000\"},{\"value\":\"789\"}],\n  \"clipboard_history\": []\n}\n";
 
 #[derive(Clone)]
@@ -312,6 +312,7 @@ struct StoreState {
 pub struct BuiltinStore {
     path: PathBuf,
     state: Mutex<StoreState>,
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl BuiltinStore {
@@ -357,6 +358,7 @@ impl BuiltinStore {
         let store = Self {
             path,
             state: Mutex::default(),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         };
         if let Err(error) = store.reload() {
             eprintln!("Cannot load password JSON: {error}");
@@ -379,6 +381,19 @@ impl BuiltinStore {
     pub fn reload(&self) -> io::Result<Arc<PasswordSnapshot>> {
         // File change notifications can observe writes with identical metadata.
         self.read_snapshot(true)
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn observed_snapshot(&self) -> Arc<PasswordSnapshot> {
+        if self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            if let Err(error) = self.reload() {
+                eprintln!("Cannot load password JSON; keeping the last valid snapshot: {error}");
+            }
+        }
+        self.snapshot()
     }
 
     pub(crate) fn snapshot_for_request(&self) -> Arc<PasswordSnapshot> {
@@ -597,7 +612,7 @@ mod tests {
         use std::{os::windows::fs::OpenOptionsExt, sync::{mpsc, Mutex}, time::Duration};
         let path = crate::test_support::temp_file("clipboard_share_conflict", br#"{"passwords":[],"clipboard_history":[]}"#);
         let reader = fs::OpenOptions::new().read(true).share_mode(3).open(&path).unwrap();
-        let store = super::BuiltinStore { path: path.clone(), state: Mutex::default() };
+        let store = super::BuiltinStore { path: path.clone(), state: Mutex::default(), dirty: Default::default() };
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             send.send(store.merge_clipboard(&["new-password".into()], 30)).unwrap();

@@ -12,7 +12,7 @@ from tests.helpers.native_fixture import native_fixture
 pytestmark = pytest.mark.requires_watch_broker
 
 
-def _wait_for_blocker(events, source, previous_owner=None):
+def _wait_for_blocker(events, source, previous_completion=0):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
@@ -20,17 +20,11 @@ def _wait_for_blocker(events, source, previous_owner=None):
         except subprocess.CalledProcessError:
             pass
         else:
-            blocked = any(row.get("event") == "suspended_missing_volume"
-                          and Path(row.get("path", "")) == source
-                          for row in display["live"])
-            if blocked:
-                for row in display["history"]:
-                    if (row.get("event") == "archive_failure_evidence"
-                            and Path(row.get("path", "")) == source
-                            and row.get("failure", {}).get("kind") == "missing_volume"
-                            and row.get("owner")
-                            and row["owner"] != previous_owner):
-                        return row["owner"]
+            for row in display["live"]:
+                if (row.get("event") == "suspended_missing_volume"
+                        and Path(row.get("path", "")) == source
+                        and row["ts"] > previous_completion):
+                    return row["ts"]
         time.sleep(0.05)
     pytest.fail("Semantic reload did not retry the unchanged missing-volume blocker")
 
@@ -38,9 +32,8 @@ def _wait_for_blocker(events, source, previous_owner=None):
 def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_path):
     # This verifies the lifecycle admission boundary, not partial acceptance:
     # the absent middle volume still prevents extraction under either policy.
-    # The new failure-evidence request owner proves a second pipeline attempt, rather
-    # than merely observing a rewritten settings file or display timestamp.
-    # Live task IDs identify stable display groups and intentionally survive retries.
+    # A new durable blocker completion proves a second attempt. Diagnostic
+    # failure history can be truncated, and live task IDs survive retries.
     watched = tmp_path / "watched"
     watched.mkdir()
     payload = tmp_path / "payload.txt"
@@ -60,10 +53,10 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
     package.json("watch", "add", watched, "-o", output)
     package.json("watch", "start", "--no-tray")
     events = package.data / ".sunpack_watch" / "events.json"
-    owner = _wait_for_blocker(events, parts[0])
+    completion = _wait_for_blocker(events, parts[0])
     package.configure(extraction={"content_requirement": "allow_partial"})
     package.json("watch", "reload")
-    _wait_for_blocker(events, parts[0], owner)
+    _wait_for_blocker(events, parts[0], completion)
     assert package.json("watch", "stop")["summary"]["stopped"]
     assert before == [(path.name, path.stat().st_size, path.stat().st_mtime_ns)
                       for path in watched.iterdir()]

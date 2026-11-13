@@ -55,6 +55,16 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(super) fn stop_failed(batch: &str, language: Language) -> Self {
+        Self {
+            batch: format!("{batch}-cancel"), kind: 3,
+            title: language.text("interrupt.stop_failed_title").to_owned(),
+            body: language.text("interrupt.stop_failed").to_owned(),
+            progress: None, label: String::new(), status: String::new(), value: String::new(),
+            action: None, report_action: None,
+        }
+    }
+
     fn progress(group: &Group) -> Self {
         let language = group.language;
         let totals = &group.totals;
@@ -256,7 +266,7 @@ impl Snapshot {
         }
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode(&self) -> Vec<u8> {
         let mode = if self.kind != 1 {
             0
         } else if self.progress.is_some() {
@@ -305,12 +315,8 @@ fn format_bytes(bytes: u128) -> String {
 }
 
 fn push_text(output: &mut Vec<u8>, value: &str) {
-    let mut end = value.len().min(8192);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    output.extend((end as u32).to_le_bytes());
-    output.extend(&value.as_bytes()[..end]);
+    output.extend((value.len() as u32).to_le_bytes());
+    output.extend(value.as_bytes());
 }
 
 #[derive(Default)]
@@ -378,9 +384,10 @@ struct Completed {
 struct RequestProgress {
     tasks: HashMap<TaskId, TaskProgress>,
     paths: HashMap<TaskId, PathBuf>,
-    started: HashSet<PathBuf>,
+    started: HashMap<TaskId, HashSet<PathBuf>>,
     roots: HashMap<TaskId, PathBuf>,
     task_roots: HashMap<TaskId, TaskId>,
+    root_tasks: HashMap<TaskId, Vec<TaskId>>,
     visible_roots: HashSet<TaskId>,
     settled: HashSet<String>,
     settled_tasks: HashSet<TaskId>,
@@ -483,6 +490,7 @@ impl Group {
                 let root = parent.and_then(|parent| request.task_roots.get(&parent).copied())
                     .unwrap_or(id);
                 request.task_roots.insert(id, root);
+                request.root_tasks.entry(root).or_default().push(id);
                 if parent.is_none() { request.roots.insert(id, path.clone()); }
                 if parent.is_none() && request.name.is_none() {
                     let name = path.file_name().unwrap_or(path.as_os_str())
@@ -549,7 +557,7 @@ impl Group {
         }
         if task.visible && !before.visible {
             if let Some(path) = request.paths.get(&id) {
-                request.started.insert(path.clone());
+                request.started.entry(request.task_roots[&id]).or_default().insert(path.clone());
             }
         }
         if task.visible && request.visible_roots.insert(request.task_roots[&id]) {
@@ -975,8 +983,20 @@ impl Activity {
         if let Some(group) = state.groups.iter_mut()
             .find(|group| group.requests.contains_key(&self.request))
         {
-            if group.requests.get_mut(&self.request).unwrap().pending_reports.remove(&id) {
+            let request = group.requests.get_mut(&self.request).unwrap();
+            if request.pending_reports.remove(&id) {
                 group.summary.report_failed |= failed;
+            }
+            if request.settled_tasks.remove(&id) {
+                if let Some(path) = request.roots.remove(&id) {
+                    request.settled.remove(&crate::path_keys::path_key(&path.to_string_lossy()));
+                }
+                request.started.remove(&id);
+                request.visible_roots.remove(&id);
+                for task in request.root_tasks.remove(&id).into_iter().flatten() {
+                    request.task_roots.remove(&task);
+                }
+                if request.name.as_ref().is_some_and(|(root, _)| *root == id) { request.name = None; }
             }
         }
         state.settle(Instant::now());
@@ -1002,7 +1022,8 @@ impl Activity {
                 return;
             };
             let request = &group.requests[&self.request];
-            (group.language, request.visible, if cancelled { request.roots.values().cloned().collect() } else { request.started.clone() }, request.settled.clone())
+            (group.language, request.visible, if cancelled { request.roots.values().cloned().collect::<HashSet<_>>() }
+                else { request.started.values().flatten().cloned().collect() }, request.settled.clone())
         };
         // Receipt projection can be large. It must not hold the presentation
         // gate or prevent disable from cancelling an active report writer.
@@ -1740,6 +1761,13 @@ mod tests {
         let full = warnings.clone();
         append_warning(&mut warnings, "more");
         assert_eq!(warnings, full);
+        let mut snapshot = Snapshot::stop_failed("batch", Language::En);
+        assert_eq!(snapshot.kind, 3);
+        assert_eq!(snapshot.title, "SunPack could not confirm stop");
+        assert_eq!(snapshot.body, "Stop unconfirmed. Check the current processing status.");
+        let target = format!("C:\\{}", "路径".repeat(1500));
+        snapshot.action = Some((1, "Open".into(), target.clone()));
+        assert!(snapshot.encode().ends_with(target.as_bytes()));
     }
 
     #[test]
@@ -1969,6 +1997,11 @@ mod tests {
             activity.report_finished(1, false);
             {
                 let state = publisher.shared.state.lock().unwrap();
+                let request = &state.groups.front().unwrap().requests[&activity.request];
+                assert!(!request.roots.contains_key(&1));
+                assert!(!request.task_roots.values().any(|root| *root == 1));
+                assert!(!request.started.contains_key(&1));
+                assert!(!request.visible_roots.contains(&1));
                 let report = state.groups.front().unwrap().report.lock().unwrap();
                 assert_eq!(report.failures, 0);
                 assert!(report.path.as_ref().is_none_or(|path| !path.exists()));

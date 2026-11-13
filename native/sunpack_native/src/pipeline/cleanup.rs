@@ -82,7 +82,7 @@ pub(super) fn recycle<'a>(paths: impl Iterator<Item = &'a Path>) -> io::Result<(
 
     fn check(result: i32) -> io::Result<()> {
         if result < 0 {
-            Err(io::Error::from_raw_os_error(result))
+            Err(io::Error::from_raw_os_error(result & 0xffff))
         } else {
             Ok(())
         }

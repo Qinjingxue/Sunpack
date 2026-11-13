@@ -167,7 +167,9 @@ def test_watch_nested_split_groups_persist_distinct_blockers(package, tmp_path):
     write_passwords(package, watch.root, ["wrong-candidate", "known"])
     package.json("watch", "add", "-d", watch.root, "-o", output)
     code, events = _watch_once(package, watch)
-    assert code == 1
+    # Like main, --once reports service execution, while archive blockers are
+    # recorded in Watch state rather than propagated as its process exit code.
+    assert code == 0
     assert {
         Path(row["path"]).name: row["event"] for row in events
     } == {
@@ -214,7 +216,7 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
     remaining = set(BLOCKERS)
     for _ in range(2):
         code, events = _watch_once(package, watch)
-        assert code == 1 and events
+        assert code == 0 and events
         blocker = events[-1]["event"]
         assert blocker in remaining, events
         remaining.remove(blocker)

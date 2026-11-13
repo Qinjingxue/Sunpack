@@ -474,7 +474,6 @@ impl<'de> Deserialize<'de> for Operation {
                         let key: String = field(&mut seq)?;
                         if !key.starts_with("owned|")
                             && !key.starts_with("flatten|")
-                            && !key.starts_with("checkpoint|")
                         {
                             return Err(A::Error::custom("unknown runtime record"));
                         }
@@ -562,15 +561,9 @@ impl StateData {
             }
             Operation::Delete(Collection::Pending, key) => {
                 self.pending.remove(key);
-                if !self.entries.contains_key(key) {
-                    self.retire_checkpoints(key);
-                }
             }
             Operation::Delete(Collection::Entries, key) => {
                 self.entries.remove(key);
-                if !self.pending.contains_key(key) {
-                    self.retire_checkpoints(key);
-                }
             }
             Operation::SetMetadata(generation, signature) => {
                 self.password_generation = *generation;
@@ -580,18 +573,7 @@ impl StateData {
         }
     }
 
-    fn retire_checkpoints(&mut self, owner: &str) {
-        let prefix = format!("checkpoint|{owner}\0");
-        let keys: Vec<_> = self
-            .runtime
-            .range(prefix.clone()..)
-            .take_while(|(key, _)| key.starts_with(&prefix))
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in keys {
-            self.runtime.remove(&key);
-        }
-    }
+
 }
 
 #[derive(Default, Serialize, Clone)]
@@ -650,15 +632,6 @@ impl NativeWatchOperations {
                     .map(|key| Operation::Delete(Collection::Entries, key))
                     .collect(),
             )),
-        }
-    }
-
-    pub(crate) fn checkpoint(owner: &str, output: &str, value: Option<Value>) -> Self {
-        Self {
-            operations: Arc::new(Operations(vec![Operation::Runtime(
-                format!("checkpoint|{}\0{}", path_key(owner), path_key(output)),
-                value,
-            )])),
         }
     }
 
@@ -1515,7 +1488,6 @@ fn decode_operation(operation: &Value) -> std::io::Result<Operation> {
                 .ok_or_else(|| invalid("runtime key missing"))?;
             if !key.starts_with("owned|")
                 && !key.starts_with("flatten|")
-                && !key.starts_with("checkpoint|")
             {
                 return Err(invalid("unknown runtime record"));
             }

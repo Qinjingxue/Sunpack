@@ -369,19 +369,7 @@ impl InputCheckpoint {
         changed || wrapper
     }
 
-    /// Apply the same publication path mapping as the output transaction.
-    pub(crate) fn rebase_flatten(&mut self, root: &Path, work: &Path, leaf: &Path) -> bool {
-        let changed = self.relocate(work, root);
-        self.relocate_flatten(leaf, root) || changed
-    }
-
     pub(crate) fn has_output(&self) -> bool { !self.output.as_os_str().is_empty() }
-
-    pub(crate) fn storage_key(&self) -> String {
-        if self.has_output() { return self.output.to_string_lossy().into_owned(); }
-        format!("input|{}|{:?}|{}|{}", path_key(&self.input.entry_path), self.input.mode,
-            self.input.format_hint, self.input.physical_extents().next().map_or(0, |extent| extent.start))
-    }
 
     pub(super) fn set_password_signature(&mut self, signature: impl FnOnce() -> String) {
         if let Some(receipt) = self.failure.as_mut().filter(|receipt| receipt.failure.is_password_retry()) {
@@ -396,7 +384,7 @@ impl InputCheckpoint {
 
     pub(super) fn promoted(&mut self, paths: &super::coordinator::PromotionPaths) -> io::Result<bool> {
         // Only physical sources are moved. Keep directory-prefix relocation in
-        // relocate/rebase_flatten, where it is actually required.
+        // relocate, where it is actually required.
         if !self.sources.iter().any(|source| paths.target(&source.path).is_some()) {
             return Ok(false);
         }

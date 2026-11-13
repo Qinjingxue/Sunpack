@@ -666,13 +666,12 @@ impl Drop for OutputReservationGuard {
 }
 
 impl OutputNames {
-    fn claim(&mut self, path: &Path, owner: u64, source: &Path) {
-        let key = output_key(path);
+    fn claim(&mut self, path: &Path, key: String, owner: u64, source: String) {
         if !self.claimed.contains_key(&key) {
             self.owners.entry(owner).or_default().push(key.clone());
         }
         self.claimed.insert(key, OutputClaim {
-            owner, source: resolved_key(source), path: path.to_owned(),
+            owner, source, path: path.to_owned(),
         });
     }
 
@@ -751,14 +750,12 @@ impl OutputNames {
             .is_some_and(|(path, _)| path.starts_with(&prefix))
     }
 
-    fn conflicting_ancestor(&self, path: &Path, owner: u64, input: Option<&Path>) -> Option<PathBuf> {
-        let parent = output_key(path.parent()?);
-        let input = input.map(output_key);
+    fn conflicting_ancestor(&self, parent: &str, owner: u64, input: Option<&str>) -> Option<PathBuf> {
         // Check root-first, so rerouting leaves every unrelated owning tree.
-        let ancestors: Vec<_> = crate::path_keys::path_ancestors(&parent).collect();
+        let ancestors: Vec<_> = crate::path_keys::path_ancestors(parent).collect();
         for ancestor in ancestors.into_iter().rev() {
             if let Some(claim) = self.claimed.get(ancestor) {
-                if claim.owner == owner && input.as_deref().is_some_and(|input| {
+                if claim.owner == owner && input.is_some_and(|input| {
                     input == ancestor || input.strip_prefix(ancestor).is_some_and(|tail| tail.starts_with('\\'))
                 }) {
                     continue;
@@ -771,17 +768,20 @@ impl OutputNames {
 
     fn retain(&mut self, path: &Path, owner: u64, source: &Path, input: Option<&Path>) -> bool {
         let key = output_key(path);
+        let source = resolved_key(source);
+        let input = input.map(output_key);
         // Several continued carrier segments share one container. Only the
         // same physical source in this request may reuse that exact claim.
         if self.claimed.get(&key).is_some_and(|claim| {
-            claim.owner == owner && claim.source == resolved_key(source)
+            claim.owner == owner && claim.source == source
         }) {
             return true;
         }
-        if self.conflicting_ancestor(path, owner, input).is_some() || self.has_under(&key) {
+        let parent = output_key(path.parent().unwrap_or(Path::new(".")));
+        if self.conflicting_ancestor(&parent, owner, input.as_deref()).is_some() || self.has_under(&key) {
             return false;
         }
-        self.claim(path, owner, source);
+        self.claim(path, key, owner, source);
         true
     }
 
@@ -789,12 +789,16 @@ impl OutputNames {
         registry: &Mutex<Self>, preferred: PathBuf, result: &ArchiveResult,
         observer: &impl Observer, owner: u64, input: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
+        let parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
+        let source = resolved_key(&result.path);
+        let input = input.map(output_key);
         loop {
-            let path = match registry.lock().unwrap().plan(preferred.clone(), result, owner, input)? {
-                Ok(path) => path,
+            let (path, claim_key) = match registry.lock().unwrap().plan_keys(
+                preferred.clone(), parent.clone(), owner, &source, input.as_deref(),
+            )? {
+                Ok(plan) => plan,
                 Err(failure) => return Ok(Err(failure)),
             };
-            let claim_key = output_key(&path);
             // The memory claim prevents peers selecting this tree. Creation
             // and durable publication have their own exclusive boundary and
             // must not block unrelated Engine name allocations.
@@ -806,7 +810,7 @@ impl OutputNames {
                         inner.is::<super::OutputCreateError>()
                     });
                     if creation_error && error.kind() == io::ErrorKind::AlreadyExists
-                        && fs::symlink_metadata(&path).is_ok()
+                        && path.try_exists().unwrap_or(false)
                     {
                         continue;
                     }
@@ -818,12 +822,21 @@ impl OutputNames {
     }
 
     fn plan(
-        &mut self, mut preferred: PathBuf, result: &ArchiveResult,
+        &mut self, preferred: PathBuf, result: &ArchiveResult,
         owner: u64, input: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
+        let parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
+        self.plan_keys(preferred, parent, owner, &resolved_key(&result.path),
+            input.map(output_key).as_deref()).map(|result| result.map(|(path, _)| path))
+    }
+
+    fn plan_keys(
+        &mut self, mut preferred: PathBuf, mut parent: String,
+        owner: u64, source: &str, input: Option<&str>,
+    ) -> io::Result<Result<(PathBuf, String), Failure>> {
         // A different request may own an ancestor even though this leaf does
         // not exist. Number that ancestor, preserving the mirrored suffix.
-        while let Some(ancestor) = self.conflicting_ancestor(&preferred, owner, input) {
+        while let Some(ancestor) = self.conflicting_ancestor(&parent, owner, input) {
             let (base, relative) = conflicting_output_base(
                 &preferred, &output_key(&preferred), &output_key(&ancestor),
             )?;
@@ -840,14 +853,17 @@ impl OutputNames {
                 index += 1;
             };
             preferred = replacement.join(relative);
+            parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
         }
-        let preferred_key = output_key(&preferred);
+        let candidate_key = |path: &Path| format!("{}\\{}", parent.trim_end_matches('\\'),
+            crate::path_keys::case_key(&path.file_name().unwrap().to_string_lossy()));
+        let preferred_key = candidate_key(&preferred);
         // Always recheck the preferred unnumbered name, as main does. The
         // history only accelerates numbered alternatives across requests.
         let mut index = 0;
         loop {
             let path = if index == 0 { preferred.clone() } else { numbered(&preferred, index) };
-            let candidate_key = output_key(&path);
+            let candidate_key = candidate_key(&path);
             if self.has_under(&candidate_key) {
                 self.observe_slot(&candidate_key, &preferred_key, index);
                 index = self.next_index(&preferred_key);
@@ -862,8 +878,8 @@ impl OutputNames {
             };
             if !exists {
                 self.observe_slot(&candidate_key, &preferred_key, index);
-                self.claim(&path, owner, &result.path);
-                return Ok(Ok(path));
+                self.claim(&path, candidate_key.clone(), owner, source.to_owned());
+                return Ok(Ok((path, candidate_key)));
             }
             index = self.next_index(&preferred_key);
         }
@@ -1663,6 +1679,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             .as_ref()
                             .is_some_and(|failure| failure.kind == FailureKind::MissingVolume)
                 }) {
+                    this.observer.notify(Event::ResolvingVolumes { id });
                     stage("missing_volume", cancel).await?;
                     if let Some(mut replacement) = discovery::retry_volume(
                         &executed.result,
@@ -1928,7 +1945,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 let commit_completed = !cancel.cancelled();
                 outputs_committed &= commit_completed || result.retained || result.output.is_none();
                 if commit_completed || result.retained {
-                    this.observer.commit_output(&result, checkpoint.as_ref())?;
+                    this.observer.after_output(&result)?;
                     // Cancellation after this durable commit must not roll it
                     // back. Match main's commit/check then retire ordering.
                     if commit_completed && !multi {
@@ -2006,7 +2023,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         .expect("carrier has a retained output");
                     let first = &mut completed[index];
                     let segment = first.output.replace(root.clone());
-                    let published = this.observer.commit_output(first, None);
+                    let published = this.observer.after_output(first);
                     first.output = segment;
                     published?;
                 }
@@ -2335,9 +2352,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 }
                 for checkpoint in &mut outcome.checkpoints {
-                    if checkpoint.promoted(&paths)? {
-                        self.observer.checkpoint(checkpoint)?;
-                    }
+                    checkpoint.promoted(&paths)?;
                 }
             }
             Err(error) if self.request.cancel.cancelled() => return Err(error),
@@ -2688,6 +2703,7 @@ impl<'run, O: Observer> Run<'run, O> {
             return Ok(Executed { planned_output: None, result, inventory: None, input: Arc::new(input) });
         }
         stage("preflight", &self.request.cancel).await?;
+        self.observer.notify(Event::Extracting { id });
         let output = if self.request.mode == Mode::Extract {
             let preferred = carrier.map_or_else(
                 || self.preferred_output(&input, depth),
@@ -3244,7 +3260,6 @@ fn flatten_result(
         }
         for checkpoint in &mut children.checkpoints {
             checkpoint.relocate_flatten(&old, &new);
-            observer.checkpoint(checkpoint)?;
         }
         let mut relocated_recoveries = HashMap::new();
         for child in &mut children.archives {
@@ -6307,7 +6322,20 @@ mod tests {
         assert_eq!(fs::read(preferred.join("user-file")).unwrap(), b"keep");
         assert_eq!(names.lock().unwrap().claimed.len(), 1);
         fs::remove_dir(output).unwrap();
-        fs::remove_dir_all(preferred).unwrap();
+        fs::remove_dir_all(&preferred).unwrap();
+        // A dangling directory entry is not a competing created directory.
+        // main's mkdir fails once; retrying it must not select the same name.
+        let target = source.with_extension("target");
+        fs::create_dir(&target).unwrap();
+        let junction = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"]).arg(&preferred).arg(&target).output().unwrap();
+        assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stdout));
+        fs::remove_dir(&target).unwrap();
+        let failure = OutputNames::reserve(&names, preferred.clone(), &result,
+            &|_: Event| {}, 2, None).unwrap().unwrap_err();
+        assert_eq!(failure.kind, FailureKind::FilesystemError);
+        assert!(!names.lock().unwrap().owners.contains_key(&2));
+        fs::remove_dir(&preferred).unwrap();
         fs::remove_file(source).unwrap();
     }
 

@@ -27,6 +27,15 @@ pub(super) struct Host {
     passwords: Mutex<Option<Arc<passwords::BuiltinStore>>>,
     idle: Mutex<Duration>,
     pub(super) watch: Arc<watch::Watch>,
+    sources: Mutex<SourceObservers>,
+}
+
+#[derive(Default)]
+struct SourceObservers {
+    paths: Vec<PathBuf>,
+    observers: Vec<watch::FileObserver>,
+    passwords: Arc<Mutex<Option<std::sync::Weak<passwords::BuiltinStore>>>>,
+    changed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Host {
@@ -41,6 +50,7 @@ impl Host {
             passwords: Mutex::default(),
             idle: Mutex::new(Duration::from_secs_f64(config::default_idle_seconds())),
             watch: Arc::new(watch::Watch::new(Arc::new(wake))),
+            sources: Mutex::default(),
         }
     }
 
@@ -77,7 +87,59 @@ impl Host {
         {
             *held = Some(Arc::clone(&source));
         }
+        let sources = self.sources.lock().unwrap();
+        let mut observed = sources.passwords.lock().unwrap();
+        if observed.as_ref().and_then(std::sync::Weak::upgrade)
+            .is_none_or(|previous| !Arc::ptr_eq(&previous, &source)) {
+            *observed = Some(Arc::downgrade(&source));
+            source.invalidate();
+        }
         Ok(source)
+    }
+
+    fn password_snapshot(&self, cwd: &Path) -> io::Result<Arc<passwords::PasswordSnapshot>> {
+        let store = self.passwords(cwd)?;
+        let sources = self.sources.lock().unwrap();
+        let observed = sources.paths.contains(&store.path().to_path_buf())
+            && !sources.observers.is_empty() && sources.observers.iter().all(watch::FileObserver::alive);
+        drop(sources);
+        Ok(if observed { store.observed_snapshot() } else { store.snapshot_for_request() })
+    }
+
+    fn generation(&self, cwd: &Path) -> config::ConfigRead {
+        let config_sources = config::resolve_sources(cwd);
+        let mut paths = config::watch_paths(cwd, &config_sources);
+        let password_path = resources::writable_data_dir(cwd).map(|dir| dir.join(passwords::FILENAME));
+        let Ok(password_path) = password_path else { return config::generation(cwd); };
+        paths.push(password_path.clone());
+        let mut sources = self.sources.lock().unwrap();
+        if sources.changed.swap(false, std::sync::atomic::Ordering::AcqRel)
+            || sources.paths != paths || sources.observers.iter().any(|observer| !observer.alive()) {
+            let passwords = Arc::clone(&sources.passwords);
+            let changed = Arc::clone(&sources.changed);
+            match watch::observe_files(&paths, &password_path, move |config, changed_passwords| {
+                if config {
+                    config::invalidate_sources();
+                    changed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if changed_passwords {
+                    if let Some(store) = passwords.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
+                        store.invalidate();
+                    }
+                }
+            }) {
+                Ok(observers) => {
+                    sources.observers = observers;
+                    sources.paths = paths;
+                    config::invalidate_sources();
+                    if let Some(store) = sources.passwords.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
+                        store.invalidate();
+                    }
+                }
+                Err(_) => return config::generation(cwd),
+            }
+        }
+        config::observed_generation(cwd)
     }
 }
 
@@ -671,7 +733,7 @@ pub(super) async fn run(
     // main's archive dispatch errors retain argv, but config/password handlers
     // catch their own failures and return an empty command-input envelope.
     let error_argv = (options.json && matches!(options.command, "scan" | "extract")).then_some(args);
-    let generation = config::generation(cwd);
+    let generation = host.generation(cwd);
     let language = generation.language();
     let execution = match options.command {
         "scan" | "extract" => match generation.normalized(true) {
@@ -721,7 +783,6 @@ pub(super) async fn run(
             line(session, Stream::Out, log)?;
         }
         if options.pause
-            && session.input_is_terminal()
             && code != 130
             && (options.command != "extract" || code != 0)
         {
@@ -1584,7 +1645,7 @@ async fn archives(
     let builtin = if options.no_builtins {
         None
     } else {
-        Some(host.passwords(cwd)?.snapshot_for_request())
+        Some(host.password_snapshot(cwd)?)
     };
     let clipboard = cli_clipboard(&settings);
     if cancel.cancelled() {
@@ -2394,7 +2455,7 @@ async fn show_passwords(
     let snapshot = if options.no_builtins {
         None
     } else {
-        Some(host.passwords(cwd)?.snapshot_for_request())
+        Some(host.password_snapshot(cwd)?)
     };
     let item = password_item(
         &user,
@@ -2899,7 +2960,6 @@ mod recursive_prompt_tests {
             Ok(self.answers.lock().unwrap().pop_front())
         }
         fn interactive(&self) -> bool { self.interactive }
-        fn input_is_terminal(&self) -> bool { false }
         fn unicode(&self) -> bool { !self.ascii }
         fn terminal_size(&self) -> (usize, usize) { (80, 25) }
     }

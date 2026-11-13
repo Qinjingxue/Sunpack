@@ -35,13 +35,14 @@ impl StateData {
                 }
             }
         }
-        // A suspended nested input can retain a verified checkpoint after its
-        // pending work was retired. Its output is still recovery-owned.
-        for (_, record) in self.runtime.range("checkpoint|".to_owned()..)
-            .take_while(|(key, _)| key.starts_with("checkpoint|"))
-        {
-            for path in crate::pipeline::InputCheckpoint::serialized_output_roots(record) {
-                roots.retain_root(path);
+        // Only failed inputs retain logical recovery after pending work ends.
+        for entry in self.entries.values() {
+            for record in entry.failure_payload.get("input_checkpoints")
+                .and_then(Value::as_array).into_iter().flatten()
+            {
+                for path in crate::pipeline::InputCheckpoint::serialized_output_roots(record) {
+                    roots.retain_root(path);
+                }
             }
         }
         roots
@@ -508,7 +509,14 @@ mod tests {
                 "sources":[],"output":checkpoint,"container":container,
                 "files":1,"bytes":1,"encrypted":false,"discovery_source":"embedded",
             })).unwrap();
-            data.runtime.insert("checkpoint|test".into(), serde_json::to_value(receipt).unwrap());
+            let entry = super::super::EntryRecord {
+                path: "test".into(), status: "failed_password".into(),
+                failure_payload: json!({"input_checkpoints":[receipt]}).as_object().unwrap().clone(),
+                size: 0, mtime: 0.0, file_id: String::new(), change_usn: 0,
+                last_error: String::new(), attempt_count: 1, failure_kind: String::new(),
+                failure_stage: String::new(), last_attempt_at: 0.0,
+            };
+            data.entries.insert("test".into(), Arc::new(entry));
             data.runtime.insert("flatten|test".into(), json!({"root":flatten}));
         }
         state.apply(&state.owned_retirement_operations(&[], Some(&[affected.to_string_lossy().into_owned()])));
@@ -527,7 +535,7 @@ mod tests {
         state.apply(&state.owned_retirement_operations(&[], None));
         assert!(has_owned(&state, &checkpoint));
         assert!(has_owned(&state, &container));
-        state.lock().runtime.remove("checkpoint|test");
+        state.lock().entries.remove("test");
         state.apply(&state.owned_retirement_operations(&[], None));
         assert!(!has_owned(&state, &checkpoint));
         assert!(!has_owned(&state, &container));
