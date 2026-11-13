@@ -1,5 +1,6 @@
 //! Real admission methods with a checkpoint-local barrier, not a simulated queue.
 use super::*;
+use crate::watch_store::PendingObservation;
 use std::os::windows::fs::OpenOptionsExt;
 use std::process::Command;
 
@@ -51,6 +52,7 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
             let settings = Arc::new(Config::default());
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let mut scheduler = Scheduler {
+                candidate_diagnostics: CandidateDiagnostics::default(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
                 roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
@@ -164,4 +166,81 @@ fn run_isolated(name: &str, child: &str) {
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     fs::remove_dir_all(base).unwrap();
     fs::remove_file(marker).unwrap();
+}
+
+#[test]
+fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
+    const CHILD: &str = "SUNPACK_SURVIVING_OUTPUT_RECOVERY_TEST";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
+        for source_present in [true, false] {
+            let directory = base.join(if source_present { "source" } else { "missing" });
+            let watched = directory.join("watched");
+            fs::create_dir_all(&watched).unwrap();
+            let source = watched.join("owner.zip");
+            fs::write(&source, b"outer archive").unwrap();
+            let root_id = key(&watched);
+            let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
+            let settings = Arc::new(Config::default());
+            let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
+            let mut scheduler = Scheduler {
+                admission_checkpoint: None,
+                candidate_diagnostics: CandidateDiagnostics::default(),
+                cwd: base.clone(), root_file: directory.join(ROOTS_FILE),
+                roots: BTreeMap::from([(root_id.clone(), (Root { path: watched.clone(), output: None,
+                    recursive: true, deep: false, scanned: true }, scope))]),
+                available_roots: HashSet::from([root_id.clone()]),
+                user_password_signature: user_password_signature(&settings.user_passwords),
+                settings, engine: Arc::new(Engine::new(base.join("unused-worker.exe"))),
+                catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)), journal,
+                options: Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap()),
+                deep_options: NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap(),
+                passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
+                root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+                parent_observers: HashMap::new(), config_observers: Vec::new(), config_sources: Default::default(),
+                pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+                active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+                tray: None, monitor: None, toast: None, cache_deadline: None,
+                external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+            };
+            let owner = source.to_str().unwrap();
+            let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
+            scheduler.journal.commit(true, |state| {
+                Ok(state.pending_operations(
+                    [(PendingObservation(owner.into(), candidate.size as i64, candidate.mtime,
+                        candidate.observation.file_id.clone(), candidate.observation.change_usn),
+                        watched.to_string_lossy().into_owned(), None)],
+                    false, watched.to_str().unwrap(), false, true, None,
+                )?.0)
+            }).unwrap();
+            let surviving = watched.join("surviving");
+            let missing = watched.join("missing");
+            for output in [&surviving, &missing] {
+                for keep in [None, Some(true)] {
+                    scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
+                        output.to_string_lossy().into_owned(), output.to_string_lossy().into_owned(),
+                        keep, None)?.unwrap())).unwrap();
+                }
+            }
+            let nested = surviving.join("unfinished.zip");
+            fs::write(&nested, b"nested archive").unwrap();
+            fs::remove_dir(&missing).unwrap();
+            if !source_present { fs::remove_file(&source).unwrap(); }
+            scheduler.recover_pending(None).unwrap();
+            assert!(scheduler.journal.state().pending(owner).is_some(), "owner intent must survive");
+            if source_present {
+                assert_eq!(scheduler.pending.len(), 2);
+                assert!(scheduler.pending.contains_key(&key(&source)));
+                assert!(scheduler.pending.contains_key(&key(&nested)));
+                assert!(scheduler.journal.state().pending(nested.to_str().unwrap()).is_some());
+            } else {
+                assert!(scheduler.pending.is_empty(), "unrebuildable owner must remain durable");
+            }
+        }
+        return;
+    }
+    run_isolated("recovery_scans_surviving_outputs_while_requeueing_missing_output_owner", CHILD);
 }

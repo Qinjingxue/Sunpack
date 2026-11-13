@@ -415,3 +415,18 @@ def test_main_cli_contracts_preserve_parent_flags_and_reject_abbreviations(packa
     assert "the following arguments are required: command" in abbreviated_help.stderr
     empty = package.json("passwords", "--no-bpw", "--pw-file=", "-p", "explicit")
     assert empty["items"][0]["user_passwords"] == ["explicit"]
+
+
+def test_standalone_watch_once_keeps_continuous_status(package, tmp_path):
+    # The existing once test has continuous Watch enabled. This covers the
+    # independent host status/generation contract without starting a service.
+    watched = tmp_path / "once-root"
+    watched.mkdir()
+    package.json("watch", "add", watched)
+    before = package.json("watch", "status")["summary"]
+    assert not before["running"]
+    assert package.json("watch", "start", "--once")["summary"]["exit_code"] == 0
+    after = package.json("watch", "status")["summary"]
+    assert not after["running"]
+    assert after["generation"] == before["generation"]
+    assert after["last_error"] == before["last_error"] == ""

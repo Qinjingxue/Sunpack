@@ -622,18 +622,19 @@ impl Drop for ActiveRequest {
 
 impl Server {
     fn submit(self: &Arc<Self>, pipe: OwnedHandle) -> crate::pipeline::RequestHandle<io::Result<()>> {
+        let connected = Instant::now();
         let activity = ActiveRequest::new(Arc::clone(self));
         let handler = Arc::clone(self);
         let cancel = Cancellation::new();
         let request = self.host.scheduler.submit(self.host.scheduler.next_id(), Origin::Foreground, &cancel.clone(),
-            move |spawner| Box::pin(async move { handler.request(pipe, spawner, cancel).await }));
+            move |spawner| Box::pin(async move { handler.request(pipe, spawner, cancel, connected).await }));
         // Connection lifetime includes output/control and CLI cleanup, like the
         // protocol's on_closed callback after its owned work finishes.
         request.on_ready(move || drop(activity));
         request
     }
 
-    async fn request(self: &Arc<Self>, pipe: OwnedHandle, spawner: crate::pipeline::scheduling::Spawner<'static>, cancel: Cancellation) -> io::Result<()> {
+    async fn request(self: &Arc<Self>, pipe: OwnedHandle, spawner: crate::pipeline::scheduling::Spawner<'static>, cancel: Cancellation, connected: Instant) -> io::Result<()> {
         let peer = self.io.bind(pipe, &self.shutdown)?;
         let header = Header::read(&peer, &self.build_id, &self.token).await?;
         let connection = Arc::new(Connection {
@@ -666,6 +667,9 @@ impl Server {
                 self.wake.signal();
                 return Ok(());
             }
+            let started = Instant::now();
+            let foreground = header.argv.first().is_none_or(|command| command != "--cancel-watch-batch");
+            if foreground { super::diagnostics::event("foreground_request_started", serde_json::json!({"origin":"foreground","command":header.argv.first(),"queue_ms":connected.elapsed().as_secs_f64()*1000.0})); }
             let session: Arc<dyn Session> = connection.clone();
             let result = cli::run(&self.host, &header.cwd, header.argv, session, cancel).await;
             let code = match result {
@@ -675,6 +679,7 @@ impl Server {
                     3
                 }
             };
+            if foreground { super::diagnostics::event("foreground_request_finished", serde_json::json!({"origin":"foreground","exit_code":code,"duration_ms":started.elapsed().as_secs_f64()*1000.0})); }
             connection.frame(0, &code.to_be_bytes()).await?;
             connection.output.drain().await
         }, control, output).await
@@ -712,6 +717,10 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         let wake = Arc::clone(&wake);
         move || wake.signal()
     });
+    let retention = config::load(cwd).map_or(7, |settings| settings.watch.event_log_retention_days);
+    let mut log_path = state_path(cwd, identity)?.into_os_string();
+    log_path.push(".events.json");
+    let log = super::diagnostics::Log::open(log_path.into(), retention, &host.watch)?;
     let server = Arc::new(Server {
         host,
         wake,
@@ -777,12 +786,23 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
             }
         }
     })();
+    let exit_reason = if result.is_err() { "error" } else if server.activity.lock().unwrap().shutting_down { "shutdown" } else { "idle" };
+    super::diagnostics::event("host_stopping", serde_json::json!({"foreground_requests":server.activity.lock().unwrap().active,"exit_reason":exit_reason}));
     server.shutdown.cancel();
-    let _ = server.host.watch.stop();
+    let stopping_watch = server.host.watch.is_running();
+    if stopping_watch { super::diagnostics::event("watch_stopping", serde_json::json!({})); }
+    let stopped_watch = server.host.watch.stop();
+    if stopping_watch {
+        if let Ok(summary) = stopped_watch {
+            super::diagnostics::event(if summary["stopped"] == true { "watch_stopped" } else { "watch_stop_ignored" }, summary);
+        }
+    }
     let _drained = server
         .drained
         .wait_while(server.activity.lock().unwrap(), |state| state.active != 0)
         .unwrap();
+    drop(_drained);
+    log.finish(exit_reason);
     result
 }
 

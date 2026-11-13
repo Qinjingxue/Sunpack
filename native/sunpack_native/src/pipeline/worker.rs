@@ -97,6 +97,7 @@ fn pump_stderr(mut pipe: impl Read, shared: &Shared) {
 
 #[derive(Default)]
 struct State {
+    pid: u32,
     jobs: HashMap<String, Job>,
     parked: VecDeque<(String, Arc<Mailbox>)>,
     ready: bool,
@@ -182,15 +183,26 @@ impl WriteCompletion {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct CommunicationError {
+    pub(super) kind: &'static str,
+    message: String,
+}
+impl std::fmt::Display for CommunicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+impl std::error::Error for CommunicationError {}
+
 #[derive(Clone)]
 struct WorkerExit {
+    failure_kind: &'static str,
     message: String,
     kind: io::ErrorKind,
 }
 
 impl WorkerExit {
     fn error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
+        io::Error::new(self.kind, CommunicationError { kind: self.failure_kind, message: self.message.clone() })
     }
 }
 
@@ -218,7 +230,7 @@ impl Job {
     }
 
     fn protocol_error(&mut self, error: io::Error) {
-        self.result = Some(Err(error));
+        self.result = Some(Err(io::Error::new(error.kind(), CommunicationError { kind: "process_io", message: error.to_string() })));
         self.accumulator.take();
         // Wake the existing submission waiter to use its ordered cancel write.
         // The result stays private until job_finished stops the native writer.
@@ -358,6 +370,8 @@ impl Process {
             .spawn(move || run_process(spawn, &owner_child, &owner))?;
         Ok(Self { owner: Some(owner), child, shared })
     }
+
+    pub(super) fn pid(&self) -> u32 { self.shared.state.lock().unwrap().pid }
 
     pub(super) fn thread_capacity(&self) -> usize {
         self.shared.state.lock().unwrap().thread_capacity.max(1)
@@ -661,6 +675,7 @@ fn run_process(
             return;
         }
     };
+    shared.state.lock().unwrap().pid = spawned.id();
     #[cfg(windows)]
     let _job = crate::core::process::KillOnCloseJob::attach(&spawned).ok();
     let input = spawned.stdin.take().expect("worker stdin is piped");
@@ -694,8 +709,7 @@ fn run_process(
         .name("sunpack-worker-stdin".into())
         .spawn(move || {
             dispatch_stdin(input, &owner, |error| {
-                stop_child(&owner_child);
-                owner.fail(error.to_string(), io::ErrorKind::BrokenPipe);
+                fail_stdin(&owner_child, &owner, error);
             });
         }) {
         Ok(writer) => writer,
@@ -720,12 +734,15 @@ fn run_process(
         .is_some_and(|code| matches!(code as u32, 0xc0000017 | 0xc000012d));
     // Release the child lock before publication; a failed write may be reaping too.
     drop(child_guard);
-    shared.fail(
-        result.err().map_or_else(
+    shared.fail_classified(
+        result.as_ref().err().map_or_else(
             || "sevenzip_worker exited before job completion".to_owned(),
             |error| format!("sevenzip_worker transport failed: {error}"),
         ),
         if out_of_memory { io::ErrorKind::OutOfMemory } else { io::ErrorKind::BrokenPipe },
+        // Main publishes process-level transport failure after wait(): the
+        // worker is gone. Job-local protocol errors remain process_io.
+        "worker_lost",
     );
     let _ = writer.join();
     if let Some(owner) = stderr_owner { let _ = owner.join(); }
@@ -825,6 +842,7 @@ impl Shared {
             if let Some(expected) = state.startup_command.take() {
                 if mode != Some(expected) {
                     state.abort_startup = Some(WorkerExit {
+                        failure_kind: "process_io",
                         message: "worker acknowledged a different process mode".into(),
                         kind: io::ErrorKind::InvalidData,
                     });
@@ -938,11 +956,15 @@ impl Shared {
     }
 
     fn fail(&self, message: String, kind: io::ErrorKind) {
+        self.fail_classified(message, kind, "process_io");
+    }
+
+    fn fail_classified(&self, message: String, kind: io::ErrorKind, failure_kind: &'static str) {
         let mut state = self.state.lock().unwrap();
         if state.closed.is_some() {
             return;
         }
-        let exit = state.abort_startup.take().unwrap_or(WorkerExit { message, kind });
+        let exit = state.abort_startup.take().unwrap_or(WorkerExit { message, kind, failure_kind });
         for (_, job) in state.jobs.drain() {
             job.mailbox
                 .update(|updates| updates.result = Some(Err(exit.error())));
@@ -969,7 +991,7 @@ impl State {
     fn abandon_startup(&mut self) {
         if !self.ready && self.closed.is_none() && self.abort_startup.is_none() {
             self.startup_abandoned = true;
-            self.abort_startup = Some(WorkerExit {
+            self.abort_startup = Some(WorkerExit { failure_kind: "process_io",
                 message: "worker startup abandoned".into(),
                 kind: io::ErrorKind::BrokenPipe,
             });
@@ -996,7 +1018,7 @@ impl State {
                         completion: Arc::new(WriteCompletion::default()),
                     });
                 }
-                Err(error) => self.abort_startup = Some(WorkerExit { message: error.to_string(), kind: error.kind() }),
+                Err(error) => self.abort_startup = Some(WorkerExit { failure_kind: "process_io", message: error.to_string(), kind: error.kind() }),
             }
         }
     }
@@ -1021,6 +1043,13 @@ fn stop_child(child: &Mutex<Option<Child>>) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+fn fail_stdin(child: &Mutex<Option<Child>>, shared: &Shared, error: &io::Error) {
+    // Reap before releasing admitted jobs, and preserve the same classification
+    // whichever pipe observes the dead worker first (main's abort/on_error).
+    stop_child(child);
+    shared.fail_classified(error.to_string(), io::ErrorKind::BrokenPipe, "worker_lost");
 }
 
 fn dispatch_stdin(mut input: impl Write, shared: &Shared, failed: impl FnOnce(&io::Error)) {
@@ -1125,8 +1154,7 @@ impl Process {
         let owner_child = Arc::clone(&child);
         let writer = thread::spawn(move || {
             dispatch_stdin(input, &owner, |error| {
-                stop_child(&owner_child);
-                owner.fail(error.to_string(), io::ErrorKind::BrokenPipe);
+                fail_stdin(&owner_child, &owner, error);
             });
         });
         shared.state.lock().unwrap().ready = true;
@@ -1496,6 +1524,35 @@ mod tests {
     }
 
     #[test]
+    fn stdin_first_worker_death_keeps_worker_lost() {
+        struct ClosedPipe;
+        impl Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::ErrorKind::BrokenPipe.into()) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        // This fixture owns a real, already-reaped child and only an stdin
+        // dispatcher, so stdout cannot win publication and hide the regression.
+        let process = Process::with_test_input(ClosedPipe);
+        let mailbox = register(&process.shared, "admitted");
+        let write = process.shared.send(Arc::new(vec![1]));
+        let error = write.wait_blocking().unwrap_err();
+        assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, "worker_lost");
+        let error = mailbox.updates.lock().unwrap().result.take().unwrap().err().unwrap();
+        assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, "worker_lost");
+        assert!(process.child.lock().unwrap().as_mut().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn communication_failures_keep_the_report_kind() {
+        for kind in ["worker_lost", "process_io"] {
+            let error = WorkerExit { message: "worker failed".into(), kind: io::ErrorKind::BrokenPipe, failure_kind: kind }.error();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "worker failed");
+            assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, kind);
+        }
+    }
+
+    #[test]
     fn job_protocol_errors_cancel_once_and_wait_for_native_completion() {
         for malformed in [
             // A frame boundary and job route survive a malformed event body.
@@ -1542,7 +1599,9 @@ mod tests {
             let Poll::Ready(result) = waiting.as_mut().poll(&mut cx) else {
                 panic!("job_finished did not deliver the protocol error");
             };
-            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData);
+            let error = result.err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, "process_io");
             drop(waiting);
             drop(process);
             let shutdown = encode_worker_frame(&json!({"worker_command": "shutdown"})).unwrap();

@@ -5,6 +5,8 @@ mod cli;
 #[cfg(windows)]
 mod doctor;
 #[cfg(windows)]
+mod diagnostics;
+#[cfg(windows)]
 mod failure;
 #[cfg(windows)]
 mod pipe;

@@ -1060,17 +1060,25 @@ impl PathRule {
                 "extensions",
                 "full_names",
             ],
-            "Unsupported path rule",
+            &format!("Unsupported {}", object.get("name").and_then(Value::as_str).unwrap_or("None")),
         )?;
         let parse = |key: &str| -> io::Result<Vec<RuleEntry>> {
             let Some(value) = object.get(key) else {
                 return Ok(Vec::new());
             };
-            let entries: Vec<RuleEntry> = Vec::deserialize(value)
-                .map_err(|error| invalid(format!("{key} must be a list of rule objects: {error}")))?;
-            if let Some(index) = entries.iter().position(|entry| entry.value.is_empty()) {
-                return Err(invalid(format!("{key}[{index}] requires a nonempty value string")));
-            }
+            let values = value.as_array()
+                .ok_or_else(|| invalid(format!("{key} must be a list of rule objects")))?;
+            let entries = values.iter().enumerate().map(|(index, value)| {
+                let entry: RuleEntry = RuleEntry::deserialize(value).map_err(|_| invalid(format!(
+                    "{key}[{index}] requires a nonempty value string and a regex boolean"
+                )))?;
+                if entry.value.is_empty() {
+                    return Err(invalid(format!(
+                        "{key}[{index}] requires a nonempty value string and a regex boolean"
+                    )));
+                }
+                Ok(entry)
+            }).collect::<io::Result<Vec<_>>>()?;
             Ok(entries)
         };
         Ok(Self { entries: [parse("paths")?, parse("files")?, parse("extensions")?, parse("full_names")?] })
@@ -1108,14 +1116,10 @@ impl ScanFilter {
         };
         let kind = match name {
             "blacklist" => {
-                ScanFilterKind::Blacklist(PathRule::parse(value).map_err(|error| {
-                    invalid(format!("filesystem.scan_filters[{index}]: {error}"))
-                })?)
+                ScanFilterKind::Blacklist(PathRule::parse(value)?)
             }
             "whitelist" => {
-                ScanFilterKind::Whitelist(PathRule::parse(value).map_err(|error| {
-                    invalid(format!("filesystem.scan_filters[{index}]: {error}"))
-                })?)
+                ScanFilterKind::Whitelist(PathRule::parse(value)?)
             }
             "size_range" => {
                 check_keys(
@@ -1151,7 +1155,7 @@ impl ScanFilter {
                             13 => *byte == b':', 16 => *byte == b'Z', _ => byte.is_ascii_digit(),
                         })
                     }).ok_or_else(|| invalid("Time bounds must be null or UTC minutes: YYYY-MM-DDTHH:mmZ"))?;
-                    utc_minute(text).map(Some).ok_or_else(|| invalid(format!("Invalid UTC minute: {text}")))
+                    utc_minute(text).map(Some).ok_or_else(|| invalid("Invalid UTC minute"))
                 };
                 let (start, end) = (parse_time("start_utc")?, parse_time("end_utc")?);
                 if start.zip(end).is_some_and(|(start, end)| start >= end) {
@@ -1243,6 +1247,24 @@ fn utc_minute(value: &str) -> Option<i128> {
 #[cfg(test)]
 mod filter_runtime_tests {
     use super::*;
+
+    #[test]
+    fn filter_validation_errors_match_public_main_messages() {
+        let cases = [
+            (serde_json::json!({"name":"mtime_range","start_utc":"2026-02-30T00:00Z"}), "Invalid UTC minute"),
+            (serde_json::json!({"name":"blacklist","unexpected":true}), "Unsupported blacklist fields: unexpected"),
+            (serde_json::json!({"name":"blacklist","paths":[{"value":"a","regex":1}]}), "paths[0] requires a nonempty value string and a regex boolean"),
+            (serde_json::json!({"name":"whitelist","paths":[{"value":"","regex":false}]}), "paths[0] requires a nonempty value string and a regex boolean"),
+            (serde_json::json!({"name":"blacklist","paths":null}), "paths must be a list of rule objects"),
+        ];
+        for (value, expected) in cases {
+            let error = match ScanFilter::parse(0, &value) {
+                Ok(_) => panic!("invalid filter accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 
     #[test]
     fn saved_output_mapping_participates_in_runtime_configuration() {

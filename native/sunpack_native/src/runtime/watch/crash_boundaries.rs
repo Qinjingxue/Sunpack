@@ -143,6 +143,7 @@ fn hard_death_recovers_partially_promoted_family_without_duplicate_admission() {
             let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
             let settings = Arc::new(Config::parse(&json!({})).unwrap());
             let mut scheduler = Scheduler {
+                candidate_diagnostics: CandidateDiagnostics::default(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: base.join(ROOTS_FILE),
                 roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,
@@ -294,6 +295,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
         let settings = Arc::new(Config::default());
             let mut scheduler = Scheduler {
+                candidate_diagnostics: CandidateDiagnostics::default(),
                 admission_checkpoint: None,
                 cwd: base.clone(), root_file: base.join(ROOTS_FILE),
                 roots: BTreeMap::from([(key(&watched), (Root { path: watched.clone(), output: None,

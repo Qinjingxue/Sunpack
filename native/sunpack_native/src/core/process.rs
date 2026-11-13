@@ -190,11 +190,11 @@ pub(crate) fn expire_foreground_override() -> io::Result<()> {
 pub(crate) struct ForegroundPriority;
 
 impl ForegroundPriority {
-    pub(crate) fn enter() -> Self {
+    pub(crate) fn enter() -> (Self, io::Result<()>) {
         let mut priority = PRIORITY.lock().unwrap_or_else(|error| error.into_inner());
         priority.enter_foreground();
-        let _ = apply_mode(priority.effective());
-        Self
+        let applied = apply_mode(priority.effective());
+        (Self, applied)
     }
 }
 

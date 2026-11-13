@@ -25,7 +25,6 @@ struct TaskRow {
     children: BTreeSet<TaskId>,
     label: String,
     carrier: bool,
-    retain_display: bool,
     phase: Phase,
     wait: ResourceWait,
     progress: Option<(u64, u64)>,
@@ -109,14 +108,6 @@ impl Panel {
             Event::Finalizing { .. } => return,
             Event::Finished { id, result, .. } => {
                 let status = result.status;
-                if status == TaskStatus::Skipped {
-                    let mut ancestor = Some(id);
-                    while let Some(id) = ancestor {
-                        let Some(task) = self.tasks.get_mut(&id) else { break; };
-                        task.retain_display = true;
-                        ancestor = task.parent;
-                    }
-                }
                 if let Some(task) = self.tasks.get_mut(&id) {
                     if status == TaskStatus::Complete { task.progress = Some((1, 1)); }
                     task.result = Some(result);
@@ -213,7 +204,6 @@ impl Panel {
                 label,
                 children: BTreeSet::new(),
                 carrier: false,
-                retain_display: false,
                 phase: Phase::Queued,
                 wait: ResourceWait::default(),
                 progress: None,
@@ -237,20 +227,8 @@ impl Panel {
         self.tasks.get(&id).is_some_and(|row| row.wait.disk && row.wait.disk_episode == episode)
     }
 
-    pub(super) fn scope_progress(&self, id: TaskId) -> HashMap<(PathBuf, Option<u64>), (u64, u64)> {
-        let mut progress = HashMap::new();
-        let mut pending = vec![id];
-        while let Some(id) = pending.pop() {
-            if let Some(row) = self.tasks.get(&id) {
-                pending.extend(row.children.iter().copied());
-                if !row.carrier {
-                    if let Some(value) = row.progress {
-                        progress.insert((row.path.clone(), row.offset), value);
-                    }
-                }
-            }
-        }
-        progress
+    pub(super) fn take_scope_output(&mut self, id: TaskId) -> Option<PathBuf> {
+        self.tasks.get_mut(&id)?.result.as_mut()?.output.take()
     }
 
     pub(super) fn remove(&mut self, id: TaskId) {
@@ -369,10 +347,6 @@ impl Panel {
             .write(session, &output)
             .is_ok()
             .then_some(Frame { size, rows });
-    }
-
-    pub(super) fn retains_scope(&self, id: TaskId) -> bool {
-        self.roots.contains(&id) && self.tasks.get(&id).is_some_and(|task| task.retain_display)
     }
 
     pub(super) fn write_scope(&self, id: TaskId, unicode: bool, language: Language, writer: &mut impl io::Write) -> io::Result<()> {
@@ -833,8 +807,6 @@ mod tests {
         panel.end_batch(&terminal, Language::En, true);
         assert!(!terminal.output.lock().unwrap().is_empty());
         assert_eq!(panel.frame.as_ref().unwrap().rows.len(), 10);
-        // Normal completed scopes keep the established ScopeReport path.
-        assert!(!panel.retains_scope(1));
     }
 
     #[test]

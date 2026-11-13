@@ -332,6 +332,10 @@ impl Engine {
         }
     }
 
+    pub(crate) fn worker_pid(&self) -> u32 {
+        self.worker.lock().unwrap().process.as_ref().map_or(0, |process| process.pid())
+    }
+
     pub(crate) fn set_process_mode(&self, mode: ProcessMode) -> io::Result<bool> {
         super::scheduling::block_on(self.set_process_mode_async(mode))
     }
@@ -400,7 +404,7 @@ struct Run<'a, O> {
     checkpoint_anchors: OnceLock<RecoveryAnchorIndex>,
     promoted_sources: HashMap<String, usize>,
     scan_errors: Mutex<DirectoryReadErrors>,
-    cleanup_tasks: Mutex<Vec<PendingCleanup>>,
+    cleanup_tasks: Mutex<CleanupTasks>,
 }
 
 #[derive(Default)]
@@ -462,6 +466,21 @@ struct RecursiveScope {
 enum RetryOutput<'a> {
     Recreate(&'a Path),
     Existing(&'a Path),
+}
+
+#[derive(Default)]
+struct CleanupTasks {
+    next_id: u64,
+    active: HashMap<u64, PendingCleanup>,
+    finished: Vec<super::scheduling::Join<Outcome>>,
+}
+
+impl CleanupTasks {
+    fn retire(&mut self, id: u64) {
+        if let Some(finished) = self.active.remove(&id) {
+            self.finished.push(finished.task);
+        }
+    }
 }
 
 struct PendingCleanup {
@@ -840,21 +859,27 @@ impl OutputNames {
             let (base, relative) = conflicting_output_base(
                 &preferred, &output_key(&preferred), &output_key(&ancestor),
             )?;
-            let mut index = 1;
-            let replacement = loop {
-                let candidate = numbered(base, index);
-                let exists = match candidate.try_exists() {
-                    Ok(exists) => exists,
-                    Err(error) => return Ok(Err(file_failure(error))),
-                };
-                if !exists && !self.has_under(&output_key(&candidate)) {
-                    break candidate;
-                }
-                index += 1;
+            let base_parent = output_key(base.parent().unwrap_or(Path::new(".")));
+            let replacement = match self.next_available(base, &base_parent)? {
+                Ok((path, _)) => path,
+                Err(failure) => return Ok(Err(failure)),
             };
             preferred = replacement.join(relative);
             parent = output_key(preferred.parent().unwrap_or(Path::new(".")));
         }
+        let (path, key) = match self.next_available(&preferred, &parent)? {
+            Ok(candidate) => candidate,
+            Err(failure) => return Ok(Err(failure)),
+        };
+        self.claim(&path, key.clone(), owner, source.to_owned());
+        Ok(Ok((path, key)))
+    }
+
+    // Both a leaf and a rebased ancestor use the same reservation-aware history.
+    // Ancestor slots are released by release_key's existing ancestor walk.
+    fn next_available(&mut self, preferred: &Path, parent: &str)
+        -> io::Result<Result<(PathBuf, String), Failure>>
+    {
         let candidate_key = |path: &Path| format!("{}\\{}", parent.trim_end_matches('\\'),
             crate::path_keys::case_key(&path.file_name().unwrap().to_string_lossy()));
         let preferred_key = candidate_key(&preferred);
@@ -862,7 +887,7 @@ impl OutputNames {
         // history only accelerates numbered alternatives across requests.
         let mut index = 0;
         loop {
-            let path = if index == 0 { preferred.clone() } else { numbered(&preferred, index) };
+            let path = if index == 0 { preferred.to_owned() } else { numbered(preferred, index) };
             let candidate_key = candidate_key(&path);
             if self.has_under(&candidate_key) {
                 self.observe_slot(&candidate_key, &preferred_key, index);
@@ -878,7 +903,6 @@ impl OutputNames {
             };
             if !exists {
                 self.observe_slot(&candidate_key, &preferred_key, index);
-                self.claim(&path, candidate_key.clone(), owner, source.to_owned());
                 return Ok(Ok((path, candidate_key)));
             }
             index = self.next_index(&preferred_key);
@@ -1115,17 +1139,16 @@ impl<'run, O: Observer> Run<'run, O> {
     async fn drain_cleanup(&self, root: Option<&Path>, outcome: &mut Outcome) {
         let pending = {
             let mut tasks = self.cleanup_tasks.lock().unwrap();
-            let mut selected = Vec::new();
-            let mut index = 0;
-            while index < tasks.len() {
-                if root.is_none_or(|root| tasks[index].paths.iter().any(|path| relative_to(path, root).is_some())) {
-                    selected.push(tasks.swap_remove(index));
-                } else { index += 1; }
-            }
+            let mut selected = std::mem::take(&mut tasks.finished);
+            let ids: Vec<_> = tasks.active.iter().filter_map(|(&id, task)| {
+                root.is_none_or(|root| task.paths.iter().any(|path| relative_to(path, root).is_some()))
+                    .then_some(id)
+            }).collect();
+            selected.extend(ids.into_iter().filter_map(|id| tasks.active.remove(&id)).map(|task| task.task));
             selected
         };
         for pending in pending {
-            let mut cleanup = pending.task.wait().await;
+            let mut cleanup = pending.wait().await;
             outcome.cleanup_results.append(&mut cleanup.cleanup_results);
             outcome.errors.append(&mut cleanup.errors);
         }
@@ -2145,23 +2168,30 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 dedup_paths(&mut deletes);
                 dedup_paths(&mut recycles);
-                let paths = deletes.iter().chain(&recycles).cloned().collect();
-                let cleanup = Arc::clone(&this);
-                let task = spawner.spawn(Box::pin(async move {
-                    // The family lease outlives its archive consumer, until the
-                    // background deletion/recycle has released its sources.
-                    let _lease = lease;
-                    let mut outcome = Outcome::default();
-                    if deletes.is_empty() && recycles.is_empty() { return outcome; }
-                    if stage("background_source_cleanup", &cleanup.request.cancel).await.is_err() {
-                        return outcome;
-                    }
-                    let mut shell = cleanup.engine.shell.branch();
-                    cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut outcome, &mut shell);
-                    cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut outcome, &mut shell);
-                    outcome
-                }));
-                this.cleanup_tasks.lock().unwrap().push(PendingCleanup { paths, task });
+                if deletes.is_empty() && recycles.is_empty() {
+                    drop(lease);
+                } else {
+                    let paths = deletes.iter().chain(&recycles).cloned().collect();
+                    let cleanup = Arc::clone(&this);
+                    // Register under the same lock used by completion retirement;
+                    // even an immediately completed task cannot leave a stale item.
+                    let mut tasks = this.cleanup_tasks.lock().unwrap();
+                    let id = tasks.next_id;
+                    tasks.next_id += 1;
+                    let task = spawner.spawn(Box::pin(async move {
+                        let _lease = lease;
+                        let mut outcome = Outcome::default();
+                        if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
+                            let mut shell = cleanup.engine.shell.branch();
+                            cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut outcome, &mut shell);
+                            cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut outcome, &mut shell);
+                        }
+                        let mut tasks = cleanup.cleanup_tasks.lock().unwrap();
+                        tasks.retire(id);
+                        outcome
+                    }));
+                    tasks.active.insert(id, PendingCleanup { paths, task });
+                }
             } else {
                 outcome.promoted_sources.extend(admitted_promoted.into_iter().map(|(_, source)| source));
                 drop(lease);
@@ -2203,7 +2233,15 @@ impl<'run, O: Observer> Run<'run, O> {
                         result.path.clone()
                     },
                     depth,
-                    result: super::TaskCompletion::from_group(&completed),
+                    result: {
+                        let mut completion = super::TaskCompletion::from_group(&completed);
+                        // A carrier's physical container is not derivable from
+                        // the surviving segment paths when only one succeeded.
+                        if multi && completion.output.is_some() {
+                            completion.output = carrier.clone();
+                        }
+                        completion
+                    },
                 });
             }
             outcome.archives.append(&mut completed.into());
@@ -2269,11 +2307,11 @@ impl<'run, O: Observer> Run<'run, O> {
                     .iter()
                     .map(|(_, target)| resolved_key(target))
                     .collect();
-                let _destinations = self
-                    .engine
-                    .leases
-                    .acquire(keys, &self.request.cancel)
-                    .await?;
+                let _destinations = match self.engine.leases
+                    .acquire_absent(keys, plan.moves(), &self.request.cancel).await {
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    result => result?,
+                };
                 stage("promotion", &self.request.cancel).await?;
                 let _promotion = Promotion::begin(sources.to_vec())?;
                 let (residual, removed, _, error, collision) = plan.execute(|| {
@@ -3045,8 +3083,16 @@ impl<'run, O: Observer> Run<'run, O> {
         } else if is_cancellation(&error) {
             Failure::new(FailureKind::Cancelled, "Operation interrupted")
         } else if worker {
-            Failure::new(FailureKind::ProcessError, error.to_string())
-                .with_context(super::FailureContext::Extraction)
+            {
+                let mut failure = Failure::new(FailureKind::ProcessError, error.to_string())
+                    .with_context(super::FailureContext::Extraction);
+                let evidence = failure.evidence.get_or_insert_with(Default::default);
+                evidence.native_kind = Some(error.get_ref()
+                    .and_then(|error| error.downcast_ref::<super::worker::CommunicationError>())
+                    .map_or("process_io", |error| error.kind).into());
+                evidence.stage = Some("worker_communication".into());
+                failure
+            }
         } else {
             file_failure(error)
         }
@@ -4165,12 +4211,33 @@ impl Leases {
         keys: HashSet<String>,
         cancel: &Cancellation,
     ) -> io::Result<Lease> {
+        self.acquire_absent(keys, &[], cancel).await
+    }
+
+    async fn acquire_absent(
+        self: &Arc<Self>,
+        keys: HashSet<String>,
+        absent: &[(PathBuf, PathBuf)],
+        cancel: &Cancellation,
+    ) -> io::Result<Lease> {
         let mut waiting = LeaseWait {
             owner: self,
             id: None,
         };
         let mut subscription = None;
         poll_fn(|cx| {
+            if !absent.is_empty() {
+                if let Err(error) = cancel.check_io() {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            for (_, path) in absent {
+                match path.try_exists() {
+                    Ok(false) => {},
+                    Ok(true) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::AlreadyExists, "promotion destination exists"))),
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+            }
             let mut state = self.state.lock().unwrap();
             if let Err(error) = cancel.check_io() {
                 return Poll::Ready(Err(error));
@@ -4306,6 +4373,44 @@ mod tests {
         assert!(state.blocked_by.is_empty());
         drop(state);
         drop(held);
+    }
+
+    #[test]
+    fn promotion_collision_does_not_wait_for_destination_lease() {
+        use std::future::Future;
+        use std::task::{Context, Wake};
+        struct Noop;
+        impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+        let leases = Arc::new(Leases::default());
+        let cancel = Cancellation::new();
+        let target = std::env::temp_dir().join(format!("sunpack-lease-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let keys = [resolved_key(&target)].into_iter().collect();
+        let held = super::super::scheduling::block_on(leases.acquire(keys, &cancel)).unwrap();
+        std::fs::write(&target, b"occupied").unwrap();
+        let moves = [(PathBuf::new(), target.clone())];
+        let keys = [resolved_key(&target)].into_iter().collect();
+        let mut pending = Box::pin(leases.acquire_absent(keys, &moves, &cancel));
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::AlreadyExists));
+        drop(pending);
+        std::fs::remove_file(&target).unwrap();
+
+        // A destination created while waiting must be rechecked after wake.
+        let keys = [resolved_key(&target)].into_iter().collect();
+        let mut pending = Box::pin(leases.acquire_absent(keys, &moves, &cancel));
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        std::fs::write(&target, b"occupied").unwrap();
+        drop(held);
+        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::AlreadyExists));
+        drop(pending);
+        let state = leases.state.lock().unwrap();
+        assert!(state.waiters.is_empty() && state.blocked_by.is_empty());
+        drop(state);
+        std::fs::remove_file(target).unwrap();
     }
 
     #[test]
@@ -4924,6 +5029,33 @@ mod tests {
             Some(output), None, 1, 1).is_some());
         release_reader_resources_under_roots(vec![source.to_string_lossy().into_owned()]).unwrap();
         fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn completed_cleanup_retires_paths_without_losing_results() {
+        let tasks = Arc::new(Mutex::new(CleanupTasks::default()));
+        Scheduler::new().run(1, Origin::Foreground, &Cancellation::new(), |spawner| {
+            let tasks = Arc::clone(&tasks);
+            Box::pin(async move {
+                for id in 0..32 {
+                    let completed = Arc::clone(&tasks);
+                    let mut pending = tasks.lock().unwrap();
+                    let task = spawner.spawn(Box::pin(async move {
+                        let mut outcome = Outcome::default();
+                        record_cleanup(&mut outcome, Path::new("source.zip"), "delete", Err(io::ErrorKind::PermissionDenied.into()));
+                        completed.lock().unwrap().retire(id);
+                        outcome
+                    }));
+                    pending.active.insert(id, PendingCleanup { paths: vec![PathBuf::from("source.zip")], task });
+                }
+            })
+        });
+        let mut tasks = tasks.lock().unwrap();
+        assert!(tasks.active.is_empty(), "completed paths must not remain in root-drain scans");
+        assert_eq!(tasks.finished.len(), 32);
+        for task in std::mem::take(&mut tasks.finished) {
+            assert_eq!(super::super::scheduling::block_on(task.wait()).cleanup_results.len(), 1);
+        }
     }
 
     fn test_run<'a, O: Observer>(
@@ -6252,6 +6384,31 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    // Covers history reuse on ancestor rebases and released descendant slots;
+    // the leaf-only allocator tests cannot exercise this ownership path.
+    #[test]
+    fn ancestor_rebases_share_number_history_and_reuse_released_slots() {
+        let source = crate::test_support::temp_file("ancestor_history", b"input");
+        let base = source.with_extension("output");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
+        let result = receipt(&input, DiscoverySource::Direct, 1);
+        let mut names = OutputNames::default();
+        assert_eq!(names.plan(base.clone(), &result, 1, None).unwrap().unwrap(), base);
+        for index in 1..=32 {
+            let wanted = base.join(format!("child-{index}"));
+            assert_eq!(names.plan(wanted, &result, index as u64 + 1, None).unwrap().unwrap(),
+                numbered(&base, index).join(format!("child-{index}")));
+        }
+        let family = output_key(&base);
+        assert_eq!(names.indices[&family].next, 33);
+        assert_eq!(names.indices[&family].observed.len(), 32);
+        names.release(2);
+        assert_eq!(names.plan(base.join("replacement"), &result, 99, None).unwrap().unwrap(),
+            numbered(&base, 1).join("replacement"));
+        assert_eq!(names.indices[&family].next, 33);
+        fs::remove_file(source).unwrap();
+    }
+
     #[test]
     fn conflicting_output_ancestor_preserves_alias_spelling() {
         for spelling in ["physical", "junction-alias"] {
@@ -6642,14 +6799,18 @@ mod tests {
                                     ContentRequirement::AllowPartial, ContentRequirement::Complete] {
                     Arc::make_mut(&mut request.config).extraction.content_requirement = requirement;
                     let outcome = {
-                        struct RetainedOnly;
+                        struct RetainedOnly(Mutex<Option<PathBuf>>);
                         impl Observer for RetainedOnly {
-                            fn notify(&self, _: Event) {}
+                            fn notify(&self, event: Event) {
+                                if let Event::Finished { id: 1, result, .. } = event {
+                                    *self.0.lock().unwrap() = result.output;
+                                }
+                            }
                             fn allow_recursive(&self, _: usize, _: usize) -> bool {
                                 panic!("retained output must not be scanned or prompt again");
                             }
                         }
-                        let observer = RetainedOnly;
+                        let observer = RetainedOnly(Mutex::new(None));
                         let mut run = test_run(&engine, &request, &observer);
                         for (index, checkpoint) in request.checkpoints.iter().enumerate() {
                             Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy()))).or_default().insert(checkpoint.key(), index);
@@ -6663,12 +6824,15 @@ mod tests {
                             source: DiscoverySource::Embedded, retry: None,
                             scope: None,
                         };
-                        run.recursion.serve(&request.cancel,
+                        let outcome = run.recursion.serve(&request.cancel,
                             |depth, pending| observer.allow_recursive(depth, pending),
                             || Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
                                 run.execute_task(task, 1, 1, None, spawner)
                             }),
-                        ).unwrap()
+                        ).unwrap();
+                        assert_eq!(observer.0.lock().unwrap().as_deref(), Some(container.as_path()),
+                            "one surviving segment must still report its physical carrier root");
+                        outcome
                     };
                     let accepted = requirement == ContentRequirement::AllowPartial
                         && matches!(kind, FailureKind::Damaged | FailureKind::MissingVolume)

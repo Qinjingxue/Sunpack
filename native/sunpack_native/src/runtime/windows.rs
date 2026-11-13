@@ -164,8 +164,10 @@ pub(super) fn foreground_active() -> bool {
 pub(super) fn maintain_when_foreground_idle(engine: &Engine, maintain: impl FnOnce()) {
     let _transition = crate::pipeline::block_on(PRIORITY_TRANSITION.lock());
     if !foreground_active() {
-        let _ = process::expire_foreground_override();
-        let _ = engine.set_process_mode(process::effective_mode());
+        let host = process::expire_foreground_override();
+        let mode = process::effective_mode();
+        let worker = engine.set_process_mode(mode);
+        super::diagnostics::qos(mode, engine.worker_pid(), &host, &worker);
         maintain();
     }
 }
@@ -193,8 +195,10 @@ pub(super) fn configure_priority(engine: &Engine, mode: ProcessMode) {
 
 pub(super) async fn configure_priority_async(engine: &Engine, mode: ProcessMode) {
     let _transition = PRIORITY_TRANSITION.lock().await;
-    let _ = process::configure_mode(mode);
-    let _ = engine.set_process_mode_async(process::effective_mode()).await;
+    let host = process::configure_mode(mode);
+    let mode = process::effective_mode();
+    let worker = engine.set_process_mode_async(mode).await;
+    super::diagnostics::qos(mode, engine.worker_pid(), &host, &worker);
 }
 
 pub(super) struct Foreground<'a> {
@@ -206,8 +210,10 @@ pub(super) struct Foreground<'a> {
 impl<'a> Foreground<'a> {
     pub(super) async fn enter_async(engine: &'a Engine, watch: &'a super::watch::Watch) -> Self {
         let _transition = PRIORITY_TRANSITION.lock().await;
-        let host = process::ForegroundPriority::enter();
-        let _ = engine.set_process_mode_async(process::effective_mode()).await;
+        let (host, applied) = process::ForegroundPriority::enter();
+        let mode = process::effective_mode();
+        let worker = engine.set_process_mode_async(mode).await;
+        super::diagnostics::qos(mode, engine.worker_pid(), &applied, &worker);
         Self { engine, watch, host: Some(host) }
     }
 
@@ -226,8 +232,10 @@ impl<'a> Foreground<'a> {
             if unwatched {
                 let _transition = PRIORITY_TRANSITION.lock().await;
                 if !foreground_active() {
-                    let _ = process::expire_foreground_override();
-                    let _ = self.engine.set_process_mode_async(process::effective_mode()).await;
+                    let host = process::expire_foreground_override();
+                    let mode = process::effective_mode();
+                    let worker = self.engine.set_process_mode_async(mode).await;
+                    super::diagnostics::qos(mode, self.engine.worker_pid(), &host, &worker);
                 }
             }
         }

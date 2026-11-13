@@ -59,6 +59,7 @@ impl Host {
     }
 
     pub(super) fn configure_idle(&self, settings: &Config) {
+        super::diagnostics::retention(settings.watch.event_log_retention_days);
         if let Some(idle) = settings
             .performance
             .persistent_server_idle_seconds
@@ -1104,7 +1105,6 @@ struct Progress {
     language: Language,
     display: Mutex<Display>,
     reporting: reporting::Reports,
-    branches: Mutex<HashMap<PathBuf, (PathBuf, u64, String)>>,
     prompt: bool,
     visible: bool,
     verbose: bool,
@@ -1133,6 +1133,7 @@ struct Display {
     panel: Option<live::Panel>,
     prompting: bool,
     deferred: Vec<u8>,
+    outputs: Vec<PathBuf>,
 }
 
 impl Progress {
@@ -1193,32 +1194,28 @@ impl Progress {
         }
         // Do not render the completion events only to immediately clear them.
         self.apply_events(&mut display, false);
-        // main flushes its existing task rows. In particular, skipped preflight
-        // segments are display facts, not synthetic successful ArchiveResults.
-        let retained_display = !archives.is_empty() && display.panel.as_ref().is_some_and(|panel| panel.retains_scope(id));
-        if retained_display {
-            // This path writes the retained task tree instead of ScopeReport,
-            // but the completed scope still owns and releases its branch links.
-            let mut branches = self.branches.lock().unwrap();
-            for archive in archives { branches.remove(&archive.path); }
-        }
-        let report = (!retained_display && !archives.is_empty()).then(|| {
-            let latest = display.panel.as_ref().map(|panel| panel.scope_progress(id)).unwrap_or_default();
-            ScopeReport::new(archives, self, latest)
-        });
-        if display.prompting {
-            let Display { panel, deferred, .. } = &mut *display;
-            if retained_display {
-                panel.as_ref().unwrap().write_scope(id, self.session.unicode(), self.language, deferred)?;
-            } else if let Some(report) = report { report.write(deferred)?; }
-        } else {
-            if let Some(panel) = &mut display.panel { panel.clear(self.session.as_ref())?; }
-            if retained_display || report.is_some() {
-                let mut writer = BufWriter::new(SessionWriter(self.session.as_ref()));
-                if retained_display {
-                    display.panel.as_ref().unwrap().write_scope(id, self.session.unicode(), self.language, &mut writer)?;
-                } else if let Some(report) = report { report.write(&mut writer)?; }
-                writer.flush()?;
+        // Completion events already carry authoritative policy and relocation
+        // results. Keep the same task tree for live and final output.
+        if !archives.is_empty() {
+            let Display { panel, deferred, outputs, prompting } = &mut *display;
+            if let Some(panel) = panel {
+                if *prompting {
+                    panel.write_scope(id, self.session.unicode(), self.language, deferred)?;
+                } else {
+                    panel.clear(self.session.as_ref())?;
+                    let mut writer = BufWriter::new(SessionWriter(self.session.as_ref()));
+                    panel.write_scope(id, self.session.unicode(), self.language, &mut writer)?;
+                    writer.flush()?;
+                }
+                // A directory kept for manual recovery is still a failed input.
+                // Only accepted root inputs authorize the summary output, as in
+                // main's success/has_retained_outputs check; verbose rows above
+                // continue to show the actual output even on failure.
+                if archives.iter().take_while(|archive| archive.depth == 1)
+                    .any(|archive| archive.failure.is_none() || archive.partial)
+                {
+                    if let Some(output) = panel.take_scope_output(id) { outputs.push(output); }
+                }
             }
         }
         if let Some(panel) = &mut display.panel { panel.remove(id); }
@@ -1242,15 +1239,6 @@ impl Observer for Progress {
     fn notify(&self, event: Event) {
         if self.visible && !self.cancel.cancelled() {
             self.reporting.notify(event);
-        }
-    }
-
-    fn archive_branch(&self, parent: &ArchiveResult, child: &ArchiveResult) {
-        if self.visible {
-            self.branches.lock().unwrap().insert(
-                child.path.clone(),
-                (parent.path.clone(), parent.offset, parent.format.clone()),
-            );
         }
     }
 
@@ -1338,181 +1326,6 @@ fn tree_edge(unicode: bool, last: bool) -> (&'static str, &'static str) {
         (true, false) => ("├─ ", "│  "),
         (false, true) => ("\\---", "    "),
         (false, false) => ("+---", "|   "),
-    }
-}
-
-struct ScopeReport<'a> {
-    progress: HashMap<(PathBuf, Option<u64>), (u64, u64)>,
-    archives: &'a [ArchiveResult],
-    unicode: bool,
-    language: Language,
-    verbose: bool,
-    groups: Vec<std::ops::Range<usize>>,
-    children: Vec<Vec<usize>>,
-    roots: Vec<usize>,
-}
-
-impl<'a> ScopeReport<'a> {
-    fn new(archives: &'a [ArchiveResult], progress: &Progress, latest: HashMap<(PathBuf, Option<u64>), (u64, u64)>) -> Self {
-        let mut report = Self {
-            progress: latest,
-            archives,
-            unicode: progress.session.unicode(),
-            language: progress.language,
-            verbose: progress.verbose,
-            groups: Vec::new(),
-            children: Vec::new(),
-            roots: Vec::new(),
-        };
-        if archives.len() == 1 {
-            return report;
-        }
-        let mut index = HashMap::new();
-        for (position, item) in archives.iter().enumerate() {
-            index.insert(
-                (item.path.as_path(), item.offset, item.format.as_str()),
-                position,
-            );
-            if let Some(original) = &item.promotion_original_path {
-                index.insert(
-                    (original.as_path(), item.offset, item.format.as_str()),
-                    position,
-                );
-            }
-        }
-        report.children.resize_with(archives.len(), Vec::new);
-        let mut branches = progress.branches.lock().unwrap();
-        let mut start = 0;
-        while let Some(item) = archives.get(start) {
-            let end = start
-                + archives[start..]
-                    .iter()
-                    .take_while(|next| next.path == item.path && next.depth == item.depth)
-                    .count();
-            let group = report.groups.len();
-            report.groups.push(start..end);
-            let parent = branches
-                .remove(&item.path)
-                .and_then(|(path, offset, format)| {
-                    index
-                        .get(&(path.as_path(), offset, format.as_str()))
-                        .copied()
-                });
-            if let Some(parent) = parent.filter(|&parent| archives[parent].depth < item.depth) {
-                report.children[parent].push(group);
-            } else {
-                report.roots.push(group);
-            }
-            start = end;
-        }
-        report
-    }
-
-    fn write(&self, writer: &mut impl Write) -> io::Result<()> {
-        enum Visit {
-            Group(usize, Option<bool>),
-            Segment(usize, usize, bool),
-            Archive(usize, bool),
-            Restore(usize),
-        }
-        let mut prefix = String::new();
-        let mut pending = Vec::new();
-        if self.archives.len() == 1 {
-            Self::title(writer, "", "", &Self::name(&self.archives[0]))?;
-            pending.push(Visit::Archive(0, false));
-        } else {
-            pending.extend(self.roots.iter().rev().map(|&root| Visit::Group(root, None)));
-        }
-        while let Some(visit) = pending.pop() {
-            match visit {
-                Visit::Restore(len) => prefix.truncate(len),
-                Visit::Group(group, last) => {
-                    let range = self.groups[group].clone();
-                    let (edge, continuation) = last.map_or(("", ""), |last| tree_edge(self.unicode, last));
-                    Self::title(writer, &prefix, edge, &Self::name(&self.archives[range.start]))?;
-                    pending.push(Visit::Restore(prefix.len()));
-                    prefix.push_str(continuation);
-                    if range.len() == 1 {
-                        pending.push(Visit::Archive(range.start, false));
-                    } else {
-                        let result = crate::pipeline::TaskCompletion::from_group(&self.archives[range.clone()]);
-                        if result.status == TaskStatus::Failed {
-                            let status = live::status_text(self.language.text(task_status_key(result.status)), None, "", None);
-                            writeln!(writer, "{prefix}  {status}")?;
-                            if let Some(detail) = task_detail(result.status, result.failure.as_ref(), None, false, self.verbose, self.language) {
-                                Self::title(writer, &prefix, "  ", &detail)?;
-                            }
-                        }
-                        let end = range.end;
-                        for (number, position) in range.enumerate().rev() {
-                            pending.push(Visit::Segment(position, number + 1, position + 1 == end));
-                        }
-                    }
-                }
-                Visit::Segment(position, number, last) => {
-                    let item = &self.archives[position];
-                    let label = self.language.translate("cli.scan.segment", &[("index", &number.to_string())]);
-                    let label = format!("{label} ({}) [{}, {})", item.format, item.offset, end_offset(item));
-                    let (edge, continuation) = tree_edge(self.unicode, last);
-                    Self::title(writer, &prefix, edge, &label)?;
-                    pending.push(Visit::Restore(prefix.len()));
-                    prefix.push_str(continuation);
-                    pending.push(Visit::Archive(position, true));
-                }
-                Visit::Archive(position, segment) => {
-                    self.status(writer, position, &prefix, segment)?;
-                    if let Some(children) = self.children.get(position) {
-                        for (index, &child) in children.iter().enumerate().rev() {
-                            pending.push(Visit::Group(child, Some(index + 1 == children.len())));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn name(archive: &ArchiveResult) -> Cow<'_, str> {
-        archive
-            .path
-            .file_name()
-            .unwrap_or(archive.path.as_os_str())
-            .to_string_lossy()
-    }
-
-    fn title(writer: &mut impl Write, prefix: &str, edge: &str, label: &str) -> io::Result<()> {
-        let label = single_line(label);
-        writeln!(writer, "{prefix}{edge}{label}")
-    }
-
-    fn status(
-        &self,
-        writer: &mut impl Write,
-        position: usize,
-        prefix: &str,
-        segment: bool,
-    ) -> io::Result<()> {
-        let item = &self.archives[position];
-        let status = task_status_key(TaskStatus::of(item));
-        let last = if item.partial || item.failure.is_some() {
-            [&item.path].into_iter().chain(item.promotion_original_path.iter()).find_map(|path| {
-                self.progress.get(&(path.clone(), Some(item.offset)))
-                    .or_else(|| self.progress.get(&(path.clone(), None))).copied()
-            })
-        } else { Some((1, 1)) };
-        let status = live::status_text(self.language.text(status), last, "", None);
-        writeln!(writer, "{prefix}  {status}")?;
-        if let Some(detail) = task_detail(TaskStatus::of(item), item.failure.as_ref(), None, segment, self.verbose, self.language) {
-            Self::title(writer, prefix, "  ", &detail)?;
-        }
-        if let Some(output) = item.output.as_ref().filter(|_| self.verbose) {
-            let detail = self.language.translate(
-                "report.detail.output",
-                &[("output", &output.to_string_lossy())],
-            );
-            Self::title(writer, prefix, "  ", &detail)?;
-        }
-        Ok(())
     }
 }
 
@@ -1695,7 +1508,6 @@ async fn archives(
         language,
         display: Mutex::default(),
         reporting: reporting::Reports::default(),
-        branches: Mutex::default(),
         prompt: settings.recursive_extract == Recursion::Prompt,
         visible: !options.json && !scan,
         verbose: options.verbose,
@@ -1714,8 +1526,8 @@ async fn archives(
     let mut cleanup = ReceiptOrder::new();
     let mut checkpoints = Vec::new();
     let mut promoted_sources = Vec::new();
-    let began = Instant::now();
     loop {
+        let began = Instant::now();
         let mut request = Request::new(
             std::mem::take(&mut candidate_paths),
             if scan { Mode::Scan } else { Mode::Extract },
@@ -1794,6 +1606,10 @@ async fn archives(
                 "recovered_outputs": counts.recovered, "wrong_password_failure": current.archives.iter().any(password_failure),
                 "failures": failures,
             }));
+        }
+        if !options.json {
+            let outputs = std::mem::take(&mut progress.display.lock().unwrap().outputs);
+            report_extract_round(&current, &outputs, began.elapsed().as_secs(), session, language)?;
         }
         checkpoints = current.checkpoints;
         promoted_sources = current.promoted_sources;
@@ -1903,129 +1719,146 @@ async fn archives(
             !options.no_builtins,
         ));
     } else {
-        line(session, Stream::Out, &format!("\n{}", "-".repeat(54)))?;
-        let elapsed = began.elapsed().as_secs();
-        let seconds = (elapsed % 60).to_string();
-        let duration = if elapsed >= 60 {
-            language.translate(
-                "duration.minutes_seconds",
-                &[
-                    ("minutes", &(elapsed / 60).to_string()),
-                    ("seconds", &seconds),
-                ],
-            )
-        } else {
-            language.translate("duration.seconds", &[("seconds", &seconds)])
-        };
-        line(
-            session,
-            Stream::Out,
-            &language.translate("report.time", &[("duration", &duration)]),
-        )?;
-        line(
-            session,
-            Stream::Out,
-            &language.translate(
-                "report.counts",
-                &[
-                    ("complete", &counts.success.to_string()),
-                    ("partial", &counts.partial.to_string()),
-                    ("failed", &failed.to_string()),
-                    ("scan_errors", &scan_errors.to_string()),
-                    ("input_errors", &input_errors.to_string()),
-                ],
-            ),
-        )?;
-        if counts.nested != 0 {
-            line(
-                session,
-                Stream::Out,
-                &language.translate(
-                    "report.recursion",
-                    &[
-                        ("levels", &counts.depth.to_string()),
-                        ("count", &counts.nested.to_string()),
-                    ],
-                ),
-            )?;
-        }
-        let mut outputs = all_archives
-            .values()
-            .flat_map(|receipt| &receipt.entries)
-            .filter(|item| item.depth == 1 && (item.failure.is_none() || item.partial))
-            .filter_map(|item| item.output.as_deref())
-            .peekable();
-        if outputs.peek().is_some() {
-            let location = crate::pipeline::common_ancestor(outputs);
-            let display = location.as_deref().map_or_else(
-                || Cow::Borrowed(language.text("report.multiple_locations")),
-                Path::to_string_lossy,
-            );
-            line(
-                session,
-                Stream::Out,
-                &language.translate("report.output", &[("output", &display)]),
-            )?;
-        }
-        for recovery in &counts.recovered {
-            let archive = recovery["archive"].as_str().unwrap_or_default();
-            let name = Path::new(archive)
-                .file_name()
-                .unwrap_or(std::ffi::OsStr::new(archive))
-                .to_string_lossy();
-            let complete = recovery["complete_files"]
-                .as_u64()
-                .unwrap_or_default()
-                .to_string();
-            line(
-                session,
-                Stream::Out,
-                &language.translate(
-                    "report.partial",
-                    &[("archive", &name), ("complete_files", &complete)],
-                ),
-            )?;
-            if let Some(warning) = recovery["warning"]["message"].as_str() {
-                line(
-                    session,
-                    Stream::Out,
-                    &language.translate("report.partial_warning", &[("warning", warning)]),
-                )?;
-            }
-        }
-        result.emit_errors(session)?;
-        if counts.partial > 0 && result.errors.is_empty() {
-            line(
-                session,
-                Stream::Out,
-                language.text("report.partial_complete"),
-            )?;
-        }
-        let cleanup_failures = cleanup
-            .values()
-            .filter(|receipt| receipt.status == CleanupStatus::Failed)
-            .count();
-        if cleanup_failures > 0 {
-            let message = language.translate(
-                "cleanup.incomplete",
-                &[("count", &cleanup_failures.to_string())],
-            );
-            line(
-                session,
-                Stream::Err,
-                &language.translate("report.postprocess_warning", &[("message", &message)]),
-            )?;
-            for receipt in cleanup.values().filter(|receipt| receipt.status == CleanupStatus::Failed) {
-                line(session, Stream::Err, &format!("  {}: {}", receipt.path.display(), receipt.message))?;
-            }
-        }
-        line(session, Stream::Out, &"-".repeat(54))?;
+        // Every round has already emitted its errors before the retry prompt.
+        result.emitted_errors = result.errors.len();
     }
     Ok((i32::from(!result.errors.is_empty()), result))
     };
     let result = settle_unwind(execution).await;
     foreground.finish_async().await;
     match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) }
+}
+
+fn report_extract_round(
+    current: &Outcome, outputs: &[PathBuf], elapsed: u64,
+    session: &dyn Session, language: Language,
+) -> io::Result<()> {
+    let counts = ArchiveSummary::collect(&current.archives, language, false);
+    let scan_errors = current.errors.iter()
+        .filter(|error| error.kind == InputErrorKind::FilesystemScan)
+        .map(InputError::count).sum::<usize>();
+    let input_errors = current.errors.iter()
+        .filter(|error| error.kind == InputErrorKind::InvalidInput).count() + counts.input_errors;
+    let failed = counts.failed + current.errors.iter()
+        .filter(|error| error.kind == InputErrorKind::EmbeddedDiscovery).count();
+    let mut errors: Vec<_> = current.errors.iter()
+        .filter(|error| matches!(error.kind, InputErrorKind::FilesystemScan | InputErrorKind::EmbeddedDiscovery))
+        .chain(current.errors.iter().filter(|error| error.kind == InputErrorKind::InvalidInput))
+        .map(|error| input_error_message(error, language, false)).collect();
+    errors.extend(counts.errors);
+    if scan_errors != 0 { errors.push(language.text("report.scan_incomplete").into()); }
+    line(session, Stream::Out, &format!("\n{}", "-".repeat(54)))?;
+    let seconds = (elapsed % 60).to_string();
+    let duration = if elapsed >= 60 {
+        language.translate(
+            "duration.minutes_seconds",
+            &[
+                ("minutes", &(elapsed / 60).to_string()),
+                ("seconds", &seconds),
+            ],
+        )
+    } else {
+        language.translate("duration.seconds", &[("seconds", &seconds)])
+    };
+    line(
+        session,
+        Stream::Out,
+        &language.translate("report.time", &[("duration", &duration)]),
+    )?;
+    line(
+        session,
+        Stream::Out,
+        &language.translate(
+            "report.counts",
+            &[
+                ("complete", &counts.success.to_string()),
+                ("partial", &counts.partial.to_string()),
+                ("failed", &failed.to_string()),
+                ("scan_errors", &scan_errors.to_string()),
+                ("input_errors", &input_errors.to_string()),
+            ],
+        ),
+    )?;
+    if counts.nested != 0 {
+        line(
+            session,
+            Stream::Out,
+            &language.translate(
+                "report.recursion",
+                &[
+                    ("levels", &counts.depth.to_string()),
+                    ("count", &counts.nested.to_string()),
+                ],
+            ),
+        )?;
+    }
+    let mut outputs = outputs.iter().peekable();
+    if outputs.peek().is_some() {
+        let location = crate::pipeline::common_ancestor(outputs);
+        let display = location.as_deref().map_or_else(
+            || Cow::Borrowed(language.text("report.multiple_locations")),
+            Path::to_string_lossy,
+        );
+        line(
+            session,
+            Stream::Out,
+            &language.translate("report.output", &[("output", &display)]),
+        )?;
+    }
+    for recovery in &counts.recovered {
+        let archive = recovery["archive"].as_str().unwrap_or_default();
+        let name = Path::new(archive)
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new(archive))
+            .to_string_lossy();
+        let complete = recovery["complete_files"]
+            .as_u64()
+            .unwrap_or_default()
+            .to_string();
+        line(
+            session,
+            Stream::Out,
+            &language.translate(
+                "report.partial",
+                &[("archive", &name), ("complete_files", &complete)],
+            ),
+        )?;
+        if let Some(warning) = recovery["warning"]["message"].as_str() {
+            line(
+                session,
+                Stream::Out,
+                &language.translate("report.partial_warning", &[("warning", warning)]),
+            )?;
+        }
+    }
+    for error in &errors { line(session, Stream::Err, error)?; }
+    if counts.partial > 0 && errors.is_empty() {
+        line(
+            session,
+            Stream::Out,
+            language.text("report.partial_complete"),
+        )?;
+    }
+    let cleanup_failures = current.cleanup_results
+        .iter()
+        .filter(|receipt| receipt.status == CleanupStatus::Failed)
+        .count();
+    if cleanup_failures > 0 {
+        let message = language.translate(
+            "cleanup.incomplete",
+            &[("count", &cleanup_failures.to_string())],
+        );
+        line(
+            session,
+            Stream::Err,
+            &language.translate("report.postprocess_warning", &[("message", &message)]),
+        )?;
+        for receipt in current.cleanup_results.iter().filter(|receipt| receipt.status == CleanupStatus::Failed) {
+            line(session, Stream::Err, &format!("  {}: {}", receipt.path.display(), receipt.message))?;
+        }
+    }
+    line(session, Stream::Out, &"-".repeat(54))?;
+    Ok(())
 }
 
 fn report_scan(
@@ -2798,6 +2631,22 @@ async fn watch_command(
         }
         _ => unreachable!(),
     }
+    let event = match options.action.as_str() {
+        "start" if options.once => None,
+        "start" => Some(if result.summary["started"] == true { "watch_started" } else { "watch_start_reused" }),
+        "stop" => Some(if result.summary["stopped"] == true { "watch_stopped" } else { "watch_stop_ignored" }),
+        "reload" => Some(if result.summary["running"] != true { "watch_reload_ignored" } else if result.summary["reloaded"] == true { "watch_reloaded" } else { "watch_reload_skipped" }),
+        "add" => Some(if result.summary["apply"].is_null() { "watch_roots_add_ignored" } else { "watch_roots_added" }),
+        "remove" => Some(if result.summary["apply"].is_null() { "watch_roots_remove_ignored" } else { "watch_roots_removed" }),
+        _ => None,
+    };
+    if let Some(event) = event {
+        let payload = if matches!(options.action.as_str(), "add" | "remove") {
+            if result.summary["apply"].is_null() { json!({"paths":result.inputs["paths"]}) }
+            else { result.summary["apply"].clone() }
+        } else { result.summary.clone() };
+        super::diagnostics::event(event, payload);
+    }
     Ok((code, result))
 }
 
@@ -2986,7 +2835,7 @@ mod recursive_prompt_tests {
                     session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
                     cancel: Cancellation::new(), language,
                     display: Mutex::default(), reporting: reporting::Reports::default(),
-                    branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+                    prompt: false, visible: true, verbose: false,
                 };
                 progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), depth: 1, segment: None });
                 progress.notify(Event::ResourceWait {
@@ -3032,7 +2881,7 @@ mod recursive_prompt_tests {
                 session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
                 cancel: Cancellation::new(), language,
                 display: Mutex::default(), reporting: reporting::Reports::default(),
-                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+                prompt: false, visible: true, verbose: false,
             };
             progress.notify(Event::Queued { id: 1, parent: None, path: "input.zip".into(), depth: 1, segment: None });
             let emit = |state| progress.notify(Event::ResourceWait { id: 1, path: "input.zip".into(), state });
@@ -3165,7 +3014,7 @@ mod recursive_prompt_tests {
                 session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
                 cancel: Cancellation::new(), language: Language::En,
                 display: Mutex::default(), reporting: reporting::Reports::default(),
-                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+                prompt: false, visible: true, verbose: false,
             };
             assert!(matches!(progress.worker_updates(), crate::pipeline::WorkerUpdates::All));
             progress.notify(Event::Queued { id: 7, parent: None, path: "embedded.bin".into(), depth: 1, segment: None });
@@ -3218,18 +3067,33 @@ mod recursive_prompt_tests {
                 session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
                 cancel: Cancellation::new(), language: Language::En,
                 display: Mutex::default(), reporting: reporting::Reports::default(),
-                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+                prompt: false, visible: true, verbose: false,
             };
             let mut archives = vec![
                 report_archive("carrier.bin", 10), report_archive("carrier.bin", 20),
                 report_archive("child.zip", 0), report_archive("other.zip", 0),
             ];
             archives[2].depth = 2;
-            progress.archive_branch(&archives[0], &archives[2]);
             archives[1].failure = Some(crate::pipeline::Failure::new(FailureKind::Damaged, "damage"));
-            let report = ScopeReport::new(&archives, &progress, HashMap::new());
-            let mut bytes = Vec::new();
-            report.write(&mut bytes).unwrap();
+            for (id, parent, position, segment) in [
+                (1, None, 0, None),
+                (2, Some(1), 0, Some(1)),
+                (3, Some(1), 1, Some(2)),
+                (4, Some(2), 2, None),
+                (5, None, 3, None),
+            ] {
+                let archive = &archives[position];
+                progress.notify(Event::Queued { id, parent, path: archive.path.clone(), depth: archive.depth,
+                    segment: segment.map(|index| crate::pipeline::Segment {
+                        index, count: 2, offset: archive.offset, end_offset: archive.end_offset, format: archive.format.clone(),
+                    }) });
+                progress.notify(Event::Finished { id, path: archive.path.clone(), depth: archive.depth,
+                    result: if id == 1 { crate::pipeline::TaskCompletion::from_group(&archives[..2]) }
+                        else { crate::pipeline::TaskCompletion::from_result(archive) } });
+            }
+            progress.finish_scope(1, &archives[..3]).unwrap();
+            progress.finish_scope(5, &archives[3..]).unwrap();
+            let bytes = std::mem::take(&mut *input.stdout.lock().unwrap());
             let text = String::from_utf8(bytes).unwrap();
             let error = Language::En.text("report.status.error");
             assert!(text.starts_with(&format!("carrier.bin\n  [{error}]")), "{text}");
@@ -3256,6 +3120,73 @@ mod recursive_prompt_tests {
                 assert!(text.lines().any(|line| line == format!("{continuation}  {format}")), "{text}");
             }
         }
+    }
+
+    // One output fact has two uses: verbose recovery detail and accepted top-level
+    // summary location. Failed rescue bytes must not acquire success semantics.
+    #[test]
+    fn summary_output_requires_an_accepted_root_input_but_verbose_keeps_failure_output() {
+        for (accepted_sibling, accepted_partial) in [(false, false), (true, false), (false, true)] {
+            let session = Arc::new(Input::default());
+            let progress = Progress {
+                session: session.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+                cancel: Cancellation::new(), language: Language::En,
+                display: Mutex::default(), reporting: reporting::Reports::default(),
+                prompt: false, visible: true, verbose: true,
+            };
+            let mut failed = report_archive("carrier.bin", 0);
+            failed.failure = Some(crate::pipeline::Failure::new(
+                if accepted_partial { FailureKind::Damaged } else { FailureKind::Unsupported }, "failure"));
+            failed.output = Some(PathBuf::from("rescued-output"));
+            failed.partial = accepted_partial;
+            let mut archives = vec![failed];
+            if accepted_sibling { archives.push(report_archive("carrier.bin", 100)); }
+            // A complete recursive descendant does not authorize its failed root.
+            let mut nested = report_archive("nested.zip", 0);
+            nested.depth = 2;
+            archives.push(nested);
+            let mut completion = crate::pipeline::TaskCompletion::from_group(&archives[..archives.len() - 1]);
+            completion.output = Some(PathBuf::from("rescued-output"));
+            progress.notify(Event::Queued { id: 1, parent: None, path: "carrier.bin".into(), depth: 1, segment: None });
+            progress.notify(Event::Finished { id: 1, path: "carrier.bin".into(), depth: 1, result: completion });
+            progress.finish_scope(1, &archives).unwrap();
+            assert!(String::from_utf8(session.stdout.lock().unwrap().clone()).unwrap().contains("rescued-output"));
+            let display = progress.display.lock().unwrap();
+            assert_eq!(display.outputs.len(), usize::from(accepted_sibling || accepted_partial));
+        }
+    }
+
+    // Rendering two completions separately protects the retry round boundary:
+    // counts and durations must not inherit a preceding attempt or prompt time.
+    #[test]
+    fn extract_round_summaries_keep_counts_times_and_cleanup_local() {
+        let input = Input::default();
+        let mut first = Outcome::default();
+        first.archives.push(report_archive("good.zip", 0));
+        let mut blocked = report_archive("locked.zip", 0);
+        blocked.failure = Some(crate::pipeline::Failure::new(FailureKind::WrongPassword, "wrong"));
+        first.archives.push(blocked);
+        first.cleanup_results.push(crate::pipeline::CleanupResult {
+            path: "good.zip".into(), mode: "delete", status: CleanupStatus::Failed,
+            error_code: 5, message: "locked".into(),
+        });
+        report_extract_round(&first, &[PathBuf::from("carrier-output")], 1, &input, Language::En).unwrap();
+        line(&input, Stream::Out, Language::En.text("cli.password_retry_prompt")).unwrap();
+        let mut second = Outcome::default();
+        second.archives.push(report_archive("locked.zip", 0));
+        report_extract_round(&second, &[], 2, &input, Language::En).unwrap();
+        let text = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
+        let prompt = text.find(Language::En.text("cli.password_retry_prompt")).unwrap();
+        for (elapsed, failed, slice) in [("1", "1", &text[..prompt]), ("2", "0", &text[prompt..])] {
+            let duration = Language::En.translate("duration.seconds", &[("seconds", elapsed)]);
+            assert!(slice.contains(&Language::En.translate("report.time", &[("duration", &duration)])), "{slice}");
+            assert!(slice.contains(&Language::En.translate("report.counts", &[
+                ("complete", "1"), ("partial", "0"), ("failed", failed), ("scan_errors", "0"), ("input_errors", "0"),
+            ])), "{slice}");
+        }
+        assert!(text[..prompt].contains("good.zip: locked"));
+        assert!(!text[prompt..].contains("good.zip: locked"));
+        assert!(text[..prompt].contains("carrier-output"));
     }
 
     #[test]
@@ -3335,15 +3266,15 @@ mod recursive_prompt_tests {
     fn deeply_nested_final_tree_uses_an_explicit_traversal_stack() {
         std::thread::Builder::new().stack_size(128 * 1024).spawn(|| {
             let count = 2048;
-            let archives: Vec<_> = (0..count).map(|i| report_archive(&format!("{i}.zip"), 0)).collect();
-            let report = ScopeReport {
-                progress: HashMap::new(), archives: &archives, unicode: true,
-                language: Language::En, verbose: false,
-                groups: (0..count).map(|i| i..i + 1).collect(),
-                children: (0..count).map(|i| if i + 1 < count { vec![i + 1] } else { vec![] }).collect(),
-                roots: vec![0],
-            };
-            report.write(&mut io::sink()).unwrap();
+            let mut panel = live::Panel::new(false);
+            let session = Input::default();
+            for id in 1..=count {
+                panel.update(&session, Language::En, Event::Queued {
+                    id, parent: (id > 1).then_some(id - 1), path: format!("{id}.zip").into(),
+                    depth: id as usize, segment: None,
+                }, true);
+            }
+            panel.write_scope(1, true, Language::En, &mut io::sink()).unwrap();
         }).unwrap().join().unwrap();
     }
 
@@ -3354,7 +3285,7 @@ mod recursive_prompt_tests {
             session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
             cancel: Cancellation::new(), language: Language::En,
             display: Mutex::default(), reporting: reporting::Reports::default(),
-            branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+            prompt: false, visible: true, verbose: false,
         };
         progress.notify(Event::Queued { id: 7, parent: None, path: "test.zip".into(), depth: 1, segment: None });
         progress.finish_scope(7, &[]).unwrap();
@@ -3364,33 +3295,33 @@ mod recursive_prompt_tests {
     }
 
     #[test]
-    fn retained_skipped_scope_releases_only_its_branch_links() {
+    fn completed_scope_releases_only_its_panel_tree() {
         for prompting in [false, true] {
             let session = Arc::new(Input::default());
             let progress = Progress {
                 session, watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
                 cancel: Cancellation::new(), language: Language::En,
                 display: Mutex::default(), reporting: reporting::Reports::default(),
-                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+                prompt: false, visible: true, verbose: false,
             };
             progress.display.lock().unwrap().prompting = prompting;
             let parent = report_archive("parent.zip", 0);
             let mut child = report_archive("child.zip", 0);
             child.depth = 2;
             let other = report_archive("other.zip", 0);
-            progress.archive_branch(&parent, &child);
-            progress.archive_branch(&parent, &other);
+            progress.notify(Event::Queued { id: 3, parent: None, path: other.path.clone(), depth: 1, segment: None });
             progress.notify(Event::Queued { id: 1, parent: None, path: parent.path.clone(), depth: 1, segment: None });
             progress.notify(Event::Queued { id: 2, parent: Some(1), path: child.path.clone(), depth: 2, segment: None });
             progress.notify(Event::Finished { id: 2, path: child.path.clone(), depth: 2,
                 result: crate::pipeline::TaskCompletion { discovery: None, status: TaskStatus::Skipped,
                     failure: None, output: None } });
             progress.finish_scope(1, &[parent, child]).unwrap();
-            let branches = progress.branches.lock().unwrap();
-            assert_eq!(branches.len(), 1);
-            assert!(branches.contains_key(&other.path));
             let display = progress.display.lock().unwrap();
-            assert!(!display.panel.as_ref().unwrap().retains_scope(1));
+            let mut bytes = Vec::new();
+            display.panel.as_ref().unwrap().write_scope(1, true, Language::En, &mut bytes).unwrap();
+            assert!(bytes.is_empty());
+            display.panel.as_ref().unwrap().write_scope(3, true, Language::En, &mut bytes).unwrap();
+            assert!(String::from_utf8(bytes).unwrap().contains("other.zip"));
         }
     }
 
@@ -3429,7 +3360,7 @@ mod recursive_prompt_tests {
         let progress = Progress {
             session: input.clone(), watch, cancel, language: Language::En,
             display: Mutex::default(), reporting: reporting::Reports::default(),
-            branches: Mutex::default(), prompt: true, visible: false, verbose: false,
+            prompt: true, visible: false, verbose: false,
         };
         assert!(crate::pipeline::block_on(progress.allow_recursive_async(2, 1)));
         assert!(!crate::pipeline::block_on(progress.allow_recursive_async(3, 1)));
