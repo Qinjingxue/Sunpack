@@ -120,6 +120,11 @@ impl Activity {
     pub(super) fn sample_count(&self) -> usize {
         self.0.state.lock().unwrap().quiet.samples.as_ref().map_or(0, |samples| samples.len())
     }
+
+    #[cfg(test)]
+    pub(super) fn observed_size(&self) -> Option<u64> {
+        self.0.state.lock().unwrap().baseline.as_ref().map(|baseline| baseline.0)
+    }
     pub(super) fn deadline(&self) -> Option<Instant> { self.0.state.lock().unwrap().due }
     pub(super) fn summary(&self) -> (f64, Option<f64>, f64, f64) {
         let state = self.0.state.lock().unwrap();

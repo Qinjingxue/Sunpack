@@ -111,7 +111,6 @@ function Invoke-TestStep {
         [AllowEmptyString()]
         [string[]]$Command,
         [int]$TimeoutSeconds = $StepTimeoutSeconds,
-        [switch]$QuietOutput,
         [switch]$KeepElevationIfAdministrator,
         [switch]$RequireExecutedTests
     )
@@ -131,11 +130,7 @@ function Invoke-TestStep {
     $stdoutPath = $null
     $stderrPath = $null
     $retainOutput = $false
-
-    if ($QuietOutput) {
-        $stdoutPath = [System.IO.Path]::GetTempFileName()
-        $stderrPath = [System.IO.Path]::GetTempFileName()
-    }
+    $showOutput = $VerboseOutput.IsPresent
 
     if ($Command.Length -ge 3 -and $Command[1] -eq "-m" -and $Command[2] -eq "pytest") {
         $junitReportPath = Join-Path ([System.IO.Path]::GetTempPath()) (
@@ -180,15 +175,18 @@ function Invoke-TestStep {
 
     $process = $null
     try {
+        if (-not $retainOutput) {
+            $stdoutPath = [System.IO.Path]::GetTempFileName()
+            $stderrPath = [System.IO.Path]::GetTempFileName()
+        }
+        # Native children bypass the PowerShell streams captured by the UAC relaunch.
         $startProcessArgs = @{
             FilePath = $runnerExecutable
             ArgumentList = @($runnerArguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument $_ })
             NoNewWindow = $true
             PassThru = $true
-        }
-        if ($QuietOutput) {
-            $startProcessArgs.RedirectStandardOutput = $stdoutPath
-            $startProcessArgs.RedirectStandardError = $stderrPath
+            RedirectStandardOutput = $stdoutPath
+            RedirectStandardError = $stderrPath
         }
         $process = Start-Process @startProcessArgs
 
@@ -204,6 +202,7 @@ function Invoke-TestStep {
 
         $timeoutMs = [Math]::Max(1, $TimeoutSeconds) * 1000
         if (-not $process.WaitForExit($timeoutMs)) {
+            $showOutput = $true
             $terminated = $false
             try {
                 # taskkill follows detached descendants that Process.Kill($true) can miss.
@@ -287,8 +286,10 @@ function Invoke-TestStep {
 
         Write-Host ("    FAIL ({0:N2}s)" -f $duration) -ForegroundColor Red
         Write-Host ("    Command: " + $joinedCommand) -ForegroundColor DarkGray
+        $showOutput = $true
         return
     } catch {
+        $showOutput = $true
         $duration = ((Get-Date) - $startTime).TotalSeconds
         $script:StepResults += [pscustomobject]@{
             Label = $Label
@@ -308,9 +309,10 @@ function Invoke-TestStep {
         }
         foreach ($outputPath in @($stdoutPath, $stderrPath)) {
             if ($outputPath -and (Test-Path -LiteralPath $outputPath)) {
-                if ($retainOutput) {
+                if ($showOutput -or $retainOutput) {
                     Get-Content -LiteralPath $outputPath -Encoding UTF8 | ForEach-Object { Write-Host $_ }
-                } else {
+                }
+                if (-not $retainOutput) {
                     Remove-Item -LiteralPath $outputPath -Force
                 }
             }
@@ -559,7 +561,7 @@ try {
     # Use the optimized CI profile for the harness, even when the public CLI
     # and its fixtures below are tested from the release build.
     Invoke-TestStep -Label "Rust correctness tests" -Command @(
-        "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
+        "cargo", "test", "--quiet", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
         "--workspace", "--profile", "ci", "--target", $target,
         "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
     )

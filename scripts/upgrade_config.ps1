@@ -41,8 +41,7 @@ function Assert-PrivateDirectory([string]$Directory) {
     }
 }
 
-# This script owns config migration and the pre-1.4 runtime-data reset.
-# A missing marker never triggers a reset.
+# This script owns config migration and the managed-data reset.
 $dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
 Assert-PlainPath $dataDirectory
 Assert-PrivateDirectory $dataDirectory
@@ -52,9 +51,9 @@ if ($versionText -match '^(\d+\.\d+\.\d+(?:\.\d+)?)(?:-[0-9A-Za-z.-]+)?$') {
     [void][Version]::TryParse($Matches[1], [ref]$version)
 }
 if ($null -eq $version) {
-    if ((Test-Path -LiteralPath $dataDirectory) -and
-        @(Get-ChildItem -LiteralPath $dataDirectory -Force).Count -gt 0) {
-        throw "Unknown installed version '$PreviousVersion'; refusing to reset existing SunPack data."
+    if (Test-Path -LiteralPath $dataDirectory) {
+        Assert-PlainTree $dataDirectory
+        Remove-Item -LiteralPath $dataDirectory -Recurse -Force
     }
     exit 0
 }

@@ -6407,7 +6407,7 @@ mod tests {
     }
 
     #[test]
-    fn native_burst_learns_before_scheduler_drains_its_coalesced_signal() {
+    fn native_burst_updates_activity_before_scheduler_drains_its_coalesced_signal() {
         use std::io::Write;
         use std::time::Duration;
         let marker = crate::test_support::temp_file("watch_capture", b"");
@@ -6424,21 +6424,18 @@ mod tests {
         let observer = RootObserver::start(&watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]),
             &watched.join("builtin_passwords.json"), &hub, &journal, &catalog).unwrap();
         let mut file = fs::File::create(&source).unwrap();
-        // Keep the writer open: these are content samples, not CLOSE epochs.
-        for _ in 0..4 {
-            let last = activity.summary().1;
+        // Wait for each size to reach the shared activity without draining the
+        // scheduler's signals. Cadence confirmation is tested with a controlled clock.
+        for size in 1..=4 {
             file.write_all(b"x").unwrap();
             file.flush().unwrap();
             file.sync_data().unwrap();
-            let limit = Instant::now() + Duration::from_secs(5);
-            while activity.summary().1 == last && Instant::now() < limit {
-                thread::sleep(Duration::from_millis(5));
-            }
-            assert_ne!(activity.summary().1, last);
-            thread::sleep(Duration::from_millis(100));
+            let signals = hub.signals.lock().unwrap();
+            let (_signals, wait) = hub.wake.wait_timeout_while(signals, Duration::from_secs(5), |signals| {
+                !signals.activities.contains_key(&source) || activity.observed_size() != Some(size)
+            }).unwrap();
+            assert!(!wait.timed_out(), "observer did not publish size {size}");
         }
-        assert!(activity.summary().2 > 0.0);
-        assert!(activity.sample_count() >= 2);
         let deadline = activity.deadline().unwrap();
         // No scheduler tick has run, so all wakes still occupy one path slot.
         let signals = std::mem::take(&mut *hub.signals.lock().unwrap());

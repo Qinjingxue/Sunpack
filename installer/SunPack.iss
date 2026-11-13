@@ -786,6 +786,8 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  UserConfigPath: string;
 begin
   ApplyStartupTaskDefault;
   { PrepareToInstall can be retried after Watch has already been stopped. }
@@ -806,12 +808,14 @@ begin
   end;
   if not UpgradePrepared then
   begin
-    InitializeLanguageOnInstall := not FileExists(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
+    UserConfigPath := ExpandConstant('{commonappdata}\SunPack\sunpack_config.json');
+    InitializeLanguageOnInstall := not FileExists(UserConfigPath);
     if not UpgradeConfigurationFields then
     begin
       Result := CustomMessage('PrepareDataUpgradeFailed');
       Exit;
     end;
+    InitializeLanguageOnInstall := InitializeLanguageOnInstall or not FileExists(UserConfigPath);
     UpgradePrepared := True;
   end;
   if not RemoveMachinePath(ExistingApplicationDirectory) then

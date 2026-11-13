@@ -88,12 +88,10 @@ def test_pre_140_upgrade_retains_user_inputs_and_retires_state(tmp_path, repo_ro
 
 
 def test_version_gate_and_failed_preflight_leave_all_data_untouched(tmp_path, repo_root):
-    # No runtime test can detect a destructive unknown-version guess, a current
-    # install repair, or mutation before JSON/reparse preflight. One matrix
-    # covers these distinct entry conditions without separate fine-grained tests.
+    # Exercise current repairs and failed JSON/reparse preflight on disk.
     for index, (version, broken, success) in enumerate([
         ("1.4.0", False, True), ("v1.4.0-2-gabcdef0", True, False),
-        ("1.10.0", False, True), ("", False, False), ("invalid", False, False),
+        ("1.10.0", False, True),
         ("1.3.5", True, False),
     ]):
         data = tmp_path / str(index)

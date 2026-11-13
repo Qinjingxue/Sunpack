@@ -98,7 +98,10 @@ begin
     if StopStage <> 2 then RaiseException('Installed before runtime/broker stop');
     if ExpandConstant('{{param:AddPath|1}}') = '1' then
       if not AddMachinePath then RaiseException('Cannot add PATH');
-    SaveStringToFile(ExpandConstant('{{param:Fixture}}\\completed'), 'ok', False);
+    if InitializeLanguageOnInstall then
+      SaveStringToFile(ExpandConstant('{{param:Fixture}}\\completed'), 'initialize language', False)
+    else
+      SaveStringToFile(ExpandConstant('{{param:Fixture}}\\completed'), 'ok', False);
   end;
 end;
 """, encoding="utf-8-sig")
@@ -113,11 +116,11 @@ end;
         f"/DIR={fresh / 'app'}", f"/Fixture={fresh}", f"/Data={fresh / 'data'}", "/AddPath=0", f"/LOG={log}",
     ], capture_output=True, text=True)
     assert result.returncode == 0, log.read_text(encoding="utf-8-sig", errors="replace")
-    assert (fresh / "completed").is_file()
+    assert (fresh / "completed").read_text() == "initialize language"
 
     cases = [("v1.2.9", True, False), ("v1.3.0", True, False),
              ("v1.3.5-2-gabcdef0", True, False), ("1.4.0", False, False),
-             ("1.10.0", False, False), (None, False, True), ("invalid", False, True),
+             ("1.10.0", False, False), (None, False, False), ("invalid", False, False),
              ("1.3.5", True, True)]
     try:
         for index, (version, migrate, failure) in enumerate(cases):
@@ -170,12 +173,18 @@ end;
                     assert (fixture / name).read_bytes() == content
             else:
                 assert result.returncode == 0, log.read_text(encoding="utf-8-sig", errors="replace")
-                assert (fixture / "completed").is_file()
+                reset = version in (None, "invalid")
+                assert (fixture / "completed").read_text() == ("initialize language" if reset else "ok")
                 assert not installed.exists()
                 assert not (app / "unrelated.txt").exists()
                 assert (app / "sunpack_advanced_config.json").read_bytes() == (
                     repo_root / "sunpack_advanced_config.json").read_bytes()
-                if migrate:
+                if reset:
+                    assert {p.name for p in data.iterdir()} == {"sunpack_config.json", "builtin_passwords.json"}
+                    for name in ("sunpack_config.json", "builtin_passwords.json"):
+                        assert (data / name).read_bytes() == (repo_root / name).read_bytes()
+                    assert (custom / "state.snapshot").read_bytes() == b"old state"
+                elif migrate:
                     updated = json.loads((data / "sunpack_config.json").read_text(encoding="utf-8-sig"))
                     assert updated["cli"]["language"] == "en"
                     assert updated["watch"]["tray_enabled"] is False
