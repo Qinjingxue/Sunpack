@@ -110,6 +110,14 @@ impl Reports {
         }
     }
 
+    pub(crate) fn relocate_outputs(&self, old: &std::path::Path, new: &std::path::Path) {
+        for (_, event) in self.state.lock().unwrap().events.values_mut() {
+            if let Event::Finished { result, .. } = event {
+                result.relocate_output(old, new);
+            }
+        }
+    }
+
     pub(crate) fn take_events(&self) -> Vec<Event> {
         let mut events: Vec<_> = self.state.lock().unwrap().events.drain().map(|(_, event)| event).collect();
         events.sort_unstable_by_key(|(sequence, _)| *sequence);

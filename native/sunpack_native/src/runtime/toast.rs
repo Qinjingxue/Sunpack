@@ -1660,7 +1660,7 @@ mod tests {
             id: 2,
             path: "carrier".into(),
             depth: 1,
-            success: true,
+            result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None },
         });
         let snapshot = current(&publisher);
         assert_eq!(snapshot.status, "0/2 finished");
@@ -1777,7 +1777,7 @@ mod tests {
         let activity = publisher.register(Arc::from("42"), Language::En);
         activity.event(queued(1, "a.zip", None, 0));
         progress(&activity, 1, "a.zip", 1, 2);
-        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: false });
+        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
         let mut outcome = Outcome::default();
         outcome.archives.push(archive("a.zip", Some(FailureKind::Damaged)));
         activity.root_finished(1, &outcome);
@@ -1801,7 +1801,7 @@ mod tests {
         progress(&activity, 1, "a.zip", 1, 2);
         let mut outcome = Outcome::default();
         outcome.archives.push(archive("a.zip", None));
-        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: true });
+        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
         activity.root_finished(1, &outcome);
         activity.report_finished(1, false);
         finish_debounce(&publisher);
@@ -1822,7 +1822,7 @@ mod tests {
                 activity.event(queued(id, path, None, 0));
                 progress(&activity, id, path, 1, 2);
             }
-            activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: true });
+            activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
             assert_eq!(current(&publisher).status, "0/3 finished");
             let mut done = Outcome::default();
             done.archives.push(archive("a.zip", None));
@@ -1843,7 +1843,7 @@ mod tests {
             assert_eq!(current(&publisher).status, "1/3 finished");
             let mut failed = Outcome::default();
             failed.archives.push(archive("c.zip", Some(FailureKind::Damaged)));
-            activity.event(Event::Finished { id: 3, path: "c.zip".into(), depth: 1, success: false });
+            activity.event(Event::Finished { id: 3, path: "c.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Failed, failure: None, output: None } });
             activity.root_finished(3, &failed);
             activity.record_root(3, Path::new("c.zip"), &failed);
             activity.report_finished(3, false);
@@ -1884,7 +1884,7 @@ mod tests {
         assert_eq!(current(&publisher).label, "3 archives");
         // A root can finish before later descendants are queued. Retain its
         // scalar ancestry until the native request itself has completed.
-        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, success: true });
+        activity.event(Event::Finished { id: 1, path: "a.zip".into(), depth: 1, result: crate::pipeline::TaskCompletion { status: crate::pipeline::TaskStatus::Complete, failure: None, output: None } });
         activity.event(queued(5, "a/nested.zip", Some(1), 1));
         progress(&activity, 5, "a/nested.zip", 1, 2);
         assert_eq!(current(&publisher).status, "0/3 finished");

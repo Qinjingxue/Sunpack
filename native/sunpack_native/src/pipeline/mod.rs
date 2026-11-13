@@ -421,6 +421,55 @@ impl Outcome {
             .is_some_and(|failure| failure.kind == FailureKind::Cancelled))
     }
 
+    /// After the physical root's publication and relocation are finished, keep
+    /// main's physical task summary rather than every successful segment. Scan
+    /// and durable observers consume the detailed results before this boundary.
+    fn compact_completed_extract(&mut self) {
+        if !self.settled() { return; }
+        // A blocked descendant needs its ancestors and successful siblings on
+        // the next attempt. Release receipts only when this entire root is done.
+        if !self.scan_incomplete && self.errors.is_empty()
+            && self.archives.iter().all(|archive| archive.failure.is_none())
+        {
+            self.checkpoints = Vec::new();
+            self.promoted_sources = Vec::new();
+        }
+        self.removed_promotion_dirs = Vec::new();
+        let mut groups: HashMap<(String, usize), Vec<ArchiveResult>> = HashMap::new();
+        let mut order = Vec::new();
+        for archive in std::mem::take(&mut self.archives) {
+            let key = (crate::path_keys::path_key(&archive.path.to_string_lossy()), archive.depth);
+            if !groups.contains_key(&key) { order.push(key.clone()); }
+            groups.entry(key).or_default().push(archive);
+        }
+        for key in order {
+            let mut entries = groups.remove(&key).expect("completed physical input");
+            if entries.iter().all(|entry| entry.failure.is_none() && !entry.partial) {
+                let output = common_ancestor(entries.iter().filter_map(|entry| entry.output.as_deref()));
+                let files = entries.iter().map(|entry| entry.files).sum();
+                let bytes = entries.iter().map(|entry| entry.bytes).sum();
+                let mut summary = entries.remove(0);
+                summary.output = output;
+                summary.files = files;
+                summary.bytes = bytes;
+                entries = vec![summary];
+            }
+            for entry in &mut entries {
+                // Extraction-only provenance has already been consumed by
+                // cleanup, promotion and recovery receipts. Failure evidence
+                // stays on the sparse result for CLI diagnostics.
+                entry.source_paths = Vec::new();
+                // Confirmed passwords already live in the engine's recent
+                // password cache; extract reports never read this scan field.
+                entry.password = None;
+                entry.damage_flags = None;
+                entry.volume_attempts = None;
+                entry.promotion_original_path = None;
+            }
+            self.archives.extend(entries);
+        }
+    }
+
     pub(crate) fn input_failures(&self) -> HashMap<String, InputFailure<'_>> {
         let mut inputs: HashMap<String, InputFailure<'_>> = HashMap::new();
         for archive in &self.archives {
@@ -474,6 +523,76 @@ pub struct Segment {
     pub end_offset: Option<u64>,
 }
 
+/// The result needed by an in-flight display, without worker diagnostics or
+/// recovery inventories. The final report uses the same status projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    Complete,
+    Partial,
+    Failed,
+}
+
+impl TaskStatus {
+    pub fn of(result: &ArchiveResult) -> Self {
+        if result.partial { Self::Partial }
+        else if result.failure.is_some() { Self::Failed }
+        else { Self::Complete }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskCompletion {
+    pub status: TaskStatus,
+    pub failure: Option<Failure>,
+    pub output: Option<PathBuf>,
+}
+
+impl TaskCompletion {
+    pub fn from_result(result: &ArchiveResult) -> Self {
+        Self {
+            status: TaskStatus::of(result),
+            failure: result.failure.as_ref().map(|failure| Failure {
+                kind: failure.kind,
+                message: failure.message.clone(),
+                password_retry: failure.password_retry,
+                // Only the fields used by the common human-facing projection.
+                evidence: failure.evidence.as_deref().map(|e| Box::new(FailureEvidence {
+                    possible_missing_volume: e.possible_missing_volume,
+                    archive_read_fault: e.archive_read_fault.clone(),
+                    native_kind: e.native_kind.clone(),
+                    stage: e.stage.clone(),
+                    ..FailureEvidence::default()
+                })),
+            }),
+            output: result.output.clone(),
+        }
+    }
+
+    pub(crate) fn relocate_output(&mut self, old: &Path, new: &Path) {
+        if let Some(output) = &mut self.output {
+            relocate_flatten_output(output, old, new);
+        }
+    }
+
+    pub fn from_group(results: &[ArchiveResult]) -> Self {
+        if results.len() == 1 { return Self::from_result(&results[0]); }
+        let status = if results.iter().any(|r| TaskStatus::of(r) == TaskStatus::Failed) {
+            TaskStatus::Failed
+        } else if results.iter().any(|r| r.partial) { TaskStatus::Partial }
+        else { TaskStatus::Complete };
+        Self { status, failure: None, output: common_ancestor(results.iter().filter_map(|r| r.output.as_deref())) }
+    }
+}
+
+pub(crate) fn relocate_flatten_output(path: &mut PathBuf, old: &Path, new: &Path) {
+    if let Ok(suffix) = path.strip_prefix(old) {
+        *path = new.join(suffix);
+    } else if old.starts_with(&*path) && path.starts_with(new) {
+        // A carrier segment may own a wrapper above the flattened leaf.
+        *path = new.to_path_buf();
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     Queued {
@@ -512,7 +631,7 @@ pub enum Event {
         id: TaskId,
         path: PathBuf,
         depth: usize,
-        success: bool,
+        result: TaskCompletion,
     },
     Skipped {
         id: TaskId,
@@ -635,7 +754,7 @@ pub(crate) trait Observer: Send + Sync {
         Ok(())
     }
 
-    fn after_flatten(&self, _output: &Path) -> io::Result<()> {
+    fn after_flatten(&self, _old: &Path, _output: &Path) -> io::Result<()> {
         Ok(())
     }
 

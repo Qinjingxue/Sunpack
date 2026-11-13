@@ -94,11 +94,13 @@ std::string runtime_binary_stamp(const std::wstring& path) {
 }
 
 bool file_exists(const std::wstring& path);
+std::wstring program_data_dir();
 
 struct InstallContext {
     std::wstring directory;
     std::string runtime_id;
     std::wstring runtime;
+    std::wstring data_dir;
 };
 
 InstallContext install_context(const std::wstring& executable) {
@@ -106,6 +108,7 @@ InstallContext install_context(const std::wstring& executable) {
     fs::path directory = fs::path(executable).parent_path();
     if (directory.filename() == L"bin") directory = directory.parent_path();
     fs::path runtime = directory / L"sunpack-runtime.exe";
+    fs::path data_dir = program_data_dir();
     // Official source builds keep the launcher and Rust artifacts in their
     // native build directories. Do not stage a fake package beside the runtime.
     if (!file_exists(runtime.wstring()) && fs::path(executable).stem() == L"sunpack_launcher") {
@@ -122,9 +125,10 @@ InstallContext install_context(const std::wstring& executable) {
             const auto platform = arch == L"build-arm64" ? L"arm64" : L"x64";
             runtime = root / L".cache" / L"rust-target" / platform / target / (ci ? L"ci" : L"release") / L"sunpack-runtime.exe";
             directory = root;
+            data_dir = root;
         }
     }
-    return {directory.wstring(), "v2-" + fnv1a_hex(utf8(executable)), runtime.wstring()};
+    return {directory.wstring(), "v2-" + fnv1a_hex(utf8(executable)), runtime.wstring(), data_dir.wstring()};
 }
 
 InstallContext install_context() {
@@ -241,11 +245,11 @@ std::wstring join_config_path(const std::wstring& directory, const wchar_t* file
     return directory + L"\\" + filename;
 }
 
-std::vector<std::wstring> program_data_roots() {
+std::wstring program_data_dir() {
     std::array<wchar_t, 32768> program_data{};
     const DWORD length = GetEnvironmentVariableW(L"PROGRAMDATA", program_data.data(), static_cast<DWORD>(program_data.size()));
     if (length == 0 || length >= program_data.size()) return {};
-    return {std::wstring(program_data.data(), length) + L"\\SunPack"};
+    return std::wstring(program_data.data(), length) + L"\\SunPack";
 }
 
 std::wstring first_existing_config(const std::vector<std::wstring>& roots, const wchar_t* filename) {
@@ -268,12 +272,13 @@ std::string normalize_language(const std::string& raw) {
 }
 
 // Resolves cli.language the same way the Python config layer does for an
-// installed build: sunpack_config.json comes from %ProgramData%\SunPack and
-// sunpack_advanced_config.json from the install directory. Missing or
+// installed or source build: writable config and advanced config use the same
+// data/application roots as the runtime. Missing or
 // unreadable config falls back to English, matching the Python default.
-std::string cli_language_from_config(const std::wstring& launcher_dir) {
-    const std::wstring simple_path = first_existing_config(program_data_roots(), L"sunpack_config.json");
-    const std::wstring advanced_path = first_existing_config({launcher_dir}, L"sunpack_advanced_config.json");
+std::string cli_language_from_config(const InstallContext& context) {
+    const std::wstring simple_path = context.data_dir.empty() ? std::wstring()
+        : first_existing_config({context.data_dir}, L"sunpack_config.json");
+    const std::wstring advanced_path = first_existing_config({context.directory}, L"sunpack_advanced_config.json");
     std::string language;
     if (!simple_path.empty()) language = config_language(simple_path);
     if (language.empty() && !advanced_path.empty()) language = config_language(advanced_path);
@@ -281,12 +286,8 @@ std::string cli_language_from_config(const std::wstring& launcher_dir) {
 }
 
 std::wstring state_path(const InstallContext& context) {
-    std::array<wchar_t, 32768> program_data{};
-    DWORD length = GetEnvironmentVariableW(L"PROGRAMDATA", program_data.data(), static_cast<DWORD>(program_data.size()));
-    if (length == 0 || length >= program_data.size()) {
-        return {};
-    }
-    return std::wstring(program_data.data(), length) + L"\\SunPack\\runtime-" + wide_utf8(context.runtime_id) + L".state";
+    if (context.data_dir.empty()) return {};
+    return join_config_path(context.data_dir, (L"runtime-" + wide_utf8(context.runtime_id) + L".state").c_str());
 }
 
 // Serialize only endpoint startup, never command execution. A readiness event
@@ -805,7 +806,7 @@ int wmain(int argc, wchar_t** argv) {
             // Another launcher may have completed startup while we waited.
             outcome = request(context, request_arguments, false, code, invocation_cwd, &startup);
         }
-        const std::string language = cli_language_from_config(launcher_cwd);
+        const std::string language = cli_language_from_config(context);
         DWORD spawn_error = ERROR_SUCCESS;
         HANDLE runtime_process = nullptr;
         DWORD runtime_exit_code = STILL_ACTIVE;
@@ -850,7 +851,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!ok) code = shutdown ? 0 : 1;
     std::string language;
     if (pause || (!ok && !shutdown)) {
-        language = cli_language_from_config(launcher_cwd);
+        language = cli_language_from_config(context);
     }
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");

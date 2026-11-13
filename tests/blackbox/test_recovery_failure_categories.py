@@ -131,3 +131,48 @@ def test_complete_carrier_keeps_damaged_segment_output_beside_success(package, t
     assert recovered.read_bytes() == b"complete member from damaged segment"
     assert good.parent != recovered.parent
     assert carrier.is_file()
+
+
+def test_completed_roots_keep_nested_results_passwords_and_failures(package, tmp_path):
+    # Completed roots are reduced to sparse CLI facts while other roots are
+    # still running. Exercise all three consumers together, without ordering
+    # assumptions, artificial delays or a production-only test hook.
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    nested = io.BytesIO()
+    with zipfile.ZipFile(nested, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("nested-result.txt", b"nested root result")
+    outer = inputs / "outer.zip"
+    with zipfile.ZipFile(outer, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("child.zip", nested.getvalue())
+    (tmp_path / "encrypted-result.txt").write_bytes(b"encrypted root result")
+    encrypted = inputs / "encrypted.7z"
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", "-proot-key",
+         str(encrypted), "encrypted-result.txt"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    unsupported = inputs / "unsupported.zip"
+    _unsupported_later_member(unsupported, _nested_zip())
+    original = {source: source.read_bytes() for source in inputs.iterdir()}
+    package.configure(recursive_authorization={"enabled": False})
+    output = tmp_path / "out"
+    report = package.json(
+        "extract", "-d", "--no-builtin-pw", "-p", "root-key",
+        "-r", "*", "-c", "k", "-o", output, inputs, code=1,
+    )
+    # main counts physical tasks (including the nested task), not segments.
+    for summary in (report["summary"], report["tasks"][0]):
+        assert summary["success_count"] == 3, report
+        assert summary["failed_count"] == 1, report
+        assert summary["processed_count"] == 4, report
+        assert summary["partial_success_count"] == 0, report
+    failure, = report["tasks"][0]["failures"]
+    assert failure["kind"] == "unsupported", report
+    assert "root-key" in report["items"][0]["recent_passwords"], report
+    for name, expected in (("nested-result.txt", b"nested root result"),
+                           ("encrypted-result.txt", b"encrypted root result")):
+        result, = output.rglob(name)
+        assert result.read_bytes() == expected
+    assert not list(output.rglob("must-not-recurse.txt"))
+    assert all(source.read_bytes() == data for source, data in original.items())

@@ -23,6 +23,8 @@ pub struct InputCheckpoint {
     input: LogicalLayout,
     sources: Box<[SourceGeneration]>,
     output: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planned_output: Option<PathBuf>,
     container: Option<PathBuf>,
     files: u64,
     bytes: u64,
@@ -93,6 +95,12 @@ impl PromotedSource {
 }
 
 impl InputCheckpoint {
+    /// Lightweight projection of this module's serialized recovery contract.
+    pub(crate) fn serialized_output_roots(record: &serde_json::Value) -> impl Iterator<Item = &str> {
+        ["output", "container"].into_iter().filter_map(move |field| record[field].as_str())
+            .filter(|path| !path.is_empty())
+    }
+
     pub fn entry(&self) -> &Path {
         &self.input.entry
     }
@@ -156,6 +164,7 @@ impl InputCheckpoint {
             },
             sources: sources.into_boxed_slice(),
             output: result.output.clone().unwrap_or_default(),
+            planned_output: None,
             container: container.map(Path::to_path_buf),
             files: result.files,
             bytes: result.bytes,
@@ -205,21 +214,29 @@ impl InputCheckpoint {
 
     }
 
+    pub(super) fn output_slot(&self) -> Option<&Path> {
+        if self.has_output() { Some(self.output()) } else { self.planned_output.as_deref() }
+    }
+
+    pub(super) fn set_planned_output(&mut self, path: Option<&Path>) {
+        self.planned_output = if self.has_output() { None } else { path.map(Path::to_path_buf) };
+    }
+
     pub(super) fn output_slot_for(&self, input: &ArchiveInput, container: &Path) -> bool {
         // Dependency generations and retry facts decide whether the result can
         // be reused, not whether the same logical segment keeps its old slot.
         let start = self.input.parts.first().map(|part| part.extent.start)
             .or_else(|| self.input.ranges.first().map(|range| range.start)).unwrap_or(0);
         self.schema_version == SCHEMA_VERSION
-            && self.has_output()
             && self.container() == Some(container)
-            && self.output.strip_prefix(container).is_ok_and(|relative| !relative.as_os_str().is_empty())
+            && self.output_slot().is_some_and(|output| output.strip_prefix(container)
+                .is_ok_and(|relative| !relative.as_os_str().is_empty()))
             && path_key(&self.input.entry.to_string_lossy()) == path_key(&input.entry_path)
             && self.input.format == input.format_hint
             && start == input.physical_extents().next().map_or(0, |extent| extent.start)
     }
 
-    pub(super) fn container(&self) -> Option<&Path> {
+    pub(crate) fn container(&self) -> Option<&Path> {
         self.container
             .as_ref()
             .map(|container| container.as_path())
@@ -258,6 +275,7 @@ impl InputCheckpoint {
         };
         let has_output = self.has_output();
         mapped(&mut self.carrier);
+        if let Some(planned) = &mut self.planned_output { mapped(planned); }
         mapped(&mut self.input.entry);
         if has_output { mapped(&mut self.output); }
         if let Some(container) = &mut self.container {
@@ -486,6 +504,7 @@ mod tests {
                     path: source.clone(), generation: capture_file_generation(&source).unwrap().persisted(),
                 }].into_boxed_slice(),
                 output: output.clone(),
+                planned_output: None,
                 container: Some(container.clone()),
                 files: 1, bytes: 4, encrypted: None,
                 discovery_source: DiscoverySource::Embedded, children_complete: true,
@@ -558,6 +577,7 @@ mod tests {
                 path: source.clone(), generation: generations[&key].persisted(),
             }].into_boxed_slice(),
             output: output.clone(),
+            planned_output: None,
             container: None, files: 1, bytes: 7, encrypted: None,
             discovery_source: DiscoverySource::Direct, children_complete: true,
             remaining_depth: 0, failure: None,
@@ -611,6 +631,25 @@ mod tests {
         ).unwrap();
         assert!(legacy_complete.valid_for(&input, &generations));
         assert!(legacy_complete.valid_for(&alternatives, &generations));
+        // A failed input reserves its name without advertising recoverable
+        // content. Persist and relocate that namespace independently of output.
+        let mut failed = partial.clone();
+        failed.output = PathBuf::new();
+        let container = output.with_extension("carrier");
+        let slot = container.join("segment");
+        failed.container = Some(container.clone());
+        failed.set_planned_output(Some(&slot));
+        let mut failed: InputCheckpoint = serde_json::from_slice(
+            &serde_json::to_vec(&failed).unwrap(),
+        ).unwrap();
+        assert!(!failed.has_output());
+        assert!(failed.result(1).output.is_none());
+        assert!(failed.output_slot_for(&input, &container));
+        assert_eq!(failed.output_slot(), Some(slot.as_path()));
+        let moved = container.with_extension("moved");
+        assert!(failed.relocate(&container, &moved));
+        assert_eq!(failed.output_slot(), Some(moved.join("segment").as_path()));
+        assert!(!failed.has_output());
         // Length changes make this deterministic even on coarse file clocks.
         fs::write(&source, b"changed archive generation").unwrap();
         generations.insert(key, capture_file_generation(&source).unwrap());

@@ -5,7 +5,7 @@ use crate::core::{passwords, resources};
 use crate::io::cancellation::is_cancellation;
 use crate::pipeline::{
     ArchiveResult, Cancellation, CleanupStatus, Engine, Event, FailureKind, InputError,
-    InputErrorKind, Mode, Observer, Outcome, Request, TaskId,
+    InputErrorKind, Mode, Observer, Outcome, Request, TaskId, TaskStatus,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -971,7 +971,7 @@ impl Progress {
             let prompting = display.prompting;
             display
                 .panel
-                .get_or_insert_with(live::Panel::default)
+                .get_or_insert_with(|| live::Panel::new(self.verbose))
                 .update(self.session.as_ref(), self.language, event, prompting);
         } else if let Event::ResourceWait { path, state, .. } = event {
             if !state.disk {
@@ -1105,8 +1105,18 @@ impl Observer for Progress {
         self.watch.prepare_external_flatten(output, work, leaf)
     }
 
-    fn after_flatten(&self, output: &Path) -> io::Result<()> {
-        self.watch.finish_external_flatten(output)
+    fn after_flatten(&self, old: &Path, output: &Path) -> io::Result<()> {
+        self.watch.finish_external_flatten(output)?;
+        if self.visible {
+            // Use the same lock order as flush_events. A queued Finished must
+            // not restore its old path after the visible rows were relocated.
+            let mut display = self.display.lock().unwrap();
+            self.reporting.relocate_outputs(old, output);
+            if let Some(panel) = &mut display.panel {
+                panel.relocate_outputs(old, output);
+            }
+        }
+        Ok(())
     }
 
     fn after_output(&self, archive: &ArchiveResult) -> io::Result<()> {
@@ -1269,9 +1279,7 @@ impl<'a> ScopeReport<'a> {
         prefix: &mut String,
     ) -> io::Result<()> {
         let item = &self.archives[position];
-        let status = if item.partial { "report.status.partial" }
-            else if item.failure.is_some() { "report.status.error" }
-            else { "report.status.complete" };
+        let status = task_status_key(TaskStatus::of(item));
         let last = if item.partial || item.failure.is_some() {
             [&item.path].into_iter().chain(item.promotion_original_path.iter()).find_map(|path| {
                 self.progress.get(&(path.clone(), Some(item.offset)))
@@ -1284,19 +1292,8 @@ impl<'a> ScopeReport<'a> {
             "{prefix}  [{}]{progress}",
             self.language.text(status)
         )?;
-        if let Some(failure) = item
-            .failure
-            .as_ref()
-            .filter(|_| !item.partial || self.verbose)
-        {
-            if !failure.is_password_retry() {
-                Self::title(
-                    writer,
-                    prefix,
-                    "  ",
-                    &failure_message(failure, self.language),
-                )?;
-            }
+        if let Some(detail) = task_detail(TaskStatus::of(item), item.failure.as_ref(), self.verbose, self.language) {
+            Self::title(writer, prefix, "  ", &detail)?;
         }
         if let Some(output) = item.output.as_ref().filter(|_| self.verbose) {
             let detail = self.language.translate(
@@ -1312,6 +1309,19 @@ impl<'a> ScopeReport<'a> {
         }
         Ok(())
     }
+}
+
+fn task_status_key(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Complete => "report.status.complete",
+        TaskStatus::Partial => "report.status.partial",
+        TaskStatus::Failed => "report.status.error",
+    }
+}
+
+fn task_detail<'a>(status: TaskStatus, failure: Option<&'a crate::pipeline::Failure>, verbose: bool, language: Language) -> Option<Cow<'a, str>> {
+    failure.filter(|failure| (status == TaskStatus::Failed || verbose) && !failure.is_password_retry())
+        .map(|failure| failure_message(failure, language))
 }
 
 fn command_error(
@@ -1576,6 +1586,13 @@ async fn archives(
         for receipt in current.cleanup_results {
             cleanup.insert(path_key(&receipt.path), receipt);
         }
+        // A retry replaces the physical task's previous result. Successful
+        // carriers now have one sparse summary instead of one entry per segment.
+        let replaced: std::collections::HashSet<_> = current.archives.iter()
+            .map(|archive| (path_key(&archive.path), archive.depth)).collect();
+        all_archives.retain(|_, archive: &mut ArchiveResult| {
+            !replaced.contains(&(path_key(&archive.path), archive.depth))
+        });
         for archive in current.archives {
             if !options.json
                 && !archive.partial
@@ -2310,10 +2327,13 @@ async fn show_config(
     crate::pipeline::stage("cli", &Cancellation::new()).await?;
     let (path, payload) = config::load_raw(cwd)?;
     result.summary = json!({"config_path": path, "changed": false});
+    if options.action == "show" {
+        if !options.json { write_json(session, &payload)?; }
+        result.items.push(payload);
+        return Ok((0, result));
+    }
     let errors = match Config::parse(&payload) {
-        Ok(settings) if options.action == "validate" => settings.validate_scan_filters(),
-        Ok(_) => Vec::new(),
-        Err(error) if options.action == "show" => return Err(error),
+        Ok(settings) => settings.validate_scan_filters(),
         Err(error) => vec![error.to_string()],
     };
     if !errors.is_empty() {
@@ -2324,23 +2344,10 @@ async fn show_config(
         result.items.push(json!({"ok": false, "errors": errors, "warnings": []}));
         return Ok((2, result));
     }
-    if options.action == "show" {
-        if !options.json {
-            write_json(session, &payload)?;
-        }
-        result.items.push(payload);
-    } else {
-        if !options.json {
-            line(
-                session,
-                Stream::Out,
-                language.text("cli.config.valid_config"),
-            )?;
-        }
-        result
-            .items
-            .push(json!({"ok": true, "errors": [], "warnings": []}));
+    if !options.json {
+        line(session, Stream::Out, language.text("cli.config.valid_config"))?;
     }
+    result.items.push(json!({"ok": true, "errors": [], "warnings": []}));
     Ok((0, result))
 }
 

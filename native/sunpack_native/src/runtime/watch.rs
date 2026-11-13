@@ -762,6 +762,42 @@ struct Running {
     completion: Arc<RunCompletion>,
 }
 
+// Keep the native volume facts until roots can be selected without filesystem IO.
+// Both directions require rearm/checkpoint; only arrival requests directory work.
+#[derive(Default)]
+struct VolumeChanges {
+    affected: u32,
+    arrivals: u32,
+    initial: bool,
+}
+
+impl VolumeChanges {
+    fn add(&mut self, mask: u32, arrived: bool) {
+        if mask == 0 { self.initial = true; }
+        else {
+            self.affected |= mask;
+            if arrived { self.arrivals |= mask; }
+        }
+    }
+    fn is_empty(&self) -> bool { self.affected == 0 && !self.initial }
+    fn disk(path: &Path) -> u32 {
+        match path.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+                std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter)
+                    if letter.is_ascii_alphabetic() => 1 << (letter.to_ascii_uppercase() - b'A'),
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+    fn affects(&self, root: &Path, observed: bool) -> bool {
+        self.affected & Self::disk(root) != 0 || (self.initial && !observed)
+    }
+    fn arrives(&self, root: &Path, observed: bool) -> bool {
+        self.arrivals & Self::disk(root) != 0 || (self.initial && !observed)
+    }
+}
+
 #[derive(Default)]
 struct Signals {
     changed_roots: HashMap<String, HashSet<PathBuf>>,
@@ -773,7 +809,7 @@ struct Signals {
     foreground_finished: bool,
     maintenance: bool,
     clipboard: Option<Vec<String>>,
-    volumes_changed: bool,
+    volumes: VolumeChanges,
     rebuild: Vec<CommandReply<bool>>,
     cancel: Vec<(String, CommandReply<bool>)>,
     roots: Vec<RootCompleted>,
@@ -929,7 +965,7 @@ impl Hub {
                 && !value.maintenance
                 && !value.foreground_finished
                 && value.clipboard.is_none()
-                && !value.volumes_changed
+                && value.volumes.is_empty()
                 && value.rebuild.is_empty()
                 && value.cancel.is_empty()
                 && value.once.is_empty()
@@ -1651,8 +1687,8 @@ impl Scheduler {
                                 pending.drain(..pending.len() - clipboard_limit);
                             }
                         }
-                        crate::core::clipboard_monitor::Notification::VolumeChanged => {
-                            signals.volumes_changed = true
+                        crate::core::clipboard_monitor::Notification::VolumeChanged { unitmask, arrived } => {
+                            signals.volumes.add(unitmask, arrived);
                         }
                     });
                 });
@@ -2047,7 +2083,7 @@ impl Scheduler {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            let signals = self.hub.wait(deadline);
+            let mut signals = self.hub.wait(deadline);
             for (batch, waiter) in signals.cancel {
                 let _ = waiter.send(Ok(self.cancel_display_batch(&batch)));
             }
@@ -2098,11 +2134,20 @@ impl Scheduler {
                     );
                 }
             }
-            if signals.volumes_changed
-                || !signals.changed_roots.is_empty()
+            for (id, (root, _)) in &self.roots {
+                let observed = self.root_observers.get(id).is_some_and(|observers| observers.root.is_some());
+                if signals.volumes.affects(&root.path, observed) {
+                    signals.topology_roots.insert(id.clone());
+                    signals.changed_roots.entry(id.clone()).or_default();
+                    if signals.volumes.arrives(&root.path, observed) {
+                        self.available_roots.remove(id);
+                    }
+                }
+            }
+            if !signals.changed_roots.is_empty()
                 || !signals.once.is_empty()
             {
-                let all_roots = signals.volumes_changed || !signals.once.is_empty();
+                let all_roots = !signals.once.is_empty();
                 if self.options.is_some() && (all_roots || !signals.topology_roots.is_empty()) {
                     self.rearm_root_observers((!all_roots).then_some(&signals.topology_roots));
                 }
@@ -3612,15 +3657,9 @@ impl Scheduler {
     }
 
     fn delay(&mut self, id: String, mut pending: Pending, now: Instant) {
-        let boundary = self.settings.watch.boundary_confirmation_seconds;
-        // An outstanding sharing conflict still needs a readiness boundary
-        // when the writer never emits another directory event.
-        let seconds = if pending.quiet.seconds > 0.0 {
-            pending.quiet.seconds.min(boundary)
-        } else {
-            boundary
-        };
-        pending.due = quiet::after(now, seconds);
+        pending.due = pending.quiet.boundary_deadline(
+            now, self.settings.watch.boundary_confirmation_seconds,
+        );
         self.due.insert((pending.due, id.clone()), ());
         self.pending.insert(id, pending);
     }
@@ -4126,7 +4165,7 @@ impl Scheduler {
             };
             let mut entry = make_entry(
                 &candidate,
-                &failure.message,
+                &super::failure::message(failure, self.settings.cli.language),
                 Some(input_failure),
                 self.journal.state().entry(&candidate.path).as_deref(),
                 &active.passwords,
@@ -4177,6 +4216,9 @@ impl Scheduler {
                 ));
             }
         }
+        let output_containers: HashMap<&Path, &Path> = outcome.checkpoints.iter()
+            .filter_map(|checkpoint| checkpoint.container().map(|container| (checkpoint.output(), container)))
+            .collect();
         for candidate in active.inputs {
             let id = watch_path_key(&candidate.path);
             if self.pending.contains_key(&id)
@@ -4197,8 +4239,9 @@ impl Scheduler {
             let input_failure = failed_archive.and_then(|archive| input_failures
                 .get(&crate::path_keys::path_key(&archive.path.to_string_lossy())));
             let failure = input_failure.and_then(InputFailure::failure);
+            let failure_message = failure.map(|failure| super::failure::message(failure, self.settings.cli.language));
             let error = input_error.map(|error| error.as_str())
-                .or_else(|| failure.map(|failure| failure.message.as_str()));
+                .or_else(|| failure_message.as_deref());
             let retryable = input_failure.is_some_and(InputFailure::retryable);
             let stale = error.is_some()
                 // A promoted terminal child may outlive its successfully
@@ -4282,14 +4325,12 @@ impl Scheduler {
                 "no_tasks_found"
             };
             if published.insert(watch_path_key(canonical)) {
-                let outputs = archives
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.output.as_deref())
-                    .collect::<HashSet<_>>();
+                let outputs = completion_output_dirs(archives.into_iter().flatten()
+                    .filter_map(|item| item.output.as_deref()), &output_containers);
                 self.journal
                     .log(json!({"event":event,"path":canonical,"owner":batch,
-                    "error":error,"output_dirs":outputs,"retire_group":true}));
+                    "error":error,"error_kind":failure.map(|failure| failure.kind),
+                    "output_dirs":outputs,"retire_group":true}));
             }
             operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
                 &candidate.path,
@@ -4446,6 +4487,16 @@ fn completion_input_errors<'a>(
         }
     }
     paths
+}
+
+// Receipts retain the physical carrier container even when only one segment
+// survived. A common ancestor of logical outputs alone would open that segment.
+fn completion_output_dirs<'a>(
+    outputs: impl IntoIterator<Item = &'a Path>, containers: &HashMap<&Path, &Path>,
+) -> Vec<PathBuf> {
+    crate::pipeline::common_ancestor(outputs.into_iter()
+        .map(|output| containers.get(output).copied().unwrap_or(output)))
+        .into_iter().collect()
 }
 
 fn completion_archives<'a>(
@@ -4882,7 +4933,7 @@ impl Observer for WatchObserver {
         Ok(())
     }
 
-    fn after_flatten(&self, output: &Path) -> io::Result<()> {
+    fn after_flatten(&self, _old: &Path, output: &Path) -> io::Result<()> {
         finish_flatten(&self.journal, &output.to_string_lossy())
     }
 
@@ -5202,6 +5253,43 @@ fn spawn_error_dialog(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_opens_physical_container_with_one_or_many_retained_segments() {
+        let container = Path::new(r"C:\output\carrier");
+        let a = Path::new(r"C:\output\carrier\zip");
+        let b = Path::new(r"C:\output\carrier\7z");
+        let containers = HashMap::from([(a, container), (b, container)]);
+        assert_eq!(completion_output_dirs([a], &containers), vec![container.to_path_buf()]);
+        assert_eq!(completion_output_dirs([b, a], &containers), vec![container.to_path_buf()]);
+        assert_eq!(completion_output_dirs([a], &HashMap::new()), vec![a.to_path_buf()]);
+        assert!(completion_output_dirs([], &containers).is_empty());
+    }
+
+    #[test]
+    fn volume_notifications_select_only_matching_roots_and_preserve_arrivals() {
+        let c = Path::new(r"C:\downloads");
+        let d = Path::new(r"D:\downloads");
+        let unc = Path::new(r"\\server\share");
+        let mut changes = VolumeChanges::default();
+        assert!(changes.is_empty());
+        changes.add(1 << 2, false);
+        assert!(changes.affects(c, true));
+        assert!(!changes.arrives(c, true));
+        assert!(!changes.affects(d, false));
+        assert!(!changes.affects(unc, false));
+        changes.add(1 << 3, true);
+        changes.add(1 << 3, false);
+        assert!(changes.affects(c, true));
+        assert!(changes.arrives(d, true));
+        let mut initial = VolumeChanges::default();
+        initial.add(0, true);
+        for root in [c, d, unc] {
+            assert!(!initial.affects(root, true));
+            assert!(initial.affects(root, false));
+            assert!(initial.arrives(root, false));
+        }
+    }
+
     #[test]
     fn password_notifications_do_not_reload_unrelated_configuration() {
         let files = HashMap::from([

@@ -41,6 +41,12 @@ impl Quiet {
         after(now, if retry_unchanged { 0.0 } else { self.seconds })
     }
 
+    pub(super) fn boundary_deadline(&self, now: Instant, confirmation: f64) -> Instant {
+        // A fresh/reset tracker has no learned quiet window. Main keeps its
+        // boundary retry immediately eligible, including a busy-file recheck.
+        after(now, self.seconds.min(confirmation))
+    }
+
     pub(super) fn observe(&mut self, now: f64, boundary: bool, reset: bool, learn: bool) {
         if reset {
             *self = Self::default();
@@ -164,6 +170,23 @@ pub(super) fn after(now: Instant, seconds: f64) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_boundary_preserves_zero_quiet_and_caps_learned_windows() {
+        let mut quiet = Quiet::default();
+        let now = Instant::now();
+        // First activity and boundary-only/busy retries do not learn a delay.
+        quiet.observe(1.0, false, false, true);
+        assert_eq!(quiet.boundary_deadline(now, 0.5), now);
+        quiet.observe(2.0, false, false, false);
+        assert_eq!(quiet.boundary_deadline(now, 0.5), now);
+        quiet.seconds = 2.0;
+        assert_eq!(quiet.boundary_deadline(now, 0.5), after(now, 0.5));
+        quiet.seconds = 0.2;
+        assert_eq!(quiet.boundary_deadline(now, 0.5), after(now, 0.2));
+        quiet.observe(3.0, true, true, false);
+        assert_eq!(quiet.boundary_deadline(now, 0.5), now);
+    }
 
     #[test]
     fn content_close_preserves_learned_quiet_and_unchanged_retry_is_immediate() {

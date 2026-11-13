@@ -168,3 +168,16 @@ def test_archive_infrastructure_failures_keep_main_exit_classification(package, 
     result = package.run(*args, "--json")
     assert result.returncode == code, (result.stdout, result.stderr)
     assert json.loads(result.stdout)["errors"]
+
+
+def test_show_keeps_invalid_execution_values_visible(package):
+    # A bad regex is validated later and does not exercise Config::parse.
+    package.configure(recursive_extract=0)
+    shown = package.json("config", "show")
+    assert shown["items"][0]["recursive_extract"] == 0
+    text = package.run("config", "show")
+    assert text.returncode == 0, text.stderr
+    assert json.loads(text.stdout)["recursive_extract"] == 0
+    checked = package.json("config", "validate", code=2)
+    assert checked["items"][0]["ok"] is False
+    assert checked["errors"]

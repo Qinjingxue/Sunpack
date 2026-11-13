@@ -23,20 +23,19 @@ pub(crate) fn package_root() -> Option<PathBuf> {
 }
 
 fn development_root(cwd: &Path) -> Option<PathBuf> {
+    development_root_for(env::current_exe().ok().as_deref(), cwd)
+}
+
+fn development_root_for(exe: Option<&Path>, cwd: &Path) -> Option<PathBuf> {
     let checkout = |root: &Path| {
         root.join("native/Cargo.toml").is_file()
             && root.join("sunpack_advanced_config.json").is_file()
     };
-    cwd.ancestors()
-        .find(|root| checkout(root))
+    // Match main's module-root-first policy: the invoking directory may itself
+    // be a different checkout, but must not replace the running application's root.
+    exe.and_then(|exe| exe.ancestors().find(|root| checkout(root)))
+        .or_else(|| cwd.ancestors().find(|root| checkout(root)))
         .map(Path::to_path_buf)
-        .or_else(|| {
-            env::current_exe()
-                .ok()?
-                .ancestors()
-                .find(|root| checkout(root))
-                .map(Path::to_path_buf)
-        })
 }
 
 /// Resolve the native CLI entry point without mistaking a source build for a package.
@@ -168,6 +167,22 @@ impl Drop for FileMutex {
 #[cfg(test)]
 mod entrypoint_tests {
     use super::*;
+
+    #[test]
+    fn running_checkout_precedes_another_checkout_used_as_cwd() {
+        let temp = env::temp_dir().join(format!("sunpack-resource-roots-{}", std::process::id()));
+        let application = temp.join("application");
+        let caller = temp.join("caller");
+        for root in [&application, &caller] {
+            std::fs::create_dir_all(root.join("native")).unwrap();
+            std::fs::write(root.join("native/Cargo.toml"), "[workspace]").unwrap();
+            std::fs::write(root.join("sunpack_advanced_config.json"), "{}").unwrap();
+        }
+        let exe = application.join(".cache/rust-target/x64/target/ci/sunpack-runtime.exe");
+        assert_eq!(development_root_for(Some(&exe), &caller), Some(application));
+        assert_eq!(development_root_for(None, &caller), Some(caller));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn source_launcher_uses_the_runtime_build_profile_without_package_staging() {

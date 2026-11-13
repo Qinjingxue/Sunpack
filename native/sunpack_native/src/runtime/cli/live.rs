@@ -2,7 +2,7 @@
 
 use super::{tree_edge, Session, Stream};
 use crate::core::i18n::Language;
-use crate::pipeline::{Event, ResourceWait, TaskId};
+use crate::pipeline::{Event, ResourceWait, TaskId, TaskCompletion, TaskStatus};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::io;
@@ -15,7 +15,7 @@ enum Phase {
     Preparing,
     Working,
     Finalizing,
-    Finished(bool),
+    Finished(TaskStatus),
 }
 
 struct TaskRow {
@@ -28,6 +28,7 @@ struct TaskRow {
     phase: Phase,
     wait: ResourceWait,
     progress: Option<(u64, u64)>,
+    result: Option<TaskCompletion>,
 }
 
 struct Row {
@@ -47,9 +48,20 @@ pub(super) struct Panel {
     frame: Option<Frame>,
     cursor_unknown: bool,
     last_render: Option<Instant>,
+    verbose: bool,
 }
 
 impl Panel {
+    pub(super) fn new(verbose: bool) -> Self { Self { verbose, ..Self::default() } }
+
+    pub(super) fn relocate_outputs(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        for task in self.tasks.values_mut() {
+            if let Some(result) = &mut task.result {
+                result.relocate_output(old, new);
+            }
+        }
+    }
+
     pub(super) fn update(
         &mut self,
         session: &dyn Session,
@@ -99,6 +111,7 @@ impl Panel {
                         phase: Phase::Queued,
                         wait: ResourceWait::default(),
                         progress: None,
+                        result: None,
                     },
                 );
                 (id, None)
@@ -107,7 +120,14 @@ impl Panel {
             Event::Waiting { id } => (id, Some(Phase::Queued)),
             Event::Working { id } => (id, Some(Phase::Working)),
             Event::Finalizing { id } => (id, Some(Phase::Finalizing)),
-            Event::Finished { id, success, .. } => (id, Some(Phase::Finished(success))),
+            Event::Finished { id, result, .. } => {
+                let status = result.status;
+                if let Some(task) = self.tasks.get_mut(&id) {
+                    if status == TaskStatus::Complete { task.progress = Some((1, 1)); }
+                    task.result = Some(result);
+                }
+                (id, Some(Phase::Finished(status)))
+            },
             Event::Progress {
                 id,
                 completed_bytes,
@@ -314,6 +334,23 @@ impl Panel {
                 id: Some(id),
                 text: row_text(task, &prefix, edge, width, unicode, language),
             });
+            let detail_prefix = format!("{prefix}{continuation}  ");
+            if !task.carrier || matches!(task.phase, Phase::Finished(TaskStatus::Failed)) {
+                if let Some(result) = &task.result {
+                    let detail = super::task_detail(result.status, result.failure.as_ref(), self.verbose, language);
+                    let output = result.output.as_ref().filter(|_| self.verbose).map(|output| language.translate(
+                        "report.detail.output", &[("output", &output.to_string_lossy())],
+                    ));
+                    for text in detail.as_deref().into_iter().chain(output.as_deref()) {
+                        if rows.len() == height {
+                            rows.pop();
+                            rows.push(Row { id: None, text: clipped(ellipsis(unicode), width, unicode) });
+                            return rows;
+                        }
+                        rows.push(Row { id: Some(id), text: clipped(&format!("{detail_prefix}{text}"), width, unicode) });
+                    }
+                }
+            }
             if !task.children.is_empty() {
                 prefix.push_str(continuation);
                 stack.push((task.children.iter().peekable(), prefix.len(), false));
@@ -378,7 +415,7 @@ fn row_text(
     }
     let available = width - indent;
     let mut line = format!("{prefix}{edge}");
-    if task.carrier {
+    if task.carrier && !matches!(task.phase, Phase::Finished(TaskStatus::Failed)) {
         line.push_str(&clipped(&task.label, available, unicode));
         return line;
     }
@@ -390,8 +427,7 @@ fn row_text(
             Phase::Preparing => "report.status.preparing",
             Phase::Working => "report.status.extracting",
             Phase::Finalizing => "report.status.finalizing",
-            Phase::Finished(true) => "report.status.complete",
-            Phase::Finished(false) => "report.status.error",
+            Phase::Finished(status) => super::task_status_key(status),
         };
         (language.text(status), String::new())
     };
@@ -517,6 +553,101 @@ mod tests {
             path: path.into(),
             depth: if id == 5 { 2 } else { 1 },
             segment,
+        }
+    }
+
+    #[test]
+    fn flatten_relocates_visible_and_buffered_descendant_outputs() {
+        use super::super::reporting::Reports;
+        let terminal = Terminal { size: (140, 40), output: Mutex::default() };
+        let mut panel = Panel::new(true);
+        let reports = Reports::default();
+        for (id, parent) in [(1, None), (2, Some(1)), (3, Some(2)), (4, Some(1)), (5, None)] {
+            panel.update(&terminal, Language::En, queued(id, parent, "nested.zip", None), false);
+        }
+        // A nested descendant is already visible, another is still coalesced,
+        // a segment owns the wrapper, and an unrelated root must stay intact.
+        for (id, path) in [(3, "root/wrapper/leaf/nested/deep"),
+                           (4, "root/wrapper"), (5, "elsewhere/output")] {
+            panel.update(&terminal, Language::En, Event::Finished {
+                id, path: "nested.zip".into(), depth: 1,
+                result: TaskCompletion { status: TaskStatus::Complete, failure: None, output: Some(path.into()) },
+            }, false);
+        }
+        reports.notify(Event::Finished {
+            id: 2, path: "nested.zip".into(), depth: 1,
+            result: TaskCompletion { status: TaskStatus::Complete, failure: None,
+                output: Some("root/wrapper/leaf/nested".into()) },
+        });
+        let (old, new) = (std::path::Path::new("root/wrapper/leaf"), std::path::Path::new("root"));
+        reports.relocate_outputs(old, new);
+        panel.relocate_outputs(old, new);
+        for event in reports.take_events() {
+            panel.update(&terminal, Language::En, event, false);
+        }
+        for (id, expected) in [(2, "root/nested"), (3, "root/nested/deep"),
+                               (4, "root"), (5, "elsewhere/output")] {
+            assert_eq!(panel.tasks[&id].result.as_ref().unwrap().output.as_deref(), Some(std::path::Path::new(expected)));
+        }
+        let rows = panel.rows(terminal.size, true, Language::En);
+        assert!(rows.iter().all(|row| !row.text.contains("wrapper")));
+        assert!(rows.iter().any(|row| row.text.contains("elsewhere")));
+    }
+
+    #[test]
+    fn finished_rows_project_results_while_other_work_is_running() {
+        use crate::pipeline::{Failure, FailureKind};
+        let terminal = Terminal { size: (140, 40), output: Mutex::default() };
+        for verbose in [false, true] {
+            let mut panel = Panel::new(verbose);
+            for (id, path) in [(1, "carrier"), (2, "slow.zip"), (3, "cancelled.zip")] {
+                panel.update(&terminal, Language::En, queued(id, None, path, None), false);
+            }
+            for (id, status) in [(4, TaskStatus::Partial), (5, TaskStatus::Complete)] {
+                panel.update(&terminal, Language::En, queued(id, Some(1), "carrier", Some(Segment {
+                    format: "zip".into(), index: (id - 3) as usize, count: 2,
+                    offset: id * 100, end_offset: Some(id * 100 + 50),
+                })), false);
+                panel.update(&terminal, Language::En, Event::Progress {
+                    id, path: "carrier".into(), completed_bytes: 6, total_bytes: 10,
+                }, false);
+                panel.update(&terminal, Language::En, Event::Finished {
+                    id, path: "carrier".into(), depth: 1,
+                    result: TaskCompletion { status,
+                        failure: (status == TaskStatus::Partial).then(|| Failure::new(FailureKind::Damaged, "raw")),
+                        output: Some(format!("output-{id}").into()),
+                    },
+                }, false);
+            }
+            panel.update(&terminal, Language::En, Event::Finished {
+                id: 3, path: "cancelled.zip".into(), depth: 1,
+                result: TaskCompletion { status: TaskStatus::Failed,
+                    failure: Some(Failure::new(FailureKind::Cancelled, "raw")), output: None },
+            }, false);
+            let rows = panel.rows(terminal.size, true, Language::En);
+            let text = rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(text.contains(Language::En.text("report.status.partial")));
+            assert!(rows.iter().any(|row| row.id == Some(4) && row.text.contains("60%")));
+            assert!(rows.iter().any(|row| row.id == Some(5) && row.text.contains("100%")));
+            assert!(text.contains(Language::En.text("failure.user_interrupted")));
+            assert_eq!(text.contains(Language::En.text("failure.damaged")), verbose);
+            assert_eq!(text.contains("output-4"), verbose);
+            assert_eq!(text.contains("output-5"), verbose);
+            assert!(text.contains("slow.zip"));
+            // Authoritative carrier finalization can change a segment's output.
+            panel.update(&terminal, Language::En, Event::Finished {
+                id: 4, path: "carrier".into(), depth: 1,
+                result: TaskCompletion { status: TaskStatus::Failed,
+                    failure: Some(Failure::new(FailureKind::Damaged, "raw")), output: None },
+            }, false);
+            let text = panel.rows(terminal.size, true, Language::En).into_iter()
+                .map(|row| row.text).collect::<Vec<_>>().join("\n");
+            assert!(!text.contains("output-4"));
+            assert!(text.contains(Language::En.text("failure.damaged")));
+            panel.remove(1);
+            assert!(!panel.tasks.contains_key(&4));
+            assert!(!panel.tasks.contains_key(&5));
+            assert!(panel.tasks.contains_key(&2));
         }
     }
 

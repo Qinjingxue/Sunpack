@@ -40,10 +40,8 @@ impl StateData {
         for (_, record) in self.runtime.range("checkpoint|".to_owned()..)
             .take_while(|(key, _)| key.starts_with("checkpoint|"))
         {
-            for field in ["output", "container"] {
-                if let Some(path) = record[field]["path"].as_str() {
-                    roots.retain_root(path);
-                }
+            for path in crate::pipeline::InputCheckpoint::serialized_output_roots(record) {
+                roots.retain_root(path);
             }
         }
         roots
@@ -474,10 +472,11 @@ mod tests {
         let sibling = base.join("old-sibling");
         let active = affected.join("active");
         let committed = affected.join("committed");
-        let checkpoint = affected.join("checkpoint");
+        let container = affected.join("container");
+        let checkpoint = container.join("segment");
         let flatten = affected.join("flatten");
         let state = NativeWatchState::new();
-        for path in [&stale, &sibling, &active, &committed, &checkpoint, &flatten] {
+        for path in [&stale, &sibling, &active, &committed, &container, &checkpoint, &flatten] {
             put_owned(&state, path, "missing-directory");
         }
         let mut pending = PendingRecord {
@@ -489,20 +488,36 @@ mod tests {
         {
             let mut data = state.lock();
             data.pending.insert(path_key(&pending.path), Arc::new(pending));
-            data.runtime.insert("checkpoint|test".into(), json!({"output":{"path":checkpoint}}));
+            let receipt: crate::pipeline::InputCheckpoint = serde_json::from_value(json!({
+                "schema_version":1,"carrier":base.join("source.zip"),
+                "input":{"entry":base.join("source.zip"),"mode":"file","format":"zip","parts":[],"ranges":[]},
+                "sources":[],"output":checkpoint,"container":container,
+                "files":1,"bytes":1,"encrypted":false,"discovery_source":"embedded",
+                "children_complete":true,"remaining_depth":0
+            })).unwrap();
+            data.runtime.insert("checkpoint|test".into(), serde_json::to_value(receipt).unwrap());
             data.runtime.insert("flatten|test".into(), json!({"root":flatten}));
         }
         state.apply(&state.owned_retirement_operations(&[], Some(&[affected.to_string_lossy().into_owned()])));
         assert!(!has_owned(&state, &stale));
         assert!(has_owned(&state, &sibling)); // "old" must not match "old-sibling".
-        for path in [&active, &committed, &checkpoint, &flatten] {
+        for path in [&active, &committed, &container, &checkpoint, &flatten] {
             assert!(has_owned(&state, path));
         }
         state.apply(&state.owned_retirement_operations(&[], None));
         assert!(!has_owned(&state, &sibling));
-        for path in [&active, &committed, &checkpoint, &flatten] {
+        for path in [&active, &committed, &container, &checkpoint, &flatten] {
             assert!(has_owned(&state, path));
         }
+        // Completion has removed Pending but the entry/checkpoint remains.
+        state.lock().pending.clear();
+        state.apply(&state.owned_retirement_operations(&[], None));
+        assert!(has_owned(&state, &checkpoint));
+        assert!(has_owned(&state, &container));
+        state.lock().runtime.remove("checkpoint|test");
+        state.apply(&state.owned_retirement_operations(&[], None));
+        assert!(!has_owned(&state, &checkpoint));
+        assert!(!has_owned(&state, &container));
         std::fs::remove_file(marker).unwrap();
     }
 

@@ -706,11 +706,25 @@ impl OutputNames {
 
     fn reserve(
         &mut self,
-        mut preferred: PathBuf,
+        preferred: PathBuf,
         result: &ArchiveResult,
         observer: &impl Observer,
         owner: u64,
         input: Option<&Path>,
+    ) -> io::Result<Result<PathBuf, Failure>> {
+        self.allocate(preferred, result, owner, input, |path| observer.register_output(result, path))
+    }
+
+    fn plan(
+        &mut self, preferred: PathBuf, result: &ArchiveResult,
+        owner: u64, input: Option<&Path>,
+    ) -> io::Result<Result<PathBuf, Failure>> {
+        self.allocate(preferred, result, owner, input, |_| Ok(()))
+    }
+
+    fn allocate(
+        &mut self, mut preferred: PathBuf, result: &ArchiveResult,
+        owner: u64, input: Option<&Path>, mut register: impl FnMut(&Path) -> io::Result<()>,
     ) -> io::Result<Result<PathBuf, Failure>> {
         // A different request may own an ancestor even though this leaf does
         // not exist. Number that ancestor, preserving the mirrored suffix.
@@ -752,7 +766,7 @@ impl OutputNames {
                 }
             };
             if !exists {
-                if let Err(error) = observer.register_output(result, &path) {
+                if let Err(error) = register(&path) {
                     let creation_error = error.get_ref().is_some_and(|inner| {
                         inner.is::<super::OutputCreateError>()
                     });
@@ -1081,7 +1095,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         FailureKind::Cancelled, "Operation interrupted",
                     ));
                     self.observer.notify(Event::Finished {
-                        id, path: cancelled.path.clone(), depth, success: false,
+                        id, path: cancelled.path.clone(), depth,
+                        result: super::TaskCompletion::from_result(&cancelled),
                     });
                     outcome.archives.push(cancelled);
                     continue;
@@ -1113,7 +1128,11 @@ impl<'run, O: Observer> Run<'run, O> {
     async fn finish_root(&self, id: TaskId, path: &Path, result: io::Result<Outcome>) -> io::Result<Outcome> {
         if result.as_ref().is_ok_and(Outcome::settled) {
             stage("report", &Cancellation::new()).await?;
-            self.observer.root_finished(id, path, result.unwrap()).await
+            let mut outcome = self.observer.root_finished(id, path, result.unwrap()).await?;
+            if self.request.mode == Mode::Extract {
+                outcome.compact_completed_extract();
+            }
+            Ok(outcome)
         } else { result }
     }
 
@@ -1257,6 +1276,31 @@ impl<'run, O: Observer> Run<'run, O> {
                         .and_then(|root| this.retry_slot_for(&logical.input, root))).flatten()
                 })
                 .collect();
+            // Reserve logical names in input order before discovery/password
+            // failures can return. A planned slot is not a physical output.
+            let mut planned_slots = vec![None; count];
+            if let Some(root) = carrier.as_deref() {
+                for (index, logical) in task.inputs.iter_mut().enumerate() {
+                    let previous = retained[index].or(retry_slots[index])
+                        .filter(|checkpoint| checkpoint.container() == Some(root))
+                        .and_then(InputCheckpoint::output_slot);
+                    let mut names = this.output_names.registry.lock().unwrap();
+                    let slot = previous.filter(|path| names.retain(
+                        path, this.output_names.owner, Path::new(&logical.input.entry_path), Some(root),
+                    ));
+                    if let Some(slot) = slot {
+                        planned_slots[index] = Some(slot.to_owned());
+                    } else {
+                        let result = receipt(&logical.input, task.source, depth);
+                        match names.plan(root.join(archive_name(&logical.input)), &result,
+                            this.output_names.owner, Some(root))?
+                        {
+                            Ok(slot) => planned_slots[index] = Some(slot),
+                            Err(failure) => { logical.failure.get_or_insert(failure); }
+                        }
+                    }
+                }
+            }
             let mut completed = Vec::with_capacity(task.inputs.len());
             let mut outputs_committed = true;
             let mut carrier_children_complete = true;
@@ -1265,8 +1309,8 @@ impl<'run, O: Observer> Run<'run, O> {
             let retry = task.retry.filter(|_| task.inputs.len() == 1);
             let mut promotion_sources = task.owned_paths;
             let mut superseded_candidates = HashSet::new();
-            for (((logical, checkpoint), retry_slot), &id) in
-                task.inputs.into_iter().zip(retained.drain(..)).zip(retry_slots).zip(&ids)
+            for (index, (((logical, checkpoint), retry_slot), &id)) in
+                task.inputs.into_iter().zip(retained.drain(..)).zip(retry_slots).zip(&ids).enumerate()
             {
                 if multi {
                     this.observer.notify(Event::Started {
@@ -1331,13 +1375,15 @@ impl<'run, O: Observer> Run<'run, O> {
                     let retry_output = if let Some(previous) = retry_slot {
                         stage("preflight", cancel).await?;
                         let result = previous.result(depth);
-                        let cleared = this.discard_failed_output(&result, previous.output(), &mut outcome)?;
+                        let slot = previous.output_slot().expect("selected retry slot");
+                        let cleared = !previous.has_output()
+                            || this.discard_failed_output(&result, slot, &mut outcome)?;
                         // Main records cleanup errors but still executes this
                         // selected input in its fixed slot. Never turn the old
                         // result into a receipt for the changed dependencies.
-                        Some(if cleared { RetryOutput::Recreate(previous.output()) }
-                             else { RetryOutput::Existing(previous.output()) })
-                    } else { None };
+                        Some(if cleared { RetryOutput::Recreate(slot) }
+                             else { RetryOutput::Existing(slot) })
+                    } else { planned_slots[index].as_deref().map(RetryOutput::Recreate) };
                     this.execute_input(
                         logical,
                         id,
@@ -1452,7 +1498,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         id,
                         path: result.path.clone(),
                         depth,
-                        success: result.failure.is_none() || result.partial,
+                        result: super::TaskCompletion::from_result(&result),
                     });
                 }
                 parent_outputs.push((result, inventory, input, id, children_already_complete, remaining_depth));
@@ -1529,12 +1575,11 @@ impl<'run, O: Observer> Run<'run, O> {
             // Join every writer before committing or cleaning up, then restore
             // logical segment order, including segments with no recursive work.
             descendants.sort_unstable_by_key(|(index, _)| *index);
-            for (_, descendant) in descendants {
+            for (index, descendant) in descendants {
                 let (mut result, input, children_already_complete, remaining_depth, mut descendants, ran_recursive_children) = descendant?;
                 stage("output_state", &Cancellation::new()).await?;
-                let children_complete = children_already_complete
+                let mut children_complete = children_already_complete
                     || (!cancel.cancelled() && subtree_complete(&descendants));
-                carrier_children_complete &= children_complete;
                 if ran_recursive_children
                     && result.failure.is_none()
                     && children_complete
@@ -1565,7 +1610,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     flatten_result(
                         &*this.observer, &mut result, &mut descendants, Some(&this.created_outputs),
                     )?;
+                    children_complete &= subtree_complete(&descendants);
                 }
+                carrier_children_complete &= children_complete;
                 let mut checkpoint = if this.request.mode == Mode::Extract {
                     InputCheckpoint::create(
                         &owner_path,
@@ -1580,6 +1627,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     None
                 };
                 if let Some(checkpoint) = &mut checkpoint {
+                    checkpoint.set_planned_output(planned_slots[index].as_deref());
                     checkpoint.set_password_signature(|| candidates.signature(&input.entry_path));
                 }
                 // A cancelled newly created root remains uncommitted until
@@ -1775,6 +1823,16 @@ impl<'run, O: Observer> Run<'run, O> {
             if this.request.mode == Mode::Extract {
                 project_possible_missing_volume(&mut completed, split_input);
             }
+            // Refresh segment rows after carrier policy, promotion and flattening,
+            // just as main's task_finished refreshes its input_results.
+            if multi {
+                for (&id, result) in ids.iter().zip(&completed) {
+                    this.observer.notify(Event::Finished {
+                        id, path: result.path.clone(), depth,
+                        result: super::TaskCompletion::from_result(result),
+                    });
+                }
+            }
             if let Some(result) = completed.first() {
                 this.observer.notify(Event::Finished {
                     id: task_id,
@@ -1784,11 +1842,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         result.path.clone()
                     },
                     depth,
-                    success: if multi {
-                        complete
-                    } else {
-                        result.failure.is_none() || result.partial
-                    },
+                    result: super::TaskCompletion::from_group(&completed),
                 });
             }
             outcome.archives.extend(completed);
@@ -2033,7 +2087,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 // The root was retained through an unchanged sibling above.
                 // Claim only this logical child, never delete the carrier root.
                 self.output_names.registry.lock().unwrap().retain(
-                    checkpoint.output(), self.output_names.owner,
+                    checkpoint.output_slot().expect("matching output slot"), self.output_names.owner,
                     Path::new(&input.entry_path), Some(carrier),
                 ).then_some(checkpoint)
             })
@@ -2208,6 +2262,9 @@ impl<'run, O: Observer> Run<'run, O> {
                 });
             }
         };
+        if plan.verified {
+            result.password = plan.selected.as_deref().map(str::to_owned);
+        }
         let codepage = if self.request.mode == Mode::Extract
             && input.format_hint == "zip"
             && input.volume_attempts.is_none()
@@ -2387,6 +2444,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     let mut failure = classify_worker_failure(value, plan.evidence, split);
                     if failure.kind == FailureKind::WrongPassword && !plan.has_candidates {
                         failure = Failure::password_required();
+                    }
+                    if matches!(failure.kind, FailureKind::WrongPassword | FailureKind::PasswordInconclusive) {
+                        result.password = None;
                     }
                     if failure.kind == FailureKind::Damaged && flag(value, "password_crc_proven") {
                         result.password = plan
@@ -2669,7 +2729,7 @@ fn flatten_result(
     }
     if let (Some(old), Some(new)) = (stats.source_dir, stats.output_dir) {
         // Settle the durable pre-move receipts before publishing rebased ones.
-        observer.after_flatten(&new)?;
+        observer.after_flatten(&old, &new)?;
         // Successful flatten commonly keeps the root spelling unchanged while
         // moving its leaf's descendants. Rebase rollback receipts with the same
         // mapping as checkpoints, before any fallible durable publication.
@@ -2682,12 +2742,7 @@ fn flatten_result(
         }
         for child in &mut children.archives {
             if let Some(path) = child.output.as_mut() {
-                if let Ok(suffix) = path.strip_prefix(&old) {
-                    *path = new.join(suffix);
-                } else if old.starts_with(&*path) && path.starts_with(&new) {
-                    // A carrier segment may own a wrapper above the leaf.
-                    *path = new.clone();
-                }
+                super::relocate_flatten_output(path, &old, &new);
             }
         }
         for receipt in &mut children.cleanup_results {
@@ -3042,6 +3097,10 @@ fn remove_empty_or_promoted(output: &Path, promoted_dirs: &[String]) -> bool {
 
 fn subtree_complete(outcome: &Outcome) -> bool {
     !outcome.scan_incomplete
+        // Source deletion/recycling warnings do not invalidate extraction, but
+        // a failed namespace flatten must stop ancestors from flattening it.
+        && !outcome.cleanup_results.iter().any(|cleanup|
+            cleanup.mode == "flatten" && cleanup.status == CleanupStatus::Failed)
         && !outcome
             .errors
             .iter()
@@ -3999,6 +4058,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn worker_failure_preserves_only_noncontradicted_strong_password() {
+        use crate::scan::worker_wire::NativeWorkerFrameDecoder;
+        struct Input(mpsc::Sender<Vec<u8>>);
+        impl io::Write for Input {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let _ = self.0.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let source = crate::test_support::temp_file("verified_failure", &encrypted_rar_fixture());
+        for (failure, kind, expected) in [
+            ("unsupported_method", FailureKind::Unsupported, Some("secret")),
+            ("encrypted_or_wrong_password", FailureKind::WrongPassword, None),
+        ] {
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(Vec::new(), Mode::Scan);
+            let observer = |_: Event| {};
+            let mut run = test_run(&engine, &request, &observer);
+            Arc::get_mut(&mut run).unwrap().candidates = CandidateSet::new(
+                Arc::from([Arc::from("secret")]), None, &engine.password_attempts, None,
+            );
+            let (sent, received) = mpsc::channel();
+            let process = Process::with_test_input(Input(sent));
+            engine.worker.lock().unwrap().process = Some(Arc::clone(&process));
+            let responder = std::thread::spawn(move || {
+                let bytes = received.recv().unwrap();
+                let mut decoder = NativeWorkerFrameDecoder::default();
+                let frames = decoder.feed(&bytes).unwrap();
+                decoder.finish().unwrap();
+                let request = &frames[0].summary;
+                let id = &request["job_id"];
+                process.test_event(json!({"type":"result", "job_id":id,
+                    "status":"error", "failure_kind":failure,
+                    "unsupported_method":failure == "unsupported_method",
+                    "failure_stage":"item_extract", "encrypted":true}));
+                process.test_event(json!({"type":"native_event", "event":"job_finished", "job_id":id}));
+                request.clone()
+            });
+            let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "encrypted".into());
+            input.analysis.password_required = true;
+            // No discovery-supplied password: only the real probe's strong
+            // plan can populate the failed result, not an existing receipt.
+            let logical = LogicalInput { input, password: None, failure: None };
+            let mut shell = engine.shell.branch();
+            let mut outcome = Outcome::default();
+            let result = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
+                Box::pin(run.execute_input(logical, 1, DiscoverySource::Direct,
+                    1, None, None, &run.candidates, &mut shell, &mut outcome))
+            }).unwrap().result;
+            let submitted = responder.join().unwrap();
+            assert_eq!(submitted["password_verified"], true);
+            assert_eq!(submitted["password"], "secret");
+            assert_eq!(result.failure.unwrap().kind, kind);
+            assert_eq!(result.password.as_deref(), expected);
+        }
+        release_reader_resources_under_roots(vec![source.to_string_lossy().into_owned()]).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
     fn test_run<'a, O: Observer>(
         engine: &'a Engine,
         request: &'a Request,
@@ -4454,14 +4574,18 @@ mod tests {
         fs::remove_file(marker).unwrap();
     }
 
+    fn encrypted_rar_fixture() -> Vec<u8> {
+        let hex = "526172211a07010074de7b1c21040000010f7b64253244702e2a32eb93579555a37d38b616cb97898c463d3682920551724ed0c1c974029cc2b8ef8491fc816311daa1b0410f6115608170466e4948a8c6d4f17e28b08c727b4acfc116d3d075ce011963dc0c72e50a803d9036619810e92352e809830c9463ab4a0abdaab61e008218673e9c51409f76b2064bf7982e56d8173f1e387329bd5aca3bac49063545fcbfc19547d2be214b4fe1dae172b250e168f2a258548930b1763fb500c7869d70f2539d86fd19214dcc3bca1363154b0a0f2b0bba7dcc224ec1893cbc31cfa95158ccf5e96d74921de6f268ea4429e2ddf63d49220005742fef059f868372345f071322a7e690d56d5ac17b563fa9e923076fa2c58aa8e88e9843df17b7e79a30ca936d8215c92f6832f86887c3c3160ecfddfcdf7712382f84f39eb8";
+        (0..hex.len()).step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap()).collect()
+    }
+
     #[test]
     fn recursive_discovery_waits_for_consent_and_releases_the_manifest() {
         // Real RAR5 -hp fixture (password "secret"). A real successful probe
         // changes this request's password cache, so this catches discovery moved
         // above the prompt without a mock or process-global test counters.
-        let hex = "526172211a07010074de7b1c21040000010f7b64253244702e2a32eb93579555a37d38b616cb97898c463d3682920551724ed0c1c974029cc2b8ef8491fc816311daa1b0410f6115608170466e4948a8c6d4f17e28b08c727b4acfc116d3d075ce011963dc0c72e50a803d9036619810e92352e809830c9463ab4a0abdaab61e008218673e9c51409f76b2064bf7982e56d8173f1e387329bd5aca3bac49063545fcbfc19547d2be214b4fe1dae172b250e168f2a258548930b1763fb500c7869d70f2539d86fd19214dcc3bca1363154b0a0f2b0bba7dcc224ec1893cbc31cfa95158ccf5e96d74921de6f268ea4429e2ddf63d49220005742fef059f868372345f071322a7e690d56d5ac17b563fa9e923076fa2c58aa8e88e9843df17b7e79a30ca936d8215c92f6832f86887c3c3160ecfddfcdf7712382f84f39eb8";
-        let rar: Vec<_> = (0..hex.len()).step_by(2)
-            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap()).collect();
+        let rar = encrypted_rar_fixture();
         let source = crate::test_support::temp_file("recursive_consent", b"source");
         let root = source.with_extension("output");
         fs::create_dir(&root).unwrap();
@@ -4977,6 +5101,28 @@ mod tests {
             fs::remove_dir_all(&root).unwrap();
           }
         }
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn failed_segment_plans_name_without_creating_recoverable_output() {
+        let source = crate::test_support::temp_file("planned_segment", b"carrier");
+        let root = source.with_extension("output");
+        fs::create_dir(&root).unwrap();
+        let preferred = root.join("segment");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "segment".into());
+        let result = receipt(&input, DiscoverySource::Embedded, 1);
+        let mut names = OutputNames::default();
+        let failed = names.plan(preferred.clone(), &result, 1, None).unwrap().unwrap();
+        let sibling = names.plan(preferred.clone(), &result, 1, None).unwrap().unwrap();
+        assert_eq!(failed, preferred);
+        assert_eq!(sibling, numbered(&preferred, 1));
+        assert!(!failed.exists() && !sibling.exists());
+        names.release(1);
+        assert!(names.retain(&failed, 2, &source, Some(&root)));
+        assert!(names.retain(&sibling, 2, &source, Some(&root)));
+        assert_eq!(names.plan(preferred.clone(), &result, 2, None).unwrap().unwrap(), numbered(&preferred, 2));
+        fs::remove_dir(root).unwrap();
         fs::remove_file(source).unwrap();
     }
 
@@ -5680,16 +5826,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn flatten_failure_keeps_extraction_successful_and_reports_output() {
-        struct DenyFlatten;
-        impl Observer for DenyFlatten {
-            fn notify(&self, _: Event) {}
-
-            fn before_flatten(&self, _: &Path, _: &Path, _: &Path) -> io::Result<()> {
-                Err(io::ErrorKind::PermissionDenied.into())
-            }
-        }
-
+        use std::os::windows::fs::OpenOptionsExt;
         let source = crate::test_support::temp_file("flatten_warning", b"input");
         let output = source.with_extension("output");
         let wrapper = output.join("wrapper");
@@ -5704,19 +5843,117 @@ mod tests {
         archive.output = Some(output.clone());
         let mut outcome = Outcome::default();
 
-        let result = flatten_result(&DenyFlatten, &mut archive, &mut outcome, None);
+        // A real directory handle without FILE_SHARE_DELETE prevents the
+        // root rename; ordinary source-cleanup warnings must remain distinct.
+        let held = fs::OpenOptions::new().access_mode(0x80).share_mode(3)
+            .custom_flags(0x0200_0000).open(&output).unwrap();
+        let result = flatten_result(&|_: Event| {}, &mut archive, &mut outcome, None);
         let payload = fs::read(wrapper.join("payload.txt"));
+        drop(held);
         fs::remove_dir_all(&output).unwrap();
-        fs::remove_file(source).unwrap();
+        fs::remove_file(&source).unwrap();
 
         result.unwrap();
         outcome.archives.push(archive);
         assert_eq!(outcome.succeeded(), 1);
         assert_eq!(outcome.failed(), 0);
+        assert!(!subtree_complete(&outcome), "ancestors must not flatten an unsettled child");
+        let mut source_warning = Outcome::default();
+        record_cleanup(&mut source_warning, &source, "delete", Err(io::ErrorKind::PermissionDenied.into()));
+        assert!(subtree_complete(&source_warning), "source cleanup alone does not block ancestors");
         assert_eq!(outcome.archives[0].output.as_ref(), Some(&output));
         assert_eq!(payload.unwrap(), b"payload");
         assert!(
             matches!(&outcome.cleanup_results[..], [CleanupResult { path, mode: "flatten", status: CleanupStatus::Failed, .. }] if path == &output)
         );
+    }
+
+    #[test]
+    fn completed_extract_compacts_segments_but_keeps_nested_summary_and_retry_receipts() {
+        struct DetailedPublication(std::sync::atomic::AtomicBool);
+        impl Observer for DetailedPublication {
+            fn notify(&self, _: Event) {}
+            async fn root_finished(&self, _: TaskId, _: &Path, outcome: Outcome) -> io::Result<Outcome> {
+                assert_eq!(outcome.archives.len(), 3);
+                assert_eq!(outcome.checkpoints.len(), 3);
+                assert!(outcome.archives.iter().all(|entry| !entry.source_paths.is_empty() && entry.password.is_some()));
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(outcome)
+            }
+        }
+        let source = crate::test_support::temp_file("completed_extract_summary", b"source");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        let generations = HashMap::from([
+            (path_key(&source.to_string_lossy()), capture_file_generation(&source).unwrap()),
+        ]);
+        let output = source.with_extension("output");
+        // None: successful physical carrier. Failure/partial: receipts must
+        // remain available for CLI retry and durable observer publication.
+        for (mode, failure_kind, partial, uncommitted) in [
+            (Mode::Extract, None, false, false),
+            (Mode::Extract, Some(FailureKind::WrongPassword), false, false),
+            (Mode::Extract, Some(FailureKind::Damaged), true, false),
+            (Mode::Extract, None, false, true),
+            (Mode::Scan, None, false, false),
+        ] {
+            let mut outcome = Outcome::default();
+            for index in 0..3 {
+                let mut archive = receipt(&input, DiscoverySource::Embedded, if index == 2 { 2 } else { 1 });
+                if index == 2 { archive.path = output.join("nested.zip"); }
+                archive.offset = index * 100;
+                archive.output = Some(output.join(format!("segment{index}")));
+                archive.files = 1;
+                archive.bytes = 10;
+                archive.password = Some("successful-password".into());
+                if index == 1 {
+                    archive.partial = partial;
+                    archive.failure = failure_kind.map(|kind| {
+                        let mut failure = Failure::new(kind, "worker diagnostic");
+                        failure.evidence = worker_evidence(&json!({"failure_stage": "item_extract"}), None, None);
+                        failure
+                    });
+                }
+                outcome.checkpoints.push(InputCheckpoint::create(
+                    &source, &input, &archive, &generations, None, true, 0,
+                ).unwrap());
+                outcome.archives.push(archive);
+            }
+            outcome.uncommitted = uncommitted;
+            let before = serde_json::to_value(&outcome.checkpoints).unwrap();
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(Vec::new(), mode);
+            let observer = DetailedPublication(std::sync::atomic::AtomicBool::new(false));
+            let run = test_run(&engine, &request, &observer);
+            let outcome = Scheduler::new().run(1, request.origin, &request.cancel, |_| {
+                Box::pin(run.finish_root(1, &source, Ok(outcome)))
+            }).unwrap();
+            assert_eq!(observer.0.load(std::sync::atomic::Ordering::SeqCst), !uncommitted);
+            if uncommitted || mode == Mode::Scan {
+                assert_eq!(outcome.archives.len(), 3);
+                assert!(outcome.archives.iter().all(|entry| entry.password.is_some()));
+                assert_eq!(serde_json::to_value(&outcome.checkpoints).unwrap(), before);
+            } else if failure_kind.is_some() {
+                assert_eq!(outcome.archives.len(), 3);
+                assert_eq!(serde_json::to_value(&outcome.checkpoints).unwrap(), before);
+                let failure = outcome.archives[1].failure.as_ref().unwrap();
+                assert_eq!(Some(failure.kind), failure_kind);
+                assert_eq!(failure.message, "worker diagnostic");
+                assert_eq!(failure.evidence.as_ref().unwrap().stage.as_deref(), Some("item_extract"));
+                assert_eq!(outcome.archives[1].partial, partial);
+                assert!(outcome.archives.iter().all(|entry| entry.source_paths.is_empty() && entry.password.is_none()));
+            } else {
+                assert!(outcome.checkpoints.is_empty());
+                assert_eq!(outcome.checkpoints.capacity(), 0);
+                assert_eq!(outcome.archives.len(), 2);
+                assert_eq!(outcome.archives[0].output.as_ref(), Some(&output));
+                assert_eq!((outcome.archives[0].files, outcome.archives[0].bytes), (2, 20));
+                assert_eq!(outcome.archives[1].depth, 2);
+                assert_eq!(outcome.archives[1].path, output.join("nested.zip"));
+                assert_eq!(outcome.succeeded(), 2);
+                assert_eq!(outcome.failed(), 0);
+                assert!(outcome.archives.iter().all(|entry| entry.source_paths.is_empty() && entry.password.is_none()));
+            }
+        }
+        fs::remove_file(source).unwrap();
     }
 }

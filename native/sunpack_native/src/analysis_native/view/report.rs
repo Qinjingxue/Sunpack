@@ -392,14 +392,6 @@ impl AnalysisBinaryView {
             .iter()
             .copied()
             .min_by_key(|index| evidences[*index].range_key());
-        let best = best_selected.or_else(|| {
-            evidences
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| status_rank(e.status) != 0)
-                .max_by_key(|(index, e)| (status_rank(e.status), std::cmp::Reverse(*index)))
-                .map(|(i, _)| i)
-        });
         let plan = SegmentPlan::build(&evidences, &selected, size)?;
         let to_segment = |(evidence, index): (usize, usize)| -> io::Result<AnalysisSegment> {
             let evidence = &evidences[evidence];
@@ -422,7 +414,7 @@ impl AnalysisBinaryView {
             .map(to_segment)
             .collect::<io::Result<_>>()?;
         let password_segment = plan.password_segment.map(to_segment).transpose()?;
-        let primary = best.map(|index| &evidences[index]);
+        let primary = best_selected.map(|index| &evidences[index]);
         let mut facts = primary
             .map(Evidence::analysis_facts)
             .transpose()?

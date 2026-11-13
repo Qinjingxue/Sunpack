@@ -818,7 +818,7 @@ pub(crate) struct NativeWatchReplay {
 
 fn entry_event(record: &EntryRecord) -> Value {
     serde_json::json!({"event":record.status,"path":record.path,"ts":record.last_attempt_at,
-        "error":crate::event_log::diagnostic_text(&record.last_error)})
+        "error":crate::event_log::diagnostic_text(&record.last_error),"error_kind":record.failure_kind})
 }
 
 pub(crate) struct NativeWatchState {
@@ -1703,6 +1703,22 @@ fn replay_segment_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replayed_entry_event_keeps_business_failure_kind_and_message() {
+        let entry = EntryRecord {
+            path: r"C:\input\archive.zip".into(),
+            status: "failed_retryable".into(),
+            failure_kind: "wrong_password".into(),
+            last_error: "密码不在密码列表中".into(),
+            size: 0, mtime: 0.0, file_id: String::new(), change_usn: 0,
+            attempt_count: 1, failure_stage: String::new(),
+            failure_payload: Map::new(), last_attempt_at: 0.0
+        };
+        let event = entry_event(&entry);
+        assert_eq!(event["error_kind"], "wrong_password");
+        assert_eq!(event["error"], entry.last_error);
+    }
 
     #[test]
     fn carrier_outputs_survive_legacy_snapshot_and_incremental_replay() {

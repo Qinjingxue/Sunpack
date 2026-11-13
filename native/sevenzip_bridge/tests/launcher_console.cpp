@@ -26,7 +26,12 @@ void development_entrypoint_contract() {
             const auto context = install_context(executable.wstring());
             const auto target = std::wstring(arch) == L"arm64" ? L"aarch64-pc-windows-msvc" : L"x86_64-pc-windows-msvc";
             const auto expected = root / L".cache" / L"rust-target" / arch / target / profile / L"sunpack-runtime.exe";
-            require(context.directory == root.wstring() && context.runtime == expected.wstring(), "native source layout");
+            require(context.directory == root.wstring() && context.runtime == expected.wstring() &&
+                    context.data_dir == root.wstring(), "native source layout");
+            require(state_path(context) == (root / (L"runtime-" + wide_utf8(context.runtime_id) + L".state")).wstring(),
+                    "source launcher and runtime share the state directory");
+            std::ofstream(root / L"sunpack_config.json") << "{\"cli\":{\"language\":\"zh\"}}";
+            require(cli_language_from_config(context) == "zh", "source writable config language");
         }
     }
     const auto installed = root / L"package";
@@ -34,6 +39,7 @@ void development_entrypoint_contract() {
     std::ofstream(installed / L"sunpack-runtime.exe") << "runtime";
     const auto context = install_context((installed / L"bin" / L"sunpack.exe").wstring());
     require(context.directory == installed.wstring() && context.runtime == (installed / L"sunpack-runtime.exe").wstring(), "packaged layout unchanged");
+    require(context.data_dir == program_data_dir(), "packaged writable data remains ProgramData");
     fs::remove_all(root);
 }
 
