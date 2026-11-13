@@ -786,7 +786,6 @@ pub(crate) trait Observer: Send + Sync {
 pub(crate) enum WorkerUpdates {
     #[default]
     All,
-    Resources,
     None,
 }
 

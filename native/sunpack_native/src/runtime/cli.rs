@@ -390,13 +390,13 @@ fn looks_like_option(arg: &str) -> bool {
     // Numeric negative values can be passed as separate arguments, including passwords.
     !value.is_empty()
         && !arg.contains(' ')
-        && !value.bytes().all(|byte| byte.is_ascii_digit())
+        && !value.chars().all(|character| config::decimal_digit(character).is_some())
         && !value.split_once('.').is_some_and(|(integer, fraction)| {
             !fraction.is_empty()
                 && integer
-                    .bytes()
-                    .chain(fraction.bytes())
-                    .all(|byte| byte.is_ascii_digit())
+                    .chars()
+                    .chain(fraction.chars())
+                    .all(|character| config::decimal_digit(character).is_some())
         })
 }
 
@@ -977,30 +977,21 @@ impl Progress {
         if self.cancel.cancelled() {
             return;
         }
-        if self.session.interactive() {
-            if self.cancel.cancelled() {
-                return;
+        // Keep one task-tree model for both final reports and live rendering.
+        // Noninteractive sessions only update the model; no terminal frame is made.
+        let interactive = self.session.interactive();
+        if !interactive {
+            if let Event::ResourceWait { path, state, .. } = &event {
+                if state.disk {
+                    let (status, hint) = live::wait_status(state, self.language);
+                    let filename = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                    let _ = line(self.session.as_ref(), Stream::Err, &format!("{filename}: {status} — {hint}"));
+                }
             }
-            let prompting = display.prompting;
-            display
-                .panel
-                .get_or_insert_with(|| live::Panel::new(self.verbose))
-                .update(self.session.as_ref(), self.language, event, prompting);
-        } else if let Event::ResourceWait { path, state, .. } = event {
-            if !state.disk {
-                return;
-            }
-            let (status, hint) = live::wait_status(state, self.language);
-            let filename = path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy();
-            let _ = line(
-                self.session.as_ref(),
-                Stream::Err,
-                &format!("{filename}: {status} — {hint}"),
-            );
         }
+        let prompting = display.prompting || !interactive;
+        display.panel.get_or_insert_with(|| live::Panel::new(self.verbose))
+            .update(self.session.as_ref(), self.language, event, prompting);
     }
 
     fn finish_scope(&self, id: TaskId, archives: &[ArchiveResult]) -> io::Result<()> {
@@ -1040,10 +1031,8 @@ impl Observer for Progress {
         use crate::pipeline::WorkerUpdates;
         if !self.visible {
             WorkerUpdates::None
-        } else if self.session.interactive() {
-            WorkerUpdates::All
         } else {
-            WorkerUpdates::Resources
+            WorkerUpdates::All
         }
     }
 
@@ -1217,13 +1206,62 @@ impl<'a> ScopeReport<'a> {
     }
 
     fn write(&self, writer: &mut impl Write) -> io::Result<()> {
+        enum Visit {
+            Group(usize, Option<bool>),
+            Segment(usize, usize, bool),
+            Archive(usize),
+            Restore(usize),
+        }
         let mut prefix = String::new();
+        let mut pending = Vec::new();
         if self.archives.len() == 1 {
             Self::title(writer, "", "", &Self::name(&self.archives[0]))?;
-            return self.status_and_children(writer, 0, &mut prefix);
+            pending.push(Visit::Archive(0));
+        } else {
+            pending.extend(self.roots.iter().rev().map(|&root| Visit::Group(root, None)));
         }
-        for &root in &self.roots {
-            self.group(writer, root, &mut prefix, None)?;
+        while let Some(visit) = pending.pop() {
+            match visit {
+                Visit::Restore(len) => prefix.truncate(len),
+                Visit::Group(group, last) => {
+                    let range = self.groups[group].clone();
+                    let (edge, continuation) = last.map_or(("", ""), |last| tree_edge(self.unicode, last));
+                    Self::title(writer, &prefix, edge, &Self::name(&self.archives[range.start]))?;
+                    pending.push(Visit::Restore(prefix.len()));
+                    prefix.push_str(continuation);
+                    if range.len() == 1 {
+                        pending.push(Visit::Archive(range.start));
+                    } else {
+                        let result = crate::pipeline::TaskCompletion::from_group(&self.archives[range.clone()]);
+                        if result.status == TaskStatus::Failed {
+                            let status = live::status_text(self.language.text(task_status_key(result.status)), None, "", None);
+                            writeln!(writer, "{prefix}  {status}")?;
+                        }
+                        let end = range.end;
+                        for (number, position) in range.enumerate().rev() {
+                            pending.push(Visit::Segment(position, number + 1, position + 1 == end));
+                        }
+                    }
+                }
+                Visit::Segment(position, number, last) => {
+                    let item = &self.archives[position];
+                    let label = self.language.translate("cli.scan.segment", &[("index", &number.to_string())]);
+                    let label = format!("{label} ({}) [{}, {})", item.format, item.offset, end_offset(item));
+                    let (edge, continuation) = tree_edge(self.unicode, last);
+                    Self::title(writer, &prefix, edge, &label)?;
+                    pending.push(Visit::Restore(prefix.len()));
+                    prefix.push_str(continuation);
+                    pending.push(Visit::Archive(position));
+                }
+                Visit::Archive(position) => {
+                    self.status(writer, position, &prefix)?;
+                    if let Some(children) = self.children.get(position) {
+                        for (index, &child) in children.iter().enumerate().rev() {
+                            pending.push(Visit::Group(child, Some(index + 1 == children.len())));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1236,46 +1274,6 @@ impl<'a> ScopeReport<'a> {
             .to_string_lossy()
     }
 
-    fn group(
-        &self,
-        writer: &mut impl Write,
-        group: usize,
-        prefix: &mut String,
-        last: Option<bool>,
-    ) -> io::Result<()> {
-        let range = self.groups[group].clone();
-        let (edge, continuation) = last.map_or(("", ""), |last| tree_edge(self.unicode, last));
-        let name = Self::name(&self.archives[range.start]);
-        let len = prefix.len();
-        Self::title(writer, prefix, edge, &name)?;
-        prefix.push_str(continuation);
-        if range.len() == 1 {
-            self.status_and_children(writer, range.start, prefix)?;
-        } else {
-            let end = range.end;
-            for (number, position) in range.enumerate() {
-                let item = &self.archives[position];
-                let label = self
-                    .language
-                    .translate("cli.scan.segment", &[("index", &(number + 1).to_string())]);
-                let label = format!(
-                    "{label} ({}) [{}, {})",
-                    item.format,
-                    item.offset,
-                    end_offset(item)
-                );
-                let (edge, continuation) = tree_edge(self.unicode, position + 1 == end);
-                let segment_prefix = prefix.len();
-                Self::title(writer, prefix, edge, &label)?;
-                prefix.push_str(continuation);
-                self.status_and_children(writer, position, prefix)?;
-                prefix.truncate(segment_prefix);
-            }
-        }
-        prefix.truncate(len);
-        Ok(())
-    }
-
     fn title(writer: &mut impl Write, prefix: &str, edge: &str, label: &str) -> io::Result<()> {
         let label = if label.contains(['\r', '\n']) {
             Cow::Owned(label.replace(['\r', '\n'], " "))
@@ -1285,11 +1283,11 @@ impl<'a> ScopeReport<'a> {
         writeln!(writer, "{prefix}{edge}{label}")
     }
 
-    fn status_and_children(
+    fn status(
         &self,
         writer: &mut impl Write,
         position: usize,
-        prefix: &mut String,
+        prefix: &str,
     ) -> io::Result<()> {
         let item = &self.archives[position];
         let status = task_status_key(TaskStatus::of(item));
@@ -1310,11 +1308,6 @@ impl<'a> ScopeReport<'a> {
                 &[("output", &output.to_string_lossy())],
             );
             Self::title(writer, prefix, "  ", &detail)?;
-        }
-        if let Some(children) = self.children.get(position) {
-            for (i, &child) in children.iter().enumerate() {
-                self.group(writer, child, prefix, Some(i + 1 == children.len()))?;
-            }
         }
         Ok(())
     }
@@ -1988,11 +1981,13 @@ fn report_scan(
             } else {
                 let multiple = group.len() > 1;
                 let last = index + 1 == group.len();
-                let (edge, prefix) = if !multiple {
-                    ("", "  ")
-                } else {
+                let (edge, continuation) = if multiple {
                     tree_edge(session.unicode(), last)
+                } else {
+                    ("", "")
                 };
+                let prefix = format!("{continuation}  ");
+                let prefix = prefix.as_str();
                 if multiple {
                     let text = language
                         .translate("cli.scan.segment", &[("index", &(index + 1).to_string())]);
@@ -2694,6 +2689,11 @@ mod option_tests {
         assert!(value.verbose);
         assert_eq!(value.passwords.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), ["secret", "-.5", "-with space"]);
         assert_eq!(value.paths, ["--no-b"]);
+        for password in ["-１２３", "-١٢٣", "-१२३", "-.１２", "-١.٢"] {
+            let value = parse(&["passwords", "--no-bpw", "--password", password, "--json"]).unwrap();
+            assert_eq!(value.passwords[0].as_ref(), password);
+        }
+        assert!(parse(&["passwords", "--password", "-²"]).is_err());
         assert_eq!(parse(&["extract", "a.zip", "--", "-b.zip"]).unwrap().paths, ["a.zip", "-b.zip"]);
         let value = parse(&["watch", "--json", "--", "start", "--once"]).unwrap();
         assert!(value.once);
@@ -2740,6 +2740,7 @@ mod recursive_prompt_tests {
     #[derive(Default)]
     struct Input {
         interactive: bool,
+        ascii: bool,
         cancel_input: bool,
         reads: std::sync::atomic::AtomicUsize,
         answers: Mutex<VecDeque<String>>,
@@ -2762,7 +2763,7 @@ mod recursive_prompt_tests {
         }
         fn interactive(&self) -> bool { self.interactive }
         fn input_is_terminal(&self) -> bool { false }
-        fn unicode(&self) -> bool { true }
+        fn unicode(&self) -> bool { !self.ascii }
         fn terminal_size(&self) -> (usize, usize) { (80, 25) }
     }
 
@@ -2822,19 +2823,24 @@ mod recursive_prompt_tests {
 
     #[test]
     fn settled_failure_and_partial_trees_keep_the_last_known_progress() {
-        for (partial, known) in [(false, true), (true, true), (false, false)] {
-            let input = Arc::new(Input { interactive: true, ..Input::default() });
+        for (partial, known, interactive) in [
+            (false, true, true), (true, true, true), (false, false, true),
+            (false, true, false), (true, true, false), (false, false, false),
+        ] {
+            let input = Arc::new(Input { interactive, ..Input::default() });
             let progress = Progress {
                 session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
                 cancel: Cancellation::new(), language: Language::En,
                 display: Mutex::default(), reporting: reporting::Reports::default(),
                 branches: Mutex::default(), prompt: false, visible: true, verbose: false,
             };
+            assert!(matches!(progress.worker_updates(), crate::pipeline::WorkerUpdates::All));
             progress.notify(Event::Queued { id: 7, parent: None, path: "embedded.bin".into(), depth: 1, segment: None });
             if known {
                 progress.notify(Event::Progress { id: 7, path: "embedded.bin".into(), completed_bytes: 40, total_bytes: 100 });
             }
             progress.flush_events();
+            if !interactive { assert!(input.stdout.lock().unwrap().is_empty()); }
             input.stdout.lock().unwrap().clear();
             let archive = ArchiveResult {
                 path: "embedded.bin".into(), format: "zip".into(), output: None,
@@ -2851,10 +2857,85 @@ mod recursive_prompt_tests {
             let expected = if known { " [########------------]  40%" } else { " [--------------------]  --%" };
             assert!(text.contains(&format!("[{status}]{expected}")), "{text}");
             assert!(!text.contains("100%"), "{text}");
+            if !interactive { assert!(!text.contains('\x1b'), "{text}"); }
             input.stdout.lock().unwrap().clear();
             progress.flush_events();
             assert!(input.stdout.lock().unwrap().is_empty());
         }
+    }
+
+    fn report_archive(path: &str, offset: u64) -> ArchiveResult {
+        ArchiveResult {
+            path: path.into(), format: "zip".into(), output: None, failure: None,
+            files: 0, bytes: 0, encrypted: None, depth: 1, offset,
+            end_offset: None, volume_completeness: None, volume_attempts: None,
+            source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Direct,
+            damage_flags: None, partial: false, retained: false, recovered_complete_files: 0,
+            promoted: false, promotion_original_path: None,
+        }
+    }
+
+    // Checks the carrier/segment hierarchy in both final output modes, including
+    // failed parent status and the shared two-space detail indentation.
+    #[test]
+    fn carrier_final_and_scan_reports_keep_parent_status_and_detail_indentation() {
+        for ascii in [false, true] {
+            let input = Arc::new(Input { ascii, ..Input::default() });
+            let progress = Progress {
+                session: input.clone(), watch: Arc::new(watch::Watch::new(Arc::new(|| {}))),
+                cancel: Cancellation::new(), language: Language::En,
+                display: Mutex::default(), reporting: reporting::Reports::default(),
+                branches: Mutex::default(), prompt: false, visible: true, verbose: false,
+            };
+            let mut archives = vec![
+                report_archive("carrier.bin", 10), report_archive("carrier.bin", 20),
+                report_archive("child.zip", 0), report_archive("other.zip", 0),
+            ];
+            archives[2].depth = 2;
+            progress.archive_branch(&archives[0], &archives[2]);
+            archives[1].failure = Some(crate::pipeline::Failure::new(FailureKind::Damaged, "damage"));
+            let report = ScopeReport::new(&archives, &progress, HashMap::new());
+            let mut bytes = Vec::new();
+            report.write(&mut bytes).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            let error = Language::En.text("report.status.error");
+            assert!(text.starts_with(&format!("carrier.bin\n  [{error}]")), "{text}");
+            assert_eq!(text.matches(&format!("[{error}]")).count(), 2, "{text}");
+            let (_, continuation) = tree_edge(!ascii, false);
+            let (edge, _) = tree_edge(!ascii, true);
+            assert!(text.contains(&format!("\n{continuation}{edge}child.zip\n")), "{text}");
+            let segment = Language::En.translate("cli.scan.segment", &[("index", "2")]);
+            assert!(text.find("child.zip").unwrap() < text.find(&segment).unwrap(), "{text}");
+            assert!(text.find(&segment).unwrap() < text.find("\nother.zip\n").unwrap(), "{text}");
+            let options = Options::parse(&["scan".into(), "carrier.bin".into()]).unwrap();
+            let mut outcome = Outcome::default();
+            outcome.archives = archives;
+            report_scan(outcome, vec![], &options, input.as_ref(), Language::En).unwrap();
+            let text = String::from_utf8(input.stdout.lock().unwrap().clone()).unwrap();
+            let format = Language::En.translate("cli.scan.format", &[("format", "zip")]);
+            for last in [false, true] {
+                let (_, continuation) = tree_edge(!ascii, last);
+                assert!(text.lines().any(|line| line == format!("{continuation}  {format}")), "{text}");
+            }
+        }
+    }
+
+    // Rendering must not consume a native call frame per nesting level. The
+    // small thread stack catches recursive traversal without Windows fixtures.
+    #[test]
+    fn deeply_nested_final_tree_uses_an_explicit_traversal_stack() {
+        std::thread::Builder::new().stack_size(128 * 1024).spawn(|| {
+            let count = 2048;
+            let archives: Vec<_> = (0..count).map(|i| report_archive(&format!("{i}.zip"), 0)).collect();
+            let report = ScopeReport {
+                progress: HashMap::new(), archives: &archives, unicode: true,
+                language: Language::En, verbose: false,
+                groups: (0..count).map(|i| i..i + 1).collect(),
+                children: (0..count).map(|i| if i + 1 < count { vec![i + 1] } else { vec![] }).collect(),
+                roots: vec![0],
+            };
+            report.write(&mut io::sink()).unwrap();
+        }).unwrap().join().unwrap();
     }
 
     #[test]

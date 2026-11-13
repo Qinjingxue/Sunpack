@@ -159,7 +159,7 @@ impl Engine {
         let scheduler = self.scheduler.get_or_init(Scheduler::new);
         let execute = || {
             scheduler.run(request_id, request.origin, &request.cancel, |spawner| {
-                Box::pin(run.execute_request(request_id, spawner))
+                Box::pin(run.execute_request(spawner))
             })
         };
         let executed = if request.mode == Mode::Extract
@@ -205,7 +205,7 @@ impl Engine {
                     } else { None };
                     stage("discovery", &request.cancel).await?;
                     let run = engine.prepare(request, ObserverRef::Owned(observer), request_id)?;
-                    run.execute_request(request_id, spawner).await
+                    run.execute_request(spawner).await
                     }.await;
                     stage("report", &Cancellation::new()).await.expect("completion is not cancellable");
                     complete(result)
@@ -969,7 +969,7 @@ struct Executed {
 }
 
 impl<'run, O: Observer> Run<'run, O> {
-    async fn execute_request(self: &Arc<Self>, request_id: u64, spawner: Spawner<'run>) -> io::Result<Outcome> {
+    async fn execute_request(self: &Arc<Self>, spawner: Spawner<'run>) -> io::Result<Outcome> {
         let decisions = Arc::clone(&self.recursion.decisions);
         let _cancellation = self.request.cancel.subscribe(move || {
             let decisions: Vec<_> = decisions.lock().unwrap().values().cloned().collect();
@@ -978,11 +978,9 @@ impl<'run, O: Observer> Run<'run, O> {
         stage("discovery", &self.request.cancel).await?;
         let mut discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
         if self.resolve_aliases { dedup_resolved_plans(&mut discovered.tasks); }
-        if self.request.mode == Mode::Extract {
-            self.engine.leases.extend_request(request_id, self.request.origin,
-                discovered.tasks.iter().flat_map(|task| task.owned_paths.iter().map(String::as_str)),
-                &self.request.cancel).await?;
-        }
+        // Request admission covers only the user's original selections, as in
+        // main. Discovery may resolve different selections to one volume family;
+        // claim_task serializes that family without rejecting either request.
         let executed = self.execute_batch(discovered, 1, None, None, spawner).await;
         self.finish(executed).await
     }
@@ -1191,10 +1189,11 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut outcome = Outcome::default();
             let mut shell = this.engine.shell.branch();
             let mut generations = this.capture_generations(&task);
+            let discovered = task.source != DiscoverySource::Direct;
             let watch_root = depth == 1
                 && this.request.origin == Origin::Watch
                 && this.request.mode == Mode::Extract;
-            if watch_root && !this.should_process_watch(&task, &generations)? {
+            if !this.should_process_task(&task, &generations, discovered, watch_root)? {
                 this.observer.notify(Event::Skipped { id: task_id });
                 return Ok(outcome);
             }
@@ -1440,7 +1439,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             lease = this.claim_task(&replacement).await?;
                             stage("preflight", cancel).await?;
                             generations = this.capture_generations(&replacement);
-                            if watch_root && !this.should_process_watch(&replacement, &generations)? {
+                            if !this.should_process_task(&replacement, &generations, discovered, watch_root)? {
                                 this.observer.notify(Event::Skipped { id: task_id });
                                 return Ok(outcome);
                             }
@@ -2124,11 +2123,26 @@ impl<'run, O: Observer> Run<'run, O> {
             .collect()
     }
 
-    fn should_process_watch(
+    fn should_process_task(
         &self,
         task: &Task,
         generations: &HashMap<String, PhysicalFileGeneration>,
+        discovered: bool,
+        watch_root: bool,
     ) -> io::Result<bool> {
+        // A discovered proposal can depart while waiting for its physical lease.
+        // Explicit direct inputs still take the ordinary open/failure path.
+        // Keep the original proposal's eligibility through volume replacement;
+        // finding a relation later does not turn a Direct task into discovery.
+        if discovered && task.owned_paths.iter().all(|path| {
+            !generations.contains_key(&path_key(path))
+                && Path::new(path).try_exists().is_ok_and(|exists| !exists)
+        }) {
+            return Ok(false);
+        }
+        if !watch_root {
+            return Ok(true);
+        }
         let data_paths: Vec<_> = task
             .inputs
             .iter()
@@ -2141,12 +2155,6 @@ impl<'run, O: Observer> Run<'run, O> {
                     .chain(whole_file.then_some(input.entry_path.as_str()))
             })
             .collect();
-        if data_paths.iter().all(|path| {
-            !generations.contains_key(&path_key(path))
-                && Path::new(path).try_exists().is_ok_and(|exists| !exists)
-        }) {
-            return Ok(false);
-        }
         self.observer.should_process_sources(
             Path::new(&task.entry().entry_path),
             &data_paths,
@@ -2166,8 +2174,9 @@ impl<'run, O: Observer> Run<'run, O> {
         }
         let report = match analyze_input(&original.input, &self.analysis, None, true) {
             Ok(report) => report,
-            Err(error) if !self.request.cancel.cancelled() => {
-                original.failure = Some(file_failure(error));
+            // Planning is advisory, as in main. A transient analysis read must
+            // not replace the original input with a terminal extraction failure.
+            Err(error) if !is_cancellation(&error) && !self.request.cancel.cancelled() => {
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -3367,7 +3376,45 @@ struct LeaseState {
     active: HashSet<String>,
     requests: HashMap<u64, RequestClaim>,
     next_waiter: u64,
-    waiters: HashMap<u64, Waker>,
+    waiters: HashMap<u64, LeaseWaiter>,
+    blocked_by: HashMap<LeaseBlocker, HashSet<u64>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum LeaseBlocker {
+    Request(u64),
+    Path(String),
+}
+
+struct LeaseWaiter {
+    waker: Waker,
+    blockers: HashSet<LeaseBlocker>,
+}
+
+impl LeaseState {
+    fn remove_waiter(&mut self, id: u64) -> Option<Waker> {
+        let waiter = self.waiters.remove(&id)?;
+        for blocker in waiter.blockers {
+            if let Some(ids) = self.blocked_by.get_mut(&blocker) {
+                ids.remove(&id);
+                if ids.is_empty() { self.blocked_by.remove(&blocker); }
+            }
+        }
+        Some(waiter.waker)
+    }
+
+    fn wait(&mut self, id: u64, blockers: HashSet<LeaseBlocker>, waker: &Waker) {
+        self.remove_waiter(id);
+        for blocker in &blockers {
+            self.blocked_by.entry(blocker.clone()).or_default().insert(id);
+        }
+        self.waiters.insert(id, LeaseWaiter { waker: waker.clone(), blockers });
+    }
+
+    fn released(&mut self, blocker: &LeaseBlocker) -> Vec<Waker> {
+        let Some(ids) = self.blocked_by.remove(blocker) else { return Vec::new(); };
+        ids.into_iter().filter_map(|id| self.remove_waiter(id)).collect()
+    }
 }
 
 struct RequestClaim {
@@ -3415,10 +3462,6 @@ impl RequestClaim {
             };
             current = parent;
         }
-    }
-
-    fn covers(&self, path: &str) -> bool {
-        self.paths.contains_key(path) || self.includes_directory(path)
     }
 
     fn overlaps(&self, other: &Self) -> bool {
@@ -3500,9 +3543,9 @@ impl Drop for RequestClaimGuard {
         let mut state = self.registry.state.lock().unwrap();
         state.requests.remove(&self.id);
         crate::collections::trim_map(&mut state.requests);
-        let waiters = std::mem::take(&mut state.waiters);
+        let waiters = state.released(&LeaseBlocker::Request(self.id));
         drop(state);
-        for waker in waiters.into_values() { waker.wake(); }
+        for waker in waiters { waker.wake(); }
     }
 }
 
@@ -3536,43 +3579,10 @@ impl Leases {
         Ok(RequestClaimGuard { registry: Arc::clone(self), id })
     }
 
-    async fn extend_request<'a>(
-        self: &Arc<Self>,
-        id: u64,
-        origin: Origin,
-        paths: impl Iterator<Item = &'a str>,
-        cancel: &Cancellation,
-    ) -> io::Result<()> {
-        let extra: HashSet<_> = {
-            let state = self.state.lock().unwrap();
-            let Some(claim) = state.requests.get(&id) else {
-                return Ok(());
-            };
-            paths
-                .filter(|path| !claim.covers(&path_key(path)))
-                .collect()
-        };
-        if extra.is_empty() {
-            return Ok(());
-        }
-        let inputs = extra
-            .into_iter()
-            .map(|path| ClaimedInput::new(Path::new(path)))
-            .collect::<io::Result<Vec<_>>>()?;
-        self.admit_request(id, origin, inputs, cancel).await
-    }
-
     async fn admit_request(
         self: &Arc<Self>, id: u64, origin: Origin, inputs: Vec<ClaimedInput>, cancel: &Cancellation,
     ) -> io::Result<()> {
-        let mut claim = {
-            let mut state = self.state.lock().unwrap();
-            let previous = state.requests.remove(&id);
-            if previous.is_some() {
-                for waker in std::mem::take(&mut state.waiters).into_values() { waker.wake(); }
-            }
-            previous.unwrap_or_else(|| RequestClaim::new(origin))
-        };
+        let mut claim = RequestClaim::new(origin);
         for input in inputs { claim.add(input); }
         let mut claim = Some(claim);
         let mut waiting = LeaseWait { owner: self, id: None };
@@ -3580,25 +3590,29 @@ impl Leases {
         poll_fn(|cx| {
             let mut state = self.state.lock().unwrap();
             if let Err(error) = cancel.check_io() { return Poll::Ready(Err(error)); }
-            match state.requests.values().find(|current| claim.as_ref().unwrap().overlaps(current)) {
-                None => {
-                    state.requests.insert(id, claim.take().unwrap());
-                    return Poll::Ready(Ok(()));
+            let mut blockers = HashSet::new();
+            for (&owner, current) in &state.requests {
+                if claim.as_ref().unwrap().overlaps(current) {
+                    if origin == Origin::Foreground {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::WouldBlock, current.conflict())));
+                    }
+                    blockers.insert(LeaseBlocker::Request(owner));
                 }
-                Some(current) if origin == Origin::Foreground =>
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::WouldBlock, current.conflict()))),
-                Some(_) => {}
+            }
+            if blockers.is_empty() {
+                state.requests.insert(id, claim.take().unwrap());
+                return Poll::Ready(Ok(()));
             }
             let waiter = *waiting.id.get_or_insert_with(|| {
                 state.next_waiter += 1;
                 state.next_waiter
             });
-            state.waiters.insert(waiter, cx.waker().clone());
+            state.wait(waiter, blockers, cx.waker());
             drop(state);
             if subscription.is_none() {
                 let owner = Arc::clone(self);
                 subscription = cancel.subscribe(move || {
-                    let wake = owner.state.lock().unwrap().waiters.remove(&waiter);
+                    let wake = owner.state.lock().unwrap().remove_waiter(waiter);
                     if let Some(wake) = wake { wake.wake(); }
                 });
             }
@@ -3629,12 +3643,14 @@ impl Leases {
                 state.next_waiter += 1;
                 state.next_waiter
             });
-            state.waiters.insert(id, cx.waker().clone());
+            let blockers = keys.intersection(&state.active)
+                .cloned().map(LeaseBlocker::Path).collect();
+            state.wait(id, blockers, cx.waker());
             drop(state);
             if subscription.is_none() {
                 let owner = Arc::clone(self);
                 subscription = cancel.subscribe(move || {
-                    let waker = owner.state.lock().unwrap().waiters.remove(&id);
+                    let waker = owner.state.lock().unwrap().remove_waiter(id);
                     if let Some(waker) = waker {
                         waker.wake();
                     }
@@ -3656,9 +3672,12 @@ impl Drop for LeaseWait<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
             let mut state = self.owner.state.lock().unwrap();
-            state.waiters.remove(&id);
+            state.remove_waiter(id);
             if state.waiters.capacity() > 256 {
                 crate::collections::trim_map(&mut state.waiters);
+            }
+            if state.blocked_by.capacity() > 256 {
+                crate::collections::trim_map(&mut state.blocked_by);
             }
         }
     }
@@ -3675,11 +3694,10 @@ impl Drop for Lease {
             let target = active.len().saturating_mul(2);
             active.shrink_to(target);
         }
-        let waiters = std::mem::take(&mut state.waiters);
+        let waiters: Vec<_> = self.keys.iter()
+            .flat_map(|key| state.released(&LeaseBlocker::Path(key.clone()))).collect();
         drop(state);
-        for (_, waker) in waiters {
-            waker.wake();
-        }
+        for waker in waiters { waker.wake(); }
     }
 }
 
@@ -3687,6 +3705,114 @@ impl Drop for Lease {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn lease_notifications_follow_blockers_and_unregister_cancelled_waiters() {
+        use std::future::Future;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Wake};
+
+        #[derive(Default)]
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let leases = Arc::new(Leases::default());
+        let cancel = Cancellation::new();
+        let keys = |paths: &[&str]| paths.iter().map(|path| (*path).to_owned()).collect();
+        let first = super::super::scheduling::block_on(leases.acquire(keys(&["a"]), &cancel)).unwrap();
+        let second = super::super::scheduling::block_on(leases.acquire(keys(&["b"]), &cancel)).unwrap();
+        let unrelated = super::super::scheduling::block_on(leases.acquire(keys(&["c"]), &cancel)).unwrap();
+        let wakes = Arc::new(CountWake::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = Box::pin(leases.acquire(keys(&["a", "b"]), &cancel));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        drop(unrelated);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        drop(first);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        drop(second);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
+        let held = match waiting.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(lease)) => lease,
+            _ => panic!("released family remained blocked"),
+        };
+        drop(waiting);
+
+        // Cancellation and dropping a pending future remove both directions
+        // of the dependency index, not just its stored waker.
+        let stopped = Cancellation::new();
+        let mut cancelled = Box::pin(leases.acquire(keys(&["a"]), &stopped));
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        stopped.cancel();
+        assert!(matches!(cancelled.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        drop(cancelled);
+        let mut abandoned = Box::pin(leases.acquire(keys(&["b"]), &cancel));
+        assert!(abandoned.as_mut().poll(&mut cx).is_pending());
+        drop(abandoned);
+        let state = leases.state.lock().unwrap();
+        assert!(state.waiters.is_empty());
+        assert!(state.blocked_by.is_empty());
+        drop(state);
+        drop(held);
+    }
+
+    #[test]
+    fn request_notifications_are_separate_from_physical_family_leases() {
+        use std::future::Future;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Wake};
+
+        #[derive(Default)]
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let leases = Arc::new(Leases::default());
+        let cancel = Cancellation::new();
+        let first_path = [PathBuf::from("claim-family.7z.001")];
+        let other_path = [PathBuf::from("claim-family.7z.002")];
+        let first = leases.reserve_request(1, Origin::Foreground, &first_path, &cancel).unwrap();
+        let family: HashSet<_> = ["claim-family.7z.001", "claim-family.7z.002"]
+            .into_iter().map(str::to_owned).collect();
+        let held = super::super::scheduling::block_on(leases.acquire(family.clone(), &cancel)).unwrap();
+        // A different original volume remains admissible while the resolved
+        // physical family is in use; the same original selection is still busy.
+        let other = leases.reserve_request(2, Origin::Foreground, &other_path, &cancel).unwrap();
+        assert!(matches!(leases.reserve_request(3, Origin::Foreground, &first_path, &cancel),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        let request_wakes = Arc::new(CountWake::default());
+        let request_waker = Waker::from(Arc::clone(&request_wakes));
+        let mut request_cx = Context::from_waker(&request_waker);
+        let mut request = Box::pin(leases.reserve_request_async(4, Origin::Watch, &first_path, &cancel));
+        assert!(request.as_mut().poll(&mut request_cx).is_pending());
+        let physical_wakes = Arc::new(CountWake::default());
+        let physical_waker = Waker::from(Arc::clone(&physical_wakes));
+        let mut physical_cx = Context::from_waker(&physical_waker);
+        let mut physical = Box::pin(leases.acquire(family, &cancel));
+        assert!(physical.as_mut().poll(&mut physical_cx).is_pending());
+        drop(other);
+        assert_eq!(request_wakes.0.load(Ordering::SeqCst), 0);
+        assert_eq!(physical_wakes.0.load(Ordering::SeqCst), 0);
+        drop(first);
+        assert_eq!(request_wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(physical_wakes.0.load(Ordering::SeqCst), 0);
+        let claim = match request.as_mut().poll(&mut request_cx) {
+            Poll::Ready(Ok(claim)) => claim,
+            _ => panic!("released original request remained blocked"),
+        };
+        drop(held);
+        assert_eq!(physical_wakes.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(physical.as_mut().poll(&mut physical_cx), Poll::Ready(Ok(_))));
+        drop(request);
+        drop(physical);
+        drop(claim);
+        let state = leases.state.lock().unwrap();
+        assert!(state.waiters.is_empty());
+        assert!(state.blocked_by.is_empty());
+    }
 
     #[test]
     fn worker_failure_proof_survives_json_and_streamed_report() {
@@ -4166,6 +4292,139 @@ mod tests {
             scan_errors: Mutex::new(DirectoryReadErrors::report()),
             cleanup_tasks: Mutex::default(),
         })
+    }
+
+    #[test]
+    fn advisory_planning_read_error_preserves_the_original_input() {
+        // The analysis open fails, but the later extraction path must still
+        // receive the original input rather than a fabricated terminal failure.
+        let path = crate::test_support::temp_file("planning_read_error", b"archive");
+        fs::remove_file(&path).unwrap();
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let request = Request::new(vec![path.clone()], Mode::Scan);
+        let observer = |_: Event| {};
+        let run = test_run(&engine, &request, &observer);
+        let input = ArchiveInput::file(path.to_string_lossy().into_owned(), "rar".into(), "archive".into());
+        let mut task = Task {
+            primary: None,
+            owned_paths: vec![input.entry_path.clone()],
+            inputs: vec![LogicalInput { input, password: Some(Arc::from("secret")), failure: None }],
+            source: DiscoverySource::Direct,
+            retry: None,
+        };
+        run.plan_inputs(&mut task).unwrap();
+        assert_eq!(task.inputs.len(), 1);
+        assert_eq!(task.inputs[0].input.entry_path, path.to_string_lossy());
+        assert_eq!(task.inputs[0].input.format_hint, "rar");
+        assert_eq!(task.inputs[0].password.as_deref(), Some("secret"));
+        assert!(task.inputs[0].failure.is_none());
+        // Restore a valid archive before the next stage, modelling the end of
+        // the transient read failure. Confirm the original logical input reaches
+        // the real worker submission path using the existing test transport.
+        fs::write(&path, encrypted_rar_fixture()).unwrap();
+        struct Input(mpsc::Sender<Vec<u8>>);
+        impl io::Write for Input {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let _ = self.0.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let (sent, received) = mpsc::channel();
+        let process = Process::with_test_input(Input(sent));
+        engine.worker.lock().unwrap().process = Some(Arc::clone(&process));
+        struct CancelOnPanic(Cancellation);
+        impl Drop for CancelOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() { self.0.cancel(); }
+            }
+        }
+        let responder_cancel = request.cancel.clone();
+        let responder = std::thread::spawn(move || {
+            // A transport assertion must wake the awaiting request too, rather
+            // than leave the scheduler parked after this thread has unwound.
+            let _cancel_on_panic = CancelOnPanic(responder_cancel);
+            let bytes = received.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("planning error suppressed worker submission");
+            let mut decoder = crate::scan::worker_wire::NativeWorkerFrameDecoder::default();
+            let frames = decoder.feed(&bytes).unwrap();
+            decoder.finish().unwrap();
+            let submitted = &frames[0].summary;
+            let id = &submitted["job_id"];
+            process.test_event(json!({"type":"result", "job_id":id,
+                "status":"ok", "archive_type":"rar", "encrypted":true}));
+            process.test_event(json!({"type":"native_event", "event":"job_finished", "job_id":id}));
+            submitted.clone()
+        });
+        let logical = task.inputs.remove(0);
+        let cancel_input = logical.input.clone();
+        let mut shell = engine.shell.branch();
+        let mut outcome = Outcome::default();
+        let result = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |_| {
+            Box::pin(run.execute_input(logical, 1, DiscoverySource::Direct,
+                1, None, None, &run.candidates, &mut shell, &mut outcome))
+        }).unwrap().result;
+        let submitted = responder.join().unwrap();
+        assert_eq!(submitted["operation"], "scan");
+        assert_eq!(submitted["password"], "secret");
+        assert!(result.failure.is_none());
+        // With an existing, readable input, this must be a cancellation error,
+        // not the earlier NotFound error accidentally satisfying is_err().
+        task.inputs.push(LogicalInput { input: cancel_input, password: None, failure: None });
+        request.cancel.cancel();
+        let error = request.cancel.run(|| run.plan_inputs(&mut task)).unwrap_err();
+        assert!(is_cancellation(&error));
+        release_reader_resources_under_roots(vec![path.to_string_lossy().into_owned()]).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn departed_discovered_tasks_skip_before_started_across_modes_and_depths() {
+        // Exercise the real task boundary, not just its predicate: no worker,
+        // Started event, or failed receipt may be produced for a stale proposal.
+        let path = crate::test_support::temp_file("departed_proposal", b"archive");
+        let input = ArchiveInput::file(path.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+        fs::remove_file(&path).unwrap();
+        for mode in [Mode::Scan, Mode::Extract] {
+            for origin in [Origin::Foreground, Origin::Watch] {
+                for depth in [1, 2] {
+                    let engine = Engine::new(PathBuf::from("unused-worker"));
+                    let mut request = Request::new(vec![path.clone()], mode);
+                    request.origin = origin;
+                    let events = Mutex::new(Vec::new());
+                    let observer = |event: Event| { events.lock().unwrap().push(event); };
+                    let run = test_run(&engine, &request, &observer);
+                    let task = Task {
+                        primary: None,
+                        owned_paths: vec![input.entry_path.clone()],
+                        inputs: vec![LogicalInput { input: input.clone(), password: None, failure: None }],
+                        source: DiscoverySource::Detection,
+                        retry: None,
+                    };
+                    let outcome = Scheduler::new().run(1, origin, &request.cancel, |spawner| {
+                        run.execute_task(task, 1, depth, None, spawner)
+                    }).unwrap();
+                    assert!(outcome.archives.is_empty());
+                    assert!(outcome.errors.is_empty());
+                    assert!(matches!(events.lock().unwrap().as_slice(), [Event::Skipped { id: 1 }]));
+                    // Direct user selections are not stale discovery proposals.
+                    let direct = Task {
+                        primary: None,
+                        owned_paths: vec![input.entry_path.clone()],
+                        inputs: vec![LogicalInput { input: input.clone(), password: None, failure: None }],
+                        source: DiscoverySource::Direct,
+                        retry: None,
+                    };
+                    assert!(run.should_process_task(&direct, &HashMap::new(), false, false).unwrap());
+                    // A replacement can be classified Relations while retaining
+                    // the original Direct task's no-silent-skip boundary.
+                    let mut replacement = direct;
+                    replacement.source = DiscoverySource::Relations;
+                    assert!(run.should_process_task(&replacement, &HashMap::new(), false, false).unwrap());
+                    assert!(!run.should_process_task(&replacement, &HashMap::new(), true, false).unwrap());
+                }
+            }
+        }
     }
 
     fn output_manifest(files: &[(&str, &[u8])]) -> crate::scan::directory::NativeWorkerManifest {

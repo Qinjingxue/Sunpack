@@ -368,3 +368,53 @@ def test_scan_bounds_filesystem_diagnostics_across_targets_and_subtrees(package,
     assert any(message.startswith("Cannot read directory:") and "blocked-" in message
                for message in report["errors"])
     assert report["errors"][-1] == "Additional filesystem scan errors omitted from this report: 2"
+
+
+def test_distinct_volume_requests_do_not_expand_original_busy_claim(package, tmp_path):
+    # The retry prompt is an observable request-lifetime barrier: the first
+    # request has discovered the entire family but still owns its original
+    # admission claim. A second physical entry must not become an initial busy.
+    payload = tmp_path / "payload.bin"
+    content = bytes(range(256)) * 32
+    payload.write_bytes(content)
+    archive = tmp_path / "family.7z"
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v1k",
+         "-mhe=on", "-pfixture-key", str(archive), payload.name],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    parts = sorted(tmp_path.glob("family.7z.*"))
+    assert len(parts) >= 2
+    first_output = tmp_path / "first-output"
+    second_output = tmp_path / "second-output"
+
+    def wait_for_prompt(stream):
+        marker = "Enter new passwords and retry extraction?"
+        tail = ""
+        while character := stream.read(1):
+            tail = (tail + character)[-len(marker):]
+            if tail == marker:
+                return True
+        return False
+
+    command = [str(package.launcher), "extract", "-c", "k", "-o", str(first_output),
+               "--no-builtin-pw", "--no-pause", "-p", "wrong", str(parts[0])]
+    with ThreadPoolExecutor(max_workers=1) as executor, subprocess.Popen(
+        command, cwd=package.data, env=package.env, encoding="utf-8",
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ) as process:
+        try:
+            assert executor.submit(wait_for_prompt, process.stdout).result(timeout=60)
+            duplicate = package.json("scan", parts[0], code=1)
+            assert duplicate["summary"]["status"] == "busy"
+            second = package.json("extract", "-c", "k", "-o", second_output,
+                                  "--no-builtin-pw", "-p", "fixture-key", parts[1])
+            assert second["summary"]["success_count"] == 1
+            stdout, stderr = process.communicate("y\nfixture-key\n\n", timeout=60)
+            assert process.returncode == 0, (stdout, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+    _only_output(first_output, payload.name, content)
+    _only_output(second_output, payload.name, content)
+    assert all(part.is_file() for part in parts)

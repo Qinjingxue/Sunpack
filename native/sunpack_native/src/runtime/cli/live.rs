@@ -242,6 +242,7 @@ impl Panel {
     }
 
     pub(super) fn redraw(&mut self, session: &dyn Session, language: Language, force: bool) {
+        if !session.interactive() { return; }
         let now = Instant::now();
         if !force
             && self
