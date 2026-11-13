@@ -318,9 +318,12 @@ impl Options {
         let mut supplied = false;
         let mut after_action = false;
         let mut paths_closed = false;
+        let mut parent_flags = (false, false, false);
+        let mut in_cluster = false;
         // argparse reports unknown arguments only after processing actions;
         // a later help action may exit successfully first.
         while let Some(mut arg) = args.pop_front() {
+            let from_cluster = std::mem::take(&mut in_cluster);
             supplied = true;
             if arg == "--" && !positional {
                 if paths_closed { unrecognized.push("--".to_owned()); }
@@ -330,8 +333,8 @@ impl Options {
             }
             if positional || !looks_like_option(&arg) {
                 if matches!(command, "watch" | "config") && options.action.is_empty() {
-                    // argparse's selected subparser installs fresh common defaults.
-                    // main restores only exact raw argv flags after parsing below.
+                    // The action has its own common options. Explicit parent
+                    // flags are restored after parsing the action.
                     options.json = false;
                     options.verbose = false;
                     options.pause = false;
@@ -377,14 +380,23 @@ impl Options {
             }
             paths_closed |= !options.paths.is_empty();
             validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), command, &options.action)?;
+            if !from_cluster && matches!(command, "watch" | "config") && options.action.is_empty() {
+                match arg.as_ref() {
+                    "-j" | "--json" => parent_flags.0 = true,
+                    "-v" | "--verbose" => parent_flags.1 = true,
+                    "--pause" => parent_flags.2 = true,
+                    _ => {}
+                }
+            }
             if !arg.starts_with("--") && arg.len() > 2 && arg.as_bytes()[1].is_ascii() {
-                let short = short_option(arg.as_bytes()[1]);
+                let short = short_option(arg.as_bytes()[1]).filter(|spec| spec.scope.accepts(command, &options.action));
                 if short.is_some_and(OptionSpec::takes_value) {
                     if arg.as_bytes()[2] != b'=' {
                         arg.to_mut().insert(2, '=');
                     }
                 } else if short.is_some() {
                     args.push_front(Cow::Owned(format!("-{}", &arg[2..])));
+                    in_cluster = true;
                     arg = Cow::Owned(arg[..2].to_owned());
                 }
             }
@@ -403,23 +415,23 @@ impl Options {
                     .ok_or_else(|| argument_error(command, &options.action, flag, "expected one argument"))
             };
             let selected = option_spec(flag).filter(|spec| spec.scope.accepts(command, &options.action));
+            if let (Some(spec), Some(value)) = (selected, inline) {
+                if !spec.takes_value() {
+                    return Err(explicit_argument(command, &options.action, flag, value));
+                }
+            }
             match selected.map(|spec| spec.id) {
                 Some(OptionId::Help) => {
-                    if let Some(value) = inline {
-                        return Err(explicit_argument(command, &options.action, flag, value));
-                    }
                     options.help = true;
                     break;
                 }
                 Some(OptionId::Json) => options.json = true,
                 Some(OptionId::Verbose) => options.verbose = true,
                 Some(OptionId::Pause) => {
-                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.no_pause { return Err(argument_error(command, &options.action, "--pause", "not allowed with argument --no-pause")); }
                     options.pause = true;
                 }
                 Some(OptionId::NoPause) => {
-                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.pause { return Err(argument_error(command, &options.action, "--no-pause", "not allowed with argument --pause")); }
                     options.no_pause = true;
                 }
@@ -427,12 +439,10 @@ impl Options {
                 Some(OptionId::Deep) => options.deep = true,
                 Some(OptionId::Direct) => options.direct = true,
                 Some(OptionId::Flatten) => {
-                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.flatten == Some(false) { return Err(argument_error(command, &options.action, "-f", "not allowed with argument -F/--no-flatten")); }
                     options.flatten = Some(true)
                 }
                 Some(OptionId::NoFlatten) => {
-                    if let Some(value) = inline { return Err(explicit_argument(command, &options.action, flag, value)); }
                     if options.flatten == Some(true) { return Err(argument_error(command, &options.action, "-F", "not allowed with argument -f/--flatten")); }
                     options.flatten = Some(false)
                 }
@@ -475,9 +485,6 @@ impl Options {
                     continue;
                 }
             }
-            if let Some(value) = inline {
-                return Err(explicit_argument(command, &options.action, flag, value));
-            }
         }
         let wants_paths = match (command, options.action.as_str()) {
             ("extract" | "scan", "") => true,
@@ -489,9 +496,6 @@ impl Options {
         };
         if options.help {
             return Ok(options);
-        }
-        if options.no_pause && options.pause {
-            return Err(argument_error(command, &options.action, "--no-pause", "not allowed with argument --pause"));
         }
         if wants_paths && options.paths.is_empty() {
             if !supplied || (command == "watch" && !after_action) {
@@ -512,16 +516,9 @@ impl Options {
         if !unrecognized.is_empty() {
             return Err(parser_error("", "", format!("unrecognized arguments: {}", unrecognized.join(" "))));
         }
-        // Deliberately match main's raw argv restoration, including option-
-        // shaped positional paths after `--`. Do not rewrite the values themselves.
-        for argument in argv {
-            match argument.as_str() {
-                "-j" | "--json" => options.json = true,
-                "-v" | "--verbose" => options.verbose = true,
-                "--pause" => options.pause = true,
-                _ => {}
-            }
-        }
+        options.json |= parent_flags.0;
+        options.verbose |= parent_flags.1;
+        options.pause |= parent_flags.2 && !options.no_pause;
         Ok(options)
     }
 }
@@ -777,7 +774,8 @@ pub(super) async fn run(
     // catch their own failures and return an empty command-input envelope.
     let error_argv = (options.json && matches!(options.command, "scan" | "extract")).then_some(args);
     let inspection = options.command == "doctor" || (options.command == "config" && !options.rule_stdin);
-    let generation = (!options.rule_stdin).then(|| host.generation(cwd, inspection));
+    let generation = (!options.rule_stdin && options.command != "version")
+        .then(|| host.generation(cwd, inspection));
     let language = generation.as_ref().map_or_else(|| config::load_language(cwd), config::ConfigRead::language);
     let execution = match options.command {
         "scan" | "extract" => match generation.unwrap().normalized(true) {
@@ -828,7 +826,7 @@ pub(super) async fn run(
         for log in &result.logs {
             line(session, Stream::Out, log)?;
         }
-        if options.pause
+        if session.local_pause() && options.pause
             && code != 130
             && (options.command != "extract" || code != 0)
         {
@@ -2702,9 +2700,9 @@ mod option_tests {
         assert!(parse(&["watch", "--verbose", "status"]).unwrap().verbose);
         assert!(parse(&["config", "-j", "show"]).unwrap().json);
         let value = parse(&["extract", "--", "--json", "--verbose", "--pause"]).unwrap();
-        assert!(value.json && value.verbose && value.pause);
+        assert!(!value.json && !value.verbose && !value.pause);
         assert_eq!(value.paths, ["--json", "--verbose", "--pause"]);
-        // Only exact argv tokens restore flags. Attached passwords remain data.
+        // Attached passwords remain data even when they look like options.
         for password in ["--json", "-j", "--verbose", "-v", "--pause"] {
             let token = format!("--password={password}");
             let value = parse(&["extract", &token, "a.zip"]).unwrap();
@@ -2718,7 +2716,7 @@ mod option_tests {
         let value = parse(&["watch", "-jv", "status", "-j"]).unwrap();
         assert!(value.json && !value.verbose);
         let value = parse(&["watch", "--pause", "start", "--no-pause"]).unwrap();
-        assert!(value.pause && value.no_pause);
+        assert!(!value.pause && value.no_pause);
         let value = parse(&["extract", "--pw-file=", "--out-dir=", "a.zip"]).unwrap();
         assert!(value.password_file.is_none());
         assert!(value.output.is_none());

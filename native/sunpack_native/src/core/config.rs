@@ -1,7 +1,6 @@
 use super::{i18n::Language, resources};
 use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
 use crate::scan::path_filter::{NativePathRule, RuleEntry};
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::{
     borrow::Cow,
@@ -311,36 +310,49 @@ fn parse_config_file(path: &Path) -> io::Result<Value> {
 fn merge_named(base: &mut Vec<Value>, changes: Vec<Value>) {
     // Preserve the external layer's order for configured filters. A definition
     // omitted from the new layer retains its relative position.
-    let mut names = Vec::new();
-    let mut unnamed = Vec::new();
+    use std::collections::HashMap;
+
+    let mut indices: HashMap<_, _> = base.iter().enumerate().filter_map(|(index, item)| {
+        Some((item.get("name")?.as_str()?.to_owned(), index))
+    }).collect();
+    let mut order = Vec::with_capacity(changes.len());
+    let mut occurrences = vec![0usize; base.len()];
     for entry in changes {
-        let Some(name) = entry.get("name").and_then(Value::as_str).map(str::to_owned) else {
-            unnamed.push(entry);
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            base.push(entry);
+            occurrences.push(0);
             continue;
         };
-        if let Some(existing) = base
-            .iter_mut()
-            .rev()
-            .find(|item| item["name"] == name.as_str())
-        {
-            merge(existing, entry, MergeScope::Other);
+        let index = if let Some(&index) = indices.get(name) {
+            merge(&mut base[index], entry, MergeScope::Other);
+            index
         } else {
+            let index = base.len();
+            indices.insert(name.to_owned(), index);
             base.push(entry);
-        }
-        names.push(name);
+            occurrences.push(0);
+            index
+        };
+        order.push(index);
+        occurrences[index] += 1;
     }
-    let mut ordered = Vec::with_capacity(base.len() + unnamed.len());
-    for name in &names {
-        if let Some(entry) = base.iter().rev().find(|item| item["name"] == name.as_str()) {
-            ordered.push(entry.clone());
-        }
+    let mut ordered = Vec::with_capacity(base.len());
+    for index in order {
+        // Duplicate names repeat their final merged definition. Move each
+        // unique value directly from the layer and clone only those duplicates.
+        let entry = if occurrences[index] == 1 {
+            base[index].take()
+        } else {
+            occurrences[index] -= 1;
+            base[index].clone()
+        };
+        ordered.push(entry);
     }
-    ordered.extend(base.drain(..).filter(|entry| {
-        entry["name"]
-            .as_str()
-            .is_none_or(|name| !names.iter().any(|item| item == name))
+    ordered.extend(base.drain(..).enumerate().filter_map(|(index, entry)| {
+        let overridden = entry.get("name").and_then(Value::as_str)
+            .is_some_and(|name| indices.get(name).is_some_and(|&last| occurrences[last] != 0));
+        (occurrences[index] == 0 && !overridden).then_some(entry)
     }));
-    ordered.extend(unnamed);
     *base = ordered;
 }
 
@@ -436,6 +448,16 @@ struct Generation {
     snapshot: Snapshot,
     revision: u64,
     language: Language,
+    reload_error: Option<Arc<io::Error>>,
+}
+
+impl Generation {
+    fn check_reload(&self) -> io::Result<()> {
+        match &self.reload_error {
+            Some(error) => Err(io::Error::new(error.kind(), Arc::clone(error))),
+            None => Ok(()),
+        }
+    }
 }
 
 static SOURCE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -446,7 +468,6 @@ pub(crate) fn invalidate_sources() {
 
 pub(crate) struct ConfigRead {
     observed: io::Result<Arc<Generation>>,
-    previous: Option<Arc<Generation>>,
     language: Language,
     raw: Option<Value>,
 }
@@ -464,17 +485,16 @@ impl ConfigRead {
     }
 
     pub(crate) fn normalized(self, keep_previous: bool) -> io::Result<Config> {
-        match self.observed {
-            Ok(current) => Ok(current.snapshot.config.clone()),
-            Err(error) => match self.previous.filter(|_| keep_previous) {
-                Some(previous) => Ok(previous.snapshot.config.clone()),
-                None => Err(error),
-            },
+        let current = self.observed?;
+        if !keep_previous {
+            current.check_reload()?;
         }
+        Ok(current.snapshot.config.clone())
     }
 
     pub(crate) fn into_inspection(self) -> io::Result<(PathBuf, Value, Config)> {
         let current = self.observed?;
+        current.check_reload()?;
         Ok((
             inspection_path(&current.snapshot.sources),
             self.raw.expect("inspection reads the raw configuration"),
@@ -511,47 +531,54 @@ pub(crate) fn read_generation(cwd: &Path, sources: ConfigSources, mode: ReadMode
     if let Some(hit) = previous.as_ref().filter(|_| matches!(mode, ReadMode::Observe) && !refresh) {
         return ConfigRead {
             observed: Ok(Arc::clone(hit)),
-            previous: None,
             language: hit.language,
             raw: None,
         };
     }
-    let stamp = sources.stamp().ok();
+    let stamp = if matches!(mode, ReadMode::Observe) { None } else { sources.stamp().ok() };
     if let Some(hit) = previous
         .as_ref()
         .filter(|hit| !refresh && stamp.is_some() && hit.stamp == stamp)
     {
         return ConfigRead {
             observed: Ok(Arc::clone(hit)),
-            previous: None,
             language: hit.language,
             raw: None,
         };
     }
     let mut language = default_language();
     let mut inspection = None;
-    let observed = (|| {
+    let read = (|| {
         let raw = sources.load(cwd)?;
         language = raw_language(&raw);
         let config = Config::parse(&raw)?;
         if matches!(mode, ReadMode::Inspect) {
             inspection = Some(raw);
         }
-        let current = Arc::new(Generation {
-            stamp,
-            revision,
-            language,
-            snapshot: Snapshot {
-                config,
-                sources,
-            },
-        });
+        Ok::<_, io::Error>(config)
+    })();
+    let observed = (|| {
+        let (snapshot, stamp, reload_error) = match read {
+            Ok(config) => (Snapshot { config, sources }, stamp, None),
+            Err(error) if matches!(mode, ReadMode::Observe | ReadMode::CheckStamp) => {
+                let Some(previous) = previous.as_ref() else { return Err(error); };
+                (Snapshot { config: previous.snapshot.config.clone(), sources }, None, Some(Arc::new(error)))
+            }
+            Err(error) => return Err(error),
+        };
+        let current = Arc::new(Generation { stamp, snapshot, revision, language, reload_error });
+        // A stamp-based reader can recheck an unavailable source on its next
+        // request. Event-observed requests consume this revision even on error.
+        if current.reload_error.is_some() && !matches!(mode, ReadMode::Observe) {
+            return Ok(current);
+        }
         let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
         let index = cache
             .iter()
             .position(|entry| entry.snapshot.sources == current.snapshot.sources);
         if let Some(hit) = index.map(|index| &cache[index]) {
-            if !refresh && current.stamp.is_some() && hit.stamp == current.stamp {
+            if !refresh && current.stamp.is_some() && hit.stamp == current.stamp
+                && hit.revision == revision {
                 return Ok(Arc::clone(hit));
             }
             if !previous
@@ -570,12 +597,7 @@ pub(crate) fn read_generation(cwd: &Path, sources: ConfigSources, mode: ReadMode
         cache.truncate(CONFIG_CACHE_LIMIT);
         Ok(current)
     })();
-    ConfigRead {
-        observed,
-        previous,
-        language,
-        raw: inspection,
-    }
+    ConfigRead { observed, language, raw: inspection }
 }
 
 pub fn load_language(cwd: &Path) -> Language {
@@ -605,6 +627,7 @@ pub(crate) fn reload_snapshot(cwd: &Path) -> io::Result<Snapshot> {
 
 fn snapshot(read: ConfigRead) -> io::Result<Snapshot> {
     let generation = read.observed?;
+    generation.check_reload()?;
     Ok(Snapshot {
         config: generation.snapshot.config.clone(),
         sources: generation.snapshot.sources.clone(),
@@ -1079,7 +1102,7 @@ impl PathRule {
                 "extensions",
                 "full_names",
             ],
-            &format!("Unsupported {}", object.get("name").and_then(Value::as_str).unwrap_or("None")),
+                &format!("Unsupported {}", object.get("name").and_then(Value::as_str).map(str::trim).unwrap_or("None")),
         )?;
         let parse = |key: &str| -> io::Result<Vec<RuleEntry>> {
             let Some(value) = object.get(key) else {
@@ -1088,15 +1111,15 @@ impl PathRule {
             let values = value.as_array()
                 .ok_or_else(|| invalid(format!("{key} must be a list of rule objects")))?;
             let entries = values.iter().enumerate().map(|(index, value)| {
-                let entry: RuleEntry = RuleEntry::deserialize(value).map_err(|_| invalid(format!(
-                    "{key}[{index}] requires a nonempty value string and a regex boolean"
-                )))?;
-                if entry.value.is_empty() {
-                    return Err(invalid(format!(
+                value.as_object().filter(|entry| entry.len() == 2)
+                    .and_then(|entry| {
+                        let value = entry.get("value")?.as_str().filter(|value| !value.is_empty())?;
+                        let regex = entry.get("regex")?.as_bool()?;
+                        Some(RuleEntry { value: value.into(), regex })
+                    })
+                    .ok_or_else(|| invalid(format!(
                         "{key}[{index}] requires a nonempty value string and a regex boolean"
-                    )));
-                }
-                Ok(entry)
+                    )))
             }).collect::<io::Result<Vec<_>>>()?;
             Ok(entries)
         };
@@ -1268,6 +1291,30 @@ mod layer_merge_tests {
     use super::*;
 
     #[test]
+    fn observed_invalid_edit_is_consumed_while_inspection_stays_strict() {
+        let path = crate::test_support::temp_file("observed_config", br#"{"cli":{"language":"en"}}"#);
+        let sources = ConfigSources { simple: Some(path.clone()), ..Default::default() };
+        let read = |mode| read_generation(Path::new("."), sources.clone(), mode);
+        let first = read(ReadMode::Observe).observed.unwrap();
+        std::fs::write(&path, br#"{"cli":{"language":"zh"},"recursive_extract":0}"#).unwrap();
+        invalidate_sources();
+        let failed = read(ReadMode::Observe);
+        assert!(failed.language() == Language::Zh);
+        let fallback = failed.observed.unwrap();
+        assert!(fallback.reload_error.is_some());
+        assert!(fallback.snapshot.config == first.snapshot.config);
+        let reused = read(ReadMode::Observe).observed.unwrap();
+        assert!(Arc::ptr_eq(&fallback, &reused));
+        assert!(read(ReadMode::Inspect).into_inspection().is_err());
+
+        std::fs::write(&path, br#"{"cli":{"language":"zh"}}"#).unwrap();
+        invalidate_sources();
+        let current = read(ReadMode::Observe).normalized(true).unwrap();
+        assert!(current.cli.language == Language::Zh);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn one_config_value_preserves_layer_precedence_and_named_filter_order() {
         let advanced = crate::test_support::temp_file("merge_advanced", br#"{"cli":{"language":"en","language":"zh"},"user_passwords":["old"],"filesystem":{"scan_filters":[{"name":"a","z":0,"a":1},{"name":"b","keep":true},{"name":"c","untouched":7}]},"analysis":{"filesystem":{"scan_filters":[{"name":"a","old":true}]}}}"#);
         let simple = crate::test_support::temp_file("merge_simple", br#"{"filesystem":{"scan_filters":[{"name":"b","extra":7},{"name":"a","a":2,"new":3}]},"user_passwords":["second","first"],"analysis":{"filesystem":{"scan_filters":[{"name":"a","new":true}]}}}"#);
@@ -1322,6 +1369,7 @@ mod filter_runtime_tests {
             (serde_json::json!({"name":"mtime_range","start_utc":"2026-02-30T00:00Z"}), "Invalid UTC minute"),
             (serde_json::json!({"name":"blacklist","unexpected":true}), "Unsupported blacklist fields: unexpected"),
             (serde_json::json!({"name":"blacklist","paths":[{"value":"a","regex":1}]}), "paths[0] requires a nonempty value string and a regex boolean"),
+            (serde_json::json!({"name":"blacklist","paths":[["a",false]]}), "paths[0] requires a nonempty value string and a regex boolean"),
             (serde_json::json!({"name":"whitelist","paths":[{"value":"","regex":false}]}), "paths[0] requires a nonempty value string and a regex boolean"),
             (serde_json::json!({"name":"blacklist","paths":null}), "paths must be a list of rule objects"),
         ];

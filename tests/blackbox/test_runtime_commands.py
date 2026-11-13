@@ -86,6 +86,12 @@ def test_cli_password_values_and_noninteractive_prompt_contract(package):
     assert report["items"][0]["user_passwords"] == ["--no-bpw", "-42"]
     assert not report["items"][0]["use_builtin_passwords"]
 
+    # A command-line field can span multiple pipe reads, with more arguments
+    # following immediately in the same request.
+    long_argument = "密" * 6000
+    report = package.json("passwords", "-p", long_argument, "-p", "last", "--no-bpw")
+    assert report["items"][0]["combined_passwords"] == [long_argument, "last"]
+
     prompt = package.json("passwords", "--ask-pw", code=2)
     assert prompt["inputs"]["argv"] == ["passwords", "--ask-pw", "--json"]
     assert prompt["errors"] == ["interactive password input is unavailable in JSON mode"]
@@ -130,12 +136,26 @@ def test_running_cli_keeps_last_passwords_until_valid_edit_or_deletion(package):
 def test_launcher_preserves_flag_like_operands_and_validates_pause_flags(package, tmp_path):
     archive = tmp_path / "--pause"
     flag_like = tmp_path / "--_sunpack-terminal-size=80x24"
-    for source in (archive, flag_like):
+    json_name = tmp_path / "--json"
+    for source in (archive, flag_like, json_name):
         with zipfile.ZipFile(source, "w") as payload:
             payload.writestr("member.txt", "payload")
     report = package.run("scan", "--json", "--", archive.name, flag_like.name, cwd=tmp_path)
     assert report.returncode == 0, (report.stdout, report.stderr)
     assert json.loads(report.stdout)["summary"]["archive_count"] == 2
+
+    human = package.run("scan", "--", json_name.name, cwd=tmp_path)
+    assert human.returncode == 0, human.stderr
+    assert str(json_name) in human.stdout and not human.stdout.startswith("{")
+
+    invalid_pause = package.run("version", "--pause")
+    assert invalid_pause.returncode == 2 and "unrecognized arguments: --pause" in invalid_pause.stderr
+
+    rejected_prompt = package.run("scan", "--json", "--pause", "--ask-pw", "--", archive.name, cwd=tmp_path)
+    assert rejected_prompt.returncode == 2, rejected_prompt.stderr
+    assert json.loads(rejected_prompt.stdout)["inputs"]["argv"] == [
+        "scan", "--json", "--pause", "--ask-pw", "--", archive.name,
+    ]
 
     conflict = package.run("scan", archive, "--pause", "--no-pause")
     assert conflict.returncode == 2

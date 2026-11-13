@@ -105,6 +105,7 @@ trait Session: Send + Sync {
         Box::pin(async move { self.read_line(prompt) })
     }
     fn interactive(&self) -> bool;
+    fn local_pause(&self) -> bool { true }
     fn unicode(&self) -> bool;
     fn terminal_size(&self) -> (usize, usize);
 }

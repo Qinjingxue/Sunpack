@@ -137,8 +137,8 @@ pub(crate) struct EmbeddedCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(C)]
 struct RawHit {
-    // Only validated root evidence retains absolute offsets. Transient scan
-    // batches use four-byte records before immutable block encoding.
+    // Decoded hits use absolute offsets. Transient scan batches use four-byte
+    // records before immutable block encoding.
     location: [u8; 8],
     pattern: u8,
 }
@@ -194,21 +194,11 @@ impl RawHit {
             .get(self.pattern as usize)
             .map_or("xz_footer", |pattern| pattern.2)
     }
-
-    fn format(&self) -> &'static str {
-        match self.kind() {
-            "zip_eocd" => "zip",
-            "rar4" | "rar5" => "rar",
-            "lz4_skippable" => "lz4",
-            kind => kind,
-        }
-    }
 }
 
 #[derive(Default)]
 pub(crate) struct NativeScanResult {
     file_size: u64,
-    raw_hits: Vec<RawHit>,
     candidates: Vec<EmbeddedCandidate>,
     #[cfg(test)]
     raw_hit_count: usize,
@@ -325,15 +315,6 @@ impl NativeScanResult {
 
     pub(crate) fn file_size(&self) -> u64 {
         self.file_size
-    }
-
-    pub(crate) fn signature_hits(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
-        self.raw_hits.iter().map(|hit| {
-            (
-                hit.hit_name(),
-                hit.offset() + if hit.kind() == "tar" { 257 } else { 0 },
-            )
-        })
     }
 }
 
@@ -593,24 +574,9 @@ fn scan_embedded_archives_native_with_iocp(
         });
     }
     resolve_logical_candidates(&mut candidates);
-    // Only validated root evidence survives in the cached native scan. Noise,
-    // inner signatures and consumed directory records have no later users.
-    let mut roots = Vec::new();
-    let mut cursor = raw_hits.iter();
-    for group in candidates.chunk_by(|a, b| a.offset == b.offset) {
-        roots.extend(cursor.equal_offset(group[0].offset).filter(|hit| {
-            hit.kind() != "zip64_eocd"
-                && group
-                    .iter()
-                    .any(|candidate| hit.format() == candidate.format)
-        }));
-    }
-    let raw_hits = roots;
-
     cancellation.check_io()?;
     Ok(NativeScanResult {
         file_size,
-        raw_hits,
         candidates,
         #[cfg(test)]
         raw_hit_count,
@@ -3108,8 +3074,7 @@ mod tests {
 
     #[test]
     fn validates_supported_stream_headers_in_one_pass() {
-        // The previous valid-stream check cannot catch noisy storage retention
-        // or filtering that hides a real peer after dense rejected headers.
+        // Filtering must keep real peers after dense rejected headers.
         let mut noise = Vec::new();
         for pattern in [2, 5, 6, 7, 10] {
             let magic = PATTERNS[pattern].0;
@@ -3136,7 +3101,6 @@ mod tests {
         )
         .unwrap();
         assert!(scan.raw_hit_count > 2000);
-        assert!(scan.raw_hits.len() <= scan.candidates.len());
         let formats: Vec<_> = scan.candidates().iter().map(|row| row.format).collect();
         assert_eq!(formats, ["bzip2", "xz", "zstd"]);
         let _ = fs::remove_file(path);

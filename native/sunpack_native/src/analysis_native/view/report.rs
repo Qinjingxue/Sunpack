@@ -9,8 +9,7 @@ use crate::analysis_native::structure::{
 use crate::io::archive_state::{AnalysisFacts, AnalysisStatus, ArchiveInput, OpenMode, VolumeCompleteness};
 use crate::io::cancellation::{CancellableOnce, Cancellation};
 use crate::io::reader::FileIdentity;
-use crate::scan::embedded::{EmbeddedCandidate, NativeScanResult};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -151,7 +150,6 @@ impl Segment {
 // Keep only the facts consumed by selection and extraction planning.
 enum EvidenceDetails {
     Empty,
-    Embedded { anchor: bool, zip_eocd_offset: Option<u64> },
     Zip(Box<ZipObservation>),
     Tar(Box<TarObservation>),
     Rar(Box<RarObservation>),
@@ -169,9 +167,6 @@ impl EvidenceDetails {
         }
     }
 
-    fn embedded_anchor(&self) -> bool {
-        matches!(self, Self::Embedded { anchor: true, .. })
-    }
 }
 
 pub(crate) struct Evidence {
@@ -226,7 +221,6 @@ enum ReportHitKind {
     ZipOther,
     Rar,
     SevenZip,
-    Tar,
 }
 
 impl ReportHitKind {
@@ -235,7 +229,6 @@ impl ReportHitKind {
             "zip_local" => Some(Self::ZipLocal),
             "zip_eocd" => Some(Self::ZipEocd),
             "7z" => Some(Self::SevenZip),
-            "tar_ustar" => Some(Self::Tar),
             name if name.starts_with("rar") => Some(Self::Rar),
             name if name.starts_with("zip_") => Some(Self::ZipOther),
             // Stream modules consume structural facts, not signature hits.
@@ -254,7 +247,6 @@ struct ReportContext<'a> {
     view: &'a AnalysisBinaryView,
     disk_starts: Option<&'a [u64]>,
     hits: Arc<[SignatureHit]>,
-    embedded_scan: Option<&'a NativeScanResult>,
     stream_structure: Option<Option<Arc<StreamObservation>>>,
 }
 
@@ -278,16 +270,10 @@ pub(crate) struct AnalysisReport {
 pub(crate) fn analyze_input(
     input: &ArchiveInput,
     config: &NativeAnalysisConfig,
-    initial_prepass: Option<&NativeScanResult>,
-    format_structure: bool,
 ) -> io::Result<AnalysisReport> {
     let cache_bytes = 64 * 1024 * 1024;
     if input.mode == OpenMode::File || (input.parts.is_empty() && input.ranges.is_empty()) {
-        return AnalysisBinaryView::new(&input.entry_path, cache_bytes)?.analyze(
-            config,
-            initial_prepass,
-            format_structure,
-        );
+        return AnalysisBinaryView::new(&input.entry_path, cache_bytes)?.analyze_report(config, None);
     }
     let extents = if input.mode.structured() {
         let mut parts: Vec<_> = input.parts.iter().collect();
@@ -297,70 +283,37 @@ pub(crate) fn analyze_input(
         input.physical_extents().collect::<Vec<_>>()
     };
     if extents.len() == 1 && extents[0].start == 0 && extents[0].end.is_none() {
-        return AnalysisBinaryView::new(&extents[0].path, cache_bytes)?.analyze(
-            config,
-            initial_prepass,
-            format_structure,
-        );
+        return AnalysisBinaryView::new(&extents[0].path, cache_bytes)?.analyze_report(config, None);
     }
     let (reader, starts) = ManagedReader::open_extents(
         extents.iter().map(|e| (e.path.as_str(), e.start, e.end)),
         ReaderConfig { cache_bytes },
     )?;
     let view = AnalysisBinaryView { reader };
-    view.analyze_report(
-        config,
-        initial_prepass,
-        format_structure,
-        input.mode.structured().then_some(&starts),
-    )
+    view.analyze_report(config, input.mode.structured().then_some(&starts))
 }
 
 impl AnalysisBinaryView {
-    pub(crate) fn analyze_report(
+    fn analyze_report(
         &self,
         config: &NativeAnalysisConfig,
-        initial_prepass: Option<&NativeScanResult>,
-        format_structure: bool,
         disk_starts: Option<&[u64]>,
     ) -> io::Result<AnalysisReport> {
         let cancellation = Cancellation::current();
         cancellation.check()?;
-        let hits = match initial_prepass {
-            Some(scan) => scan
-                .signature_hits()
-                .filter_map(|(name, offset)| {
-                    let pattern = ANALYSIS_SIGNATURES
-                        .iter()
-                        .position(|(item, _)| *item == name)
-                        .or_else(|| {
-                            name.starts_with("zip_")
-                                .then_some(ANALYSIS_SIGNATURES.len() - 1)
-                        })?;
-                    Some(SignatureHit::new(pattern, offset))
-                })
-                .collect::<Vec<_>>()
-                .into(),
-            None => signature_prepass_native(&self.reader).map_err(reader_error)?,
-        };
         let mut context = ReportContext {
             view: self,
             disk_starts,
-            hits,
-            embedded_scan: initial_prepass,
+            hits: signature_prepass_native(&self.reader).map_err(reader_error)?,
             stream_structure: None,
         };
         let mut evidences = Vec::new();
-        if format_structure {
-            for module in &config.modules {
-                cancellation.check()?;
-                evidences.push(match context.run_module(module) {
-                    Ok(evidence) => evidence,
-                    Err(_) => {
-                        Evidence::new(module.kind.format(), "error", Vec::new(), EvidenceDetails::Empty)
-                    }
-                });
-            }
+        for module in &config.modules {
+            cancellation.check()?;
+            evidences.push(match context.run_module(module) {
+                Ok(evidence) => evidence,
+                Err(_) => Evidence::new(module.kind.format(), "error", Vec::new(), EvidenceDetails::Empty),
+            });
         }
         cancellation.check()?;
         let size = self.reader.len();
@@ -442,79 +395,27 @@ impl<'a> ReportContext<'a> {
             .collect()
     }
 
-    fn embedded(&self, format: &str, logical_only: bool) -> Vec<&'a EmbeddedCandidate> {
-        self.embedded_scan
-            .into_iter()
-            .flat_map(NativeScanResult::candidates)
-            .filter(|item| {
-                item.format == format && (!logical_only || item.candidate_kind == "logical_archive")
-            })
-            .collect()
-    }
-
-    fn preserve_multiple(&self) -> bool {
-        self.embedded_scan.is_some()
-    }
-
     // ---- RAR ------------------------------------------------------------
 
     fn rar_module(&mut self) -> std::io::Result<Evidence> {
         let hits = self.hits(|kind| kind == ReportHitKind::Rar);
-        let embedded = self.embedded("rar", true);
-        if hits.is_empty() && embedded.is_empty() {
+        if hits.is_empty() {
             return Ok(Evidence::not_found("rar"));
         }
         let mut candidates = Vec::new();
-        let mut exact_starts = HashSet::new();
-        for item in &embedded {
-            let start = item.offset;
-            let end = item.end_offset;
-            let Some(end) = end else { continue };
-            if item.boundary_kind != "exact" || !item.extractable {
-                continue;
-            }
-            exact_starts.insert(start);
-
-            candidates.push(Evidence::new(
-                "rar",
-                "extractable",
-                vec![Segment::new(start, Some(end), Vec::new())],
-                EvidenceDetails::Empty,
-            ));
-        }
-        let mut starts = embedded.iter().map(|item| item.offset).collect::<Vec<_>>();
-        if starts.is_empty() {
-            starts = hits.iter().map(|hit| hit.offset).collect::<Vec<_>>();
-        }
+        let mut starts = hits.iter().map(|hit| hit.offset).collect::<Vec<_>>();
         starts.sort_unstable();
         starts.dedup();
-        for start in starts
-            .into_iter()
-            .filter(|start| !exact_starts.contains(start))
-        {
+        for start in starts {
             let native = (self.view.probe_rar_native(start))?;
             candidates.push(rar_from_native(native, start));
         }
-        Ok(combine_candidates("rar", candidates, self.preserve_multiple()))
+        Ok(select_candidate("rar", candidates))
     }
 
     // ---- 7z -------------------------------------------------------------
 
     fn seven_zip_module(&mut self) -> std::io::Result<Evidence> {
-        let embedded = self.embedded("7z", true);
-        let mut exact = Vec::new();
-        for item in embedded {
-            if item.boundary_kind == "exact" && item.end_offset.is_some() && item.extractable {
-                exact.push(item);
-            }
-        }
-        if !exact.is_empty() {
-            let candidates = exact
-                .iter()
-                .map(|item| seven_zip_from_embedded(item))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            return Ok(combine_candidates("7z", candidates, true));
-        }
         let hits = self.hits(|kind| kind == ReportHitKind::SevenZip);
         if hits.is_empty() {
             return Ok(Evidence::not_found("7z"));
@@ -527,38 +428,12 @@ impl<'a> ReportContext<'a> {
             let native = (self.view.probe_seven_zip_native(start))?;
             candidates.push(seven_zip_from_native(native, start));
         }
-        Ok(combine_candidates("7z", candidates, self.preserve_multiple()))
+        Ok(select_candidate("7z", candidates))
     }
 
     // ---- TAR ------------------------------------------------------------
 
     fn tar_module(&mut self) -> std::io::Result<Evidence> {
-        let embedded = self.embedded("tar", true);
-        if !embedded.is_empty() {
-            let mut candidates = Vec::new();
-            for item in &embedded {
-                let start = item.offset;
-                let end = item.end_offset;
-                let boundary_kind = item.boundary_kind;
-                let exact = end.is_some() && boundary_kind == "exact" && item.extractable;
-
-                candidates.push(Evidence::new(
-                    "tar",
-                    if exact { "extractable" } else { "damaged" },
-                    vec![Segment::new(
-                        start,
-                        end,
-                        if exact {
-                            Vec::new()
-                        } else {
-                            vec!["tar_boundary_unresolved".to_string()]
-                        },
-                    )],
-                    EvidenceDetails::Empty,
-                ));
-            }
-            return Ok(combine_candidates("tar", candidates, true));
-        }
         // Ordinary analysis owns only a TAR starting at the logical input start.
         // Nonzero TAR candidates belong to the canonical embedded scanner;
         // raw ustar hits can also be bytes inside a compression stream.
@@ -603,18 +478,8 @@ impl<'a> ReportContext<'a> {
                 ReportHitKind::ZipLocal | ReportHitKind::ZipEocd | ReportHitKind::ZipOther
             )
         });
-        let embedded = self.embedded("zip", false);
-        if hits.is_empty() && embedded.is_empty() {
+        if hits.is_empty() {
             return Ok(Evidence::not_found("zip"));
-        }
-        let mut logical = Vec::new();
-        for item in &embedded {
-            if item.candidate_kind == "logical_archive" {
-                logical.push(zip_from_embedded(item));
-            }
-        }
-        if !logical.is_empty() {
-            return Ok(combine_candidates("zip", logical, true));
         }
         // Resolve only on recovery, once per analysis, including an absent local header.
         let mut earliest_local = None::<Option<u64>>;
@@ -650,30 +515,7 @@ impl<'a> ReportContext<'a> {
                 },
             );
         }
-        let known_starts = evidences
-            .iter()
-            .flat_map(|evidence| evidence.segments.iter().map(|segment| segment.start))
-            .collect::<HashSet<_>>();
-        for item in &embedded {
-            if !item.validation.contains("local_header") {
-                continue;
-            }
-            let start = item.offset;
-            if known_starts.contains(&start) {
-                continue;
-            }
-            evidences.push(Evidence::new(
-                "zip",
-                "damaged",
-                vec![Segment::new(
-                    start,
-                    None,
-                    vec!["central_directory_unavailable".to_string()],
-                )],
-                EvidenceDetails::Empty,
-            ));
-        }
-        Ok(combine_candidates("zip", evidences, self.preserve_multiple()))
+        Ok(select_candidate("zip", evidences))
     }
 
     fn zip_eocd_observation(&self, requested: u64) -> std::io::Result<ZipObservation> {
@@ -688,34 +530,6 @@ impl<'a> ReportContext<'a> {
     // ---- Compression streams -------------------------------------------
 
     fn stream_module(&mut self, format: &'static str) -> std::io::Result<Evidence> {
-        let embedded = self.embedded(format, true);
-        if !embedded.is_empty() {
-            let mut complete = true;
-            let mut segments = Vec::new();
-            for item in &embedded {
-                let end = item.end_offset;
-                let extractable =
-                    end.is_some() && item.boundary_kind == "exact" && item.extractable;
-                complete &= extractable;
-                let mut segment = Segment::new(
-                    item.offset,
-                    end,
-                    if end.is_some() {
-                        Vec::new()
-                    } else {
-                        vec!["stream_boundary_inferred".to_string()]
-                    },
-                );
-                segment.extractable = extractable;
-                segments.push(segment);
-            }
-            return Ok(Evidence::new(
-                format,
-                if complete { "extractable" } else { "damaged" },
-                segments,
-                EvidenceDetails::Empty,
-            ));
-        }
         let Some(result) = self.full_stream_structure()? else {
             return Ok(Evidence::not_found(format));
         };
@@ -894,20 +708,6 @@ fn rar_from_native(mut raw: RarObservation, start: u64) -> Evidence {
     )
 }
 
-fn seven_zip_from_embedded(item: &EmbeddedCandidate) -> std::io::Result<Evidence> {
-    let start = item.offset;
-    let end = item
-        .end_offset
-        .ok_or_else(|| io::Error::other("validated 7z has no end"))?;
-
-    Ok(Evidence::new(
-        "7z",
-        "extractable",
-        vec![Segment::new(start, Some(end), Vec::new())],
-        EvidenceDetails::Empty,
-    ))
-}
-
 fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> Evidence {
     let mut damage_flags = Vec::new();
     if let Some((fault, legacy)) = &raw.read_fault {
@@ -962,21 +762,6 @@ fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> Evidence {
     )
 }
 
-fn zip_from_embedded(item: &EmbeddedCandidate) -> Evidence {
-    let start = item.offset;
-    let bounded_end = item.end_offset.filter(|end| *end > start);
-    let extractable = item.boundary_kind == "exact" && item.extractable && bounded_end.is_some();
-    let mut segment = Segment::new(start, bounded_end, Vec::new());
-    segment.zip_eocd_offset = item.zip_eocd_offset.and_then(|offset| offset.checked_sub(start));
-    Evidence::new(
-        "zip", if extractable { "extractable" } else { "damaged" }, vec![segment],
-        EvidenceDetails::Embedded {
-            anchor: !item.candidate_kind.is_empty() && item.candidate_kind != "logical_archive",
-            zip_eocd_offset: item.zip_eocd_offset,
-        },
-    )
-}
-
 fn zip_from_native(
     native: ZipObservation,
     hits: &[ReportSignatureHit],
@@ -1023,79 +808,13 @@ fn zip_local_header_recovery(
     ))
 }
 
-fn combine_candidates(
-    format: &str,
-    candidates: Vec<Evidence>,
-    preserve_multiple: bool,
-) -> Evidence {
-    let mut usable = candidates
+fn select_candidate(format: &str, candidates: Vec<Evidence>) -> Evidence {
+    candidates
         .into_iter()
         .filter(|item| !item.segments.is_empty())
-        .collect::<Vec<_>>();
-    if usable.is_empty() {
-        return Evidence::not_found(format);
-    }
-    if usable
-        .iter()
-        .any(|item| item.status == "damaged" || item.status == "extractable")
-    {
-        usable.retain(|item| item.status == "damaged" || item.status == "extractable");
-    }
-    // Prefer established format state, then the first outer physical range.
-    let mut best = 0usize;
-    for (index, item) in usable.iter().enumerate().skip(1) {
-        let current = &usable[best];
-        let rank = status_rank(item.status);
-        let best_rank = status_rank(current.status);
-        if rank > best_rank || (rank == best_rank && item.range_key() < current.range_key()) {
-            best = index;
-        }
-    }
-    if !preserve_multiple {
-        return usable.swap_remove(best);
-    }
-    let mut seen = HashMap::new();
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut details = EvidenceDetails::Empty;
-    let status = usable[best].status;
-    for (index, item) in usable.into_iter().enumerate() {
-        let password_required = item.details.password_required();
-        if index == best {
-            details = item.details;
-        }
-        for mut segment in item.segments {
-            // Merging evidence must not promote a damaged peer or lose an
-            // encrypted peer's password requirement with the primary details.
-            segment.password_required =
-                Some(segment.password_required.unwrap_or(password_required));
-            let key = (segment.start, segment.end);
-            if let Some(&index) = seen.get(&key) {
-                let previous: &mut Segment = &mut segments[index];
-                let password = previous.password_required.unwrap_or(false)
-                    || segment.password_required.unwrap_or(false);
-                if !previous.extractable && segment.extractable {
-                    *previous = segment;
-                }
-                previous.password_required = Some(password);
-            } else {
-                seen.insert(key, segments.len());
-                segments.push(segment);
-            }
-        }
-    }
-    segments.sort_by_key(|segment| {
-        (
-            segment.start,
-            segment.end.is_none(),
-            segment.end.unwrap_or(0),
-        )
-    });
-    Evidence {
-        format: format.to_string(),
-        status,
-        segments,
-        details,
-    }
+        // Prefer established format state, then the first outer physical range.
+        .min_by_key(|item| (std::cmp::Reverse(status_rank(item.status)), item.range_key()))
+        .unwrap_or_else(|| Evidence::not_found(format))
 }
 
 fn status_rank(status: &str) -> u8 {
@@ -1120,9 +839,6 @@ impl SegmentPlan {
         let mut candidates = Vec::new();
         for &evidence_index in selected {
             let evidence = &evidences[evidence_index];
-            if evidence.details.embedded_anchor() {
-                continue;
-            }
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
                 if !segment.extractable
                     || !matches!(segment.end, Some(end) if segment.start < end && end <= size)
@@ -1206,7 +922,6 @@ impl Evidence {
         };
         let (zip_eocd_offset, zip_spanned) = match &self.details {
             EvidenceDetails::Zip(value) => (Some(value.eocd_offset), value.is_multi_disk),
-            EvidenceDetails::Embedded { zip_eocd_offset, .. } => (*zip_eocd_offset, false),
             _ => (None, false),
         };
         AnalysisFacts { zip_eocd_offset, zip_spanned,
@@ -1379,15 +1094,9 @@ mod report_tests {
         format: &str,
         status: &'static str,
         segments: &[(u64, Option<u64>)],
-        details: &[(&str, &str)],
+        password_required: bool,
     ) -> Evidence {
-        let password_required = details.iter().any(|&(key, value)| key == "password_required" && !value.is_empty());
-        let anchor = details.iter().any(|&(key, value)| key == "candidate_kind" && value != "logical_archive" && !value.is_empty());
-        let facts = if anchor {
-            EvidenceDetails::Embedded { anchor: true, zip_eocd_offset: None }
-        } else {
-            EvidenceDetails::Zip(Box::new(ZipObservation { password_required, ..Default::default() }))
-        };
+        let facts = EvidenceDetails::Zip(Box::new(ZipObservation { password_required, ..Default::default() }));
         Evidence::new(
             format,
             status,
@@ -1434,19 +1143,13 @@ mod report_tests {
     }
 
     #[test]
-    fn plan_orders_carved_segments_including_prefix_and_skips_anchor_fragments() {
+    fn plan_orders_outer_carved_segments_including_prefix() {
         let evidences = vec![
-            evidence("rar", "extractable", &[(40, Some(60))], &[]),
-            evidence("7z", "extractable", &[(4, Some(32)), (0, Some(14))], &[]),
-            evidence(
-                "zip",
-                "extractable",
-                &[(13, Some(81))],
-                &[("source", "embedded_scan"), ("candidate_kind", "anchor")],
-            ),
-            evidence("tar", "extractable", &[(90, None)], &[]),
+            evidence("rar", "extractable", &[(40, Some(60))], false),
+            evidence("7z", "extractable", &[(4, Some(32)), (0, Some(14))], false),
+            evidence("tar", "extractable", &[(90, None)], false),
         ];
-        let plan = SegmentPlan::build(&evidences, &[0, 1, 2, 3], 100);
+        let plan = SegmentPlan::build(&evidences, &[0, 1, 2], 100);
         assert_eq!(
             planned(&evidences, &plan),
             vec![("7z".into(), 0), ("rar".into(), 40)]
@@ -1460,19 +1163,19 @@ mod report_tests {
                 "7z",
                 "damaged",
                 &[(0, None)],
-                &[("password_required", "yes")],
+                true,
             ),
             evidence(
                 "rar",
                 "damaged",
                 &[(90, None), (64, None)],
-                &[("password_required", "yes")],
+                true,
             ),
             evidence(
                 "zip",
                 "damaged",
                 &[(10, None)],
-                &[("password_required", "yes")],
+                true,
             ),
         ];
         let plan = SegmentPlan::build(&evidences, &[], 200);
@@ -1482,7 +1185,7 @@ mod report_tests {
 
     #[test]
     fn plan_proves_missing_volume_from_seven_zip_declared_end() {
-        let mut seven = evidence("7z", "damaged", &[(0, None)], &[]);
+        let mut seven = evidence("7z", "damaged", &[(0, None)], false);
         seven.details = EvidenceDetails::SevenZip(Box::new(SevenZipObservation {
             start_header_crc_ok: true, archive_offset: 0, next_header_offset: 100, next_header_size: 10,
             ..Default::default()
@@ -1501,64 +1204,16 @@ mod report_tests {
     }
 
     #[test]
-    fn combine_prefers_first_outer_range_and_deduplicates_segments() {
+    fn selection_prefers_first_proven_outer_range() {
         let candidates = vec![
-            evidence("rar", "weak", &[(9, None)], &[]),
-            evidence("rar", "extractable", &[(30, Some(50))], &[]),
-            evidence(
-                "rar",
-                "extractable",
-                &[(4, Some(20)), (30, Some(50))],
-                &[("password_required", "yes")],
-            ),
+            evidence("rar", "weak", &[(0, None)], false),
+            evidence("rar", "extractable", &[(30, Some(50))], false),
+            evidence("rar", "extractable", &[(4, Some(20))], true),
         ];
-        let combined = combine_candidates("rar", candidates, true);
-        assert_eq!(combined.status, "extractable");
-        assert!(combined.details.password_required());
-        let spans = combined
-            .segments
-            .iter()
-            .map(|segment| (segment.start, segment.end))
-            .collect::<Vec<_>>();
-        assert_eq!(spans, vec![(4, Some(20)), (30, Some(50))]);
-    }
-
-    #[test]
-    fn merged_plan_preserves_peer_eligibility_and_password_ownership() {
-        // Existing isolated-format tests cannot expose promotion of bounded
-        // damaged peers, lost password facts, or a duplicate hiding a valid
-        // segment. One in-memory plan covers those independent merge effects.
-        let candidates = vec![
-            evidence("zip", "damaged", &[(40, Some(60)), (80, Some(90))], &[]),
-            evidence("zip", "extractable", &[(40, Some(60))], &[]),
-            evidence(
-                "zip",
-                "damaged",
-                &[(10, Some(20))],
-                &[("password_required", "yes")],
-            ),
-        ];
-        let combined = combine_candidates("zip", candidates, true);
-        let evidences = vec![combined];
-        let plan = SegmentPlan::build(&evidences, &[0], 100);
-        assert_eq!(planned(&evidences, &plan), vec![("zip".into(), 40)]);
-        assert_eq!(plan.password_segment, Some((0, 0)));
-        assert_eq!(evidences[0].range_key().0, 40);
-
-        // An encrypted primary must likewise not transfer its password
-        // requirement to an earlier, unencrypted damaged peer.
-        let candidates = vec![
-            evidence(
-                "rar",
-                "extractable",
-                &[(40, Some(60))],
-                &[("password_required", "yes")],
-            ),
-            evidence("rar", "damaged", &[(10, Some(20))], &[]),
-        ];
-        let evidences = vec![combine_candidates("rar", candidates, true)];
-        let plan = SegmentPlan::build(&evidences, &[0], 100);
-        assert_eq!(plan.password_segment, Some((0, 1)));
+        let selected = select_candidate("rar", candidates);
+        assert_eq!(selected.status, "extractable");
+        assert!(selected.details.password_required());
+        assert_eq!(selected.segments[0].start, 4);
     }
 
     #[test]
@@ -1601,7 +1256,7 @@ mod report_tests {
         {
             let view = AnalysisBinaryView::new(&tar_path.to_string_lossy(), 0).unwrap();
             let context = ReportContext { view: &view, disk_starts: None, hits: Vec::new().into(),
-                embedded_scan: None, stream_structure: None };
+                stream_structure: None };
             let evidence = context.tar_candidate(0).unwrap().unwrap();
             assert_eq!(evidence.status, "extractable");
             assert_eq!(evidence.segments[0].end, Some(tar.len() as u64));

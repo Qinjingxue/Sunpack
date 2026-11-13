@@ -113,7 +113,7 @@ fn configuration_changes(
         // Overflow/invalidated subscriptions cannot identify a single source.
         return (true, files.values().any(|(_, passwords)| *passwords));
     };
-    names.iter().filter_map(|name| files.get(&name.to_lowercase()))
+    names.iter().filter_map(|name| files.get(&crate::path_keys::case_key(name)))
         .fold((false, false), |(reload, passwords), (config, password)|
             (reload || *config, passwords || *password))
 }
@@ -1100,25 +1100,30 @@ impl Hub {
 
 fn configuration_targets(paths: &[PathBuf], passwords: &Path) -> io::Result<HashMap<PathBuf, HashMap<String, (bool, bool)>>> {
     let mut targets: HashMap<PathBuf, HashMap<String, (bool, bool)>> = HashMap::new();
-    for path in paths.iter().map(PathBuf::as_path).chain([passwords])
-    {
-        let parent = path.parent().and_then(nearest_directory).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("No observable configuration directory for {}", path.display()))
-        })?;
-        let Some(name) = path
-            .strip_prefix(parent)
-            .ok()
-            .and_then(|path| path.components().next())
-        else {
-            continue;
-        };
-        let target = targets.entry(parent.to_owned()).or_default().entry(
-            name.as_os_str().to_string_lossy().to_lowercase(),
-        ).or_default();
-        // A missing parent is watched through its nearest ancestor. Its
-        // arrival can replace configuration and password sources together.
-        target.0 |= path != passwords || parent.join(name.as_os_str()) != path;
-        target.1 |= path == passwords;
+    for path in paths.iter().map(PathBuf::as_path).filter(|path| *path != passwords).chain([passwords]) {
+        let password = path == passwords;
+        // Source selection retains the lexical path so replacement or a new
+        // higher-priority file can wake the runtime. Watch its resolved name
+        // too when a config file points elsewhere, as main does.
+        let resolved: Option<PathBuf> = (!password).then(|| fs::canonicalize(path).ok())
+            .flatten()
+            .map(|path| PathBuf::from(crate::path_keys::normalize_windows_extended_prefix(path.to_string_lossy().into_owned())))
+            .filter(|resolved| key(resolved) != key(path));
+        for path in std::iter::once(path).chain(resolved.as_deref()) {
+            let parent = path.parent().and_then(nearest_directory).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("No observable configuration directory for {}", path.display()))
+            })?;
+            let Some(name) = path.strip_prefix(parent).ok().and_then(|path| path.components().next()) else {
+                continue;
+            };
+            let target = targets.entry(parent.to_owned()).or_default().entry(
+                crate::path_keys::case_key(&name.as_os_str().to_string_lossy()),
+            ).or_default();
+            // A missing parent is watched through its nearest ancestor. Its
+            // arrival can replace configuration and password sources together.
+            target.0 |= !password || parent.join(name.as_os_str()) != path;
+            target.1 |= password;
+        }
     }
     Ok(targets)
 }
@@ -1608,6 +1613,7 @@ impl CandidateDiagnostics {
 enum CandidateAdmission {
     Observe,
     Retry,
+    QueuedRecovery,
     CrashRecovery,
     PasswordRetry,
     // Startup USN recovery and pipeline completion errors may clear an
@@ -2312,6 +2318,9 @@ impl Scheduler {
         let snapshot = self.engine.run_stage("watch_config_reload", Origin::Watch, || config::reload_snapshot(&self.cwd))?;
         let config_changed = *self.settings != snapshot.config;
         let scheduler_changed = scheduler_configuration_changed(&self.settings, &snapshot.config);
+        let tray_changed = self.settings.watch.tray_enabled != snapshot.config.watch.tray_enabled
+            || self.settings.cli.language != snapshot.config.cli.language;
+        let process_mode_changed = self.settings.runtime.process_mode != snapshot.config.runtime.process_mode;
         let mut observed_paths = config::watch_paths(&self.cwd, &snapshot.sources);
         observed_paths.push(self.root_file.clone());
         let observers_changed = self.continuous
@@ -2392,7 +2401,12 @@ impl Scheduler {
         windows::configure_priority(&self.engine, self.settings.runtime.process_mode);
         self.reconcile_shell();
         let changed = config_changed || roots_changed;
-        if !changed {
+        if changed {
+            self.journal.log(json!({"event":"service_reloaded", "state_dir":self.root_file.with_file_name(WATCH_METADATA),
+                "roots":self.roots.values().map(|(root, _)| &root.path).collect::<Vec<_>>(),
+                "scheduler_restarted":scheduler_changed, "tray_reconciled":tray_changed,
+                "runtime_process_mode_changed":process_mode_changed}));
+        } else {
             self.journal.log(json!({"event":"service_reload_skipped","reason":"no_semantic_change"}));
         }
         Ok(changed)
@@ -3318,9 +3332,9 @@ impl Scheduler {
             blocked_unchanged
         };
         let boundary = quiet::is_boundary(&candidate);
-        let force = admission != CandidateAdmission::Observe;
+        let force = !matches!(admission, CandidateAdmission::Observe | CandidateAdmission::QueuedRecovery);
         if (admission != CandidateAdmission::ExplicitRetry && interrupted.is_some() && blocked_unchanged)
-            || (!force && (unchanged || blocked_unchanged))
+            || (admission == CandidateAdmission::Observe && (unchanged || blocked_unchanged))
         {
             if let Some(before) = blocked.filter(|before| {
                 blocked_unchanged
@@ -3406,7 +3420,7 @@ impl Scheduler {
         let quiet = activity;
         let retry_unchanged = became_active && match admission {
             CandidateAdmission::PasswordRetry => blocked_unchanged,
-            CandidateAdmission::CrashRecovery => unchanged,
+            CandidateAdmission::QueuedRecovery | CandidateAdmission::CrashRecovery => unchanged,
             _ => false,
         };
         // Force admission of a stable head when a peer arrives, without
@@ -3752,6 +3766,7 @@ impl Scheduler {
                 .map(key)
                 .collect::<HashSet<_>>();
             let mut revisit = BTreeMap::new();
+            let mut inspected_outputs = HashSet::new();
             let mut cleanup_failed = false;
             for (task, output) in pending.active_outputs.iter() {
                 if pending.committed_roots.contains(output)
@@ -3761,14 +3776,15 @@ impl Scheduler {
                 {
                     continue;
                 }
-                if recovery_output_matches(state, &pending, output) {
-                    if let Err(error) = crate::postprocess::remove_owned_tree(Path::new(output)) {
-                        cleanup_failed = true;
-                        self.journal.log(json!({"event":"crash_output_cleanup","path":output,"error":error.to_string()}));
-                        continue;
+                if inspected_outputs.insert(watch_path_key(output)) {
+                    if recovery_output_matches(state, &pending, output) {
+                        if let Err(error) = crate::postprocess::remove_owned_tree(Path::new(output)) {
+                            cleanup_failed = true;
+                            self.journal.log(json!({"event":"crash_output_cleanup","path":output,"error":error.to_string()}));
+                        }
+                    } else {
+                        self.journal.log(json!({"event":"crash_output_identity_changed","owner_path":pending.path,"output_dir":output}));
                     }
-                } else {
-                    self.journal.log(json!({"event":"crash_output_identity_changed","owner_path":pending.path,"output_dir":output}));
                 }
                 if Path::new(task).is_file() && !pending.completed_sources.contains(task) {
                     revisit.insert(watch_path_key(task), task.clone());
@@ -3865,11 +3881,13 @@ impl Scheduler {
                 continue;
             }
             if revisit.is_empty() && verified.is_empty() {
+                if !pending.active_outputs.is_empty() {
+                    self.journal.log(json!({"event":"crash_recovery_source_missing","owner_path":pending.path}));
+                    continue;
+                }
                 if source.is_file() {
                     revisit.insert(watch_path_key(&pending.path), pending.path.clone());
-                } else if !pending.active_outputs.is_empty()
-                    || !NativePresence::at(&pending.path).is_absent()
-                {
+                } else if !NativePresence::at(&pending.path).is_absent() {
                     continue;
                 }
             }
@@ -3878,8 +3896,10 @@ impl Scheduler {
             let admission = if pending.internal_recovery || !pending.active_outputs.is_empty()
                 || pending.committed_roots.iter().next().is_some() || pending.promoted_destinations.iter().next().is_some() {
                 CandidateAdmission::CrashRecovery
-            } else {
+            } else if pending.force {
                 CandidateAdmission::Retry
+            } else {
+                CandidateAdmission::QueuedRecovery
             };
             for (id, path) in revisit {
                 if state.entry(&path).is_some_and(|entry| {
@@ -4081,7 +4101,7 @@ impl Scheduler {
                 }
                 Err(error) => {
                     self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, now);
+                    self.delay(id, pending, Instant::now(), true);
                     continue;
                 }
             };
@@ -4109,7 +4129,7 @@ impl Scheduler {
                 );
                 pending.candidate = current;
                 self.unpublished.insert(id.clone());
-                self.delay(id, pending, now);
+                self.delay(id, pending, now, false);
                 continue;
             }
             if quiet::is_boundary(&current) {
@@ -4133,7 +4153,7 @@ impl Scheduler {
                 Ok(true) => {}
                 Ok(false) => {
                     self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, None);
-                    self.delay(id, pending, now);
+                    self.delay(id, pending, Instant::now(), true);
                     continue;
                 }
                 Err(error) if missing_path(&error) => {
@@ -4142,7 +4162,7 @@ impl Scheduler {
                 }
                 Err(error) => {
                     self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, now);
+                    self.delay(id, pending, Instant::now(), true);
                     continue;
                 }
             }
@@ -4246,10 +4266,13 @@ impl Scheduler {
         Ok(())
     }
 
-    fn delay(&mut self, id: String, mut pending: Pending, now: Instant) {
-        pending.due = pending.quiet.boundary_deadline(
-            now, self.settings.watch.boundary_confirmation_seconds,
-        );
+    fn delay(&mut self, id: String, mut pending: Pending, now: Instant, probe_failed: bool) {
+        let confirmation = self.settings.watch.boundary_confirmation_seconds;
+        let due = pending.quiet.boundary_deadline(now, confirmation);
+        // An outstanding writer or observation error needs a recheck even
+        // without further file changes. A new input has no learned cadence;
+        // reuse the confirmation interval so the failed probe cannot spin.
+        pending.due = if probe_failed && due == now { quiet::after(now, confirmation) } else { due };
         self.due.insert((pending.due, id.clone()), ());
         self.pending.insert(id, pending);
     }
@@ -4579,7 +4602,13 @@ impl Scheduler {
                 if !self.pending.contains_key(&path) {
                     let captured = claimed.lock().unwrap().candidates.get(&path).and_then(Option::as_ref).cloned();
                     let tracker = quiet.remove(&path);
-                    self.observe_candidate_with_event(&root, path, CandidateAdmission::Observe, recovery.clone(), captured.as_ref(), tracker,
+                    let admission = if self.journal.state().entry(&path)
+                        .is_some_and(|entry| entry.status == "suspended_missing_volume") {
+                        CandidateAdmission::Retry
+                    } else {
+                        CandidateAdmission::Observe
+                    };
+                    self.observe_candidate_with_event(&root, path, admission, recovery.clone(), captured.as_ref(), tracker,
                         Some(&CandidateEvent::Business("pipeline_claim_released")))?;
                 }
             }

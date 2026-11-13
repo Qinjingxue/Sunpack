@@ -198,6 +198,55 @@ def test_once_drains_admitted_work_without_waiting_for_a_busy_pending_file(packa
     assert [path.read_bytes() for path in output.rglob("ready.txt")] == [b"drain this round"]
 
 
+def test_watch_observes_edits_to_config_symlink_target(package, tmp_path):
+    config = package.data / "sunpack_config.json"
+    real_config = tmp_path / "watch-settings.json"
+    config.replace(real_config)
+    try:
+        config.symlink_to(real_config)
+    except OSError as error:
+        if error.winerror != 1314:
+            raise
+        pytest.skip("Creating file symlinks requires Windows Developer Mode or SeCreateSymbolicLinkPrivilege")
+
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    output = tmp_path / "out"
+    package.json("watch", "add", watched, "-o", output)
+    package.json("watch", "start", "--no-tray")
+
+    first = watched / "keep.zip"
+    _zip(first, "kept.txt", b"keep the first source")
+    _wait_for_output(output, "kept.txt", b"keep the first source")
+    assert first.is_file()
+
+    payload = json.loads(real_config.read_text(encoding="utf-8"))
+    payload["post_extract"]["archive_cleanup_mode"] = "d"
+    replacement = real_config.with_suffix(".tmp")
+    replacement.write_text(json.dumps(payload), encoding="utf-8")
+    replacement.replace(real_config)
+    # Use the real reload signal so an explicit config command cannot mask a
+    # missing subscription on the link's destination.
+    events = package.data / ".sunpack_watch" / "events.json"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            history = native_fixture("display_events", path=str(events))["history"]
+        except subprocess.CalledProcessError:
+            pass  # The display store may still be publishing its manifest.
+        else:
+            if any(row["event"] == "service_reloaded" for row in history):
+                break
+        time.sleep(0.05)
+    else:
+        pytest.fail("Watch did not reload after editing the config symlink target")
+    second = watched / "delete.zip"
+    _zip(second, "deleted.txt", b"delete the second source")
+    _wait_for_output(output, "deleted.txt", b"delete the second source")
+    package.json("watch", "stop")
+    assert not second.exists()
+
+
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
 @pytest.mark.parametrize("layout", ["outside-alias", "inside-alias", "direct"])
 def test_owned_outputs_are_excluded_after_restart_but_admit_replacement(
@@ -264,7 +313,7 @@ def test_watch_retries_unobserved_candidate_after_acl_only_recovery(package, tmp
     # metadata-visible but identity-unreadable candidate and an idle, empty queue
     # before the SECURITY-only repair. A raw SYNCHRONIZE deny is necessary:
     # FileSystemAccessRule strips SYNCHRONIZE from Deny rules, and denying
-    # parent enumeration would fail is_file before reaching candidate_error.
+    # parent enumeration would fail is_file before reaching the observation.
     watched = tmp_path / "watched"
     watched.mkdir()
     output = tmp_path / "out"
@@ -332,13 +381,15 @@ if ($Restore) {
         while time.monotonic() < deadline:
             try:
                 history = native_fixture("display_events", path=str(events))["history"]
-                if any(item.get("event") == "candidate_error" and Path(item.get("path", "")) == current for item in history):
+                if any(item.get("event") == "candidate_ignored"
+                       and item.get("reason") == "observation_error"
+                       and Path(item.get("path", "")) == current for item in history):
                     break
             except (OSError, subprocess.CalledProcessError):
                 pass
             time.sleep(0.01)
         else:
-            pytest.fail("Identity denial did not reach the exact candidate_error path")
+            pytest.fail("Watch did not observe the identity denial during its initial scan")
         assert package.json("watch", "status")["summary"]["pending"] == 0
         package.json("scan", idle_probe)
         # Reader-cache release is an observable idle-maintenance barrier. An

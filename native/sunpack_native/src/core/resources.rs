@@ -86,14 +86,17 @@ pub fn writable_data_dir(cwd: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn tool_path(cwd: &Path, name: &str) -> io::Result<PathBuf> {
-    let dirs = if cfg!(target_arch = "aarch64") {
+fn tool_dirs() -> [&'static str; 2] {
+    if cfg!(target_arch = "aarch64") {
         ["tools-arm64", "tools"]
     } else {
         ["tools", "tools-x64"]
-    };
+    }
+}
+
+fn tool_path(cwd: &Path, name: &str) -> io::Result<PathBuf> {
     for root in resource_roots(cwd) {
-        for dir in dirs {
+        for dir in tool_dirs() {
             let path = root.join(dir).join(name);
             if path.is_file() {
                 return Ok(path);
@@ -111,7 +114,27 @@ pub fn worker_path(cwd: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn toast_library_path(cwd: &Path) -> io::Result<PathBuf> {
-    tool_path(cwd, "sunpack_toast.dll")
+    find_toast_library(resource_roots(cwd)).ok_or_else(|| io::Error::new(
+        io::ErrorKind::NotFound,
+        r"Optional sunpack_toast.dll was not found under tools\ or native\toast_host\build.",
+    ))
+}
+
+fn find_toast_library(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    const DLL: &str = "sunpack_toast.dll";
+    let build = if cfg!(target_arch = "aarch64") {
+        "native/toast_host/build-arm64/Release"
+    } else {
+        "native/toast_host/build-x64/Release"
+    };
+    let dirs = [build, "native/toast_host/build/Release", "native/toast_host/build/Debug"];
+    for root in roots {
+        if let Some(path) = dirs.into_iter().chain(tool_dirs()).chain([""])
+            .map(|dir| root.join(dir).join(DLL)).find(|path| path.is_file()) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 pub(crate) struct FileMutex(*mut std::ffi::c_void);
@@ -193,5 +216,23 @@ mod entrypoint_tests {
             assert_eq!(development_launcher(root, &exe).unwrap(), root.join(format!("native/sevenzip_bridge/build-{arch}{suffix}/Release/sunpack_launcher.exe")));
         }
         assert!(development_launcher(root, &root.join("debug/sunpack-runtime.exe")).is_err());
+    }
+
+    #[test]
+    fn toast_lookup_prefers_the_current_architecture_in_the_running_checkout() {
+        let marker = crate::test_support::temp_file("toast_lookup", b"");
+        let root = marker.with_extension("checkout");
+        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+        let current = root.join(format!("native/toast_host/build-{arch}/Release/sunpack_toast.dll"));
+        let staged = root.join("tools/sunpack_toast.dll");
+        for file in [&current, &staged] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"").unwrap();
+        }
+        assert_eq!(find_toast_library([root.clone()]), Some(current.clone()));
+        std::fs::remove_file(current).unwrap();
+        assert_eq!(find_toast_library([root.clone()]), Some(staged));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(marker).unwrap();
     }
 }

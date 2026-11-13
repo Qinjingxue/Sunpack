@@ -257,29 +257,71 @@ fn read_field(input: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-async fn read_word(peer: &transport::Peer) -> io::Result<u32> {
-    Ok(u32::from_be_bytes(peer.read_exact(4).await?.try_into().unwrap()))
+#[derive(Default)]
+struct PipeReader {
+    // Keep bytes already fetched after the last argument for the control stream.
+    buffer: Vec<u8>,
+    unread: std::ops::Range<usize>,
 }
-async fn read_peer_field(peer: &transport::Peer, length: usize) -> io::Result<Vec<u8>> {
-    if length > MAX_FIELD { return Err(io::ErrorKind::InvalidData.into()); }
-    peer.read_exact(length).await
+
+impl PipeReader {
+    async fn take(&mut self, peer: &transport::Peer, limit: usize) -> io::Result<&[u8]> {
+        if self.unread.is_empty() {
+            if self.buffer.is_empty() {
+                self.buffer.resize(8192, 0);
+            }
+            let (buffer, bytes) = peer.read_some(std::mem::take(&mut self.buffer)).await?;
+            self.buffer = buffer;
+            self.unread = 0..bytes;
+        }
+        let start = self.unread.start;
+        self.unread.start += limit.min(self.unread.len());
+        Ok(&self.buffer[start..self.unread.start])
+    }
+
+    async fn fixed<const N: usize>(&mut self, peer: &transport::Peer) -> io::Result<[u8; N]> {
+        let mut result = [0; N];
+        let mut offset = 0;
+        while offset < N {
+            let chunk = self.take(peer, N - offset).await?;
+            result[offset..offset + chunk.len()].copy_from_slice(chunk);
+            offset += chunk.len();
+        }
+        Ok(result)
+    }
+
+    async fn word(&mut self, peer: &transport::Peer) -> io::Result<u32> {
+        Ok(u32::from_be_bytes(self.fixed(peer).await?))
+    }
+
+    async fn field(&mut self, peer: &transport::Peer, length: usize) -> io::Result<Vec<u8>> {
+        if length > MAX_FIELD {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let mut result = Vec::new();
+        while result.len() < length {
+            result.extend_from_slice(self.take(peer, length - result.len()).await?);
+        }
+        Ok(result)
+    }
 }
+
 impl Header {
-    async fn read(peer: &transport::Peer, build_id: &[u8; 16], token: &[u8; 32]) -> io::Result<Self> {
-        let header = peer.read_exact(64).await?;
+    async fn read(reader: &mut PipeReader, peer: &transport::Peer, build_id: &[u8; 16], token: &[u8; 32]) -> io::Result<Self> {
+        let header = reader.fixed::<64>(peer).await?;
         if &header[..4] != b"SPK2" || &header[4..20] != build_id || &header[20..52] != token {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         let flags = u32::from_be_bytes(header[52..56].try_into().unwrap());
         let cwd_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
         let argc = u32::from_be_bytes(header[60..64].try_into().unwrap());
-        let cwd = PathBuf::from(String::from_utf8(read_peer_field(peer, cwd_len).await?).map_err(io::Error::other)?);
+        let cwd = PathBuf::from(String::from_utf8(reader.field(peer, cwd_len).await?).map_err(io::Error::other)?);
         if !cwd.is_absolute() { return Err(io::ErrorKind::InvalidInput.into()); }
         let mut argv = Vec::new();
         let mut terminal_size = 80 | 24 << 16;
         for index in 0..argc {
-            let size = read_word(peer).await? as usize;
-            let arg = String::from_utf8(read_peer_field(peer, size).await?).map_err(io::Error::other)?;
+            let size = reader.word(peer).await? as usize;
+            let arg = String::from_utf8(reader.field(peer, size).await?).map_err(io::Error::other)?;
             if flags & TERMINAL_SIZE_FIELD != 0 && index + 1 == argc {
                 terminal_size = arg.strip_prefix("--_sunpack-terminal-size=")
                     .and_then(|value| value.split_once('x'))
@@ -488,11 +530,11 @@ impl Connection {
         }
     }
 
-    async fn read_control(&self, cwd: &Path) -> io::Result<()> {
+    async fn read_control(&self, cwd: &Path, mut reader: PipeReader) -> io::Result<()> {
         loop {
-            match read_word(&self.peer).await? {
+            match reader.word(&self.peer).await? {
                 RESIZE if self.flags & 10 == 10 => {
-                    let size = encode_terminal_size(read_word(&self.peer).await?, read_word(&self.peer).await?)
+                    let size = encode_terminal_size(reader.word(&self.peer).await?, reader.word(&self.peer).await?)
                         .ok_or(io::ErrorKind::InvalidData)?;
                     self.terminal_size.store(size, Ordering::Relaxed);
                 }
@@ -512,7 +554,7 @@ impl Connection {
                     let Some(reply) = reply else {
                         return if self.cancel.cancelled() { Ok(()) } else { Err(io::ErrorKind::InvalidData.into()) };
                     };
-                    reply.complete(read_peer_field(&self.peer, length as usize).await);
+                    reply.complete(reader.field(&self.peer, length as usize).await);
                 }
             }
         }
@@ -565,6 +607,7 @@ impl Session for Connection {
         Box::pin(self.read_line_async(prompt))
     }
     fn interactive(&self) -> bool { self.flags & 2 != 0 }
+    fn local_pause(&self) -> bool { false }
     fn unicode(&self) -> bool { self.flags & 16 != 0 }
     fn terminal_size(&self) -> (usize, usize) {
         let size = self.terminal_size.load(Ordering::Relaxed);
@@ -634,7 +677,8 @@ impl Server {
 
     async fn request(self: &Arc<Self>, pipe: OwnedHandle, spawner: crate::pipeline::scheduling::Spawner<'static>, cancel: Cancellation, connected: Instant) -> io::Result<()> {
         let peer = self.io.bind(pipe, &self.shutdown)?;
-        let header = Header::read(&peer, &self.build_id, &self.token).await?;
+        let mut reader = PipeReader::default();
+        let header = Header::read(&mut reader, &peer, &self.build_id, &self.token).await?;
         let connection = Arc::new(Connection {
             peer, output: output::Output::default(), prompt: Mutex::default(), input: Mutex::default(),
             cancel: cancel.clone(), finishing: AtomicBool::new(false),
@@ -649,7 +693,7 @@ impl Server {
             let connection = Arc::clone(&connection);
             let cwd = header.cwd.clone();
             Some(spawner.spawn(Box::pin(async move {
-                if connection.read_control(&cwd).await.is_err()
+                if connection.read_control(&cwd, reader).await.is_err()
                     && !connection.finishing.load(Ordering::Acquire)
                 {
                     connection.cancel.cancel();
@@ -1019,7 +1063,7 @@ mod async_connection_tests {
                 let output = spawner.spawn(Box::pin(async move { writer.pump_output().await }));
                 let reader = connection.clone();
                 let control = spawner.spawn(Box::pin(async move {
-                    if reader.read_control(&std::env::current_dir().unwrap()).await.is_err() { reader.close(); }
+                    if reader.read_control(&std::env::current_dir().unwrap(), PipeReader::default()).await.is_err() { reader.close(); }
                 }));
                 connection.finish_request(async {
                     assert_eq!(connection.read_line_async("first").await?.as_deref(), Some("answer\r\n"));

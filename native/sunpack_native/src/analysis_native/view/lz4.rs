@@ -1,27 +1,5 @@
 impl<'a> ReportContext<'a> {
     fn lz4_module(&mut self) -> io::Result<Evidence> {
-        let rows = self.embedded("lz4", true);
-        if !rows.is_empty() {
-            let mut blocked = false;
-            let segments = rows
-                .into_iter()
-                .map(|row| {
-                    let error = row.lz4_index.as_ref().map_or("", |index| index.error);
-                    let mut segment =
-                        lz4_segment(row.offset, row.end_offset, row.extractable, error);
-                    blocked |= !row.extractable;
-                    segment.password_required = Some(false);
-                    segment
-                })
-                .collect();
-            return Ok(Evidence::new(
-                "lz4",
-                if blocked { "damaged" } else { "extractable" },
-                segments,
-                EvidenceDetails::Empty,
-            ));
-        }
-
         if self.stream_structure.is_none() {
             let Ok(prefix) = self.view.reader.read_cached_at(0, 4) else {
                 return Ok(Evidence::not_found("lz4"));

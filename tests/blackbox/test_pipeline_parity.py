@@ -96,8 +96,10 @@ def test_explicit_outer_archive_keeps_nested_failure_beside_it(package, tmp_path
     assert str(promoted) in report["errors"][0]
 
 
-@pytest.mark.parametrize("select_directory", [False, True], ids=["file", "directory"])
-def test_extract_deduplicates_the_same_archive_through_a_junction(package, tmp_path, select_directory):
+@pytest.mark.parametrize(("command", "select_directory"), [
+    ("extract", False), ("extract", True), ("scan", False),
+], ids=["extract-file", "extract-directory", "scan-file"])
+def test_deduplicates_the_same_archive_through_a_junction(package, tmp_path, command, select_directory):
     real = tmp_path / "real"
     real.mkdir()
     source = real / "archive.zip"
@@ -115,15 +117,17 @@ def test_extract_deduplicates_the_same_archive_through_a_junction(package, tmp_p
     output = tmp_path / "output"
 
     try:
-        report = package.json(
-            "extract", "-c", "k", "-o", output,
-            real if select_directory else source, alias / source.name,
-        )
+        options = ("-c", "k", "-o", output) if command == "extract" else ()
+        report = package.json(command, *options, real if select_directory else source, alias / source.name)
     finally:
         alias.rmdir()
 
-    assert report["summary"]["success_count"] == 1
-    assert [path.read_bytes() for path in output.rglob("item.txt")] == [b"payload"]
+    if command == "scan":
+        assert report["summary"]["archive_count"] == 1
+        assert len(report["items"]) == 1
+    else:
+        assert report["summary"]["success_count"] == 1
+        assert [path.read_bytes() for path in output.rglob("item.txt")] == [b"payload"]
 
 
 def test_damaged_zipcrypto_remembers_password_proved_by_earlier_member(package, tmp_path):

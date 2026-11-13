@@ -130,6 +130,31 @@ impl AttemptCache {
         candidates.len() != before
     }
 
+    fn fill_available<'p>(
+        &self,
+        key: &Key,
+        batch: &mut Vec<Arc<str>>,
+        candidates: &mut impl Iterator<Item = &'p Arc<str>>,
+        cancellation: &Cancellation,
+    ) -> io::Result<()> {
+        while batch.len() < BATCH_SIZE {
+            cancellation.check_io()?;
+            let mut state = self.0.lock().unwrap();
+            // Bound the work under the cache lock even if every candidate
+            // in this window was rejected on a previous request.
+            for _ in 0..BATCH_SIZE {
+                let Some(candidate) = candidates.next() else { return Ok(()); };
+                if state.negative.get(&(key.clone(), candidate.clone())).is_none() {
+                    batch.push(candidate.clone());
+                    if batch.len() == BATCH_SIZE {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn remember_proof(&self, key: Key, proof: Option<Arc<str>>) {
         self.0.lock().unwrap().successes.insert(key, proof, MAX_SUCCESSES);
     }
@@ -289,44 +314,42 @@ impl CandidateSet {
                 _ => {}
             }
         }
-        let mut candidates = self
+        let candidates = self
             .for_path(&input.entry_path)
-            .filter(|value| needs_password || !value.is_empty())
-            .peekable();
+            .filter(|value| needs_password || !value.is_empty());
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut pending = Vec::new();
         let mut evidence = None;
         let mut password_rejected = false;
         let mut has_candidates = false;
+        let mut candidates = candidates.inspect(|_| has_candidates = true);
         // The empty password has priority only when Rust has not already
         // established encryption. A backend proof may still be necessary.
         let mut empty_probe = !needs_password;
-        if empty_probe {
-            batch.push(Arc::from(""));
-        }
-        if batch.is_empty() && candidates.peek().is_none() {
-            return Ok(Err(Failure::password_required()));
-        }
         loop {
             cancellation.check_io()?;
-            if !std::mem::take(&mut empty_probe) {
-                batch.extend(candidates.by_ref().take(BATCH_SIZE - batch.len()).cloned());
-                has_candidates |= !batch.is_empty();
-            }
-            if batch.is_empty() {
-                break;
-            }
-            if let Some(key) = key.as_ref() {
-                password_rejected |= self.cache.remove_rejected(key, &mut batch);
+            if std::mem::take(&mut empty_probe) {
+                batch.push(Arc::from(""));
+                if let Some(key) = key.as_ref() {
+                    password_rejected |= self.cache.remove_rejected(key, &mut batch);
+                }
                 if batch.is_empty() {
                     continue;
                 }
+            } else {
+                // Fill the verification batch after skipping cached negatives.
+                // Sparse survivors must still reach the native parallel paths.
+                if let Some(key) = key.as_ref() {
+                    self.cache.fill_available(key, &mut batch, &mut candidates, cancellation)?;
+                } else {
+                    batch.extend(candidates.by_ref().take(BATCH_SIZE - batch.len()).cloned());
+                }
+                if batch.is_empty() {
+                    password_rejected |= has_candidates;
+                    break;
+                }
             }
             if check_single_enc && batch.len() == 1 {
-                if candidates.peek().is_some() {
-                    // More configured candidates may survive the rejection cache.
-                    continue;
-                }
                 // The worker authenticates the sole ENC candidate when opening
                 // the archive. A host probe would repeat the same Argon2 work.
                 pending.append(&mut batch);
@@ -584,6 +607,14 @@ mod tests {
             assert!(candidates.is_empty());
             assert_eq!(cache.proof(&key(n)).unwrap().as_deref(), Some("good"));
         }
+        let sparse: Vec<Arc<str>> = (0..BATCH_SIZE * 2).map(|n| Arc::from(n.to_string())).collect();
+        let rejected: Vec<_> = sparse.iter().step_by(2).cloned().collect();
+        cache.reject(key(130), &rejected);
+        let mut candidates = sparse.iter();
+        let mut batch = Vec::new();
+        cache.fill_available(&key(130), &mut batch, &mut candidates, &Cancellation::new()).unwrap();
+        assert!(batch.iter().eq(sparse.iter().skip(1).step_by(2)));
+        assert!(candidates.next().is_none());
         cache.clear();
         for n in 0..MAX_REJECTIONS as u64 {
             cache.reject(key(n), &[Arc::from("bad")]);

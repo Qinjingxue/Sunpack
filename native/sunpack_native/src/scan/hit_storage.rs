@@ -2341,6 +2341,7 @@ impl<'a> HitView<'a> {
         let (leaf, n, data) = self.leaf(segment, index);
         rank + leaf.end as usize - n + leaf_lower_bound(data, leaf.control, n, relative)
     }
+    #[cfg(test)]
     pub(super) fn iter(self) -> Cursor<'a> {
         self.range(0, self.len(), TAGS)
     }
@@ -2722,6 +2723,7 @@ impl<'a> Cursor<'a> {
         }
         self.next = self.next.max(self.lower_bound_cached(offset));
     }
+    #[cfg(test)]
     pub(super) fn equal_offset<'b>(
         &'b mut self,
         offset: u64,

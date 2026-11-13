@@ -139,8 +139,10 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
                 scheduler.due.insert((now, id.clone()), ());
                 assert!(scheduler.prepare_ready_blocking(now, 1).unwrap().is_empty(),
                     "parked {case} reused readiness despite a locked file");
+                let retry = scheduler.pending[&id].due;
+                assert!(retry > now, "parked {case} would repeatedly probe a busy file");
                 held.lock().unwrap().take();
-                assert_eq!(scheduler.prepare_ready_blocking(Instant::now(), 1).unwrap().len(), 1,
+                assert_eq!(scheduler.prepare_ready_blocking(retry, 1).unwrap().len(), 1,
                     "parked {case} was lost after becoming readable");
             }
             held.lock().unwrap().take();
@@ -176,8 +178,8 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
         fs::create_dir_all(base.join("native")).unwrap();
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
-        for source_present in [true, false] {
-            let directory = base.join(if source_present { "source" } else { "missing" });
+        for case in ["source", "missing", "active"] {
+            let directory = base.join(case);
             let watched = directory.join("watched");
             fs::create_dir_all(&watched).unwrap();
             let source = watched.join("owner.zip");
@@ -216,6 +218,20 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
                     false, watched.to_str().unwrap(), false, true, None,
                 )?.0)
             }).unwrap();
+            if case == "active" {
+                // The surviving outer archive cannot stand in for a nested
+                // task that disappeared while owning uncommitted output.
+                let output = watched.join("unfinished-output");
+                let task = watched.join("missing-nested.zip");
+                scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
+                    task.to_string_lossy().into_owned(), output.to_string_lossy().into_owned(),
+                    None, None)?.unwrap())).unwrap();
+                scheduler.recover_pending(None).unwrap();
+                assert!(!output.exists());
+                assert!(scheduler.journal.state().pending(owner).is_some());
+                assert!(scheduler.pending.is_empty());
+                continue;
+            }
             let surviving = watched.join("surviving");
             let missing = watched.join("missing");
             for output in [&surviving, &missing] {
@@ -228,10 +244,10 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
             let nested = surviving.join("unfinished.zip");
             fs::write(&nested, b"nested archive").unwrap();
             fs::remove_dir(&missing).unwrap();
-            if !source_present { fs::remove_file(&source).unwrap(); }
+            if case == "missing" { fs::remove_file(&source).unwrap(); }
             scheduler.recover_pending(None).unwrap();
             assert!(scheduler.journal.state().pending(owner).is_some(), "owner intent must survive");
-            if source_present {
+            if case == "source" {
                 assert_eq!(scheduler.pending.len(), 2);
                 assert!(scheduler.pending.contains_key(&key(&source)));
                 assert!(scheduler.pending.contains_key(&key(&nested)));
@@ -298,7 +314,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         write_roots(&scheduler.root_file, &[scheduler.roots[&root_id].0.clone()]).unwrap();
         let output = watched.join("interrupted-output");
         scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
-            output.to_string_lossy().into_owned(), output.to_string_lossy().into_owned(),
+            owner.to_owned(), output.to_string_lossy().into_owned(),
             None, None)?.unwrap())).unwrap();
         let member = output.join("locked.txt");
         fs::write(&member, b"unfinished extraction").unwrap();

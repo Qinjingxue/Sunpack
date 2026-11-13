@@ -778,24 +778,8 @@ int wmain(int argc, wchar_t** argv) {
         pause |= wcscmp(argv[index], L"--pause") == 0;
         no_pause |= wcscmp(argv[index], L"--no-pause") == 0;
     }
-    std::vector<std::wstring> request_arguments;
-    bool options = true;
-    bool server_pause_disabled = false;
-    for (int index = first_request_argument; index < argc; ++index) {
-        if (options && wcscmp(argv[index], L"--") == 0) {
-            if (pause && !no_pause) {
-                request_arguments.emplace_back(L"--no-pause");
-                server_pause_disabled = true;
-            }
-            options = false;
-        }
-        if (options && pause && !no_pause && wcscmp(argv[index], L"--pause") == 0) continue;
-        request_arguments.emplace_back(argv[index]);
-    }
-    // Preserve mutually exclusive option diagnostics instead of hiding the
-    // conflict. The runtime never pauses for a usage error.
+    const std::vector<std::wstring> request_arguments(argv + first_request_argument, argv + argc);
     pause &= !no_pause;
-    if (pause && !server_pause_disabled) request_arguments.emplace_back(L"--no-pause");
     int code = 1;
     RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd);
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
@@ -855,11 +839,16 @@ int wmain(int argc, wchar_t** argv) {
     } else if (outcome == RequestOutcome::DeliveryUncertain && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
     }
-    if (pause && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
-        write_stream(STD_OUTPUT_HANDLE, localized(language, kPressEnterEn, kPressEnterZh));
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD input_mode = 0;
+    if (pause && code != 130 && GetConsoleMode(input, &input_mode)) {
+        DWORD output_mode = 0;
+        const DWORD prompt_stream = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &output_mode)
+            ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE;
+        write_stream(prompt_stream, localized(language, kPressEnterEn, kPressEnterZh));
         wchar_t buffer[2]{};
         DWORD read = 0;
-        ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 1, &read, nullptr);
+        ReadConsoleW(input, buffer, 1, &read, nullptr);
     }
     return code;
 }

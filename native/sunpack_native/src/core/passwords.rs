@@ -9,7 +9,7 @@ use crate::{
     path_keys::path_key,
 };
 use serde::{
-    de::{self, DeserializeSeed, SeqAccess, Visitor},
+    de::{self, value::MapAccessDeserializer, DeserializeSeed, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 use serde_json::value::RawValue;
@@ -19,6 +19,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -161,6 +162,28 @@ struct Record<'a> {
     scopes: Option<&'a RawValue>,
 }
 
+// The password file schema uses objects. Serde's derived struct parser also
+// accepts arrays of positional fields unless we request a map explicitly.
+struct JsonObject<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for JsonObject<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+            type Value = JsonObject<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(JsonObject)
+            }
+        }
+        deserializer.deserialize_map(ObjectVisitor(PhantomData))
+    }
+}
+
 fn valid_text(value: &str) -> Result<(), &'static str> {
     if value.contains('\0') {
         Err("password fields must be strings without NUL")
@@ -227,7 +250,7 @@ impl<'de> Visitor<'de> for Passwords<'_> {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(mut self, mut entries: A) -> Result<(), A::Error> {
-        while let Some(record) = entries.next_element::<Record<'_>>()? {
+        while let Some(JsonObject(record)) = entries.next_element::<JsonObject<Record<'_>>>()? {
             valid_text(&record.value).map_err(de::Error::custom)?;
             let password = self
                 .0
@@ -272,7 +295,7 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 
 impl<'a> Document<'a> {
     fn parse(text: &'a str) -> io::Result<Self> {
-        serde_json::from_str(text).map_err(invalid_json)
+        serde_json::from_str(text).map(|JsonObject(document)| document).map_err(invalid_json)
     }
 
     fn read_passwords(&self, index: Option<&mut IndexBuilder>) -> io::Result<()> {
@@ -294,12 +317,6 @@ impl<'a> Document<'a> {
         }
         Ok(values)
     }
-}
-
-fn read_text(path: &Path) -> io::Result<String> {
-    let mut text = String::new();
-    TrackedFile::open_reader(path)?.read_to_string(&mut text)?;
-    Ok(text)
 }
 
 #[derive(Default)]
@@ -460,7 +477,7 @@ impl BuiltinStore {
             return Ok(false);
         }
         let _lock = FileMutex::lock(&self.path, "SunPack.EditableFile")?;
-        let original = read_text(&self.path)?;
+        let original = crate::io::resource_lifecycle::read_shared_utf8_text(&self.path)?;
         let document = Document::parse(original.strip_prefix('\u{feff}').unwrap_or(&original))?;
         document.read_passwords(None)?;
         let history = document.history()?;
@@ -606,6 +623,15 @@ fn clipboard_text() -> Option<String> {
 mod tests {
     use super::{atomic_file, fs, io, publish, Document, IndexBuilder, PasswordSnapshot, Write};
     use std::path::Path;
+
+    #[test]
+    fn builtin_password_documents_require_objects() {
+        assert!(Document::parse(r#"[[{"value":"secret"}]]"#).is_err());
+        assert!(Document::parse(r#"{"passwords":[["secret"]]}"#)
+            .unwrap().read_passwords(None).is_err());
+        assert!(Document::parse(r#"{"passwords":[{"value":"secret"}]}"#)
+            .unwrap().read_passwords(None).is_ok());
+    }
 
     #[test]
     fn clipboard_save_reports_share_conflict_without_waiting_for_reader() {

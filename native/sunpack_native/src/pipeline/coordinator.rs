@@ -538,20 +538,42 @@ enum RetryOutput<'a> {
 struct CleanupTasks {
     next_id: u64,
     active: HashMap<u64, PendingCleanup>,
-    finished: Vec<super::scheduling::Join<Outcome>>,
+    failures: BTreeMap<String, CleanupResult>,
 }
 
 impl CleanupTasks {
-    fn retire(&mut self, id: u64) {
-        if let Some(finished) = self.active.remove(&id) {
-            self.finished.push(finished.task);
+    fn retire(&mut self, id: u64, failures: Vec<CleanupResult>) -> Vec<CleanupResult> {
+        if self.active.remove(&id).is_some() {
+            for failure in failures {
+                self.record_failure(failure);
+            }
+            Vec::new()
+        } else {
+            failures
         }
+    }
+
+    fn record_failure(&mut self, failure: CleanupResult) {
+        self.failures.insert(namespace_key(&failure.path), failure);
+    }
+
+    fn take_failures(&mut self, root: Option<&Path>) -> Vec<CleanupResult> {
+        let Some(root) = root else {
+            return std::mem::take(&mut self.failures).into_values().collect();
+        };
+        let key = namespace_key(root);
+        let base = key.trim_end_matches('\\');
+        // The ASCII successor of '\\' bounds all keys starting with base + '\\'.
+        let descendants = format!("{base}\\")..format!("{base}]");
+        self.failures.remove(&key).into_iter().chain(
+            self.failures.extract_if(descendants, |_, _| true).map(|(_, failure)| failure),
+        ).collect()
     }
 }
 
 struct PendingCleanup {
     paths: Vec<PathBuf>,
-    task: super::scheduling::Join<Outcome>,
+    task: super::scheduling::Join<Vec<CleanupResult>>,
 }
 
 /// One shared decision per depth, like main's prompt gates. Only the blocking
@@ -1152,7 +1174,9 @@ impl<'run, O: Observer> Run<'run, O> {
         });
         stage("discovery", &self.request.cancel).await?;
         let mut discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
-        if self.resolve_aliases { dedup_resolved_plans(&mut discovered.tasks); }
+        if self.resolve_aliases && discovered.tasks.len() > 1 {
+            dedup_resolved_plans(&mut discovered.tasks);
+        }
         // Request admission covers only the user's original selections, as in
         // main. Discovery may resolve different selections to one volume family;
         // claim_task shares reads within a request and serializes other requests.
@@ -1200,20 +1224,28 @@ impl<'run, O: Observer> Run<'run, O> {
     }
 
     async fn drain_cleanup(&self, root: Option<&Path>, outcome: &mut Outcome) {
-        let pending = {
+        let (mut failures, pending) = {
             let mut tasks = self.cleanup_tasks.lock().unwrap();
-            let mut selected = std::mem::take(&mut tasks.finished);
+            let failures = tasks.take_failures(root);
             let ids: Vec<_> = tasks.active.iter().filter_map(|(&id, task)| {
                 root.is_none_or(|root| task.paths.iter().any(|path| relative_to(path, root).is_some()))
                     .then_some(id)
             }).collect();
-            selected.extend(ids.into_iter().filter_map(|id| tasks.active.remove(&id)).map(|task| task.task));
-            selected
+            let pending: Vec<_> = ids.into_iter().filter_map(|id| tasks.active.remove(&id)).map(|task| task.task).collect();
+            (failures, pending)
         };
         for pending in pending {
-            let mut cleanup = pending.wait().await;
-            outcome.cleanup_results.append(&mut cleanup.cleanup_results);
-            outcome.errors.append(&mut cleanup.errors);
+            let mut results = pending.wait().await;
+            if let Some(root) = root.filter(|_| !results.is_empty()) {
+                let mut tasks = self.cleanup_tasks.lock().unwrap();
+                for failure in results.extract_if(.., |failure| relative_to(&failure.path, root).is_none()) {
+                    tasks.record_failure(failure);
+                }
+            }
+            failures.append(&mut results);
+        }
+        for failure in failures {
+            record_cleanup_failure(outcome, failure);
         }
     }
 
@@ -1276,13 +1308,28 @@ impl<'run, O: Observer> Run<'run, O> {
         let owner = Arc::clone(self);
         let has_root_errors = !root_errors.is_empty();
         let root_errors = Mutex::new(root_errors);
+        // Scan has no request claim to reveal aliases. For multiple targets,
+        // claim each distinct plan and reuse its resolved paths in the read
+        // lease. The resolution cache lives only through this planning step.
+        let resolved_paths = if depth == 1 && self.request.mode == Mode::Scan && self.request.inputs.len() > 1
+            && batch.tasks.len() > 1
+        {
+            dedup_resolved_plans(&mut batch.tasks)
+        } else {
+            HashMap::new()
+        };
         let task_count = batch.tasks.len();
         if depth == 1 {
             self.observer.roots_planned(batch.tasks.iter().map(|task| task.entry().entry_path.as_str()));
         }
         // Register every planned consumer before any one of them can finish.
-        let tasks = batch.tasks.into_iter().map(|task| self.register_task(task)).collect();
-        let executed = spawner.bounded_map(tasks, move |(task, sources)| {
+        let tasks = batch.tasks.into_iter().map(|task| {
+            let (task, sources, _) = self.register_task(task);
+            let keys = (!resolved_paths.is_empty()).then(|| source_lease_keys(&task, &resolved_paths));
+            (task, sources, keys)
+        }).collect();
+        drop(resolved_paths);
+        let executed = spawner.bounded_map(tasks, move |(task, sources, keys)| {
             let root_errors = has_root_errors
                 .then(|| root_errors.lock().unwrap().remove(&task.entry().entry_path))
                 .flatten();
@@ -1296,7 +1343,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 let ready = stage("report", &Cancellation::new()).await;
                 let id = owner.queue_task(task.entry(), depth, parent_id, None);
                 let mut result = match ready {
-                    Ok(()) => owner.execute_task((task, sources), id, depth, scope, children).await,
+                    Ok(()) => owner.execute_task((task, sources, keys), id, depth, scope, children).await,
                     Err(error) => Err(error),
                 };
                 let unowned_errors = match (&mut result, root_errors) {
@@ -1457,14 +1504,14 @@ impl<'run, O: Observer> Run<'run, O> {
         true
     }
 
-    fn register_task(&self, task: Task) -> (Task, CleanupOwner) {
+    fn register_task(&self, task: Task) -> (Task, CleanupOwner, Option<HashSet<String>>) {
         let sources = CleanupOwner::new(Arc::clone(&self.cleanup_refs), &task.owned_paths);
-        (task, sources)
+        (task, sources, None)
     }
 
     fn execute_task(
         self: &Arc<Self>,
-        (mut task, mut sources): (Task, CleanupOwner),
+        (mut task, mut sources, keys): (Task, CleanupOwner, Option<HashSet<String>>),
         task_id: TaskId,
         depth: usize,
         inherited_scope: Option<Arc<RecursiveScope>>,
@@ -1480,7 +1527,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 && this.request.origin == Origin::Watch
                 && this.request.mode == Mode::Extract;
             let requested = this.requested_generation(&task, watch_root);
-            let mut lease = this.claim_task(&task).await?;
+            let mut lease = this.claim_task(&task, keys).await?;
             stage("preflight", cancel).await?;
             let mut outcome = Outcome::default();
             let mut shell = this.engine.shell.branch();
@@ -1830,7 +1877,7 @@ impl<'run, O: Observer> Run<'run, O> {
                             sources.refresh(&replacement.owned_paths);
                             drop(lease);
                             let requested = this.requested_generation(&replacement, watch_root);
-                            lease = this.claim_task(&replacement).await?;
+                            lease = this.claim_task(&replacement, None).await?;
                             stage("preflight", cancel).await?;
                             let (current_generations, missing) = this.capture_generations(&replacement);
                             generations = current_generations;
@@ -2308,17 +2355,15 @@ impl<'run, O: Observer> Run<'run, O> {
                         // Read pins can be shared within a request; mutation cannot.
                         let keys = recycles.iter().chain(&deletes).map(|path| resolved_key(path)).collect();
                         drop(lease);
-                        let mut outcome = Outcome::default();
+                        let mut failures = Vec::new();
                         if stage("background_source_cleanup", &cleanup.request.cancel).await.is_ok() {
                             if let Ok(_exclusive) = cleanup.engine.leases.acquire(keys, &cleanup.request.cancel).await {
                                 let mut shell = cleanup.engine.shell.branch();
-                                cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut outcome, &mut shell);
-                                cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut outcome, &mut shell);
+                                cleanup.cleanup_sources(&recycles, &generations, CleanupMode::Recycle, &mut failures, &mut shell);
+                                cleanup.cleanup_sources(&deletes, &generations, CleanupMode::Delete, &mut failures, &mut shell);
                             }
                         }
-                        let mut tasks = cleanup.cleanup_tasks.lock().unwrap();
-                        tasks.retire(id);
-                        outcome
+                        cleanup.cleanup_tasks.lock().unwrap().retire(id, failures)
                     }));
                     tasks.active.insert(id, PendingCleanup { paths, task });
                 }
@@ -2683,12 +2728,8 @@ impl<'run, O: Observer> Run<'run, O> {
         ).then_some(checkpoint)
     }
 
-    async fn claim_task(&self, task: &Task) -> io::Result<Lease> {
-        let keys = task
-            .owned_paths
-            .iter()
-            .map(|path| resolved_key(Path::new(path)))
-            .collect();
+    async fn claim_task(&self, task: &Task, keys: Option<HashSet<String>>) -> io::Result<Lease> {
+        let keys = keys.unwrap_or_else(|| source_lease_keys(task, &HashMap::new()));
         self.engine.leases.acquire_shared(keys, self.output_names.owner, &self.request.cancel).await
     }
 
@@ -2775,12 +2816,12 @@ impl<'run, O: Observer> Run<'run, O> {
             return Ok(());
         }
         let original = &mut task.inputs[0];
-        let structure_only =
-            original.input.format_hint == "lz4" && !original.input.analysis.structure_complete;
-        if task.source != DiscoverySource::Direct && !structure_only {
+        if task.source != DiscoverySource::Direct {
             return Ok(());
         }
-        let report = match analyze_input(&original.input, &self.analysis, None, true) {
+        // Detection already walks LZ4 and routes any independent, bounded
+        // archive to Embedded. A second analysis cannot recover a new plan.
+        let report = match analyze_input(&original.input, &self.analysis) {
             Ok(report) => report,
             // Planning is advisory, as in main. A transient analysis read must
             // not replace the original input with a terminal extraction failure.
@@ -3359,7 +3400,7 @@ impl<'run, O: Observer> Run<'run, O> {
         paths: &[PathBuf],
         generations: &HashMap<String, PhysicalFileGeneration>,
         cleanup: CleanupMode,
-        outcome: &mut Outcome,
+        failures: &mut Vec<CleanupResult>,
         shell: &mut ShellUpdates<'_>,
     ) {
         let mode = match cleanup {
@@ -3371,7 +3412,7 @@ impl<'run, O: Observer> Run<'run, O> {
         for path in paths {
             match capture_file_generation(path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => record_cleanup(outcome, path, mode, Err(error)),
+                Err(error) => failures.extend(cleanup_failure(path, mode, Err(error))),
                 Ok(current) => {
                     let key = path_key(&path.to_string_lossy());
                     if generations
@@ -3396,7 +3437,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 for path in valid {
                     let copy = error.raw_os_error().map(io::Error::from_raw_os_error)
                         .unwrap_or_else(|| io::Error::new(error.kind(), error.to_string()));
-                    record_cleanup(outcome, path, mode, Err(copy));
+                    failures.extend(cleanup_failure(path, mode, Err(copy)));
                 }
                 return;
             }
@@ -3410,7 +3451,7 @@ impl<'run, O: Observer> Run<'run, O> {
             if removed.is_ok() {
                 shell.parent(path);
             }
-            record_cleanup(outcome, path, mode, removed);
+            failures.extend(cleanup_failure(path, mode, removed));
         }
     }
 }
@@ -3496,8 +3537,15 @@ fn flatten_result(
             }
         }
         for receipt in &mut children.cleanup_results {
-            if let Ok(suffix) = receipt.path.strip_prefix(&old) {
+            if let Some(suffix) = relative_to(&receipt.path, &old) {
                 receipt.path = new.join(suffix);
+            }
+        }
+        for error in &mut children.errors {
+            if error.kind == InputErrorKind::Cleanup {
+                if let Some(suffix) = relative_to(&error.path, &old) {
+                    error.path = new.join(suffix);
+                }
             }
         }
         result.output = Some(new);
@@ -3539,28 +3587,35 @@ impl PromotionPaths {
 }
 
 fn record_cleanup(outcome: &mut Outcome, path: &Path, mode: &'static str, removed: io::Result<()>) {
-    let Err(error) = removed else {
-        return;
-    };
-    if error.kind() == io::ErrorKind::NotFound {
-        return;
+    if let Some(failure) = cleanup_failure(path, mode, removed) {
+        record_cleanup_failure(outcome, failure);
     }
-    let message = error.to_string();
-    outcome.errors.push(InputError {
+}
+
+fn cleanup_failure(path: &Path, mode: &'static str, removed: io::Result<()>) -> Option<CleanupResult> {
+    let error = removed.err()?;
+    if error.kind() == io::ErrorKind::NotFound {
+        return None;
+    }
+    Some(CleanupResult {
         path: path.to_path_buf(),
-        message: message.clone(),
+        mode,
+        status: CleanupStatus::Failed,
+        error_code: error.raw_os_error().unwrap_or(0),
+        message: error.to_string(),
+    })
+}
+
+fn record_cleanup_failure(outcome: &mut Outcome, failure: CleanupResult) {
+    outcome.errors.push(InputError {
+        path: failure.path.clone(),
+        message: failure.message.clone(),
         kind: InputErrorKind::Cleanup,
         scan_operation: None,
         scan_count: None,
         failure: None,
     });
-    outcome.cleanup_results.push(CleanupResult {
-        path: path.to_path_buf(),
-        mode,
-        status: CleanupStatus::Failed,
-        error_code: error.raw_os_error().unwrap_or(0),
-        message,
-    });
+    outcome.cleanup_results.push(failure);
 }
 
 fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> ArchiveResult {
@@ -4056,7 +4111,13 @@ fn resolved_key(path: &Path) -> String {
     }
 }
 
-fn dedup_resolved_plans(tasks: &mut Vec<Task>) {
+fn source_lease_keys(task: &Task, resolved: &HashMap<String, Arc<str>>) -> HashSet<String> {
+    task.owned_paths.iter().map(|path| {
+        resolved.get(path).map_or_else(|| resolved_key(Path::new(path)), |key| key.to_string())
+    }).collect()
+}
+
+fn dedup_resolved_plans(tasks: &mut Vec<Task>) -> HashMap<String, Arc<str>> {
     // Alias paths can have different scan filters. Resolve them after discovery
     // so the path that actually supplied a plan stays eligible for extraction.
     type Extent = (Arc<str>, u64, Option<u64>);
@@ -4087,6 +4148,7 @@ fn dedup_resolved_plans(tasks: &mut Vec<Task>) {
         });
         !task.inputs.is_empty()
     });
+    paths
 }
 
 fn namespace_key(path: &Path) -> String {
@@ -5291,7 +5353,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_cleanup_retires_paths_without_losing_results() {
+    fn completed_cleanup_retires_jobs_and_keeps_only_failures() {
         let tasks = Arc::new(Mutex::new(CleanupTasks::default()));
         Scheduler::new().run(1, Origin::Foreground, &Cancellation::new(), |spawner| {
             let tasks = Arc::clone(&tasks);
@@ -5300,10 +5362,13 @@ mod tests {
                     let completed = Arc::clone(&tasks);
                     let mut pending = tasks.lock().unwrap();
                     let task = spawner.spawn(Box::pin(async move {
-                        let mut outcome = Outcome::default();
-                        record_cleanup(&mut outcome, Path::new("source.zip"), "delete", Err(io::ErrorKind::PermissionDenied.into()));
-                        completed.lock().unwrap().retire(id);
-                        outcome
+                        let failures = if id == 0 {
+                            cleanup_failure(Path::new("source.zip"), "delete", Err(io::ErrorKind::PermissionDenied.into()))
+                                .into_iter().collect()
+                        } else {
+                            Vec::new()
+                        };
+                        completed.lock().unwrap().retire(id, failures)
                     }));
                     pending.active.insert(id, PendingCleanup { paths: vec![PathBuf::from("source.zip")], task });
                 }
@@ -5311,10 +5376,11 @@ mod tests {
         });
         let mut tasks = tasks.lock().unwrap();
         assert!(tasks.active.is_empty(), "completed paths must not remain in root-drain scans");
-        assert_eq!(tasks.finished.len(), 32);
-        for task in std::mem::take(&mut tasks.finished) {
-            assert_eq!(super::super::scheduling::block_on(task.wait()).cleanup_results.len(), 1);
-        }
+        assert!(tasks.take_failures(Some(Path::new("other"))).is_empty());
+        let failures = tasks.take_failures(None);
+        let [failure] = failures.as_slice() else { panic!("expected one failed cleanup") };
+        assert_eq!(failure.path, Path::new("source.zip"));
+        assert_eq!(failure.status, CleanupStatus::Failed);
     }
 
     fn test_run<'a, O: Observer>(

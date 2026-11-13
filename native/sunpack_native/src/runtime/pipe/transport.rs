@@ -153,16 +153,12 @@ impl Peer {
         result
     }
 
-    pub(super) async fn read_exact(&self, length: usize) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0; length];
-        let mut offset = 0;
-        while offset < length {
-            let (next, bytes) = self.transfer(buffer, offset, true).await?;
-            if bytes == 0 { return Err(io::ErrorKind::UnexpectedEof.into()); }
-            buffer = next;
-            offset += bytes;
+    pub(super) async fn read_some(&self, buffer: Vec<u8>) -> io::Result<(Vec<u8>, usize)> {
+        let (buffer, bytes) = self.transfer(buffer, 0, true).await?;
+        if bytes == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        Ok(buffer)
+        Ok((buffer, bytes))
     }
 
     pub(super) async fn write_all(&self, mut buffer: Vec<u8>) -> io::Result<()> {
@@ -248,31 +244,33 @@ mod tests {
         // Buffered input may complete ReadFile synchronously; it still owns an
         // IOCP packet, so the buffer cannot be returned/freed before dequeue.
         client.write_all(b"buffered").unwrap();
-        assert_eq!(crate::pipeline::block_on(peer.read_exact(8)).unwrap(), b"buffered");
+        let (bytes, length) = crate::pipeline::block_on(peer.read_some(vec![0; 16])).unwrap();
+        assert_eq!(&bytes[..length], b"buffered");
         let mut write = Box::pin(peer.write_all(vec![b'x'; 4 * 1024 * 1024]));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(matches!(write.as_mut().poll(&mut cx), Poll::Pending));
         assert!(!reactor.state.pending.lock().unwrap().operations.is_empty());
         // A client not consuming stdout must not prevent its control input.
         client.write_all(b"cancel").unwrap();
-        assert_eq!(crate::pipeline::block_on(peer.read_exact(6)).unwrap(), b"cancel");
+        let (bytes, length) = crate::pipeline::block_on(peer.read_some(bytes)).unwrap();
+        assert_eq!(&bytes[..length], b"cancel");
         peer.close();
         assert!(crate::pipeline::block_on(write).is_err());
         assert!(reactor.state.pending.lock().unwrap().operations.is_empty());
-        assert!(crate::pipeline::block_on(peer.read_exact(1)).is_err());
+        assert!(crate::pipeline::block_on(peer.read_some(vec![0; 1])).is_err());
 
         let (broken, client) = pair(&reactor);
         drop(client);
-        assert!(crate::pipeline::block_on(broken.read_exact(1)).is_err());
+        assert!(crate::pipeline::block_on(broken.read_some(vec![0; 1])).is_err());
         assert!(reactor.state.pending.lock().unwrap().operations.is_empty());
 
         let (pending, _client) = pair(&reactor);
-        let mut read = Box::pin(pending.read_exact(32));
+        let mut read = Box::pin(pending.read_some(vec![0; 32]));
         assert!(matches!(read.as_mut().poll(&mut cx), Poll::Pending));
         drop(read); // CancelIoEx, never free a kernel-owned buffer here.
         let state = Arc::clone(&reactor.state);
         drop(reactor); // Joins actual cancellation packets, without a timeout/poll loop.
         assert!(state.pending.lock().unwrap().operations.is_empty());
-        assert!(crate::pipeline::block_on(pending.read_exact(1)).is_err());
+        assert!(crate::pipeline::block_on(pending.read_some(vec![0; 1])).is_err());
     }
 }
