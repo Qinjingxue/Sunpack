@@ -814,6 +814,7 @@ struct Signals {
     cancel: Vec<(String, CommandReply<bool>)>,
     roots: Vec<RootCompleted>,
     completed: Vec<String>,
+    claimed: HashSet<String>,
 }
 
 impl Signals {
@@ -969,6 +970,7 @@ impl Hub {
                 && value.rebuild.is_empty()
                 && value.cancel.is_empty()
                 && value.once.is_empty()
+                && value.claimed.is_empty()
                 && value.completed.is_empty()
                 && value.roots.is_empty()
         };
@@ -1239,6 +1241,23 @@ struct Pending {
     due: Instant,
     force: bool,
     recovery: Option<Arc<Recovery>>,
+}
+
+// Park only deadlines, retaining the sealed observations for completion and
+// durable recovery. A stale notification after release must not park new work.
+fn park_claimed_deadlines(
+    pending: &HashMap<String, Pending>,
+    due: &mut BTreeMap<(Instant, String), ()>,
+    claims: &HashMap<String, Arc<str>>,
+    paths: HashSet<String>,
+) {
+    for path in paths {
+        if claims.contains_key(&path) {
+            if let Some(pending) = pending.get(&path) {
+                due.remove(&(pending.due, path));
+            }
+        }
+    }
 }
 
 // Claimed siblings cannot be admitted while the owner runs. Transfer their old
@@ -2087,6 +2106,12 @@ impl Scheduler {
             for (batch, waiter) in signals.cancel {
                 let _ = waiter.send(Ok(self.cancel_display_batch(&batch)));
             }
+            // Claims arrive from pipeline workers. Remove each queued deadline
+            // once; keep its observation for generation-safe completion.
+            {
+                let claims = self.hub.claims.lock().unwrap();
+                park_claimed_deadlines(&self.pending, &mut self.due, &claims, signals.claimed);
+            }
             let mut completion_error = None;
             for root in signals.roots {
                 if let Err(error) = self.complete_root(root) { completion_error = Some(error); }
@@ -2672,6 +2697,7 @@ impl Scheduler {
                 self.retire_departed_owner(&id, &pending.candidate.path)?;
             }
         }
+        self.journal.log(json!({"event":"candidate_departed","path":path,"recursive":recursive}));
         self.catalog.forget_observation(path, recursive, true);
         self.retire_stale_promoted(Some(path), recursive)?;
         self.retire_missing_entries(Some(path), recursive)
@@ -2825,7 +2851,11 @@ impl Scheduler {
                     {
                         self.due.remove(&(pending.due, id.clone()));
                         pending.due = now;
-                        self.due.insert((now, id), ());
+                        if !self.active_paths.contains_key(&id)
+                            && !self.hub.claims.lock().unwrap().contains_key(&id)
+                        {
+                            self.due.insert((now, id), ());
+                        }
                     }
                 }
                 pending.candidate = candidate;
@@ -2838,6 +2868,7 @@ impl Scheduler {
             .get(&id)
             .map(|(batch, _)| batch.as_ref())
             .or_else(|| claim.get(&id).map(AsRef::as_ref));
+        let owned = batch.is_some();
         if let Some(active) = batch.and_then(|batch| self.active.get_mut(batch)) {
             // Let the running request finish. A new generation of one source
             // must never interrupt the other sources in its batch.
@@ -2881,7 +2912,7 @@ impl Scheduler {
                 boundary,
             );
         }
-        self.due.insert((due, id.clone()), ());
+        if !owned { self.due.insert((due, id.clone()), ()); }
         self.unpublished.insert(id.clone());
         self.pending.insert(
             id,
@@ -4018,6 +4049,15 @@ impl Scheduler {
             }
             crate::collections::trim_map(&mut claims);
         }
+        // Changes observed during ownership are the next generation, not
+        // members of the completed request. Restore only their admission keys.
+        for path in groups.keys().chain(completed.promoted.keys()).cloned()
+            .chain(active.inputs.iter().map(|candidate| watch_path_key(&candidate.path)))
+        {
+            if let Some(pending) = self.pending.get(&path) {
+                self.due.insert((pending.due, path), ());
+            }
+        }
         for candidate in &active.inputs {
             let id = watch_path_key(&candidate.path);
             self.active_paths.remove(&id);
@@ -4033,7 +4073,6 @@ impl Scheduler {
             }
             Err(error) => {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
-                let revalidate = crate::password::context::is_input_changed(&error);
                 for candidate in &active.inputs {
                     let id = watch_path_key(&candidate.path);
                     if self.pending.contains_key(&id) || active.touched.contains(&id) {
@@ -4046,26 +4085,17 @@ impl Scheduler {
                         ));
                         continue;
                     }
-                    if revalidate {
-                        // Retired proof material cannot establish failure for
-                        // a still-present source. Re-admit it through the
-                        // current catalog and ordinary ownership checks.
-                        self.enqueue_with_recovery(
-                            &active.root,
-                            candidate.path.clone(),
-                            true,
-                            active.recovery.clone(),
-                        )?;
-                        continue;
-                    }
-                    self.journal
-                        .log(json!({"event":"failed_terminal","path":candidate.path,
+                    // main's pipeline_completion_error path re-admits ordinary
+                    // request exceptions too (for example a transient sharing
+                    // violation), unlike an extraction Outcome failure.
+                    self.journal.log(json!({"event":"failed_terminal","path":candidate.path,
                         "owner":batch,"error":error.to_string()}));
+                    self.enqueue_with_recovery(
+                        &active.root, candidate.path.clone(), true, active.recovery.clone(),
+                    )?;
                 }
                 self.journal.commit(true, |_| Ok(absent))?;
-                if revalidate {
-                    self.persist_candidates(BTreeMap::new(), true)?;
-                }
+                self.persist_candidates(BTreeMap::new(), true)?;
                 self.release_display_claims(batch, &groups);
                 self.arm_idle_cleanup();
                 return Ok(Outcome::default());
@@ -4219,6 +4249,9 @@ impl Scheduler {
         let output_containers: HashMap<&Path, &Path> = outcome.checkpoints.iter()
             .filter_map(|checkpoint| checkpoint.container().map(|container| (checkpoint.output(), container)))
             .collect();
+        let canonical_inputs: HashMap<_, _> = active.inputs.iter()
+            .map(|candidate| (watch_path_key(&candidate.path), candidate.clone())).collect();
+        let mut projected_groups = HashSet::new();
         for candidate in active.inputs {
             let id = watch_path_key(&candidate.path);
             if self.pending.contains_key(&id)
@@ -4228,10 +4261,10 @@ impl Scheduler {
                 continue;
             }
             let group = groups.get(&id);
-            let canonical = group.map_or(candidate.path.as_str(), |group| {
-                group.path.to_str().unwrap_or(&candidate.path)
+            let canonical = group.map_or_else(|| candidate.path.clone(), |group| {
+                group.path.to_string_lossy().into_owned()
             });
-            let canonical_id = watch_path_key(canonical);
+            let canonical_id = watch_path_key(&canonical);
             let archives = by_path.get(&canonical_id).or_else(|| by_path.get(&id));
             let input_error = error_paths.get(&canonical_id).or_else(|| error_paths.get(&id));
             let failed_archive = input_error.is_none()
@@ -4243,11 +4276,44 @@ impl Scheduler {
             let error = input_error.map(|error| error.as_str())
                 .or_else(|| failure_message.as_deref());
             let retryable = input_failure.is_some_and(InputFailure::retryable);
+            // A multipart request has one logical result and one blocker.
+            // Physical sibling generations only need their pending WAL retired.
+            let candidate = if completed.cancelled {
+                candidate
+            } else {
+                if id != canonical_id {
+                    operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(
+                        &candidate.path, None,
+                    ));
+                }
+                if self.pending.contains_key(&canonical_id)
+                    || active.touched.contains(&canonical_id)
+                    || !projected_groups.insert(canonical_id.clone())
+                {
+                    continue;
+                }
+                if id == canonical_id {
+                    candidate
+                } else if let Some(head) = canonical_inputs.get(&canonical_id) {
+                    head.clone()
+                } else if error.is_none() {
+                    // Successful source cleanup may already have removed the
+                    // head. No blocker observation is needed for a success.
+                    let mut head = candidate;
+                    head.path = canonical.clone();
+                    head
+                } else {
+                    let Ok(Some(head)) = watch_candidate_for_path(Path::new(&canonical), None) else {
+                        continue;
+                    };
+                    head
+                }
+            };
             let stale = error.is_some()
                 // A promoted terminal child may outlive its successfully
                 // consumed outer source. That is still this owner's failure.
                 && !failed_archive.is_some_and(|archive| archive.depth > 1)
-                && (NativePresence::at(canonical).is_absent()
+                && (NativePresence::at(&canonical).is_absent()
                     || (!retryable
                         && group.is_some_and(|group| {
                             group.multipart
@@ -4324,7 +4390,7 @@ impl Scheduler {
             } else {
                 "no_tasks_found"
             };
-            if published.insert(watch_path_key(canonical)) {
+            if published.insert(watch_path_key(&canonical)) {
                 let outputs = completion_output_dirs(archives.into_iter().flatten()
                     .filter_map(|item| item.output.as_deref()), &output_containers);
                 self.journal
@@ -4881,6 +4947,9 @@ impl Observer for WatchObserver {
                 claims.insert(key, Arc::clone(&self.batch));
             }
         }
+        self.hub.update(|signals| {
+            signals.claimed.extend(group.members.iter().map(|path| watch_path_key(path)));
+        });
         self.journal.log(
             json!({"event":"pipeline_sources_claimed","path":path,"owner":self.batch,
             "processing":true,"groups":[group]}),
@@ -6082,6 +6151,12 @@ mod tests {
             unpublished.insert(id);
         }
         let changed = watch_path_key("split.003");
+        let claims = groups.keys().map(|path| (path.clone(), Arc::<str>::from("owner"))).collect();
+        park_claimed_deadlines(&pending, &mut due, &claims, groups.keys().cloned().collect());
+        assert!(due.is_empty());
+        assert_eq!(pending.len(), 2); // observations survive until generation-safe completion
+        // A changed generation is queued while ownership continues, but is
+        // admitted only after release. Completion consumes only the old sibling.
         let mut inputs = Vec::new();
         consume_claimed_pending(&mut pending, &mut due, &mut unpublished, &groups,
             &HashSet::from([changed.clone()]), &mut inputs);
@@ -6090,6 +6165,11 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(pending.contains_key(&changed));
         assert_eq!(unpublished, HashSet::from([changed.clone()]));
+        assert!(due.is_empty());
+        let changed_pending = pending.get(&changed).unwrap();
+        due.insert((changed_pending.due, changed.clone()), ());
+        // A late claim wake cannot remove the now-released new generation.
+        park_claimed_deadlines(&pending, &mut due, &HashMap::new(), HashSet::from([changed.clone()]));
         assert_eq!(due.len(), 1);
         assert_eq!(due.keys().next().unwrap().1, changed);
     }

@@ -20,6 +20,7 @@ const CONFIG_CACHE_LIMIT: usize = 64;
 pub struct Config {
     pub cli: CliConfig,
     pub runtime: RuntimeConfig,
+    pub output: OutputConfig,
     pub watch: WatchConfig,
     pub passwords: PasswordConfig,
     pub user_passwords: Vec<String>,
@@ -31,6 +32,12 @@ pub struct Config {
     pub filesystem: FilesystemConfig,
     pub performance: PerformanceConfig,
     pub analysis: AnalysisConfig,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct OutputConfig {
+    pub root: Option<std::path::PathBuf>,
+    pub fixed_root: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -782,6 +789,11 @@ impl Config {
                 language: raw_language(value),
             },
             runtime: RuntimeConfig { process_mode },
+            output: OutputConfig {
+                root: field(value, &["output", "root"]).as_str()
+                    .filter(|root| !root.is_empty()).map(std::path::PathBuf::from),
+                fixed_root: json_truthy(field(value, &["output", "fixed_root"])),
+            },
             watch,
             passwords: PasswordConfig {
                 clipboard_passwords_enabled: bool_field(
@@ -1155,6 +1167,21 @@ fn utc_minute(value: &str) -> Option<i128> {
 #[cfg(test)]
 mod filter_runtime_tests {
     use super::*;
+
+    #[test]
+    fn saved_output_mapping_participates_in_runtime_configuration() {
+        let mut raw = defaults().clone();
+        let original = Config::parse(&raw).unwrap();
+        assert!(original.output.root.is_none());
+        assert!(!original.output.fixed_root);
+        raw["output"] = serde_json::json!({"root": "Recovered", "fixed_root": true});
+        let mapped = Config::parse(&raw).unwrap();
+        assert_eq!(mapped.output.root.as_deref(), Some(std::path::Path::new("Recovered")));
+        assert!(mapped.output.fixed_root);
+        assert!(mapped != original);
+        raw["output"]["root"] = Value::String(String::new());
+        assert!(Config::parse(&raw).unwrap().output.root.is_none());
+    }
 
     #[test]
     fn configured_user_passwords_are_literal_ordered_and_deduplicated() {

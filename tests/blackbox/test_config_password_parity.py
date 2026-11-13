@@ -170,14 +170,49 @@ def test_archive_infrastructure_failures_keep_main_exit_classification(package, 
     assert json.loads(result.stdout)["errors"]
 
 
-def test_show_keeps_invalid_execution_values_visible(package):
-    # A bad regex is validated later and does not exercise Config::parse.
+def test_show_validates_runtime_fields_but_preserves_raw_values(package):
     package.configure(recursive_extract=0)
-    shown = package.json("config", "show")
-    assert shown["items"][0]["recursive_extract"] == 0
-    text = package.run("config", "show")
-    assert text.returncode == 0, text.stderr
-    assert json.loads(text.stdout)["recursive_extract"] == 0
-    checked = package.json("config", "validate", code=2)
-    assert checked["items"][0]["ok"] is False
-    assert checked["errors"]
+    for action in ("show", "validate"):
+        assert package.json("config", action, code=2)["errors"]
+        text = package.run("config", action)
+        assert text.returncode == 2, (text.stdout, text.stderr)
+
+    # Show performs runtime validation, not validate-only regex compilation,
+    # and returns the saved document rather than normalized enum spellings.
+    package.configure(recursive_extract=1, runtime={"process_mode": "NORMAL"},
+                      filesystem={"scan_filters": [{"name": "blacklist", "enabled": False,
+                          "full_names": [{"value": "[", "regex": True}]}]})
+    assert package.json("config", "show")["items"][0]["runtime"]["process_mode"] == "NORMAL"
+    assert package.json("config", "validate", code=2)["errors"]
+
+
+@pytest.mark.parametrize("mapping", ["default", "configured", "cli", "mirrored"])
+def test_saved_output_mapping_and_cli_override(package, tmp_path, mapping):
+    source = tmp_path / "Downloads"
+    parent = source / "set"
+    parent.mkdir(parents=True)
+    archive = parent / "a.zip"
+    with zipfile.ZipFile(archive, "w") as payload:
+        payload.writestr("member.txt", "payload")
+    saved = tmp_path / "saved"
+    override = tmp_path / "override"
+    args = ["extract", source]
+    if mapping == "default":
+        expected = parent / "a"
+    else:
+        # Use the ordinary saved JSON path. output is not an environment
+        # override field in main's configuration schema.
+        package.configure(output={"root": str(saved), "fixed_root": mapping != "mirrored"})
+        expected = saved / "a"
+        if mapping == "cli":
+            args += ["-o", override]
+            expected = override / "a"
+        elif mapping == "mirrored":
+            expected = saved / "set" / "a"
+    assert package.json(*args)["summary"]["success_count"] == 1
+    assert (expected / "member.txt").read_text() == "payload"
+    if mapping != "default":
+        assert not (parent / "a").exists()
+    if mapping == "cli":
+        assert not saved.exists()
+        assert not (override / "set").exists()

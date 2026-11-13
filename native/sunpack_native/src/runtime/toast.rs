@@ -796,6 +796,7 @@ impl Shared {
         if state.stopping {
             return false;
         }
+        drop(state);
         show();
         true
     }
@@ -817,9 +818,12 @@ impl Shared {
             state.settle(Instant::now());
             return false;
         }
-        show();
+        // Accept this generation before releasing the snapshot. New work
+        // can publish independently while the sole presenter sends it.
         state.retire_front();
         state.settle(Instant::now());
+        drop(state);
+        show();
         true
     }
 }
@@ -1373,14 +1377,13 @@ impl Toast {
                             state = presenter_shared.changed.wait(state).unwrap();
                         }
                     };
+                    drop(state);
                     if matches!(display, Display::Clear) {
                         let error = presenter.as_ref().and_then(|current| current.clear().err());
                         if error.is_some() { presenter.take(); }
-                        drop(state);
                         if let Some(error) = error { report_error("toast_error", &error); }
                         continue;
                     }
-                    drop(state);
                     let mut published_report = None;
                     let mut completion = None;
                     let snapshot = match display {
@@ -1404,8 +1407,9 @@ impl Toast {
                         }
                     };
                     let payload = snapshot.encode();
-                    // Stop and native publication share this short gate. Report
-                    // IO never holds it, so disable cannot wait on the writer.
+                    // Validate and consume under the state gate, then call
+                    // WinRT outside it. Only this thread performs native effects;
+                    // newer progress, clear or stop is consumed on its next turn.
                     let mut available = true;
                     let mut failure = None;
                     let show = || {
@@ -1484,9 +1488,9 @@ impl Drop for Toast {
         self.publisher.shared.state.lock().unwrap().stopping = true;
         self.publisher.reports.cancellation.cancel();
         self.publisher.shared.changed.notify_one();
-        // A writer may be inside a filesystem call. It owns the presenter and
-        // draft cleanup; cancellation makes it exit without showing a stale
-        // toast. Never synchronously join that IO from Watch's service thread.
+        // The worker owns presenter and draft cleanup. An already accepted
+        // native send may finish; stopping prevents consuming later snapshots.
+        // Never synchronously join its file or WinRT IO from Watch's thread.
         drop(self.thread.take());
     }
 }
@@ -2167,6 +2171,29 @@ mod tests {
             entry.unwrap().path().extension().is_some_and(|ext| ext == "txt")
         }));
     }
+    #[test]
+    fn native_presentation_releases_state_before_sending_progress_and_completion() {
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let first = publisher.register(Arc::from("01"), Language::En);
+        first.event(queued(1, "first.zip", None, 0));
+        assert!(publisher.shared.present(|| {
+            assert!(publisher.shared.state.try_lock().is_ok());
+            progress(&first, 1, "first.zip", 1, 2);
+        }));
+        first.finish(&success(), false, false, one_root);
+        finish_debounce(&publisher);
+        let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+        assert!(publisher.shared.present_completed(&completed, || {
+            assert!(publisher.shared.state.try_lock().is_ok());
+            let next = publisher.register(Arc::from("02"), Language::En);
+            next.event(queued(2, "next.zip", None, 0));
+            progress(&next, 2, "next.zip", 1, 2);
+            assert_ne!(current(&publisher).batch, completed.id.as_ref());
+        }));
+        assert_eq!(publisher.shared.state.lock().unwrap().groups.len(), 1);
+    }
+
     #[test]
     fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
         // Pause at the report/presentation boundary, where checking only

@@ -325,32 +325,44 @@ impl NativeWatchState {
         NativeWatchOperations { operations: Arc::new(Operations(operations)) }
     }
 
-    /// Called under the same journal gate as mkdir + output publication. A
-    /// verified root's own LastWrite events are generated output too. Missing or
-    /// replaced roots fail verification and reach lifecycle reconciliation;
-    /// the watched-directory boundary always remains visible for rearming.
-    pub(crate) fn retain_unowned_events(&self, paths: &mut Vec<PathBuf>, boundary: &Path) {
-        let boundary = path_key(&boundary.to_string_lossy());
+    /// Capture registrations at the mkdir/publication boundary. Identity I/O
+    /// must happen after releasing the journal's global publication gate.
+    pub(crate) fn owned_event_records(&self, paths: &[PathBuf]) -> BTreeMap<String, Value> {
         let keys: Vec<_> = paths.iter().map(|path| path_key(&path.to_string_lossy())).collect();
-        let records = self.lock().owned_records(Some(&keys), false);
+        self.lock().owned_records(Some(&keys), false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_unowned_events(&self, paths: &mut Vec<PathBuf>, boundary: &Path) {
+        let records = self.owned_event_records(paths);
+        self.filter_owned_event_records(paths, boundary, records);
+    }
+
+    pub(crate) fn filter_owned_event_records(
+        &self, paths: &mut Vec<PathBuf>, boundary: &Path, records: BTreeMap<String, Value>,
+    ) {
+        let boundary = path_key(&boundary.to_string_lossy());
         let mut identities = HashMap::new();
-        let mut owned = HashSet::new();
-        for (key, record) in records {
-            let Some(path) = record["path"].as_str() else { continue; };
-            if identities.entry(path.to_owned()).or_insert_with(|| output_identity(path))
+        let verified: Vec<_> = records.into_iter().filter(|(_, record)| {
+            let Some(path) = record["path"].as_str() else { return false; };
+            identities.entry(path.to_owned()).or_insert_with(|| output_identity(path))
                 .as_ref().is_ok_and(|identity| identity.as_ref()
-                    .is_some_and(|identity| record_matches(&record, identity)))
-            {
-                owned.insert(key["owned|".len()..].to_owned());
-            }
-        }
-        let mut keys = keys.into_iter();
-        paths.retain(|_| {
-            let key = keys.next().unwrap();
+                    .is_some_and(|identity| record_matches(record, identity)))
+        }).collect();
+        // A concurrent rollback or replacement must not inherit the snapshot's
+        // exclusion. Only registrations that survived the probe still filter.
+        let data = self.lock();
+        let owned: HashSet<_> = verified.into_iter().filter_map(|(key, record)| {
+            data.runtime.get(&key).filter(|current| same_registration(&record, current))
+                .map(|_| key["owned|".len()..].to_owned())
+        }).collect();
+        paths.retain(|path| {
+            let key = path_key(&path.to_string_lossy());
             key == boundary || !crate::path_keys::path_ancestors(&key)
-                    .any(|parent| owned.contains(parent))
+                .any(|parent| owned.contains(parent))
         });
     }
+
 }
 
 fn record_paths(record: &Value) -> impl Iterator<Item = &str> {
@@ -705,6 +717,23 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn event_snapshot_does_not_hide_revoked_output_after_identity_probe() {
+        let marker = crate::test_support::temp_file("owned_event_snapshot", b"");
+        let output = marker.with_extension("output");
+        std::fs::create_dir(&output).unwrap();
+        let state = NativeWatchState::new();
+        let identity = output_identity(output.to_str().unwrap()).unwrap().unwrap();
+        put_owned(&state, &output, &identity);
+        let mut paths = vec![output.join("generated.zip")];
+        let records = state.owned_event_records(&paths);
+        state.apply(&state.remove_owned_output(&[output.to_string_lossy().into_owned()], &identity));
+        state.filter_owned_event_records(&mut paths, marker.parent().unwrap(), records);
+        assert_eq!(paths, vec![output.join("generated.zip")]);
+        std::fs::remove_dir(output).unwrap();
+        std::fs::remove_file(marker).unwrap();
+    }
+
     #[test]
     fn owned_lifecycle_filters_bursts_but_keeps_reuse_offline_and_flatten_safe() {
         let marker = crate::test_support::temp_file("owned_lifecycle", b"");

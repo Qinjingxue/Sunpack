@@ -69,3 +69,58 @@ def test_numbered_collision_normalizes_unicode_decimal_suffix(package, tmp_path)
     package.json("extract", "-r", "1", "-o", output, source)
     assert (output / "archive(2)" / "item.txt").read_bytes() == b"payload"
     assert (existing / "untouched.txt").read_bytes() == b"existing"
+
+
+@pytest.mark.parametrize("cleanup", ["k", "d", "r"])
+@pytest.mark.parametrize("embedded", [False, True], ids=["split", "embedded-split"])
+def test_recursive_shared_walk_preserves_each_file_relation_scope(
+    package, tmp_path, cleanup, embedded,
+):
+    root = tmp_path / "inputs"
+    child = root / "child"
+    other = root / "other"
+    child.mkdir(parents=True)
+    other.mkdir()
+    payload = tmp_path / "payload.txt"
+    content = bytes(range(256)) * 12
+    payload.write_bytes(content)
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v1k",
+         str(child / "split.7z"), str(payload)],
+        check=True, capture_output=True,
+    )
+    head, *tails = sorted(child.glob("split.7z.*"))
+    assert tails
+    if embedded:
+        head.write_bytes(b"carrier prefix\0" + head.read_bytes())
+    tails = [tail.rename(other / tail.name) for tail in tails]
+    original = {part: part.read_bytes() for part in [head, *tails]}
+    ordinary = root / "ordinary.zip"
+    with zipfile.ZipFile(ordinary, "w") as archive:
+        archive.writestr("ordinary.txt", b"ordinary")
+    package.configure(filesystem={"scan_filters_enabled": False})
+
+    # Adding an unrelated ancestor target may share its recursive walk, but
+    # cannot make this child's missing siblings visible to discovery/retry.
+    alone = package.json("extract", "-d", "-R", "-c", "k", "-r", "1",
+                         "-o", tmp_path / "alone", head, code=1)
+    combined_out = tmp_path / "combined"
+    combined = package.json("extract", "-d", "-R", "-c", cleanup, "-r", "1",
+                            "-o", combined_out, ordinary, head, code=1)
+    assert alone["summary"]["failed_count"] == combined["summary"]["failed_count"] == 1
+    assert combined["summary"]["success_count"] == 1
+    assert next(combined_out.rglob("ordinary.txt")).read_bytes() == b"ordinary"
+    assert not list(combined_out.rglob(payload.name))
+    assert {part: part.read_bytes() for part in original} == original
+
+    # The same tails inside the original recursive boundary must still work,
+    # including the embedded split route, proving this is not a blanket reject.
+    nested = child / "download"
+    nested.mkdir()
+    for tail in tails:
+        tail.rename(nested / tail.name)
+    recovered = tmp_path / "recovered"
+    report = package.json("extract", "-d", "-R", "-c", "k", "-r", "1",
+                          "-o", recovered, head)
+    assert report["summary"]["success_count"] == 1
+    assert next(recovered.rglob(payload.name)).read_bytes() == content

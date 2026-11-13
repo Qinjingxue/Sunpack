@@ -80,23 +80,16 @@ pub(crate) struct NativeCandidateTable {
 
 pub(crate) struct FileTargets {
     names_by_path: HashMap<String, String>,
-    directories: HashSet<String>,
 }
 
 impl FileTargets {
-    pub(crate) fn new(targets: Vec<(String, String)>, directories: Vec<String>) -> Self {
+    pub(crate) fn new(targets: Vec<(String, String)>) -> Self {
         Self {
             names_by_path: targets
                 .into_iter()
                 .map(|(path, name)| (path_key(&path), case_key(&name)))
                 .collect(),
-            directories: directories.into_iter().collect(),
         }
-    }
-
-    fn in_directory(&self, key: &str) -> bool {
-        !self.directories.is_empty()
-            && crate::path_keys::path_ancestors(key).any(|parent| self.directories.contains(parent))
     }
 
     fn select(&self, snapshot: &NativeDirectorySnapshot) -> Option<NativeDirectorySnapshot> {
@@ -111,7 +104,7 @@ impl FileTargets {
                     exact += 1;
                     true
                 } else {
-                    self.in_directory(&key)
+                    false
                 }
             })
             .collect();
@@ -129,7 +122,7 @@ impl FileTargets {
                     physical_matches.insert(key);
                     true
                 } else {
-                    self.in_directory(&key)
+                    false
                 }
             };
             let contains = match row {
@@ -946,13 +939,6 @@ impl NativeCandidateTable {
             self.append_speculative_files(raw);
         })();
         Ok(())
-    }
-
-    pub(crate) fn extend(&mut self, other: &mut NativeCandidateTable) {
-        self.rows.append(&mut other.rows);
-        self.relation_sources.append(&mut other.relation_sources);
-        self.relation_failures
-            .extend(other.relation_failures.drain());
     }
 
     pub(crate) fn dedupe(&mut self) {

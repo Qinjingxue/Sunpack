@@ -96,6 +96,39 @@ fn password_key(input: &ArchiveInput) -> (String, u64) {
     (path_key(&input.entry_path), offset)
 }
 
+fn scope_view(
+    snapshot: &NativeDirectorySnapshot,
+    scope: &NativeDiscoveryScope,
+) -> NativeDirectorySnapshot {
+    snapshot.view(
+        snapshot.rows.iter().copied()
+            .filter(|&row| scope.contains(&snapshot.table.paths[row]))
+            .collect(),
+    )
+}
+
+fn scan_discovery_scope(
+    options: &NativeDirectoryScanOptions,
+    scope: &NativeDiscoveryScope,
+    shared_roots: &HashMap<String, String>,
+    snapshots: &mut HashMap<String, (NativeDirectorySnapshot, NativeDirectorySnapshot)>,
+) -> io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
+    let Some(root) = shared_roots.get(scope.key()) else {
+        return options.scan_scope(scope);
+    };
+    if !snapshots.contains_key(root) {
+        snapshots.insert(
+            root.clone(),
+            options.scan_scope(&NativeDiscoveryScope::new(root.clone(), None, Vec::new()))?,
+        );
+    }
+    let (filtered, raw) = &snapshots[root];
+    if scope.key() == path_key(root).trim_end_matches('\\') {
+        return Ok((filtered.share_rows(), raw.share_rows()));
+    }
+    Ok((scope_view(filtered, scope), scope_view(raw, scope)))
+}
+
 fn walk_can_reach(root: &str, target: &str) -> bool {
     for path in Path::new(target).ancestors() {
         if path_key(&path.to_string_lossy()).trim_end_matches('\\') == root {
@@ -193,6 +226,11 @@ pub(super) fn discover(
         })
         .collect();
     drop(seen_roots);
+    // Enumeration may be covered by an ancestor target; main still retains
+    // every explicitly selected boundary for missing-volume replacement.
+    let mut logical_scopes: BTreeMap<_, _> = scopes.iter()
+        .map(|scope| (scope.key().to_owned(), scope.clone()))
+        .collect();
     let share_recursive = request.recursive && options.can_share_recursive_context();
     if share_recursive && scopes.len() > 1 {
         let roots: HashMap<_, _> = scopes.iter().map(|scope| (scope.key(), scope)).collect();
@@ -219,12 +257,19 @@ pub(super) fn discover(
                 .is_some_and(|scope| scope.contains_key(key))
         })
     };
-    let mut table = NativeCandidateTable::new();
     let mut verified = HashMap::new();
     let mut retry_scopes = Vec::new();
-    let mut by_parent = BTreeMap::<_, (_, Vec<_>, Vec<_>)>::new();
+    let mut by_parent = BTreeMap::<_, (_, Vec<_>)>::new();
     for path in &files {
         let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(path));
+        let logical_scope = request.discovery_scope.clone().unwrap_or_else(|| {
+            NativeDiscoveryScope::new(
+                parent.to_string_lossy().into_owned(),
+                if request.direct { Some(0) } else { max_depth },
+                Vec::new(),
+            )
+        });
+        logical_scopes.entry(logical_scope.key().to_owned()).or_insert(logical_scope);
         if !roots.is_empty() {
             let key = path_key(path);
             let parent_path = parent.to_string_lossy();
@@ -252,75 +297,60 @@ pub(super) fn discover(
         key.truncate(key.trim_end_matches('\\').len());
         by_parent
             .entry((key, bucket))
-            .or_insert_with(|| (parent, Vec::new(), Vec::new()))
+            .or_insert_with(|| (parent, Vec::new()))
             .1
             .push((path.clone(), filesystem_logical_name(path)));
     }
-    let mut covered_directories = HashSet::new();
+    // Share physical enumeration, never the logical relation boundary. Each
+    // selected file keeps its original parent scope, including replacement retry.
+    let mut shared_roots = HashMap::new();
     if share_recursive
         && !request.direct
         && request.discovery_scope.is_none()
         && request.watch_catalog.is_none()
-        && !by_parent.is_empty()
-        && (by_parent.len() > 1 || !scopes.is_empty())
     {
-        // A file contributes a relation search boundary, whereas a selected
-        // directory admits all its archives. Merge their walks without widening
-        // the latter to unrelated files elsewhere in the shared snapshot.
         let file_roots: HashMap<_, _> = by_parent
             .iter()
-            .map(|((key, _), (root, _, _))| (key.clone(), root.clone()))
+            .map(|((key, _), (root, _))| (key.clone(), root.clone()))
             .collect();
-        let outer_root = |key: &str, path: &str| {
-            path_ancestors(key)
+        for (key, path) in file_roots
+            .iter()
+            .map(|(key, path)| (key.as_str(), path.as_str()))
+            .chain(scopes.iter().map(|scope| (scope.key(), scope.root.as_str())))
+        {
+            if let Some((_, root)) = path_ancestors(key)
                 .filter_map(|ancestor| file_roots.get_key_value(ancestor))
                 .filter(|(root, _)| walk_can_reach(root, path))
                 .last()
-        };
-        if file_roots.len() > 1 {
-            let unmerged = std::mem::take(&mut by_parent);
-            for ((key, _), (path, mut targets, _)) in unmerged {
-                let (key, root) = outer_root(&key, &path).unwrap();
-                by_parent
-                    .entry((key.clone(), String::new()))
-                    .or_insert_with(|| (root.clone(), Vec::new(), Vec::new()))
-                    .1
-                    .append(&mut targets);
-            }
-        }
-        for scope in &scopes {
-            if let Some((key, _)) = outer_root(scope.key(), &scope.root) {
-                by_parent
-                    .get_mut(&(key.clone(), String::new()))
-                    .unwrap()
-                    .2
-                    .push(scope.key().to_owned());
-                covered_directories.insert(scope.key());
+            {
+                shared_roots.insert(key.to_owned(), root.clone());
             }
         }
     }
+    let mut shared_snapshots = HashMap::new();
     for scope in &scopes {
-        if covered_directories.contains(scope.key()) {
-            continue;
-        }
         request.cancel.check_io()?;
-        let (filtered, raw) = options.scan_scope(scope)?;
-        result.scan_errors.extend(filtered.scan_errors());
-        table.extend(&mut directory_table(
+        let (filtered, raw) =
+            scan_discovery_scope(options, scope, &shared_roots, &mut shared_snapshots)?;
+        if !shared_roots.contains_key(scope.key()) {
+            result.scan_errors.extend(filtered.scan_errors());
+        }
+        let mut table = directory_table(
             &filtered,
             &raw,
             None,
             candidates,
             &mut verified,
             request,
-        )?);
+        )?;
+        result.project_scope(&mut table, candidates, &verified, request)?;
         retry_scopes.push(Arc::new(RetryScope {
             scope: scope.clone(),
             snapshot: raw,
             bucket: String::new(),
         }));
     }
-    for ((_, bucket), (parent, targets, directories)) in by_parent {
+    for ((_, bucket), (parent, targets)) in by_parent {
         request.cancel.check_io()?;
         let scope = request.discovery_scope.clone().unwrap_or_else(|| {
             NativeDiscoveryScope::new(
@@ -332,25 +362,30 @@ pub(super) fn discover(
         let (filtered, raw) = if let Some(catalog) = &request.watch_catalog {
             options.catalog_snapshot(catalog, &scope, &targets[0].0)?
         } else {
-            options.scan_scope(&scope)?
+            scan_discovery_scope(options, &scope, &shared_roots, &mut shared_snapshots)?
         };
-        result.scan_errors.extend(filtered.scan_errors());
-        table.extend(&mut directory_table(
+        if !shared_roots.contains_key(scope.key()) {
+            result.scan_errors.extend(filtered.scan_errors());
+        }
+        let mut table = directory_table(
             &filtered,
             &raw,
-            Some(FileTargets::new(targets, directories)),
+            Some(FileTargets::new(targets)),
             candidates,
             &mut verified,
             request,
-        )?);
+        )?;
+        result.project_scope(&mut table, candidates, &verified, request)?;
         retry_scopes.push(Arc::new(RetryScope {
             scope,
             snapshot: raw,
             bucket,
         }));
     }
-    table.dedupe();
-    result.project(&mut table, candidates, &verified, request, false)?;
+    for (filtered, _) in shared_snapshots.values() {
+        result.scan_errors.extend(filtered.scan_errors());
+    }
+    merge_shared_inputs(&mut result.tasks);
     if request.origin == Origin::Watch {
         let admitted = |path: &str| {
             let key = path_key(path);
@@ -395,6 +430,7 @@ pub(super) fn discover(
             ));
         }
     }
+    retain_logical_retry_scopes(logical_scopes.into_values(), &mut retry_scopes);
     assign_retry_scopes(&mut result.tasks, &retry_scopes);
     Ok(result)
 }
@@ -463,6 +499,32 @@ impl OutputDiscovery {
             })],
         );
         Ok(())
+    }
+}
+
+fn retain_logical_retry_scopes(
+    logical_scopes: impl IntoIterator<Item = NativeDiscoveryScope>,
+    scopes: &mut Vec<Arc<RetryScope>>,
+) {
+    let mut by_root: HashMap<_, _> = scopes.iter()
+        .map(|scope| (scope.scope.key().to_owned(), Arc::clone(scope)))
+        .collect();
+    for scope in logical_scopes {
+        if by_root.contains_key(scope.key()) {
+            continue;
+        }
+        let Some(source) = path_ancestors(scope.key()).find_map(|key| {
+            by_root.get(key).filter(|source| source.scope.contains_key(scope.key()))
+        }) else {
+            continue;
+        };
+        let retry = Arc::new(RetryScope {
+            snapshot: scope_view(&source.snapshot, &scope),
+            scope,
+            bucket: source.bucket.clone(),
+        });
+        by_root.insert(retry.scope.key().to_owned(), Arc::clone(&retry));
+        scopes.push(retry);
     }
 }
 
@@ -548,7 +610,7 @@ pub(super) fn retry_volume(
     let table = directory_table(
         &filtered,
         &raw,
-        Some(FileTargets::new(targets, Vec::new())),
+        Some(FileTargets::new(targets)),
         candidates,
         &mut verified,
         request,
@@ -645,6 +707,25 @@ fn directory_table(
 }
 
 impl Discovered {
+    fn project_scope(
+        &mut self,
+        table: &mut NativeCandidateTable,
+        candidates: &CandidateSet,
+        verified: &VerifiedPasswords,
+        request: &Request,
+    ) -> io::Result<()> {
+        // Embedded Relations must use this target's boundary too, not the
+        // first ancestor snapshot in an aggregate table. Merge ownership only
+        // after each scope has finished discovery, as in main.
+        table.dedupe();
+        let mut scoped = Self::default();
+        scoped.project(table, candidates, verified, request, false)?;
+        self.tasks.extend(scoped.tasks);
+        self.blocked_paths.extend(scoped.blocked_paths);
+        self.scan_errors.merge_report(scoped.scan_errors);
+        Ok(())
+    }
+
     fn project(
         &mut self,
         table: &mut NativeCandidateTable,
@@ -1054,6 +1135,92 @@ fn root(parents: &mut [usize], mut index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covered_explicit_targets_keep_their_retry_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "sunpack-covered-scope-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos(),
+        ));
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let archive = child.join("archive.zip");
+        // A complete stored ZIP, so discovery needs no worker or passwords.
+        std::fs::write(&archive, b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00").unwrap();
+        let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let candidates = CandidateSet::new(
+            Arc::from([]), None, &super::super::passwords::AttemptCache::default(), None,
+        );
+        for target in [&child, &archive] {
+            for ancestor_first in [false, true] {
+                let inputs = if ancestor_first { vec![root.clone(), target.clone()] }
+                    else { vec![target.clone(), root.clone()] };
+                let mut request = Request::new(inputs, super::super::Mode::Scan);
+                request.recursive = true;
+                let result = discover(&request, &options, &candidates).unwrap();
+                assert!(result.errors.is_empty());
+                assert_eq!(result.tasks.len(), 1);
+                let task = &result.tasks[0];
+                assert_eq!(task.inputs.len(), 1);
+                assert_eq!(path_key(&task.entry().entry_path), path_key(&archive.to_string_lossy()));
+                let retry = task.retry.as_ref().unwrap();
+                assert_eq!(retry.scope.key(), path_key(&child.to_string_lossy()));
+                assert!(retry.snapshot.rows.iter().all(|&row| {
+                    retry.scope.contains(&retry.snapshot.table.paths[row])
+                }));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_walk_keeps_child_rows_and_retry_scope_local() {
+        let root = std::env::temp_dir().join(format!(
+            "sunpack-scope-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos(),
+        ));
+        let child = root.join("child");
+        let other = root.join("other");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let head = child.join("split.7z.001");
+        std::fs::write(&head, b"head").unwrap();
+        std::fs::write(other.join("split.7z.002"), b"tail").unwrap();
+        let outer = NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), None, Vec::new());
+        let inner = NativeDiscoveryScope::new(child.to_string_lossy().into_owned(), None, Vec::new());
+        let roots = HashMap::from([
+            (outer.key().to_owned(), outer.root.clone()),
+            (inner.key().to_owned(), outer.root.clone()),
+        ]);
+        let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let mut snapshots = HashMap::new();
+        let (_, outer_raw) = scan_discovery_scope(&options, &outer, &roots, &mut snapshots).unwrap();
+        let (_, inner_raw) = scan_discovery_scope(&options, &inner, &roots, &mut snapshots).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert!(Arc::ptr_eq(&outer_raw.table, &inner_raw.table));
+        let paths: Vec<_> = inner_raw.rows.iter().map(|&row| &inner_raw.table.paths[row]).collect();
+        assert!(paths.iter().any(|path| path_key(path) == path_key(&head.to_string_lossy())));
+        assert!(paths.iter().all(|path| inner.contains(path)));
+        // Both an explicit child directory and a covered child file's parent
+        // remain logical boundaries when only the ancestor was discovered.
+        let mut scopes = vec![Arc::new(RetryScope {
+            scope: outer.clone(), snapshot: outer_raw, bucket: String::new(),
+        })];
+        retain_logical_retry_scopes([outer, inner.clone(), inner.clone()], &mut scopes);
+        assert_eq!(scopes.len(), 2);
+        assert!(Arc::ptr_eq(&scopes[0].snapshot.table, &scopes[1].snapshot.table));
+        assert_eq!(*scopes[1].snapshot.rows, *inner_raw.rows);
+        let head = head.to_string_lossy().into_owned();
+        let mut tasks = vec![Task::single(
+            ArchiveInput::file(head.clone(), "7z".into(), "split".into()),
+            vec![head], DiscoverySource::Relations, None,
+        )];
+        assign_retry_scopes(&mut tasks, &scopes);
+        assert_eq!(tasks[0].retry.as_ref().unwrap().scope.key(), inner.key());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn shared_logical_order_does_not_replace_relation_primary() {

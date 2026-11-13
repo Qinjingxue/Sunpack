@@ -331,27 +331,35 @@ impl InputCheckpoint {
             || receipt.password_signature.as_ref().is_some_and(|saved| *saved == signature()))
     }
 
-    pub(super) fn promoted(&mut self, moves: &[(PathBuf, PathBuf)]) -> io::Result<()> {
-        for (source, destination) in moves {
-            let entry_moved = self.input.entry == *source;
-            self.relocate(source, destination);
-            if entry_moved {
-                if let Some(facts) = self.failure.as_mut().and_then(|partial| partial.retry_facts.as_mut()) {
-                    // Collision aliases can change a disguised carrier's
-                    // discovery name without changing its bytes or analysis.
-                    // Preserve names supplied by relation semantics instead
-                    // of replacing them with a physical filename.
-                    let logical_name = crate::scan::directory::filesystem_logical_name;
-                    if facts.logical_name == logical_name(&source.to_string_lossy()) {
-                        facts.logical_name = logical_name(&destination.to_string_lossy());
-                    }
+    pub(super) fn promoted(&mut self, paths: &super::coordinator::PromotionPaths) -> io::Result<bool> {
+        // Only physical sources are moved. Keep directory-prefix relocation in
+        // relocate/rebase_flatten, where it is actually required.
+        if !self.sources.iter().any(|source| paths.target(&source.path).is_some()) {
+            return Ok(false);
+        }
+        if let Some(destination) = paths.target(&self.input.entry) {
+            if let Some(facts) = self.failure.as_mut().and_then(|receipt| receipt.retry_facts.as_mut()) {
+                let logical_name = crate::scan::directory::filesystem_logical_name;
+                if facts.logical_name == logical_name(&self.input.entry.to_string_lossy()) {
+                    facts.logical_name = logical_name(&destination.to_string_lossy());
                 }
             }
         }
+        paths.remap(&mut self.carrier);
+        paths.remap(&mut self.input.entry);
+        if let Some(planned) = &mut self.planned_output { paths.remap(planned); }
+        if self.has_output() { paths.remap(&mut self.output); }
+        if let Some(container) = &mut self.container { paths.remap(container); }
         for source in &mut self.sources {
+            paths.remap(&mut source.path);
             source.generation = capture_file_generation(&source.path)?.persisted();
         }
-        Ok(())
+        for extent in self.input.parts.iter_mut().map(|part| &mut part.extent).chain(&mut self.input.ranges) {
+            if let Some(target) = paths.target(Path::new(&extent.path)) {
+                extent.path = target.to_string_lossy().into_owned();
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn result(&self, depth: usize) -> ArchiveResult {
@@ -467,6 +475,58 @@ mod tests {
     use std::{fs, sync::Arc};
 
     #[test]
+    fn bulk_promotion_remaps_all_layout_fields_once() {
+        let marker = crate::test_support::temp_file("checkpoint_bulk_promotion", b"marker");
+        let root = marker.with_extension("output");
+        fs::create_dir_all(&root).unwrap();
+        let moves: Vec<_> = (0..256).map(|index| (
+            root.join(format!("old-{index}")), root.join(format!("new-{index}")),
+        )).collect();
+        let mut sources = Vec::new();
+        let mut parts = Vec::new();
+        for (index, (source, target)) in moves.iter().enumerate() {
+            fs::write(source, b"part").unwrap();
+            sources.push(SourceGeneration {
+                path: source.clone(), generation: capture_file_generation(source).unwrap().persisted(),
+            });
+            parts.push(InputPart {
+                extent: InputExtent { path: source.to_string_lossy().into_owned(), start: 0, end: Some(4) },
+                volume_number: Some(index as u32 + 1), canonical_name: format!("archive.7z.{:03}", index + 1),
+            });
+            fs::rename(source, target).unwrap();
+        }
+        let retained = root.join("retained-output");
+        let mut checkpoint = InputCheckpoint {
+            schema_version: SCHEMA_VERSION, carrier: moves[0].0.clone(),
+            input: LogicalLayout {
+                entry: moves[0].0.clone(), mode: OpenMode::NativeVolumes, format: "7z".into(),
+                ranges: parts.iter().map(|part| part.extent.clone()).collect::<Vec<_>>().into_boxed_slice(),
+                parts: parts.into_boxed_slice(),
+            },
+            sources: sources.into_boxed_slice(), output: retained.clone(),
+            planned_output: Some(retained.clone()), container: Some(root.clone()),
+            files: 1, bytes: 4, encrypted: None, discovery_source: DiscoverySource::Embedded,
+            children_complete: true, remaining_depth: 0, failure: None,
+        };
+        let paths = super::super::coordinator::PromotionPaths::new(&moves);
+        assert!(checkpoint.promoted(&paths).unwrap());
+        assert_eq!(checkpoint.carrier, moves[0].1);
+        assert_eq!(checkpoint.input.entry, moves[0].1);
+        assert_eq!(checkpoint.output, retained);
+        assert_eq!(checkpoint.planned_output.as_ref(), Some(&retained));
+        assert_eq!(checkpoint.container.as_ref(), Some(&root));
+        for (index, (_, target)) in moves.iter().enumerate() {
+            assert_eq!(&checkpoint.sources[index].path, target);
+            assert_eq!(Path::new(&checkpoint.input.parts[index].extent.path), target);
+            assert_eq!(Path::new(&checkpoint.input.ranges[index].path), target);
+            assert_eq!(checkpoint.sources[index].generation, capture_file_generation(target).unwrap().persisted());
+        }
+        assert!(!checkpoint.promoted(&paths).unwrap());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
     fn promoted_partial_collision_reuses_receipt_after_fresh_discovery_naming() {
         use crate::io::archive_state::archive_input_slices;
         use crate::postprocess::NativeBlockedInputPromotion;
@@ -525,7 +585,7 @@ mod tests {
             assert_ne!(destination, root.join(filename));
             let (_, _, _, error, _) = plan.execute(|| Ok(()));
             assert!(error.is_empty(), "{error}");
-            checkpoint.promoted(plan.moves()).unwrap();
+            checkpoint.promoted(&super::super::coordinator::PromotionPaths::new(plan.moves())).unwrap();
             let checkpoint: InputCheckpoint = serde_json::from_value(
                 serde_json::to_value(checkpoint).unwrap(),
             ).unwrap();
@@ -660,7 +720,7 @@ mod tests {
         let promoted = source.with_extension("promoted");
         fs::rename(&source, &promoted).unwrap();
         let mut complete = complete;
-        complete.promoted(&[(source, promoted.clone())]).unwrap();
+        complete.promoted(&super::super::coordinator::PromotionPaths::new(&[(source, promoted.clone())])).unwrap();
         assert_eq!(complete.entry(), promoted);
         assert_eq!(Path::new(&complete.input.parts[0].extent.path), promoted);
         fs::remove_dir(output).unwrap();

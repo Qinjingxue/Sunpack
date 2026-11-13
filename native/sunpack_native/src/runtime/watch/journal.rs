@@ -217,10 +217,12 @@ impl Journal {
     /// advancing a cursor. An output's mkdir and durable registration cannot
     /// be observed halfway through by a directory-notification callback.
     pub(super) fn filter_owned_events(&self, paths: &mut Vec<PathBuf>, boundary: &Path) {
-        let frontier = self.frontier.lock().unwrap();
-        if frontier.fault.is_none() {
-            self.state.retain_unowned_events(paths, boundary);
-        }
+        let records = {
+            let frontier = self.frontier.lock().unwrap();
+            if frontier.fault.is_some() { return; }
+            self.state.owned_event_records(paths)
+        };
+        self.state.filter_owned_event_records(paths, boundary, records);
     }
 
     pub(super) fn flush(&self) -> io::Result<()> {

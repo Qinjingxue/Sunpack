@@ -151,6 +151,8 @@ pub enum FailureKind {
 pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causes: Vec<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Box<FailureEvidence>>,
     /// Explicit classification decision, independent of fallback diagnostics.
@@ -164,12 +166,23 @@ impl Failure {
     pub(crate) fn is_password_retry(&self) -> bool {
         matches!(self.kind, FailureKind::PasswordRequired | FailureKind::WrongPassword)
             || (self.kind == FailureKind::PasswordInconclusive && self.password_retry)
+            || self.causes.iter().any(Self::is_password_retry)
+    }
+
+    pub(crate) fn contains(&self, kind: FailureKind) -> bool {
+        self.kind == kind || self.causes.iter().any(|cause| cause.contains(kind))
+    }
+
+    pub(crate) fn with_cause(mut self, cause: Option<Self>) -> Self {
+        self.causes.extend(cause);
+        self
     }
 
     pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            causes: Vec::new(),
             evidence: None,
             password_retry: false,
         }
@@ -478,7 +491,7 @@ impl Outcome {
                 .or_default();
             input.failed |= !archive.partial;
             match failure.kind {
-                FailureKind::MissingVolume => { input.missing.get_or_insert(failure); }
+                _ if failure.contains(FailureKind::MissingVolume) => { input.missing.get_or_insert(failure); }
                 _ if failure.is_password_retry() => { input.password.get_or_insert(failure); }
                 _ if !archive.partial => { input.terminal.get_or_insert(failure); }
                 _ => {}
@@ -554,6 +567,7 @@ impl TaskCompletion {
             failure: result.failure.as_ref().map(|failure| Failure {
                 kind: failure.kind,
                 message: failure.message.clone(),
+                causes: failure.causes.clone(),
                 password_retry: failure.password_retry,
                 // Only the fields used by the common human-facing projection.
                 evidence: failure.evidence.as_deref().map(|e| Box::new(FailureEvidence {

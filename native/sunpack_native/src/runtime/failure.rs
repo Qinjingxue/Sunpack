@@ -11,7 +11,7 @@ pub(super) fn message(failure: &Failure, language: Language) -> Cow<'_, str> {
     if failure.kind == FailureKind::PasswordInconclusive {
         return language.text("failure.password_state_unknown").into();
     }
-    if failure.is_password_retry() {
+    if failure.kind != FailureKind::FilesystemError && failure.is_password_retry() {
         return language.text("failure.password_not_in_list").into();
     }
     let evidence = failure.evidence.as_deref();
@@ -64,6 +64,14 @@ pub(super) fn message(failure: &Failure, language: Language) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::pipeline::{ArchiveReadFault, FailureEvidence};
+
+    #[test]
+    fn promotion_error_keeps_filesystem_diagnostic_and_password_cause() {
+        let failure = Failure::new(FailureKind::FilesystemError, "Unable to promote: access denied")
+            .with_cause(Some(Failure::new(FailureKind::PasswordRequired, "password required")));
+        assert!(failure.is_password_retry());
+        assert_eq!(message(&failure, Language::En), "Unable to promote: access denied");
+    }
 
     #[test]
     fn split_recovery_warning_preserves_failure_kind_and_diagnostics() {

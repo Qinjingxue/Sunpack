@@ -782,6 +782,8 @@ struct FailureReport<'a> {
     kind: FailureKind,
     message: std::borrow::Cow<'a, str>,
     details: FailureDetails<'a>,
+    #[serde(skip_serializing_if = "<[crate::pipeline::Failure]>::is_empty")]
+    causes: &'a [crate::pipeline::Failure],
 }
 
 #[derive(Serialize)]
@@ -1320,7 +1322,8 @@ fn task_status_key(status: TaskStatus) -> &'static str {
 }
 
 fn task_detail<'a>(status: TaskStatus, failure: Option<&'a crate::pipeline::Failure>, verbose: bool, language: Language) -> Option<Cow<'a, str>> {
-    failure.filter(|failure| (status == TaskStatus::Failed || verbose) && !failure.is_password_retry())
+    failure.filter(|failure| (status == TaskStatus::Failed || verbose)
+        && (failure.kind == crate::pipeline::FailureKind::FilesystemError || !failure.is_password_retry()))
         .map(|failure| failure_message(failure, language))
 }
 
@@ -1558,6 +1561,7 @@ async fn archives(
                     Some(FailureReport {
                         kind: failure.kind,
                         message: failure_message(failure, language),
+                        causes: &failure.causes,
                         details: FailureDetails {
                             path: &archive.path,
                             promoted_nested_input: archive.promoted.then_some(true),
@@ -1567,6 +1571,7 @@ async fn archives(
                 .chain(invalid_inputs.map(|error| FailureReport {
                     kind: FailureKind::InvalidInput,
                     message: (&error.message).into(),
+                    causes: &[],
                     details: FailureDetails {
                         path: &error.path,
                         promoted_nested_input: None,
@@ -2327,12 +2332,14 @@ async fn show_config(
     crate::pipeline::stage("cli", &Cancellation::new()).await?;
     let (path, payload) = config::load_raw(cwd)?;
     result.summary = json!({"config_path": path, "changed": false});
-    if options.action == "show" {
-        if !options.json { write_json(session, &payload)?; }
-        result.items.push(payload);
-        return Ok((0, result));
-    }
     let errors = match Config::parse(&payload) {
+        Ok(_) if options.action == "show" => {
+            // The persistent runtime validates configuration before dispatch,
+            // even when show returns the original, unnormalized document.
+            if !options.json { write_json(session, &payload)?; }
+            result.items.push(payload);
+            return Ok((0, result));
+        }
         Ok(settings) => settings.validate_scan_filters(),
         Err(error) => vec![error.to_string()],
     };
@@ -2599,6 +2606,34 @@ async fn watch_command(
 #[cfg(test)]
 mod option_tests {
     use super::*;
+
+    #[test]
+    fn extract_failure_report_keeps_nested_archive_causes() {
+        use crate::pipeline::Failure;
+        for kind in [FailureKind::PasswordRequired, FailureKind::MissingVolume] {
+            let archive = Failure::new(kind, "archive blocked");
+            let promotion = Failure::new(FailureKind::FilesystemError, "promotion denied")
+                .with_cause(Some(archive));
+            let failure = Failure::new(FailureKind::FilesystemError, "postprocess failed")
+                .with_cause(Some(promotion));
+            let report = FailureReport {
+                kind: failure.kind,
+                message: failure_message(&failure, Language::En),
+                causes: &failure.causes,
+                details: FailureDetails { path: Path::new("nested.zip"), promoted_nested_input: None },
+            };
+            let json = serde_json::to_value(report).unwrap();
+            assert_eq!(json["kind"], "filesystem_error");
+            assert_eq!(json["message"], "postprocess failed");
+            assert_eq!(json["causes"][0]["message"], "promotion denied");
+            assert_eq!(json["causes"][0]["causes"][0]["kind"], serde_json::to_value(kind).unwrap());
+        }
+        let invalid = FailureReport {
+            kind: FailureKind::InvalidInput, message: "invalid input".into(), causes: &[],
+            details: FailureDetails { path: Path::new("missing.zip"), promoted_nested_input: None },
+        };
+        assert!(serde_json::to_value(invalid).unwrap().get("causes").is_none());
+    }
 
     #[test]
     fn password_display_escapes_controls_without_changing_candidates() {

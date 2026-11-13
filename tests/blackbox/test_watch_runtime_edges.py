@@ -358,3 +358,47 @@ if ($Restore) {
         if saved.exists():
             acl(current, restore=True)
         package.json("watch", "stop")
+
+
+def test_password_blocked_split_group_retires_departed_non_head_member(package, tmp_path):
+    import random
+
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(random.Random(105).randbytes(8192))
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mx=0", "-v1k", "-mhe=on",
+         "-pdeparted-member-only", str(watched / "locked.7z"), str(payload)],
+        check=True, capture_output=True,
+    )
+    parts = sorted(watched.glob("locked.7z.*"))
+    assert len(parts) >= 3
+    package.json("watch", "add", watched, "-o", tmp_path / "out")
+    package.json("watch", "start", "--no-tray")
+    events = package.data / ".sunpack_watch" / "events.json"
+
+    def wait_members(expected):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                rows = native_fixture("display_events", path=str(events))["live"]
+            except subprocess.CalledProcessError:
+                pass
+            else:
+                blocked = [row for row in rows if row.get("event") == "failed_password"
+                           and Path(row.get("path", "")) == parts[0]]
+                if len(blocked) == 1 and {
+                    Path(member) for member in blocked[0].get("group", {}).get("members", [])
+                } == expected:
+                    return
+            time.sleep(0.05)
+        pytest.fail("Password blocker did not publish the current physical member set")
+
+    try:
+        wait_members(set(parts))
+        # No write to the head or password change accompanies this departure.
+        parts[-1].replace(tmp_path / parts[-1].name)
+        wait_members(set(parts[:-1]))
+    finally:
+        package.json("watch", "stop")

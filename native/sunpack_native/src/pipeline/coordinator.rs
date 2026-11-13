@@ -136,16 +136,13 @@ impl Engine {
 
     fn run_with(
         &self,
-        mut request: Request,
+        request: Request,
         observer: &impl Observer,
     ) -> io::Result<Outcome> {
         // main enters its shared pipeline service (including the handshake)
         // before admitting discovery or preflight work.
         super::scheduling::block_on(self.worker(&request.config.performance.worker, &request.cancel))
             .map_err(super::startup_error)?;
-        if let Some(output) = request.output_root.take() {
-            request.output_root = Some(std::path::absolute(output)?);
-        }
         let request_id = self.next_id();
         let _request_claim = if request.mode == Mode::Extract {
             Some(self.leases.reserve_request(
@@ -200,10 +197,6 @@ impl Engine {
                     engine.worker(&request.config.performance.worker, &request.cancel).await
                         .map_err(super::startup_error)?;
                     stage("request_admission", &request.cancel).await?;
-                    let mut request = request;
-                    if let Some(output) = request.output_root.take() {
-                        request.output_root = Some(std::path::absolute(output)?);
-                    }
                     let _claim = if reservation.is_some() {
                         reservation
                     } else if request.mode == Mode::Extract {
@@ -223,6 +216,15 @@ impl Engine {
     fn prepare<'a, O: Observer>(
         &self, mut request: Request, observer: ObserverRef<'a, O>, request_id: u64,
     ) -> io::Result<Arc<Run<'a, O>>> {
+        // Watch supplies its own root mapping, including an empty mapping for
+        // nested recovery. Only foreground requests inherit the saved root;
+        // their CLI -o overrides root without replacing fixed_root.
+        if request.output_root.is_none() && request.origin == Origin::Foreground {
+            request.output_root = request.config.output.root.clone();
+        }
+        if let Some(output) = request.output_root.take() {
+            request.output_root = Some(std::path::absolute(output)?);
+        }
         let resolve_aliases = request.inputs.len() > 1 && self.leases.has_aliases(request_id);
         let candidates = CandidateSet::new(
             std::mem::take(&mut request.passwords),
@@ -605,22 +607,32 @@ impl OutputNames {
         });
     }
 
-    fn release(&mut self, owner: u64) {
-        for key in self.owners.remove(&owner).into_iter().flatten() {
-            self.claimed.remove(&key);
-            // A candidate ancestor can have been blocked by this descendant.
-            // Return each observed slot to its bounded family and recheck the
-            // actual directory before reusing it on the next request.
-            for candidate in crate::path_keys::path_ancestors(&key) {
-                if let Some(slots) = self.slots.remove(candidate) {
-                    for (family, index) in slots {
-                        if let Some(history) = self.indices.get_mut(&family) {
-                            history.observed.remove(candidate);
-                            history.release(index);
-                        }
+    fn release_path(&mut self, key: &str, owner: u64) {
+        if self.claimed.get(key).is_none_or(|claim| claim.owner != owner) { return; }
+        if let Some(paths) = self.owners.get_mut(&owner) {
+            paths.retain(|path| path != key);
+            if paths.is_empty() { self.owners.remove(&owner); }
+        }
+        self.release_key(key);
+    }
+
+    fn release_key(&mut self, key: &str) {
+        self.claimed.remove(key);
+        for candidate in crate::path_keys::path_ancestors(key) {
+            if let Some(slots) = self.slots.remove(candidate) {
+                for (family, index) in slots {
+                    if let Some(history) = self.indices.get_mut(&family) {
+                        history.observed.remove(candidate);
+                        history.release(index);
                     }
                 }
             }
+        }
+    }
+
+    fn release(&mut self, owner: u64) {
+        for key in self.owners.remove(&owner).into_iter().flatten() {
+            self.release_key(&key);
         }
         crate::collections::trim_map(&mut self.owners);
         crate::collections::trim_map(&mut self.slots);
@@ -705,26 +717,40 @@ impl OutputNames {
     }
 
     fn reserve(
-        &mut self,
-        preferred: PathBuf,
-        result: &ArchiveResult,
-        observer: &impl Observer,
-        owner: u64,
-        input: Option<&Path>,
+        registry: &Mutex<Self>, preferred: PathBuf, result: &ArchiveResult,
+        observer: &impl Observer, owner: u64, input: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
-        self.allocate(preferred, result, owner, input, |path| observer.register_output(result, path))
+        loop {
+            let path = match registry.lock().unwrap().plan(preferred.clone(), result, owner, input)? {
+                Ok(path) => path,
+                Err(failure) => return Ok(Err(failure)),
+            };
+            let claim_key = output_key(&path);
+            // The memory claim prevents peers selecting this tree. Creation
+            // and durable publication have their own exclusive boundary and
+            // must not block unrelated Engine name allocations.
+            match observer.register_output(result, &path) {
+                Ok(()) => return Ok(Ok(path)),
+                Err(error) => {
+                    registry.lock().unwrap().release_path(&claim_key, owner);
+                    let creation_error = error.get_ref().is_some_and(|inner| {
+                        inner.is::<super::OutputCreateError>()
+                    });
+                    if creation_error && error.kind() == io::ErrorKind::AlreadyExists
+                        && fs::symlink_metadata(&path).is_ok()
+                    {
+                        continue;
+                    }
+                    if !creation_error { return Err(error); }
+                    return Ok(Err(file_failure(error)));
+                }
+            }
+        }
     }
 
     fn plan(
-        &mut self, preferred: PathBuf, result: &ArchiveResult,
-        owner: u64, input: Option<&Path>,
-    ) -> io::Result<Result<PathBuf, Failure>> {
-        self.allocate(preferred, result, owner, input, |_| Ok(()))
-    }
-
-    fn allocate(
         &mut self, mut preferred: PathBuf, result: &ArchiveResult,
-        owner: u64, input: Option<&Path>, mut register: impl FnMut(&Path) -> io::Result<()>,
+        owner: u64, input: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
         // A different request may own an ancestor even though this leaf does
         // not exist. Number that ancestor, preserving the mirrored suffix.
@@ -766,22 +792,6 @@ impl OutputNames {
                 }
             };
             if !exists {
-                if let Err(error) = register(&path) {
-                    let creation_error = error.get_ref().is_some_and(|inner| {
-                        inner.is::<super::OutputCreateError>()
-                    });
-                    if creation_error && error.kind() == io::ErrorKind::AlreadyExists
-                        && fs::symlink_metadata(&path).is_ok()
-                    {
-                        index = self.next_index(&preferred_key);
-                        continue;
-                    }
-                    if index != 0 {
-                        self.indices.get_mut(&preferred_key).unwrap().release(index);
-                    }
-                    if !creation_error { return Err(error); }
-                    return Ok(Err(file_failure(error)));
-                }
                 self.observe_slot(&candidate_key, &preferred_key, index);
                 self.claim(&path, owner, &result.path);
                 return Ok(Ok(path));
@@ -1748,7 +1758,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 && completed.iter().any(|result| result.failure.is_some() && !result.partial)
                 && completed.iter().any(|result| {
                     result.failure.as_ref().is_some_and(|failure| {
-                        failure.is_password_retry() || failure.kind == FailureKind::MissingVolume
+                        failure.is_password_retry() || failure.contains(FailureKind::MissingVolume)
                     })
                 })
             {
@@ -1962,13 +1972,14 @@ impl<'run, O: Observer> Run<'run, O> {
         match promoted {
             Ok((moves, receipts, success, error)) => {
                 outcome.promoted_sources.extend(receipts);
+                let paths = PromotionPaths::new(&moves);
                 for result in results {
                     if success {
                         result.promotion_original_path = Some(result.path.clone());
                     }
-                    map_promoted_path(&mut result.path, &moves);
+                    paths.remap(&mut result.path);
                     for source in &mut result.source_paths {
-                        map_promoted_path(source, &moves);
+                        paths.remap(source);
                     }
                     result.promoted = success;
                     if !success {
@@ -1978,16 +1989,11 @@ impl<'run, O: Observer> Run<'run, O> {
                                 "Unable to promote blocked nested input: {}",
                                 error.as_deref().unwrap_or("unknown move failure")
                             ),
-                        ));
+                        ).with_cause(result.failure.take()));
                     }
                 }
                 for checkpoint in &mut outcome.checkpoints {
-                    if checkpoint.source_paths().any(|path| {
-                        moves
-                            .iter()
-                            .any(|(source, _)| resolved_key(path) == resolved_key(source))
-                    }) {
-                        checkpoint.promoted(&moves)?;
+                    if checkpoint.promoted(&paths)? {
                         self.observer.checkpoint(checkpoint)?;
                     }
                 }
@@ -1997,7 +2003,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 results[representative].failure = Some(Failure::new(
                     FailureKind::FilesystemError,
                     format!("Unable to promote blocked nested input: {error}"),
-                ));
+                ).with_cause(results[representative].failure.take()));
             }
         }
         Ok(())
@@ -2575,7 +2581,7 @@ impl<'run, O: Observer> Run<'run, O> {
         let mut root = parent.to_path_buf();
         if let Some(output_root) = self.request.output_root.as_ref().filter(|_| depth == 1) {
             root = output_root.clone();
-            if self.request.origin == Origin::Foreground {
+            if self.request.origin == Origin::Foreground && !self.request.config.output.fixed_root {
                 if let Some(relative) = relative_to(parent, output_root) {
                     root.push(relative);
                 } else if let Some(base) = &self.output_base {
@@ -2609,9 +2615,9 @@ impl<'run, O: Observer> Run<'run, O> {
         result: &ArchiveResult,
         carrier: Option<&Path>,
     ) -> io::Result<Result<PathBuf, Failure>> {
-        // Serialize only the name claim and durable publication, not workers.
+        // Claim under the naming gate; publish without holding it.
         let input = carrier.or_else(|| (result.depth > 1).then_some(result.path.as_path()));
-        let reserved = self.output_names.registry.lock().unwrap().reserve(
+        let reserved = OutputNames::reserve(&self.output_names.registry,
             preferred, result, &*self.observer, self.output_names.owner, input,
         )?;
         if let Ok(path) = &reserved {
@@ -2755,10 +2761,26 @@ fn flatten_result(
     Ok(())
 }
 
-fn map_promoted_path(path: &mut PathBuf, moves: &[(PathBuf, PathBuf)]) {
-    let key = resolved_key(path);
-    if let Some((_, target)) = moves.iter().find(|(source, _)| resolved_key(source) == key) {
-        *path = target.clone();
+/// Promotion moves physical files, never directory prefixes. Normalize each
+/// source once, then visit each result/checkpoint field once.
+pub(super) struct PromotionPaths(HashMap<String, PathBuf>);
+
+impl PromotionPaths {
+    pub(super) fn new(moves: &[(PathBuf, PathBuf)]) -> Self {
+        Self(moves.iter().map(|(source, target)| (resolved_key(source), target.clone())).collect())
+    }
+
+    pub(super) fn target(&self, path: &Path) -> Option<&PathBuf> {
+        self.0.get(&resolved_key(path))
+    }
+
+    pub(super) fn remap(&self, path: &mut PathBuf) -> bool {
+        if let Some(target) = self.target(path) {
+            *path = target.clone();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -4430,6 +4452,85 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn denied_nested_promotion_keeps_archive_cause_and_retry_path() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let marker = crate::test_support::temp_file("promotion_denied", b"marker");
+        let root = marker.with_extension("output");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        for kind in [FailureKind::PasswordRequired, FailureKind::MissingVolume] {
+            let source = nested.join("blocked.zip");
+            fs::write(&source, b"archive").unwrap();
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let request = Request::new(vec![root.clone()], Mode::Extract);
+            let observer = |_: Event| {};
+            let run = test_run(&engine, &request, &observer);
+            let execute = || {
+                let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "blocked".into());
+                let task = Task {
+                    primary: None,
+                    inputs: vec![LogicalInput { input, password: None,
+                        failure: Some(Failure::new(kind, "archive blocked")) }],
+                    owned_paths: vec![source.to_string_lossy().into_owned()],
+                    source: DiscoverySource::Embedded, retry: None,
+                };
+                Scheduler::new().run(1, request.origin, &request.cancel, |spawner| {
+                    run.execute_task(task, 1, 2, None, spawner)
+                }).unwrap()
+            };
+            // Permit generation reads but deny rename/removal without production hooks.
+            let lock = fs::OpenOptions::new().read(true).share_mode(1).open(&source).unwrap();
+            let outcome = execute();
+            let failed = outcome.archives.iter().find(|result| result.failure.is_some()).unwrap();
+            let failure = failed.failure.as_ref().unwrap();
+            assert_eq!(failure.kind, FailureKind::FilesystemError);
+            assert_eq!(failure.causes[0].kind, kind);
+            assert!(failed.path.is_file());
+            assert!(!failed.promoted);
+            let failures = outcome.input_failures();
+            let input = failures.values().next().unwrap();
+            assert!(input.retryable());
+            assert!(input.terminal.is_none());
+            assert_eq!(failure.is_password_retry(), kind == FailureKind::PasswordRequired);
+            let restored: Failure = serde_json::from_value(serde_json::to_value(failure).unwrap()).unwrap();
+            assert!(restored.contains(kind));
+            drop(lock);
+            // The same source can be retried once the external obstruction is removed.
+            let retry = execute();
+            assert!(retry.archives.iter().any(|result| result.promoted));
+            fs::remove_file(root.join("blocked.zip")).unwrap();
+            fs::create_dir_all(&nested).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn bulk_promotion_mapping_is_exact_and_not_cascading() {
+        let moves: Vec<_> = (0..2048).map(|index| (
+            PathBuf::from(format!("missing-promotion-source/part-{index}")),
+            PathBuf::from(format!("missing-promotion-target/part-{index}")),
+        )).collect();
+        let paths = PromotionPaths::new(&moves);
+        assert_eq!(paths.0.len(), moves.len());
+        for (source, target) in &moves {
+            let mut path = source.clone();
+            assert!(paths.remap(&mut path));
+            assert_eq!(&path, target);
+            let mut child = source.join("not-a-moved-file");
+            assert!(!paths.remap(&mut child));
+        }
+        let a = PathBuf::from("missing-promotion-a");
+        let b = PathBuf::from("missing-promotion-b");
+        let c = PathBuf::from("missing-promotion-c");
+        let paths = PromotionPaths::new(&[(a.clone(), b.clone()), (b.clone(), c)]);
+        let mut path = a;
+        paths.remap(&mut path);
+        assert_eq!(path, b);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn nested_carrier_promotion_preserves_accepted_siblings_for_retry() {
         // Exercise the real task boundary and physical move, not just its
         // predicate: accepted siblings must keep their output and receipts
@@ -5025,6 +5126,65 @@ mod tests {
     }
 
     #[test]
+    fn output_registration_does_not_hold_naming_gate_and_failure_releases_only_its_claim() {
+        struct Register<'a>(&'a Mutex<OutputNames>);
+        impl Observer for Register<'_> {
+            fn notify(&self, _: Event) {}
+            fn register_output(&self, result: &ArchiveResult, path: &Path) -> io::Result<()> {
+                let mut names = self.0.try_lock().expect("registration held the global naming gate");
+                // Simulate a peer selecting the same tree during publication.
+                let peer = names.plan(path.to_owned(), result, 2, None)?.unwrap();
+                assert_ne!(peer, path);
+                Err(super::super::OutputCreateError::wrap(io::ErrorKind::PermissionDenied.into()))
+            }
+        }
+        let source = crate::test_support::temp_file("unlocked_output_registration", b"input");
+        let preferred = source.with_extension("output");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
+        let result = receipt(&input, DiscoverySource::Direct, 1);
+        let names = Mutex::new(OutputNames::default());
+        assert!(OutputNames::reserve(&names, preferred.clone(), &result, &Register(&names), 1, None)
+            .unwrap().is_err());
+        let mut names = names.lock().unwrap();
+        assert!(!names.owners.contains_key(&1));
+        assert_eq!(names.claimed.len(), 1);
+        assert_eq!(names.plan(preferred.clone(), &result, 3, None).unwrap().unwrap(), preferred);
+        names.release(2);
+        names.release(3);
+        assert!(names.claimed.is_empty());
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn output_creation_collision_retries_without_reusing_external_directory() {
+        struct Collision(PathBuf);
+        impl Observer for Collision {
+            fn notify(&self, _: Event) {}
+            fn register_output(&self, _: &ArchiveResult, path: &Path) -> io::Result<()> {
+                if path == self.0 {
+                    fs::create_dir(path)?;
+                    fs::write(path.join("user-file"), b"keep")?;
+                }
+                crate::scan::scope::create_output_root_exclusive(path)
+                    .map_err(super::super::OutputCreateError::wrap)
+            }
+        }
+        let source = crate::test_support::temp_file("output_create_collision", b"input");
+        let preferred = source.with_extension("output");
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "a".into());
+        let result = receipt(&input, DiscoverySource::Direct, 1);
+        let names = Mutex::new(OutputNames::default());
+        let output = OutputNames::reserve(&names, preferred.clone(), &result,
+            &Collision(preferred.clone()), 1, None).unwrap().unwrap();
+        assert_eq!(output, numbered(&preferred, 1));
+        assert_eq!(fs::read(preferred.join("user-file")).unwrap(), b"keep");
+        assert_eq!(names.lock().unwrap().claimed.len(), 1);
+        fs::remove_dir(output).unwrap();
+        fs::remove_dir_all(preferred).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
     fn independent_output_trees_survive_peer_cleanup_and_creation_failure() {
         struct ObserverWithFailure;
         impl Observer for ObserverWithFailure {
@@ -5054,45 +5214,43 @@ mod tests {
             let owner = if shared_request { 1 } else { 2 };
             let first = OutputReservationGuard { registry: Arc::clone(&registry), owner: 1 };
             let second = OutputReservationGuard { registry: Arc::clone(&registry), owner };
-            let mut names = registry.lock().unwrap();
             let preferred = root.join("a");
             let descendant = preferred.join("sub").join("b");
             let (failed, successful) = if descendant_first {
-                let successful = names.reserve(descendant.clone(), &result, &ObserverWithFailure, owner, None).unwrap().unwrap();
-                (names.reserve(preferred.clone(), &result, &ObserverWithFailure, 1, None).unwrap().unwrap(), successful)
+                let successful = OutputNames::reserve(&registry, descendant.clone(), &result, &ObserverWithFailure, owner, None).unwrap().unwrap();
+                (OutputNames::reserve(&registry, preferred.clone(), &result, &ObserverWithFailure, 1, None).unwrap().unwrap(), successful)
             } else {
-                let failed = names.reserve(preferred.clone(), &result, &ObserverWithFailure, 1, None).unwrap().unwrap();
-                (failed, names.reserve(descendant.clone(), &result, &ObserverWithFailure, owner, None).unwrap().unwrap())
+                let failed = OutputNames::reserve(&registry, preferred.clone(), &result, &ObserverWithFailure, 1, None).unwrap().unwrap();
+                (failed, OutputNames::reserve(&registry, descendant.clone(), &result, &ObserverWithFailure, owner, None).unwrap().unwrap())
             };
             assert!(!successful.starts_with(&failed) && !failed.starts_with(&successful));
             fs::write(successful.join("payload"), b"keep").unwrap();
             let generated = successful.join("nested.zip");
             let nested = successful.join("nested");
-            assert_eq!(names.reserve(nested.clone(), &result, &ObserverWithFailure, owner, Some(&generated))
+            assert_eq!(OutputNames::reserve(&registry, nested.clone(), &result, &ObserverWithFailure, owner, Some(&generated))
                 .unwrap().unwrap(), nested);
-            let foreign = names.reserve(successful.join("foreign"), &result, &ObserverWithFailure, 3, Some(&generated))
+            let foreign = OutputNames::reserve(&registry, successful.join("foreign"), &result, &ObserverWithFailure, 3, Some(&generated))
                 .unwrap().unwrap();
             assert!(!foreign.starts_with(&successful));
-            assert!(!names.retain(&successful.join("continued"), 3, &result.path, None));
+            assert!(!registry.lock().unwrap().retain(&successful.join("continued"), 3, &result.path, None));
             cleanup_owned_output(&failed).unwrap();
             assert_eq!(fs::read(successful.join("payload")).unwrap(), b"keep");
-            assert_eq!(names.reserve(root.join("denied"), &result, &ObserverWithFailure, owner, None)
+            assert_eq!(OutputNames::reserve(&registry, root.join("denied"), &result, &ObserverWithFailure, owner, None)
                 .unwrap().unwrap_err().kind, FailureKind::FilesystemError);
-            assert!(names.reserve(root.join("journal"), &result, &ObserverWithFailure, owner, None).is_err());
+            assert!(OutputNames::reserve(&registry, root.join("journal"), &result, &ObserverWithFailure, owner, None).is_err());
             // Released owners leave bounded family history, not ownership.
             // More families evict history without affecting live claims.
             for short_owner in 10..42 {
                 let family = root.join(format!("family-{short_owner}"));
                 fs::create_dir(&family).unwrap();
-                names.reserve(family.clone(), &result, &ObserverWithFailure, short_owner, None)
+                OutputNames::reserve(&registry, family.clone(), &result, &ObserverWithFailure, short_owner, None)
                     .unwrap().unwrap();
-                assert!(names.indices.contains_key(&output_key(&family)));
-                names.release(short_owner);
-                assert!(names.indices.len() <= OUTPUT_HISTORY_LIMIT);
-                assert!(!names.owners.contains_key(&short_owner));
+                assert!(registry.lock().unwrap().indices.contains_key(&output_key(&family)));
+                registry.lock().unwrap().release(short_owner);
+                assert!(registry.lock().unwrap().indices.len() <= OUTPUT_HISTORY_LIMIT);
+                assert!(!registry.lock().unwrap().owners.contains_key(&short_owner));
             }
-            names.release(3);
-            drop(names);
+            registry.lock().unwrap().release(3);
             drop(second);
             drop(first);
             assert!(registry.lock().unwrap().claimed.is_empty());
@@ -5143,24 +5301,25 @@ mod tests {
         fs::create_dir(&preferred).unwrap();
         let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
         let result = receipt(&input, DiscoverySource::Direct, 1);
-        let mut names = OutputNames::default();
+        let names = Mutex::new(OutputNames::default());
         let family = output_key(&preferred);
         for owner in 1..=32 {
-            let output = names.reserve(preferred.clone(), &result, &Create, owner, None).unwrap().unwrap();
+            let output = OutputNames::reserve(&names, preferred.clone(), &result, &Create, owner, None).unwrap().unwrap();
             assert_eq!(output, numbered(&preferred, owner as usize));
-            names.release(owner);
-            let history = &names.indices[&family];
+            names.lock().unwrap().release(owner);
+            let guard = names.lock().unwrap();
+            let history = &guard.indices[&family];
             assert_eq!(history.next, owner as usize + 1);
             assert_eq!(history.available.first(), Some(&(owner as usize)));
         }
         // Released reservations remain reusable if their actual output is
         // removed, rather than blindly allocating ever increasing numbers.
         fs::remove_dir(numbered(&preferred, 32)).unwrap();
-        assert_eq!(names.reserve(preferred.clone(), &result, &Create, 33, None).unwrap().unwrap(), numbered(&preferred, 32));
-        names.release(33);
+        assert_eq!(OutputNames::reserve(&names, preferred.clone(), &result, &Create, 33, None).unwrap().unwrap(), numbered(&preferred, 32));
+        names.lock().unwrap().release(33);
         fs::remove_dir(&preferred).unwrap();
-        assert_eq!(names.reserve(preferred.clone(), &result, &Create, 34, None).unwrap().unwrap(), preferred);
-        names.release(34);
+        assert_eq!(OutputNames::reserve(&names, preferred.clone(), &result, &Create, 34, None).unwrap().unwrap(), preferred);
+        names.lock().unwrap().release(34);
         struct Fail;
         impl Observer for Fail {
             fn notify(&self, _: Event) {}
@@ -5168,15 +5327,16 @@ mod tests {
                 Err(super::super::OutputCreateError::wrap(io::ErrorKind::PermissionDenied.into()))
             }
         }
-        assert!(names.reserve(preferred.clone(), &result, &Fail, 35, None).unwrap().is_err());
-        assert_eq!(names.reserve(preferred.clone(), &result, &Create, 36, None).unwrap().unwrap(), numbered(&preferred, 33));
-        names.release(36);
-        for index in 0..(OUTPUT_HISTORY_LIMIT + 1) { names.next_index(&format!("family-{index}")); }
-        assert_eq!(names.indices.len(), OUTPUT_HISTORY_LIMIT);
-        assert_eq!(names.history_order.len(), OUTPUT_HISTORY_LIMIT);
-        assert!(!names.indices.contains_key(&family));
-        assert!(names.slots.values().all(|slots| !slots.contains_key(&family)));
-        names.clear_history();
+        assert!(OutputNames::reserve(&names, preferred.clone(), &result, &Fail, 35, None).unwrap().is_err());
+        assert_eq!(OutputNames::reserve(&names, preferred.clone(), &result, &Create, 36, None).unwrap().unwrap(), numbered(&preferred, 33));
+        names.lock().unwrap().release(36);
+        for index in 0..(OUTPUT_HISTORY_LIMIT + 1) { names.lock().unwrap().next_index(&format!("family-{index}")); }
+        assert_eq!(names.lock().unwrap().indices.len(), OUTPUT_HISTORY_LIMIT);
+        assert_eq!(names.lock().unwrap().history_order.len(), OUTPUT_HISTORY_LIMIT);
+        assert!(!names.lock().unwrap().indices.contains_key(&family));
+        assert!(names.lock().unwrap().slots.values().all(|slots| !slots.contains_key(&family)));
+        names.lock().unwrap().clear_history();
+        let names = names.lock().unwrap();
         assert!(names.indices.is_empty() && names.slots.is_empty());
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(source).unwrap();
