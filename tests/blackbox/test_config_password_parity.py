@@ -1,8 +1,11 @@
 import json
 import subprocess
 import zipfile
+from contextlib import nullcontext
 
 import pytest
+
+from tests.helpers.marker_utils import open_shared_file
 
 
 @pytest.mark.parametrize("name", ["blacklist", "whitelist"])
@@ -89,6 +92,17 @@ def test_unreadable_simple_config_cannot_fall_back_to_advanced_config(package):
     assert package.json("config", "validate", code=2)["errors"]
 
 
+def test_scan_rule_validation_reads_complete_redirected_json(package):
+    command = ("config", "validate", "--scan-rule-stdin", "--json")
+    payload = json.dumps({"files": [{"value": "sample", "regex": False}]}, indent=2)
+    result = package.run(*command, input=payload)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert json.loads(result.stdout)["summary"]["valid"]
+    invalid = package.run(*command, input=payload + "\n{}")
+    assert invalid.returncode == 2
+    assert json.loads(invalid.stdout)["errors"]
+
+
 def test_password_text_sources_preserve_nul_candidates(package, tmp_path):
     passwords = tmp_path / "passwords.txt"
     passwords.write_bytes(b"before\nbad\x00candidate\nafter\n")
@@ -170,6 +184,7 @@ def test_archive_infrastructure_failures_keep_main_exit_classification(package, 
     with zipfile.ZipFile(archive, "w") as payload:
         payload.writestr("member.txt", "payload")
     args = [operation, archive]
+    lock = nullcontext()
     if failure == "config":
         # No previous normalized snapshot exists in this fresh runtime.
         path = package.data / "sunpack_config.json"
@@ -177,16 +192,22 @@ def test_archive_infrastructure_failures_keep_main_exit_classification(package, 
         path.mkdir()
         code = 3
     elif failure in {"worker", "worker_start"}:
-        # Remove only the isolated package's link, never the build output.
         worker = package.launcher.parent.parent / "tools" / "sunpack_sevenzip_worker.exe"
-        worker.unlink()
         if failure == "worker_start":
-            worker.write_bytes(b"not an executable")
+            # Lock a private copy so launching the valid PE fails without
+            # showing Windows' unsupported application dialog.
+            executable = worker.read_bytes()
+            worker.unlink()
+            worker.write_bytes(executable)
+            lock = open_shared_file(worker, "rb", share=0)
+        else:
+            worker.unlink()
         code = 1
     else:
         args += ["-P", tmp_path / "absent-passwords.txt"]
         code = 2
-    result = package.run(*args, "--json")
+    with lock:
+        result = package.run(*args, "--json")
     assert result.returncode == code, (result.stdout, result.stderr)
     assert json.loads(result.stdout)["errors"]
 

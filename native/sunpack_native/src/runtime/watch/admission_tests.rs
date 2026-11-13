@@ -521,7 +521,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             if kind == "modified" { signals.modified_paths.insert(path.clone()); }
             signals.candidate_events.insert(path.clone(), event);
             scheduler.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
-                &signals.modified_paths, &signals.candidate_events, false).unwrap();
+                &signals.modified_paths, &signals.candidate_events).unwrap();
             assert!(scheduler.pending.contains_key(&key(&path)));
             expected.push((path, "candidate_active", kind, String::new()));
         }
@@ -536,10 +536,10 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             signals.root_changed(&root_id, Some(vec![old.clone(), new.clone()]));
             signals.candidate_events.insert(new.clone(), CandidateEvent::Moved(old.clone()));
             assert!(Signals::prepare_root_changes(&mut signals.changed_roots,
-                &signals.topology_roots, &signals.modified_paths, false));
+                &signals.topology_roots, &signals.modified_paths));
             if fail { *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(new.clone()); }
             scheduler.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
-                &signals.modified_paths, &signals.candidate_events, false).unwrap();
+                &signals.modified_paths, &signals.candidate_events).unwrap();
             *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = None;
             assert_eq!(scheduler.pending.contains_key(&key(&new)), !fail);
             expected.push((new, if fail { "candidate_ignored" } else { "candidate_active" },

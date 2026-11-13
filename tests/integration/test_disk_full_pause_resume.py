@@ -158,7 +158,8 @@ def _extract(package, diagnostic_dir, *archives, output=None):
                 assert process.poll() is None, diagnostic + stdout.read_text(encoding="utf-8", errors="replace")
                 return all(
                     any(f"{archive.name}: {status}" in diagnostic
-                        for status in ("Disk full", "Waiting for memory/disk"))
+                        for status in ("Free space to resume automatically",
+                                       "Resumes when memory and disk space are available"))
                     for archive in archives
                 )
 

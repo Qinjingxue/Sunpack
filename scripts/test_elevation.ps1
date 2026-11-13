@@ -14,7 +14,8 @@ function ConvertTo-PowerShellValueLiteral {
         return ConvertTo-PowerShellSingleQuotedLiteral -Value $Value
     }
     if ($Value -is [bool]) {
-        return if ($Value) { '$true' } else { '$false' }
+        if ($Value) { return '$true' }
+        return '$false'
     }
     if ($Value -is [System.Collections.IEnumerable]) {
         $items = @($Value | ForEach-Object { ConvertTo-PowerShellValueLiteral -Value $_ })
@@ -33,7 +34,8 @@ function ConvertTo-PowerShellValueLiteral {
 function Invoke-TestScriptElevated {
     param(
         [Parameter(Mandatory = $true)][string]$ScriptPath,
-        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$BoundParameters
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$BoundParameters,
+        [switch]$ShowOutput
     )
 
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -82,6 +84,9 @@ function Invoke-TestScriptElevated {
     $hostPath = (Get-Process -Id $PID).Path
     $process = $null
     try {
+        if ($ShowOutput) {
+            Write-Host "Running acceptance with elevation for the temporary Broker and disk-full tests."
+        }
         $process = Start-Process `
             -FilePath $hostPath `
             -ArgumentList @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand) `
@@ -101,6 +106,9 @@ function Invoke-TestScriptElevated {
                 [Console]::Error.WriteLine("The elevated process did not produce its diagnostic log.")
             }
         } elseif (Test-Path -LiteralPath $diagnosticPath) {
+            if ($ShowOutput) {
+                Get-Content -LiteralPath $diagnosticPath | ForEach-Object { Write-Host $_ }
+            }
             Remove-Item -LiteralPath $diagnosticPath -Force
         }
         return $exitCode

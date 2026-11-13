@@ -1182,7 +1182,11 @@ impl NativeWatchState {
     }
 
     pub(crate) fn entry(&self, path: &str) -> Option<Arc<EntryRecord>> {
-        self.lock().entries.get(&path_key(path)).cloned()
+        self.entry_by_key(&path_key(path))
+    }
+
+    pub(crate) fn entry_by_key(&self, key: &str) -> Option<Arc<EntryRecord>> {
+        self.lock().entries.get(key).cloned()
     }
 
     pub(crate) fn observation_state(

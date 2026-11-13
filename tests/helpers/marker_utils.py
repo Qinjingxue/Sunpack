@@ -17,11 +17,11 @@ _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
 _kernel32.CloseHandle.restype = wintypes.BOOL
 
 
-def open_shared_file(path: Path, mode="r", **kwargs):
+def open_shared_file(path: Path, mode="r", *, share=0x1 | 0x2 | 0x4, **kwargs):
     # Live reads and simulated downloads allow moves without closing the file.
     writing = mode[0] in "wa"
     handle = _kernel32.CreateFileW(
-        str(path), 0x40000000 if writing else 0x80000000, 0x1 | 0x2 | 0x4,
+        str(path), 0x40000000 if writing else 0x80000000, share,
         None, {"w": 2, "a": 4}.get(mode[0], 3), 0x80, None,
     )
     if handle == ctypes.c_void_p(-1).value:

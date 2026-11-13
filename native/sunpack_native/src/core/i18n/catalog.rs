@@ -93,7 +93,7 @@ pub(super) static MESSAGES: &[(&str, &str, &str)] = &[
     ("cli.passwords.summary", "[CLI] Password source summary:", "[命令行] 密码来源汇总："),
     ("cli.passwords.user_input", "  User input: {value}", "  用户输入：{value}"),
     ("cli.pause", "Wait for a key press before exit", "退出前等待按键"),
-    ("cli.pause_prompt", "Press any key to exit...", "按任意键退出..."),
+    ("cli.press_enter", "Press Enter to continue...", "按回车键继续..."),
     ("cli.persistent_identity_required", "sunpack persistent process requires the native launcher runtime identity", "sunpack 持久进程需要 native 启动器提供运行时标识"),
     ("cli.persistent_launch_failed", "sunpack persistent process failed to start: {error}", "sunpack 持久进程启动失败：{error}"),
     ("cli.persistent_request_failed", "SunPack persistent request failed: {error}", "SunPack 持久请求失败：{error}"),

@@ -84,6 +84,19 @@ def test_overlapping_recursive_targets_keep_ancestor_scan_filters(package, tmp_p
     assert item["discovery_source"] == "relations"
 
 
+def test_flat_output_with_long_name_does_not_need_flatten_work_path(package, tmp_path):
+    # The archive and destination names fit NTFS. The unused staging suffix does not.
+    source = tmp_path / ("a" * 248 + ".zip")
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("item.txt", b"payload")
+
+    output = tmp_path / "out"
+    report = package.json("extract", "-f", "-r", "1", "-o", output, source)
+
+    assert report["summary"]["cleanup_results"] == []
+    assert (output / source.stem / "item.txt").read_bytes() == b"payload"
+
+
 @pytest.mark.parametrize("keep_first_segment", [False, True])
 def test_carrier_flattens_only_final_remaining_branch(package, tmp_path, keep_first_segment):
     (tmp_path / "secret.txt").write_text("secret", encoding="utf-8")

@@ -862,14 +862,28 @@ impl NativeCandidateTable {
         Ok(())
     }
 
-    /// Only password-blocked relation proposals leave Rust for policy probing.
+    /// Prepare bounded Rust password probes for unresolved RAR relations.
     pub(crate) fn encrypted_rar_groups(&self) -> Vec<RelationProjection> {
         let mut output = Vec::new();
         for row in &self.rows {
             if let Candidate::Relation(group) = row {
                 let data = group.candidate_data();
                 if data.format_hint == "rar" && data.needs_password {
-                    output.push(group.project());
+                    let mut probe = group.project();
+                    if probe.input.mode.structured() && probe.input.parts.is_empty() {
+                        // Encrypted main headers can hide all volume numbers.
+                        // Verify the header at its known offset before asking
+                        // Relations to assign volumes using the decrypted facts.
+                        use crate::io::archive_state::{InputExtent, InputPart, OpenMode};
+                        let start = group.entry_anchor().and_then(|anchor| anchor.structure_offset).unwrap_or(0);
+                        probe.input.mode = OpenMode::FileRange;
+                        probe.input.parts = Box::new([InputPart::range(InputExtent {
+                            path: probe.input.entry_path.clone(),
+                            start,
+                            end: None,
+                        })]);
+                    }
+                    output.push(probe);
                 }
             }
         }

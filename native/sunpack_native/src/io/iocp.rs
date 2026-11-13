@@ -373,15 +373,7 @@ where
     let worker_count = requested_worker_count
         .clamp(1, 8)
         .min(rayon::current_num_threads().clamp(1, 8));
-    let mut expected_read_operations = 0u64;
-    let mut expected_base = 0u64;
-    while expected_base < file_size {
-        let visible_end = expected_base
-            .saturating_add(chunk_bytes as u64)
-            .min(file_size);
-        expected_read_operations = expected_read_operations.saturating_add(1);
-        expected_base = visible_end;
-    }
+    let expected_read_operations = file_size.div_ceil(chunk_bytes as u64);
     let handles = Arc::new(open_handles(path)?);
     let wake_handles = Arc::clone(&handles);
     let _subscription = cancellation.subscribe(move || unsafe {

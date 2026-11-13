@@ -178,18 +178,18 @@ pub(crate) struct WatchCandidateRow {
 
 pub(crate) fn flatten_single_branch_directories(
     base: &Path,
-    work_path: Option<&Path>,
+    work_path: &Path,
+    leaf: FlattenLeaf<'_>,
     before_move: impl FnOnce(&Path, &Path, &Path) -> io::Result<()>,
-    resume_leaf: Option<&Path>,
 ) -> FlattenStats {
     let mut stats = FlattenStats::default();
     flatten_single_branch_chain_with_publisher(
         base,
         &mut stats,
         work_path,
+        leaf,
         rename_no_replace,
         before_move,
-        resume_leaf,
     );
     stats
 }
@@ -306,35 +306,38 @@ pub(crate) struct FlattenStats {
     pub(crate) source_dir: Option<PathBuf>,
 }
 
+pub(crate) enum FlattenLeaf<'a> {
+    Prepared(&'a Path),
+    Resume(&'a Path),
+}
+
 #[cfg(test)]
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
+    let Some(leaf) = discover_flatten_leaf(root) else { return; };
     flatten_single_branch_chain_with_publisher(
         root,
         stats,
-        None,
+        &root.with_extension("flatten-work"),
+        FlattenLeaf::Prepared(&leaf),
         rename_no_replace,
         |_, _, _| Ok(()),
-        None,
     );
 }
 
 fn flatten_single_branch_chain_with_publisher(
     root: &Path,
     stats: &mut FlattenStats,
-    reserved_work: Option<&Path>,
+    work: &Path,
+    leaf: FlattenLeaf<'_>,
     publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
     before_move: impl FnOnce(&Path, &Path, &Path) -> io::Result<()>,
-    resume_leaf: Option<&Path>,
 ) {
-    let leaf = match resume_leaf {
-        Some(leaf) => Some(leaf.to_path_buf()),
-        None => discover_flatten_leaf(root),
-    };
-    let Some(leaf) = leaf else {
-        return;
+    let (leaf, resume) = match leaf {
+        FlattenLeaf::Prepared(path) => (path, false),
+        FlattenLeaf::Resume(path) => (path, true),
     };
     let leaf_relative = match leaf.strip_prefix(root) {
-        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        Ok(relative) if !relative.as_os_str().is_empty() => relative,
         _ => {
             stats.errors.push(format!(
                 "{}: flatten leaf is not below output root",
@@ -344,35 +347,18 @@ fn flatten_single_branch_chain_with_publisher(
         }
     };
 
-    let work = if let Some(work) = reserved_work {
-        let prepared = if resume_leaf.is_none() {
-            before_move(root, work, &leaf)
-        } else {
-            Ok(())
-        };
-        if let Err(error) = prepared.and_then(|_| {
-            if resume_leaf.is_some() {
-                Ok(())
-            } else {
-                rename_no_replace(root, work)
-            }
-        }) {
+    if !resume {
+        if let Err(error) = before_move(root, work, leaf).and_then(|_| rename_no_replace(root, work)) {
             stats
                 .errors
                 .push(format!("{}: {error}", normalize_path(work)));
             return;
         }
-        work.to_path_buf()
-    } else {
-        let Some(work) = rename_root_to_visible_work(root, stats) else {
-            return;
-        };
-        work
-    };
-    stats.output_dir = Some(work.clone());
+    }
+    stats.output_dir = Some(work.to_path_buf());
     stats.source_dir = Some(root.to_path_buf());
-    let leaf_in_work = work.join(&leaf_relative);
-    if let Err(error) = if resume_leaf.is_some() && root.is_dir() {
+    let leaf_in_work = work.join(leaf_relative);
+    if let Err(error) = if resume && root.is_dir() {
         Ok(())
     } else {
         publish(&leaf_in_work, root)
@@ -389,15 +375,15 @@ fn flatten_single_branch_chain_with_publisher(
     }
     stats.moved += 1;
     stats.output_dir = Some(root.to_path_buf());
-    stats.source_dir = Some(leaf);
+    stats.source_dir = Some(leaf.to_path_buf());
 
-    match remove_empty_flatten_wrappers(&work, &leaf_relative) {
+    match remove_empty_flatten_wrappers(work, leaf_relative) {
         Ok(removed) => stats.removed_dirs += removed,
         Err(error) => stats.errors.push(error),
     }
 }
 
-fn discover_flatten_leaf(root: &Path) -> Option<PathBuf> {
+pub(crate) fn discover_flatten_leaf(root: &Path) -> Option<PathBuf> {
     let mut current = only_child_directory(root)?;
     while let Some(child) = only_child_directory(&current) {
         current = child;
@@ -412,48 +398,6 @@ fn only_child_directory(dir: &Path) -> Option<PathBuf> {
         return None;
     }
     first.metadata().ok()?.is_dir().then(|| first.path())
-}
-
-fn rename_root_to_visible_work(root: &Path, stats: &mut FlattenStats) -> Option<PathBuf> {
-    let Some(parent) = root.parent() else {
-        stats.errors.push(format!(
-            "{}: output root has no parent for flatten work directory",
-            normalize_path(root)
-        ));
-        return None;
-    };
-    let Some(root_name) = root.file_name() else {
-        stats.errors.push(format!(
-            "{}: output root has no directory name",
-            normalize_path(root)
-        ));
-        return None;
-    };
-
-    let mut attempt = 1usize;
-    loop {
-        let mut work_name = root_name.to_os_string();
-        work_name.push(".__sunpack_flatten_work__");
-        if attempt > 1 {
-            work_name.push(attempt.to_string());
-        }
-        let work = parent.join(work_name);
-        match rename_no_replace(root, &work) {
-            Ok(()) => return Some(work),
-            Err(error) if is_name_collision(&error) => {
-                attempt = attempt.saturating_add(1);
-            }
-            Err(error) => {
-                stats.errors.push(format!(
-                    "{} -> {}: {}",
-                    normalize_path(root),
-                    normalize_path(&work),
-                    error
-                ));
-                return None;
-            }
-        }
-    }
 }
 
 fn is_name_collision(error: &io::Error) -> bool {
@@ -742,14 +686,14 @@ mod tests {
         flatten_single_branch_chain_with_publisher(
             &output,
             &mut stats,
-            None,
+            &container.path().join("flatten-work"),
+            FlattenLeaf::Prepared(&output.join("outer/inner")),
             |leaf, root| {
                 fs::create_dir(root)?;
                 fs::write(root.join("unrelated.txt"), b"unrelated")?;
                 rename_no_replace(leaf, root)
             },
             |_, _, _| Ok(()),
-            None,
         );
         let retained = stats.output_dir.as_ref().unwrap();
         assert_ne!(retained, &output);

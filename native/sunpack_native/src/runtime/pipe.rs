@@ -607,7 +607,13 @@ impl Session for Connection {
         Box::pin(self.read_line_async(prompt))
     }
     fn interactive(&self) -> bool { self.flags & 2 != 0 }
-    fn local_pause(&self) -> bool { false }
+    fn input_is_terminal(&self) -> bool { self.flags & 4 != 0 }
+    fn pause_on_exit<'a>(&'a self, prompt: &'a str) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.input_is_terminal() { self.frame(4, prompt.as_bytes()).await?; }
+            Ok(())
+        })
+    }
     fn unicode(&self) -> bool { self.flags & 16 != 0 }
     fn terminal_size(&self) -> (usize, usize) {
         let size = self.terminal_size.load(Ordering::Relaxed);
@@ -991,13 +997,56 @@ mod async_connection_tests {
         (client, server.submit(peer))
     }
     fn help_request(server: &Server) -> Vec<u8> {
+        command_request(server, 0, &["--help"])
+    }
+    fn command_request(server: &Server, flags: u32, args: &[&str]) -> Vec<u8> {
         let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
         let mut bytes = [b"SPK2".as_slice(), &server.build_id, &server.token].concat();
-        for word in [0, cwd.len() as u32, 1] { bytes.extend(word.to_be_bytes()); }
+        for word in [flags, cwd.len() as u32, args.len() as u32] { bytes.extend(word.to_be_bytes()); }
         bytes.extend(cwd.as_bytes());
-        bytes.extend(6_u32.to_be_bytes());
-        bytes.extend(b"--help");
+        for arg in args {
+            bytes.extend((arg.len() as u32).to_be_bytes());
+            bytes.extend(arg.as_bytes());
+        }
         bytes
+    }
+
+    #[test]
+    fn exit_pause_uses_client_side_frame_after_text_commands() {
+        let server = server();
+        let cases: &[(&[&str], bool, u32, i32)] = &[
+            (&["watch", "list", "--pause"], true, 4, 0),
+            (&["watch", "list", "--pause"], false, 0, 0),
+            (&["watch", "list", "--pause", "--json"], false, 4, 0),
+            (&["watch", "list", "--pause", "--help"], false, 4, 0),
+            (&["version", "--pause"], false, 4, 2),
+        ];
+        for &(args, pause, flags, expected) in cases {
+            let (mut client, request) = connect(&server);
+            client.write_all(&command_request(&server, flags, args)).unwrap();
+            let mut handshake = [0; 20];
+            client.read_exact(&mut handshake).unwrap();
+            assert_eq!(&handshake[..4], b"SPS2");
+            let mut exit_prompt = None;
+            loop {
+                let mut kind = [0];
+                client.read_exact(&mut kind).unwrap();
+                let length = read_u32(&mut client).unwrap() as usize;
+                let bytes = read_field(&mut client, length).unwrap();
+                match kind[0] {
+                    0 => {
+                        assert_eq!(i32::from_be_bytes(bytes.try_into().unwrap()), expected, "{args:?}");
+                        break;
+                    }
+                    1 | 2 => {}
+                    4 => { assert!(exit_prompt.replace(bytes).is_none()); }
+                    _ => panic!("unexpected interactive input frame for {args:?}"),
+                }
+            }
+            assert_eq!(exit_prompt.is_some(), pause, "{args:?}");
+            assert!(exit_prompt.is_none_or(|prompt| !prompt.is_empty()));
+            request.join().unwrap().unwrap();
+        }
     }
 
     #[test]

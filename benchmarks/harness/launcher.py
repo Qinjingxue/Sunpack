@@ -25,11 +25,14 @@ class NativePackage:
         self.data.mkdir(parents=True)
         target = {"x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}[arch]
         wrapper = REPO_ROOT / "native/sevenzip_bridge" / f"build-{arch}{'-ci' if profile == 'ci' else ''}" / "Release"
+        package = launcher.resolve().parent if launcher else None
+        if package is not None and package.name.lower() == "bin":
+            package = package.parent
         sources = {
             "sunpack.exe": launcher or wrapper / "sunpack_launcher.exe",
-            "sunpack-runtime.exe": launcher.parent / "sunpack-runtime.exe" if launcher else REPO_ROOT / ".cache/rust-target" / arch / target / profile / "sunpack-runtime.exe",
-            "tools/sunpack_sevenzip_worker.exe": launcher.parent / "tools/sunpack_sevenzip_worker.exe" if launcher else wrapper / "sunpack_sevenzip_worker.exe",
-            "sunpack_advanced_config.json": launcher.parent / "sunpack_advanced_config.json" if launcher else REPO_ROOT / "sunpack_advanced_config.json",
+            "sunpack-runtime.exe": package / "sunpack-runtime.exe" if package else REPO_ROOT / ".cache/rust-target" / arch / target / profile / "sunpack-runtime.exe",
+            "tools/sunpack_sevenzip_worker.exe": package / "tools/sunpack_sevenzip_worker.exe" if package else wrapper / "sunpack_sevenzip_worker.exe",
+            "sunpack_advanced_config.json": (package or REPO_ROOT) / "sunpack_advanced_config.json",
         }
         for name, source in sources.items():
             if not source.is_file():

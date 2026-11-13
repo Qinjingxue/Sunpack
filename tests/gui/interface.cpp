@@ -734,6 +734,15 @@ int wmain(int argc,wchar_t** argv) {
     int result=0;
     try {
         if(mode==L"--acceptance") {
+            const auto package=dir/"package";
+            fs::create_directories(package/"bin");
+            const auto packaged_cli=package/"sunpack.exe";
+            atomic_write(packaged_cli,"");
+            const std::vector<std::wstring> package_args{L"--app-root",package.wstring()};
+            assert(parse_options(package_args).cli.executable==packaged_cli);
+            const auto installed_cli=package/"bin"/"sunpack.exe";
+            atomic_write(installed_cli,"");
+            assert(parse_options(package_args).cli.executable==installed_cli);
             wheel_chain_contracts();
             rendering_contracts();
         }

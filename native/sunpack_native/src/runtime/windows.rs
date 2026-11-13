@@ -588,9 +588,11 @@ fn startup_key() -> io::Result<RegistryKey> {
 
 // A caller choosing a background notice owns its thread lifetime.
 pub(super) fn show_error(title: &str, message: &str) -> io::Result<()> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND};
     let title = wide(OsStr::new(title));
     let message = wide(OsStr::new(message));
-    let result = unsafe { MessageBoxW(null_mut(), message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR) };
+    let result = unsafe {
+        MessageBoxW(null_mut(), message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND)
+    };
     if result == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }

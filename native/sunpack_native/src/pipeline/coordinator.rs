@@ -27,7 +27,7 @@ use crate::io::resource_lifecycle::{
 };
 use crate::path_keys::{normalize_windows_extended_prefix, path_ancestors, path_key, resolved_path_key};
 use crate::postprocess::{
-    flatten_single_branch_directories, remove_owned_file, remove_owned_tree,
+    discover_flatten_leaf, flatten_single_branch_directories, remove_owned_file, remove_owned_tree, FlattenLeaf,
     NativeBlockedInputPromotion,
 };
 use crate::scan::directory::{
@@ -3467,6 +3467,9 @@ fn flatten_result(
     let Some(output) = result.output.as_ref() else {
         return Ok(());
     };
+    let Some(leaf) = discover_flatten_leaf(output) else {
+        return Ok(());
+    };
     let attempt = || -> io::Result<_> {
         let mut work = output.as_os_str().to_os_string();
         work.push(".__sunpack_flatten_work__");
@@ -3478,9 +3481,9 @@ fn flatten_result(
             let _promotion = Promotion::begin(vec![output.to_string_lossy().into_owned()])?;
             Ok(flatten_single_branch_directories(
                 output,
-                Some(&available),
+                &available,
+                FlattenLeaf::Prepared(&leaf),
                 |root, work, leaf| observer.before_flatten(root, work, leaf),
-                None,
             ))
         })();
         names.registry.lock().unwrap().release_path(&output_key(&available), names.owner);

@@ -15,6 +15,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "scripts\test_environment.ps1")
+. (Join-Path $PSScriptRoot "scripts\test_elevation.ps1")
 
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $unelevatedRunner = Join-Path $repoRoot "scripts\run_unelevated_process.py"
@@ -50,8 +51,6 @@ function Invoke-TestArtifactCleanup {
         Write-Host ("    NOTE - stale artifact cleanup could not run: " + $_.Exception.Message) -ForegroundColor Yellow
     }
 }
-
-Invoke-TestArtifactCleanup
 
 function Initialize-ExitCodeProbe {
     if ("SunPack.ProcessExit" -as [type]) {
@@ -479,6 +478,16 @@ function Invoke-TestWatchServiceAction {
     Invoke-Native -FilePath $PowerShellHost -Arguments $arguments
 }
 
+$elevatedArguments = @{} + $PSBoundParameters
+$elevatedArguments.NoWait = [System.Management.Automation.SwitchParameter]::Present
+$elevatedExitCode = Invoke-TestScriptElevated -ScriptPath $PSCommandPath -BoundParameters $elevatedArguments -ShowOutput
+if ($null -ne $elevatedExitCode) {
+    Wait-BeforeExit
+    exit $elevatedExitCode
+}
+
+Invoke-TestArtifactCleanup
+
 trap {
     Write-Host ("ERROR: " + $_.Exception.Message) -ForegroundColor Red
     Wait-BeforeExit
@@ -547,9 +556,11 @@ try {
         -BrokerPath $brokerPath
     $watchServiceInstalled = $true
 
+    # Use the optimized CI profile for the harness, even when the public CLI
+    # and its fixtures below are tested from the release build.
     Invoke-TestStep -Label "Rust correctness tests" -Command @(
         "cargo", "test", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
-        "--workspace", "--profile", $BuildProfile, "--target", $target,
+        "--workspace", "--profile", "ci", "--target", $target,
         "--target-dir", (Join-Path $repoRoot (".cache\rust-target\" + $Arch))
     )
     Invoke-TestStep -Label "CLI and Watch acceptance tests" -Command @(
@@ -559,8 +570,9 @@ try {
     )
     # DiskPart must retain elevation, unlike ordinary launcher/GUI tests.
     # Missing elevation or any prerequisite skip is an incomplete acceptance run.
+    $diskTestWorkers = if ($ParallelWorkers -gt 1) { [Math]::Min(3, $ParallelWorkers) } else { 0 }
     Invoke-TestStep -Label "Real disk-full recovery tests" -KeepElevationIfAdministrator -RequireExecutedTests -Command @(
-        $python, "-m", "pytest", "-q", "-rs", "-n", "0",
+        $python, "-m", "pytest", "-q", "-rs", "-n", [string]$diskTestWorkers,
         "tests/integration/test_disk_full_pause_resume.py"
     )
 } finally {

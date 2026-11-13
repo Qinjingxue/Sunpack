@@ -129,9 +129,15 @@ Options parse_options(const std::vector<std::wstring>& args) {
     }
     // A fixture data directory cannot control the installed runtime accidentally.
     result.allow_cli=!custom || !result.cli.executable.empty();
-    if(result.cli.executable.empty()) result.cli.executable=exe/"bin"/"sunpack.exe";
-    result.cli.cwd=result.data_dir;
     if(result.cli.app_root.empty()) result.cli.app_root=exe;
+    if(result.cli.executable.empty()) {
+        const auto& app=result.cli.app_root;
+        result.cli.executable=app/"bin"/"sunpack.exe";
+        std::error_code ec;
+        if(!fs::is_regular_file(result.cli.executable,ec) && fs::is_regular_file(app/"sunpack.exe",ec))
+            result.cli.executable=app/"sunpack.exe";
+    }
+    result.cli.cwd=result.data_dir;
     return result;
 }
 Application::Application(Options options):options_(std::move(options)) {}

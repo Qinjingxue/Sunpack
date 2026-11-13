@@ -81,6 +81,27 @@ def test_carrier_native_volume_and_password_matrix(package, tmp_path, kind, pass
     assert all(path.is_file() for path in parts)
 
 
+def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package, tmp_path):
+    case = create_encrypted_rar_archive(
+        tmp_path, "numbered", password=PASSWORD, header_encrypt=True, split=True,
+        payload_size=160 * 1024, split_volume_size=48 * 1024,
+    )
+    parts = sorted(case.archive_dir.iterdir())
+    assert len(parts) > 2 and parts[0] == case.entry_path
+    renamed = []
+    for index, part in enumerate(parts, 1):
+        target = part.with_name(f"renamed.opaque.{index:03d}")
+        part.rename(target)
+        renamed.append(target)
+
+    output = tmp_path / "out"
+    report = package.json("extract", "-r", "1", "-c", "k", "-o", output,
+                          "--no-builtin-pw", "-p", PASSWORD, renamed[0])
+
+    assert report["summary"]["success_count"] == 1
+    assert (output / "renamed" / case.marker_name).read_text(encoding="utf-8") == case.marker_text
+
+
 @pytest.mark.requires_watch_broker
 @pytest.mark.parametrize("kind", ["rar4", "rar5", "zip-spanned"])
 def test_watch_format_volume_arrival_survives_runtime_restart(package, tmp_path, kind):

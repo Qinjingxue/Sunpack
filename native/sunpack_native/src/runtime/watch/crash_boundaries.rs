@@ -97,9 +97,8 @@ fn hard_death_recovers_flatten_publication_and_rebase_boundaries() {
                 // intent; the resumed pipeline can perform the same operation.
                 assert!(leaf.join("nested/payload").is_file());
                 let result = crate::postprocess::flatten_single_branch_directories(
-                    &root, Some(&work),
+                    &root, &work, crate::postprocess::FlattenLeaf::Prepared(&leaf),
                     |root, work, leaf| prepare_flatten(&journal, owner.to_str().unwrap(), root, work, leaf),
-                    None,
                 );
                 assert!(result.errors.is_empty(), "{:?}", result.errors);
                 finish_flatten(&journal, root.to_str().unwrap()).unwrap();

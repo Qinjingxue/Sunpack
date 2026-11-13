@@ -826,11 +826,11 @@ pub(super) async fn run(
         for log in &result.logs {
             line(session, Stream::Out, log)?;
         }
-        if session.local_pause() && options.pause
+        if options.pause
             && code != 130
             && (options.command != "extract" || code != 0)
         {
-            let _ = session.aread_line(language.text("cli.pause_prompt")).await?;
+            session.pause_on_exit(language.text("cli.press_enter")).await?;
         }
     }
     session.drain().await?;
@@ -1672,9 +1672,9 @@ async fn archives(
                 "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
                 "password_retry_count": 0, "cleanup_results": cleanup.values,
             });
-            result.items.push(password_item(
+            result.items.push(serde_json::to_value(password_item(
                 &user, &clipboard, &engine.recent_passwords(), builtin.as_deref(), !options.no_builtins,
-            ));
+            ))?);
             return Ok((i32::from(!result.errors.is_empty()), result));
         }
         let outputs = std::mem::take(&mut progress.display.lock().unwrap().outputs);
@@ -2200,50 +2200,66 @@ fn end_offset(entry: &ArchiveResult) -> String {
         .map_or_else(|| "?".to_owned(), |end| end.to_string())
 }
 
-fn password_item(
-    user: &[Arc<str>],
-    clipboard: &[Arc<str>],
-    recent: &[Arc<str>],
-    snapshot: Option<&passwords::PasswordSnapshot>,
-    use_builtin: bool,
-) -> Value {
+#[derive(Serialize)]
+struct PasswordItem<'a> {
+    user_passwords: &'a [Arc<str>],
+    recent_passwords: &'a [Arc<str>],
+    clipboard_passwords: &'a [Arc<str>],
+    builtin_passwords: &'a [Arc<str>],
+    use_builtin_passwords: bool,
+    combined_passwords: Vec<&'a str>,
+}
+
+fn password_item<'a>(
+    user: &'a [Arc<str>],
+    clipboard: &'a [Arc<str>],
+    recent: &'a [Arc<str>],
+    snapshot: Option<&'a passwords::PasswordSnapshot>,
+    use_builtin_passwords: bool,
+) -> PasswordItem<'a> {
     let builtin = snapshot.map_or(&[][..], passwords::PasswordSnapshot::global);
     let configured = user
         .iter()
         .chain(clipboard)
         .map(Arc::as_ref)
         .chain(builtin.iter().map(AsRef::as_ref));
-    let mut eligible_recent = HashSet::new();
-    if !recent.is_empty() {
-        let mut wanted: HashSet<&str> = recent.iter().map(AsRef::as_ref).collect();
+    let mut missing_recent: HashSet<&str> = recent.iter().map(AsRef::as_ref).collect();
+    if !missing_recent.is_empty() {
         for value in configured.clone() {
-            if wanted.remove(value) {
-                eligible_recent.insert(value);
-                if wanted.is_empty() {
-                    break;
-                }
+            missing_recent.remove(value);
+            if missing_recent.is_empty() {
+                break;
             }
         }
     }
     let mut seen = HashSet::new();
-    let combined: Vec<_> = recent
+    let combined_passwords = recent
         .iter()
         .map(AsRef::as_ref)
-        .filter(|value| eligible_recent.contains(value))
+        .filter(|value| !missing_recent.contains(value))
         .chain(configured)
         .filter(|value| seen.insert(*value))
         .collect();
-    json!({"user_passwords":user,"recent_passwords":recent,"clipboard_passwords":clipboard,
-        "builtin_passwords":builtin,"use_builtin_passwords":use_builtin,"combined_passwords":combined})
+    PasswordItem {
+        user_passwords: user,
+        recent_passwords: recent,
+        clipboard_passwords: clipboard,
+        builtin_passwords: builtin,
+        use_builtin_passwords,
+        combined_passwords,
+    }
 }
 
 // The command displays Python-style list values, as main does. Escape only
 // their textual representation; the candidates themselves remain unchanged.
 fn password_repr(value: &str) -> String {
-    static NON_PRINTABLE: OnceLock<regex::Regex> = OnceLock::new();
-    let non_printable = NON_PRINTABLE.get_or_init(|| regex::Regex::new(r"[\p{C}\p{Z}]").unwrap());
-    let quote = if value.contains('\'') && !value.contains('"') { '"' } else { '\'' };
     let mut text = String::with_capacity(value.len() + 2);
+    append_password_repr(&mut text, value);
+    text
+}
+
+fn append_password_repr(text: &mut String, value: &str) {
+    let quote = if value.contains('\'') && !value.contains('"') { '"' } else { '\'' };
     text.push(quote);
     for ch in value.chars() {
         match ch {
@@ -2252,7 +2268,7 @@ fn password_repr(value: &str) -> String {
             '\n' => text.push_str("\\n"),
             '\r' => text.push_str("\\r"),
             c if c == quote => { text.push('\\'); text.push(c); }
-            c if c != ' ' && non_printable.is_match(c.encode_utf8(&mut [0; 4])) => {
+            c if password_non_printable(c) => {
                 use std::fmt::Write;
                 let code = c as u32;
                 if code <= 0xff { let _ = write!(text, "\\x{code:02x}"); }
@@ -2263,6 +2279,30 @@ fn password_repr(value: &str) -> String {
         }
     }
     text.push(quote);
+}
+
+fn password_non_printable(value: char) -> bool {
+    if value.is_ascii() {
+        return value.is_ascii_control();
+    }
+    use regex_syntax::hir::{Class, ClassUnicode, HirKind};
+    static NON_PRINTABLE: OnceLock<ClassUnicode> = OnceLock::new();
+    let ranges = NON_PRINTABLE.get_or_init(|| {
+        let hir = regex_syntax::Parser::new().parse(r"[\p{C}\p{Z}]").unwrap();
+        let HirKind::Class(Class::Unicode(class)) = hir.into_kind() else { unreachable!() };
+        class
+    }).ranges();
+    let index = ranges.partition_point(|range| range.end() < value);
+    ranges.get(index).is_some_and(|range| range.start() <= value)
+}
+
+fn password_list_repr<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let mut text = String::from("[");
+    for (index, value) in values.into_iter().enumerate() {
+        if index != 0 { text.push_str(", "); }
+        append_password_repr(&mut text, value);
+    }
+    text.push(']');
     text
 }
 
@@ -2289,49 +2329,44 @@ async fn show_passwords(
         snapshot.as_deref(),
         !options.no_builtins,
     );
-    let count = |field: &str| item[field].as_array().map_or(0, Vec::len);
     let mut result = CommandResult::new("passwords");
-    result.inputs = json!({"json":options.json,"use_builtin_passwords":!options.no_builtins});
-    result.summary = json!({
-        "user_password_count": count("user_passwords"), "recent_password_count": 0,
-        "clipboard_password_count": count("clipboard_passwords"), "builtin_password_count": count("builtin_passwords"),
-        "combined_password_count": count("combined_passwords"),
-    });
-    if !options.json {
-        line(session, Stream::Out, language.text("cli.passwords.summary"))?;
-        for (key, field) in [
-            ("user_input", "user_passwords"),
-            ("recent", "recent_passwords"),
-            ("clipboard", "clipboard_passwords"),
-            ("builtin", "builtin_passwords"),
-            ("final_order", "combined_passwords"),
-        ] {
-            let value = item[field]
-                .as_array()
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(password_repr)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            let text = language.translate(
-                &format!("cli.passwords.{key}"),
-                &[("value", &format!("[{value}]"))],
-            );
-            line(session, Stream::Out, &text)?;
-        }
+    if options.json {
+        result.inputs = json!({"json":true,"use_builtin_passwords":!options.no_builtins});
+        result.summary = json!({
+            "user_password_count": item.user_passwords.len(), "recent_password_count": 0,
+            "clipboard_password_count": item.clipboard_passwords.len(), "builtin_password_count": item.builtin_passwords.len(),
+            "combined_password_count": item.combined_passwords.len(),
+        });
+        result.items.push(serde_json::to_value(item)?);
+        return Ok((0, result));
     }
-    result.items.push(item);
+    line(session, Stream::Out, language.text("cli.passwords.summary"))?;
+    let show = |key, value: String| {
+        line(session, Stream::Out, &language.translate(key, &[("value", &value)]))
+    };
+    for (key, values) in [
+        ("cli.passwords.user_input", item.user_passwords),
+        ("cli.passwords.recent", item.recent_passwords),
+        ("cli.passwords.clipboard", item.clipboard_passwords),
+        ("cli.passwords.builtin", item.builtin_passwords),
+    ] {
+        show(key, password_list_repr(values.iter().map(Arc::as_ref)))?;
+    }
+    show("cli.passwords.final_order", password_list_repr(item.combined_passwords))?;
     Ok((0, result))
 }
 
 async fn validate_scan_rule(session: &dyn Session) -> io::Result<(i32, CommandResult)> {
-    let input = session.aread_line("").await?.ok_or(io::ErrorKind::UnexpectedEof)?;
+    let mut input = String::new();
+    while let Some(line) = session.aread_line("").await? {
+        input.push_str(&line);
+        if session.input_is_terminal() { break; }
+    }
     crate::pipeline::stage("cli", &Cancellation::new()).await?;
-    let rule = serde_json::from_str(&input)?;
+    let mut rule: Value = serde_json::from_str(&input)?;
+    if let Some(object) = rule.as_object_mut() {
+        object.insert("name".into(), json!("blacklist"));
+    }
     config::PathRule::parse(&rule)?.compile()?;
     let mut result = CommandResult::new("config");
     result.inputs = json!({"action": "validate"});
@@ -2499,7 +2534,7 @@ async fn watch_command(
                 host.watch
                     .add_async(cwd, &paths, output, options.deep, options.recursive).await?;
             result.summary["start_requested"] = Value::Bool(options.start);
-            if options.start && !host.watch.is_running() {
+            if options.start && !host.watch.is_enabled() {
                 result.summary["start"] = host.watch.start_async(cwd, host.engine(cwd)?, true).await?;
                 if result.summary["start"]["running"] == Value::Bool(true) {
                     crate::pipeline::stage("cli", &Cancellation::new()).await?;

@@ -279,6 +279,10 @@ fn command_reply<T: Default>() -> (CommandReply<T>, Arc<Reply<T>>) {
 #[derive(Default)]
 struct RunCompletion(Mutex<(Option<Result<i32, (io::ErrorKind, String)>>, Vec<Waker>)>);
 impl RunCompletion {
+    fn is_complete(&self) -> bool {
+        self.0.lock().unwrap().0.is_some()
+    }
+
     fn complete(&self, result: &io::Result<i32>) {
         let wakes = {
             let mut state = self.0.lock().unwrap();
@@ -340,11 +344,13 @@ impl Watch {
             .is_some_and(|run| !run.thread.is_finished())
     }
 
+    pub(super) fn is_enabled(&self) -> bool {
+        self.running.lock().unwrap().as_ref().is_some_and(Running::continuous)
+    }
+
     pub(super) fn foreground_finished(&self, when_unwatched: impl FnOnce()) {
         let running = self.running.lock().unwrap();
-        if let Some(run) = running.as_ref()
-            .filter(|run| run.continuous && !run.thread.is_finished())
-        {
+        if let Some(run) = running.as_ref().filter(|run| run.continuous()) {
             run.hub.update(|signals| signals.foreground_finished = true);
         } else {
             when_unwatched();
@@ -355,7 +361,7 @@ impl Watch {
 
     pub(super) fn status(&self, cwd: &Path) -> io::Result<Value> {
         let slot = self.running.lock().unwrap();
-        let run = slot.as_ref().filter(|run| run.continuous && !run.thread.is_finished());
+        let run = slot.as_ref().filter(|run| run.continuous());
         Ok(json!({
             "running": run.is_some(), "generation": self.generation.load(Ordering::Relaxed),
             "pending": run.map_or(0, |run| run.hub.pending_count.load(Ordering::Relaxed)),
@@ -365,21 +371,34 @@ impl Watch {
     }
 
     pub(super) async fn start_async(&self, cwd: &Path, engine: Arc<Engine>, tray: bool) -> io::Result<Value> {
-        let _lifecycle = self.lifecycle.lock().await;
-        let previous = {
-            let mut slot = self.running.lock().unwrap();
-            if slot.as_ref().is_some_and(|run| run.continuous && !run.thread.is_finished()) {
-                return Ok(json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}));
-            }
-            slot.take()
+        let (lifecycle, previous) = loop {
+            let lifecycle = self.lifecycle.lock().await;
+            let once = {
+                let mut slot = self.running.lock().unwrap();
+                if slot.as_ref().is_some_and(Running::continuous) {
+                    return Ok(json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}));
+                }
+                match slot.as_ref() {
+                    Some(run) if !run.thread.is_finished() && !run.completion.is_complete() => {
+                        Arc::clone(&run.completion)
+                    }
+                    _ => break (lifecycle, slot.take()),
+                }
+            };
+            drop(lifecycle);
+            // The one-shot command owns its work. Share the journal only
+            // after that command releases it, without stopping its scan.
+            let _ = once.wait().await;
         };
-        if let Some(previous) = previous { previous.hub.stop(); let _ = Self::join_run(previous).await; }
+        if let Some(previous) = previous { let _ = Self::join_run(previous).await; }
         let (running, ready) = self.spawn_run(cwd, engine, tray, false, Cancellation::default()).await?;
         let hub = Arc::clone(&running.hub);
         *self.running.lock().unwrap() = Some(running);
+        let generation = self.generation.load(Ordering::Relaxed);
         // Like main, publish the host-owned service before readiness and allow
         // stop to interrupt startup without cancelling the caller's future.
-        drop(_lifecycle);
+        drop(lifecycle);
+        (self.wake_host)();
         if let Err(error) = ready.wait().await {
             let _lifecycle = self.lifecycle.lock().await;
             let failed = {
@@ -389,8 +408,7 @@ impl Watch {
             if let Some(failed) = failed { let _ = Self::join_run(failed).await; }
             return Err(error);
         }
-        (self.wake_host)();
-        Ok(json!({"running":true,"started":true,"generation":self.generation.load(Ordering::Relaxed)}))
+        Ok(json!({"running":true,"started":true,"generation":generation}))
     }
 
     async fn spawn_run(&self, cwd: &Path, engine: Arc<Engine>, tray: bool, once: bool,
@@ -452,10 +470,15 @@ impl Watch {
     }
 
     pub(super) async fn stop_async(&self) -> io::Result<Value> {
+        self.stop_running(false).await
+    }
+
+    async fn stop_running(&self, include_once: bool) -> io::Result<Value> {
         let lifecycle = self.lifecycle.lock().await;
         let generation = self.generation.load(Ordering::Relaxed);
-        let current = self.running.lock().unwrap().as_ref().map(|running|
-            (Arc::clone(&running.hub), Arc::clone(&running.completion), !running.thread.is_finished()));
+        let current = self.running.lock().unwrap().as_ref()
+            .filter(|run| include_once || run.continuous())
+            .map(|run| (Arc::clone(&run.hub), Arc::clone(&run.completion), !run.thread.is_finished()));
         let Some((hub, completion, stopped)) = current else {
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
         };
@@ -472,7 +495,10 @@ impl Watch {
         };
         let joined = if let Some(running) = running { Self::join_run(running).await } else { Ok(()) };
         (self.wake_host)();
-        if stopped { result?; joined?; }
+        if stopped {
+            result?;
+            joined?;
+        }
         Ok(json!({"running":false,"stopped":stopped,"generation":self.generation.load(Ordering::Relaxed)}))
     }
 
@@ -532,7 +558,7 @@ impl Watch {
     }
 
     async fn reload_result(&self) -> io::Result<Option<io::Result<bool>>> {
-        let hub = self.running.lock().unwrap().as_ref().filter(|run| !run.thread.is_finished()).map(|run| Arc::clone(&run.hub));
+        let hub = self.running.lock().unwrap().as_ref().filter(|run| run.continuous()).map(|run| Arc::clone(&run.hub));
         let Some(hub) = hub else { return Ok(None); };
         let (ready, wait) = command_reply();
         hub.queue_reload(Some(ready));
@@ -540,7 +566,7 @@ impl Watch {
     }
 
     // Compatibility for non-driver shutdown and existing synchronous tests.
-    pub(super) fn stop(&self) -> io::Result<Value> { block_on(self.stop_async()) }
+    pub(super) fn stop(&self) -> io::Result<Value> { block_on(self.stop_running(true)) }
     #[cfg(test)]
     pub(super) fn run_once(&self, cwd: &Path, engine: Arc<Engine>, cancel: &Cancellation) -> io::Result<i32> { block_on(self.run_once_async(cwd, engine, cancel)) }
     #[cfg(test)]
@@ -568,25 +594,26 @@ impl Watch {
         let mut added = Vec::new();
         let mut updated = Vec::new();
         let mut rejected = Vec::new();
-        let running = self.is_running();
+        let running = self.is_enabled();
         {
             let _lock = FileMutex::lock(&path, ROOTS_LOCK)?;
             let mut roots = read_roots(&path)?;
             for root in paths {
                 let id = key(root);
                 if let Some(existing) = roots.iter_mut().find(|entry| key(&entry.path) == id) {
-                    let before = existing.clone();
+                    let changed = (recursive && !existing.recursive) || (deep && !existing.deep);
                     existing.scanned &= !recursive || existing.recursive;
                     existing.recursive |= recursive;
                     existing.deep |= deep;
-                    if *existing != before {
-                        updated.push(root.clone());
+                    if changed {
+                        updated.push(existing.path.clone());
                     }
                     continue;
                 }
                 roots.push(Root {
                     path: root.clone(),
-                    output: output.map(|value| resolve_output(root, value)).transpose()?,
+                    output: output.map(str::trim).filter(|value| !value.is_empty())
+                        .map(|value| resolve_output(root, value)).transpose()?,
                     deep,
                     recursive,
                     scanned: false,
@@ -615,7 +642,8 @@ impl Watch {
         let apply = apply.map(|(applied, generation)| {
             json!({
                 "roots_path":path,"added":added,"updated":updated,"rejected":rejected,
-                "applied":applied,"running":true,"generation":generation,
+                "applied":applied && (!added.is_empty() || !updated.is_empty()),
+                "running":true,"generation":generation,
             })
         });
         Ok(json!({
@@ -645,7 +673,7 @@ impl Watch {
             }
         }
         let apply = self
-            .root_change_status(self.is_running(), !removed.is_empty()).await?
+            .root_change_status(self.is_enabled(), !removed.is_empty()).await?
             .map(|(applied, generation)| {
                 json!({
                     "roots_path":path,"removed":removed,"applied":applied,
@@ -679,8 +707,8 @@ impl Watch {
         stage("catalog_maintenance", &Cancellation::new()).await?;
         let dir = state_dir(cwd)?;
         let snapshot = config::load_snapshot(cwd)?;
-        let state = journal::Journal::open(&dir, snapshot.config.watch.event_log_retention_days)?;
-        state.rebuild_log()
+        Ok(journal::Journal::open(&dir, snapshot.config.watch.event_log_retention_days)
+            .and_then(|state| state.rebuild_log()).unwrap_or(false))
     }
 
     pub(super) async fn cancel_batch_async(&self, id: &str) -> bool {
@@ -787,6 +815,12 @@ struct Running {
     completion: Arc<RunCompletion>,
 }
 
+impl Running {
+    fn continuous(&self) -> bool {
+        self.continuous && !self.thread.is_finished()
+    }
+}
+
 // Keep the native volume facts until roots can be selected without filesystem IO.
 // Both directions require rearm/checkpoint; only arrival requests directory work.
 #[derive(Default)]
@@ -876,16 +910,14 @@ struct Signals {
 
 impl Signals {
     fn prepare_root_changes(changed_roots: &mut HashMap<String, HashSet<PathBuf>>,
-        topology_roots: &HashSet<String>, modified_paths: &HashSet<PathBuf>, all_roots: bool) -> bool {
-                    // Directory modified is not an arrival. Its USN progress
-                    // is merged by idle maintenance, not a named subtree scan.
-                    for paths in changed_roots.values_mut() {
-                        paths.retain(|path| !modified_paths.contains(path) || !path.is_dir());
-                    }
-                    all_roots || !topology_roots.is_empty()
-                        || changed_roots.values().any(|paths|
-                            paths.iter().any(|path| !modified_paths.contains(path) && !path.is_file()))
-
+        topology_roots: &HashSet<String>, modified_paths: &HashSet<PathBuf>) -> bool {
+        // Directory modified is not an arrival. Its USN progress is merged
+        // by idle maintenance, not a named subtree scan.
+        for paths in changed_roots.values_mut() {
+            paths.retain(|path| !modified_paths.contains(path) || !path.is_dir());
+        }
+        !topology_roots.is_empty() || changed_roots.values().any(|paths|
+            paths.iter().any(|path| !modified_paths.contains(path) && !path.is_file()))
     }
 
     fn root_changed(&mut self, id: &str, paths: Option<Vec<PathBuf>>) {
@@ -2244,6 +2276,11 @@ impl Scheduler {
         let refresh_catalog = self.root_progress.observe(policy_changed, self.roots.is_empty());
         self.available_roots.retain(|id| next.contains_key(id));
         self.roots = next;
+        if !refresh_catalog && !restart_scheduler {
+            // A no-op reload still updates initial-scan markers above. The
+            // existing observers and output ownership need no reconciliation.
+            return Ok((self.root_progress.checkpoint, self.root_progress.recovery));
+        }
         // Root policy is already durable. Publish it independently of WAL
         // retirement, and always restore subscriptions even if retirement fails.
         let retirement: io::Result<()> = (|| {
@@ -2592,25 +2629,29 @@ impl Scheduler {
                     );
                 }
             }
-            for (id, (root, _)) in &self.roots {
-                let observed = self.root_observers.get(id).is_some_and(|observers| observers.root.is_some());
-                if signals.volumes.affects(&root.path, observed) {
-                    signals.topology_roots.insert(id.clone());
-                    signals.changed_roots.entry(id.clone()).or_default();
-                    if signals.volumes.arrives(&root.path, observed) {
-                        self.available_roots.remove(id);
+            if !signals.volumes.is_empty() {
+                for (id, (root, _)) in &self.roots {
+                    let observed = self.root_observers.get(id).is_some_and(|observers| observers.root.is_some());
+                    if signals.volumes.affects(&root.path, observed) {
+                        signals.topology_roots.insert(id.clone());
+                        signals.changed_roots.entry(id.clone()).or_default();
+                        if signals.volumes.arrives(&root.path, observed) {
+                            self.available_roots.remove(id);
+                        }
                     }
                 }
             }
-            if !signals.changed_roots.is_empty()
-                || !signals.once.is_empty()
-            {
-                let all_roots = !signals.once.is_empty();
-                if self.options.is_some() && (all_roots || !signals.topology_roots.is_empty()) {
-                    self.rearm_root_observers((!all_roots).then_some(&signals.topology_roots));
+            if !signals.changed_roots.is_empty() || !signals.once.is_empty() {
+                // With a live service, --once asks for one ordinary scheduler
+                // turn. Only a native topology event or an admission needs a
+                // checkpoint; the control request is not a rescan.
+                if self.options.is_some() && !signals.topology_roots.is_empty() {
+                    self.rearm_root_observers(Some(&signals.topology_roots));
                 }
-                let result = self.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
-                    &signals.modified_paths, &signals.candidate_events, all_roots).and_then(|_| {
+                let result = (if signals.changed_roots.is_empty() { Ok(()) } else {
+                    self.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
+                        &signals.modified_paths, &signals.candidate_events)
+                }).and_then(|_| {
                         if signals.once.is_empty() {
                             Ok(())
                         } else {
@@ -2685,16 +2726,12 @@ impl Scheduler {
         self.journal.commit(true, |state| Ok(retirement.operations(state)))
     }
 
-    fn observe_file_changes(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
-        let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_directory", Origin::Watch, || self.observe_file_changes_blocking(changed, events))
-    }
-
     fn observe_file_changes_blocking(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
         // Match main's ordinary file-event path: enqueue in memory without
         // refreshing the durable inventory or advancing its USN stamp. The
         // captured burst is reconciled once at admission/recovery instead.
+        let mut retried = HashSet::new();
         for (id, paths) in changed {
             let Some((_, scope)) = self.roots.get(id) else { continue };
             let scope = scope.clone();
@@ -2702,18 +2739,8 @@ impl Scheduler {
                 let event = events.get(path);
                 let path = path.to_string_lossy();
                 if !scope.contains(&path) || self.catalog.is_owned(&path) { continue; }
-                let peers = self.catalog.bucket_paths(&scope, &path);
                 self.observe_candidate_with_event(id, path.to_string(), CandidateAdmission::Observe, None, None, None, event)?;
-                for peer in peers.into_iter().filter(|peer| peer.as_str() != path.as_ref()) {
-                    if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
-                        entry.failure_payload.get("blockers").and_then(Value::as_array)
-                            .is_some_and(|blockers| blockers.iter().any(|value| value == "missing_volume"))
-                    }) {
-                        if let Some((root, recovery)) = self.blocker_route(&entry) {
-                            self.enqueue_with_recovery(&root, peer, recovery)?;
-                        }
-                    }
-                }
+                self.retry_volume_peers(&scope, &path, &mut retried)?;
             }
         }
         if self.cache_deadline.is_none() { self.arm_idle_cleanup(); }
@@ -2722,15 +2749,15 @@ impl Scheduler {
 
     fn observe_root_changes(&mut self, changed: &mut HashMap<String, HashSet<PathBuf>>,
         topology: &HashSet<String>, modified: &HashSet<PathBuf>,
-        events: &HashMap<PathBuf, CandidateEvent>, all_roots: bool) -> io::Result<()> {
-        let recovery = self.engine.run_stage("watch_directory", Origin::Watch, || {
-            Signals::prepare_root_changes(changed, topology, modified, all_roots)
-        });
-        if recovery {
-            self.checkpoint_with_events(changed, all_roots, false, events)
-        } else {
-            self.observe_file_changes(changed, events)
-        }
+        events: &HashMap<PathBuf, CandidateEvent>) -> io::Result<()> {
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_directory", Origin::Watch, || {
+            if Signals::prepare_root_changes(changed, topology, modified) {
+                self.checkpoint_blocking(changed, false, false, events)
+            } else {
+                self.observe_file_changes_blocking(changed, events)
+            }
+        })
     }
 
     fn checkpoint(&mut self, changed: &HashMap<String, HashSet<PathBuf>>, all_roots: bool, startup: bool) -> io::Result<()> {
@@ -2826,6 +2853,7 @@ impl Scheduler {
         }
         let mut marks = Vec::new();
         let mut admitted = HashSet::new();
+        let mut retried = HashSet::new();
         let mut cursors = Vec::new();
         let mut failures = HashSet::new();
         for (id, root, scope, identity, current, cached, arrived) in probes {
@@ -2979,29 +3007,11 @@ impl Scheduler {
                 };
                 let path_id = watch_path_key(&path);
                 if admitted.insert(path_id) {
-                    let peers = self.catalog.bucket_paths(&scope, &path);
                     self.observe_candidate_with_event(&id, path.clone(), admission,
                         None, None, None, Some(events.get(Path::new(&path)).unwrap_or(&CandidateEvent::Business(
                             if index >= recovered_paths { "initial_scan" }
                             else if startup { "startup_usn_recovery" } else { "usn_recovery" }))))?;
-                    for peer in peers.into_iter().filter(|peer| peer != &path) {
-                        if let Some(entry) = self.journal.state().entry(&peer).filter(|entry| {
-                            entry
-                                .failure_payload
-                                .get("blockers")
-                                .and_then(Value::as_array)
-                                .is_some_and(|blockers| {
-                                    blockers.iter().any(|value| value == "missing_volume")
-                                })
-                        }) {
-                            let key = watch_path_key(&peer);
-                            if let Some((root, recovery)) = self.blocker_route(&entry) {
-                                if admitted.insert(key) {
-                                    self.enqueue_with_recovery(&root, peer, recovery)?;
-                                }
-                            }
-                        }
-                    }
+                    self.retry_volume_peers(&scope, &path, &mut retried)?;
                 }
             }
             match (current, identity) {
@@ -3493,7 +3503,7 @@ impl Scheduler {
         if self.unpublished.is_empty() && cursors.is_empty() && retire.is_none() && handoff.is_none() {
             return Ok(());
         }
-        let keys = self.unpublished.clone();
+        let keys = &self.unpublished;
         self.journal.commit(durable, |state| {
             use crate::watch_store::PendingObservation;
             let mut ordinary = Vec::new();
@@ -3656,6 +3666,21 @@ impl Scheduler {
 
     fn retry_missing_volumes(&mut self, roots: Option<&HashSet<String>>) -> io::Result<()> {
         self.retry_missing_volumes_with_event(roots, "volume_changed")
+    }
+
+    fn retry_volume_peers(&mut self, scope: &NativeDiscoveryScope, seed: &str, retried: &mut HashSet<String>) -> io::Result<()> {
+        let seed_key = crate::path_keys::path_key(seed);
+        for peer in self.catalog.bucket_paths(scope, seed) {
+            let id = crate::path_keys::path_key(&peer);
+            if id == seed_key || retried.contains(&id) { continue; }
+            let Some(entry) = self.journal.state().entry_by_key(&id)
+                .filter(|entry| entry.status == "suspended_missing_volume") else { continue };
+            if let Some((root, recovery)) = self.blocker_route(&entry) {
+                retried.insert(id);
+                self.enqueue_with_recovery(&root, peer, recovery)?;
+            }
+        }
+        Ok(())
     }
 
     fn retry_missing_volumes_with_event(&mut self, roots: Option<&HashSet<String>>, event: &'static str) -> io::Result<()> {
@@ -4177,6 +4202,9 @@ impl Scheduler {
             return Ok(());
         }
         let now = Instant::now();
+        if self.due.first_key_value().is_none_or(|((due, _), _)| *due > now) {
+            return Ok(());
+        }
         let prepared = self.prepare_ready(now, available)?;
         if prepared.is_empty() { return Ok(()); }
         // Keep the already-probed owners available for atomic publication.
@@ -5906,9 +5934,9 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
         }
         crate::postprocess::flatten_single_branch_directories(
             Path::new(root),
-            Some(Path::new(work)),
+            Path::new(work),
+            crate::postprocess::FlattenLeaf::Resume(Path::new(leaf)),
             |_, _, _| Ok(()),
-            Some(Path::new(leaf)),
         );
         if identity_if_present(root).is_ok_and(|identity| identity.as_deref() == Some(new)) {
             recover_finish_flatten(journal, root)?;
@@ -6257,15 +6285,21 @@ mod tests {
         assert_eq!(status["generation"], 0);
         assert_eq!(status["last_error"], "");
         assert_eq!(status["state_dir"], json!(resources::writable_data_dir(&cwd).unwrap().join(WATCH_METADATA)));
+        assert_eq!(block_on(watch.stop_async()).unwrap()["stopped"], false);
+        assert_eq!(watch.reload().unwrap()["running"], false);
+        assert!(!hub.stopped.load(Ordering::Acquire));
 
         // A second once caller must share the standalone result. The
         // standalone scheduler never services the continuous tick queue.
         let engine = Arc::new(Engine::new(PathBuf::from("unused-worker")));
         let cancel = Cancellation::new();
+        let mut start = Box::pin(watch.start_async(&cwd, Arc::clone(&engine), false));
         let mut second = Box::pin(watch.run_once_async(&cwd, engine, &cancel));
         let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(start.as_mut().poll(&mut cx).is_pending());
         assert!(second.as_mut().poll(&mut cx).is_pending());
         assert!(hub.signals.lock().unwrap().once.is_empty());
+        assert!(!hub.stopped.load(Ordering::Acquire));
         completion.complete(&Ok(0));
         assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(0))));
 
@@ -6303,17 +6337,17 @@ mod tests {
         let mut signals = Signals::default();
         signals.root_changed("root", Some(vec![directory.clone(), file.clone(), missing.clone()]));
         signals.modified_paths.extend([directory.clone(), file.clone(), missing.clone()]);
-        assert!(!Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, false));
+        assert!(!Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths));
         assert!(!signals.changed_roots["root"].contains(&directory));
         assert!(signals.changed_roots["root"].contains(&file));
         for path in [directory.clone(), missing] {
             let mut signals = Signals::default();
             signals.root_changed("root", Some(vec![path]));
-            assert!(Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, false));
+            assert!(Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths));
         }
         let mut signals = Signals::default();
         signals.root_changed("root", None);
-        assert!(Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths, false));
+        assert!(Signals::prepare_root_changes(&mut signals.changed_roots, &signals.topology_roots, &signals.modified_paths));
         std::fs::remove_file(file).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }

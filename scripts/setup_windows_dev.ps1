@@ -5,6 +5,8 @@ param(
     [string]$Arch = "x64",
     [switch]$SkipAcceptanceTestTools,
     [switch]$BootstrapOnly,
+    # Used when build_windows.ps1 has already built the native artifacts.
+    [switch]$AcceptanceTestDependenciesOnly,
     [ValidateSet("release", "ci")]
     [string]$BuildProfile = "ci",
     [ValidateRange(1, 64)]
@@ -707,7 +709,7 @@ Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust wo
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 Assert-CommandExists -Command "uv" -Description "uv dependency manager"
-if ($Clean) {
+if ($Clean -and -not $AcceptanceTestDependenciesOnly) {
     Write-Step "Cleaning native build outputs"
     foreach ($output in @($rustTargetDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
         $fullOutput = [IO.Path]::GetFullPath($output)
@@ -745,6 +747,9 @@ if ($BootstrapOnly) {
 Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
 if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
     Ensure-AcceptanceTestTools -RepoRoot $repoRoot -ToolsRoot $toolsRoot
+}
+if ($AcceptanceTestDependenciesOnly) {
+    return
 }
 
 Write-Step "Building Rust runtime and native fixture tool"

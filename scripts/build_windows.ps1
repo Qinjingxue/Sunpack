@@ -660,6 +660,7 @@ $runAcceptanceTests = -not $SkipTests
 if ($promptForAcceptanceTests) {
     $runAcceptanceTests = Confirm-AcceptanceTests
 }
+$runAcceptanceTests = $runAcceptanceTests -and $processArch -eq $buildArch
 
 Assert-PathExists -LiteralPath $installerScriptPath -Description "Inno Setup installer script"
 $innoCompiler = Get-InnoSetupCompiler -PreferredPath $InnoCompilerPath
@@ -715,8 +716,12 @@ $cargoArgs = @(
     "build", "--locked", "--manifest-path", (Join-Path $repoRoot "native\Cargo.toml"),
     "--release", "--target", $rustTarget, "--target-dir", $rustTargetDir,
     "--jobs", [string]$BuildJobs, "--config", $rustFlags,
-    "-p", "sunpack-native", "-p", "sunpack-watch-broker"
+    "-p", "sunpack-native", "-p", "sunpack-watch-broker",
+    "--bin", "sunpack-runtime", "--bin", "sunpack-watch-broker"
 )
+if ($runAcceptanceTests) {
+    $cargoArgs += @("--example", "real_fixture")
+}
 if ($FastBuild) {
     $cargoArgs += @("--config", "profile.release.lto=false", "--config", "profile.release.codegen-units=16")
 }
@@ -884,12 +889,23 @@ if ($processArch -eq $buildArch) {
     Write-Host "Packaged executable is $buildArch and cannot run under the current $processArch process" -ForegroundColor Yellow
 }
 
-if ($runAcceptanceTests -and $processArch -eq $buildArch) {
+if ($runAcceptanceTests) {
+    # The release build already supplied the native artifacts for acceptance.
+    Write-Step "Preparing acceptance test dependencies"
+    Invoke-Native -FilePath "powershell" -Arguments @(
+        "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $PSScriptRoot "setup_windows_dev.ps1"),
+        "-Arch", $buildArch, "-AcceptanceTestDependenciesOnly"
+    )
+    $fixtureBuildPath = Join-Path $rustTargetDir "$rustTarget\release\examples\real_fixture.exe"
+    Assert-PathExists -LiteralPath $fixtureBuildPath -Description "Native test fixture executable"
+    Copy-Item -LiteralPath $fixtureBuildPath -Destination (Join-Path $toolsRoot "real_fixture.exe") -Force
+
     Write-Step "Running acceptance tests"
     Invoke-Native -FilePath "powershell" -Arguments @(
         "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $repoRoot "run_acceptance_tests.ps1"),
-        "-NoWait", "-Arch", $buildArch, "-BuildProfile", "release"
+        "-NoWait", "-Arch", $buildArch, "-BuildProfile", "release", "-SkipEnvironmentRefresh"
     )
 }
 

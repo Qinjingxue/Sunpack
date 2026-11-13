@@ -19,6 +19,9 @@ from benchmarks.harness.launcher import NativePackage
 from benchmarks.harness.workspace import BenchmarkWorkspace
 from benchmarks.watch_broker import SERVICE_ENV, isolated_broker_environment
 
+NUMBERED_VOLUME = re.compile(r"\.\d{3,}$")
+RAR_VOLUME = re.compile(r"\.part\d+\.rar$", re.I)
+
 
 def output_summary(root: Path):
     files = [path for path in root.rglob("*") if path.is_file()] if root.exists() else []
@@ -29,11 +32,11 @@ def _copy_case(item, destination: Path, shape: str):
     destination.mkdir(parents=True, exist_ok=True)
     source = Path(item["path"])
     members = [source]
-    if re.search(r"\.\d{3,}$", source.name):
+    if NUMBERED_VOLUME.search(source.name):
         prefix = source.name.rsplit(".", 1)[0] + "."
         members = [path for path in source.parent.iterdir() if path.name.startswith(prefix) and path.suffix[1:].isdigit()]
-    elif re.search(r"\.part\d+\.rar$", source.name, re.I):
-        prefix = re.split(r"\.part\d+\.rar$", source.name, flags=re.I)[0]
+    elif RAR_VOLUME.search(source.name):
+        prefix = RAR_VOLUME.split(source.name)[0]
         members = list(source.parent.glob(prefix + ".part*.rar"))
     for member in members:
         if member.is_file():
@@ -42,10 +45,10 @@ def _copy_case(item, destination: Path, shape: str):
     if shape == "disguised":
         # Keep numbered-volume suffixes: renaming only one part changes the
         # archive, rather than measuring disguised input discovery.
-        if "split" not in item["format"]:
+        if not item["split"]:
             result = result.rename(result.with_suffix(".opaque"))
     elif shape == "carrier":
-        if "split" in item["format"]:
+        if item["split"]:
             raise ValueError("carrier shape requires a single-file archive")
         carrier = result.with_suffix(".carrier")
         with carrier.open("wb") as output, result.open("rb") as archive:
@@ -63,13 +66,19 @@ def _case_rows(args, workspace):
         if not source.is_file():
             raise FileNotFoundError(source)
         # Preserve volume siblings for externally supplied split inputs.
-        return {"external": {"path": source, "format": args.archive_format or source.suffix.lstrip("."), "workload": "external"}}, {}, {"external": True}
+        item = {
+            "path": source, "format": args.archive_format or source.suffix.lstrip("."),
+            "split": bool(NUMBERED_VOLUME.search(source.name) or RAR_VOLUME.search(source.name)),
+        }
+        return {"external": item}, {}, {"external": True}
     corpus, skipped, cache = _cached_corpus(
         workspace.corpus, cache_root=args.cache_root, small_files=args.small_files,
         large_files=args.large_files, large_file_mib=args.large_file_mib, rebuild=args.rebuild_corpus,
     )
     selected = set(args.formats.split(",")) if args.formats else None
-    return {key: item for key, item in corpus.items() if selected is None or item["format"] in selected}, skipped, cache
+    cases = {key: {**item, "split": item["format"].endswith("-split")}
+             for key, item in corpus.items() if selected is None or item["format"] in selected}
+    return cases, skipped, cache
 
 
 def _configure_watch(app, args, inputs, outputs, *, live=False):
@@ -128,7 +137,7 @@ def _watch_arrivals(app, workspace, args, corpus, skipped):
                 time.sleep(args.arrival_interval_ms / 1000)
             staged = []
             for key, item in corpus.items():
-                if args.shape == "carrier" and "split" in item["format"]:
+                if args.shape == "carrier" and item["split"]:
                     skipped[key] = "carrier shape excludes multi-file volume sets"
                     continue
                 for index in range(args.copies):
@@ -252,16 +261,18 @@ def main(argv=None):
                 rows, timeline = _watch_arrivals(app, workspace, args, corpus, skipped)
             else:
                 corpus, skipped, cache = _case_rows(args, workspace)
-                if not corpus:
-                    raise ValueError("No archives selected")
                 inputs = workspace.work / "inputs"
+                staged = []
                 for key, item in corpus.items():
-                    if args.shape == "carrier" and "split" in item["format"]:
+                    if args.shape == "carrier" and item["split"]:
                         skipped[key] = "carrier shape excludes multi-file volume sets"
                         continue
                     for copy in range(args.copies):
                         name = key.replace(":", "-") + (f"-copy-{copy}" if copy else "")
-                        _copy_case(item, inputs / name, args.shape)
+                        entry = _copy_case(item, inputs / name, args.shape)
+                        staged.append((key, item, copy, name, entry))
+                if not staged:
+                    raise ValueError("No archives selected")
                 if args.mode == "scan":
                     ordinary = inputs / "ordinary"
                     ordinary.mkdir()
@@ -286,18 +297,14 @@ def main(argv=None):
                         if output.exists():
                             shutil.rmtree(output)
                     else:
-                        for key, item in corpus.items():
-                            directory = inputs / key.replace(":", "-")
-                            if not directory.exists():
-                                continue
-                            entry = next(iter(directory.iterdir())) if "split" not in item["format"] else directory / Path(item["path"]).name
-                            output = workspace.outputs / f"round-{run}-{key.replace(':', '-')}"
+                        for key, item, copy, name, entry in staged:
+                            output = workspace.outputs / f"round-{run}-{name}"
                             measurement = app.run("extract", "--direct-file", "-d", "-r", args.recursive, "-c", "k", "--no-flatten", "--no-pause", "-o", output, entry, *password_args)
-                            row = {"case": key, "format": item["format"], "run": run, "output": output_summary(output), **measurement}
+                            row = {"case": key, "format": item["format"], "run": run, "copy": copy, "output": output_summary(output), **measurement}
                             if args.compare_7z:
                                 # Compare identical unwrapped archive input; carrier
                                 # discovery is a separate SunPack workload.
-                                baseline = workspace.outputs / f"sevenzip-{run}-{key.replace(':', '-')}"
+                                baseline = workspace.outputs / f"sevenzip-{run}-{name}"
                                 seconds, code = _timed_seven_zip_extract(Path(item["path"]), baseline, item["format"])
                                 row["sevenzip"] = {"seconds": seconds, "returncode": code, "output": output_summary(baseline)}
                                 shutil.rmtree(baseline)
