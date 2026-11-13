@@ -755,14 +755,15 @@ impl Summary {
             }
         }
         if summary.succeeded != 0 {
-            let mut outputs = outcome.archives.iter().filter(|archive| {
+            let containers = super::watch::completion_output_containers(outcome);
+            let outputs = outcome.archives.iter().filter(|archive| {
                 let root = archive_owner(archive, owner);
                 roots.get(&root).is_some_and(|completion| completion.accepted
                     && !completion.terminal && !completion.retry)
                     && started.is_none_or(|started| started.contains(&root))
-            }).filter_map(|archive| archive.output.as_deref());
-            summary.output = crate::pipeline::common_ancestor(outputs.clone())
-                .or_else(|| outputs.next().map(Path::to_owned));
+            }).filter_map(|archive| archive.output.as_deref())
+                .map(|output| containers.get(output).copied().unwrap_or(output));
+            summary.output = existing_output_target(outputs);
         }
         let cleanup_failed = outcome.cleanup_results.iter()
             .filter(|result| result.status == CleanupStatus::Failed
@@ -781,15 +782,17 @@ impl Summary {
         self.report_failed |= other.report_failed;
         append_warning(&mut self.cleanup_warnings, &other.cleanup_warnings);
         if let Some(output) = other.output {
-            self.output = match self.output.take() {
-                Some(previous) => {
-                    crate::pipeline::common_ancestor([previous.as_path(), output.as_path()])
-                        .or(Some(previous))
-                }
-                None => Some(output),
-            };
+            self.output = existing_output_target(self.output.as_deref().into_iter()
+                .chain(std::iter::once(output.as_path())));
         }
     }
+}
+
+fn existing_output_target<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf> {
+    let mut paths = paths.into_iter().filter(|path| path.is_dir());
+    let first = paths.next()?;
+    crate::pipeline::common_ancestor(std::iter::once(first).chain(paths))
+        .or_else(|| Some(first.to_owned()))
 }
 
 // A native batch can contain many independent top-level tasks. Keep carrier
@@ -1827,6 +1830,20 @@ mod tests {
         let snapshot = Snapshot::completed(&completed, None);
         assert!(snapshot.body.ends_with(&format!("{}\n{}",
             Language::En.translate("cleanup.incomplete", &[("count", "1")]), warning)));
+
+        // An output moved away during recursive cleanup must not widen the
+        // Open output target beyond the directory the user can still open.
+        let live = directory.0.join("live");
+        fs::create_dir_all(&live).unwrap();
+        let mut result = Outcome::default();
+        for path in [directory.0.join("departed"), live.clone()] {
+            let mut output = archive("a.zip", None);
+            output.output = Some(path);
+            result.archives.push(output);
+        }
+        let summary = Summary::for_outcome(Language::En, &result, false, true, &one_root, None);
+        assert_eq!(summary.output, Some(live));
+
         // Match main's Unicode-character bound, including its ellipsis.
         let mut warnings = "界".repeat(2046);
         append_warning(&mut warnings, "两个警告");

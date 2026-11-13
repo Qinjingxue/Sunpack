@@ -60,7 +60,11 @@ def test_semantic_reload_retries_unchanged_missing_volume_blocker(package, tmp_p
     else:
         # No Config change and no input event: root policy alone must run
         # the same recovery lifecycle as main's scheduler restart.
-        package.json("watch", "add", watched, "-o", tmp_path / "new-output")
+        roots = package.data / "sunpack_watch_roots.txt"
+        pending = roots.with_suffix(".tmp")
+        replacement_output = tmp_path / "new-output"
+        pending.write_text(f"{watched} | {replacement_output} | false | true | false\n", encoding="utf-8")
+        pending.replace(roots)
     package.json("watch", "reload")
     _wait_for_blocker(events, parts[0], completion)
     assert package.json("watch", "stop")["summary"]["stopped"]

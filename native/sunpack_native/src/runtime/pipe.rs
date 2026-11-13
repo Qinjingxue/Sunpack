@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+    LockFileEx, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
@@ -77,25 +77,25 @@ struct StateFile {
 }
 
 impl StateFile {
-    fn acquire(path: PathBuf) -> io::Result<Option<Self>> {
+    fn acquire(path: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(path.parent().unwrap())?;
         let mut lock_path = path.as_os_str().to_owned();
         lock_path.push(".lock");
-        let lock = match OpenOptions::new()
+        let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .share_mode(0)
-            .open(lock_path)
-        {
-            Ok(lock) => lock,
-            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        Ok(Some(Self { path, _lock: lock }))
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(lock_path)?;
+        // Launchers serialize startup. A child spawned after its predecessor
+        // closes the listener waits for that owner to finish removing the state
+        // and draining the log before publishing the next endpoint.
+        let mut range = OVERLAPPED::default();
+        if unsafe { LockFileEx(lock.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut range) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { path, _lock: lock })
     }
 
     fn publish(
@@ -266,13 +266,13 @@ async fn read_peer_field(peer: &transport::Peer, length: usize) -> io::Result<Ve
 }
 impl Header {
     async fn read(peer: &transport::Peer, build_id: &[u8; 16], token: &[u8; 32]) -> io::Result<Self> {
-        let header = peer.read_exact(52).await?;
-        if &header[..4] != b"SPK2" || &header[4..20] != build_id || &header[20..] != token {
+        let header = peer.read_exact(64).await?;
+        if &header[..4] != b"SPK2" || &header[4..20] != build_id || &header[20..52] != token {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        let flags = read_word(peer).await?;
-        let cwd_len = read_word(peer).await? as usize;
-        let argc = read_word(peer).await?;
+        let flags = u32::from_be_bytes(header[52..56].try_into().unwrap());
+        let cwd_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
+        let argc = u32::from_be_bytes(header[60..64].try_into().unwrap());
         let cwd = PathBuf::from(String::from_utf8(read_peer_field(peer, cwd_len).await?).map_err(io::Error::other)?);
         if !cwd.is_absolute() { return Err(io::ErrorKind::InvalidInput.into()); }
         let mut argv = Vec::new();
@@ -479,12 +479,12 @@ impl Connection {
         while let Some(frame) = self.output.next().await {
             let acknowledge = OutputFrame(&self.output);
             let result = self.peer.write_all(frame).await;
-            drop(acknowledge);
             if result.is_err() {
                 self.cancel.cancel();
                 self.close();
                 return;
             }
+            drop(acknowledge);
         }
     }
 
@@ -579,7 +579,7 @@ struct CloseConnection(Arc<Connection>);
 impl Drop for CloseConnection { fn drop(&mut self) { self.0.close(); } }
 
 struct Activity {
-    last_idle: Instant,
+    last_completed: Option<Instant>,
     active: usize,
     shutting_down: bool,
 }
@@ -595,8 +595,7 @@ struct Server {
     build_id: [u8; 16],
 }
 
-/// Each connection owns its active count even if thread creation is rejected
-/// (the unstarted closure is dropped), or request execution unwinds.
+/// Count connections until their owned work has drained, including an unwind.
 struct ActiveRequest(Arc<Server>);
 
 impl ActiveRequest {
@@ -612,7 +611,6 @@ impl Drop for ActiveRequest {
         let mut activity = self.0.activity.lock().unwrap();
         activity.active -= 1;
         if activity.active == 0 {
-            activity.last_idle = Instant::now();
             self.0.drained.notify_all();
         }
         drop(activity);
@@ -651,8 +649,10 @@ impl Server {
             let connection = Arc::clone(&connection);
             let cwd = header.cwd.clone();
             Some(spawner.spawn(Box::pin(async move {
-                if connection.read_control(&cwd).await.is_err() {
-                    if !connection.finishing.load(Ordering::Acquire) { connection.cancel.cancel(); }
+                if connection.read_control(&cwd).await.is_err()
+                    && !connection.finishing.load(Ordering::Acquire)
+                {
+                    connection.cancel.cancel();
                     connection.close();
                 }
             })))
@@ -680,8 +680,16 @@ impl Server {
                 }
             };
             if foreground { super::diagnostics::event("foreground_request_finished", serde_json::json!({"origin":"foreground","exit_code":code,"duration_ms":started.elapsed().as_secs_f64()*1000.0})); }
+            // The launcher closes as soon as it reads the status frame. Its
+            // control EOF can arrive before the completed write is observed.
+            connection.finishing.store(true, Ordering::Release);
             connection.frame(0, &code.to_be_bytes()).await?;
-            connection.output.drain().await
+            connection.output.drain().await?;
+            if connection.output.closed() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            self.activity.lock().unwrap().last_completed = Some(Instant::now());
+            Ok(())
         }, control, output).await
     }
 }
@@ -699,9 +707,7 @@ fn idle_wait(started: Instant, idle: Duration) -> u32 {
 }
 
 pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
-    let Some(state) = StateFile::acquire(state_path(cwd, identity)?)? else {
-        return Ok(());
-    };
+    let state = StateFile::acquire(state_path(cwd, identity)?)?;
     let exe = std::env::current_exe()?;
     let stamp = runtime_stamp(&exe)?;
     let build_id = crate::io::runtime_binary::runtime_binary_build_id(&exe)?;
@@ -717,15 +723,16 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         let wake = Arc::clone(&wake);
         move || wake.signal()
     });
-    let retention = config::load(cwd).map_or(7, |settings| settings.watch.event_log_retention_days);
-    let mut log_path = state_path(cwd, identity)?.into_os_string();
+    let settings = config::load(cwd).ok();
+    let retention = settings.as_ref().map_or(7, |settings| settings.watch.event_log_retention_days);
+    let mut log_path = state.path.as_os_str().to_owned();
     log_path.push(".events.json");
     let log = super::diagnostics::Log::open(log_path.into(), retention, &host.watch)?;
     let server = Arc::new(Server {
         host,
         wake,
         activity: Mutex::new(Activity {
-            last_idle: Instant::now(),
+            last_completed: None,
             active: 0,
             shutting_down: false,
         }),
@@ -741,8 +748,8 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let ready = unsafe { OwnedHandle::from_raw_handle(ready) };
-    if let Ok(settings) = config::load(cwd) {
-        server.host.configure_idle(&settings);
+    if let Some(settings) = settings.as_ref() {
+        server.host.configure_idle(settings);
     }
     let result = (|| {
         let mut accept = Accept::arm(&name_wide, &security, true)?;
@@ -751,12 +758,13 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
         if unsafe { SetEvent(ready.as_raw_handle()) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut served = false;
         loop {
             let (wait, shutting_down) = {
                 let state = server.activity.lock().unwrap();
-                let timeout = if served && state.active == 0 && !server.host.watch.is_running() {
-                    idle_wait(state.last_idle, server.host.idle_after())
+                let timeout = if state.active == 0 && !server.host.watch.is_running() {
+                    state.last_completed.map_or(INFINITE, |completed| {
+                        idle_wait(completed, server.host.idle_after())
+                    })
                 } else {
                     INFINITE
                 };
@@ -772,7 +780,6 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
                     accept = Accept::arm(&name_wide, &security, false)?;
                     match connected {
                         Ok(peer) => {
-                            served = true;
                             server.submit(peer);
                         }
                         Err(error) if matches!(error.raw_os_error(), Some(109 | 232 | 233)) => {}
@@ -786,7 +793,13 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
             }
         }
     })();
-    let exit_reason = if result.is_err() { "error" } else if server.activity.lock().unwrap().shutting_down { "shutdown" } else { "idle" };
+    let exit_reason = if result.is_err() {
+        "error"
+    } else if server.activity.lock().unwrap().shutting_down {
+        "cli_shutdown"
+    } else {
+        "idle_timeout"
+    };
     super::diagnostics::event("host_stopping", serde_json::json!({"foreground_requests":server.activity.lock().unwrap().active,"exit_reason":exit_reason}));
     server.shutdown.cancel();
     let stopping_watch = server.host.watch.is_running();
@@ -916,7 +929,7 @@ mod async_connection_tests {
 
     fn server() -> Arc<Server> {
         Arc::new(Server {
-            host: Host::new(), activity: Mutex::new(Activity { last_idle: Instant::now(), active: 0, shutting_down: false }),
+            host: Host::new(), activity: Mutex::new(Activity { last_completed: None, active: 0, shutting_down: false }),
             drained: Condvar::new(), wake: Arc::new(Event::new(false).unwrap()),
             shutdown: Cancellation::new(), io: transport::Reactor::new().unwrap(), token: [0; 32], build_id: [0; 16],
         })
@@ -953,9 +966,10 @@ mod async_connection_tests {
             held.push((client, request));
         }
         let (mut invalid, rejected) = connect(&server);
-        invalid.write_all(&[0; 52]).unwrap();
+        invalid.write_all(&[0; 64]).unwrap();
         assert_eq!(rejected.join().unwrap().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         assert!(!server.activity.lock().unwrap().shutting_down);
+        assert!(server.activity.lock().unwrap().last_completed.is_none());
         let (mut client, healthy) = connect(&server);
         client.write_all(&help_request(&server)).unwrap();
         let (finished, ready) = mpsc::channel();
@@ -980,6 +994,7 @@ mod async_connection_tests {
         let (_client, code) = response.expect("incomplete clients consumed CLI execution capacity");
         assert_eq!(code.unwrap(), 0);
         healthy.join().unwrap().unwrap();
+        assert!(server.activity.lock().unwrap().last_completed.is_some());
         server.shutdown.cancel();
         for (_client, request) in held { assert!(request.join().unwrap().is_err()); }
         let activity = server.drained.wait_while(server.activity.lock().unwrap(), |state| state.active != 0).unwrap();

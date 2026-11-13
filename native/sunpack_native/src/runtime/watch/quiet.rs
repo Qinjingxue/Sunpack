@@ -82,7 +82,7 @@ impl Activity {
             let at = super::windows::monotonic_seconds();
             let claims = claims.lock().unwrap();
             if claims.contains_key(key) { return Ok(false); }
-            state.record(&candidate, now, at, false, false);
+            state.record(&candidate, now, at, false, None);
             return Ok(true);
         }
         Ok(false)
@@ -96,7 +96,7 @@ impl Activity {
     }
 
     pub(super) fn content_deadline(&self, candidate: &WatchCandidateRow, now: Instant,
-        at: f64, reset: bool, retry_unchanged: bool, force: bool) -> Instant {
+        at: f64, reset: bool, retry_unchanged: bool, forced_content_change: Option<bool>) -> Instant {
         let mut state = self.0.state.lock().unwrap();
         if retry_unchanged {
             if state.observed.is_some_and(|previous| previous > now) {
@@ -105,9 +105,8 @@ impl Activity {
             state.due = Some(now);
             return now;
         }
-        // A native capture already accounted for this generation and its
-        // original timestamp. Only actual new/forced observations learn here.
-        state.record(candidate, now, at, reset, force);
+        // A native capture may already have timed this generation.
+        state.record(candidate, now, at, reset, forced_content_change);
         state.due.unwrap_or(now)
     }
 
@@ -164,19 +163,23 @@ impl Activity {
 }
 
 impl ActivityState {
-    fn record(&mut self, candidate: &WatchCandidateRow, now: Instant, at: f64, reset: bool, force: bool) {
+    fn record(&mut self, candidate: &WatchCandidateRow, now: Instant, at: f64, reset: bool,
+        forced_content_change: Option<bool>) {
         if self.observed.is_some_and(|previous| previous > now) { return; }
         self.observed = Some(now);
-        let changed = self.baseline.as_ref().is_none_or(|(size, mtime, id, usn)|
-            content_changed(*size, *mtime, id, *usn, candidate));
+        let changed = forced_content_change.unwrap_or_else(||
+            self.baseline.as_ref().is_none_or(|(size, mtime, id, usn)|
+                content_changed(*size, *mtime, id, *usn, candidate)));
         let reset = self.baseline.as_ref().map_or(reset, |(size, _, id, _)|
             *size > candidate.size || *id != candidate.observation.file_id);
         let boundary = is_boundary(candidate);
-        if changed || force {
+        if changed {
             self.quiet.observe(at, boundary, reset, true);
-            self.due = Some(after(now, self.quiet.seconds));
         } else if boundary {
             self.quiet.end_phase();
+        }
+        if changed || forced_content_change.is_some() {
+            self.due = Some(after(now, self.quiet.seconds));
         }
         self.baseline = Some((candidate.size, candidate.mtime,
             candidate.observation.file_id.clone(), candidate.observation.change_usn));
@@ -373,19 +376,19 @@ mod tests {
             candidate.mtime = index as f64 * 0.2;
             candidate.observation.change_usn += 1;
             signal.0.state.lock().unwrap().record(&candidate,
-                after(now, candidate.mtime), candidate.mtime, false, false);
+                after(now, candidate.mtime), candidate.mtime, false, None);
         }
         let before = owner.summary();
         assert!((before.0 - 0.30950540136780874).abs() < 1e-9);
         assert_eq!(owner.sample_count(), WINDOW);
         let deadline = owner.deadline().unwrap();
         assert_eq!(owner.content_deadline(&candidate, after(now, 100.0), 100.0,
-            false, false, false), deadline);
+            false, false, None), deadline);
         assert_eq!(owner.summary(), before); // scheduler drain does not relearn
         // An older scheduler probe cannot overwrite a newer callback sample.
         candidate.size -= 1;
         candidate.observation.change_usn -= 1;
-        owner.content_deadline(&candidate, now, 0.0, false, false, false);
+        owner.content_deadline(&candidate, now, 0.0, false, false, None);
         assert_eq!(owner.summary(), before);
         candidate.observation.change_reasons = CLOSE;
         owner.metadata(&candidate, now);
@@ -399,13 +402,13 @@ mod tests {
         candidate.size += 2;
         candidate.observation.change_usn += 2;
         candidate.observation.change_reasons = 1;
-        owner.content_deadline(&candidate, after(now, 102.0), 102.0, false, false, false);
+        owner.content_deadline(&candidate, after(now, 102.0), 102.0, false, false, None);
         let latest = owner.deadline();
         owner.accelerate(after(now, 101.0), after(now, 101.0));
         assert_eq!(owner.deadline(), latest);
         let cadence = owner.summary();
         assert_eq!(owner.content_deadline(&candidate, after(now, 103.0), 103.0,
-            false, true, true), after(now, 103.0));
+            false, true, Some(true)), after(now, 103.0));
         assert_eq!(owner.deadline(), Some(after(now, 103.0)));
         assert_eq!(owner.summary(), cadence);
         drop(signal);

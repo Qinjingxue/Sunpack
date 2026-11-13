@@ -1,6 +1,6 @@
 use super::{watch, windows, Session, Stream};
 use super::failure::report as failures;
-use crate::core::config::{self, CleanupMode, Config, Recursion};
+use crate::core::config::{self, CleanupMode, Config, ReadMode, Recursion};
 use crate::core::i18n::Language;
 use crate::core::{passwords, resources};
 use crate::io::cancellation::is_cancellation;
@@ -107,11 +107,14 @@ impl Host {
         Ok(if observed { store.observed_snapshot() } else { store.snapshot_for_request() })
     }
 
-    fn generation(&self, cwd: &Path) -> config::ConfigRead {
+    fn generation(&self, cwd: &Path, inspect: bool) -> config::ConfigRead {
         let config_sources = config::resolve_sources(cwd);
+        let mode = if inspect { ReadMode::Inspect } else { ReadMode::CheckStamp };
         let mut paths = config::watch_paths(cwd, &config_sources);
         let password_path = resources::writable_data_dir(cwd).map(|dir| dir.join(passwords::FILENAME));
-        let Ok(password_path) = password_path else { return config::generation(cwd); };
+        let Ok(password_path) = password_path else {
+            return config::read_generation(cwd, config_sources, mode);
+        };
         paths.push(password_path.clone());
         let mut retired = Vec::new();
         let mut sources = self.sources.lock().unwrap();
@@ -146,7 +149,7 @@ impl Host {
                 Err(_) => {
                     sources.changed.store(true, std::sync::atomic::Ordering::Release);
                     drop(sources);
-                    return config::generation(cwd);
+                    return config::read_generation(cwd, config_sources, mode);
                 },
             }
         }
@@ -154,7 +157,7 @@ impl Host {
         // The last reader of a removed directory joins its native observer.
         // Never do that while holding the request source registry lock.
         drop(retired);
-        config::observed_generation(cwd)
+        config::read_generation(cwd, config_sources, if inspect { mode } else { ReadMode::Observe })
     }
 }
 
@@ -172,8 +175,8 @@ struct Options {
     recursive: bool,
     direct: bool,
     flatten: Option<bool>,
-    depth: Option<String>,
-    cleanup: Option<String>,
+    depth: Option<(Recursion, String)>,
+    cleanup: Option<CleanupMode>,
     output: Option<String>,
     password_file: Option<String>,
     passwords: Vec<Arc<str>>,
@@ -435,14 +438,14 @@ impl Options {
                 }
                 Some(OptionId::Recur) => {
                     let value = take()?.trim().to_owned();
-                    Recursion::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
-                    options.depth = Some(value);
+                    let depth = Recursion::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
+                    options.depth = Some((depth, value));
                     continue;
                 }
                 Some(OptionId::Cleanup) => {
                     let value = take()?.trim().to_ascii_lowercase();
-                    CleanupMode::parse(&value).map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?;
-                    options.cleanup = Some(value);
+                    options.cleanup = Some(CleanupMode::parse(&value)
+                        .map_err(|error| argument_error(command, &options.action, flag, &error.to_string()))?);
                     continue;
                 }
                 Some(OptionId::Output) => {
@@ -665,7 +668,6 @@ struct CommandResult {
     items: Vec<Value>,
     tasks: Vec<Value>,
     logs: Vec<String>,
-    emitted_errors: usize,
 }
 
 impl CommandResult {
@@ -678,14 +680,12 @@ impl CommandResult {
             items: Vec::new(),
             tasks: Vec::new(),
             logs: Vec::new(),
-            emitted_errors: 0,
         }
     }
 
-    fn emit_errors(&mut self, session: &dyn Session) -> io::Result<()> {
-        for error in &self.errors[self.emitted_errors..] {
+    fn emit_errors(&self, session: &dyn Session) -> io::Result<()> {
+        for error in &self.errors {
             line(session, Stream::Err, error)?;
-            self.emitted_errors += 1;
         }
         Ok(())
     }
@@ -776,28 +776,31 @@ pub(super) async fn run(
     // main's archive dispatch errors retain argv, but config/password handlers
     // catch their own failures and return an empty command-input envelope.
     let error_argv = (options.json && matches!(options.command, "scan" | "extract")).then_some(args);
-    let generation = host.generation(cwd);
-    let language = generation.language();
+    let inspection = options.command == "doctor" || (options.command == "config" && !options.rule_stdin);
+    let generation = (!options.rule_stdin).then(|| host.generation(cwd, inspection));
+    let language = generation.as_ref().map_or_else(|| config::load_language(cwd), config::ConfigRead::language);
     let execution = match options.command {
-        "scan" | "extract" => match generation.normalized(true) {
+        "scan" | "extract" => match generation.unwrap().normalized(true) {
             Ok(config) => {
                 host.configure_idle(&config);
                 archives(host, cwd, &options, Arc::clone(&owned_session), language, &cancel, config).await
             }
             Err(error) => Err(error),
         },
-        "passwords" => match generation.normalized(true) {
+        "passwords" => match generation.unwrap().normalized(true) {
             Ok(config) => show_passwords(host, cwd, &options, session, language, config).await,
             Err(error) => Err(error),
         },
-        "config" => show_config(cwd, &options, session, language).await,
+        "config" if options.rule_stdin => validate_scan_rule(session).await,
+        "config" => show_config(generation.unwrap().into_inspection(), &options, session, language),
         "version" => show_version(session),
-        "doctor" => doctor(cwd, session, options.json, language),
+        "doctor" => doctor(cwd, generation.unwrap().into_inspection().map(|(path, _, settings)| (path, settings)),
+            session, options.json, language),
         "watch" => watch_command(host, cwd, &options, session, language, &cancel).await,
         _ => unreachable!(),
     };
     crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
-    let (code, mut result) = match execution {
+    let (code, result) = match execution {
         Ok(value) => value,
         Err(error) if is_cancellation(&error) => {
             interrupted(&options, session, language, None, Vec::new())?
@@ -983,33 +986,25 @@ impl<K: Eq + std::hash::Hash, V> ReceiptOrder<K, V> {
         }
     }
 
-    fn values(&self) -> impl Iterator<Item = &V> {
-        self.values.iter()
-    }
 }
 
 #[derive(Default)]
-struct ArchiveReceipts {
+struct ArchiveStatus {
     round: usize,
-    entries: Vec<ArchiveResult>,
+    failed: bool,
 }
 
-fn record_archives(
-    recorded: &mut ReceiptOrder<String, ArchiveReceipts>,
+fn record_archive_status(
+    recorded: &mut HashMap<String, ArchiveStatus>,
     round: usize,
-    current: impl IntoIterator<Item = ArchiveResult>,
+    current: &[ArchiveResult],
 ) {
     for archive in current {
-        let index = *recorded.indices.entry(path_key(&archive.path)).or_insert(recorded.values.len());
-        if index == recorded.values.len() {
-            recorded.values.push(ArchiveReceipts::default());
+        let status = recorded.entry(path_key(&archive.path)).or_default();
+        if status.round != round {
+            *status = ArchiveStatus { round, failed: false };
         }
-        let receipt = &mut recorded.values[index];
-        if receipt.round != round {
-            receipt.round = round;
-            receipt.entries.clear();
-        }
-        receipt.entries.push(archive);
+        status.failed |= !archive.partial && archive.failure.is_some();
     }
 }
 
@@ -1022,6 +1017,21 @@ fn password_failure(archive: &ArchiveResult) -> bool {
         .failure
         .as_ref()
         .is_some_and(|failure| failure.is_password_retry())
+}
+
+fn password_retry_paths(archives: &[ArchiveResult]) -> Vec<PathBuf> {
+    let mut retry = ReceiptOrder::new();
+    for archive in archives {
+        let Some(failure) = archive.failure.as_ref() else { continue; };
+        let blocked = failures::recovery(failure).map_or_else(
+            || failure.is_password_retry() && !failure.contains(FailureKind::MissingVolume),
+            crate::pipeline::InputRecovery::has_password_blocker,
+        );
+        if blocked {
+            retry.insert(path_key(&archive.path), &archive.path);
+        }
+    }
+    retry.values.into_iter().filter(|path| path.exists()).cloned().collect()
 }
 
 use super::failure::message as failure_message;
@@ -1046,11 +1056,15 @@ impl ArchiveSummary {
         json: bool,
     ) -> Self {
         let groups = failures::archive_groups(archives);
+        Self::from_groups(&groups, language, json)
+    }
+
+    fn from_groups(groups: &[Vec<&ArchiveResult>], language: Language, json: bool) -> Self {
         let mut summary = Self {
             processed: groups.len(),
             ..Self::default()
         };
-        for entries in &groups {
+        for entries in groups {
             let depth = entries[0].depth;
             summary.depth = summary.depth.max(depth);
             summary.nested += usize::from(depth > 1);
@@ -1461,13 +1475,13 @@ async fn archives(
         Err(error) => return archive_request_error(error, &inputs, options.command, language),
     };
     let mut overrides = serde_json::Map::new();
-    if let Some(value) = &options.depth {
-        settings.recursive_extract = Recursion::parse(value)?;
+    if let Some((depth, value)) = &options.depth {
+        settings.recursive_extract = *depth;
         overrides.insert("recursive_extract".into(), json!(value));
     }
-    if let Some(value) = &options.cleanup {
-        settings.post_extract.archive_cleanup_mode = CleanupMode::parse(value)?;
-        overrides.insert("archive_cleanup_mode".into(), json!(value));
+    if let Some(cleanup) = options.cleanup {
+        settings.post_extract.archive_cleanup_mode = cleanup;
+        overrides.insert("archive_cleanup_mode".into(), json!(cleanup.option()));
     }
     if let Some(flatten) = options.flatten {
         settings.post_extract.flatten_single_directory = flatten;
@@ -1557,11 +1571,9 @@ async fn archives(
     }
     let foreground = windows::Foreground::enter_async(&engine, &host.watch).await;
     let execution = async {
-    let mut result = CommandResult::new(options.command);
     let mut retries = 0;
-    let mut all_archives = ReceiptOrder::new();
-    let mut all_errors: ReceiptOrder<_, InputError> = ReceiptOrder::new();
-    let mut cleanup = ReceiptOrder::new();
+    let mut archive_status = HashMap::new();
+    let mut had_input_error = false;
     let mut checkpoints = Vec::new();
     let mut promoted_sources = Vec::new();
     loop {
@@ -1619,13 +1631,11 @@ async fn archives(
             return report_scan(current, inputs, options, session, language);
         }
         if options.json {
-            let counts = ArchiveSummary::collect(&current.archives, language, true);
-            let scan_errors = current
-                .errors
-                .iter()
-                .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-                .map(InputError::count)
-                .sum::<usize>();
+            let mut result = CommandResult::new(options.command);
+            let groups = failures::archive_groups(&current.archives);
+            let counts = ArchiveSummary::from_groups(&groups, language, true);
+            let filesystem_errors = current.errors.iter().filter(|error| error.kind == InputErrorKind::FilesystemScan);
+            let scan_errors = filesystem_errors.clone().map(InputError::count).sum::<usize>();
             let invalid_inputs = current
                 .errors
                 .iter()
@@ -1635,57 +1645,57 @@ async fn archives(
             let failed = counts.failed + embedded_failures.clone().count();
             let mut failures: Vec<_> = embedded_failures
                 .map(|error| failures::Report::input_error(error, language)).collect();
-            failures.extend(failures::collect(&current.archives, language));
-            failures.extend(invalid_inputs.map(|error| failures::Report::input_error(error, language)));
+            failures.extend(groups.iter().filter_map(|entries| failures::archive_report(entries, language)));
+            failures.extend(invalid_inputs.clone().map(|error| failures::Report::input_error(error, language)));
+            result.errors.extend(current.errors.iter()
+                .filter(|error| matches!(error.kind, InputErrorKind::FilesystemScan | InputErrorKind::EmbeddedDiscovery))
+                .chain(invalid_inputs)
+                .map(|error| input_error_message(error, language, true)));
+            result.errors.extend(counts.errors);
             result.tasks.push(json!({
                 "success_count": counts.success, "failed_count": failed,
                 "input_error_count": input_errors, "scan_error_count": scan_errors,
                 "processed_count": counts.processed, "partial_success_count": counts.partial,
-                "recovered_outputs": counts.recovered, "wrong_password_failure": current.archives.iter().any(password_failure),
+                "recovered_outputs": &counts.recovered, "wrong_password_failure": current.archives.iter().any(password_failure),
                 "failures": failures,
             }));
+            let mut cleanup = ReceiptOrder::new();
+            for receipt in current.cleanup_results {
+                cleanup.insert(path_key(&receipt.path), receipt);
+            }
+            result.inputs = json!({
+                "paths": inputs, "common_root": common_root, "json": true, "verbose": options.verbose,
+                "direct_file": options.direct, "deep_detect": options.deep, "config_overrides": overrides,
+            });
+            result.summary = json!({
+                "success_count": counts.success, "failed_count": failed, "scan_error_count": scan_errors,
+                "scan_failures": filesystem_errors.map(|error| failures::Report::filesystem_scan(error, language)).collect::<Vec<_>>(),
+                "input_error_count": input_errors, "processed_count": counts.processed,
+                "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
+                "password_retry_count": 0, "cleanup_results": cleanup.values,
+            });
+            result.items.push(password_item(
+                &user, &clipboard, &engine.recent_passwords(), builtin.as_deref(), !options.no_builtins,
+            ));
+            return Ok((i32::from(!result.errors.is_empty()), result));
         }
-        if !options.json {
-            let outputs = std::mem::take(&mut progress.display.lock().unwrap().outputs);
-            report_extract_round(&current, &outputs, began.elapsed().as_secs(), session, language)?;
-        }
+        let outputs = std::mem::take(&mut progress.display.lock().unwrap().outputs);
+        report_extract_round(&current, &outputs, began.elapsed().as_secs(), session, language)?;
         checkpoints = current.checkpoints;
         promoted_sources = current.promoted_sources;
-        for receipt in current.cleanup_results {
-            cleanup.insert(path_key(&receipt.path), receipt);
-        }
         // Retry inputs are physical paths. Replace every segment for a path
         // together even when a formerly nested carrier is now a root.
-        for archive in &current.archives {
-            if !options.json
-                && !archive.partial
-                && password_failure(archive)
-                && archive.path.exists()
-            {
-                candidate_paths.push(archive.path.clone());
-            }
-        }
-        trim_password_retry_recovery(&candidate_paths, &mut checkpoints, &mut promoted_sources);
-        record_archives(&mut all_archives, retries, current.archives);
-        for error in current.errors {
-            let omitted = error.scan_operation.as_deref() == Some("report_omitted");
-            let key = (
-                path_key(&error.path),
-                error.kind as u8,
-                error.scan_operation.clone(),
-                if omitted {
-                    String::new()
-                } else {
-                    error.message.clone()
-                },
-            );
-            if all_errors.indices.get(&key).is_none_or(|index| error.count() > all_errors.values[*index].count()) {
-                all_errors.insert(key, error);
-            }
-        }
+        candidate_paths = password_retry_paths(&current.archives);
+        record_archive_status(&mut archive_status, retries, &current.archives);
+        had_input_error |= current.errors.iter().any(|error| error.kind != InputErrorKind::Cleanup);
+        drop(current.archives);
+        drop(current.errors);
+        drop(current.cleanup_results);
+        drop(outputs);
         if candidate_paths.is_empty() {
             break;
         }
+        trim_password_retry_recovery(&candidate_paths, &mut checkpoints, &mut promoted_sources);
         let retry = confirm(
             session,
             language,
@@ -1713,55 +1723,10 @@ async fn archives(
         dedupe(&mut user);
         retries += 1;
     }
-    crate::pipeline::stage("cli_output", &Cancellation::new()).await?;
-    let counts = ArchiveSummary::collect(all_archives.values().flat_map(|receipt| &receipt.entries), language, options.json);
-    let scan_errors = all_errors
-        .values()
-        .filter(|error| error.kind == InputErrorKind::FilesystemScan)
-        .map(InputError::count)
-        .sum::<usize>();
-    let input_errors = all_errors
-        .values()
-        .filter(|error| error.kind == InputErrorKind::InvalidInput)
-        .count()
-        + counts.input_errors;
-    let failed = counts.failed + all_errors.values().filter(|error| error.kind == InputErrorKind::EmbeddedDiscovery).count();
-    // main emits scan failures before discovered target failures.
-    let is_scan_failure = |error: &&InputError| matches!(error.kind,
-        InputErrorKind::FilesystemScan | InputErrorKind::EmbeddedDiscovery);
-    result.errors.extend(all_errors.values().filter(is_scan_failure)
-        .chain(all_errors.values().filter(|error| error.kind == InputErrorKind::InvalidInput))
-        .map(|error| input_error_message(error, language, options.json)));
-    result.errors.extend(counts.errors);
-    if !options.json && scan_errors != 0 {
-        result
-            .errors
-            .push(language.text("report.scan_incomplete").into());
-    }
-    if options.json {
-        result.inputs = json!({
-            "paths": inputs, "common_root": common_root, "json": options.json, "verbose": options.verbose,
-            "direct_file": options.direct, "deep_detect": options.deep, "config_overrides": overrides,
-        });
-        result.summary = json!({
-            "success_count": counts.success, "failed_count": failed, "scan_error_count": scan_errors,
-            "scan_failures": all_errors.values().filter(|error| error.kind == InputErrorKind::FilesystemScan).map(|error| failures::Report::filesystem_scan(error, language)).collect::<Vec<_>>(),
-            "input_error_count": input_errors, "processed_count": counts.processed,
-            "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
-            "password_retry_count": retries, "cleanup_results": cleanup.values().collect::<Vec<_>>(),
-        });
-        result.items.push(password_item(
-            &user,
-            &clipboard,
-            &engine.recent_passwords(),
-            builtin.as_deref(),
-            !options.no_builtins,
-        ));
-    } else {
-        // Every round has already emitted its errors before the retry prompt.
-        result.emitted_errors = result.errors.len();
-    }
-    Ok((i32::from(!result.errors.is_empty()), result))
+    // Each round has already written its report. Only the latest status per
+    // carrier and any request-level input failures affect the final exit code.
+    let failed = had_input_error || archive_status.values().any(|status| status.failed);
+    Ok((i32::from(failed), CommandResult::new(options.command)))
     };
     let result = settle_unwind(execution).await;
     foreground.finish_async().await;
@@ -2365,37 +2330,35 @@ async fn show_passwords(
     Ok((0, result))
 }
 
-async fn show_config(
-    cwd: &Path,
+async fn validate_scan_rule(session: &dyn Session) -> io::Result<(i32, CommandResult)> {
+    let input = session.aread_line("").await?.ok_or(io::ErrorKind::UnexpectedEof)?;
+    crate::pipeline::stage("cli", &Cancellation::new()).await?;
+    let rule = serde_json::from_str(&input)?;
+    config::PathRule::parse(&rule)?.compile()?;
+    let mut result = CommandResult::new("config");
+    result.inputs = json!({"action": "validate"});
+    result.summary = json!({"valid": true});
+    Ok((0, result))
+}
+
+fn show_config(
+    settings: io::Result<(PathBuf, Value, Config)>,
     options: &Options,
     session: &dyn Session,
     language: Language,
 ) -> io::Result<(i32, CommandResult)> {
     let mut result = CommandResult::new("config");
     result.inputs = json!({"action": options.action});
-    if options.rule_stdin {
-        let input = session.aread_line("").await?.ok_or(io::ErrorKind::UnexpectedEof)?;
-        crate::pipeline::stage("cli", &Cancellation::new()).await?;
-        let rule = serde_json::from_str(&input)?;
-        config::PathRule::parse(&rule)?.compile()?;
-        result.summary = json!({"valid": true});
+    let (path, payload, settings) = settings?;
+    result.summary = json!({"config_path": path, "changed": false});
+    if options.action == "show" {
+        if !options.json {
+            write_json(session, &payload)?;
+        }
+        result.items.push(payload);
         return Ok((0, result));
     }
-    crate::pipeline::stage("cli", &Cancellation::new()).await?;
-    let (path, payload) = config::load_raw(cwd)?;
-    result.summary = json!({"config_path": path, "changed": false});
-    let errors = match Config::parse(&payload)? {
-        _ if options.action == "show" => {
-            // The persistent runtime validates configuration before dispatch,
-            // even when show returns the original, unnormalized document.
-            if !options.json {
-                write_json(session, &payload)?;
-            }
-            result.items.push(payload);
-            return Ok((0, result));
-        }
-        settings => settings.validate_scan_filters(),
-    };
+    let errors = settings.validate_scan_filters();
     if !errors.is_empty() {
         result.summary["valid"] = Value::Bool(false);
         result.errors.extend(errors.iter().map(|error| language.translate(
@@ -2426,12 +2389,13 @@ fn show_version(session: &dyn Session) -> io::Result<(i32, CommandResult)> {
 
 fn doctor(
     cwd: &Path,
+    settings: io::Result<(PathBuf, Config)>,
     session: &dyn Session,
     json_output: bool,
     language: Language,
 ) -> io::Result<(i32, CommandResult)> {
     let mut result = CommandResult::new("doctor");
-    result.items = super::doctor::checks(cwd)?;
+    result.items = super::doctor::checks(cwd, settings);
     let failed = result
         .items
         .iter()
@@ -2695,8 +2659,8 @@ mod option_tests {
             assert!(value.verbose && value.recursive && value.deep && value.direct);
             assert!(value.prompt_passwords && value.no_builtins);
             assert_eq!(value.flatten, Some(true));
-            assert_eq!(value.depth.as_deref(), Some("1"));
-            assert_eq!(value.cleanup.as_deref(), Some("k"));
+            assert_eq!(value.depth, Some((Recursion::Fixed(1), "1".into())));
+            assert_eq!(value.cleanup, Some(CleanupMode::Keep));
             assert_eq!(value.output.as_deref(), Some("dest"));
             assert_eq!(value.password_file.as_deref(), Some("passwords.txt"));
             assert_eq!(value.passwords[0].as_ref(), "secret");
@@ -2915,7 +2879,7 @@ mod recursive_prompt_tests {
                 else { vec!["extract".into(), "input.zip".into()] };
             let options = Options::parse(&args).unwrap();
             let error = "C:\\output: access denied".to_owned();
-            let (code, mut result) = interrupted(&options, &input, Language::En, None, vec![error.clone()]).unwrap();
+            let (code, result) = interrupted(&options, &input, Language::En, None, vec![error.clone()]).unwrap();
             if json { write_json(&input, &result).unwrap(); }
             else { result.emit_errors(&input).unwrap(); }
             assert_eq!(code, 130);
@@ -3104,19 +3068,14 @@ mod recursive_prompt_tests {
                 promoted: false, promotion_original_path: None, scan_layout: Default::default(),
             }
         }
-        let mut all = ReceiptOrder::new();
-        record_archives(&mut all, 0, [archive("C:/data/Carrier.bin", 2, 100, true),
+        let mut all = HashMap::new();
+        record_archive_status(&mut all, 0, &[archive("C:/data/Carrier.bin", 2, 100, true),
                                    archive("C:/data/Carrier.bin", 2, 900, true),
                                    archive("C:/data/other.zip", 1, 0, false)]);
-        record_archives(&mut all, 1, [archive("c:/DATA/carrier.bin", 1, 100, false)]);
-        let ordered: Vec<_> = all.values().flat_map(|receipt| &receipt.entries).collect();
-        assert_eq!(ordered.iter().map(|item| item.path.as_path()).collect::<Vec<_>>(),
-            [Path::new("c:/DATA/carrier.bin"), Path::new("C:/data/other.zip")]);
-        let summary = ArchiveSummary::collect(ordered, Language::En, true);
-        assert_eq!(summary.success, 2);
-        assert_eq!(summary.failed, 0);
-        assert_eq!(summary.nested, 0);
-        assert!(summary.errors.is_empty());
+        assert!(all[&path_key(Path::new("C:/data/Carrier.bin"))].failed);
+        record_archive_status(&mut all, 1, &[archive("c:/DATA/carrier.bin", 1, 100, false)]);
+        assert_eq!(all.len(), 2);
+        assert!(all.values().all(|status| !status.failed));
     }
 
     #[test]
@@ -3381,7 +3340,7 @@ mod recursive_prompt_tests {
     }
 
     #[test]
-    fn final_failure_summary_uses_main_names_and_emits_errors_once() {
+    fn final_failure_summary_uses_main_names_and_keeps_carrier_status() {
         let mut archive = report_archive("C:/inputs/blocked.zip", 0);
         archive.failure = Some(crate::pipeline::Failure::new(FailureKind::Damaged, "native detail"));
         let summary = ArchiveSummary::collect([&archive], Language::En, true);
@@ -3395,15 +3354,6 @@ mod recursive_prompt_tests {
         let summary = ArchiveSummary::collect([&archive, &sibling], Language::En, false);
         let message = format!("blocked.zip [{}]", Language::En.text("failure.embedded_extract_failed"));
         assert_eq!(summary.errors, [Language::En.translate("report.failed", &[("task", &message)])]);
-        let input = Input::default();
-        let mut result = CommandResult::new("extract");
-        result.errors = summary.errors;
-        result.emit_errors(&input).unwrap();
-        line(&input, Stream::Out, &"-".repeat(54)).unwrap();
-        result.emit_errors(&input).unwrap();
-        let text = String::from_utf8(input.combined.lock().unwrap().clone()).unwrap();
-        assert_eq!(text, format!("{}\n{}\n", result.errors[0], "-".repeat(54)));
-        assert!(!serde_json::to_value(&result).unwrap().as_object().unwrap().contains_key("emitted_errors"));
     }
 
     #[test]

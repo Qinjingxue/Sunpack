@@ -28,7 +28,7 @@ fn read_error(fault: &crate::pipeline::ArchiveReadFault) -> Value {
     })
 }
 
-fn recovery(failure: &Failure) -> Option<&crate::pipeline::InputRecovery> {
+pub(in crate::runtime) fn recovery(failure: &Failure) -> Option<&crate::pipeline::InputRecovery> {
     failure.recovery.as_deref().or_else(|| failure.causes.iter().find_map(recovery))
 }
 
@@ -99,14 +99,19 @@ impl Report {
                 if failure.kind == FailureKind::BackendUnavailable {
                     spec = super::Message::key("failure.password_verifier_unavailable");
                 }
-                // Only native resolver results carry an actual diagnostic and
-                // read-error record. A missing one is not reconstructed from a
-                // generic classification message.
-                if let Some(evidence) = failure.evidence.as_deref()
-                    .filter(|e| e.stage.as_deref() == Some("password_preflight"))
-                {
-                    details = json!({"diagnostic": failure.message, "read_error": evidence.archive_read_fault.as_ref().map(read_error)});
-                }
+                let evidence = failure.evidence.as_deref()
+                    .filter(|e| e.stage.as_deref() == Some("password_preflight"));
+                let diagnostic = if evidence.is_some() {
+                    failure.message.as_str()
+                } else if failure.kind == FailureKind::PasswordRequired {
+                    "archive requires a password but no candidates were provided"
+                } else {
+                    ""
+                };
+                let read_error = evidence
+                    .and_then(|evidence| evidence.archive_read_fault.as_ref())
+                    .map(read_error);
+                details = json!({"diagnostic": diagnostic, "read_error": read_error});
             }
             Some(FailureContext::WorkerWarning) => {
                 stage = "extraction";
@@ -255,11 +260,6 @@ fn aggregate(causes: Vec<Report>, count: usize, language: Language) -> Report {
         details: json!({"segment_count": count, "failed_segment_count": causes.len()}), causes }
 }
 
-pub(in crate::runtime) fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Report> {
-    archive_groups(archives.iter()).into_iter()
-        .filter_map(|entries| archive_report(&entries, language)).collect()
-}
-
 pub(in crate::runtime) fn archive_groups<'a>(archives: impl IntoIterator<Item = &'a ArchiveResult>) -> Vec<Vec<&'a ArchiveResult>> {
     let mut positions = HashMap::new();
     let mut groups: Vec<Vec<&ArchiveResult>> = Vec::new();
@@ -358,6 +358,11 @@ fn archive_projection(entries: &[&ArchiveResult], language: Language, warning_on
 mod tests {
     use super::*;
     use crate::pipeline::FailureEvidence;
+
+    fn collect(archives: &[ArchiveResult], language: Language) -> Vec<Report> {
+        archive_groups(archives).into_iter()
+            .filter_map(|entries| archive_report(&entries, language)).collect()
+    }
 
     #[test]
     fn scan_failure_preserves_main_receipt_and_count() {

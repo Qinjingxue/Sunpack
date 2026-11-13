@@ -1,3 +1,4 @@
+import ctypes
 import io
 import json
 import os
@@ -5,8 +6,9 @@ import subprocess
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from ctypes import wintypes
 from pathlib import Path
+from threading import Barrier
 
 import psutil
 import pytest
@@ -229,6 +231,60 @@ def test_existing_runtime_uses_latest_archive_request_idle_setting(package, tmp_
     assert not state.exists()
 
 
+def test_launcher_restarts_while_previous_runtime_drains(package):
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    package.configure(performance={"persistent_server_idle_seconds": 60})
+    assert package.json("config", "show")["items"]
+    state, = package.data.glob("runtime-*.state")
+    pipe, _, _, pid, _ = state.read_text(encoding="utf-8").splitlines()
+    owner = psutil.Process(int(pid))
+    manifest = str(state) + ".events.json"
+
+    # Deny replacement until the next launcher reaches the previous owner's
+    # teardown window. Keep reads and writes shared for the existing writer.
+    deadline = time.monotonic() + 10
+    while True:
+        handle = kernel.CreateFileW(manifest, 0x80000000, 3, None, 3, 0x80, None)
+        if handle != wintypes.HANDLE(-1).value:
+            break
+        assert ctypes.get_last_error() in (2, 32) and time.monotonic() < deadline
+        time.sleep(0.01)
+    replacement = None
+    try:
+        assert package.run("--persistent-shutdown").returncode == 0
+        deadline = time.monotonic() + 10
+        while kernel.WaitNamedPipeW(pipe, 1) or ctypes.get_last_error() != 2:
+            assert time.monotonic() < deadline, "old listener is still open"
+            time.sleep(0.01)
+        assert owner.is_running()
+        replacement = subprocess.Popen(
+            [str(package.launcher), "config", "show", "--json"], cwd=package.data,
+            env=package.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        with pytest.raises(subprocess.TimeoutExpired):
+            replacement.wait(timeout=1)
+    finally:
+        assert kernel.CloseHandle(handle)
+        owner.wait(timeout=15)
+        if replacement is not None:
+            try:
+                output, error = replacement.communicate(timeout=15)
+            finally:
+                if replacement.poll() is None:
+                    replacement.kill()
+                    replacement.communicate(timeout=10)
+    assert replacement.returncode == 0, error
+    assert json.loads(output)["items"]
+    assert int(state.read_text(encoding="utf-8").splitlines()[3]) != owner.pid
+
+
 def test_extract_reports_invalid_input_and_filesystem_errors_separately(package, tmp_path):
     missing = tmp_path / "missing.zip"
     report = package.json("extract", "--direct-file", tmp_path, missing, code=1)
@@ -417,6 +473,7 @@ def test_main_cli_contracts_preserve_parent_flags_and_reject_abbreviations(packa
     assert empty["items"][0]["user_passwords"] == ["explicit"]
 
 
+@pytest.mark.requires_watch_broker
 def test_standalone_watch_once_keeps_continuous_status(package, tmp_path):
     # The existing once test has continuous Watch enabled. This covers the
     # independent host status/generation contract without starting a service.

@@ -1,4 +1,5 @@
 use super::{Failure, FailureKind};
+use crate::collections::CacheOrder;
 use crate::core::passwords::PasswordSnapshot;
 use crate::io::archive_state::{ArchiveInput, OpenMode};
 use crate::io::cancellation::Cancellation;
@@ -89,93 +90,10 @@ pub(super) struct AttemptCache(Arc<Mutex<AttemptCacheState>>);
 
 #[derive(Default)]
 struct AttemptCacheState {
+    // Independent budgets keep negative candidates from evicting positive proofs.
     successes: CacheOrder<Key, Option<Arc<str>>>,
     negative: CacheOrder<(Key, Arc<str>), ()>,
     recent: VecDeque<Arc<str>>,
-}
-
-// main keeps independent LRU budgets for successful contexts and individual
-// rejected (context, password) pairs. A batch of contexts must not evict all
-// proofs or rejections just because it crosses an unrelated context limit.
-// Slots form an intrusive oldest-to-newest list. A hit changes only links,
-// with no key clone, allocation, ordered-tree operation, or growing timestamp.
-// Each cache has a fixed positive budget; eviction reuses the oldest slot.
-struct CacheOrder<K, V> {
-    entries: HashMap<K, usize>,
-    slots: Vec<CacheEntry<K, V>>,
-    oldest: Option<usize>,
-    newest: Option<usize>,
-}
-
-struct CacheEntry<K, V> {
-    key: K,
-    value: V,
-    previous: Option<usize>,
-    next: Option<usize>,
-}
-
-impl<K, V> Default for CacheOrder<K, V> {
-    fn default() -> Self {
-        Self { entries: HashMap::new(), slots: Vec::new(), oldest: None, newest: None }
-    }
-}
-
-impl<K: Eq + std::hash::Hash + Clone, V> CacheOrder<K, V> {
-    fn touch(&mut self, index: usize) {
-        if self.newest == Some(index) {
-            return;
-        }
-        let previous = self.slots[index].previous;
-        let next = self.slots[index].next;
-        if let Some(previous) = previous {
-            self.slots[previous].next = next;
-        } else {
-            self.oldest = next;
-        }
-        if let Some(next) = next {
-            self.slots[next].previous = previous;
-        }
-        if let Some(newest) = self.newest {
-            self.slots[newest].next = Some(index);
-        }
-        self.slots[index].previous = self.newest;
-        self.slots[index].next = None;
-        self.newest = Some(index);
-    }
-
-    fn get(&mut self, key: &K) -> Option<&V> {
-        let index = *self.entries.get(key)?;
-        self.touch(index);
-        Some(&self.slots[index].value)
-    }
-
-    fn insert(&mut self, key: K, value: V, limit: usize) {
-        if let Some(&index) = self.entries.get(&key) {
-            self.slots[index].value = value;
-            self.touch(index);
-            return;
-        }
-        let index = if self.slots.len() == limit {
-            let index = self.oldest.unwrap();
-            self.entries.remove(&self.slots[index].key);
-            self.slots[index].key = key.clone();
-            self.slots[index].value = value;
-            self.touch(index);
-            index
-        } else {
-            let index = self.slots.len();
-            self.slots.push(CacheEntry { key: key.clone(), value,
-                previous: self.newest, next: None });
-            if let Some(newest) = self.newest {
-                self.slots[newest].next = Some(index);
-            } else {
-                self.oldest = Some(index);
-            }
-            self.newest = Some(index);
-            index
-        };
-        self.entries.insert(key, index);
-    }
 }
 
 impl AttemptCache {
@@ -516,7 +434,6 @@ impl CandidateSet {
             encrypted: needs_password.then_some(true),
             verified: false,
             evidence,
-            has_candidates,
             cache_key: key,
         };
         Ok(Ok(plan))
@@ -551,7 +468,6 @@ pub(super) struct PasswordPlan {
     pub encrypted: Option<bool>,
     pub verified: bool,
     pub evidence: Option<&'static str>,
-    pub has_candidates: bool,
     cache_key: Option<Key>,
 }
 
@@ -564,7 +480,6 @@ impl PasswordPlan {
             encrypted: None,
             verified: false,
             evidence: Some("empty_password_direct"),
-            has_candidates: false,
             cache_key: None,
         }
     }
@@ -576,22 +491,17 @@ impl PasswordPlan {
             encrypted: Some(false),
             verified: false,
             evidence: None,
-            has_candidates: false,
             cache_key: None,
         }
     }
 
     fn verified(password: Arc<str>) -> Self {
-        // A verified empty password is still a real candidate, not the
-        // no-candidate fallback used before encryption is known.
-        let has_candidates = true;
         Self {
             selected: Some(password),
             candidates: Vec::new(),
             encrypted: Some(true),
             verified: true,
             evidence: None,
-            has_candidates,
             cache_key: None,
         }
     }
@@ -653,47 +563,6 @@ mod tests {
         assert_eq!(plan.selected.as_deref(), Some("fixture-secret"));
         assert!(plan.candidates.is_empty(), "must not use the all-rejected candidate fallback");
         std::fs::remove_file(source).unwrap();
-    }
-
-    #[test]
-    fn cache_order_reuses_slots_and_matches_lru_on_hits_and_replacements() {
-        // Compare mixed middle/head/tail touches and overwritten values with a
-        // simple ordered-list model; also catch leaked eviction slots.
-        for limit in [1, 3, 17] {
-            let mut cache = CacheOrder::default();
-            let mut expected = VecDeque::new();
-            for step in 0..512 {
-                let key = (step * 7 + step / 3) % (limit * 2 + 1);
-                let previous = expected.iter().position(|(old, _)| *old == key)
-                    .and_then(|index| expected.remove(index));
-                if step % 3 == 0 {
-                    assert_eq!(cache.get(&key).copied(), previous.map(|(_, value)| value));
-                    if let Some(previous) = previous {
-                        expected.push_back(previous);
-                    }
-                } else {
-                    cache.insert(key, step, limit);
-                    expected.push_back((key, step));
-                    if expected.len() > limit { expected.pop_front(); }
-                }
-                let mut actual = Vec::new();
-                let mut position = cache.oldest;
-                let mut previous = None;
-                while let Some(index) = position {
-                    assert!(actual.len() < limit, "cyclic LRU links");
-                    let entry = &cache.slots[index];
-                    assert_eq!(entry.previous, previous);
-                    assert_eq!(cache.entries.get(&entry.key), Some(&index));
-                    actual.push((entry.key, entry.value));
-                    previous = position;
-                    position = entry.next;
-                }
-                assert_eq!(cache.newest, previous);
-                assert_eq!(actual, expected.iter().copied().collect::<Vec<_>>());
-                assert_eq!(cache.entries.len(), expected.len());
-                assert_eq!(cache.slots.len(), expected.len());
-            }
-        }
     }
 
     #[test]
@@ -873,7 +742,6 @@ mod tests {
         let plan = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
         assert_eq!(plan.selected.as_deref(), Some(""));
         assert_eq!(plan.candidates, [Arc::<str>::from("")]);
-        assert!(plan.has_candidates);
         let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
         assert_eq!(absent.plan(&input, None, &Cancellation::new()).unwrap()
             .err().unwrap().kind, FailureKind::PasswordRequired);
@@ -886,11 +754,10 @@ mod tests {
         let key = Key::for_input(&input, &sessions).unwrap();
         cache.remember_proof(key, Some(Arc::from("")));
         let cached = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-        assert!(cached.verified && cached.has_candidates);
+        assert!(cached.verified);
         assert_eq!(cached.selected.as_deref(), Some(""));
         let known = empty.plan(&input, Some(Arc::from("")), &Cancellation::new()).unwrap().unwrap();
-        assert!(known.verified && known.has_candidates);
-        assert!(!PasswordPlan::empty_fallback().has_candidates);
+        assert!(known.verified);
         drop(sessions);
         let _ = std::fs::remove_file(path);
     }
@@ -973,8 +840,9 @@ mod tests {
         let sessions = open_sessions(&input).unwrap();
         assert!(Key::for_input(&input, &sessions).unwrap() != planned);
         cache.clear();
-        assert!(cache.0.lock().unwrap().successes.entries.is_empty());
-        assert!(cache.0.lock().unwrap().negative.entries.is_empty());
+        let state = cache.0.lock().unwrap();
+        assert_eq!(state.successes.len(), 0);
+        assert_eq!(state.negative.len(), 0);
         drop(sessions);
         let _ = std::fs::remove_file(head);
         let _ = std::fs::remove_file(tail);

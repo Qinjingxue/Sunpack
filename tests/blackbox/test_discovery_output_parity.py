@@ -191,8 +191,10 @@ def _nested_mixed_carrier(package, tmp_path, *, recursive_child=False):
     # Unlike a successful segment containing a blocked child, this carrier's
     # own sibling segment fails. Promotion must settle the carrier itself.
     (tmp_path / "secret.txt").write_bytes(b"secret")
-    locked = tmp_path / "locked.zip"
-    subprocess.run([str(package.tools / "7z.exe"), "a", "-tzip", "-mem=AES256", "-punknown",
+    locked = tmp_path / "locked.7z"
+    # Encrypted headers block this segment before the worker writes any files.
+    # A payload-encrypted ZIP can leave an unverified member and a second branch.
+    subprocess.run([str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", "-punknown",
                     str(locked), "secret.txt"], cwd=tmp_path, check=True, capture_output=True)
     ordinary = io.BytesIO()
     with zipfile.ZipFile(ordinary, "w") as archive:
@@ -214,7 +216,8 @@ def _nested_mixed_carrier(package, tmp_path, *, recursive_child=False):
 def test_nested_mixed_carrier_promotes_before_flattening_successful_segment(package, tmp_path):
     outer, carrier = _nested_mixed_carrier(package, tmp_path)
     output = tmp_path / "out"
-    package.configure(post_extract={"flatten_single_directory": True}, recursive_authorization={"enabled": False})
+    package.configure(post_extract={"flatten_single_directory": True}, recursive_authorization={"enabled": False},
+                      filesystem={"scan_filters_enabled": False})
     report = package.json("extract", "-d", "-r", "*", "-c", "k", "--no-builtin-pw", "-o", output, outer, code=1)
     assert (output / "outer" / "carrier" / "hello.txt").read_bytes() == b"independent success", report
     assert (output / "outer" / "keep.txt").is_file()
@@ -226,7 +229,8 @@ def test_nested_mixed_carrier_survives_cancel_during_successful_sibling_recursio
     outer, carrier = _nested_mixed_carrier(package, tmp_path, recursive_child=True)
     output = tmp_path / "out"
     package.configure(recursive_authorization={"enabled": False},
-                      post_extract={"flatten_single_directory": True})
+                      post_extract={"flatten_single_directory": True},
+                      filesystem={"scan_filters_enabled": False})
 
     def wait_for_round(stream, number):
         marker = f"[CLI] Round {number} finished. Continue recursive extraction? (y/n): "

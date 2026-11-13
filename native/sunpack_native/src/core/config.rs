@@ -289,9 +289,16 @@ pub(crate) fn resolve_sources(cwd: &Path) -> ConfigSources {
     sources
 }
 
-fn parse_json(text: &str, path: &Path) -> io::Result<Value> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
+fn parse_file_json(path: &Path) -> io::Result<Value> {
+    let text = crate::io::resource_lifecycle::read_shared_utf8_text(path)?;
+    if text.starts_with('\u{feff}') {
+        return Err(invalid("Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)"));
+    }
+    serde_json::from_str(&text).map_err(|error| invalid(format!("{}: {error}", path.display())))
+}
+
+fn parse_config_file(path: &Path) -> io::Result<Value> {
+    let value = parse_file_json(path)?;
     if !value.is_object() {
         return Err(invalid(format!(
             "Config file must contain a JSON object: {}",
@@ -316,7 +323,7 @@ fn merge_named(base: &mut Vec<Value>, changes: Vec<Value>) {
             .rev()
             .find(|item| item["name"] == name.as_str())
         {
-            merge(existing, entry, false);
+            merge(existing, entry, MergeScope::Other);
         } else {
             base.push(entry);
         }
@@ -337,18 +344,32 @@ fn merge_named(base: &mut Vec<Value>, changes: Vec<Value>) {
     *base = ordered;
 }
 
-fn merge(base: &mut Value, layer: Value, filesystem: bool) {
+#[derive(Clone, Copy)]
+enum MergeScope {
+    Root,
+    Filesystem,
+    Other,
+}
+
+fn merge(base: &mut Value, layer: Value, scope: MergeScope) {
     match (base, layer) {
         (Value::Object(base), Value::Object(layer)) => {
             for (key, new) in layer {
                 if let Some(old) = base.get_mut(&key) {
                     match (old, new) {
                         (Value::Array(old), Value::Array(new))
-                            if filesystem && key == "scan_filters" =>
+                            if matches!(scope, MergeScope::Filesystem) && key == "scan_filters" =>
                         {
                             merge_named(old, new);
                         }
-                        (old, new) => merge(old, new, key == "filesystem"),
+                        (old, new) => {
+                            let scope = if matches!(scope, MergeScope::Root) && key == "filesystem" {
+                                MergeScope::Filesystem
+                            } else {
+                                MergeScope::Other
+                            };
+                            merge(old, new, scope);
+                        }
                     }
                 } else {
                     base.insert(key, new);
@@ -359,62 +380,37 @@ fn merge(base: &mut Value, layer: Value, filesystem: bool) {
     }
 }
 
-struct Layers {
-    sources: ConfigSources,
-    advanced: Option<String>,
-    simple: Option<String>,
-    overrides: Option<String>,
-}
-
-impl Layers {
-    fn read(sources: ConfigSources, cwd: &Path) -> io::Result<Self> {
-        use crate::io::resource_lifecycle::read_shared_utf8_text;
-        if sources.simple.is_none() && sources.advanced.is_none() {
+impl ConfigSources {
+    fn load(&self, cwd: &Path) -> io::Result<Value> {
+        if self.simple.is_none() && self.advanced.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Missing required {SIMPLE} or {ADVANCED}. Searched: {}",
-                    watch_paths(cwd, &sources).iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")),
+                    watch_paths(cwd, self).iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")),
             ));
         }
-        let advanced = sources
+        let mut value = self
             .advanced
-            .clone()
-            .map(read_shared_utf8_text)
-            .transpose()?;
-        let simple = sources
-            .simple
-            .clone()
-            .map(read_shared_utf8_text)
-            .transpose()?;
-        let overrides = match sources.override_file.clone() {
-            Some(path) => Some(read_shared_utf8_text(path)?),
-            None => sources.inline_override.as_deref().map(str::to_owned),
-        };
-        Ok(Self {
-            sources,
-            advanced,
-            simple,
-            overrides,
-        })
-    }
-
-    fn parse(&self) -> io::Result<Value> {
-        let mut value = match self.sources.advanced.as_deref().zip(self.advanced.as_deref()) {
-            Some((path, text)) => parse_json(text, path)?,
-            None => Value::Object(Map::new()),
-        };
-        if let Some((path, text)) = self.sources.simple.as_deref().zip(self.simple.as_deref()) {
-            merge(&mut value, parse_json(text, path)?, false);
+            .as_deref()
+            .map(parse_config_file)
+            .transpose()?
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        if let Some(path) = self.simple.as_deref() {
+            merge(&mut value, parse_config_file(path)?, MergeScope::Root);
         }
-        if let Some(text) = self.overrides.as_deref() {
-            let layer = match self.sources.override_file.as_deref() {
-                Some(path) => parse_json(text, path)?,
-                None => serde_json::from_str::<Value>(text).map_err(|error| invalid(if text.starts_with(['{', '[']) {
+        let overrides = match (self.override_file.as_deref(), self.inline_override.as_deref()) {
+            (Some(path), _) => Some(parse_file_json(path)?),
+            (None, Some(text)) => {
+                let layer = serde_json::from_str::<Value>(text).map_err(|error| invalid(if text.starts_with(['{', '[']) {
                     format!("{OVERRIDES} contains invalid JSON: {error}")
                 } else {
                     format!("{OVERRIDES} must be an inline JSON object or an existing JSON file: {text}")
-                }))?,
-            };
+                }))?;
+                Some(layer)
+            }
+            (None, None) => None,
+        };
+        if let Some(layer) = overrides {
             let object = layer.as_object()
                 .ok_or_else(|| invalid(format!("{OVERRIDES} must contain a JSON object")))?;
             let unknown: Vec<_> = object.keys()
@@ -422,16 +418,16 @@ impl Layers {
             if !unknown.is_empty() {
                 return Err(invalid(format!("{OVERRIDES} contains unknown config sections: {}", unknown.join(", "))));
             }
-            merge(&mut value, layer, false);
+            merge(&mut value, layer, MergeScope::Root);
         }
         Ok(value)
     }
 }
 
 pub fn load_raw(cwd: &Path) -> io::Result<(PathBuf, Value)> {
-    let layers = Layers::read(resolve_sources(cwd), cwd)?;
-    let value = layers.parse()?;
-    Ok((layers.sources.primary().to_path_buf(), value))
+    let sources = resolve_sources(cwd);
+    let value = sources.load(cwd)?;
+    Ok((sources.primary().to_path_buf(), value))
 }
 
 
@@ -439,6 +435,7 @@ struct Generation {
     stamp: Option<[Option<PhysicalFileGeneration>; 3]>,
     snapshot: Snapshot,
     revision: u64,
+    language: Language,
 }
 
 static SOURCE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -451,6 +448,14 @@ pub(crate) struct ConfigRead {
     observed: io::Result<Arc<Generation>>,
     previous: Option<Arc<Generation>>,
     language: Language,
+    raw: Option<Value>,
+}
+
+fn inspection_path(sources: &ConfigSources) -> PathBuf {
+    let path = sources.primary();
+    std::fs::canonicalize(path)
+        .map(|path| crate::path_keys::normalize_windows_extended_prefix(path.to_string_lossy().into_owned()).into())
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl ConfigRead {
@@ -467,20 +472,32 @@ impl ConfigRead {
             },
         }
     }
+
+    pub(crate) fn into_inspection(self) -> io::Result<(PathBuf, Value, Config)> {
+        let current = self.observed?;
+        Ok((
+            inspection_path(&current.snapshot.sources),
+            self.raw.expect("inspection reads the raw configuration"),
+            current.snapshot.config.clone(),
+        ))
+    }
 }
 
 pub(crate) fn generation(cwd: &Path) -> ConfigRead {
-    read_generation(cwd, false, false)
+    read_generation(cwd, resolve_sources(cwd), ReadMode::CheckStamp)
 }
 
-pub(crate) fn observed_generation(cwd: &Path) -> ConfigRead {
-    read_generation(cwd, false, true)
+#[derive(Clone, Copy)]
+pub(crate) enum ReadMode {
+    CheckStamp,
+    Observe,
+    Refresh,
+    Inspect,
 }
 
-fn read_generation(cwd: &Path, refresh: bool, observed: bool) -> ConfigRead {
+pub(crate) fn read_generation(cwd: &Path, sources: ConfigSources, mode: ReadMode) -> ConfigRead {
     static CACHE: Mutex<VecDeque<Arc<Generation>>> = Mutex::new(VecDeque::new());
     let revision = SOURCE_REVISION.load(std::sync::atomic::Ordering::Acquire);
-    let sources = resolve_sources(cwd);
     let previous = {
         let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
         cache
@@ -489,9 +506,15 @@ fn read_generation(cwd: &Path, refresh: bool, observed: bool) -> ConfigRead {
             .and_then(|index| cache.remove(index))
             .inspect(|entry| cache.push_front(Arc::clone(entry)))
     };
-    let refresh = refresh || previous.as_ref().is_some_and(|hit| hit.revision != revision);
-    if let Some(hit) = previous.as_ref().filter(|_| observed && !refresh) {
-        return ConfigRead { observed: Ok(Arc::clone(hit)), previous: None, language: hit.snapshot.config.cli.language };
+    let refresh = matches!(mode, ReadMode::Refresh | ReadMode::Inspect)
+        || previous.as_ref().is_some_and(|hit| hit.revision != revision);
+    if let Some(hit) = previous.as_ref().filter(|_| matches!(mode, ReadMode::Observe) && !refresh) {
+        return ConfigRead {
+            observed: Ok(Arc::clone(hit)),
+            previous: None,
+            language: hit.language,
+            raw: None,
+        };
     }
     let stamp = sources.stamp().ok();
     if let Some(hit) = previous
@@ -501,21 +524,26 @@ fn read_generation(cwd: &Path, refresh: bool, observed: bool) -> ConfigRead {
         return ConfigRead {
             observed: Ok(Arc::clone(hit)),
             previous: None,
-            language: hit.snapshot.config.cli.language,
+            language: hit.language,
+            raw: None,
         };
     }
-    let mut language = Language::Zh;
+    let mut language = default_language();
+    let mut inspection = None;
     let observed = (|| {
-        let layers = Layers::read(sources, cwd)?;
-        let raw = layers.parse()?;
+        let raw = sources.load(cwd)?;
         language = raw_language(&raw);
         let config = Config::parse(&raw)?;
+        if matches!(mode, ReadMode::Inspect) {
+            inspection = Some(raw);
+        }
         let current = Arc::new(Generation {
             stamp,
             revision,
+            language,
             snapshot: Snapshot {
                 config,
-                sources: layers.sources,
+                sources,
             },
         });
         let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
@@ -546,15 +574,23 @@ fn read_generation(cwd: &Path, refresh: bool, observed: bool) -> ConfigRead {
         observed,
         previous,
         language,
+        raw: inspection,
     }
 }
 
 pub fn load_language(cwd: &Path) -> Language {
-    load_raw(cwd).map_or(Language::Zh, |(_, raw)| raw_language(&raw))
+    load_raw(cwd).map_or_else(|_| default_language(), |(_, raw)| raw_language(&raw))
 }
 
 fn raw_language(raw: &Value) -> Language {
-    Language::parse(field(raw, &["cli", "language"]).as_str().unwrap_or(""))
+    let Some(cli) = raw.get("cli").and_then(Value::as_object) else {
+        return default_language();
+    };
+    Language::parse(cli.get("language").and_then(Value::as_str).unwrap_or_default())
+}
+
+fn default_language() -> Language {
+    Language::parse(defaults()["cli"]["language"].as_str().expect("valid built-in language"))
 }
 
 pub fn load_snapshot(cwd: &Path) -> io::Result<Snapshot> {
@@ -564,7 +600,7 @@ pub fn load_snapshot(cwd: &Path) -> io::Result<Snapshot> {
 pub(crate) fn reload_snapshot(cwd: &Path) -> io::Result<Snapshot> {
     // File notifications are authoritative even on filesystems whose metadata
     // cannot distinguish two same-size writes within one timestamp tick.
-    snapshot(read_generation(cwd, true, false))
+    snapshot(read_generation(cwd, resolve_sources(cwd), ReadMode::Refresh))
 }
 
 fn snapshot(read: ConfigRead) -> io::Result<Snapshot> {
@@ -832,7 +868,7 @@ impl Config {
         Ok(Self {
             user_passwords: user_passwords.into(),
             cli: CliConfig {
-                language: raw_language(value),
+                language: Language::parse(field(value, &["cli", "language"]).as_str().unwrap_or_default()),
             },
             runtime: RuntimeConfig { process_mode },
             output: OutputConfig {
@@ -991,6 +1027,14 @@ impl CleanupMode {
             "r" => Ok(Self::Recycle),
             "k" => Ok(Self::Keep),
             _ => Err(invalid("archive_cleanup_mode must be one of: d, r, k")),
+        }
+    }
+
+    pub(crate) fn option(self) -> &'static str {
+        match self {
+            Self::Delete => "d",
+            Self::Recycle => "r",
+            Self::Keep => "k",
         }
     }
 }
@@ -1225,19 +1269,21 @@ mod layer_merge_tests {
 
     #[test]
     fn one_config_value_preserves_layer_precedence_and_named_filter_order() {
-        let layers = Layers {
-            sources: ConfigSources {
-                advanced: Some("advanced.json".into()), simple: Some("simple.json".into()),
-                ..ConfigSources::default()
-            },
-            advanced: Some(r#"{"cli":{"language":"en","language":"zh"},"user_passwords":["old"],"filesystem":{"scan_filters":[{"name":"a","z":0,"a":1},{"name":"b","keep":true},{"name":"c","untouched":7}]}}"#.into()),
-            simple: Some(r#"{"filesystem":{"scan_filters":[{"name":"b","extra":7},{"name":"a","a":2,"new":3}]},"user_passwords":["second","first"]}"#.into()),
-            overrides: Some(r#"{"filesystem":{"scan_filters":[{"name":"a","last":1},{"free":true},{"name":"a","later":2}]},"cli":{"verbose":true}}"#.into()),
+        let advanced = crate::test_support::temp_file("merge_advanced", br#"{"cli":{"language":"en","language":"zh"},"user_passwords":["old"],"filesystem":{"scan_filters":[{"name":"a","z":0,"a":1},{"name":"b","keep":true},{"name":"c","untouched":7}]},"analysis":{"filesystem":{"scan_filters":[{"name":"a","old":true}]}}}"#);
+        let simple = crate::test_support::temp_file("merge_simple", br#"{"filesystem":{"scan_filters":[{"name":"b","extra":7},{"name":"a","a":2,"new":3}]},"user_passwords":["second","first"],"analysis":{"filesystem":{"scan_filters":[{"name":"a","new":true}]}}}"#);
+        let sources = ConfigSources {
+            advanced: Some(advanced.clone()),
+            simple: Some(simple.clone()),
+            inline_override: Some(r#"{"filesystem":{"scan_filters":[{"name":"a","last":1},{"free":true},{"name":"a","later":2}]},"cli":{"verbose":true}}"#.into()),
+            ..ConfigSources::default()
         };
-        let value = layers.parse().unwrap();
+        let value = sources.load(Path::new(".")).unwrap();
+        std::fs::remove_file(advanced).unwrap();
+        std::fs::remove_file(simple).unwrap();
         let expected = serde_json::json!({
             "cli":{"language":"zh","verbose":true},
             "user_passwords":["second","first"],
+            "analysis":{"filesystem":{"scan_filters":[{"name":"a","new":true}]}},
             "filesystem":{"scan_filters":[
                 {"name":"a","z":0,"a":2,"new":3,"last":1,"later":2},
                 {"name":"a","z":0,"a":2,"new":3,"last":1,"later":2},

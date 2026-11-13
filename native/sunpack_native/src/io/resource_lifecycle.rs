@@ -267,19 +267,12 @@ impl Seek for TrackedFile {
     }
 }
 
-fn shared_utf8_text(path: PathBuf) -> io::Result<String> {
+/// Read one UTF-8 snapshot without blocking an atomic replacement of its path.
+pub(crate) fn read_shared_utf8_text(path: &Path) -> io::Result<String> {
     let mut file = TrackedFile::open_reader(path)?;
     let mut text = String::new();
-    file.file.read_to_string(&mut text)?;
-    if text.starts_with('\u{feff}') {
-        text.drain(..3);
-    }
+    file.read_to_string(&mut text)?;
     Ok(text)
-}
-
-/// Read one UTF-8 snapshot without blocking an atomic replacement of its path.
-pub(crate) fn read_shared_utf8_text(path: PathBuf) -> std::io::Result<String> {
-    Ok((shared_utf8_text(path))?)
 }
 
 impl NativeResourceGuard {

@@ -1,9 +1,9 @@
 use super::windows;
-use crate::core::{config, i18n::Language, resources};
+use crate::core::{config::Config, i18n::Language, resources};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
 fn check(name: &str, status: &str, detail: impl Into<String>) -> Value {
@@ -22,10 +22,7 @@ fn checked(name: &str, result: io::Result<String>) -> Value {
     }
 }
 
-pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
-    let settings = config::load_raw(cwd).and_then(|(path, payload)| {
-        config::Config::parse(&payload).map(|settings| (path, settings))
-    });
+pub(super) fn checks(cwd: &Path, settings: io::Result<(PathBuf, Config)>) -> Vec<Value> {
     let config_check = match &settings {
         Ok((path, settings)) => {
             let errors = settings.validate_scan_filters();
@@ -125,7 +122,7 @@ pub(super) fn checks(cwd: &Path) -> io::Result<Vec<Value>> {
             format!("unable to read watch roots: {error}"),
         )),
     }
-    Ok(checks)
+    checks
 }
 
 fn data_directory() -> io::Result<String> {

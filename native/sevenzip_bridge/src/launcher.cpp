@@ -572,7 +572,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     if (startup) startup->release();
 
     const std::string cwd = utf8(request_cwd);
-    if (cwd.size() > kMaxFieldBytes) {
+    if (cwd.empty() || cwd.size() > kMaxFieldBytes) {
         return RequestOutcome::NotDelivered;
     }
     std::string wire(kRequestMagic, 4);
@@ -599,26 +599,24 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     // Bit 32 marks the final field as terminal metadata rather than a user argument.
     append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
     append_u32(wire, static_cast<std::uint32_t>(arguments.size() + !terminal_size.empty()));
-    if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, cwd.data(), cwd.size())) {
-        return RequestOutcome::NotDelivered;
-    }
-    auto send_argument = [&](const std::string& encoded) {
-        if (encoded.size() > kMaxFieldBytes) return false;
-        wire.clear();
+    wire.append(cwd);
+    auto append_argument = [&](const std::string& encoded) {
         append_u32(wire, static_cast<std::uint32_t>(encoded.size()));
-        return write_all(pipe, wire.data(), wire.size()) && write_all(pipe, encoded.data(), encoded.size());
+        wire.append(encoded);
     };
+    // Windows bounds argv and the working directory. Send one request buffer
+    // so the server can read the fixed header without waiting for three more writes.
     for (const auto& argument : arguments) {
-        if (!send_argument(utf8(argument))) return RequestOutcome::NotDelivered;
+        append_argument(utf8(argument));
     }
-    if (!terminal_size.empty() && !send_argument(terminal_size)) return RequestOutcome::NotDelivered;
-    std::array<char, 4> magic{};
-    if (!read_all(pipe, magic.data(), magic.size()) || memcmp(magic.data(), kStreamMagic, 4) != 0) {
+    if (!terminal_size.empty()) append_argument(terminal_size);
+    if (!write_all(pipe, wire.data(), wire.size())) {
         return RequestOutcome::DeliveryUncertain;
     }
-    std::array<char, 16> build_id{};
-    if (!read_all(pipe, build_id.data(), build_id.size()) ||
-        memcmp(build_id.data(), runtime_build_id.data(), build_id.size()) != 0) {
+    std::array<char, 20> handshake{};
+    if (!read_all(pipe, handshake.data(), handshake.size()) ||
+        memcmp(handshake.data(), kStreamMagic, 4) != 0 ||
+        memcmp(handshake.data() + 4, runtime_build_id.data(), 16) != 0) {
         return RequestOutcome::DeliveryUncertain;
     }
     ConsoleCancellation controls(pipe, supports_cancellation(arguments), terminal_resize);
@@ -806,7 +804,6 @@ int wmain(int argc, wchar_t** argv) {
             // Another launcher may have completed startup while we waited.
             outcome = request(context, request_arguments, false, code, invocation_cwd, &startup);
         }
-        const std::string language = cli_language_from_config(context);
         DWORD spawn_error = ERROR_SUCCESS;
         HANDLE runtime_process = nullptr;
         DWORD runtime_exit_code = STILL_ACTIVE;
@@ -826,7 +823,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (spawn_error != ERROR_SUCCESS) {
             std::string startup_error = localized_value(
-                language,
+                cli_language_from_config(context),
                 kRuntimeLaunchFailedEn,
                 kRuntimeLaunchFailedZh,
                 "{error}",
@@ -838,7 +835,7 @@ int wmain(int argc, wchar_t** argv) {
             write_stream(
                 STD_ERROR_HANDLE,
                 localized_value(
-                    language,
+                    cli_language_from_config(context),
                     kRuntimeExitedEn,
                     kRuntimeExitedZh,
                     "{code}",

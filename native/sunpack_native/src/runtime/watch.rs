@@ -59,8 +59,8 @@ impl Root {
             && output_key(self) == output_key(other)
     }
 
-    fn scope(&self, entries: &[Self], state_dir: &Path) -> NativeDiscoveryScope {
-        let mut exclude = vec![state_dir.to_string_lossy().into_owned()];
+    fn scope(&self, entries: &[Self], metadata: &[String]) -> NativeDiscoveryScope {
+        let mut exclude = metadata.to_vec();
         let own = key(&self.path);
         exclude.extend(entries.iter().filter_map(|entry| {
             let nested = key(&entry.path);
@@ -227,8 +227,7 @@ fn write_roots(path: &Path, roots: &[Root]) -> io::Result<()> {
 }
 
 fn state_dir(cwd: &Path) -> io::Result<PathBuf> {
-    let roots = PathBuf::from(crate::path_keys::resolved_path_key(&roots_path(cwd)?));
-    Ok(roots.parent().unwrap().join(WATCH_METADATA))
+    Ok(resources::writable_data_dir(cwd)?.join(WATCH_METADATA))
 }
 
 fn nearest_directory(path: &Path) -> Option<&Path> {
@@ -480,28 +479,29 @@ impl Watch {
     pub(super) async fn run_once_async(&self, cwd: &Path, engine: Arc<Engine>, cancel: &Cancellation) -> io::Result<i32> {
         cancel.check()?;
         let lifecycle = self.lifecycle.lock().await;
-        let hub = self.running.lock().unwrap().as_ref().filter(|run| !run.thread.is_finished()).map(|run| Arc::clone(&run.hub));
-        if let Some(hub) = hub {
+        let running = self.running.lock().unwrap().as_ref().filter(|run| !run.thread.is_finished())
+            .map(|run| (Arc::clone(&run.hub), run.continuous, Arc::clone(&run.completion)));
+        if let Some((hub, continuous, completion)) = running {
             drop(lifecycle);
-            let (send, receive) = command_reply();
-            // Cancellation wakes this caller without stopping continuous Watch.
-            // The queued reply remains owned by the service until it settles.
-            let cancelled = Arc::new(Reply::<()>::default());
+            let cancelled = Arc::new(Reply::<i32>::default());
             let wake = Arc::clone(&cancelled);
             let _cancel = cancel.subscribe(move || wake.complete(Err(crate::io::cancellation::cancelled_io())));
-            if !hub.queue_once(send) { return Err(io::ErrorKind::Interrupted.into()); }
-            let response = receive.wait();
-            let interrupted = cancelled.wait();
-            // poll_fn preserves one wake registration on each branch.
-            let mut response = Box::pin(response);
-            let mut interrupted = Box::pin(interrupted);
+            let mut response = Box::pin(async {
+                if !continuous {
+                    return completion.wait().await;
+                }
+                let (send, receive) = command_reply();
+                if !hub.queue_once(send) { return Err(io::ErrorKind::Interrupted.into()); }
+                receive.wait().await.map(|()| 0)
+            });
+            let mut interrupted = Box::pin(cancelled.wait());
             use std::future::Future;
-            poll_fn(|cx| match response.as_mut().poll(cx) {
+            let code = poll_fn(|cx| match response.as_mut().poll(cx) {
                 Poll::Ready(value) => Poll::Ready(value),
                 Poll::Pending => interrupted.as_mut().poll(cx),
             }).await?;
             cancel.check()?;
-            return Ok(0);
+            return Ok(code);
         }
         let previous = self.running.lock().unwrap().take();
         if let Some(previous) = previous { let _ = Self::join_run(previous).await; }
@@ -2001,7 +2001,7 @@ impl Scheduler {
             external,
             _lease: lease,
         };
-        scheduler.reconcile_roots()?;
+        scheduler.reconcile_roots(false)?;
         scheduler.activate_scan_options()?;
         scheduler.retire_missing_entries(None, true)?;
         scheduler.retire_stale_promoted(None, true)?;
@@ -2146,7 +2146,7 @@ impl Scheduler {
         }
     }
 
-    fn reconcile_roots(&mut self) -> io::Result<(bool, bool)> {
+    fn reconcile_roots(&mut self, restart_scheduler: bool) -> io::Result<(bool, bool)> {
         let engine = Arc::clone(&self.engine);
         let (entries, next, policy_changed) = engine.run_stage("watch_directory", Origin::Watch, || -> io::Result<_> {
         let (entries, rejected) = {
@@ -2203,9 +2203,14 @@ impl Scheduler {
             filesystem::validate_ntfs_watch_root(&directory.to_string_lossy())?;
         }
         let dir = state_dir(&self.cwd)?;
+        let state = dir.to_string_lossy().into_owned();
+        let resolved_state = crate::path_keys::resolved_path_key(&dir);
+        let is_alias = crate::path_keys::path_key(&state) != resolved_state;
+        let mut metadata = vec![state];
+        if is_alias { metadata.push(resolved_state); }
         let next = entries
             .iter()
-            .map(|root| (key(&root.path), (root.clone(), root.scope(&entries, &dir))))
+            .map(|root| (key(&root.path), (root.clone(), root.scope(&entries, &metadata))))
             .collect::<BTreeMap<_, _>>();
         let policy_changed = self.roots.len() != next.len()
             || next.iter().any(|(id, (root, _))| {
@@ -2215,41 +2220,21 @@ impl Scheduler {
             });
             Ok((entries, next, policy_changed))
         })?;
+        // Validate the latest root file before stopping the running scheduler.
         // Draining async requests must never hold a blocking-stage permit.
-        if policy_changed { self.drain_active(&mut Ok(0))?; }
-        engine.run_stage("watch_directory", Origin::Watch, || {
-        if policy_changed {
-            let reroute = self
-                .pending
-                .iter()
-                .filter_map(|(id, pending)| {
-                    if pending.recovery.is_some() {
-                        return (!next.contains_key(&pending.root)).then(|| (id.clone(), None));
-                    }
-                    if next
-                        .get(&pending.root)
-                        .is_some_and(|(_, scope)| scope.contains(&pending.candidate.path))
-                    {
-                        return None;
-                    }
-                    let root = next.iter().find_map(|(root, (_, scope))| {
-                        scope
-                            .contains(&pending.candidate.path)
-                            .then(|| root.clone())
-                    });
-                    Some((id.clone(), root))
-                })
-                .collect::<Vec<_>>();
-            for (id, root) in reroute {
-                if let Some(root) = root {
-                    self.pending.get_mut(&id).unwrap().root = root;
-                    self.unpublished.insert(id);
-                } else if let Some(pending) = self.pending.remove(&id) {
-                    self.due.remove(&(pending.due, id.clone()));
-                    self.unpublished.remove(&id);
-                }
+        if restart_scheduler || policy_changed {
+            self.drain_active(&mut Ok(0))?;
+            // Main builds its new scheduler from the durable work. In-memory
+            // candidates produced by the stop checkpoint must not mask pending
+            // output cleanup or promoted recovery under the new policy.
+            self.persist_candidates(BTreeMap::new(), true)?;
+            self.pending.clear();
+            self.due.clear();
+            if let Some(toast) = &self.toast {
+                toast.reset_batches();
             }
         }
+        engine.run_stage("watch_directory", Origin::Watch, || {
         let refresh_catalog = self.root_progress.observe(policy_changed, self.roots.is_empty());
         self.available_roots.retain(|id| next.contains_key(id));
         self.roots = next;
@@ -2265,11 +2250,11 @@ impl Scheduler {
                     journal: Arc::downgrade(&self.journal),
                     scopes: scopes.clone().into(),
                 });
-                self.journal.commit(false, |state| Ok(state.scope_retirement_operations(&scopes)))?;
+                self.journal.commit(true, |state| Ok(state.scope_retirement_operations(&scopes)))?;
             }
             self.retire_owned_outputs(None)
         })();
-        self.rearm_root_observers(None);
+        self.rearm_root_observers_blocking(None);
         retirement?;
         self.root_progress.retirement = false;
         Ok((self.root_progress.checkpoint, self.root_progress.recovery))
@@ -2336,11 +2321,7 @@ impl Scheduler {
         let observers = observers_changed.then(|| self.engine.run_stage("watch_rearm", Origin::Watch, || Self::observe_config(
             &self.cwd, &snapshot, &self.root_file, self.passwords.path(), &self.hub,
         ))).transpose()?;
-        if scheduler_changed {
-            self.drain_active(&mut Ok(0))?;
-            if let Some(toast) = &self.toast { toast.reset_batches(); }
-        }
-        let (roots_changed, root_policy_changed) = match self.reconcile_roots() {
+        let (roots_changed, root_policy_changed) = match self.reconcile_roots(scheduler_changed) {
             Ok(changed) => changed,
             Err(error) => {
                 // Reconciliation can fail after publishing durable root edits.
@@ -2350,9 +2331,6 @@ impl Scheduler {
                 return Err(error);
             }
         };
-        if root_policy_changed && !scheduler_changed {
-            if let Some(toast) = &self.toast { toast.reset_batches(); }
-        }
         let scheduler_changed = scheduler_changed || root_policy_changed;
         let previous = config_changed.then(|| {
             self.user_password_signature = user_password_signature(&snapshot.config.user_passwords);
@@ -2386,11 +2364,10 @@ impl Scheduler {
             // ordinary settings against the latest root file, like main.
             let rollback: io::Result<()> = (|| {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days)?;
-                let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots()?;
+                let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots(false)?;
                 self.activate_scan_options()?;
                 let restart = scheduler_changed || latest_policy_changed;
                 if restart {
-                    if let Some(toast) = &self.toast { toast.reset_batches(); }
                     self.recover_pending(None)?;
                 }
                 self.checkpoint_reload(restart || roots_changed || latest_roots_changed)?;
@@ -2826,7 +2803,10 @@ impl Scheduler {
                 .recover_changes(&scopes, &volume, journal, start, end)
                 .map(|mut paths| {
                     paths.sort_unstable_by_key(String::len);
-                    paths
+                    paths.into_iter().map(|path| {
+                        let id = crate::path_keys::path_key(&path);
+                        (path, id)
+                    }).collect::<Vec<_>>()
                 });
             ranges.insert((volume, journal), (end, changed));
         }
@@ -2907,24 +2887,28 @@ impl Scheduler {
                 // becomes readable. Visit both sources through the same catalog.
                 let mut named = changed.get(&id).into_iter().flatten().collect::<Vec<_>>();
                 named.sort_unstable_by_key(|path| path.as_os_str().len());
-                for path in changes
-                    .iter()
-                    .map(|path| std::borrow::Cow::Borrowed(path.as_str()))
-                    .chain(named.into_iter().map(|path| path.to_string_lossy()))
-                {
+                let recovered = changes.iter().map(|(path, id)| {
+                    (std::borrow::Cow::Borrowed(path.as_str()), std::borrow::Cow::Borrowed(id.as_str()))
+                });
+                let named = named.into_iter().map(|path| {
+                    let path = path.to_string_lossy();
+                    let id = crate::path_keys::path_key(&path);
+                    (path, std::borrow::Cow::Owned(id))
+                });
+                for (path, path_id) in recovered.chain(named) {
                     let path = path.as_ref();
-                    if !scope.contains(path) || self.catalog.is_owned(path) {
+                    if !scope.contains_key(path_id.as_ref()) || covered.contains(path_id.as_ref()) {
                         continue;
                     }
-                    let path_id = watch_path_key(path);
-                    if covered.contains(&path_id) {
+                    if self.catalog.is_owned(path) {
                         continue;
                     }
                     let metadata = fs::metadata(path);
                     let missing = metadata.as_ref().is_err_and(missing_path);
                     let recursive_departure =
                         missing && self.catalog.path_is_directory(&scope, path).unwrap_or(true);
-                    if !full_refresh && !has_covered_parent(&path_id, &covered) {
+                    if !full_refresh && !crate::path_keys::path_ancestors(path_id.as_ref())
+                        .skip(1).any(|parent| covered.contains(parent)) {
                         let options = self.scan_options(root.deep)?;
                         let refresh = options.catalog_refresh(&self.catalog, &scope, Some(path));
                         match collect_catalog_arrivals(refresh, &mut paths) {
@@ -2959,7 +2943,10 @@ impl Scheduler {
             let recovered_paths = paths.len();
             if !root.scanned {
                 paths.extend(self.catalog.candidate_paths(&scope, None));
-                if errors.is_empty() && current.is_ok() && identity.is_some() {
+                // The initial scan records a completed directory enumeration.
+                // It has its own durable candidate barrier below, even when
+                // the USN cursor is temporarily unavailable.
+                if errors.is_empty() {
                     marks.push(id.clone());
                 }
             }
@@ -3422,8 +3409,20 @@ impl Scheduler {
             CandidateAdmission::CrashRecovery => unchanged,
             _ => false,
         };
+        // Force admission of a stable head when a peer arrives, without
+        // learning a write interval from that unchanged input. An already
+        // pending candidate keeps main's explicit content observation.
+        let forced_content_change = if !force {
+            None
+        } else if !became_active {
+            Some(true)
+        } else if unchanged {
+            Some(false)
+        } else {
+            None
+        };
         let due = quiet.content_deadline(
-            &candidate, observed_now, observed_at, new_identity, retry_unchanged, force,
+            &candidate, observed_now, observed_at, new_identity, retry_unchanged, forced_content_change,
         );
         if recovery.is_none() {
             self.catalog.remember_observation(
@@ -3963,27 +3962,14 @@ fn missing_path(error: &io::Error) -> bool {
     )
 }
 
-fn has_covered_parent(path: &str, covered: &HashSet<String>) -> bool {
-    let mut ancestor = path;
-    loop {
-        if covered.contains(ancestor) {
-            return true;
-        }
-        let Some((parent, _)) = ancestor.rsplit_once('\\') else {
-            return false;
-        };
-        ancestor = parent;
-    }
-}
-
 fn owned_checkpoint_paths(
     scope: &NativeDiscoveryScope,
     named: Option<&HashSet<PathBuf>>,
-    recovered: Option<&[String]>,
+    recovered: Option<&[(String, String)]>,
     reconcile_root: bool,
 ) -> Vec<String> {
     if reconcile_root { return vec![scope.root.clone()]; }
-    recovered.into_iter().flatten().filter(|path| scope.contains(path)).cloned()
+    recovered.into_iter().flatten().filter(|(_, id)| scope.contains_key(id)).map(|(path, _)| path.clone())
         .chain(named.into_iter().flatten().map(|path| path.to_string_lossy().into_owned()))
         .collect()
 }
@@ -4841,9 +4827,7 @@ impl Scheduler {
                 } else { CandidateAdmission::Retry }));
             }
         }
-        let output_containers: HashMap<&Path, &Path> = outcome.checkpoints.iter()
-            .filter_map(|checkpoint| checkpoint.container().map(|container| (checkpoint.output(), container)))
-            .collect();
+        let output_containers = completion_output_containers(&outcome);
         let canonical_inputs: HashMap<_, _> = active.inputs.iter()
             .map(|candidate| (watch_path_key(&candidate.path), candidate.clone())).collect();
         let mut projected_groups = HashSet::new();
@@ -5211,6 +5195,12 @@ fn completion_input_errors<'a>(
 
 // Receipts retain the physical carrier container even when only one segment
 // survived. A common ancestor of logical outputs alone would open that segment.
+pub(super) fn completion_output_containers(outcome: &Outcome) -> HashMap<&Path, &Path> {
+    outcome.checkpoints.iter()
+        .filter_map(|checkpoint| checkpoint.container().map(|container| (checkpoint.output(), container)))
+        .collect()
+}
+
 fn completion_output_dirs<'a>(
     outputs: impl IntoIterator<Item = &'a Path>, containers: &HashMap<&Path, &Path>,
 ) -> Vec<PathBuf> {
@@ -6221,17 +6211,35 @@ mod tests {
 
     #[test]
     fn standalone_once_does_not_publish_continuous_status() {
+        use std::future::Future;
+
         let watch = Watch::new(Arc::new(|| {}));
         let (release, wait) = mpsc::channel();
         let thread = std::thread::spawn(move || { let _ = wait.recv(); Ok(()) });
+        let hub = Arc::new(Hub::new());
+        let completion = Arc::new(RunCompletion::default());
         *watch.running.lock().unwrap() = Some(Running {
-            hub: Arc::new(Hub::new()), thread, continuous: false,
-            completion: Arc::new(RunCompletion::default()),
+            hub: Arc::clone(&hub), thread, continuous: false,
+            completion: Arc::clone(&completion),
         });
-        let status = watch.status(&std::env::temp_dir()).unwrap();
+        let cwd = std::env::temp_dir();
+        let status = watch.status(&cwd).unwrap();
         assert_eq!(status["running"], false);
         assert_eq!(status["generation"], 0);
         assert_eq!(status["last_error"], "");
+        assert_eq!(status["state_dir"], json!(resources::writable_data_dir(&cwd).unwrap().join(WATCH_METADATA)));
+
+        // A second once caller must share the standalone result. The
+        // standalone scheduler never services the continuous tick queue.
+        let engine = Arc::new(Engine::new(PathBuf::from("unused-worker")));
+        let cancel = Cancellation::new();
+        let mut second = Box::pin(watch.run_once_async(&cwd, engine, &cancel));
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert!(hub.signals.lock().unwrap().once.is_empty());
+        completion.complete(&Ok(0));
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(0))));
+
         release.send(()).unwrap();
         watch.running.lock().unwrap().take().unwrap().thread.join().unwrap().unwrap();
     }
@@ -6350,7 +6358,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let source = watched.join("growing.zip");
         let activity = hub.activities.bind(key(&source), quiet::Activity::default);
-        let observer = RootObserver::start(&watched, &root, root.scope(&[], &state),
+        let observer = RootObserver::start(&watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]),
             &watched.join("builtin_passwords.json"), &hub, &journal, &catalog).unwrap();
         let mut file = fs::File::create(&source).unwrap();
         // Keep the writer open: these are content samples, not CLOSE epochs.
@@ -6375,7 +6383,7 @@ mod tests {
         let (candidate, _, _) = activity.probe(&source, None).unwrap();
         assert_eq!(activity.content_deadline(&candidate.unwrap(),
             Instant::now() + Duration::from_secs(60), windows::monotonic_seconds() + 60.0,
-            false, false, false), deadline);
+            false, false, None), deadline);
         drop(file);
         drop(observer);
         drop(signals);
@@ -6397,7 +6405,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let passwords = watched.join("builtin_passwords.json");
         let observer = RootObserver::start(
-            &watched, &root, root.scope(&[], &state), &passwords, &hub, &journal, &Arc::new(NativeWatchCatalog::new(journal.state(), None)),
+            &watched, &root, root.scope(&[], &[state.to_string_lossy().into_owned()]), &passwords, &hub, &journal, &Arc::new(NativeWatchCatalog::new(journal.state(), None)),
         ).unwrap();
         fs::write(&passwords, b"{}").unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -6425,7 +6433,8 @@ mod tests {
     #[test]
     fn admission_owned_reconciliation_uses_only_changed_paths() {
         let scope = super::NativeDiscoveryScope::new(r"C:\watched".into(), None, Vec::new());
-        let changed = vec![r"C:\watched\new.zip".to_owned(), r"C:\outside\file.zip".to_owned()];
+        let changed = [r"C:\watched\new.zip", r"C:\outside\file.zip"]
+            .map(|path| (path.to_owned(), crate::path_keys::path_key(path)));
         assert!(super::owned_checkpoint_paths(&scope, None, Some(&[]), false).is_empty());
         assert_eq!(super::owned_checkpoint_paths(&scope, None, Some(&changed), false),
             [r"C:\watched\new.zip"]);

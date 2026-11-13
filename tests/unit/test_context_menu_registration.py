@@ -320,14 +320,19 @@ def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu
     scripts_dir.mkdir()
     for name in ("register_context_menu.ps1", "context_menu_watch.ps1"):
         shutil.copyfile(Path(__file__).resolve().parents[2] / "scripts" / name, scripts_dir / name)
-    stub = tmp_path / "arguments.exe"
+    arch = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
+    target = {"arm64": "aarch64-pc-windows-msvc", "x64": "x86_64-pc-windows-msvc"}[arch]
+    stub = tmp_path / "native" / "sevenzip_bridge" / f"build-{arch}-ci" / "Release" / "sunpack_launcher.exe"
+    stub.parent.mkdir(parents=True)
     shutil.copyfile(native_argument_recorder, stub)
+    runtime = tmp_path / ".cache" / "rust-target" / arch / target / "ci" / "sunpack-runtime.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.touch()
     folder = tmp_path / "WeChat's 中文 Files & (2026)"
     folder.mkdir()
     completed = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-File", str(scripts_dir / "register_context_menu.ps1"),
-         "-AppPath", str(stub), "-DryRun"],
+         "-File", str(scripts_dir / "register_context_menu.ps1"), "-DryRun"],
         check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
     )
     commands = json.loads(completed.stdout.strip().splitlines()[-1])

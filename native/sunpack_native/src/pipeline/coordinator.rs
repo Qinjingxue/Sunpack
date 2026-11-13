@@ -11,6 +11,7 @@ use super::{
     Observer, Origin, Outcome as PublicOutcome, Request, ScanTaskFailure, Segment, TaskId,
 };
 use crate::analysis_native::{analyze_input, NativeAnalysisConfig};
+use crate::collections::CacheOrder;
 use crate::core::config::{CleanupMode, ContentRequirement, ProcessMode, Recursion, WorkerConfig};
 use crate::io::archive_state::{
     archive_input_slices, ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
@@ -34,7 +35,7 @@ use crate::scan::directory::{
 };
 use crate::scan::worker_event::WorkerFrame;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::future::poll_fn;
 use std::io;
@@ -280,6 +281,7 @@ impl Engine {
             deep_options,
             analysis,
             observer,
+            worker_request_id: request_id.to_string(),
             recursion: RecursivePrompts::default(),
             output_names: OutputReservationGuard { registry: Arc::clone(&self.output_names), owner: request_id },
             created_outputs: Mutex::default(),
@@ -402,6 +404,7 @@ struct Run<'a, O> {
     deep_options: Option<NativeDirectoryScanOptions>,
     analysis: NativeAnalysisConfig,
     observer: ObserverRef<'a, O>,
+    worker_request_id: String,
     recursion: RecursivePrompts,
     output_names: OutputReservationGuard,
     created_outputs: Mutex<CreatedOutputs>,
@@ -694,9 +697,8 @@ impl Drop for CancelPromptPanic<'_> {
 /// generated tree may enter it. Independent siblings must never overlap.
 #[derive(Default)]
 struct OutputNames {
-    indices: HashMap<String, OutputHistory>,
-    history_order: VecDeque<String>,
-    slots: HashMap<String, HashMap<String, usize>>,
+    indices: CacheOrder<Arc<str>, OutputHistory>,
+    slots: HashMap<Arc<str>, HashMap<Arc<str>, usize>>,
     claimed: BTreeMap<String, OutputClaim>,
     owners: HashMap<u64, Vec<String>>,
 }
@@ -706,7 +708,7 @@ const OUTPUT_HISTORY_LIMIT: usize = 256;
 struct OutputHistory {
     next: usize,
     available: BTreeSet<usize>,
-    observed: HashSet<String>,
+    observed: HashSet<Arc<str>>,
 }
 
 impl OutputHistory {
@@ -771,7 +773,7 @@ impl OutputNames {
         for candidate in crate::path_keys::path_ancestors(key) {
             if let Some(slots) = self.slots.remove(candidate) {
                 for (family, index) in slots {
-                    if let Some(history) = self.indices.get_mut(&family) {
+                    if let Some(history) = self.indices.peek_mut(&family) {
                         history.observed.remove(candidate);
                         history.release(index);
                     }
@@ -789,38 +791,30 @@ impl OutputNames {
     }
 
     fn clear_history(&mut self) {
-        self.indices.clear();
-        self.history_order.clear();
-        self.slots.clear();
-        crate::collections::trim_map(&mut self.indices);
-        crate::collections::trim_map(&mut self.slots);
+        self.indices = CacheOrder::default();
+        self.slots = HashMap::new();
     }
 
-    fn next_index(&mut self, family: &str) -> usize {
-        if self.indices.contains_key(family) {
-            self.history_order.retain(|key| key != family);
-        } else {
-            if self.indices.len() == OUTPUT_HISTORY_LIMIT {
-                let old = self.history_order.pop_front().unwrap();
-                let history = self.indices.remove(&old).unwrap();
-                for path in history.observed {
-                    if let Some(slots) = self.slots.get_mut(&path) {
-                        slots.remove(&old);
-                        if slots.is_empty() { self.slots.remove(&path); }
-                    }
+    fn next_index(&mut self, family: &Arc<str>) -> usize {
+        if let Some(history) = self.indices.get_mut(family) {
+            return history.take();
+        }
+        let history = OutputHistory { next: 2, available: BTreeSet::new(), observed: HashSet::new() };
+        if let Some((old, history)) = self.indices.insert(Arc::clone(family), history, OUTPUT_HISTORY_LIMIT) {
+            for path in history.observed {
+                if let Some(slots) = self.slots.get_mut(&path) {
+                    slots.remove(&old);
+                    if slots.is_empty() { self.slots.remove(&path); }
                 }
             }
-            self.indices.insert(family.to_owned(), OutputHistory { next: 1, available: BTreeSet::new(), observed: HashSet::new() });
         }
-        self.history_order.push_back(family.to_owned());
-        self.indices.get_mut(family).unwrap().take()
+        1
     }
 
-    fn observe_slot(&mut self, path: &str, family: &str, index: usize) {
-        if index != 0 {
-            self.slots.entry(path.to_owned()).or_default().insert(family.to_owned(), index);
-            self.indices.get_mut(family).unwrap().observed.insert(path.to_owned());
-        }
+    fn observe_slot(&mut self, path: &str, family: &Arc<str>, index: usize) {
+        let path: Arc<str> = Arc::from(path);
+        self.slots.entry(Arc::clone(&path)).or_default().insert(Arc::clone(family), index);
+        self.indices.peek_mut(family).unwrap().observed.insert(path);
     }
 
     fn has_under(&self, key: &str) -> bool {
@@ -945,22 +939,29 @@ impl OutputNames {
     {
         let candidate_key = |path: &Path| format!("{}\\{}", parent.trim_end_matches('\\'),
             crate::path_keys::case_key(&path.file_name().unwrap().to_string_lossy()));
-        let preferred_key = candidate_key(&preferred);
+        let preferred_key = candidate_key(preferred);
+        if !self.has_under(&preferred_key) {
+            match preferred.try_exists() {
+                Ok(false) => return Ok(Ok((preferred.to_owned(), preferred_key))),
+                Ok(true) => {}
+                Err(error) => return Ok(Err(file_failure(error))),
+            }
+        }
+        let preferred_key: Arc<str> = Arc::from(preferred_key);
         // Always recheck the preferred unnumbered name, as main does. The
         // history only accelerates numbered alternatives across requests.
-        let mut index = 0;
         loop {
-            let path = if index == 0 { preferred.to_owned() } else { numbered(preferred, index) };
+            let index = self.next_index(&preferred_key);
+            let path = numbered(preferred, index);
             let candidate_key = candidate_key(&path);
             if self.has_under(&candidate_key) {
                 self.observe_slot(&candidate_key, &preferred_key, index);
-                index = self.next_index(&preferred_key);
                 continue;
             }
             let exists = match path.try_exists() {
                 Ok(exists) => exists,
                 Err(error) => {
-                    if index != 0 { self.indices.get_mut(&preferred_key).unwrap().release(index); }
+                    self.indices.peek_mut(&preferred_key).unwrap().release(index);
                     return Ok(Err(file_failure(error)));
                 }
             };
@@ -968,7 +969,6 @@ impl OutputNames {
                 self.observe_slot(&candidate_key, &preferred_key, index);
                 return Ok(Ok((path, candidate_key)));
             }
-            index = self.next_index(&preferred_key);
         }
     }
 }
@@ -2039,8 +2039,8 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut recursive = Vec::new();
             let mut descendants = Vec::with_capacity(count);
             for (index, (result, inventory, id)) in parent_outputs.enumerate() {
-                if inventory.is_some() && depth <= this.request.max_depth && !cancel.cancelled() {
-                    recursive.push((index, result, inventory, id, None));
+                if let Some(inventory) = inventory.filter(|_| depth <= this.request.max_depth && !cancel.cancelled()) {
+                    recursive.push(((index, result, id), inventory));
                 } else {
                     descendants.push((index, Ok((result, Outcome::default(), false))));
                 }
@@ -2056,54 +2056,36 @@ impl<'run, O: Observer> Run<'run, O> {
                     ),
                 })))
             };
-            if recursive.len() > 1 {
+            if !recursive.is_empty() {
                 let candidates = this.candidates.with_scope(scope.as_ref().and_then(|scope| scope.password.as_deref()));
-                let inventories = recursive.iter_mut().map(|(index, _, inventory, _, _)| (*index, inventory.take().unwrap())).collect();
-                let mut discovered_outputs = this.discover_children_many(inventories, depth, &candidates).await?;
-                for (index, _, _, _, discovered) in &mut recursive {
-                    *discovered = discovered_outputs.remove(index);
-                }
-            }
-            let descendant_owner = Arc::clone(this);
-            let descend = move |(index, result, inventory, id, discovered): (usize, ArchiveResult, Option<NativeOutputInventory>, TaskId, Option<(Discovered, bool)>)| -> super::scheduling::Task<'_, _> {
-                let descendant_owner = Arc::clone(&descendant_owner);
-                let spawner = recursive_spawner.clone();
-                let scope = scope.clone();
-                Box::pin(async move {
-                    let this = &descendant_owner;
-                    let branch = async {
-                        let candidates = this.candidates.with_scope(
-                            scope.as_ref().and_then(|scope| scope.password.as_deref()),
-                        );
-                        let mut descendants = Outcome::default();
-                        let mut ran_recursive_children = false;
-                        let discovered = match discovered {
-                            Some(discovered) => Some(discovered),
-                            None => match inventory { Some(inventory) => Some(this.discover_children(inventory, depth, &candidates).await?), None => None },
+                let recursive = this.discover_children_many(recursive.into_iter(), depth, &candidates).await?;
+                let descendant_owner = Arc::clone(this);
+                let descend = move |((index, result, id), nested, scanned)| -> super::scheduling::Task<'_, _> {
+                    let this = Arc::clone(&descendant_owner);
+                    let spawner = recursive_spawner.clone();
+                    let scope = scope.clone();
+                    Box::pin(async move {
+                        let branch = if scanned {
+                            this.execute_batch(nested, depth + 1, scope, Some((id, &result)), spawner)
+                                .await.map(|descendants| (result, descendants, true))
+                        } else {
+                            let descendants = Outcome {
+                                errors: nested.errors.into(),
+                                scan_incomplete: this.record_scan_errors(nested.scan_errors),
+                                ..Outcome::default()
+                            };
+                            Ok((result, descendants, false))
                         };
-                        if let Some((nested, scanned)) = discovered {
-                            ran_recursive_children = scanned;
-                            if scanned {
-                                descendants = this.execute_batch(
-                                    nested, depth + 1, scope.clone(), Some((id, &result)), spawner,
-                                ).await?;
-                            } else {
-                                descendants.errors.append(&mut nested.errors.into());
-                                descendants.scan_incomplete = this.record_scan_errors(nested.scan_errors);
-                            }
-                        }
-                        Ok::<_, io::Error>((result, descendants, ran_recursive_children))
-                    }.await;
-                    (index, branch)
-                })
-            };
-            // A normal single-output archive keeps its existing consumer. Only
-            // independently recursive carrier outputs need another batch; failed,
-            // already-complete and depth-limited segments consume no extra slots.
-            if recursive.len() == 1 {
-                descendants.push(descend(recursive.pop().unwrap()).await);
-            } else if !recursive.is_empty() {
-                descendants.extend(spawner.bounded_map(recursive, descend).await);
+                        (index, branch)
+                    })
+                };
+                // Single-output archives keep their consumer. Carrier branches
+                // share the request's existing recursive consumer budget.
+                if recursive.len() == 1 {
+                    descendants.push(descend(recursive.into_iter().next().unwrap()).await);
+                } else {
+                    descendants.extend(spawner.bounded_map(recursive, descend).await);
+                }
             }
             // Cancellation may leave recursive outputs undispatched. Their
             // existing carrier receipts must stay owned for request rollback.
@@ -3011,6 +2993,7 @@ impl<'run, O: Observer> Run<'run, O> {
         };
         let mut request = json!({
             "job_id": job_id, "operation": if self.request.mode == Mode::Scan { "scan" } else { "extract" },
+            "request_id": self.worker_request_id,
             "origin": if self.request.origin == Origin::Watch { "watch" } else { "foreground" },
             "output_dir": output_string, "output_volume_key": volume_key,
             "archive_input": input.worker_input(), "password": plan.selected.as_deref().unwrap_or(""),
@@ -3121,9 +3104,6 @@ impl<'run, O: Observer> Run<'run, O> {
                     let split = input.mode.structured() || input.physical_paths().nth(1).is_some()
                         || looks_like_split_archive_name(&input.entry_path);
                     let mut failure = classify_worker_failure(value, plan.evidence, split);
-                    if failure.kind == FailureKind::WrongPassword && !plan.has_candidates {
-                        failure = Failure::password_required();
-                    }
                     if matches!(failure.kind, FailureKind::WrongPassword | FailureKind::PasswordInconclusive) {
                         result.password = None;
                     }
@@ -3259,64 +3239,59 @@ impl<'run, O: Observer> Run<'run, O> {
         }
     }
 
-    async fn discover_children_many(&self, inventories: Vec<(usize, NativeOutputInventory)>, depth: usize,
-        candidates: &CandidateSet) -> io::Result<HashMap<usize, (Discovered, bool)>> {
-        let mut results = HashMap::new();
-        let mut selected = Vec::new();
+    async fn discover_children_many<T>(
+        &self,
+        inventories: impl ExactSizeIterator<Item = (T, NativeOutputInventory)>,
+        depth: usize,
+        candidates: &CandidateSet,
+    ) -> io::Result<Vec<(T, Discovered, bool)>> {
+        if depth > self.request.max_depth || self.request.cancel.cancelled() {
+            return Ok(inventories.map(|(parent, _)| (parent, Discovered::default(), false)).collect());
+        }
+        stage("nested_scan", &self.request.cancel).await?;
+        let options = self.filtered_options()?;
+        let mut results = Vec::with_capacity(inventories.len());
         let mut outputs = Vec::new();
-        let mut prepared = Vec::with_capacity(inventories.len());
-        for (index, inventory) in inventories {
-            stage("nested_scan", &self.request.cancel).await?;
-            prepared.push((index, discovery::OutputDiscovery::prepare(inventory, self.filtered_options()?)?));
+        for (parent, inventory) in inventories {
+            self.request.cancel.check_io()?;
+            let output = discovery::OutputDiscovery::prepare(inventory, options)?;
+            let mut nested = Discovered::default();
+            nested.scan_errors.extend(output.scan_errors());
+            let has_files = output.has_files();
+            results.push((parent, nested, has_files));
+            if has_files { outputs.push(output); }
         }
-        for (index, output) in prepared {
-            let mut nested = Discovered::default(); nested.scan_errors.extend(output.scan_errors());
-            let scan = output.has_files() && self.allow_recursive(depth + 1, 1).await;
-            results.insert(index, (nested, scan));
-            if scan { selected.push(index); outputs.push(output); }
+        // Main asks once for this round when any filtered output contains
+        // files. Archive detection and password probing start after consent.
+        if outputs.is_empty() || !self.allow_recursive(depth + 1, 1).await {
+            for (_, _, scan) in &mut results { *scan = false; }
+            return Ok(results);
         }
-        if !outputs.is_empty() {
-            stage("discovery", &self.request.cancel).await?;
-            match discovery::OutputDiscovery::discover_many(outputs, candidates, &self.request) {
-                Ok(discovered) => for (index, nested) in selected.into_iter().zip(discovered) {
-                    let current = &mut results.get_mut(&index).unwrap().0;
-                    current.tasks = nested.tasks; current.blocked_paths = nested.blocked_paths; current.errors = nested.errors;
-                },
-                Err(error) if is_cancellation(&error) => {},
-                Err(error) => return Err(error),
-            }
+        stage("discovery", &self.request.cancel).await?;
+        match discovery::OutputDiscovery::discover_many(outputs, candidates, &self.request) {
+            Ok(discovered) => for ((_, current, _), mut nested) in results.iter_mut()
+                .filter(|(_, _, scan)| *scan).zip(discovered)
+            {
+                nested.scan_errors = std::mem::take(&mut current.scan_errors);
+                *current = nested;
+            },
+            Err(error) if is_cancellation(&error) => {},
+            Err(error) => return Err(error),
         }
         Ok(results)
     }
 
+    #[cfg(test)]
     async fn discover_children(
         &self,
         inventory: NativeOutputInventory,
         depth: usize,
         candidates: &CandidateSet,
     ) -> io::Result<(Discovered, bool)> {
-        let mut nested = Discovered::default();
-        if depth > self.request.max_depth || self.request.cancel.cancelled() {
-            return Ok((nested, false));
-        }
-        stage("nested_scan", &self.request.cancel).await?;
-        let output = discovery::OutputDiscovery::prepare(inventory, self.filtered_options()?)?;
-        nested.scan_errors.extend(output.scan_errors());
-        // Main asks once per depth when the filtered output has files, even if
-        // discovery will find no archives or nested authorization rejects them.
-        // Never do relation/embedded detection or password work before consent.
-        // One logical output root is pending; its archive count is not known yet.
-        let scan = output.has_files() && self.allow_recursive(depth + 1, 1).await;
-        if scan {
-            stage("discovery", &self.request.cancel).await?;
-            if let Err(error) = output.discover(candidates, &self.request, &mut nested) {
-                if !is_cancellation(&error) {
-                    return Err(error);
-                }
-                nested.tasks.clear();
-            }
-        }
-        Ok((nested, scan))
+        let (_, nested, scanned) = self.discover_children_many(
+            std::iter::once(((), inventory)), depth, candidates,
+        ).await?.pop().unwrap();
+        Ok((nested, scanned))
     }
 
     async fn allow_recursive(&self, depth: usize, pending: usize) -> bool {
@@ -3675,7 +3650,9 @@ fn worker_evidence(
     let hresult = result.get("hresult").or_else(|| diagnostics.get("hresult")).and_then(Value::as_i64);
     // Keep the scalar proof behind the classification, not passwords or the
     // complete worker payload. Main exposes these in its failure details.
-    let weak_failure = weak_password_failure(result, password_evidence);
+    // Explicit rejection takes precedence over fallback evidence in main.
+    let weak_failure = !flag(result, "password_candidates_all_rejected")
+        && weak_password_failure(result, password_evidence);
     let (classification_evidence, password_crc_proven_items, backend_operation_result) =
         if weak_failure && flag(result, "password_crc_proven") {
             (Some("entry_crc_proven_before_failure".to_owned()),
@@ -5196,6 +5173,7 @@ mod tests {
             }).unwrap().result;
             let submitted = responder.join().unwrap();
             assert_eq!(submitted["password_verified"], true);
+            assert_eq!(submitted["request_id"], run.worker_request_id);
             assert_eq!(submitted["password"], "secret");
             assert_eq!(result.failure.unwrap().kind, kind);
             assert_eq!(result.password.as_deref(), expected);
@@ -5353,6 +5331,7 @@ mod tests {
             deep_options: None,
             analysis: NativeAnalysisConfig::new(Vec::<(String, bool)>::new()),
             observer: ObserverRef::Borrowed(observer),
+            worker_request_id: "1".to_owned(),
             recursion: RecursivePrompts::default(),
             output_names: OutputReservationGuard { registry: Arc::clone(&engine.output_names), owner: 1 },
             created_outputs: Mutex::default(),
@@ -6352,11 +6331,12 @@ mod tests {
                 assert!(engine.recent_passwords().is_empty());
                 answer
             }, || scheduler.run(1, Origin::Foreground, &request.cancel, |_| {
-                Box::pin(run.discover_children_many(inventories, 1, &run.candidates))
+                Box::pin(run.discover_children_many(inventories.into_iter(), 1, &run.candidates))
             })).unwrap();
             assert_eq!(results.len(), 3);
-            for index in [3, 7, 15] {
-                let (nested, scanned) = &results[&index]; assert_eq!(*scanned, answer);
+            for (expected, (index, nested, scanned)) in [3, 7, 15].into_iter().zip(results) {
+                assert_eq!(index, expected);
+                assert_eq!(scanned, answer);
                 if answer { assert!(!nested.tasks.is_empty()); }
                 else { assert!(nested.tasks.is_empty()); }
                 for task in &nested.tasks {
@@ -6819,12 +6799,13 @@ mod tests {
                 numbered(&base, index).join(format!("child-{index}")));
         }
         let family = output_key(&base);
-        assert_eq!(names.indices[&family].next, 33);
-        assert_eq!(names.indices[&family].observed.len(), 32);
+        let history = names.indices.peek(family.as_str()).unwrap();
+        assert_eq!(history.next, 33);
+        assert_eq!(history.observed.len(), 32);
         names.release(2);
         assert_eq!(names.plan(base.join("replacement"), &result, 99, None).unwrap().unwrap(),
             numbered(&base, 1).join("replacement"));
-        assert_eq!(names.indices[&family].next, 33);
+        assert_eq!(names.indices.peek(family.as_str()).unwrap().next, 33);
         fs::remove_file(source).unwrap();
     }
 
@@ -6976,7 +6957,7 @@ mod tests {
                 fs::create_dir(&family).unwrap();
                 OutputNames::reserve(&registry, family.clone(), &result, &ObserverWithFailure, short_owner, None)
                     .unwrap().unwrap();
-                assert!(registry.lock().unwrap().indices.contains_key(&output_key(&family)));
+                assert!(registry.lock().unwrap().indices.peek(output_key(&family).as_str()).is_some());
                 registry.lock().unwrap().release(short_owner);
                 assert!(registry.lock().unwrap().indices.len() <= OUTPUT_HISTORY_LIMIT);
                 assert!(!registry.lock().unwrap().owners.contains_key(&short_owner));
@@ -6986,7 +6967,7 @@ mod tests {
             drop(first);
             assert!(registry.lock().unwrap().claimed.is_empty());
             registry.lock().unwrap().clear_history();
-            assert!(registry.lock().unwrap().indices.is_empty());
+            assert_eq!(registry.lock().unwrap().indices.len(), 0);
             fs::remove_dir_all(&root).unwrap();
           }
         }
@@ -7039,7 +7020,7 @@ mod tests {
             assert_eq!(output, numbered(&preferred, owner as usize));
             names.lock().unwrap().release(owner);
             let guard = names.lock().unwrap();
-            let history = &guard.indices[&family];
+            let history = guard.indices.peek(family.as_str()).unwrap();
             assert_eq!(history.next, owner as usize + 1);
             assert_eq!(history.available.first(), Some(&(owner as usize)));
         }
@@ -7061,14 +7042,14 @@ mod tests {
         assert!(OutputNames::reserve(&names, preferred.clone(), &result, &Fail, 35, None).unwrap().is_err());
         assert_eq!(OutputNames::reserve(&names, preferred.clone(), &result, &Create, 36, None).unwrap().unwrap(), numbered(&preferred, 33));
         names.lock().unwrap().release(36);
-        for index in 0..(OUTPUT_HISTORY_LIMIT + 1) { names.lock().unwrap().next_index(&format!("family-{index}")); }
+        for index in 0..(OUTPUT_HISTORY_LIMIT + 1) { names.lock().unwrap().next_index(&Arc::from(format!("family-{index}"))); }
         assert_eq!(names.lock().unwrap().indices.len(), OUTPUT_HISTORY_LIMIT);
-        assert_eq!(names.lock().unwrap().history_order.len(), OUTPUT_HISTORY_LIMIT);
-        assert!(!names.lock().unwrap().indices.contains_key(&family));
-        assert!(names.lock().unwrap().slots.values().all(|slots| !slots.contains_key(&family)));
+        assert!(names.lock().unwrap().indices.peek(family.as_str()).is_none());
+        assert!(names.lock().unwrap().slots.values().all(|slots| !slots.contains_key(family.as_str())));
         names.lock().unwrap().clear_history();
         let names = names.lock().unwrap();
-        assert!(names.indices.is_empty() && names.slots.is_empty());
+        assert_eq!(names.indices.len(), 0);
+        assert!(names.slots.is_empty());
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(source).unwrap();
     }

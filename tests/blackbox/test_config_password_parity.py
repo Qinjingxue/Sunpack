@@ -1,4 +1,5 @@
 import json
+import subprocess
 import zipfile
 
 import pytest
@@ -98,6 +99,24 @@ def test_password_text_sources_preserve_nul_candidates(package, tmp_path):
     interactive = package.run("passwords", "--no-bpw", "-a", input="bad\x00candidate\n\n")
     assert interactive.returncode == 0, interactive.stderr
     assert "bad\\x00candidate" in interactive.stdout
+
+
+def test_rejected_password_candidate_keeps_resolution_details(package, tmp_path):
+    (tmp_path / "secret.txt").write_bytes(b"secret")
+    archive = tmp_path / "locked.7z"
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", "-pfixture-secret",
+         str(archive), "secret.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    result = package.json("extract", "--no-bpw", "-p", "wrong", archive, code=1)
+    failure, = result["tasks"][0]["failures"]
+    assert (failure["kind"], failure["stage"]) == ("wrong_password", "password_resolution")
+    assert failure["details"]["diagnostic"] == ""
+    assert failure["details"]["read_error"] is None
 
 
 def test_enabled_invalid_regex_only_blocks_filtered_scans_and_reports_all_rules(package, tmp_path):
@@ -235,3 +254,42 @@ def test_relative_override_file_uses_service_cwd_not_request_cwd(package, tmp_pa
     (service / name).unlink()
     (request / name).write_text("{}", encoding="utf-8")
     assert package.json("config", "show", cwd=request, code=2)["errors"]
+
+
+def test_explicit_config_checks_reject_bom_without_losing_last_valid_snapshot(package, tmp_path):
+    override = tmp_path / "override.json"
+    override.write_text('{"cli":{"language":"en"}}', encoding="utf-8")
+    package.env["SUNPACK_CONFIG_OVERRIDES"] = str(override)
+    assert package.json("passwords", "--no-bpw", "-p", "example")["items"][0]["user_passwords"] == ["example"]
+
+    override.write_text("{}", encoding="utf-8-sig")
+    for action in ("show", "validate"):
+        result = package.json("config", action, code=2)
+        assert "Unexpected UTF-8 BOM" in result["errors"][0]
+    doctor = package.json("doctor", code=1)
+    config_check = next(row for row in doctor["items"] if row["name"] == "config")
+    assert config_check["status"] == "fail"
+    assert "Unexpected UTF-8 BOM" in config_check["detail"]
+    assert package.json("passwords", "--no-bpw", "-p", "example")["items"][0]["user_passwords"] == ["example"]
+
+
+def test_cli_null_language_uses_english_with_explicit_cli_section(package):
+    package.configure(cli={"language": None})
+    result = package.run("passwords", "--no-bpw", "-p", "example")
+    assert result.returncode == 0
+    assert "[CLI] Password source summary:" in result.stdout
+
+
+def test_config_checks_report_resolved_config_path_through_junction(package, tmp_path):
+    alias = tmp_path / "ProgramDataAlias"
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(package.data.parent)],
+        check=True,
+        capture_output=True,
+    )
+    package.env["PROGRAMDATA"] = str(alias)
+    expected = str(package.data / "sunpack_config.json")
+    assert package.json("config", "show")["summary"]["config_path"] == expected
+    doctor = json.loads(package.run("doctor", "--json").stdout)
+    check = next(row for row in doctor["items"] if row["name"] == "config")
+    assert check["detail"] == expected

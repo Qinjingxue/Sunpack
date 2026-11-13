@@ -162,6 +162,22 @@ def test_direct_fallback_does_not_force_unproven_signature_format(package, tmp_p
     assert [p.read_bytes() for p in output.rglob("payload.txt")] == [b"direct fallback"]
 
 
+def test_worker_rejection_with_no_password_candidates_keeps_wrong_password_kind(package, tmp_path):
+    (tmp_path / "secret.txt").write_bytes(b"secret")
+    archive = tmp_path / "locked.7z"
+    subprocess.run(
+        [str(package.tools / "7z.exe"), "a", "-t7z", "-mhe=on", "-pfixture-secret",
+         str(archive), "secret.txt"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+
+    report = package.json("extract", "--no-bpw", "-r", "1", archive, code=1)
+
+    failure, = report["tasks"][0]["failures"]
+    assert (failure["kind"], failure["stage"]) == ("wrong_password", "extraction")
+    assert "backend_operation_result" not in failure["details"]
+
+
 def test_failed_first_segment_keeps_its_output_name_for_password_retry(package, tmp_path):
     package.configure(post_extract={"flatten_single_directory": False})
     (tmp_path / "secret.txt").write_bytes(b"secret")

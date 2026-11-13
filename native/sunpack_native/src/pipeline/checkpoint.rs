@@ -504,6 +504,10 @@ impl InputRecovery {
         self.retry_output.then_some(self.output.as_path())
     }
 
+    pub(crate) fn has_password_blocker(&self) -> bool {
+        self.inputs.iter().filter_map(InputCheckpoint::failure).any(Failure::is_password_retry)
+    }
+
     pub(crate) fn report(&self, failure: impl Fn(&Failure) -> serde_json::Value) -> serde_json::Value {
         use serde_json::{json, Value};
         let inputs: Vec<_> = self.inputs.iter().map(|checkpoint| {

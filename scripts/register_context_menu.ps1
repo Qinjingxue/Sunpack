@@ -18,7 +18,6 @@ function Resolve-Launcher {
         $resolvedApp = (Resolve-Path -LiteralPath $PreferredAppPath).Path
         $appIcon = Resolve-SunPackIcon -RepoRoot $RepoRoot -FallbackPath $resolvedApp
         return @{
-            Mode = "app"
             AppPath = $resolvedApp
             IconPath = $appIcon
         }
@@ -35,7 +34,6 @@ function Resolve-Launcher {
             $resolvedExe = (Resolve-Path -LiteralPath $candidate).Path
             $appIcon = Resolve-SunPackIcon -RepoRoot $RepoRoot -FallbackPath $resolvedExe
             return @{
-                Mode = "app"
                 AppPath = $resolvedExe
                 IconPath = $appIcon
             }
@@ -59,13 +57,27 @@ function Resolve-Launcher {
         $resolvedExe = (Resolve-Path -LiteralPath $packagedCandidates[0]).Path
         $appIcon = Resolve-SunPackIcon -RepoRoot $RepoRoot -FallbackPath $resolvedExe
         return @{
-            Mode = "app"
             AppPath = $resolvedExe
             IconPath = $appIcon
         }
     }
 
-    throw "No SunPack executable was found. Build the Windows package or pass -AppPath."
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    $target = if ($arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+    foreach ($profile in @("ci", "release")) {
+        $suffix = if ($profile -eq "ci") { "-ci" } else { "" }
+        $launcher = Join-Path $RepoRoot "native\sevenzip_bridge\build-$arch$suffix\Release\sunpack_launcher.exe"
+        $runtime = Join-Path $RepoRoot ".cache\rust-target\$arch\$target\$profile\sunpack-runtime.exe"
+        if ((Test-Path -LiteralPath $launcher -PathType Leaf) -and
+            (Test-Path -LiteralPath $runtime -PathType Leaf)) {
+            return @{
+                AppPath = (Resolve-Path -LiteralPath $launcher).Path
+                IconPath = Resolve-SunPackIcon -RepoRoot $RepoRoot -FallbackPath $launcher
+            }
+        }
+    }
+
+    throw "No SunPack executable was found. Run scripts\setup_windows_dev.ps1 or pass -AppPath."
 }
 
 function Resolve-SunPackIcon {

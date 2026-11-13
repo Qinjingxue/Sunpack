@@ -307,10 +307,23 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         assert!(scheduler.pending.is_empty());
         assert!(scheduler.journal.state().pending(owner).is_some());
         drop(lock);
+        // Exercise the real shutdown checkpoint with an observer installed.
+        // Its fallback scan can admit this source before WAL recovery runs.
+        scheduler.rearm_root_observers(None);
         fs::write(&configuration, br#"{"cli":{"language":"zh"}}"#).unwrap();
         assert!(scheduler.reload().unwrap());
         assert!(!output.exists(), "semantic restart must retry interrupted cleanup");
         assert!(scheduler.pending.contains_key(&key(&source)), "unchanged durable work must be admitted again");
+
+        // The live subscription must survive a root validation error during
+        // an otherwise semantic reload.
+        let original = Arc::clone(&scheduler.root_observers[&root_id].root
+            .as_ref().unwrap().observer.changes);
+        fs::write(&scheduler.root_file, format!("{} | | invalid\n", watched.display())).unwrap();
+        fs::write(&configuration, br#"{"cli":{"language":"en"}}"#).unwrap();
+        assert!(scheduler.reload().is_err());
+        let observer = &scheduler.root_observers[&root_id].root.as_ref().unwrap().observer;
+        assert!(observer.alive() && Arc::ptr_eq(&observer.changes, &original));
         return;
     }
     run_isolated("semantic_reload_recovers_pending_after_output_unlock", CHILD);
@@ -328,7 +341,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         let directory = base.join("password");
         let watched = directory.join("watched");
         fs::create_dir_all(&watched).unwrap();
-        let source = watched.join("input.zip");
+        let source = watched.join("input.7z.001");
         fs::write(&source, b"old archive").unwrap();
         let id = watch_path_key(source.to_str().unwrap());
         let root_id = key(&watched);
@@ -395,14 +408,35 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
             CandidateAdmission::PasswordRetry, None, None, Some(pending.quiet)).unwrap();
         assert!(scheduler.pending[&id].due <= Instant::now());
 
-        // A volume-change retry is forced, but is not crash recovery. It must
-        // still respect the learned quiet window even with no current pending.
+        // A newly arrived volume retries its stable head. This must keep the
+        // learned wait without recording a new content event for the head.
         let pending = scheduler.pending.remove(&id).unwrap();
         scheduler.due.remove(&(pending.due, id.clone()));
+        drop(pending);
+        let (_, scope) = &scheduler.roots[&root_id];
+        scheduler.scan_options(false).unwrap()
+            .catalog_update(&scheduler.catalog, scope, None).unwrap();
+        scheduler.catalog.remember_observation(path, candidate.size, candidate.mtime,
+            &candidate.observation.file_id, candidate.observation.change_usn, false);
+        scheduler.catalog.retire_observation(path, Some(10.0), Some(2.0), 1.0, 0.0);
+        assert_eq!(scheduler.catalog.observation(path).unwrap().quiet_seconds, 10.0);
+        scheduler.journal.commit(true, |_| {
+            let mut entry = observed_entry(&candidate, "suspended_missing_volume", None);
+            entry.failure_payload.insert("blockers".into(), json!(["missing_volume"]));
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            operations.put_entry(Arc::new(entry));
+            Ok(operations)
+        }).unwrap();
+        let tail = watched.join("input.7z.002");
+        fs::write(&tail, b"new split volume").unwrap();
         let before = Instant::now();
-        scheduler.observe_candidate_with_quiet(&root_id, path.into(),
-            CandidateAdmission::Retry, None, None, Some(pending.quiet)).unwrap();
-        assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9));
+        scheduler.observe_file_changes_blocking(
+            &HashMap::from([(root_id.clone(), HashSet::from([tail.clone()]))]),
+            &HashMap::from([(tail, CandidateEvent::Created)]),
+        ).unwrap();
+        assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9),
+            "quiet summary after volume arrival: {:?}", scheduler.pending[&id].quiet.summary());
+        assert_eq!(scheduler.pending[&id].quiet.summary(), (10.0, Some(2.0), 1.0, 0.0));
         let pending = scheduler.pending.remove(&id).unwrap();
         scheduler.due.remove(&(pending.due, id.clone()));
         scheduler.observe_candidate_with_quiet(&root_id, path.into(),
@@ -421,6 +455,15 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
     const CHILD: &str = "SUNPACK_WATCH_EVENT_PROVENANCE_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
+        // This child owns its environment. Force the real missing-Broker
+        // fallback regardless of the parent's installed test service.
+        unsafe {
+            let suffix = format!("MissingCursor_{}", std::process::id());
+            std::env::set_var(sunpack_usn_core::SERVICE_NAME_ENV,
+                format!("{}{suffix}", sunpack_usn_core::TEST_SERVICE_NAME_PREFIX));
+            std::env::set_var(sunpack_usn_core::PIPE_NAME_ENV,
+                format!("{}{suffix}", sunpack_usn_core::TEST_PIPE_NAME_PREFIX));
+        }
         fs::create_dir_all(base.join("native")).unwrap();
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
@@ -490,7 +533,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         let recovery = watched.join("recovery.zip");
         fs::write(&recovery, b"archive").unwrap();
         scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
-        expected.push((recovery, "candidate_active", "usn_recovery", String::new()));
+        expected.push((recovery.clone(), "candidate_active", "usn_recovery", String::new()));
         scheduler.journal.flush().unwrap();
         let records = display_events::read(&directory.join("state/events.json")).unwrap();
         let history = records["history"].as_array().unwrap();
@@ -504,6 +547,16 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
                 assert!(record["error"].as_str().unwrap().starts_with("PermissionError:"));
             }
         }
+
+        // A readable initial inventory is complete independently of a USN
+        // cursor. Its pending intent must already be durable at publication.
+        let root = &mut scheduler.roots.get_mut(&root_id).unwrap().0;
+        root.scanned = false;
+        write_roots(&scheduler.root_file, std::slice::from_ref(root)).unwrap();
+        assert!(filesystem::watch_volume_cursor(&watched.to_string_lossy()).is_err());
+        scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
+        assert!(read_roots(&scheduler.root_file).unwrap()[0].scanned);
+        assert!(scheduler.journal.state().pending(recovery.to_str().unwrap()).is_some());
         return;
     }
     run_isolated("native_event_provenance_survives_ordinary_and_checkpoint_admission", CHILD);

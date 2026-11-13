@@ -469,30 +469,6 @@ impl OutputDiscovery {
         self.filtered.scan_errors()
     }
 
-    pub(super) fn discover(
-        self,
-        candidates: &CandidateSet,
-        request: &Request,
-        result: &mut Discovered,
-    ) -> io::Result<()> {
-        let Self {
-            root,
-            filtered,
-            raw,
-        } = self;
-        let mut verified = HashMap::new();
-        let mut table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
-        result.project(
-            std::slice::from_mut(&mut table),
-            candidates,
-            &verified,
-            request,
-            true,
-        )?;
-        Self::authorize(root, raw, request, result);
-        Ok(())
-    }
-
     fn authorize(root: String, raw: NativeDirectorySnapshot, request: &Request, result: &mut Discovered) {
         let policy = request.config.recursive_authorization;
         if policy.enabled && !result.tasks.is_empty() {
@@ -1394,8 +1370,7 @@ mod tests {
             ).unwrap()).collect::<Vec<_>>();
             let results = if separate {
                 outputs.into_iter().map(|output| {
-                    let mut result = Discovered::default();
-                    output.discover(&candidates, &request, &mut result).unwrap(); result
+                    OutputDiscovery::discover_many(vec![output], &candidates, &request).unwrap().pop().unwrap()
                 }).collect()
             } else { OutputDiscovery::discover_many(outputs, &candidates, &request).unwrap() };
             let mut actual = HashSet::new();

@@ -50,8 +50,8 @@ if (-not $SkipTests -and $hostArch -eq $Arch) {
         $previousTestBinary = $env:SUNPACK_GUI_TEST_BINARY
         $env:SUNPACK_GUI_TEST_BINARY = Join-Path $BuildDir 'Release\sunpack_gui_tests.exe'
         try {
-            & $python -m pytest (Join-Path $repoRoot 'tests\gui\test_integration.py::test_gui_template_texts_exist_in_both_languages') -q
-            if ($LASTEXITCODE -ne 0) { throw 'GUI resource checks failed' }
+            & $python -m pytest (Join-Path $repoRoot 'tests\gui\test_integration.py') -q
+            if ($LASTEXITCODE -ne 0) { throw 'GUI integration checks failed' }
         } finally {
             if ($null -ne $previousTestBinary) { $env:SUNPACK_GUI_TEST_BINARY = $previousTestBinary }
             else { Remove-Item Env:SUNPACK_GUI_TEST_BINARY }
