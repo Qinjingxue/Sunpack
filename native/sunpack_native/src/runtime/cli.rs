@@ -897,30 +897,41 @@ fn interrupted(
 }
 
 pub(super) fn resolve(cwd: &Path, value: &str) -> io::Result<PathBuf> {
+    std::path::absolute(request_path(cwd, value))
+}
+
+// Both execution and Watch receipts use the requesting client's drive/cwd.
+// Only execution normalizes: main echoes the lexical join (including .\).
+fn request_path<'a>(cwd: &Path, value: &'a str) -> Cow<'a, Path> {
     let path = Path::new(value);
     if path.is_absolute() {
-        return std::path::absolute(path);
+        return Cow::Borrowed(path);
     }
     let mut components = path.components();
-    let relative = match (components.next(), cwd.components().next()) {
+    let mut base_components = cwd.components();
+    let relative = match (components.next(), base_components.next()) {
         (Some(Component::Prefix(target)), Some(Component::Prefix(base)))
             if matches!((target.kind(), base.kind()),
                 (Prefix::Disk(target), Prefix::Disk(base) | Prefix::VerbatimDisk(base))
                     if target.eq_ignore_ascii_case(&base)) =>
         {
+            // ntpath.join keeps an explicitly supplied drive's spelling.
+            if matches!(base.kind(), Prefix::Disk(_)) && target.as_os_str() != base.as_os_str() {
+                let mut joined = PathBuf::from(target.as_os_str());
+                joined.push(base_components.as_path());
+                joined.push(components.as_path());
+                return Cow::Owned(joined);
+            }
             // A same-drive relative path uses the requesting client's directory.
             components.as_path()
         }
         _ => path,
     };
-    std::path::absolute(cwd.join(relative))
+    Cow::Owned(cwd.join(relative))
 }
 
 fn watch_targets(cwd: &Path, options: &Options) -> Vec<PathBuf> {
-    options.paths.iter().map(|value| {
-        let path = Path::new(value);
-        if path.is_absolute() { path.to_owned() } else { cwd.join(path) }
-    }).collect()
+    options.paths.iter().map(|value| request_path(cwd, value).into_owned()).collect()
 }
 
 fn targets(cwd: &Path, options: &Options) -> io::Result<Vec<PathBuf>> {

@@ -36,6 +36,8 @@ mod quiet;
 mod crash_boundaries;
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod completion_tests;
 
 const ROOTS_FILE: &str = "sunpack_watch_roots.txt";
 const WATCH_METADATA: &str = ".sunpack_watch";
@@ -1598,8 +1600,6 @@ fn due_admissions(
 }
 
 struct Pending {
-    // Readiness is reusable only across the current admission checkpoint.
-    admission_ready: bool,
     root: String,
     candidate: WatchCandidateRow,
     quiet: quiet::Activity,
@@ -3739,7 +3739,6 @@ impl Scheduler {
         self.pending.insert(
             id,
             Pending {
-                admission_ready: false,
                 root: root_id.to_owned(),
                 candidate,
                 quiet,
@@ -4384,24 +4383,7 @@ impl Scheduler {
                 self.pending.insert(id, pending);
                 continue;
             }
-            if pending.recovery.is_none() && self.journal.state().owned_root(&pending.candidate.path).is_some() {
-                self.unpublished.remove(&id);
-                self.journal.commit(false, |state| {
-                    Ok(if state.pending(&pending.candidate.path).is_some_and(|record| {
-                        record.matches_observation(&pending.candidate) && !record.has_output_work()
-                    }) {
-                        crate::watch_store::NativeWatchOperations::retire_pending(id)
-                    } else {
-                        crate::watch_store::NativeWatchOperations::empty()
-                    })
-                })?;
-                self.journal.log(json!({"event":"task_retired","path":pending.candidate.path}));
-                continue;
-            }
-            if pending.admission_ready {
-                prepared.push((id, pending));
-                continue;
-            }
+            if self.retire_owned_admission(&id, &pending)? { continue; }
             let path = Path::new(&pending.candidate.path);
             let previous_usn = pending.candidate.observation.change_usn;
             let (current, observed_now, observed_at) = match pending.quiet.probe(path, Some(previous_usn)) {
@@ -4500,38 +4482,25 @@ impl Scheduler {
         }
         let prepared = self.prepare_ready(now, available)?;
         if prepared.is_empty() { return Ok(()); }
-        // Keep the already-probed owners available for atomic publication.
-        // Checkpoint replaces Pending on a content/forced-recovery change, so
-        // only those changed candidates need a new filesystem readiness probe.
-        let mut prepared_ids = Vec::with_capacity(prepared.len());
-        for (id, mut pending) in prepared {
-            pending.admission_ready = true;
-            self.due.insert((pending.due, id.clone()), ());
-            self.pending.insert(id.clone(), pending);
-            prepared_ids.push(id);
-        }
-        let checkpoint = self.checkpoint(&HashMap::new(), true, false);
+        // main persists the first admitted generation before checkpointing the
+        // event burst, then submits that same batch without another readiness
+        // gate. Events during checkpoint remain independent pending candidates.
+        self.persist_candidates_and_retire(BTreeMap::new(), true, None, &prepared)?;
+        self.checkpoint(&HashMap::new(), true, false)?;
         #[cfg(test)]
-        let checkpoint = checkpoint.and_then(|()| match self.admission_checkpoint.take() {
-            Some(check) => check(self),
-            None => Ok(()),
-        });
-        let prepared = checkpoint.and_then(|()| self.prepare_ready(now, available));
-        // A new foreground claim can leave a prepared owner parked. Never
-        // retain its readiness into a later tick, including checkpoint errors.
-        for id in prepared_ids {
-            if let Some(pending) = self.pending.get_mut(&id) {
-                pending.admission_ready = false;
-            }
-        }
-        let prepared = prepared?;
-        // A fresh second probe can advance the accepted observation after
-        // the USN checkpoint. Seal those changed generations before submit.
-        if prepared.iter().any(|(id, _)| self.unpublished.contains(id)) {
-            self.persist_candidates_and_retire(BTreeMap::new(), true, None, &prepared)?;
-        }
+        if let Some(check) = self.admission_checkpoint.take() { check(self)?; }
         let mut groups = BTreeMap::new();
-        for (_, pending) in prepared {
+        for (id, pending) in prepared {
+            // main's submit still checks output ownership and active claims;
+            // these are not a second quiet/readiness decision.
+            if self.retire_owned_admission(&id, &pending)? { continue; }
+            if self.active_paths.contains_key(&id) || self.hub.claims.lock().unwrap().contains_key(&id) {
+                // A checkpoint event may already have queued a newer generation.
+                // Never replace that pending observation with this admitted one.
+                let pending = self.pending.entry(id.clone()).or_insert(pending);
+                self.due.insert((pending.due, id), ());
+                continue;
+            }
             self.journal.log(json!({
                 "event":"candidate_quiet", "path":pending.candidate.path,
                 "quiet_seconds":pending.quiet.summary().0,
@@ -4568,6 +4537,26 @@ impl Scheduler {
             }
             Ok(())
         })?
+    }
+
+    fn retire_owned_admission(&mut self, id: &str, pending: &Pending) -> io::Result<bool> {
+        if pending.recovery.is_some() || self.journal.state().owned_root(&pending.candidate.path).is_none() {
+            return Ok(false);
+        }
+        // A checkpoint may have queued another generation under this key.
+        // Retiring the admitted generation must not clear that update's WAL work.
+        if !self.pending.contains_key(id) { self.unpublished.remove(id); }
+        self.journal.commit(false, |state| {
+            Ok(if state.pending(&pending.candidate.path).is_some_and(|record| {
+                record.matches_observation(&pending.candidate) && !record.has_output_work()
+            }) {
+                crate::watch_store::NativeWatchOperations::retire_pending(id.to_owned())
+            } else {
+                crate::watch_store::NativeWatchOperations::empty()
+            })
+        })?;
+        self.journal.log(json!({"event":"task_retired","path":pending.candidate.path}));
+        Ok(true)
     }
 
     fn retire_admission(&mut self, id: &str, pending: &Pending) -> io::Result<()> {
@@ -5124,7 +5113,7 @@ impl Scheduler {
             }
         };
         let input_failures = outcome.input_failures();
-        let by_path = completion_archives(&outcome, &completed.outputs, &groups, &input_failures);
+        let (by_path, success_counts) = completion_archives(&outcome, &completed.outputs, &groups, &input_failures);
         for archive in &outcome.archives {
             if let Some(failure) = archive
                 .failure
@@ -5437,6 +5426,9 @@ impl Scheduler {
                 let mut event = json!({"event":event,"path":canonical,"owner":batch,
                     "error":error,"error_kind":failure.map(|failure| failure.kind),
                     "output_dirs":outputs,"retire_group":true});
+                if event["event"] == "done" {
+                    success_counts.get(&canonical_id).copied().unwrap_or_default().write(&mut event);
+                }
                 if let (Some(input_error), Some(failure)) = (input_error, discovery_failure) {
                     reported_discovery.insert(input_error.path.as_path());
                     event["failures"] = json!([super::failure::report::Report::from_failure(
@@ -5618,11 +5610,16 @@ fn completion_owner(
     outputs: &BTreeMap<String, String>,
     groups: &HashMap<String, Arc<SourceGroup>>,
 ) -> Option<String> {
-    let path = key(path);
-    if let Some(group) = groups.get(&path) {
+    completion_owner_key(&key(path), outputs, groups)
+}
+
+fn completion_owner_key(
+    path: &str, outputs: &BTreeMap<String, String>, groups: &HashMap<String, Arc<SourceGroup>>,
+) -> Option<String> {
+    if let Some(group) = groups.get(path) {
         return Some(key(&group.path));
     }
-    let owner = watch_path_key(output_owner(outputs, &path)?);
+    let owner = watch_path_key(output_owner(outputs, path)?);
     Some(groups.get(&owner).map(|group| key(&group.path)).unwrap_or(owner))
 }
 
@@ -5676,14 +5673,50 @@ fn completion_output_dirs<'a>(
         .into_iter().collect()
 }
 
+#[derive(Clone, Copy, Default)]
+struct CompletionSuccessCounts {
+    success_count: usize,
+    partial_success_count: usize,
+}
+impl CompletionSuccessCounts {
+    fn write(self, event: &mut Value) {
+        event["success_count"] = json!(self.success_count);
+        event["partial_success_count"] = json!(self.partial_success_count);
+    }
+}
+
 fn completion_archives<'a>(
     outcome: &'a Outcome,
     outputs: &BTreeMap<String, String>,
     groups: &HashMap<String, Arc<SourceGroup>>,
     failures: &HashMap<String, InputFailure<'_>>,
-) -> HashMap<String, Vec<&'a ArchiveResult>> {
+) -> (HashMap<String, Vec<&'a ArchiveResult>>, HashMap<String, CompletionSuccessCounts>) {
     let mut by_path: HashMap<String, Vec<&ArchiveResult>> = HashMap::new();
+    let mut counts: HashMap<String, CompletionSuccessCounts> = HashMap::new();
+    let mut counted: HashMap<(String, usize), (String, bool)> = HashMap::new();
     for archive in &outcome.archives {
+        // Main summarizes physical tasks, not carrier segments. Reuse the
+        // carrier failure verdict and the display's accepted-partial status.
+        let path = key(&archive.path);
+        if !failures.get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))
+            .is_some_and(|failure| failure.failed)
+        {
+            let partial = crate::pipeline::TaskStatus::of(archive) == crate::pipeline::TaskStatus::Partial;
+            match counted.entry((path.clone(), archive.depth)) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let owner = completion_owner_key(&path, outputs, groups).unwrap_or(path);
+                    let count = counts.entry(owner.clone()).or_default();
+                    count.success_count += 1;
+                    count.partial_success_count += usize::from(partial);
+                    entry.insert((owner, partial));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) if partial && !entry.get().1 => {
+                    counts.get_mut(&entry.get().0).unwrap().partial_success_count += 1;
+                    entry.get_mut().1 = true;
+                }
+                _ => {}
+            }
+        }
         for path in archive.source_paths.iter().chain(std::iter::once(&archive.path)) {
             by_path.entry(key(path)).or_default().push(archive);
         }
@@ -5698,7 +5731,7 @@ fn completion_archives<'a>(
             }
         }
     }
-    by_path
+    (by_path, counts)
 }
 
 fn completion_failed_archive<'a>(
@@ -7086,7 +7119,6 @@ mod tests {
         payload.insert("password_scope_dir".into(), json!(recovery.password_scope));
         payload.insert("details".into(), json!({"promoted_nested_input":true}));
         let mut pending = Pending {
-            admission_ready: false,
             root: watch_path_key(r"C:\watch\old"), candidate,
             quiet: quiet::Activity::default(), due: Instant::now(), force: true, recovery: None,
         };
@@ -7198,7 +7230,7 @@ mod tests {
         outcome.archives = vec![outer, completion_archive(other.to_str().unwrap(), 1, None),
             completion_archive(r"C:\watch\outer\inner.zip", 2, Some(FailureKind::Damaged))];
         let failures = outcome.input_failures();
-        let projected = completion_archives(&outcome, &outputs, &groups, &failures);
+        let (projected, _) = completion_archives(&outcome, &outputs, &groups, &failures);
         assert_eq!(completion_failed_archive(&projected[&key(head)], &failures).unwrap().failure.as_ref().unwrap().kind, FailureKind::Damaged);
         assert!(completion_failed_archive(&projected[&key(other)], &failures).is_none());
         assert!(output_owner(&outputs, &key(Path::new(r"C:\watch\outer-other\inner.zip"))).is_none());
@@ -7313,24 +7345,24 @@ mod tests {
         let retry_paths = outcome.archives.iter().filter(|archive| promoted_retry(archive, &failures))
             .map(|archive| key(&archive.path)).collect::<HashSet<_>>();
         assert_eq!(retry_paths.len(), 1, "one physical retry retains all logical receipts");
-        let projected = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
+        let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
         assert!(completion_failed_archive(&projected[&key(owner)], &failures).is_none());
         // A terminal failure in another physical child still fails the owner.
         outcome.archives.push(completion_archive(r"C:\Watch\outer\broken.zip", 2, Some(FailureKind::Unsupported)));
         let failures = outcome.input_failures();
-        let projected = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
+        let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
         assert_eq!(completion_failed_archive(&projected[&key(owner)], &failures).unwrap().failure.as_ref().unwrap().kind, FailureKind::Unsupported);
         outcome.archives.pop();
         // Without a successful promotion, retain the owner's retry checkpoint.
         for archive in outcome.archives.iter_mut().skip(1) { archive.promoted = false; }
         let failures = outcome.input_failures();
-        let projected = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
+        let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
         let failed = completion_failed_archive(&projected[&key(owner)], &failures).unwrap();
         assert_eq!(failures[&crate::path_keys::path_key(&failed.path.to_string_lossy())].failure().unwrap().kind, FailureKind::MissingVolume);
         // All-accepted partial evidence is successful, not a new blocker.
         outcome.archives.truncate(2);
         let failures = outcome.input_failures();
-        let projected = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
+        let (projected, _) = completion_archives(&outcome, &outputs, &HashMap::new(), &failures);
         assert!(completion_failed_archive(&projected[&key(owner)], &failures).is_none());
         assert!(!failures[&crate::path_keys::path_key(promoted_path)].retryable());
     }
@@ -7720,7 +7752,7 @@ mod tests {
         for (index, path) in group.members.iter().enumerate().skip(1) {
             let id = watch_path_key(path);
             let deadline = now + std::time::Duration::from_secs(index as u64);
-            pending.insert(id.clone(), Pending { admission_ready: false, root: "root".into(),
+            pending.insert(id.clone(), Pending { root: "root".into(),
                 candidate: WatchCandidateRow { path: path.clone(), size: 42, mtime: 1.0,
                     observation: crate::filesystem::WatchFileObservation {
                         file_id: String::new(), change_usn: index as i64, change_reasons: 0,

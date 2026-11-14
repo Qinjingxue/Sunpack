@@ -33,14 +33,14 @@ fn stopped_watch_saves_conflicting_outputs_for_runtime_validation() {
 }
 
 #[test]
-fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
+fn checkpoint_submits_the_first_ready_generation() {
     const CHILD: &str = "SUNPACK_ADMISSION_CHECKPOINT_TEST";
     if let Some(base) = std::env::var_os(CHILD) {
         let base = PathBuf::from(base);
         fs::create_dir_all(base.join("native")).unwrap();
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
-        for case in ["stable", "resnapshot", "content", "claim", "owned", "error", "stop"] {
+        for case in ["stable", "resnapshot", "content", "claim", "owned", "owned_content", "error", "stop"] {
             let directory = base.join(case);
             let watched = directory.join("watched");
             fs::create_dir_all(&watched).unwrap();
@@ -86,105 +86,76 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
             } else {
                 scheduler.enqueue(&root_id, source_text.to_owned(), CandidateAdmission::Retry).unwrap();
             }
+            let admitted = scheduler.pending[&id].candidate.clone();
             let held = Arc::new(Mutex::new(None));
             let held_in_check = Arc::clone(&held);
             let check_source = source.clone();
             let check_id = id.clone();
             scheduler.admission_checkpoint = Some(Box::new(move |scheduler| {
-                assert!(scheduler.pending[&check_id].admission_ready, "first real probe did not prepare {case}");
+                assert!(!scheduler.pending.contains_key(&check_id), "ready generation was reinserted: {case}");
                 assert!(scheduler.journal.state().pending(check_source.to_str().unwrap()).is_some(),
-                    "checkpoint must publish durable intent before reusing readiness");
-                if case == "content" {
+                    "admission must be durable before checkpoint/submit");
+                if matches!(case, "content" | "owned_content") {
                     fs::write(&check_source, b"new and larger archive generation written after checkpoint").unwrap();
                     scheduler.enqueue(&root_id, check_source.to_string_lossy().into_owned(), CandidateAdmission::Observe).unwrap();
-                    assert!(!scheduler.pending[&check_id].admission_ready);
                 }
                 if case == "claim" {
                     scheduler.hub.claims.lock().unwrap().insert(check_id.clone(), Arc::from("foreground"));
                 }
                 if case == "resnapshot" {
                     let file = fs::OpenOptions::new().write(true).open(&check_source).unwrap();
-                    file.set_modified(std::time::SystemTime::now()
-                        - std::time::Duration::from_secs(20)).unwrap();
-                    drop(file);
-                    let pending = scheduler.pending.get_mut(&check_id).unwrap();
-                    pending.admission_ready = false;
-                    return Ok(());
+                    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(20)).unwrap();
                 }
-                if case == "owned" {
+                if matches!(case, "owned" | "owned_content") {
                     let output = check_source.parent().unwrap().to_string_lossy().into_owned();
                     let identity = output_identity(&output).unwrap();
-                    scheduler.journal.commit(true, |_| {
-                        Ok(crate::watch_store::NativeWatchOperations::owned_outputs(
-                            &[output], &[&identity],
-                        ))
-                    }).unwrap();
-                    return Ok(());
+                    scheduler.journal.commit(true, |_| Ok(crate::watch_store::NativeWatchOperations::owned_outputs(
+                        &[output], &[&identity],
+                    ))).unwrap();
                 }
                 if case == "stop" { scheduler.hub.stopped.store(true, Ordering::Release); }
-                // A live writer conflicts with watch_file_is_ready's read-only
-                // sharing, while permitting catalog readers and metadata probes.
-                // Stable admission must reuse its real first successful probe.
+                // Every case now conflicts with a second readiness probe. main
+                // still submits its first batch, including new checkpoint events.
                 *held_in_check.lock().unwrap() = Some(fs::OpenOptions::new().write(true)
                     .share_mode(7).open(&check_source).unwrap());
-                assert!(!filesystem::watch_file_is_ready(check_source.to_str().unwrap()).unwrap(),
-                    "writer must block a fresh readiness probe");
+                assert!(!filesystem::watch_file_is_ready(check_source.to_str().unwrap()).unwrap());
                 if case == "error" { return Err(io::Error::other("checkpoint publication failed")); }
-                if case == "stable" {
-                    // Admission, not extraction, is under test. Retire the root
-                    // after publication so start_batch cannot launch a worker.
-                    scheduler.roots.clear();
-                }
                 Ok(())
             }));
             let result = scheduler.dispatch_ready();
             assert_eq!(result.is_err(), case == "error", "{case}: {result:?}");
             assert!(scheduler.admission_checkpoint.is_none(), "checkpoint barrier not reached: {case}");
-            if matches!(case, "stable" | "owned" | "resnapshot") {
-                assert!(scheduler.pending.is_empty(), "{case} candidate was requeued");
-                assert!(scheduler.due.is_empty());
-                if case == "owned" {
-                    assert!(scheduler.active.is_empty(), "owned output reached the worker");
-                    assert!(scheduler.journal.state().pending(source_text).is_none());
-                }
-                if case == "resnapshot" {
-                    let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
-                    assert!(scheduler.journal.state().pending(source_text).unwrap().matches_observation(&candidate));
-                    scheduler.hub.stop();
-                    scheduler.drain_active(&mut Ok(0)).unwrap();
-                }
-            } else {
-                assert!(!scheduler.pending[&id].admission_ready, "readiness leaked past {case}");
+            if matches!(case, "error" | "stop") {
                 assert!(scheduler.active.is_empty());
-                if case == "content" {
-                    assert!(scheduler.pending[&id].candidate.size > b"initial archive bytes".len() as u64);
+                assert!(scheduler.journal.state().pending(source_text).unwrap().matches_observation(&admitted),
+                    "failed/stopped admission lost its durable generation");
+            } else if matches!(case, "owned" | "owned_content") {
+                assert!(scheduler.active.is_empty());
+                assert!(scheduler.journal.state().pending(source_text).is_none());
+                if case == "owned_content" {
+                    assert!(scheduler.pending[&id].candidate.size > admitted.size);
+                    assert!(scheduler.unpublished.contains(&id), "retiring old admission cleared new generation's persistence");
                 }
-                scheduler.hub.claims.lock().unwrap().clear();
-                scheduler.hub.stopped.store(false, Ordering::Release);
-                let now = Instant::now();
-                let pending = scheduler.pending.get_mut(&id).unwrap();
-                scheduler.due.remove(&(pending.due, id.clone()));
-                pending.due = now;
-                scheduler.due.insert((now, id.clone()), ());
-                assert!(scheduler.prepare_ready_blocking(now, 1).unwrap().is_empty(),
-                    "parked {case} reused readiness despite a locked file");
-                let retry = scheduler.pending[&id].due;
-                // A busy candidate must remain scheduled, but main does not
-                // add confirmation latency to a zero learned quiet window.
-                let pending = scheduler.pending.remove(&id).unwrap();
-                scheduler.due.remove(&(retry, id.clone()));
-                pending.quiet.set_seconds(0.0);
-                scheduler.delay(id.clone(), pending, now);
-                assert_eq!(scheduler.pending[&id].due, now);
-                held.lock().unwrap().take();
-                assert_eq!(scheduler.prepare_ready_blocking(Instant::now(), 1).unwrap().len(), 1,
-                    "parked {case} was lost after becoming readable");
+            } else if case == "claim" {
+                assert!(scheduler.active.is_empty());
+                assert_eq!(scheduler.pending[&id].candidate.size, admitted.size);
+            } else {
+                let active = scheduler.active.values().next().expect("first prepared batch was not submitted");
+                assert!(active.inputs[&id].size == admitted.size && active.inputs[&id].mtime == admitted.mtime,
+                    "checkpoint substituted a different generation: {case}");
+                if matches!(case, "content" | "owned_content") {
+                    assert!(scheduler.pending[&id].candidate.size > admitted.size,
+                        "checkpoint's new generation was lost");
+                }
             }
             held.lock().unwrap().take();
+            scheduler.hub.claims.lock().unwrap().clear();
+            scheduler.hub.stop();
+            scheduler.drain_active(&mut Ok(0)).unwrap();
         }
         return;
     }
-    run_isolated("checkpoint_admission_reuses_only_unchanged_unclaimed_readiness", CHILD);
+    run_isolated("checkpoint_submits_the_first_ready_generation", CHILD);
 }
 
 fn run_isolated(name: &str, child: &str) {
@@ -265,7 +236,8 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
     let failing = bad.clone();
     scheduler.admission_checkpoint = Some(Box::new(move |scheduler| {
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
-        assert!(scheduler.pending[&key(&failing)].admission_ready);
+        assert!(!scheduler.pending.contains_key(&key(&failing)));
+        assert!(scheduler.journal.state().pending(failing.to_str().unwrap()).is_some());
         // Cache the native header in the checkpoint's current catalog. Hold
         // a real sharing conflict through the worker's password session open.
         let scope = &scheduler.roots[&root].1;

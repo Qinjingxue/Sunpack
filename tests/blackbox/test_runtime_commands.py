@@ -511,3 +511,16 @@ def test_standalone_watch_once_keeps_continuous_status(package, tmp_path):
     assert not after["running"]
     assert after["generation"] == before["generation"]
     assert after["last_error"] == before["last_error"] == ""
+
+
+def test_watch_drive_relative_receipts_preserve_client_path_spelling(package, tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    # main's _request_paths uses ntpath.join, not abspath: echo the client's
+    # same-drive base while retaining the lexical .\ component.
+    for operand in ("inbox", r".\inbox", tmp_path.drive + r".\inbox", tmp_path.drive.lower() + r".\inbox"):
+        requested = os.path.join(str(tmp_path), operand)
+        for action, key in (("add", "added"), ("remove", "removed")):
+            report = package.json("watch", action, operand, cwd=tmp_path)
+            assert report["inputs"]["paths"] == [requested]
+            assert [os.path.normcase(path) for path in report["summary"][key]] == [os.path.normcase(inbox)]
