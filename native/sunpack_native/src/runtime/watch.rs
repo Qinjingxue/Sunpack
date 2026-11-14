@@ -2061,7 +2061,34 @@ impl Scheduler {
         scheduler
             .journal
             .log(json!({"event":"watch_started","roots":scheduler.roots.len()}));
+        scheduler.suspend_empty_scheduler()?;
         Ok(scheduler)
+    }
+
+    fn suspend_empty_scheduler(&mut self) -> io::Result<()> {
+        if !self.roots.is_empty() || self.journal.suspended() { return Ok(()); }
+        // Reconciliation has already drained requests and retired removed scopes.
+        // Keep only the configuration/tray/log shell; durable recovery belongs to
+        // the next scheduler, not to an idle service with no roots.
+        self.root_observers.clear();
+        self.parent_observers.clear();
+        self.monitor.take();
+        self.toast.take();
+        *self.external.lock().unwrap() = None;
+        self.catalog.commit(true);
+        self.journal.suspend()?;
+        self.catalog.close();
+        self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(), None));
+        self.pending = HashMap::new();
+        self.unpublished = HashSet::new();
+        self.due.clear();
+        self.active = HashMap::new();
+        self.active_paths = HashMap::new();
+        self.available_roots = HashSet::new();
+        self.candidate_diagnostics = CandidateDiagnostics::default();
+        self.hub.clear_idle_completed_families();
+        self.cache_deadline = None;
+        Ok(())
     }
 
     fn observe_config(
@@ -2258,6 +2285,10 @@ impl Scheduler {
             });
             Ok((entries, next, policy_changed))
         })?;
+        if self.journal.resume()? {
+            self.catalog = Arc::new(NativeWatchCatalog::new(self.journal.state(),
+                Some(state_dir(&self.cwd)?.to_string_lossy().into_owned())));
+        }
         // Validate the latest root file before stopping the running scheduler.
         // Draining async requests must never hold a blocking-stage permit.
         if restart_scheduler || policy_changed {
@@ -2352,6 +2383,14 @@ impl Scheduler {
     }
 
     fn reload(&mut self) -> io::Result<bool> {
+        let result = self.reload_loaded();
+        // Invalid config/root policy or rollback failures may follow a resume.
+        // The rootless shell releases that temporary state on every exit path.
+        let suspended = self.suspend_empty_scheduler();
+        result.and_then(|changed| suspended.map(|()| changed))
+    }
+
+    fn reload_loaded(&mut self) -> io::Result<bool> {
         let snapshot = self.engine.run_stage("watch_config_reload", Origin::Watch, || config::reload_snapshot(&self.cwd))?;
         let config_changed = *self.settings != snapshot.config;
         let scheduler_changed = scheduler_configuration_changed(&self.settings, &snapshot.config);
@@ -2604,7 +2643,7 @@ impl Scheduler {
             if signals.password_changed || !signals.reload_waiters.is_empty() {
                 self.password_update(false)?;
             }
-            if signals.foreground_finished {
+            if signals.foreground_finished && !self.roots.is_empty() {
                 self.arm_idle_cleanup();
             } else if signals.password_changed && self.cache_deadline.is_none() {
                 let path = self.passwords.path().to_string_lossy();
@@ -3601,6 +3640,7 @@ impl Scheduler {
                 return Ok(());
             }
         };
+        if self.journal.suspended() { return Ok(()); }
         let signature = password_source_signature(&self.user_password_signature, snapshot.signature());
         let state = self.journal.state();
         let changed = state.password_source_signature() != signature;
@@ -4126,7 +4166,7 @@ impl Scheduler {
                 }
                 Err(error) => {
                     self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, Instant::now(), true);
+                    self.delay(id, pending, Instant::now());
                     continue;
                 }
             };
@@ -4154,7 +4194,7 @@ impl Scheduler {
                 );
                 pending.candidate = current;
                 self.unpublished.insert(id.clone());
-                self.delay(id, pending, now, false);
+                self.delay(id, pending, now);
                 continue;
             }
             if quiet::is_boundary(&current) {
@@ -4178,7 +4218,7 @@ impl Scheduler {
                 Ok(true) => {}
                 Ok(false) => {
                     self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, None);
-                    self.delay(id, pending, Instant::now(), true);
+                    self.delay(id, pending, Instant::now());
                     continue;
                 }
                 Err(error) if missing_path(&error) => {
@@ -4187,7 +4227,7 @@ impl Scheduler {
                 }
                 Err(error) => {
                     self.candidate_diagnostics.log_wait(&self.journal, Instant::now(), &id, &pending.candidate.path, Some(&error));
-                    self.delay(id, pending, Instant::now(), true);
+                    self.delay(id, pending, Instant::now());
                     continue;
                 }
             }
@@ -4294,13 +4334,12 @@ impl Scheduler {
         Ok(())
     }
 
-    fn delay(&mut self, id: String, mut pending: Pending, now: Instant, probe_failed: bool) {
-        let confirmation = self.settings.watch.boundary_confirmation_seconds;
-        let due = pending.quiet.boundary_deadline(now, confirmation);
-        // An outstanding writer or observation error needs a recheck even
-        // without further file changes. A new input has no learned cadence;
-        // reuse the confirmation interval so the failed probe cannot spin.
-        pending.due = if probe_failed && due == now { quiet::after(now, confirmation) } else { due };
+    fn delay(&mut self, id: String, mut pending: Pending, now: Instant) {
+        // Main keeps a fresh/reset quiet window immediately eligible even
+        // after a busy or failed probe; do not impose a separate wait floor.
+        pending.due = pending.quiet.boundary_deadline(
+            now, self.settings.watch.boundary_confirmation_seconds,
+        );
         self.due.insert((pending.due, id.clone()), ());
         self.pending.insert(id, pending);
     }
@@ -4751,9 +4790,10 @@ impl Scheduler {
             {
                 // Emit once per logical archive, including carrier segments and
                 // recursive children, rather than repeating it for every volume.
-                self.journal.log(
+                self.journal.log_failure(
                     json!({"event":"archive_failure_evidence","path":archive.path,
-                    "owner":batch,"depth":archive.depth,"offset":archive.offset,"failure":failure}),
+                    "owner":batch,"depth":archive.depth,"offset":archive.offset}),
+                    failure,
                 );
             }
         }

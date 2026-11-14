@@ -48,6 +48,7 @@ struct Checkpoint {
 
 pub(super) struct Journal {
     state: NativeWatchState,
+    suspended: AtomicBool,
     log: NativeEventLog,
     frontier: Mutex<Frontier>,
     checkpoint: Mutex<Option<Checkpoint>>,
@@ -70,6 +71,29 @@ impl Journal {
             .open(dir.join("state.runtime.lock"))?;
         let snapshot = dir.join("state.snapshot");
         let state = NativeWatchState::new();
+        let frontier = Self::restore_state(&state, dir)?;
+        let stream_id = key(&snapshot);
+        let stream = watch_journal_open(stream_id.clone())?;
+        watch_journal_seed(&stream_id, frontier.seq)?;
+        let log = NativeEventLog::new(dir.join("events.json"), retention_days.min(u32::MAX.into()) as u32, true)?;
+        state.attach_events(&log)?;
+        log.recover(Some(&state))?;
+        Ok(Self {
+            state,
+            suspended: AtomicBool::new(false),
+            log,
+            frontier: Mutex::new(frontier),
+            checkpoint: Mutex::default(),
+            maintenance: Mutex::default(),
+            snapshot,
+            stream_id,
+            _stream: stream,
+            _lock: lock,
+        })
+    }
+
+    fn restore_state(state: &NativeWatchState, dir: &Path) -> io::Result<Frontier> {
+        let snapshot = dir.join("state.snapshot");
         let checkpoint = match state.load_snapshot(snapshot.to_string_lossy().into_owned()) {
             Ok(checkpoint) => checkpoint,
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
@@ -112,23 +136,38 @@ impl Journal {
         if retire_segments(dir, retirement_boundary) {
             frontier.retirement = Some(retirement_boundary);
         }
-        let stream_id = key(&snapshot);
-        let stream = watch_journal_open(stream_id.clone())?;
-        watch_journal_seed(&stream_id, frontier.seq)?;
-        let log = NativeEventLog::new(dir.join("events.json"), retention_days.min(u32::MAX.into()) as u32, true)?;
-        state.attach_events(&log)?;
-        log.recover(Some(&state))?;
-        Ok(Self {
-            state,
-            log,
-            frontier: Mutex::new(frontier),
-            checkpoint: Mutex::default(),
-            maintenance: Mutex::default(),
-            snapshot,
-            stream_id,
-            _stream: stream,
-            _lock: lock,
-        })
+        Ok(frontier)
+    }
+
+    pub(super) fn suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    // The control/logging shell stays alive without roots, but must not retain
+    // recovery receipts. WAL is durable before releasing its in-memory views.
+    pub(super) fn suspend(&self) -> io::Result<()> {
+        if self.suspended() { return Ok(()); }
+        self.flush()?;
+        let mut checkpoint = self.checkpoint.lock().unwrap();
+        self.harvest_checkpoint(checkpoint.take())?;
+        let frontier = self.frontier.lock().unwrap();
+        watch_journal_request_flush(self.stream_id.clone(), frontier.seq)?.wait()?;
+        self.suspended.store(true, Ordering::Release);
+        self.state.unload();
+        Ok(())
+    }
+
+    pub(super) fn resume(&self) -> io::Result<bool> {
+        let mut frontier = self.frontier.lock().unwrap();
+        if !self.suspended() { return Ok(false); }
+        // Load into a temporary state so an IO error cannot publish a partially
+        // replayed generation to the live catalog or a later retry.
+        let restored = NativeWatchState::new();
+        let next = Self::restore_state(&restored, self.snapshot.parent().unwrap())?;
+        *self.state.lock() = std::mem::take(&mut *restored.lock());
+        *frontier = next;
+        self.suspended.store(false, Ordering::Release);
+        Ok(true)
     }
 
     pub(super) fn set_maintenance(&self, notify: Arc<dyn Fn() + Send + Sync>) {
@@ -141,6 +180,12 @@ impl Journal {
 
     pub(super) fn log(&self, value: Value) {
         if self.log.write(value).is_err() {
+            let _ = self.rebuild_log();
+        }
+    }
+
+    pub(super) fn log_failure(&self, value: Value, failure: &crate::pipeline::Failure) {
+        if self.log.write_failure(value, failure).is_err() {
             let _ = self.rebuild_log();
         }
     }
@@ -165,6 +210,9 @@ impl Journal {
         let ticket = {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
+            // A foreground publication captured before the final root was
+            // removed no longer belongs to an active Watch scheduler.
+            if self.suspended() { return Ok(()); }
             let operations = prepare(&self.state)?;
             if operations.__len__() == 0 {
                 return Ok(());
@@ -242,6 +290,7 @@ impl Journal {
     }
 
     pub(super) fn compact(&self) -> io::Result<()> {
+        if self.suspended() { return Ok(()); }
         let mut active = self.checkpoint.lock().unwrap();
         if active.as_ref().is_some_and(|checkpoint| !checkpoint.ready.load(Ordering::Acquire) && !checkpoint.job.is_finished()) {
             return Ok(());
@@ -250,6 +299,7 @@ impl Journal {
         let (checkpoint, seal, boundary, records, bytes) = {
             let mut frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
+            if self.suspended() { return Ok(()); }
             if !frontier.needs_checkpoint() {
                 if let Some(boundary) = frontier.retirement {
                     let dir = self.snapshot.parent().unwrap().to_owned();
@@ -423,6 +473,46 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rootless_shell_releases_receipts_and_replays_snapshot_and_wal() {
+        use crate::watch_store::PendingObservation;
+        let marker = crate::test_support::temp_file("rootless_journal", b"");
+        let dir = marker.with_extension("state");
+        let journal = Journal::open(&dir, 7).unwrap();
+        journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(7, "saved".into()))).unwrap();
+        journal.frontier.lock().unwrap().records = CHECKPOINT_RECORDS;
+        journal.flush().unwrap();
+        assert!(dir.join("state.snapshot").exists());
+        let paths: Vec<_> = (0..256).map(|index| dir.join(format!("{index}.zip")).to_string_lossy().into_owned()).collect();
+        journal.commit(true, |state| Ok(state.pending_operations(paths.iter().map(|path|
+            (PendingObservation(path.clone(), 1, 1.0, "id".into(), 1), "root".into(), None)),
+            false, "root", true, true, None)?.0)).unwrap();
+        let receipt = Arc::downgrade(&journal.state().pending(&paths[0]).unwrap());
+        journal.frontier.lock().unwrap().fault = Some("unavailable WAL".into());
+        assert!(journal.suspend().is_err());
+        assert!(!journal.suspended() && receipt.upgrade().is_some());
+        journal.frontier.lock().unwrap().fault = None;
+        journal.suspend().unwrap();
+        assert!(receipt.upgrade().is_none());
+        assert!(journal.state().pending_items().is_empty());
+        // Rootless diagnostics/maintenance never checkpoint the empty view over
+        // the saved generation or append work captured by the former scheduler.
+        journal.compact().unwrap();
+        journal.flush().unwrap();
+        journal.rebuild_log().unwrap();
+        journal.commit(true, |_| panic!("rootless shell must not prepare state mutations")).unwrap();
+        assert!(journal.resume().unwrap());
+        assert_eq!(journal.state().pending_items().len(), paths.len());
+        assert_eq!(journal.state().password_generation(), 7);
+        journal.suspend().unwrap();
+        drop(journal);
+        let reopened = Journal::open(&dir, 7).unwrap();
+        assert_eq!(reopened.state().pending_items().len(), paths.len());
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_file(marker).unwrap();
+    }
 
     #[test]
     fn configured_retention_applies_before_first_writer_pass() {

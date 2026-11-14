@@ -7,6 +7,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.helpers.installer import inno_compiler
 
 
@@ -175,3 +177,23 @@ $entries = @($items | ForEach-Object {{
         assert all(rule["type"] == "Allow" and rule["inherited"] is not is_root for rule in entry["rules"])
         if is_root:
             assert all(rule["inheritance"] == 3 and rule["propagation"] == 0 for rule in entry["rules"])
+
+
+def test_rust_writer_cpp_query_lifecycle(repo_root):
+    # The existing Rust decoder cannot detect C++ query/index/filter mistakes.
+    # This prebuilt test drives the real writer and invokes --project itself;
+    # no Python pipeline, copied store decoder, or build-on-test fallback.
+    binary = Path(os.environ.get("SUNPACK_GUI_WRITER_TEST_BINARY", repo_root / "tools" / "gui_projection_writer.exe"))
+    if not binary.is_file() and "SUNPACK_GUI_WRITER_TEST_BINARY" not in os.environ:
+        pytest.skip("Set SUNPACK_GUI_WRITER_TEST_BINARY to the prebuilt Rust lib test executable")
+    assert binary.is_file(), "Build/copy the Rust lib test executable and set SUNPACK_GUI_WRITER_TEST_BINARY"
+    arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
+    gui = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
+    assert gui.is_file(), "Build the actual C++ GUI reader with scripts/build_gui.ps1"
+    environment = {**os.environ, "SUNPACK_GUI_TEST_BINARY": str(gui)}
+    result = subprocess.run(
+        [str(binary), "--ignored", "--exact", "event_log::gui_contract::rust_writer_cpp_query_lifecycle", "--nocapture"],
+        capture_output=True, text=True, encoding="utf-8", env=environment,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout, "the real writer/GUI boundary test was not selected"

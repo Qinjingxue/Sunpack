@@ -140,9 +140,15 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
                 assert!(scheduler.prepare_ready_blocking(now, 1).unwrap().is_empty(),
                     "parked {case} reused readiness despite a locked file");
                 let retry = scheduler.pending[&id].due;
-                assert!(retry > now, "parked {case} would repeatedly probe a busy file");
+                // A busy candidate must remain scheduled, but main does not
+                // add confirmation latency to a zero learned quiet window.
+                let pending = scheduler.pending.remove(&id).unwrap();
+                scheduler.due.remove(&(retry, id.clone()));
+                pending.quiet.set_seconds(0.0);
+                scheduler.delay(id.clone(), pending, now);
+                assert_eq!(scheduler.pending[&id].due, now);
                 held.lock().unwrap().take();
-                assert_eq!(scheduler.prepare_ready_blocking(retry, 1).unwrap().len(), 1,
+                assert_eq!(scheduler.prepare_ready_blocking(Instant::now(), 1).unwrap().len(), 1,
                     "parked {case} was lost after becoming readable");
             }
             held.lock().unwrap().take();
@@ -340,6 +346,33 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
         assert!(scheduler.reload().is_err());
         let observer = &scheduler.root_observers[&root_id].root.as_ref().unwrap().observer;
         assert!(observer.alive() && Arc::ptr_eq(&observer.changes, &original));
+
+        // Removing the last root must release the data scheduler, not discard
+        // unfinished output ownership. Re-adding it loads the same durable work.
+        let root = scheduler.roots[&root_id].0.clone();
+        write_roots(&scheduler.root_file, std::slice::from_ref(&root)).unwrap();
+        let held_output = watched.join("held-output");
+        scheduler.journal.commit(true, |state| Ok(state.output_operation(owner,
+            owner.to_owned(), held_output.to_string_lossy().into_owned(), None, None)?.unwrap())).unwrap();
+        let held_member = held_output.join("locked.txt");
+        fs::write(&held_member, b"unfinished output").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&held_member).unwrap();
+        let receipt = Arc::downgrade(&scheduler.journal.state().pending(owner).unwrap());
+        write_roots(&scheduler.root_file, &[]).unwrap();
+        scheduler.reload().unwrap();
+        assert!(scheduler.journal.suspended());
+        assert!(scheduler.pending.is_empty() && scheduler.journal.state().pending_items().is_empty());
+        assert!(receipt.upgrade().is_none(), "idle shell retained recovery receipts");
+        assert!(scheduler.external.lock().unwrap().is_none());
+        scheduler.password_update(false).unwrap();
+        scheduler.journal.rebuild_log().unwrap();
+        scheduler.journal.flush().unwrap();
+        drop(held);
+        write_roots(&scheduler.root_file, &[root]).unwrap();
+        scheduler.reload().unwrap();
+        assert!(!scheduler.journal.suspended());
+        assert!(!held_output.exists(), "re-attached scheduler lost output cleanup intent");
+        assert!(scheduler.pending.contains_key(&key(&source)));
         return;
     }
     run_isolated("semantic_reload_recovers_pending_after_output_unlock", CHILD);

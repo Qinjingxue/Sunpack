@@ -323,31 +323,26 @@ impl CandidateSet {
         let mut password_rejected = false;
         let mut has_candidates = false;
         let mut candidates = candidates.inspect(|_| has_candidates = true);
-        // The empty password has priority only when Rust has not already
-        // established encryption. A backend proof may still be necessary.
-        let mut empty_probe = !needs_password;
+        // Empty has first-candidate priority, not a separate verification phase.
+        // Fill the same batch so the native verifier retains its parallel threshold.
+        if !needs_password {
+            batch.push(Arc::from(""));
+            if let Some(key) = key.as_ref() {
+                password_rejected |= self.cache.remove_rejected(key, &mut batch);
+            }
+        }
         loop {
             cancellation.check_io()?;
-            if std::mem::take(&mut empty_probe) {
-                batch.push(Arc::from(""));
-                if let Some(key) = key.as_ref() {
-                    password_rejected |= self.cache.remove_rejected(key, &mut batch);
-                }
-                if batch.is_empty() {
-                    continue;
-                }
+            // Fill after skipping cached negatives; sparse survivors must still
+            // reach the native parallel paths.
+            if let Some(key) = key.as_ref() {
+                self.cache.fill_available(key, &mut batch, &mut candidates, cancellation)?;
             } else {
-                // Fill the verification batch after skipping cached negatives.
-                // Sparse survivors must still reach the native parallel paths.
-                if let Some(key) = key.as_ref() {
-                    self.cache.fill_available(key, &mut batch, &mut candidates, cancellation)?;
-                } else {
-                    batch.extend(candidates.by_ref().take(BATCH_SIZE - batch.len()).cloned());
-                }
-                if batch.is_empty() {
-                    password_rejected |= has_candidates;
-                    break;
-                }
+                batch.extend(candidates.by_ref().take(BATCH_SIZE - batch.len()).cloned());
+            }
+            if batch.is_empty() {
+                password_rejected |= has_candidates;
+                break;
             }
             if check_single_enc && batch.len() == 1 {
                 // The worker authenticates the sole ENC candidate when opening
@@ -356,6 +351,10 @@ impl CandidateSet {
                 break;
             }
             check_single_enc = false;
+            #[cfg(test)]
+            PLANNED_BATCHES.with(|capture| {
+                if let Some(batches) = capture.borrow_mut().as_mut() { batches.push(batch.clone()); }
+            });
             let result = password::verify(input, &batch, &sessions, None)?;
             match result.status {
                 "not_required" => {
@@ -570,8 +569,49 @@ impl Failure {
 }
 
 #[cfg(test)]
+thread_local! {
+    static PLANNED_BATCHES: std::cell::RefCell<Option<Vec<Vec<Arc<str>>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, Password};
+        use sevenz_rust2::encoder_options::AesEncoderOptions;
+        let mut bytes = Vec::new();
+        {
+            let mut writer = ArchiveWriter::new(std::io::Cursor::new(&mut bytes)).unwrap();
+            writer.set_content_methods(vec![AesEncoderOptions::new(Password::new("correct")).into()]);
+            writer.push_archive_entry(ArchiveEntry::new_file("payload"), Some(b"payload".as_slice())).unwrap();
+            writer.finish().unwrap();
+        }
+        let source = crate::test_support::temp_file("password_batch_7z", &bytes);
+        // Relations' header geometry does not declare encryption. Exercise that
+        // actual password plan, rather than manually invoking the verifier.
+        let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "7z".into(), "archive".into());
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { PLANNED_BATCHES.with(|value| *value.borrow_mut() = None); } }
+        let _reset = Reset;
+        for tail in ["correct", "wrong3"] {
+            let cache = AttemptCache::default();
+            let candidates = CandidateSet::new(Arc::from([Arc::from("wrong1"), Arc::from("wrong2"), Arc::from(tail)]), None, &cache, None);
+            PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
+            let plan = candidates.plan(&input, None, &Cancellation::new()).unwrap();
+            PLANNED_BATCHES.with(|value| {
+                let borrow = value.borrow(); let batches = borrow.as_ref().unwrap();
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].iter().map(AsRef::as_ref).collect::<Vec<&str>>(), ["", "wrong1", "wrong2", tail]);
+            });
+            if tail == "correct" {
+                let plan = plan.unwrap(); assert!(plan.verified);
+                assert_eq!(plan.selected.as_deref(), Some("correct"));
+            } else { assert!(matches!(plan, Err(Failure { kind: FailureKind::WrongPassword, .. }))); }
+        }
+        std::fs::remove_file(source).unwrap();
+    }
 
     #[test]
     fn encrypted_empty_rar_crc_failure_uses_verified_direct_password_plan() {

@@ -63,6 +63,16 @@ jobs:
         run: |
           .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4
 
+      - name: Build real writer test executable for GUI contracts
+        shell: pwsh
+        run: |
+          $artifacts = & cargo test --locked --manifest-path native/Cargo.toml -p sunpack-native --lib --no-run --profile ci --target x86_64-pc-windows-msvc --target-dir .cache/rust-target/x64 --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
+          if ($LASTEXITCODE -ne 0) { throw 'Rust GUI writer test build failed' }
+          $writer = @($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sunpack_native' -and $_.executable })
+          if ($writer.Count -ne 1) { throw 'Expected exactly one Rust lib test executable' }
+          New-Item -ItemType Directory -Path tools -Force | Out-Null
+          Copy-Item -LiteralPath $writer[0].executable -Destination tools/gui_projection_writer.exe -Force
+
       - name: Save native build cache after successful compilation
         if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -83,6 +93,7 @@ jobs:
           include-hidden-files: true
           path: |
             .cache/rust-target/x64/x86_64-pc-windows-msvc/ci/sunpack-runtime.exe
+            tools/gui_projection_writer.exe
             native/sevenzip_bridge/build-x64-ci/Release/sunpack_launcher.exe
             native/sevenzip_bridge/build-x64-ci/Release/sunpack_sevenzip_worker.exe
           if-no-files-found: error
@@ -214,5 +225,6 @@ jobs:
         shell: pwsh
         run: |
           $env:SUNPACK_GUI_TEST_BINARY = (Resolve-Path .cache/gui-x64/Release/sunpack_gui_tests.exe).Path
+          $env:SUNPACK_GUI_WRITER_TEST_BINARY = (Resolve-Path tools/gui_projection_writer.exe).Path
           & .\.venv\Scripts\python.exe -m pytest -q tests/blackbox/test_runtime_commands.py::test_gui_password_edits_are_visible_to_running_runtime tests/gui/test_integration.py
           if ($LASTEXITCODE -ne 0) { throw 'GUI and runtime boundary tests failed' }

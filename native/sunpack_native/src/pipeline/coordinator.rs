@@ -3169,12 +3169,12 @@ impl<'run, O: Observer> Run<'run, O> {
                             // main keeps nonempty failed output for manual recovery,
                             // but only verified files authorize recursive processing.
                             if verified_files > 0 || stats.file_count() > 0 {
+                                result.recovered_complete_files = recovery_complete_files(&failure, verified_files as u64);
                                 result.partial = accepts_partial_content(
                                     self.request.config.extraction.content_requirement,
-                                    failure.kind, verified_files as u64,
+                                    failure.kind, result.recovered_complete_files,
                                 );
                                 result.files = stats.file_count() as u64;
-                                result.recovered_complete_files = verified_files as u64;
                                 result.bytes = stats.total_size();
                                 result.output = Some(output.clone());
                                 if result.partial {
@@ -3878,6 +3878,14 @@ fn project_possible_missing_volume(results: &mut [ArchiveResult], split: bool) {
             evidence.possible_missing_volume = false;
         }
     }
+}
+
+// Raw successful members may survive for manual recovery. Only main's
+// recoverable failure classes grant a checkpoint permission to reuse that root.
+fn recovery_complete_files(failure: &Failure, verified_files: u64) -> u64 {
+    if matches!(failure.kind, FailureKind::Damaged | FailureKind::MissingVolume)
+        && failure.causes.is_empty()
+    { verified_files } else { 0 }
 }
 
 fn accepts_partial_content(requirement: ContentRequirement, failure: FailureKind, complete_files: u64) -> bool {
@@ -7436,6 +7444,58 @@ mod tests {
     }
 
     #[test]
+    fn failed_carrier_recovery_counts_choose_only_eligible_output_roots() {
+        for kind in [FailureKind::Unsupported, FailureKind::Damaged, FailureKind::MissingVolume] {
+            let source = crate::test_support::temp_file("recovery_count_carrier", &[0; 16]);
+            let container = source.with_extension("outputs");
+            fs::create_dir(&container).unwrap();
+            let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "carrier".into());
+            let inputs: Vec<_> = archive_input_slices(&input, &[("zip", 0, Some(8)), ("zip", 8, Some(16))])
+                .unwrap().0.into_iter().map(Option::unwrap).collect();
+            let generations = HashMap::from([(path_key(&input.entry_path), capture_file_generation(&source).unwrap())]);
+            let mut checkpoints = Vec::new();
+            for (index, input) in inputs.iter().enumerate() {
+                let mut result = receipt(input, DiscoverySource::Embedded, 1);
+                let failure = Failure::new(if index == 0 { kind } else { FailureKind::WrongPassword }, "failed segment");
+                result.recovered_complete_files = recovery_complete_files(&failure, u64::from(index == 0));
+                result.failure = Some(failure);
+                if index == 0 {
+                    let output = container.join("salvaged"); fs::create_dir(&output).unwrap();
+                    fs::write(output.join("complete.txt"), b"manual recovery").unwrap();
+                    result.output = Some(output); result.files = 1;
+                }
+                let mut checkpoint = InputCheckpoint::create(&source, Arc::new(input.clone()), &result, &generations, Some(&container)).unwrap();
+                checkpoint.install_report(InputCheckpoint::report_state(input, &result, None, None, index + 1, 2));
+                checkpoint.set_password_signature(|| "old".into());
+                checkpoints.push(checkpoint);
+            }
+            // Only B's password change invalidates its receipt. A's physical
+            // salvage stays on disk, but Unsupported must not retain its root.
+            assert!(checkpoints[0].password_unchanged(|| "new".into()));
+            assert!(!checkpoints[1].password_unchanged(|| "new".into()));
+            let retained = checkpoints[0].retained_container();
+            let eligible = kind != FailureKind::Unsupported;
+            assert_eq!(retained, eligible.then_some(container.as_path()));
+            let engine = Engine::new(PathBuf::from("unused-worker"));
+            let mut request = Request::new(vec![source.clone()], Mode::Extract);
+            Arc::make_mut(&mut request.config).extraction.content_requirement = ContentRequirement::AllowPartial;
+            let observer = |_: Event| {};
+            let run = test_run(&engine, &request, &observer);
+            let selected = match retained {
+                Some(root) => root.to_path_buf(),
+                None => run.reserve_output(container.clone(), &receipt(&inputs[1], DiscoverySource::Embedded, 1), None).unwrap().unwrap(),
+            };
+            assert_eq!(selected == container, eligible);
+            let recovery = InputRecovery::capture(&checkpoints, &source, Some(&container), None, 2, true, eligible).unwrap();
+            let report = recovery.report(|failure| json!({"kind": format!("{:?}", failure.kind)}));
+            assert_eq!(report["inputs"][0]["recovered_complete_files"], u64::from(eligible));
+            assert_eq!(fs::read(container.join("salvaged/complete.txt")).unwrap(), b"manual recovery");
+            if selected != container { fs::remove_dir(selected).unwrap(); }
+            fs::remove_dir_all(container).unwrap(); fs::remove_file(source).unwrap();
+        }
+    }
+
+    #[test]
     fn retained_payload_does_not_authorize_partial_success() {
         for (kind, stage, expected) in [
             ("unsupported_method", "item_extract", true),
@@ -7455,6 +7515,11 @@ mod tests {
         }
         for kind in [FailureKind::Damaged, FailureKind::MissingVolume,
             FailureKind::WrongPassword, FailureKind::Unsupported, FailureKind::PasswordInconclusive] {
+            let mut failure = Failure::new(kind, "worker failure");
+            assert_eq!(recovery_complete_files(&failure, 2),
+                if matches!(kind, FailureKind::Damaged | FailureKind::MissingVolume) { 2 } else { 0 });
+            failure.causes.push(Failure::new(FailureKind::Unsupported, "compound cause"));
+            assert_eq!(recovery_complete_files(&failure, 2), 0);
             assert_eq!(accepts_partial_content(ContentRequirement::AllowPartial, kind, 2),
                 matches!(kind, FailureKind::Damaged | FailureKind::MissingVolume));
             assert!(!accepts_partial_content(ContentRequirement::Complete, kind, 2));

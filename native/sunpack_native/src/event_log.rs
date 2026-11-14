@@ -3,11 +3,41 @@ use crate::io::display_store::{utc_us, Store, DAY_US};
 use crate::io::display_wake::Wake;
 use crate::watch_store::NativeWatchState;
 use serde_json::{json, Value};
+use serde::ser::{SerializeSeq, SerializeStruct};
 use std::collections::{HashMap, HashSet};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
+
+mod diagnostic;
+use diagnostic::{short_string, MAX_DEPTH, MAX_ITEMS};
+
+/// Per-archive evidence never walks the shared carrier recovery receipts.
+/// Complete recovery data retains its ordinary serializer for durable state/reports.
+struct DiagnosticFailure<'a>(pub &'a crate::pipeline::Failure);
+impl serde::Serialize for DiagnosticFailure<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let failure = self.0;
+        let mut object = serializer.serialize_struct("FailureDiagnostic", 7)?;
+        object.serialize_field("kind", &failure.kind)?;
+        object.serialize_field("message", &failure.message)?;
+        if let Some(context) = &failure.context { object.serialize_field("context", context)?; }
+        if let Some(scope) = &failure.discovery_scope { object.serialize_field("discovery_scope", scope)?; }
+        if !failure.causes.is_empty() { object.serialize_field("causes", &Causes(&failure.causes))?; }
+        if let Some(evidence) = &failure.evidence { object.serialize_field("evidence", evidence)?; }
+        if failure.password_retry { object.serialize_field("password_retry", &true)?; }
+        object.end()
+    }
+}
+struct Causes<'a>(&'a [crate::pipeline::Failure]);
+impl serde::Serialize for Causes<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut list = serializer.serialize_seq(Some(self.0.len()))?;
+        for failure in self.0 { list.serialize_element(&DiagnosticFailure(failure))?; }
+        list.end()
+    }
+}
 
 const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 type Record = Arc<Vec<u8>>;
@@ -31,17 +61,9 @@ pub(crate) fn diagnostic_text(text: &str) -> &str {
     }
     &text[..end]
 }
-fn short_string<'a>(text: &'a str, max_bytes: usize, truncated: &mut bool) -> &'a str {
-    let mut end = text.len().min(max_bytes);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    *truncated |= end != text.len();
-    &text[..end]
-}
 
 fn bounded_value(value: Value, budget: &mut usize, depth: usize, truncated: &mut bool) -> Value {
-    if *budget == 0 || depth == 8 {
+    if *budget == 0 || depth == MAX_DEPTH {
         *truncated = true;
         return Value::Null;
     }
@@ -57,9 +79,9 @@ fn bounded_value(value: Value, budget: &mut usize, depth: usize, truncated: &mut
             Value::String(text)
         }
         Value::Array(values) => {
-            *truncated |= values.len() > 64;
-            let mut result = Vec::with_capacity(values.len().min(64));
-            for value in values.into_iter().take(64) {
+            *truncated |= values.len() > MAX_ITEMS;
+            let mut result = Vec::with_capacity(values.len().min(MAX_ITEMS));
+            for value in values.into_iter().take(MAX_ITEMS) {
                 if *budget == 0 {
                     *truncated = true;
                     break;
@@ -69,9 +91,9 @@ fn bounded_value(value: Value, budget: &mut usize, depth: usize, truncated: &mut
             Value::Array(result)
         }
         Value::Object(values) => {
-            *truncated |= values.len() > 64;
+            *truncated |= values.len() > MAX_ITEMS;
             let mut result = serde_json::Map::new();
-            for (key, value) in values.into_iter().take(64) {
+            for (key, value) in values.into_iter().take(MAX_ITEMS) {
                 if *budget == 0 {
                     *truncated = true;
                     break;
@@ -90,9 +112,15 @@ fn bounded_value(value: Value, budget: &mut usize, depth: usize, truncated: &mut
 }
 
 fn event_value(value: Value) -> std::io::Result<Value> {
+    event_value_with(value, None)
+}
+
+type DiagnosticProjection<'a> = (&'a str, &'a dyn Fn(&mut usize, &mut bool) -> Value);
+fn event_value_with(value: Value, diagnostic: Option<DiagnosticProjection<'_>>) -> std::io::Result<Value> {
     let Value::Object(mut fields) = value else {
         return Err(std::io::Error::other("event must be an object"));
     };
+    if let Some((name, _)) = diagnostic { fields.insert(name.to_owned(), Value::Null); }
     let event_value = fields.remove("event");
     let mut truncated = false;
     let event = short_string(
@@ -148,7 +176,7 @@ fn event_value(value: Value) -> std::io::Result<Value> {
         fields.remove_entry("error_kind"),
     ];
     for (i, (key, item)) in priority.into_iter().flatten().chain(fields).enumerate() {
-        if i == 64 || budget == 0 {
+        if i == MAX_ITEMS || budget == 0 {
             truncated = true;
             break;
         }
@@ -157,10 +185,11 @@ fn event_value(value: Value) -> std::io::Result<Value> {
             continue;
         }
         budget -= key.len();
-        result.insert(
-            key.to_owned(),
-            bounded_value(item, &mut budget, 0, &mut truncated),
-        );
+        let item = match diagnostic.filter(|(name, _)| *name == key) {
+            Some((_, project)) => project(&mut budget, &mut truncated),
+            None => bounded_value(item, &mut budget, 0, &mut truncated),
+        };
+        result.insert(key.to_owned(), item);
     }
     if truncated {
         result.insert("truncated".into(), Value::Bool(true));
@@ -952,6 +981,12 @@ impl NativeEventLog {
         self.shared()?.submit(event_value(value)?);
         Ok(())
     }
+    pub(crate) fn write_failure(&self, value: Value, failure: &crate::pipeline::Failure) -> std::io::Result<()> {
+        let project = |budget: &mut usize, truncated: &mut bool|
+            diagnostic::value(&DiagnosticFailure(failure), budget, truncated);
+        self.shared()?.submit(event_value_with(value, Some(("failure", &project)))?);
+        Ok(())
+    }
     pub(crate) fn recover(&self, state: Option<&NativeWatchState>) -> std::io::Result<()> {
         match state {
             Some(state) => state.with_event_projection(|rows| self.reset(rows)),
@@ -1006,6 +1041,34 @@ impl NativeEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_diagnostics_do_not_expand_or_change_shared_recovery_receipts() {
+        let input = crate::io::archive_state::ArchiveInput::file("C:/input.zip".into(), "zip".into(), "input.zip".into());
+        let checkpoint = json!({"schema_version":1,"carrier":"C:/input.zip","input":input,
+            "sources":[],"output":"C:/output","container":"C:/output","files":1,"bytes":1,
+            "encrypted":false,"discovery_source":"direct"});
+        let mut expected = None;
+        for count in [1, 1024] {
+            let failure: crate::pipeline::Failure = serde_json::from_value(json!({
+                "kind":"damaged","message":"CRC error","evidence":{"stage":"item_extract"},
+                "recovery":{"inputs":vec![checkpoint.clone();count],"output":"C:/output",
+                    "input_count":count,"had_checkpoints":true,"retry_output":true}
+            })).unwrap();
+            let project = |budget: &mut usize, truncated: &mut bool|
+                diagnostic::value(&DiagnosticFailure(&failure), budget, truncated);
+            let output = event_value_with(json!({"event":"archive_failure_evidence","path":"C:/input.zip"}),
+                Some(("failure", &project))).unwrap();
+            assert_eq!(output["failure"]["kind"], "damaged");
+            assert_eq!(output["failure"]["evidence"]["stage"], "item_extract");
+            assert!(output["failure"].get("recovery").is_none());
+            if let Some(expected) = &expected { assert_eq!(&output, expected); }
+            else { expected = Some(output); }
+            // Ordinary failure serialization still owns the complete durable
+            // contract. Only the per-archive diagnostic view omits the group.
+            assert_eq!(serde_json::to_value(&failure).unwrap()["recovery"]["inputs"].as_array().unwrap().len(), count);
+        }
+    }
 
     #[test]
     fn diagnostic_budget_keeps_catalog_location_and_failure_classification() {
@@ -1119,3 +1182,7 @@ mod tests {
         assert!(projection.tasks.is_empty() && projection.aliases.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "event_log/gui_contract.rs"]
+mod gui_contract;

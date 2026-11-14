@@ -1162,6 +1162,10 @@ impl NativeWatchState {
         Ok(())
     }
 
+    pub(crate) fn unload(&self) {
+        *self.lock() = StateData::default();
+    }
+
     /// Capacity-only maintenance: never changes records or checkpoint views.
     pub(crate) fn trim_idle_storage(&self) {
         let mut data = self.lock();
