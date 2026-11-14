@@ -788,6 +788,7 @@ def create_encrypted_rar_archive(
     split: bool = False,
     split_volume_size: int = 100 * 1024,
     payload_size: int = 16 * 1024,
+    old_numbering: bool = False,
 ) -> ArchiveCase:
     """Encrypted RAR: RAR4/RAR5, header+data (-hp) or data-only (-p)."""
     rar = get_optional_rar()
@@ -801,6 +802,9 @@ def create_encrypted_rar_archive(
     cmd = [str(rar), "a", "-ep1", "-idq", "-m0", "-y"]
     if rar4:
         cmd.append("-ma4")
+    if old_numbering:
+        assert rar4 and split
+        cmd.append("-vn")
     if split:
         cmd.append(f"-v{max(1024, int(split_volume_size))}b")
     cmd.append(f"-hp{password}" if header_encrypt else f"-p{password}")
