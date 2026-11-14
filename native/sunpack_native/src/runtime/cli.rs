@@ -787,11 +787,13 @@ pub(super) async fn run(
             return Ok(2);
         }
     };
+    crate::pipeline::stage("cli", &Cancellation::new()).await?;
     if options.help {
-        help(&options, config::load_language(cwd), session)?;
+        let language = config::load_language(cwd);
+        session.set_language(language);
+        help(&options, language, session)?;
         return Ok(0);
     }
-    crate::pipeline::stage("cli", &Cancellation::new()).await?;
     if options.json && options.prompt_passwords {
         let language = config::load_language(cwd);
         let mut result = CommandResult::new(options.command);
@@ -809,6 +811,7 @@ pub(super) async fn run(
     let generation = (!options.rule_stdin && options.command != "version")
         .then(|| host.generation(cwd, config::resolve_sources(cwd), inspection));
     let language = generation.as_ref().map_or_else(|| config::load_language(cwd), config::ConfigRead::language);
+    session.set_language(language);
     let execution = match options.command {
         "scan" | "extract" => match generation.unwrap().normalized(true) {
             Ok(config) => {

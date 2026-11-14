@@ -272,6 +272,42 @@ impl CandidateSet {
         self.sources.cache.remember_recent(password);
     }
 
+    /// Relations uses the same generation-bound proofs, bounded batches and
+    /// candidate parallelism as extraction. Only unresolved structure is read
+    /// afterwards; ordinary single volumes do not need an ENDARC walk.
+    pub(super) fn resolve_relation(
+        &self,
+        anchor: &crate::analysis_native::volume_anchor::VolumeAnchor,
+        cancellation: &Cancellation,
+    ) -> io::Result<(crate::analysis_native::volume_anchor::VolumeAnchor, Option<Arc<str>>)> {
+        use crate::io::archive_state::{InputExtent, InputPart};
+        // Preserve departed-source refresh even with no password candidates.
+        let reader = crate::io::reader::ManagedReader::open(&anchor.path)?;
+        let mut input = ArchiveInput::file(anchor.path.clone(), "rar".into(), String::new());
+        let offset = anchor.structure_offset.unwrap_or(0);
+        if offset != 0 || anchor.carrier_limit.is_some() {
+            input.mode = OpenMode::FileRange;
+            input.parts = vec![InputPart::range(InputExtent {
+                path: anchor.path.clone(), start: offset, end: anchor.carrier_limit,
+            })].into();
+        }
+        input.analysis.password_required = true;
+        let plan = match self.plan(&input, None, cancellation)? {
+            Ok(plan) => plan,
+            Err(failure) => {
+                let mut out = anchor.clone();
+                out.wrong_password = failure.kind == FailureKind::WrongPassword;
+                return Ok((out, None));
+            }
+        };
+        let passwords = plan.verified_password.as_ref().map(std::slice::from_ref)
+            .unwrap_or(&plan.candidates);
+        let (out, matched) = crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor(
+            anchor, &reader, passwords, offset != 0 || anchor.carrier_limit.is_some(),
+        )?;
+        Ok((out, matched.map(|index| passwords[index].clone())))
+    }
+
     pub(super) fn plan(
         &self,
         input: &ArchiveInput,
@@ -580,6 +616,51 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relations_share_batched_password_proofs_and_skip_single_volume_directory() {
+        use crate::password::rar::{rar5_header_decryption_tests::{hex_bytes, SINGLE_HP_HEX}, RAR5_CANDIDATE_THREADS};
+        use crate::analysis_native::volume_anchor::probe_volume_anchor_at_offset;
+        let bytes = hex_bytes(SINGLE_HP_HEX);
+        let source = crate::test_support::temp_file("relations_password_plan", &bytes);
+        let path = source.to_string_lossy().into_owned();
+        let cache = AttemptCache::default();
+        let wrong: Vec<Arc<str>> = (0..256).map(|n| Arc::from(format!("wrong-{n}"))).collect();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        pool.install(|| {
+            let anchor = probe_volume_anchor_at_offset(&path, 0, "rar", None);
+            let threads = Arc::new(Mutex::new(Vec::new()));
+            RAR5_CANDIDATE_THREADS.with(|value| *value.borrow_mut() = Some(threads.clone()));
+            PLANNED_BATCHES.with(|value| *value.borrow_mut() = Some(Vec::new()));
+            let candidates = CandidateSet::new(wrong.clone().into(), None, &cache, None);
+            let (blocked, password) = candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap();
+            assert!(blocked.wrong_password && password.is_none());
+            assert_eq!(threads.lock().unwrap().len(), 256);
+            assert!(threads.lock().unwrap().iter().collect::<HashSet<_>>().len() > 1);
+            let (blocked, _) = candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap();
+            assert!(blocked.wrong_password);
+            assert_eq!(threads.lock().unwrap().len(), 256, "hot retry must skip old KDFs");
+            let mut extended = wrong.clone(); extended.push(Arc::from("secret"));
+            let candidates = CandidateSet::new(extended.into(), None, &cache, None);
+            let (resolved, password) = candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap();
+            assert_eq!(password.as_deref(), Some("secret"));
+            assert!(resolved.standalone && !resolved.needs_password);
+            assert!(resolved.relation_has_next.is_none(), "standalone must stop after the main header");
+            assert_eq!(threads.lock().unwrap().len(), 257);
+            PLANNED_BATCHES.with(|value| {
+                let value = value.borrow(); let batches = value.as_ref().unwrap();
+                assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [256, 1]);
+            });
+            // Replacing the source invalidates old rejection/proof generations.
+            std::fs::write(&source, [&bytes[..], b"tail"].concat()).unwrap();
+            let candidates = CandidateSet::new(wrong.into(), None, &cache, None);
+            assert!(candidates.resolve_relation(&anchor, &Cancellation::new()).unwrap().0.wrong_password);
+            assert_eq!(threads.lock().unwrap().len(), 513);
+            RAR5_CANDIDATE_THREADS.with(|value| *value.borrow_mut() = None);
+            PLANNED_BATCHES.with(|value| *value.borrow_mut() = None);
+        });
+        std::fs::remove_file(source).unwrap();
+    }
 
     #[test]
     fn empty_and_three_configured_passwords_share_the_encrypted_header_batch() {

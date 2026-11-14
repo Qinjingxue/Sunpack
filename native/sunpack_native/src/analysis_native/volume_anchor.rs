@@ -1091,19 +1091,24 @@ pub(crate) fn resolve_encrypted_relation_anchor(
     anchor: &VolumeAnchor,
     reader: &ManagedReader,
     passwords: &[std::sync::Arc<str>],
+    require_terminal: bool,
 ) -> std::io::Result<(VolumeAnchor, Option<usize>)> {
     let rar5 = anchor.evidence.contains(&"rar5:encryption_header");
+    let reader = reader.windowed_probe_reader();
+    let mut rejected = 0;
     for (index, password) in passwords.iter().enumerate() {
-        let Some(proof) = crate::password::rar::probe_header_encrypted_terminal(
-            reader,
+        let Some(proof) = crate::password::rar::probe_header_encrypted(
+            &reader,
             anchor.structure_offset.unwrap_or(0),
             password,
             usize::try_from(reader.len() / 8).unwrap_or(usize::MAX),
+            require_terminal,
         )?
         else {
             continue;
         };
         if !proof.password_matched {
+            rejected += usize::from(proof.password_rejected);
             continue;
         }
         if rar5 && proof.main_volume.is_none() {
@@ -1132,7 +1137,7 @@ pub(crate) fn resolve_encrypted_relation_anchor(
         return Ok((out, Some(index)));
     }
     let mut out = anchor.clone();
-    out.wrong_password = !passwords.is_empty();
+    out.wrong_password = !passwords.is_empty() && rejected == passwords.len();
     Ok((out, None))
 }
 
@@ -1185,11 +1190,12 @@ pub(crate) fn upgrade_relation_rar_end_reader(
     let reader = reader.windowed_probe_reader();
     if out.encrypted {
         if let Some(password) = password {
-            if let Some(proof) = crate::password::rar::probe_header_encrypted_terminal(
+            if let Some(proof) = crate::password::rar::probe_header_encrypted(
                 &reader,
                 out.structure_offset.unwrap_or(0),
                 password,
                 usize::try_from(reader.len() / 7).unwrap_or(usize::MAX),
+                true,
             )? {
                 apply_rar_terminal_proof(&mut out, proof);
             }

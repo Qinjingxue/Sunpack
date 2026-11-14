@@ -83,6 +83,38 @@ def test_carrier_native_volume_and_password_matrix(package, tmp_path, kind, pass
     assert all(path.is_file() for path in parts)
 
 
+@pytest.mark.parametrize("flags", [0, 1, 2, 3], ids=["normal", "extra-zero", "data-zero", "both-zero"])
+def test_rar5_optional_common_fields_use_directory_password_plan(package, tmp_path, flags):
+    # Change only the public header layout of a real nonempty archive. This
+    # reaches directory Relations, then verifies the real worker output.
+    import zlib
+
+    case = create_encrypted_rar_archive(
+        tmp_path, "common-header", password=PASSWORD, header_encrypt=True,
+        split=False, payload_size=4096,
+    )
+    data = case.entry_path.read_bytes()
+    assert data[:8] == b"Rar!\x1a\x07\x01\x00"
+    assert data[12] < 128 and data[13:15] == b"\x04\x00"
+    end = 13 + data[12]
+    body = bytes([4, flags]) + b"\0" * flags.bit_count() + data[15:end]
+    block = bytes([len(body)]) + body
+    changed = data[:8] + zlib.crc32(block).to_bytes(4, "little") + block + data[end:]
+    disguised = case.entry_path.with_suffix(".opaque")
+    case.entry_path.unlink()
+    disguised.write_bytes(changed)
+    wrong = package.json("scan", "--no-builtin-pw", "-p", "wrong", case.archive_dir, code=1)
+    assert wrong["items"][0]["error_kind"] == "wrong_password", wrong
+    report = package.json("scan", "--no-builtin-pw", "-p", PASSWORD, case.archive_dir)
+    assert len(report["items"]) == 1 and not report["items"][0].get("error_kind"), report
+    output = tmp_path / "out"
+    result = package.json("extract", "--no-builtin-pw", "-p", PASSWORD,
+                          "-c", "k", "-o", output, case.archive_dir)
+    assert result["summary"]["failed_count"] == 0, result
+    marker, = output.rglob(case.marker_name)
+    assert marker.read_text(encoding="utf-8") == case.marker_text
+
+
 @pytest.mark.parametrize("carrier", [False, True], ids=["plain-file", "embedded"])
 def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package, tmp_path, carrier):
     case = create_encrypted_rar_archive(

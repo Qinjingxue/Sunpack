@@ -93,6 +93,7 @@ fn valid_identity(id: &str) -> bool {
 
 #[cfg(windows)]
 trait Session: Send + Sync {
+    fn set_language(&self, _language: crate::core::i18n::Language) {}
     fn write(&self, stream: Stream, data: &[u8]) -> io::Result<()>;
     fn read_line(&self, prompt: &str) -> io::Result<Option<String>>;
     fn awrite<'a>(&'a self, stream: Stream, data: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {

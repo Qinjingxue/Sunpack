@@ -54,6 +54,7 @@ type Aes128CbcDecryptor = Decryptor<Aes128>;
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RarTerminalProof {
     pub(crate) password_matched: bool,
+    pub(crate) password_rejected: bool,
     pub(crate) end_block_found: bool,
     pub(crate) end_block_flags: u64,
     pub(crate) end_offset: Option<u64>,
@@ -942,7 +943,11 @@ fn find_rar5_password_match(
     header: &Rar5EncryptionHeader,
 ) -> Option<usize> {
     let cancellation = Cancellation::current();
+    #[cfg(test)]
+    let threads = RAR5_CANDIDATE_THREADS.with(|value| value.borrow().clone());
     let matches = |password: &Arc<str>| {
+        #[cfg(test)]
+        if let Some(threads) = &threads { threads.lock().unwrap().push(std::thread::current().id()); }
         !cancellation.cancelled()
             && cancellation.run(|| rar5_checked_aes_key(password, header).is_some())
     };
@@ -951,6 +956,11 @@ fn find_rar5_password_match(
     } else {
         candidates.iter().position(matches)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RAR5_CANDIDATE_THREADS: std::cell::RefCell<Option<Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1254,20 +1264,20 @@ pub(crate) fn rar5_decrypt_main_header_with_read(
     rar5_main_volume(&full[..size], 0)
 }
 
-/// Walk a header-encrypted RAR stream with a password that has already been
-/// confirmed by the volume-anchor pass.  This is intentionally a relation
-/// validator helper, not a second general RAR parser: it only understands the
-/// header sizes, data spans, CRCs and ENDARC fields needed to prove terminal
-/// completeness.
-pub(crate) fn probe_header_encrypted_terminal(
+/// Share decrypted main-header and ENDARC facts between Relations and Embedded.
+/// A normal RAR5 single volume stops at its main header unless an exact carrier
+/// boundary is requested; multipart inputs retain the same terminal walk.
+/// An inconclusive structure is distinct from a failed public password check.
+pub(crate) fn probe_header_encrypted(
     reader: &ManagedReader,
     start_offset: u64,
     password: &str,
     max_blocks: usize,
+    require_terminal: bool,
 ) -> io::Result<Option<RarTerminalProof>> {
     let signature = reader.read_at(start_offset, 8)?;
     if signature.starts_with(RAR5_SIGNATURE) {
-        return probe_rar5_encrypted_terminal(reader, start_offset, password, max_blocks);
+        return probe_rar5_encrypted_terminal(reader, start_offset, password, max_blocks, require_terminal);
     }
     if signature.starts_with(RAR4_SIGNATURE) {
         return probe_rar4_encrypted_terminal(reader, start_offset, password, max_blocks);
@@ -1293,7 +1303,7 @@ pub(crate) fn resolve_embedded_rar_boundaries(
     let outcomes = (move || -> io::Result<_> {
         Cancellation::check_current_io()?;
         let reader = match ManagedReader::open(&archive_path) {
-            Ok(reader) => reader,
+            Ok(reader) => reader.windowed_probe_reader(),
             Err(error) if is_cancellation(&error) => return Err(error),
             Err(error) => {
                 // A source can disappear between scanning and reopening. Keep
@@ -1311,19 +1321,22 @@ pub(crate) fn resolve_embedded_rar_boundaries(
                 if passwords.is_empty() {
                     return Ok(("password_required", None, None));
                 }
+                let mut rejected = 0;
                 for password in passwords {
-                    let proof = probe_header_encrypted_terminal(
+                    let proof = probe_header_encrypted(
                         &reader,
                         offset,
                         password,
                         usize::try_from(reader.len().saturating_sub(offset) / 8)
                             .unwrap_or(usize::MAX),
+                        true,
                     )?;
                     Cancellation::check_current_io()?;
                     let Some(proof) = proof else {
                         continue;
                     };
                     if !proof.password_matched {
+                        rejected += usize::from(proof.password_rejected);
                         continue;
                     }
                     if proof.end_block_found {
@@ -1333,7 +1346,7 @@ pub(crate) fn resolve_embedded_rar_boundaries(
                     }
                     return Ok(("truncated", None, Some(password.clone())));
                 }
-                Ok(("wrong_password", None, None))
+                Ok((if rejected == passwords.len() { "wrong_password" } else { "password_required" }, None, None))
             })();
             match outcome {
                 Ok((status, end, password)) => outcomes.push((offset, status, end, password, None)),
@@ -1362,6 +1375,7 @@ fn probe_rar5_encrypted_terminal(
     start_offset: u64,
     password: &str,
     max_blocks: usize,
+    require_terminal: bool,
 ) -> io::Result<Option<RarTerminalProof>> {
     let block_offset = start_offset
         .checked_add(RAR5_SIGNATURE.len() as u64)
@@ -1377,28 +1391,21 @@ fn probe_rar5_encrypted_terminal(
     let Some(total_size) = total_size.filter(|size| (7..=2 * 1024 * 1024).contains(size)) else {
         return Ok(Some(RarTerminalProof::default()));
     };
-    let full = reader.read_at(block_offset, total_size)?;
-    if full.len() != total_size {
-        return Ok(Some(RarTerminalProof::default()));
-    }
-    if crc32(&full[4..]) != u32::from_le_bytes([full[0], full[1], full[2], full[3]]) {
-        return Ok(Some(RarTerminalProof::default()));
-    }
-    let Some((header_type, after_type)) = read_vint(&full, after_size) else {
+    // Discovery, fast verification and the terminal walk share the same
+    // CRC-checked common-header cursor, including optional Extra/Data sizes.
+    let full = reader.read_at(start_offset, RAR5_SIGNATURE.len() + total_size)?;
+    let Some((body, end)) = rar5_archive_encryption_header(&full) else {
         return Ok(Some(RarTerminalProof::default()));
     };
-    let Some((_header_flags, after_flags)) = read_vint(&full, after_type) else {
-        return Ok(Some(RarTerminalProof::default()));
-    };
-    if header_type != 4 {
-        return Ok(None);
-    }
-    let Some(header) = parse_rar5_encryption_body(&full, after_flags, full.len(), false, false)
-    else {
+    let Some(header) = parse_rar5_encryption_body(&full, body, end, false, false) else {
         return Ok(Some(RarTerminalProof::default()));
     };
     let Some(key) = rar5_aes_key(password, &header) else {
-        return Ok(None);
+        Cancellation::check_current_io()?;
+        return Ok(Some(RarTerminalProof {
+            password_rejected: header.has_password_check,
+            ..Default::default()
+        }));
     };
     let encrypted_header_offset = block_offset
         .checked_add(total_size as u64)
@@ -1411,6 +1418,7 @@ fn probe_rar5_encrypted_terminal(
         &cipher,
         max_blocks,
         header.has_password_check,
+        require_terminal,
     )?))
 }
 
@@ -1420,6 +1428,7 @@ fn walk_rar5_encrypted_headers(
     cipher: &Aes256,
     max_blocks: usize,
     password_matched: bool,
+    require_terminal: bool,
 ) -> io::Result<RarTerminalProof> {
     let mut proof = RarTerminalProof {
         password_matched,
@@ -1455,6 +1464,9 @@ fn walk_rar5_encrypted_headers(
             };
             proof.main_volume = Some(main);
             proof.password_matched = true;
+            if !require_terminal && main.0 & 1 == 0 {
+                return Ok(proof);
+            }
         }
         if header_flags & 0x0001 != 0 {
             let Some((_, after_extra)) = read_vint(&full, field_cursor) else {
@@ -1463,9 +1475,10 @@ fn walk_rar5_encrypted_headers(
             field_cursor = after_extra;
         }
         let data_size = if header_flags & 0x0002 != 0 {
-            let Some((value, _)) = read_vint(&full, field_cursor) else {
+            let Some((value, after_data)) = read_vint(&full, field_cursor) else {
                 return Ok(proof);
             };
+            field_cursor = after_data;
             value
         } else {
             0
@@ -1479,6 +1492,7 @@ fn walk_rar5_encrypted_headers(
                 .unwrap_or(0);
             return Ok(RarTerminalProof {
                 password_matched: true,
+                password_rejected: false,
                 end_block_found: true,
                 end_block_flags: end_flags,
                 end_offset: Some(next),
@@ -1654,6 +1668,7 @@ fn walk_rar4_encrypted_headers(
         if header_type == 0x7b {
             return Ok(RarTerminalProof {
                 password_matched: true,
+                password_rejected: false,
                 end_block_found: true,
                 end_block_flags: u64::from(header_flags),
                 end_offset: Some(next),
@@ -1865,21 +1880,38 @@ pub(crate) mod rar5_header_decryption_tests {
 
     #[test]
     fn encrypted_header_walker_returns_exact_end_for_complete_fixture() {
-        let data = hex_bytes(SINGLE_HP_HEX);
-        let reader = ManagedReader::from_bytes(data.clone(), Default::default());
-        let proof = probe_header_encrypted_terminal(&reader, 0, "secret", 4096)
-            .unwrap()
-            .unwrap();
-        assert!(proof.password_matched);
-        assert!(proof.end_block_found);
-        assert_eq!(proof.end_offset, Some(data.len() as u64));
+        let original = hex_bytes(SINGLE_HP_HEX);
+        for flags in 0u8..4 {
+            let end = 13 + original[12] as usize;
+            let mut body = vec![4, flags];
+            body.extend(std::iter::repeat_n(0, flags.count_ones() as usize));
+            body.extend_from_slice(&original[15..end]);
+            let mut block = vec![body.len() as u8]; block.extend(body);
+            let mut data = original[..8].to_vec();
+            data.extend(crc32(&block).to_le_bytes()); data.extend(&block);
+            data.extend_from_slice(&original[end..]);
+            let reader = ManagedReader::from_bytes(data.clone(), Default::default());
+            let proof = probe_header_encrypted(&reader, 0, "secret", 4096, true).unwrap().unwrap();
+            assert!(proof.password_matched && proof.end_block_found);
+            assert_eq!(proof.end_offset, Some(data.len() as u64));
+            assert!(probe_header_encrypted(&reader, 0, "wrong", 4096, true).unwrap().unwrap().password_rejected);
+        }
+        // Unsupported crypto version is not proof that the password is wrong.
+        let mut unsupported = original;
+        unsupported[15] = 1;
+        let end = 13 + unsupported[12] as usize;
+        let crc = crc32(&unsupported[12..end]);
+        unsupported[8..12].copy_from_slice(&crc.to_le_bytes());
+        let reader = ManagedReader::from_bytes(unsupported, Default::default());
+        let proof = probe_header_encrypted(&reader, 0, "secret", 4096, true).unwrap().unwrap();
+        assert!(!proof.password_matched && !proof.password_rejected);
     }
 
     #[test]
     fn encrypted_header_walker_fails_open_on_incomplete_fixture() {
         let data = hex_bytes(PART2_HP_HEX);
         let reader = ManagedReader::from_bytes(data, Default::default());
-        let proof = probe_header_encrypted_terminal(&reader, 0, "secret", 4096)
+        let proof = probe_header_encrypted(&reader, 0, "secret", 4096, true)
             .unwrap()
             .unwrap();
         assert!(proof.password_matched);

@@ -674,19 +674,15 @@ fn probe_relations(
     verified: &mut VerifiedPasswords,
     request: &Request,
 ) -> io::Result<()> {
-    use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
     use rayon::prelude::*;
     let pending = table.encrypted_rar_anchors();
     if pending.is_empty() { return Ok(()); }
     let resolved = pending.into_par_iter().map(|anchor| request.cancel.run(|| {
-        let passwords = candidates.for_embedded(&anchor.path);
-        let reader = match crate::io::reader::ManagedReader::open(&anchor.path) {
-            Ok(reader) => reader.probe_reader(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((anchor, None, true)),
-            Err(error) => return Err(error),
-        };
-        let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords)?;
-        Ok((anchor, matched.map(|index| passwords[index].clone()), false))
+        match candidates.resolve_relation(&anchor, &request.cancel) {
+            Ok((anchor, password)) => Ok((anchor, password, false)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((anchor, None, true)),
+            Err(error) => Err(error),
+        }
     })).collect::<io::Result<Vec<_>>>()?;
     let mut anchors = Vec::with_capacity(resolved.len());
     let mut refresh = Vec::new();

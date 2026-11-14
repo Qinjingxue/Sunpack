@@ -361,6 +361,7 @@ struct Connection {
     input: Mutex<PromptInput>,
     cancel: Cancellation,
     finishing: AtomicBool,
+    language: std::sync::OnceLock<crate::core::i18n::Language>,
     terminal_size: AtomicU32,
     flags: u32,
 }
@@ -551,7 +552,7 @@ impl Connection {
         }
     }
 
-    async fn read_control(&self, cwd: &Path, mut reader: PipeReader) -> io::Result<()> {
+    async fn read_control(&self, mut reader: PipeReader) -> io::Result<()> {
         loop {
             match reader.word(&self.peer).await? {
                 RESIZE if self.flags & 10 == 10 => {
@@ -561,7 +562,7 @@ impl Connection {
                 }
                 CANCEL => {
                     if !self.cancel.cancelled() {
-                        let language = config::load_language(cwd);
+                        let language = self.language.get().copied().unwrap_or_default();
                         let message = format!("{}\n", language.text("interrupt.stopping"));
                         // Like main, reserve the one cancellation notice even
                         // while ordinary producers are waiting on output space.
@@ -606,6 +607,10 @@ impl Connection {
     }
 }
 impl Session for Connection {
+    fn set_language(&self, language: crate::core::i18n::Language) {
+        let _ = self.language.set(language);
+    }
+
     fn write(&self, stream: Stream, data: &[u8]) -> io::Result<()> {
         if self.output.closed() { return Ok(()); }
         if !in_control_poll() { return block_on(self.awrite(stream, data)); }
@@ -714,7 +719,7 @@ impl Server {
         let header = Header::read(&mut reader, &peer, &self.build_id, &self.token).await?;
         let connection = Arc::new(Connection {
             peer, output: output::Output::default(), prompt: Mutex::default(), input: Mutex::default(),
-            cancel: cancel.clone(), finishing: AtomicBool::new(false),
+            cancel: cancel.clone(), finishing: AtomicBool::new(false), language: Default::default(),
             terminal_size: AtomicU32::new(header.terminal_size), flags: header.flags,
         });
         let _close = CloseConnection(Arc::clone(&connection));
@@ -724,9 +729,8 @@ impl Server {
         };
         let control = if header.flags & 1 == 0 {
             let connection = Arc::clone(&connection);
-            let cwd = header.cwd.clone();
             Some(spawner.spawn(Box::pin(async move {
-                if connection.read_control(&cwd, reader).await.is_err()
+                if connection.read_control(reader).await.is_err()
                     && !connection.finishing.load(Ordering::Acquire)
                 {
                     connection.cancel.cancel();
@@ -1215,15 +1219,70 @@ mod async_connection_tests {
     }
 
     #[test]
+    fn cancel_and_shared_driver_progress_while_request_configuration_is_blocked() {
+        let server = server();
+        let (mut client, pipe) = pipe_pair();
+        let connection = Arc::new(Connection {
+            peer: server.io.bind(pipe, &server.shutdown).unwrap(),
+            output: output::Output::default(), prompt: Mutex::default(), input: Mutex::default(),
+            cancel: Cancellation::new(), finishing: AtomicBool::new(false), language: Default::default(),
+            terminal_size: AtomicU32::new(0), flags: 0,
+        });
+        let cancel = connection.cancel.clone();
+        let (cancelled, observed) = mpsc::channel();
+        let _subscription = cancel.subscribe(move || { let _ = cancelled.send(()); });
+        let (entered, blocked) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        struct Release(Option<mpsc::Sender<()>>);
+        impl Drop for Release { fn drop(&mut self) { if let Some(sender) = self.0.take() { let _ = sender.send(()); } } }
+        let release = Release(Some(release));
+        let token = cancel.clone();
+        let request = server.host.scheduler.submit(server.host.scheduler.next_id(), Origin::Foreground, &cancel,
+            move |spawner| Box::pin(async move {
+                let writer = connection.clone();
+                let output = spawner.spawn(Box::pin(async move { writer.pump_output().await }));
+                let reader = connection.clone();
+                let control = spawner.spawn(Box::pin(async move {
+                    let _ = reader.read_control(PipeReader::default()).await;
+                }));
+                connection.finish_request(async move {
+                    crate::pipeline::stage("cli", &Cancellation::new()).await?;
+                    // Same blocking stage as request configuration loading. No
+                    // language has been published yet; CANCEL must use fallback.
+                    entered.send(()).unwrap();
+                    proceed.recv().unwrap();
+                    assert!(token.cancelled());
+                    Ok(())
+                }, Some(control), output).await
+            }));
+        blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+        client.write_all(&CANCEL.to_be_bytes()).unwrap();
+        observed.recv_timeout(Duration::from_secs(10)).expect("cancel waited for configuration");
+        let (advanced, light) = mpsc::channel();
+        let second = server.host.scheduler.submit(server.host.scheduler.next_id(), Origin::Foreground, &Cancellation::new(),
+            move |_| Box::pin(async move { advanced.send(()).unwrap(); }));
+        light.recv_timeout(Duration::from_secs(10)).expect("shared control driver was blocked");
+        let mut kind = [0]; client.read_exact(&mut kind).unwrap();
+        let length = read_u32(&mut client).unwrap() as usize;
+        let notice = read_field(&mut client, length).unwrap();
+        assert_eq!(kind, [Stream::Err as u8]);
+        assert_eq!(notice, format!("{}\n", crate::core::i18n::Language::En.text("interrupt.stopping")).as_bytes());
+        drop(release);
+        request.join().unwrap().unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
     fn real_prompt_resize_cancel_and_panic_flush_settle_all_connection_work() {
         let server = server();
         let (mut client, pipe) = pipe_pair();
         let connection = Arc::new(Connection {
             peer: server.io.bind(pipe, &server.shutdown).unwrap(),
             output: output::Output::default(), prompt: Mutex::default(), input: Mutex::default(),
-            cancel: Cancellation::new(), finishing: AtomicBool::new(false),
+            cancel: Cancellation::new(), finishing: AtomicBool::new(false), language: Default::default(),
             terminal_size: AtomicU32::new(80 | 24 << 16), flags: 14,
         });
+        connection.set_language(crate::core::i18n::Language::Zh);
         let cancel = connection.cancel.clone();
         let request = server.host.scheduler.submit(server.host.scheduler.next_id(), Origin::Foreground, &cancel,
             move |spawner| Box::pin(async move {
@@ -1232,7 +1291,7 @@ mod async_connection_tests {
                 let output = spawner.spawn(Box::pin(async move { writer.pump_output().await }));
                 let reader = connection.clone();
                 let control = spawner.spawn(Box::pin(async move {
-                    if reader.read_control(&std::env::current_dir().unwrap(), PipeReader::default()).await.is_err() { reader.close(); }
+                    if reader.read_control(PipeReader::default()).await.is_err() { reader.close(); }
                 }));
                 connection.finish_request(async {
                     assert_eq!(connection.read_line_async("first").await?.as_deref(), Some("answer\r\n"));
@@ -1273,6 +1332,8 @@ mod async_connection_tests {
         let notice = frames.iter().position(|(kind, _)| *kind == Stream::Err as u8).unwrap();
         let final_output = frames.iter().position(|(_, data)| data == b"queued-before-panic").unwrap();
         assert!(notice < final_output);
+        assert_eq!(frames[notice].1, format!("{}\n", crate::core::i18n::Language::Zh.text("interrupt.stopping")).as_bytes());
+        assert_eq!(frames.iter().filter(|(kind, _)| *kind == Stream::Err as u8).count(), 1);
         assert!(request.join().is_err());
     }
 

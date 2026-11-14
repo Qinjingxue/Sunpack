@@ -699,7 +699,7 @@ impl NativeEmbeddedBatch {
                         let reader =
                             crate::io::reader::ManagedReader::open(&anchor.path)?.probe_reader();
                         let (resolved, index) =
-                            resolve_encrypted_relation_anchor(anchor, &reader, values)?;
+                            resolve_encrypted_relation_anchor(anchor, &reader, values, true)?;
                         *anchor = resolved;
                         Ok(index.map(|index| {
                             (
