@@ -844,7 +844,7 @@ fn completion_roots(
 }
 
 fn is_terminal_input_error(error: &InputError) -> bool {
-    matches!(error.kind, InputErrorKind::InvalidInput | InputErrorKind::EmbeddedDiscovery)
+    matches!(error.kind, InputErrorKind::InvalidInput | InputErrorKind::EmbeddedDiscovery | InputErrorKind::WatchDiscoveryIo)
 }
 
 #[derive(Default)]

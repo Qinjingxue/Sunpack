@@ -1379,27 +1379,38 @@ impl RootObserver {
         // configuration/ancestor subscriptions keep their 4 KiB allocation.
         let observer = FileObserver::start_with_filter(
             directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, 64_000, move |names| {
-            let mut modified = HashSet::new();
-            let mut topology = HashSet::new();
+            let mut modified_only = HashMap::new();
             let mut password_changed = false;
             let mut events = HashMap::new();
             let mut rename_source = None;
-            let mut paths = names.map(|names| names.into_iter()
-                .filter_map(|change| {
+            let mut paths = names.map(|names| {
+                let mut paths = Vec::new();
+                for change in names {
                     let path = watched_dir.join(change.name);
                     let event = CandidateEvent::native(change.action, &path, &mut rename_source);
                     if path.file_name().is_some_and(|name| {
                         name.to_string_lossy().eq_ignore_ascii_case(&password_name)
                     }) && key(&path) == password_path {
                         password_changed = true;
-                        return None;
+                        continue;
                     }
-                    if change.action == 3 { modified.insert(path.clone()); }
-                    else { topology.insert(path.clone()); }
+                    if !scope.contains(&path.to_string_lossy()) { continue; }
+                    let modified = change.action == 3;
                     if let Some(event) = event { events.entry(path.clone()).or_insert(event); }
-                    Some(path)
-                })
-                .filter(|path| scope.contains(&path.to_string_lossy())).collect::<Vec<_>>());
+                    match modified_only.entry(path.clone()) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            *entry.get_mut() &= modified;
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(modified);
+                            // The buffer contains names, not separate filesystem
+                            // observations. Probe each once while retaining event order.
+                            paths.push(path);
+                        }
+                    }
+                }
+                paths
+            });
             let mut activities = HashMap::new();
             if let Some(paths) = paths.as_mut() {
                 journal.filter_owned_events(paths, &watched_dir);
@@ -1426,10 +1437,9 @@ impl RootObserver {
                             if let Some(event) = events.remove(path) {
                                 signals.candidate_events.entry(path.clone()).or_insert(event);
                             }
-                            if topology.contains(path) {
+                            if !modified_only[path] {
                                 signals.modified_paths.remove(path);
-                            } else if modified.contains(path)
-                                && !signals.changed_roots.get(&id).is_some_and(|old| old.contains(path)) {
+                            } else if !signals.changed_roots.get(&id).is_some_and(|old| old.contains(path)) {
                                 signals.modified_paths.insert(path.clone());
                             }
                         }
@@ -1866,6 +1876,7 @@ impl Drop for RootReportCompletion {
 }
 
 struct RootCompleted {
+    request: u64,
     reply: Arc<super::cli::reporting::Reply<Outcome>>,
     batch: String,
     id: crate::pipeline::TaskId,
@@ -1907,17 +1918,46 @@ struct SourceGroup {
 // Logical tasks own groups; physical members may have several live consumers.
 #[derive(Default)]
 struct SourceGroups {
-    planned: HashSet<String>,
+    planned: HashMap<String, Vec<String>>,
     roots: HashMap<String, Arc<SourceGroup>>,
     members: HashMap<String, usize>,
+    shared_owners: HashSet<String>,
 }
 
 impl SourceGroups {
+    fn plan(&mut self, root: String, members: Vec<String>) {
+        self.release_plan(&root);
+        for member in &members { *self.members.entry(member.clone()).or_default() += 1; }
+        self.planned.insert(root, members);
+    }
+
+    fn release_plan(&mut self, root: &str) {
+        if let Some(members) = self.planned.remove(root) {
+            for member in members { self.release_member(&member); }
+        }
+    }
+
     fn insert(&mut self, group: Arc<SourceGroup>) {
         let root = key(&group.path);
+        self.release_plan(&root);
         if let Some(previous) = self.roots.remove(&root) { self.release(&previous); }
         for member in &group.members { *self.members.entry(watch_path_key(member)).or_default() += 1; }
         self.roots.insert(root, group);
+    }
+
+    fn can_finish_alias(&self, root: &str, owners: &HashMap<String, String>) -> bool {
+        let Some(group) = self.roots.get(root) else { return false; };
+        let mut has_owner = false;
+        for member in &group.members {
+            let member = watch_path_key(member);
+            if owners.contains_key(&member) {
+                if self.shared_owners.contains(&member) || self.members.get(&member) != Some(&1) {
+                    return false;
+                }
+                has_owner = true;
+            }
+        }
+        has_owner
     }
 
     fn into_aliases(self) -> HashMap<String, Arc<SourceGroup>> {
@@ -1938,22 +1978,25 @@ impl SourceGroups {
 
     fn release(&mut self, group: &SourceGroup) {
         for member in &group.members {
-            let id = watch_path_key(member);
-            if let Some(count) = self.members.get_mut(&id) {
-                *count -= 1;
-                if *count == 0 { self.members.remove(&id); }
-            }
+            self.release_member(&watch_path_key(member));
+        }
+    }
+
+    fn release_member(&mut self, id: &str) {
+        if let Some(count) = self.members.get_mut(id) {
+            *count -= 1;
+            if *count == 0 { self.members.remove(id); }
         }
     }
 
     fn take(&mut self, root: &str) -> HashMap<String, Arc<SourceGroup>> {
-        self.planned.remove(root);
+        self.release_plan(root);
         let Some(group) = self.roots.remove(root) else { return HashMap::new(); };
         self.release(&group);
         group.members.iter().map(|member| watch_path_key(member))
             // A discovered task retains its durable owner even before claim.
             // An admitted tail with no independent task belongs to its head.
-            .filter(|member| member == root || (!self.planned.contains(member) && !self.members.contains_key(member)))
+            .filter(|member| member == root || (!self.planned.contains_key(member) && !self.members.contains_key(member)))
             .map(|member| (member, Arc::clone(&group))).collect()
     }
 }
@@ -4429,31 +4472,28 @@ impl Scheduler {
                     tentative,
                 );
             }
-            let recovery_key = pending.recovery.as_ref().map(|recovery| {
-                let mut excluded = recovery.scope.excluded_subtrees();
-                excluded.sort_unstable();
-                (
-                    recovery.scope.root.clone(),
-                    recovery.scope.max_depth,
-                    excluded,
-                )
-            });
             let password_scope = candidate_password_scope(self.journal.state(),
                 &pending.candidate.path, pending.recovery.as_deref());
+            let source = (pending.candidate, pending.quiet);
+            // Local recovery has its own discovery and durable owner. Catalog
+            // discovery keeps each relation family's errors inside the batch.
+            let recovery_owner = pending.recovery.as_ref().map(|_| source.0.path.clone());
             let (_, candidates) = groups
-                .entry((pending.root, recovery_key, password_scope))
+                .entry((pending.root, password_scope, recovery_owner))
                 .or_insert_with(|| (pending.recovery, Vec::new()));
-            candidates.push((pending.candidate, pending.quiet));
+            candidates.push(source);
         }
-        for ((root, _, password_scope), (recovery, candidates)) in groups {
-            if self.hub.stopped.load(Ordering::Acquire) {
-                // These candidates still have durable pending intent. A stop
-                // between readiness and submit must not start more requests.
-                break;
+        let engine = Arc::clone(&self.engine);
+        engine.run_stage("watch_admission", Origin::Watch, || {
+            for ((root, password_scope, _), (recovery, candidates)) in groups {
+                if self.hub.stopped.load(Ordering::Acquire) {
+                    // These candidates still have durable pending intent.
+                    break;
+                }
+                self.start_batch(root, candidates, recovery, password_scope)?;
             }
-            self.start_batch(root, candidates, recovery, password_scope)?;
-        }
-        Ok(())
+            Ok(())
+        })?
     }
 
     fn retire_admission(&mut self, id: &str, pending: &Pending) -> io::Result<()> {
@@ -4485,12 +4525,7 @@ impl Scheduler {
         self.pending.insert(id, pending);
     }
 
-    fn start_batch(&mut self, root_id: String, candidates: Vec<(WatchCandidateRow, quiet::Activity)>, recovery: Option<Arc<Recovery>>, password_scope: PathBuf) -> io::Result<()> {
-        let engine = Arc::clone(&self.engine);
-        engine.run_stage("watch_admission", Origin::Watch, || self.start_batch_blocking(root_id, candidates, recovery, password_scope))?
-    }
-
-    fn start_batch_blocking(
+    fn start_batch(
         &mut self,
         id: String,
         candidates: Vec<(WatchCandidateRow, quiet::Activity)>,
@@ -4513,16 +4548,13 @@ impl Scheduler {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let cancel = Cancellation::new();
-        let mut request = Request::new(
-            candidates
-                .iter()
-                .map(|input| PathBuf::from(&input.path))
-                .collect(),
+        let mut request = Request::with_config(
+            candidates.iter().map(|input| PathBuf::from(&input.path)).collect(),
             Mode::Extract,
+            Arc::clone(&self.settings),
         );
         request.origin = Origin::Watch;
         request.cancel = cancel.clone();
-        request.config = Arc::clone(&self.settings);
         // A missing-volume promotion visible to ordinary Watch discovery can
         // join peers anywhere in the current watched scope. Its saved local
         // scope still bounds recovery if the destination is outside it.
@@ -4779,13 +4811,17 @@ impl Scheduler {
                 let reply = super::cli::reporting::FailedReply(Arc::clone(&root.reply));
                 let toast = self.active.get(&root.batch).and_then(|active| active.toast.clone());
                 let id = root.id;
+                let request = root.request;
                 let (result, tickets) = journal.prepare_waits(|| self.prepare_root(root));
-                Some((reply, toast, id, result, tickets))
+                Some((reply, toast, id, request, result, tickets))
             }).collect::<Vec<_>>();
             let mut failure = None;
-            for (reply, toast, id, result, tickets) in replies {
+            for (reply, toast, id, request, result, tickets) in replies {
                 let durable = journal.wait_prepared(tickets);
-                let result = result.and_then(|outcome| durable.map(|()| outcome));
+                let result = result.and_then(|(outcome, members)| durable.map(|()| {
+                    engine.retire_watch_inputs(request, &members);
+                    outcome
+                }));
                 match &result {
                     Ok(outcome) => { if let Some(toast) = toast { toast.root_finished(id, outcome); } }
                     Err(error) => { failure = Some(io::Error::new(error.kind(), error.to_string())); }
@@ -4805,7 +4841,7 @@ impl Scheduler {
         self.complete_roots(vec![root])
     }
 
-    fn prepare_root(&mut self, root: RootCompleted) -> io::Result<Outcome> {
+    fn prepare_root(&mut self, root: RootCompleted) -> io::Result<(Outcome, HashSet<String>)> {
         let Some(active) = self.active.get_mut(&root.batch) else {
             return Err(io::Error::other("Watch request already retired"));
         };
@@ -4825,7 +4861,13 @@ impl Scheduler {
             root: active.root.clone(), recovery: active.recovery.clone(), password_scope: active.password_scope.clone(), passwords: Arc::clone(&active.passwords),
             inputs, quiet, dirty, claimed: Arc::clone(&active.claimed), groups: root.groups, toast: active.toast.clone(), task: Some(root.id),
         };
-        self.apply_completion(&root.batch, context, root.completed).map(|(outcome, _)| outcome)
+        let (outcome, _) = self.apply_completion(&root.batch, context, root.completed)?;
+        let groups = self.active.get(&root.batch).map(|active| active.groups.lock().unwrap());
+        let mut retired = members;
+        if let Some(groups) = groups {
+            retired.retain(|member| !groups.members.contains_key(member));
+        }
+        Ok((outcome, retired))
     }
 
     fn complete_requests(&mut self, batches: Vec<String>) -> io::Result<()> {
@@ -4997,26 +5039,8 @@ impl Scheduler {
             Err(error) => {
                 let mut absent = crate::watch_store::NativeWatchOperations::empty();
                 for candidate in &active.inputs {
-                    let id = watch_path_key(&candidate.path);
-                    if self.pending.contains_key(&id) {
-                        continue;
-                    }
-                    if NativePresence::at(&candidate.path).is_absent() {
-                        absent.extend(crate::watch_store::NativeWatchOperations::finish_pending(
-                            &candidate.path,
-                            None,
-                        ));
-                        continue;
-                    }
-                    // main's pipeline_completion_error path re-admits ordinary
-                    // request exceptions too (for example a transient sharing
-                    // violation), unlike an extraction Outcome failure.
-                    self.journal.log(json!({"event":"failed_terminal","path":candidate.path,
-                        "owner":batch,"error":error.to_string()}));
-                    self.observe_candidate_with_event(
-                        &active.root, candidate.path.clone(), CandidateAdmission::ExplicitRetry, active.recovery.clone(),
-                        None, quiet.remove(&id), Some(&CandidateEvent::Business("pipeline_completion_error")),
-                    )?;
+                    self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(),
+                        &candidate.path, &error.to_string(), quiet, &mut absent)?;
                 }
                 self.journal.commit(true, |_| Ok(absent))?;
                 self.persist_candidates(BTreeMap::new(), true)?;
@@ -5189,6 +5213,13 @@ impl Scheduler {
             let canonical_id = watch_path_key(&canonical);
             let archives = by_path.get(&canonical_id).or_else(|| by_path.get(&id));
             let input_error = error_paths.get(&canonical_id).or_else(|| error_paths.get(&id));
+            if let Some(error) = input_error.filter(|error| error.kind == crate::pipeline::InputErrorKind::WatchDiscoveryIo) {
+                if !completed.cancelled {
+                    self.retry_pipeline_error(batch, &active.root, active.recovery.as_ref(),
+                        &candidate.path, &error.message, quiet, &mut operations)?;
+                    continue;
+                }
+            }
             let discovery_failure = input_error.and_then(|error| error.failure.as_deref());
             let failed_archive = (input_error.is_none() || discovery_failure.is_some())
                 .then(|| archives.and_then(|items| completion_failed_archive(items, &input_failures))).flatten();
@@ -5389,7 +5420,9 @@ impl Scheduler {
                     } else { "volume_changed" })))?;
             }
         }
-        self.persist_candidates(BTreeMap::new(), false)?;
+        let discovery_retry = outcome.errors.iter()
+            .any(|error| error.kind == crate::pipeline::InputErrorKind::WatchDiscoveryIo);
+        self.persist_candidates(BTreeMap::new(), discovery_retry)?;
         self.arm_idle_cleanup();
         Ok((outcome, finish))
     }
@@ -5401,6 +5434,27 @@ impl Scheduler {
             // Duration conversion, where an invalid duration becomes zero.
             self.cache_deadline = idle.is_finite().then(|| quiet::after(Instant::now(), idle));
         }
+    }
+
+    fn retry_pipeline_error(
+        &mut self, batch: &str, root: &str, recovery: Option<&Arc<Recovery>>,
+        path: &str, error: &str, quiet: &mut HashMap<String, quiet::Activity>,
+        operations: &mut crate::watch_store::NativeWatchOperations,
+    ) -> io::Result<()> {
+        let id = watch_path_key(path);
+        if self.pending.contains_key(&id) { return Ok(()); }
+        if NativePresence::at(path).is_absent() {
+            operations.extend(crate::watch_store::NativeWatchOperations::finish_pending(path, None));
+            return Ok(());
+        }
+        // Main re-admits an infrastructure/read exception, unlike a
+        // terminal archive result or a password/volume blocker.
+        self.journal.log(json!({"event":"failed_terminal","path":path,
+            "owner":batch,"error":error}));
+        self.observe_candidate_with_event(
+            root, path.to_owned(), CandidateAdmission::ExplicitRetry, recovery.cloned(),
+            None, quiet.remove(&id), Some(&CandidateEvent::Business("pipeline_completion_error")),
+        )
     }
 
     fn release_display_claims(&self, batch: &str, groups: &HashMap<String, Arc<SourceGroup>>) {
@@ -5749,20 +5803,34 @@ impl Observer for WatchObserver {
         self.claimed.lock().unwrap().coalesced = true;
     }
 
-    fn roots_planned<'a>(&self, paths: impl Iterator<Item = &'a str>) {
-        self.groups.lock().unwrap().planned.extend(paths.map(watch_path_key));
+    fn roots_planned<'a>(&self, roots: impl Iterator<Item = (&'a str, &'a [String])>) {
+        let mut groups = self.groups.lock().unwrap();
+        for (path, members) in roots {
+            groups.plan(watch_path_key(path), members.iter().map(|path| watch_path_key(path)).collect());
+        }
+        let groups = &mut *groups;
+        groups.shared_owners.extend(groups.members.iter().filter_map(|(path, &count)| {
+            (count > 1 && self.owners.contains_key(path)).then(|| path.clone())
+        }));
     }
 
-    async fn root_finished(&self, id: crate::pipeline::TaskId, path: &Path, outcome: Outcome) -> io::Result<Outcome> {
-        // One admitted tail can discover several independent heads. Its WAL
-        // owner and outputs must retain their aggregate until request finish.
-        if !self.owners.contains_key(&key(path)) { return Ok(outcome); }
+    async fn root_finished(
+        &self, id: crate::pipeline::TaskId, path: &Path, outcome: Outcome, request: u64,
+    ) -> io::Result<Outcome> {
+        let root = key(path);
         // Move only this logical owner's state. A shared member stays claimed
         // until its final consumer settles; another admitted root never moves.
         let (groups, outputs, promoted) = {
         let mut claimed = self.claimed.lock().unwrap();
-        let groups = self.groups.lock().unwrap().take(&key(path));
-        let members: HashSet<_> = groups.keys().cloned().chain(std::iter::once(key(path))).collect();
+        let mut groups = self.groups.lock().unwrap();
+        // A tail can own the WAL and outputs of several independent heads.
+        // Keep their aggregate until request finish, even after a peer settles.
+        if !self.owners.contains_key(&root) && !groups.can_finish_alias(&root, &self.owners) {
+            return Ok(outcome);
+        }
+        let aliases = groups.take(&root);
+        drop(groups);
+        let members: HashSet<_> = aliases.keys().cloned().chain(std::iter::once(root)).collect();
         claimed.finished.extend(members.iter().cloned());
         drop(claimed);
         let mut shared_outputs = self.outputs.lock().unwrap();
@@ -5777,10 +5845,11 @@ impl Observer for WatchObserver {
             }
         }
         drop(shared_promoted);
-        (groups, outputs, promoted)
+        (aliases, outputs, promoted)
         };
         let reply = Arc::new(super::cli::reporting::Reply::default());
         self.hub.root_completed(RootCompleted {
+            request,
             reply: Arc::clone(&reply), batch: self.batch.to_string(), id, path: path.to_owned(), groups,
             completed: Completed { cancelled: false, result: Ok(outcome), promoted, outputs },
         });
@@ -7702,6 +7771,15 @@ mod tests {
             }
         };
         let names = (0..limit).map(|index| base.join(format!("{index}.zip")).to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let reserved: Vec<_> = names[..3].iter().map(PathBuf::from).collect();
+        for path in &reserved { fs::write(path, b"archive").unwrap(); }
+        let cancel = Cancellation::new();
+        let reservation = block_on(scheduler.engine.reserve_watch_inputs_for_test(1, &reserved, &cancel)).unwrap();
+        let blocked = |engine: &Engine, path: &Path| {
+            block_on(engine.reserve_foreground_async(&[path.to_owned()], &cancel))
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+        };
+        assert!(blocked(&scheduler.engine, &reserved[0]));
         scheduler.active_paths.extend(names.iter().map(|path| (watch_path_key(path), Arc::from("first"))));
         scheduler.active.insert("first".into(), batch(1, names.clone(), false));
         assert_eq!(scheduler.admission_available(), 0, "one full batch occupies the whole candidate window");
@@ -7715,6 +7793,7 @@ mod tests {
         let group = Arc::new(SourceGroup { path: head.into(), name: "family".into(), multipart: true,
             members: vec![names[0].clone(), names[1].clone(), discovered.to_string_lossy().into_owned()] });
         let root = || RootCompleted {
+            request: 1,
             reply: Arc::default(), batch: "first".into(), id: 1, path: head.into(),
             groups: group.members.iter().map(|member| (watch_path_key(member), Arc::clone(&group))).collect(),
             completed: Completed { cancelled: false, result: Ok(Outcome::default()),
@@ -7723,6 +7802,9 @@ mod tests {
         scheduler.complete_root(root()).unwrap();
         assert_eq!(scheduler.admission_available(), 2);
         assert_eq!(scheduler.active["first"].inputs.len(), limit - 2);
+        drop(block_on(scheduler.engine.reserve_foreground_async(&reserved[..2], &cancel))
+            .expect("the completed root and its final alias must be immediately available to the foreground"));
+        assert!(blocked(&scheduler.engine, &reserved[2]), "the other root is still active");
         scheduler.complete_root(root()).unwrap();
         assert_eq!(scheduler.admission_available(), 2, "repeated root notification cannot refund twice");
         scheduler.active_paths.extend(names[..2].iter().map(|path| (watch_path_key(path), Arc::from("second"))));
@@ -7745,6 +7827,7 @@ mod tests {
         assert!(scheduler.active_paths.is_empty(), "failed sibling suppressed cancellation projection");
         scheduler.options = None;
         assert_eq!(scheduler.admission_available(), 0);
+        drop(reservation);
         drop(scheduler);
         fs::remove_dir_all(base).unwrap();
         fs::remove_file(marker).unwrap();
@@ -7755,7 +7838,7 @@ mod tests {
         // A batch completion test cannot detect a root-only wake being ignored
         // while another native task is still running.
         fn root() -> RootCompleted {
-            RootCompleted { reply: Arc::default(), batch: "batch".into(), id: 1, path: "a.zip".into(), groups: HashMap::new(),
+            RootCompleted { request: 1, reply: Arc::default(), batch: "batch".into(), id: 1, path: "a.zip".into(), groups: HashMap::new(),
                 completed: Completed { cancelled: false, result: Ok(Outcome::default()),
                     promoted: HashMap::new(), outputs: BTreeMap::new() } }
         }
@@ -7785,14 +7868,15 @@ mod tests {
             multipart: true, members: vec![head.to_string_lossy().into_owned(), tail.to_string_lossy().into_owned()] });
         let mut groups = SourceGroups::default();
         groups.insert(group(a));
-        groups.insert(group(b));
-        groups.planned.extend([key(a), key(b), key(tail)]);
+        groups.plan(key(b), vec![key(b), key(tail)]);
+        groups.plan(key(tail), vec![]);
         let completed = groups.take(&key(a));
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[&key(a)].path, a);
-        assert_eq!(groups.roots[&key(b)].path, b);
+        assert!(groups.planned.contains_key(&key(b)));
         assert_eq!(groups.members[&key(tail)], 1);
 
+        groups.insert(group(b));
         // The independently admitted tail hasn't reached discovery yet. B
         // cannot retire its pending owner either, despite being last consumer.
         let completed = groups.take(&key(b));
@@ -7801,7 +7885,7 @@ mod tests {
         assert!(groups.members.is_empty());
         // An unadmitted physical sibling is transferred only by the final
         // consumer; it is never projected through the other head's group.
-        groups.planned = HashSet::from([key(a), key(b)]);
+        groups.release_plan(&key(tail));
         groups.insert(group(a)); groups.insert(group(b));
         assert!(!groups.take(&key(a)).contains_key(&key(tail)));
         assert_eq!(groups.take(&key(b))[&key(tail)].path, b);
@@ -7847,7 +7931,7 @@ mod tests {
             outputs: Mutex::new(ObservedOutputs::from(BTreeMap::from([(key(output), alias.to_string_lossy().into_owned()),
                 (key(other_output), other.to_string_lossy().into_owned())]))),
             batch: Arc::from("batch"), toast: None, hub: Arc::clone(&hub),
-            groups: Arc::new(Mutex::new({ let mut groups = SourceGroups::default(); groups.insert(group); groups })),
+            groups: Arc::new(Mutex::new({ let mut groups = SourceGroups::default(); groups.insert(Arc::clone(&group)); groups })),
             claimed: Arc::default(), promoted: Mutex::new(HashMap::from([(key(promoted), None)])),
         };
         // Cancellation winning the mutex first must not turn an already
@@ -7860,9 +7944,22 @@ mod tests {
         outcome.archives.push(child);
         let allocation = outcome.archives.as_ptr();
         let waker = Waker::from(Arc::new(NoWake));
-        // Tail-only admission can discover several heads. Preserve the whole
-        // result for request aggregation rather than retiring that alias early.
-        let mut deferred = Box::pin(observer.root_finished(1, head, outcome));
+        // Register two heads using the same admitted tail. Finishing one
+        // leaves the tail's WAL and output receipts available to aggregate.
+        let other_group = Arc::new(SourceGroup {
+            path: other.into(), name: "b".into(), multipart: true,
+            members: vec![other.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()],
+        });
+        observer.roots_planned([
+            (head.to_str().unwrap(), group.members.as_slice()),
+            (other.to_str().unwrap(), other_group.members.as_slice()),
+        ].into_iter());
+        {
+            let mut groups = observer.groups.lock().unwrap();
+            groups.insert(Arc::clone(&group));
+            groups.insert(Arc::clone(&other_group));
+        }
+        let mut deferred = Box::pin(observer.root_finished(1, head, outcome, 1));
         let Poll::Ready(Ok(outcome)) = deferred.as_mut().poll(&mut Context::from_waker(&waker)) else {
             panic!("alias-owned roots must return their aggregate without a handoff");
         };
@@ -7870,19 +7967,39 @@ mod tests {
         drop(deferred);
         assert_eq!(observer.outputs.lock().unwrap().paths.len(), 2);
         assert!(observer.claimed.lock().unwrap().finished.is_empty());
+
+        // A single head can finish independently when only the tail was
+        // admitted and the unrelated root remains active.
+        let mut unique = SourceGroups::default();
+        unique.insert(Arc::clone(&group));
+        *observer.groups.lock().unwrap() = unique;
+        let mut early = Box::pin(observer.root_finished(2, head, outcome, 1));
+        assert!(early.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        let root = hub.wait(None).roots.into_iter().next().unwrap();
+        assert_eq!(root.groups[&key(alias)].path, head);
+        assert_eq!(root.completed.outputs.len(), 1);
+        assert!(observer.claimed.lock().unwrap().finished.contains(&key(alias)));
+        let outcome = root.completed.result.unwrap();
+        root.reply.complete(Ok(Outcome::default()));
+        assert!(matches!(early.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Ok(_))));
+        drop(early);
+        observer.claimed.lock().unwrap().finished.clear();
+        observer.promoted.lock().unwrap().insert(key(promoted), None);
+        observer.groups.lock().unwrap().insert(group);
+
         // Directly admitted roots still settle independently of their peers.
         observer.owners.insert(key(head), head.to_string_lossy().into_owned());
         observer.owners.insert(key(other), other.to_string_lossy().into_owned());
-        observer.roots_planned([head.to_str().unwrap(), other.to_str().unwrap()].into_iter());
-        observer.groups.lock().unwrap().insert(Arc::new(SourceGroup {
-            path: other.into(), name: "b".into(), multipart: true,
-            members: vec![other.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()],
-        }));
+        observer.roots_planned([
+            (head.to_str().unwrap(), &[][..]),
+            (other.to_str().unwrap(), &[][..]),
+        ].into_iter());
+        observer.groups.lock().unwrap().insert(other_group);
         *observer.outputs.lock().unwrap() = ObservedOutputs::from(BTreeMap::from([
             (key(output), head.to_string_lossy().into_owned()),
             (key(other_output), other.to_string_lossy().into_owned()),
         ]));
-        let mut future = Box::pin(observer.root_finished(1, head, outcome));
+        let mut future = Box::pin(observer.root_finished(1, head, outcome, 1));
         assert!(future.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
         let signals = hub.wait(None);
         let root = signals.roots.into_iter().next().unwrap();

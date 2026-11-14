@@ -533,6 +533,48 @@ fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, Read, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const CRASH_READY: &str = "sunpack-journal-crash-ready";
+
+    fn wait_for_test_process_death() -> ! {
+        println!("{CRASH_READY}");
+        io::stdout().flush().unwrap();
+        let mut byte = [0];
+        io::stdin().read_exact(&mut byte).unwrap();
+        panic!("the parent must kill the journal owner without unwinding");
+    }
+
+    fn kill_test_journal_owner(test: &str, configure: impl FnOnce(&mut Command)) {
+        let module = module_path!().split_once("::").unwrap().1;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &format!("{module}::{test}"), "--include-ignored", "--nocapture"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, ready) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            for line in io::BufReader::new(stdout).lines() {
+                if line.unwrap().contains(CRASH_READY) {
+                    let _ = send.send(());
+                    return;
+                }
+            }
+        });
+        let reached = ready.recv_timeout(Duration::from_secs(30));
+        // Kill on timeout too, so a failed boundary cannot strand an owner
+        // or its exclusive state lock.
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+        reached.expect("journal child did not reach the requested crash boundary");
+        killed.unwrap();
+        assert!(!status.success());
+    }
 
     #[test]
     fn deferred_completion_submits_every_projection_before_waiting() {
@@ -628,14 +670,8 @@ mod tests {
     // the three durable representations with one coarse recovery scenario.
     #[test]
     fn hard_process_death_replays_checkpoint_and_retirement_boundaries() {
-        use std::io::{BufRead, Read, Write};
-        use std::process::{Command, Stdio};
-        use std::sync::mpsc;
-        use std::time::Duration;
-
         const CHILD: &str = "SUNPACK_JOURNAL_CRASH_CHILD";
         const PHASE: &str = "SUNPACK_JOURNAL_CRASH_PHASE";
-        const READY: &str = "sunpack-journal-crash-ready";
         if let Some(marker) = std::env::var_os(CHILD) {
             let marker = PathBuf::from(marker);
             let dir = marker.with_extension("state");
@@ -658,7 +694,7 @@ mod tests {
             let phase = std::env::var(PHASE).unwrap();
             // Hold SHARE_DELETE closed only in the published/pre-retirement
             // case. Snapshot publication succeeds while its covered WAL stays.
-            let retained = (phase == "published").then(|| {
+            let _retained = (phase == "published").then(|| {
                 OpenOptions::new().read(true).share_mode(3)
                     .open(segment_path(&dir, 1)).unwrap()
             });
@@ -674,43 +710,16 @@ mod tests {
             // A tail after the captured prefix must survive both retained and
             // retired covered segments, rather than being discarded on open.
             journal.commit(true, |_| Ok(NativeWatchOperations::password_generation(3, "three".into()))).unwrap();
-            println!("{READY}");
-            io::stdout().flush().unwrap();
-            let mut byte = [0];
-            io::stdin().read_exact(&mut byte).unwrap();
-            drop(retained);
-            panic!("the parent must kill the journal owner without unwinding");
+            wait_for_test_process_death();
         }
 
         for phase in ["before_snapshot", "published", "retired"] {
             let marker = crate::test_support::temp_file("journal_process_death", b"generation");
             let dir = marker.with_extension("state");
             let owned = marker.with_extension("owned");
-            let test_name = format!("{}::hard_process_death_replays_checkpoint_and_retirement_boundaries", module_path!().split_once("::").unwrap().1);
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test_name, "--nocapture"])
-                .env(CHILD, &marker).env(PHASE, phase)
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
-                .spawn().unwrap();
-            let stdout = child.stdout.take().unwrap();
-            let (send, ready) = mpsc::sync_channel(1);
-            let reader = thread::spawn(move || {
-                for line in io::BufReader::new(stdout).lines() {
-                    if line.unwrap().contains(READY) {
-                        let _ = send.send(());
-                        return;
-                    }
-                }
+            kill_test_journal_owner("hard_process_death_replays_checkpoint_and_retirement_boundaries", |command| {
+                command.env(CHILD, &marker).env(PHASE, phase);
             });
-            let reached = ready.recv_timeout(Duration::from_secs(30));
-            // Kill on timeout too, so a failed boundary does not leave a child
-            // or its exclusive state lock behind and hang the remaining suite.
-            let killed = child.kill();
-            let status = child.wait().unwrap();
-            reader.join().unwrap();
-            reached.expect("journal child did not reach the requested crash boundary");
-            killed.unwrap();
-            assert!(!status.success());
             for _ in 0..2 {
                 let journal = Journal::open(&dir, 7).unwrap();
                 assert_eq!(journal.state().password_generation(), 3, "{phase}");
@@ -727,6 +736,96 @@ mod tests {
             fs::remove_dir(&owned).unwrap();
             fs::remove_file(marker).unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
+    fn cpp_query_recovers_durable_blocker_after_writer_death() {
+        use crate::event_log::gui_contract::{gui_binary, project, Directory, DirectoryNotification};
+        use crate::watch_store::EntryRecord;
+        use serde_json::json;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        const CHILD: &str = "SUNPACK_GUI_JOURNAL_CRASH_CHILD";
+        let binary = gui_binary();
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let journal = Journal::open(&dir, 7).unwrap();
+            let path = dir.join("events.json");
+            let source = dir.join("disguised.bin");
+            journal.log(json!({"event":"processing_started","path":dir.join("interrupted.zip"),"owner":"interrupted"}));
+            journal.event_log().flush().unwrap();
+            let live = project(&binary, &path, "", "", "", "");
+            assert_eq!(live["total"], 3);
+            assert!(live["rows"].as_array().unwrap().iter().any(|row| row["status"] == "taskProcessing"));
+
+            // Freeze publication at the old manifest. The production commit
+            // path still fsyncs its WAL while the display writer is blocked.
+            // Leave a real unpublished history append on disk at the same time.
+            let _held = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path).unwrap();
+            let changed = DirectoryNotification::new(&dir);
+            journal.log(json!({"event":"done","path":dir.join("unpublished.zip"),"owner":"unpublished"}));
+            changed.wait_for_temp(&dir.join("events.json.tmp"));
+            journal.commit(true, |_| {
+                let mut operations = NativeWatchOperations::empty();
+                operations.put_entry(Arc::new(EntryRecord {
+                    path: source.to_string_lossy().into_owned(),
+                    size: 1,
+                    mtime: 1.0,
+                    file_id: String::new(),
+                    change_usn: 0,
+                    status: "suspended_missing_volume".into(),
+                    last_error: String::new(),
+                    attempt_count: 1,
+                    failure_kind: String::new(),
+                    failure_stage: String::new(),
+                    failure_payload: Default::default(),
+                    last_attempt_at: crate::io::display_store::utc_us() as f64 / 1_000_000.0,
+                }));
+                Ok(operations)
+            }).unwrap();
+            wait_for_test_process_death();
+        }
+
+        let dir = Directory::new("gui_crash");
+        let path = dir.0.join("events.json");
+        let source = dir.0.join("disguised.bin");
+        let member = dir.0.join("disguised.002");
+        let journal = Journal::open(&dir.0, 7).unwrap();
+        journal.log(json!({"event":"pipeline_sources_claimed","owner":"completed","processing":true,
+            "groups":[{"path":source,"name":"retained.rar","members":[source,member]}]}));
+        journal.log(json!({"event":"done","owner":"completed","path":source,"output_dirs":["previous-output"]}));
+        journal.log(json!({"event":"failed_terminal","owner":"failed","path":dir.0.join("failed.zip")}));
+        journal.event_log().flush().unwrap();
+        drop(journal);
+        let previous = project(&binary, &path, "", "", "", "");
+        assert_eq!(previous["total"], 2);
+        let completed = previous["rows"].as_array().unwrap().iter()
+            .find(|row| row["status"] == "taskSucceeded").unwrap();
+        assert_eq!(completed["name"], "disguised.bin");
+        assert_eq!(completed["parts"], json!(["disguised.bin", "disguised.002"]));
+        assert_eq!(completed["outputs"], json!(["previous-output"]));
+
+        kill_test_journal_owner("cpp_query_recovers_durable_blocker_after_writer_death", |command| {
+            command.env(CHILD, &dir.0);
+        });
+        assert!(dir.0.join("events.json.tmp").is_file());
+
+        let journal = Journal::open(&dir.0, 7).unwrap();
+        journal.event_log().flush().unwrap();
+        let restored = project(&binary, &path, "", "", "", "");
+        assert_eq!(restored["total"], 3);
+        let rows = restored["rows"].as_array().unwrap();
+        for earlier in previous["rows"].as_array().unwrap() {
+            assert!(rows.contains(earlier), "historical row changed across recovery: {earlier}");
+        }
+        let waiting = rows.iter().find(|row| row["status"] == "taskWaiting").unwrap();
+        assert_eq!(waiting["path"], completed["path"]);
+        assert_ne!(waiting["id"], completed["id"]);
+        assert_eq!(waiting["statusText"], "等待分卷");
+        drop(journal);
+        assert!(!dir.0.join("events.json.tmp").exists());
+        assert_eq!(project(&binary, &path, "", "", "", ""), restored);
     }
 
     // Exercises the durable writer and replay, not just error classification:

@@ -191,6 +191,87 @@ fn run_isolated(name: &str, child: &str) {
 }
 
 #[test]
+fn watch_discovery_read_failure_retries_only_its_archive() {
+    // Use the actual native worker at the same executable boundary as Watch.
+    // Its installation is optional for standalone Rust library test runs.
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let Ok(worker) = resources::worker_path(&checkout) else { return; };
+    let marker = crate::test_support::temp_file("watch_discovery_io", b"");
+    let base = marker.with_extension("work");
+    let watched = base.join("input");
+    let output = base.join("output");
+    fs::create_dir_all(&watched).unwrap();
+    let bad = watched.join("blocked.rar");
+    let good = watched.join("blocked.7z");
+    use crate::password::rar::rar5_header_decryption_tests::{hex_bytes, SINGLE_HP_HEX};
+    fs::write(&bad, hex_bytes(SINGLE_HP_HEX)).unwrap();
+    let payload = base.join("payload.txt");
+    fs::write(&payload, b"independent input").unwrap();
+    let mut archive = sevenz_rust2::ArchiveWriter::create(&good).unwrap();
+    archive.push_archive_entry(sevenz_rust2::ArchiveEntry::from_path(
+        &payload, "payload.txt".into()), Some(fs::File::open(&payload).unwrap())).unwrap();
+    archive.finish().unwrap();
+
+    let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+    let root = key(&watched);
+    let scope = NativeDiscoveryScope::new(watched.to_string_lossy().into_owned(), None, Vec::new());
+    let mut settings = Config::default();
+    settings.embedded_scan.enabled = false;
+    settings.post_extract.archive_cleanup_mode = crate::core::config::CleanupMode::Keep;
+    settings.user_passwords = Arc::from([Arc::from("secret")]);
+    let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
+    let engine = Arc::new(Engine::new(worker));
+    let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
+    options.catalog_refresh(&catalog, &scope, None).unwrap();
+    let mut scheduler = Scheduler {
+        candidate_diagnostics: CandidateDiagnostics::default(),
+        admission_checkpoint: None,
+        cwd: base.clone(), root_file: base.join(ROOTS_FILE),
+        roots: BTreeMap::from([(root.clone(), (Root { path: watched.clone(), output: Some(output.clone()),
+            recursive: true, deep: false, scanned: true }, scope))]),
+        available_roots: HashSet::from([root.clone()]),
+        user_password_signature: user_password_signature(&settings.user_passwords),
+        settings: Arc::new(settings), engine, catalog, journal,
+        options: None, deep_options: options,
+        passwords: BuiltinStore::shared(&base).unwrap(), hub: Arc::new(Hub::new()),
+        root_observers: HashMap::new(), root_progress: RootPolicyProgress::default(),
+        parent_observers: HashMap::new(), config_observers: Vec::new(),
+        pending: HashMap::new(), unpublished: HashSet::new(), due: BTreeMap::new(),
+        active: HashMap::new(), active_paths: HashMap::new(), continuous: false, tray_enabled: false,
+        tray: None, monitor: None, toast: None, cache_deadline: None,
+        external: Arc::new(Mutex::new(None)), _lease: BrokerLease,
+    };
+    scheduler.options = Some(NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap());
+    for path in [&good, &bad] {
+        scheduler.enqueue(&root, path.to_string_lossy().into_owned(), CandidateAdmission::Retry).unwrap();
+    }
+    let protected = Arc::new(Mutex::new(None));
+    let hold = Arc::clone(&protected);
+    let failing = bad.clone();
+    scheduler.admission_checkpoint = Some(Box::new(move |scheduler| {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
+        assert!(scheduler.pending[&key(&failing)].admission_ready);
+        // Cache the native header in the checkpoint's current catalog. Hold
+        // a real sharing conflict through the worker's password session open.
+        let scope = &scheduler.roots[&root].1;
+        scheduler.options.as_ref().unwrap().catalog_snapshot(&scheduler.catalog, scope, failing.to_str().unwrap())?;
+        *hold.lock().unwrap() = Some(fs::OpenOptions::new().write(true)
+            .share_mode(FILE_SHARE_WRITE | FILE_SHARE_DELETE).open(&failing)?);
+        Ok(())
+    }));
+    scheduler.dispatch_ready().unwrap();
+    scheduler.drain_active(&mut Ok(0)).unwrap();
+    drop(protected);
+    assert!(scheduler.pending.contains_key(&key(&bad)), "sharing error must requeue the affected archive");
+    assert!(!scheduler.pending.contains_key(&key(&good)), "independent archive was retried");
+    assert_eq!(fs::read(output.join("blocked/payload.txt")).unwrap(), b"independent input");
+    drop(scheduler);
+    crate::io::reader::release_reader_resources_under_roots(vec![watched.to_string_lossy().into_owned()]).unwrap();
+    fs::remove_dir_all(base).unwrap();
+    fs::remove_file(marker).unwrap();
+}
+
+#[test]
 fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
     const CHILD: &str = "SUNPACK_SURVIVING_OUTPUT_RECOVERY_TEST";
     if let Some(base) = std::env::var_os(CHILD) {

@@ -100,6 +100,10 @@ pub struct Request {
 
 impl Request {
     pub fn new(inputs: Vec<PathBuf>, mode: Mode) -> Self {
+        Self::with_config(inputs, mode, Arc::new(Config::default()))
+    }
+
+    pub(crate) fn with_config(inputs: Vec<PathBuf>, mode: Mode, config: Arc<Config>) -> Self {
         Self {
             inputs,
             mode,
@@ -113,7 +117,7 @@ impl Request {
             passwords: Arc::from([]),
             password_snapshot: None,
             password_scope: None,
-            config: Arc::new(Config::default()),
+            config,
             checkpoints: Vec::new(),
             promoted_sources: Vec::new(),
             cancel: Cancellation::new(),
@@ -368,6 +372,7 @@ pub enum InputErrorKind {
     InvalidInput,
     FilesystemScan,
     EmbeddedDiscovery,
+    WatchDiscoveryIo,
     Cleanup,
 }
 
@@ -800,14 +805,14 @@ pub(crate) trait Observer: Send + Sync {
 
     // Publish logical roots after discovery, before any root can complete.
     // Admitted physical aliases are not necessarily independent tasks.
-    fn roots_planned<'a>(&self, _paths: impl Iterator<Item = &'a str>) {}
+    fn roots_planned<'a>(&self, _roots: impl Iterator<Item = (&'a str, &'a [String])>) {}
 
     fn coalesced(&self) {}
 
     // The default keeps the caller's aggregate result. Watch transfers a
     // settled root to its ordinary completion queue without cloning receipts.
     fn root_finished(
-        &self, _id: TaskId, _path: &Path, outcome: Outcome,
+        &self, _id: TaskId, _path: &Path, outcome: Outcome, _request: u64,
     ) -> impl std::future::Future<Output = io::Result<Outcome>> + Send {
         async { Ok(outcome) }
     }

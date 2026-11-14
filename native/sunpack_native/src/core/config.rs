@@ -951,7 +951,6 @@ impl Config {
                     &["performance", "persistent_server_idle_seconds"],
                 )
                 .and_then(number_value)
-                .filter(|seconds| seconds.is_finite())
                 .map(|seconds| seconds.max(0.0)),
                 worker: WorkerConfig {
                     space_poll_interval_ms: at(

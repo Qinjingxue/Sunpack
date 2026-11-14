@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -26,7 +27,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
+    ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_UNLIMITED_INSTANCES,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE,
@@ -37,6 +39,11 @@ const MAX_FIELD: usize = 16 * 1024 * 1024;
 const TERMINAL_SIZE_FIELD: u32 = 32;
 const RESIZE: u32 = u32::MAX - 1;
 const CANCEL: u32 = u32::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static PIPE_BUSY: std::cell::Cell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::Cell::new(None) };
+}
 
 fn state_path(cwd: &Path, identity: &str) -> io::Result<PathBuf> {
     Ok(resources::writable_data_dir(cwd)?.join(format!("runtime-{identity}.state")))
@@ -829,9 +836,8 @@ pub(super) fn serve(cwd: &Path, identity: &str) -> io::Result<()> {
             let (wait, shutting_down) = {
                 let state = server.activity.lock().unwrap();
                 let timeout = if state.active == 0 && !server.host.watch.is_running() {
-                    state.last_completed.map_or(INFINITE, |completed| {
-                        idle_wait(completed, server.host.idle_after())
-                    })
+                    state.last_completed.zip(server.host.idle_after())
+                        .map_or(INFINITE, |(completed, idle)| idle_wait(completed, idle))
                 } else {
                     INFINITE
                 };
@@ -913,10 +919,25 @@ pub(super) fn submit_existing(
         .next()
         .filter(|id| id.len() == 16)
         .ok_or(io::ErrorKind::InvalidData)?;
-    let mut pipe = match OpenOptions::new().read(true).write(true).open(name) {
-        Ok(pipe) => pipe,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    let mut pipe = loop {
+        let error = match options.open(name) {
+            Ok(pipe) => break pipe,
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                #[cfg(test)]
+                PIPE_BUSY.with(|signal| {
+                    if let Some(signal) = signal.take() { let _ = signal.send(()); }
+                });
+                let name = windows::wide(OsStr::new(name));
+                if unsafe { WaitNamedPipeW(name.as_ptr(), INFINITE) } != 0 {
+                    continue;
+                }
+                io::Error::last_os_error()
+            }
+            Err(error) => error,
+        };
+        return if error.kind() == io::ErrorKind::NotFound { Ok(None) } else { Err(error) };
     };
     let cwd = cwd.to_str().ok_or(io::ErrorKind::InvalidInput)?;
     let mut request = Vec::new();
@@ -994,6 +1015,22 @@ mod async_connection_tests {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[test]
+    fn persistent_idle_can_be_disabled_and_reenabled_by_configuration() {
+        let host = Host::new();
+        let mut raw = serde_json::json!({"performance": {}});
+        for (setting, idle) in [
+            (serde_json::json!(0), Some(Duration::ZERO)),
+            (serde_json::json!("+inf"), None),
+            (serde_json::json!("invalid"), None),
+            (serde_json::json!(3), Some(Duration::from_secs(3))),
+        ] {
+            raw["performance"]["persistent_server_idle_seconds"] = setting;
+            host.configure_idle(&config::Config::parse(&raw).unwrap());
+            assert_eq!(host.idle_after(), idle);
+        }
+    }
+
+    #[test]
     fn competing_runtime_does_not_wait_for_a_live_owner_with_missing_endpoint() {
         let path = crate::test_support::temp_file("runtime_lock", b"invalid endpoint");
         let owner = StateFile::acquire(path.clone()).unwrap();
@@ -1050,6 +1087,47 @@ mod async_connection_tests {
             bytes.extend(arg.as_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn internal_toast_request_waits_for_the_next_pipe_instance() {
+        let identity = format!("busy-test-{}", hex(&windows::random_bytes::<16>().unwrap()));
+        let name = format!(r"\\.\pipe\SunPack-{identity}");
+        let name_wide = windows::wide(OsStr::new(&name));
+        let security = windows::PipeSecurity::current_user().unwrap();
+        let accept = Accept::arm(&name_wide, &security.attributes(), true).unwrap();
+        let mut client_options = OpenOptions::new();
+        client_options.read(true).write(true);
+        let _occupied = client_options.open(&name).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(accept.event.raw(), INFINITE) }, WAIT_OBJECT_0);
+        let _peer = accept.finish().unwrap();
+        assert_eq!(client_options.open(&name).unwrap_err().raw_os_error(), Some(ERROR_PIPE_BUSY as i32));
+
+        let server = server();
+        let cwd = std::env::current_dir().unwrap();
+        let path = state_path(&cwd, &identity).unwrap();
+        let state = StateFile::acquire(path.clone()).unwrap();
+        state.publish(&name, &server.token, &server.build_id, "test").unwrap();
+        let (busy, blocked) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let client = std::thread::spawn(move || {
+            PIPE_BUSY.with(|signal| signal.set(Some(busy)));
+            let args = ["--cancel-watch-batch".into(), "missing".into()];
+            done.send(submit_existing(&cwd, &identity, &args, false)).unwrap();
+        });
+        // Arm the second instance only after the internal client saw ERROR_PIPE_BUSY.
+        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let accept = Accept::arm(&name_wide, &security.attributes(), false).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(accept.event.raw(), 5000) }, WAIT_OBJECT_0);
+        let request = server.submit(accept.finish().unwrap());
+        drop(state);
+        let mut lock_path = path.into_os_string();
+        lock_path.push(".lock");
+        fs::remove_file(lock_path).unwrap();
+        let response = result.recv_timeout(Duration::from_secs(5)).unwrap();
+        client.join().unwrap();
+        assert_eq!(response.unwrap(), Some(1)); // The command ran, but the batch does not exist.
+        request.join().unwrap().unwrap();
     }
 
     #[test]

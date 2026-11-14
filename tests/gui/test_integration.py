@@ -179,7 +179,12 @@ $entries = @($items | ForEach-Object {{
             assert all(rule["inheritance"] == 3 and rule["propagation"] == 0 for rule in entry["rules"])
 
 
-def test_rust_writer_cpp_query_lifecycle(repo_root):
+@pytest.mark.parametrize("contract", [
+    "event_log::gui_contract::rust_writer_cpp_query_lifecycle",
+    "event_log::gui_contract::rust_writer_cpp_query_publication_conflict",
+    "runtime::watch::journal::tests::cpp_query_recovers_durable_blocker_after_writer_death",
+], ids=["lifecycle", "publication-conflict", "crash-recovery"])
+def test_rust_writer_cpp_query_contract(repo_root, contract):
     # The existing Rust decoder cannot detect C++ query/index/filter mistakes.
     # This prebuilt test drives the real writer and invokes --project itself;
     # no Python pipeline, copied store decoder, or build-on-test fallback.
@@ -192,8 +197,8 @@ def test_rust_writer_cpp_query_lifecycle(repo_root):
     assert gui.is_file(), "Build the actual C++ GUI reader with scripts/build_gui.ps1"
     environment = {**os.environ, "SUNPACK_GUI_TEST_BINARY": str(gui)}
     result = subprocess.run(
-        [str(binary), "--ignored", "--exact", "event_log::gui_contract::rust_writer_cpp_query_lifecycle", "--nocapture"],
-        capture_output=True, text=True, encoding="utf-8", env=environment,
+        [str(binary), "--ignored", "--exact", contract, "--nocapture"],
+        capture_output=True, text=True, encoding="utf-8", env=environment, timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout, "the real writer/GUI boundary test was not selected"

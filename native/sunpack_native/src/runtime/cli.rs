@@ -26,7 +26,7 @@ pub(super) struct Host {
     pub(super) scheduler: Arc<crate::pipeline::Scheduler>,
     engine: OnceLock<Arc<Engine>>,
     passwords: Arc<Mutex<Option<Arc<passwords::BuiltinStore>>>>,
-    idle: Mutex<Duration>,
+    idle: Mutex<Option<Duration>>,
     pub(super) watch: Arc<watch::Watch>,
     sources: Mutex<VecDeque<Arc<SourceObservers>>>,
 }
@@ -69,24 +69,20 @@ impl Host {
             scheduler: crate::pipeline::Scheduler::new(),
             engine: OnceLock::new(),
             passwords: Arc::default(),
-            idle: Mutex::new(Duration::from_secs_f64(config::default_idle_seconds())),
+            idle: Mutex::new(Some(Duration::from_secs_f64(config::default_idle_seconds()))),
             watch: Arc::new(watch::Watch::new(Arc::new(wake))),
             sources: Mutex::default(),
         }
     }
 
-    pub(super) fn idle_after(&self) -> Duration {
+    pub(super) fn idle_after(&self) -> Option<Duration> {
         *self.idle.lock().unwrap()
     }
 
     pub(super) fn configure_idle(&self, settings: &Config) {
         super::diagnostics::retention(settings.watch.event_log_retention_days);
-        if let Some(idle) = settings
-            .performance
-            .persistent_server_idle_seconds
-            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
-        {
-            *self.idle.lock().unwrap() = idle;
+        if let Some(seconds) = settings.performance.persistent_server_idle_seconds {
+            *self.idle.lock().unwrap() = Duration::try_from_secs_f64(seconds).ok();
         }
     }
 

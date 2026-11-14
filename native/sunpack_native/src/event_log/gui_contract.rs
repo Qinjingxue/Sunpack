@@ -1,16 +1,38 @@
 //! Actual Rust writer -> shipped C++ query boundary; no fixture decoder.
 use super::*;
 use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use windows_sys::Win32::Foundation::{ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Storage::FileSystem::{
+    FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-struct Directory(PathBuf);
+pub(crate) struct Directory(pub(crate) PathBuf);
+
+impl Directory {
+    pub(crate) fn new(test: &str) -> Self {
+        let marker = crate::test_support::temp_file(test, b"");
+        let root = Self(marker.with_extension("store"));
+        fs::remove_file(marker).unwrap();
+        fs::create_dir(&root.0).unwrap();
+        root
+    }
+}
 impl Drop for Directory {
     fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
 }
-fn project(binary: &Path, path: &Path, query: &str, cursor: &str, root: &str, status: &str) -> Value {
-    let output = Command::new(binary).arg("--project").arg(path)
-        .args([query, cursor, root, status]).output().unwrap();
+fn query_output(binary: &Path, path: &Path, filters: [&str; 4]) -> Output {
+    Command::new(binary).arg("--project").arg(path).args(filters).output().unwrap()
+}
+pub(crate) fn project(binary: &Path, path: &Path, query: &str, cursor: &str, root: &str, status: &str) -> Value {
+    let output = query_output(binary, path, [query, cursor, root, status]);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     serde_json::from_slice::<Value>(&output.stdout).unwrap()["tasks"].take()
 }
@@ -37,16 +59,97 @@ fn manifest(path: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-#[test]
-#[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
-fn rust_writer_cpp_query_lifecycle() {
+pub(crate) fn gui_binary() -> PathBuf {
     let binary = PathBuf::from(std::env::var_os("SUNPACK_GUI_TEST_BINARY")
         .expect("set SUNPACK_GUI_TEST_BINARY to the real C++ GUI test executable"));
     assert!(binary.is_file());
-    let marker = crate::test_support::temp_file("gui_writer", b"");
-    let root = Directory(marker.with_extension("store"));
-    std::fs::remove_file(marker).unwrap();
-    std::fs::create_dir(&root.0).unwrap();
+    binary
+}
+
+pub(crate) struct DirectoryNotification(HANDLE);
+
+impl DirectoryNotification {
+    pub(crate) fn new(path: &Path) -> Self {
+        let wide: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+        let handle = unsafe { FindFirstChangeNotificationW(wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_FILE_NAME) };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "{}", std::io::Error::last_os_error());
+        Self(handle)
+    }
+
+    pub(crate) fn wait_for_temp(&self, path: &Path) {
+        while !path.is_file() {
+            let result = unsafe { WaitForSingleObject(self.0, 10_000) };
+            assert_eq!(result, WAIT_OBJECT_0, "writer did not stage the manifest: {path:?}");
+            assert_ne!(unsafe { FindNextChangeNotification(self.0) }, 0);
+        }
+    }
+}
+
+impl Drop for DirectoryNotification {
+    fn drop(&mut self) {
+        unsafe { FindCloseChangeNotification(self.0) };
+    }
+}
+
+#[test]
+#[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
+fn rust_writer_cpp_query_publication_conflict() {
+    let binary = gui_binary();
+    let root = Directory::new("gui_publication");
+    let path = root.0.join("events.json");
+    let source = root.0.join("carrier.001");
+    let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
+    log.write(json!({"event":"processing_started","owner":"test","path":source})).unwrap();
+    log.flush().unwrap();
+
+    // A live GUI reader shares DELETE. Replacement must let its old handle
+    // keep reading the previous manifest while new readers see the new one.
+    let before = fs::read(&path).unwrap();
+    let mut shared = OpenOptions::new().read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&path).unwrap();
+    log.write(json!({"event":"failed_password","path":source})).unwrap();
+    log.flush().unwrap();
+    let mut old_manifest = Vec::new();
+    shared.read_to_end(&mut old_manifest).unwrap();
+    assert_eq!(old_manifest, before);
+    drop(shared);
+    let waiting = project(&binary, &path, "", "", "", "");
+    assert_eq!(waiting["rows"][0]["statusText"], "等待密码");
+
+    {
+        let _held = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let changed = DirectoryNotification::new(&root.0);
+        log.write(json!({"event":"suspended_missing_volume","path":source})).unwrap();
+        // The real writer updates the mutable index before staging publication.
+        // Wait for that boundary so the reader cannot accidentally see old slots.
+        changed.wait_for_temp(&root.0.join("events.json.tmp"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let pending = query_output(&binary, &path, [""; 4]);
+        assert_eq!(pending.status.code(), Some(ERROR_SHARING_VIOLATION as i32),
+            "{}", String::from_utf8_lossy(&pending.stdout));
+    }
+    log.flush().unwrap();
+    assert!(log.error().unwrap().is_none());
+    let healed = project(&binary, &path, "", "", "", "");
+    assert_eq!(healed["rows"][0]["statusText"], "等待分卷");
+    assert_eq!(healed["rows"][0]["id"], waiting["rows"][0]["id"]);
+    log.write(json!({"event":"done","owner":"test","path":source,
+        "output_dirs":["retained-output"]})).unwrap();
+    log.flush().unwrap();
+    drop(log);
+    let offline = project(&binary, &path, "", "", "", "");
+    assert_eq!(offline["rows"][0]["status"], "taskSucceeded");
+    assert_eq!(offline["rows"][0]["outputs"], json!(["retained-output"]));
+    assert!(!root.0.join("events.json.tmp").exists());
+}
+
+#[test]
+#[ignore = "requires the real sunpack_gui_tests.exe; run by GUI/runtime CI"]
+fn rust_writer_cpp_query_lifecycle() {
+    let binary = gui_binary();
+    let root = Directory::new("gui_writer");
     let path = root.0.join("events.json");
     let log = NativeEventLog::new(path.clone(), 7, true).unwrap();
     let base = utc_us() as f64 / 1_000_000.0 - 2.0 * 86400.0;

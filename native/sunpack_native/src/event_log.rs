@@ -1185,4 +1185,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "event_log/gui_contract.rs"]
-mod gui_contract;
+pub(crate) mod gui_contract;

@@ -115,6 +115,13 @@ impl Engine {
         self.leases.reserve_request_async(id, Origin::Foreground, inputs, cancel).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn reserve_watch_inputs_for_test(
+        &self, request: u64, paths: &[PathBuf], cancel: &Cancellation,
+    ) -> io::Result<RequestClaimGuard> {
+        self.leases.reserve_request_async(request, Origin::Watch, paths, cancel).await
+    }
+
     pub(crate) async fn run_reserved_async<O: Observer + 'static>(
         &self, request: Request, observer: Arc<O>, reservation: Arc<RequestClaimGuard>,
     ) -> io::Result<PublicOutcome> {
@@ -150,7 +157,7 @@ impl Engine {
         super::scheduling::block_on(self.worker(&request.config.performance.worker, &request.cancel))
             .map_err(super::startup_error)?;
         let request_id = self.next_id();
-        let _request_claim = if request.mode == Mode::Extract {
+        let _claim = if request.mode == Mode::Extract {
             Some(self.leases.reserve_request(
                 request_id,
                 request.origin,
@@ -402,6 +409,7 @@ impl<O> std::ops::Deref for ObserverRef<'_, O> {
 type RecoveryCheckpointIndex = HashMap<Arc<str>, HashMap<CheckpointKey, usize>>;
 type RecoveryAnchorIndex = HashMap<String, HashMap<(String, u64), Vec<(Arc<str>, usize)>>>;
 type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
+type WatchGenerations = BTreeMap<String, PhysicalFileGeneration>;
 
 enum TaskAdmission {
     Execute,
@@ -1189,26 +1197,19 @@ impl<'run, O: Observer> Run<'run, O> {
         });
         stage("discovery", &self.request.cancel).await?;
         let discovered = discovery::discover(&self.request, self.options_at(1)?, &self.candidates)?;
-        let mut requested = None;
+        let requested = self.watch_generations(&discovered);
         let mut watch = None;
-        if let Some(task) = self.watch_family(&discovered) {
-            let (members, _) = self.capture_generations(task);
-            let members = Arc::new(members);
-            if members.len() == task.owned_paths.len() {
-                let key = path_key(&task.entry().entry_path);
-                match self.engine.leases.claim_watch(key, self.output_names.owner, &members, &self.request) {
-                    Some(WatchFamily::Owner(owner)) => watch = Some(owner),
-                    Some(WatchFamily::Follower(key, owner, completion)) => {
-                        self.observer.coalesced();
-                        drop(members);
-                        drop(discovered);
-                        self.engine.leases.join_watch(&key, owner, &completion, &self.request.cancel).await?;
-                        return Ok(PublicOutcome { coalesced_from: Some(owner), ..PublicOutcome::default() });
-                    }
-                    None => {}
+        if let Some(members) = &requested {
+            match self.engine.leases.claim_watch(self.output_names.owner, members, &self.request) {
+                WatchFamily::Owner(owner) => watch = Some(owner),
+                WatchFamily::Follower(key, owner, completion) => {
+                    self.observer.coalesced();
+                    drop(requested);
+                    drop(discovered);
+                    self.engine.leases.join_watch(&key, owner, &completion, &self.request.cancel).await?;
+                    return Ok(PublicOutcome { coalesced_from: Some(owner), ..PublicOutcome::default() });
                 }
             }
-            requested = Some(members);
         }
         // Request admission covers only the user's original selections, as in
         // main. Discovery may resolve different selections to one volume family;
@@ -1219,17 +1220,23 @@ impl<'run, O: Observer> Run<'run, O> {
         result
     }
 
-    fn watch_family<'a>(&self, discovered: &'a Discovered) -> Option<&'a Task> {
+    fn watch_generations(&self, discovered: &Discovered) -> Option<Arc<WatchGenerations>> {
         if self.request.origin != Origin::Watch || self.request.mode != Mode::Extract
             || !self.request.checkpoints.is_empty() || !self.request.promoted_sources.is_empty()
             || !discovered.errors.is_empty() || !discovered.scan_errors.is_empty()
+            || !discovered.tasks.iter().any(|task| task.owned_paths.len() > 1)
         {
             return None;
         }
-        // Different Watch selections can both discover one physical volume
-        // family. A mixed batch still admits each of its tasks independently.
-        let [task] = discovered.tasks.as_slice() else { return None; };
-        (task.owned_paths.len() > 1).then_some(task)
+        // Different selections of a shared tail can resolve to multiple heads.
+        // Capture each physical path once, regardless of the number of tasks.
+        let mut members = BTreeMap::new();
+        for path in discovered.tasks.iter().flat_map(|task| &task.owned_paths) {
+            if let std::collections::btree_map::Entry::Vacant(entry) = members.entry(path_key(path)) {
+                entry.insert(capture_file_generation(Path::new(path)).ok()?);
+            }
+        }
+        Some(Arc::new(members))
     }
 
     async fn finish(&self, mut executed: io::Result<Outcome>) -> io::Result<Outcome> {
@@ -1321,7 +1328,7 @@ impl<'run, O: Observer> Run<'run, O> {
         inherited_scope: Option<Arc<RecursiveScope>>,
         parent: Option<(TaskId, &ArchiveResult)>,
         spawner: Spawner<'run>,
-        mut requested: Option<Arc<SourceGenerations>>,
+        requested: Option<Arc<WatchGenerations>>,
     ) -> io::Result<Outcome> {
         // Scan has no request claim to reveal aliases. Reuse the resolved
         // paths from deduplication for read leases in both modes.
@@ -1368,13 +1375,16 @@ impl<'run, O: Observer> Run<'run, O> {
         let root_errors = Mutex::new(root_errors);
         let task_count = batch.tasks.len();
         if depth == 1 {
-            self.observer.roots_planned(batch.tasks.iter().map(|task| task.entry().entry_path.as_str()));
+            self.observer.roots_planned(batch.tasks.iter().map(|task| {
+                (task.entry().entry_path.as_str(), task.owned_paths.as_slice())
+            }));
         }
         // Register every planned consumer before any one of them can finish.
         let tasks = batch.tasks.into_iter().map(|task| {
             let (task, sources, _, _) = self.register_task(task);
             let keys = (!resolved_paths.is_empty()).then(|| source_lease_keys(&task, &resolved_paths));
-            (task, sources, keys, requested.take())
+            let requested = requested.as_ref().filter(|_| task.owned_paths.len() > 1).cloned();
+            (task, sources, keys, requested)
         }).collect();
         drop(resolved_paths);
         let executed = spawner.bounded_map(tasks, move |(task, sources, keys, requested)| {
@@ -1454,7 +1464,7 @@ impl<'run, O: Observer> Run<'run, O> {
     async fn finish_root(&self, id: TaskId, path: &Path, result: io::Result<Outcome>) -> io::Result<Outcome> {
         if result.as_ref().is_ok_and(Outcome::settled) {
             stage("report", &Cancellation::new()).await?;
-            let mut outcome = self.observer.root_finished(id, path, result.unwrap().into()).await?;
+            let mut outcome = self.observer.root_finished(id, path, result.unwrap().into(), self.output_names.owner).await?;
             if self.request.mode == Mode::Extract {
                 outcome.compact_completed_extract();
             }
@@ -1549,7 +1559,7 @@ impl<'run, O: Observer> Run<'run, O> {
         true
     }
 
-    fn register_task(&self, task: Task) -> (Task, CleanupOwner, Option<HashSet<String>>, Option<Arc<SourceGenerations>>) {
+    fn register_task(&self, task: Task) -> (Task, CleanupOwner, Option<HashSet<String>>, Option<Arc<WatchGenerations>>) {
         let paths = if self.request.mode == Mode::Extract { task.owned_paths.as_slice() } else { &[] };
         let sources = CleanupOwner::new(Arc::clone(&self.cleanup_refs), paths);
         (task, sources, None, None)
@@ -1557,7 +1567,7 @@ impl<'run, O: Observer> Run<'run, O> {
 
     fn execute_task(
         self: &Arc<Self>,
-        (mut task, mut sources, keys, requested): (Task, CleanupOwner, Option<HashSet<String>>, Option<Arc<SourceGenerations>>),
+        (mut task, mut sources, keys, requested): (Task, CleanupOwner, Option<HashSet<String>>, Option<Arc<WatchGenerations>>),
         task_id: TaskId,
         depth: usize,
         inherited_scope: Option<Arc<RecursiveScope>>,
@@ -1581,7 +1591,8 @@ impl<'run, O: Observer> Run<'run, O> {
             let discovered = task.source != DiscoverySource::Direct;
             let discovery_scope = task.scope.clone();
             let admission = this.task_admission(&task, &generations, &missing, discovered, watch_root,
-                requested.as_deref().or(captured.as_ref()))?;
+                |path| requested.as_ref().and_then(|members| members.get(path))
+                    .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
             drop((requested, captured));
             match admission {
                 TaskAdmission::Execute => {},
@@ -1928,7 +1939,8 @@ impl<'run, O: Observer> Run<'run, O> {
                             stage("preflight", cancel).await?;
                             let (current_generations, missing) = this.capture_generations(&replacement);
                             generations = current_generations;
-                            let admission = this.task_admission(&replacement, &generations, &missing, discovered, watch_root, requested.as_ref())?;
+                            let admission = this.task_admission(&replacement, &generations, &missing, discovered, watch_root,
+                                |path| requested.as_ref().and_then(|members| members.get(path)))?;
                             drop(requested);
                             match admission {
                                 TaskAdmission::Execute => {},
@@ -2366,6 +2378,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         .map(|source| (path, source))
                 })
                 .collect();
+            let mut root_cleanup = None;
             if sources_complete && this.request.mode == Mode::Extract {
                 if watch_root {
                     stage("output_state", &Cancellation::new()).await?;
@@ -2391,14 +2404,9 @@ impl<'run, O: Observer> Run<'run, O> {
                 if deletes.is_empty() && recycles.is_empty() {
                     drop(lease);
                 } else {
-                    let paths = deletes.iter().chain(&recycles).cloned().collect();
-                    let cleanup = Arc::clone(&this);
-                    // Register under the same lock used by completion retirement;
-                    // even an immediately completed task cannot leave a stale item.
-                    let mut tasks = this.cleanup_tasks.lock().unwrap();
-                    let id = tasks.next_id;
-                    tasks.next_id += 1;
-                    let task = spawner.spawn(Box::pin(async move {
+                    let paths = (!watch_root).then(|| deletes.iter().chain(&recycles).cloned().collect());
+                    let cleanup = Arc::clone(this);
+                    let work = async move {
                         // Keep other requests off these sources until cleanup
                         // finishes. CleanupRefs has already released the last
                         // planned owner of each path in this request.
@@ -2409,9 +2417,22 @@ impl<'run, O: Observer> Run<'run, O> {
                             cleanup.cleanup_sources(&recycles, CleanupMode::Recycle, &mut failures, &mut shell);
                             cleanup.cleanup_sources(&deletes, CleanupMode::Delete, &mut failures, &mut shell);
                         }
-                        cleanup.cleanup_tasks.lock().unwrap().retire(id, failures)
-                    }));
-                    tasks.active.insert(id, PendingCleanup { paths, task });
+                        failures
+                    };
+                    if let Some(paths) = paths {
+                        // Register under the same lock used by retirement.
+                        let mut tasks = this.cleanup_tasks.lock().unwrap();
+                        let id = tasks.next_id;
+                        tasks.next_id += 1;
+                        let cleanup = Arc::clone(this);
+                        let task = spawner.spawn(Box::pin(async move {
+                            let failures = work.await;
+                            cleanup.cleanup_tasks.lock().unwrap().retire(id, failures)
+                        }));
+                        tasks.active.insert(id, PendingCleanup { paths, task });
+                    } else {
+                        root_cleanup = Some(spawner.spawn(Box::pin(work)));
+                    }
                 }
             } else {
                 outcome.promoted_sources.extend(admitted_promoted.into_iter().map(|(_, source)| source));
@@ -2485,6 +2506,13 @@ impl<'run, O: Observer> Run<'run, O> {
                 .cleanup_results
                 .append(&mut children.cleanup_results);
             outcome.uncommitted = !outputs_committed || children.uncommitted;
+            // Watch releases this root's admission claim after publication.
+            // Its source cleanup shares the task lease until it has finished.
+            if let Some(cleanup) = root_cleanup {
+                for failure in cleanup.wait().await {
+                    record_cleanup_failure(&mut outcome, failure);
+                }
+            }
             if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
                 outcome.archives = this
                     .observer
@@ -2815,14 +2843,14 @@ impl<'run, O: Observer> Run<'run, O> {
         (generations.len() == task.owned_paths.len()).then_some(generations)
     }
 
-    fn task_admission(
+    fn task_admission<'a>(
         &self,
         task: &Task,
         generations: &HashMap<String, PhysicalFileGeneration>,
         missing: &[PathBuf],
         discovered: bool,
         watch_root: bool,
-        requested: Option<&HashMap<String, PhysicalFileGeneration>>,
+        requested: impl Fn(&str) -> Option<&'a PhysicalFileGeneration>,
     ) -> io::Result<TaskAdmission> {
         // Check the resolved physical family only after its lease is acquired.
         // Departed discovery proposals are not successful output reuse.
@@ -2832,10 +2860,22 @@ impl<'run, O: Observer> Run<'run, O> {
         if watch_root && task.owned_paths.len() > 1 {
             // main retains the complete pre-wait generation when a prior owner
             // consumed members, but only while every surviving member is unchanged.
-            let version = if generations.len() == task.owned_paths.len() { Some(generations) }
-                else { requested.filter(|before| before.len() == task.owned_paths.len()
-                    && generations.iter().all(|(path, current)| before.get(path)
-                        .is_some_and(|previous| current.matches_input(&previous.persisted())))) };
+            let before_wait;
+            let version = if generations.len() == task.owned_paths.len() {
+                Some(generations)
+            } else if generations.iter().all(|(path, current)| requested(path)
+                .is_some_and(|previous| current.matches_input(&previous.persisted())))
+            {
+                // The whole request can share its pre-wait snapshot. The
+                // completed-output cache still addresses one task's family.
+                before_wait = task.owned_paths.iter().filter_map(|path| {
+                    let key = path_key(path);
+                    requested(&key).map(|generation| (key, generation.clone()))
+                }).collect::<SourceGenerations>();
+                (before_wait.len() == task.owned_paths.len()).then_some(&before_wait)
+            } else {
+                None
+            };
             if let Some(output) = version.map(|version| self.observer.completed_sources(version)).transpose()?.flatten() {
                 return Ok(TaskAdmission::Completed(output));
             }
@@ -4230,7 +4270,7 @@ struct Leases {
 struct LeaseState {
     active: HashMap<String, (Option<u64>, usize)>,
     requests: HashMap<u64, RequestClaim>,
-    watch: HashMap<Arc<str>, ActiveWatchFamily>,
+    watch: HashMap<Arc<str>, Vec<ActiveWatchFamily>>,
     next_waiter: u64,
     waiters: HashMap<u64, LeaseWaiter>,
     blocked_by: HashMap<LeaseBlocker, HashSet<u64>>,
@@ -4247,7 +4287,7 @@ type WatchSettlement = OnceLock<io::Result<()>>;
 
 struct ActiveWatchFamily {
     id: u64,
-    members: Arc<SourceGenerations>,
+    members: Arc<WatchGenerations>,
     request: Arc<Request>,
     settlement: Arc<WatchSettlement>,
 }
@@ -4286,7 +4326,10 @@ fn copy_io_error(error: &io::Error) -> io::Error {
 impl Drop for WatchFamilyOwner {
     fn drop(&mut self) {
         let mut state = self.leases.state.lock().unwrap();
-        let removed = state.watch.remove(&self.key);
+        let owners = state.watch.get_mut(&self.key).expect("registered Watch family");
+        let index = owners.iter().position(|owner| owner.id == self.id).expect("registered Watch owner");
+        let removed = owners.swap_remove(index);
+        if owners.is_empty() { state.watch.remove(&self.key); }
         crate::collections::trim_map(&mut state.watch);
         let wakes = state.released(&LeaseBlocker::Watch(self.id));
         drop(state);
@@ -4328,10 +4371,10 @@ impl LeaseState {
 
 struct RequestClaim {
     origin: Origin,
-    paths: HashMap<String, PathBuf>,
+    paths: HashMap<String, ClaimPath>,
     has_aliases: bool,
     directories: HashSet<String>,
-    objects: HashSet<(u64, [u8; 16])>,
+    objects: HashMap<(u64, [u8; 16]), usize>,
 }
 
 impl RequestClaim {
@@ -4341,7 +4384,7 @@ impl RequestClaim {
             paths: HashMap::new(),
             has_aliases: false,
             directories: HashSet::new(),
-            objects: HashSet::new(),
+            objects: HashMap::new(),
         }
     }
 
@@ -4350,11 +4393,20 @@ impl RequestClaim {
             self.directories
                 .insert(input.key.trim_end_matches('\\').to_owned());
         }
-        if let Some(identity) = input.object {
-            self.objects.insert(identity);
-        }
         self.has_aliases |= input.alias;
-        self.paths.entry(input.key).or_insert(input.path);
+        match self.paths.entry(input.key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if let Some(identity) = input.object {
+                    *self.objects.entry(identity).or_default() += 1;
+                }
+                entry.insert(ClaimPath { path: input.path, watch_aliases: Vec::new(), object: input.object });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if self.origin == Origin::Watch && entry.get().path != input.path {
+                    entry.get_mut().watch_aliases.push(input.path);
+                }
+            }
+        }
     }
 
     fn includes_directory(&self, path: &str) -> bool {
@@ -4374,7 +4426,7 @@ impl RequestClaim {
     }
 
     fn overlaps(&self, other: &Self) -> bool {
-        if !self.objects.is_disjoint(&other.objects) {
+        if self.objects.keys().any(|id| other.objects.contains_key(id)) {
             return true;
         }
         let (small, large) = if self.paths.len() <= other.paths.len() {
@@ -4393,13 +4445,19 @@ impl RequestClaim {
     }
 
     fn conflict(&self) -> BusyConflict {
-        let mut paths: Vec<_> = self.paths.values().cloned().collect();
+        let mut paths: Vec<_> = self.paths.values().map(|input| input.path.clone()).collect();
         paths.sort_unstable();
         BusyConflict {
             origin: self.origin,
             paths,
         }
     }
+}
+
+struct ClaimPath {
+    path: PathBuf,
+    watch_aliases: Vec<PathBuf>,
+    object: Option<(u64, [u8; 16])>,
 }
 
 struct ClaimedInput {
@@ -4447,6 +4505,47 @@ pub(crate) struct RequestClaimGuard {
     id: u64,
 }
 
+impl Engine {
+    pub(crate) fn retire_watch_inputs(&self, request: u64, paths: &HashSet<String>) {
+        let mut state = self.leases.state.lock().unwrap();
+        let Some(claim) = state.requests.get_mut(&request) else { return; };
+        if claim.origin != Origin::Watch || !claim.directories.is_empty() { return; }
+        let mut changed = false;
+        let (claimed, objects) = (&mut claim.paths, &mut claim.objects);
+        let mut retire_object = |identity| {
+            changed = true;
+            if let Some(identity) = identity {
+                let count = objects.get_mut(&identity).expect("claimed file identity");
+                *count -= 1;
+                if *count == 0 { objects.remove(&identity); }
+            }
+        };
+        if claim.has_aliases {
+            // Keep the canonical claim until each selected spelling retires.
+            claimed.retain(|_, input| {
+                input.watch_aliases.retain(|path| !paths.contains(&path_key(&path.to_string_lossy())));
+                if !paths.contains(&path_key(&input.path.to_string_lossy())) { return true; }
+                if let Some(alias) = input.watch_aliases.pop() {
+                    input.path = alias;
+                    true
+                } else {
+                    retire_object(input.object);
+                    false
+                }
+            });
+        } else {
+            for path in paths {
+                if let Some(input) = claimed.remove(path) { retire_object(input.object); }
+            }
+        }
+        if !changed { return; }
+        if claim.paths.is_empty() { state.requests.remove(&request); }
+        let waiters = state.released(&LeaseBlocker::Request(request));
+        drop(state);
+        for waiter in waiters { waiter.wake(); }
+    }
+}
+
 impl Drop for RequestClaimGuard {
     fn drop(&mut self) {
         let mut state = self.registry.state.lock().unwrap();
@@ -4465,13 +4564,20 @@ struct Lease {
 
 impl Leases {
     fn claim_watch(
-        self: &Arc<Self>, key: String, id: u64, members: &Arc<SourceGenerations>,
-        request: &Arc<Request>,
-    ) -> Option<WatchFamily> {
+        self: &Arc<Self>, id: u64, members: &Arc<WatchGenerations>, request: &Arc<Request>,
+    ) -> WatchFamily {
+        // The first ordered physical path is independent of the selection
+        // and task order. Compare the full generation union in its bucket.
+        let anchor = members.first_key_value().expect("resolved Watch family").0.as_str();
         let mut state = self.state.lock().unwrap();
-        if let Some((key, active)) = state.watch.get_key_value(key.as_str()) {
+        let key = state.watch.get_key_value(anchor).map_or_else(
+            || Arc::<str>::from(anchor), |(key, _)| Arc::clone(key));
+        let owners = state.watch.entry(Arc::clone(&key)).or_default();
+        let active = owners.iter().find(|active| {
             let owner = &active.request;
-            let same_policy = request.deep == owner.deep && request.max_depth == owner.max_depth
+            // A configuration change can alter output, cleanup or password
+            // candidates. Only share a result when it is valid for both runs.
+            request.deep == owner.deep && request.max_depth == owner.max_depth
                 && request.output_root == owner.output_root && request.password_scope == owner.password_scope
                 && request.direct == owner.direct && request.recursive == owner.recursive
                 && Arc::ptr_eq(&request.config, &owner.config)
@@ -4479,16 +4585,16 @@ impl Leases {
                     (Some(request), Some(owner)) => Arc::ptr_eq(request, owner),
                     (None, None) => true,
                     _ => false,
-                };
-            return (same_policy && members == &active.members && !owner.cancel.cancelled())
-                .then(|| WatchFamily::Follower(Arc::clone(key), active.id, Arc::clone(&active.settlement)));
+                } && members == &active.members && !owner.cancel.cancelled()
+        });
+        if let Some(active) = active {
+            return WatchFamily::Follower(key, active.id, Arc::clone(&active.settlement));
         }
-        let key: Arc<str> = Arc::from(key);
         let settlement = Arc::new(WatchSettlement::new());
-        state.watch.insert(Arc::clone(&key), ActiveWatchFamily {
+        owners.push(ActiveWatchFamily {
             id, members: Arc::clone(members), request: Arc::clone(request), settlement: Arc::clone(&settlement),
         });
-        Some(WatchFamily::Owner(WatchFamilyOwner { leases: Arc::clone(self), key, id, settlement }))
+        WatchFamily::Owner(WatchFamilyOwner { leases: Arc::clone(self), key, id, settlement })
     }
 
     async fn join_watch(
@@ -4499,7 +4605,7 @@ impl Leases {
         poll_fn(|cx| {
             if cancel.cancelled() { return Poll::Ready(Ok(())); }
             let mut state = self.state.lock().unwrap();
-            if !state.watch.get(key).is_some_and(|family| family.id == owner) {
+            if !state.watch.get(key).is_some_and(|owners| owners.iter().any(|active| active.id == owner)) {
                 return Poll::Ready(settlement.get().map_or_else(
                     || Err(io::Error::other("Watch extraction request failed")),
                     |result| result.as_ref().copied().map_err(copy_io_error),
@@ -5556,26 +5662,49 @@ mod tests {
         use std::future::Future;
         use std::task::Context;
 
-        let source = crate::test_support::temp_file("join_watch_family", b"generation");
-        let key = path_key(&source.to_string_lossy());
-        let members = Arc::new(HashMap::from([(key.clone(), capture_file_generation(&source).unwrap())]));
-        let leases = Arc::new(Leases::default());
-        let mut request = Request::new(vec![source.clone()], Mode::Extract);
+        let first = crate::test_support::temp_file("join_watch_first_head", b"first");
+        let second = crate::test_support::temp_file("join_watch_second_head", b"second");
+        let tail1 = crate::test_support::temp_file("join_watch_tail1", b"common tail 1");
+        let tail2 = crate::test_support::temp_file("join_watch_tail2", b"common tail 2");
+        let task = |path: &Path| Task {
+            primary: None,
+            owned_paths: [path, &tail1, &tail2].into_iter()
+                .map(|member| member.to_string_lossy().into_owned()).collect(),
+            inputs: vec![LogicalInput { password_probe: None, password: None,
+                input: ArchiveInput::file(path.to_string_lossy().into_owned(), "7z".into(), "split".into()),
+                failure: None }],
+            source: DiscoverySource::Relations, retry: None, scope: None,
+        };
+        let engine = Engine::new(PathBuf::from("unused-worker"));
+        let leases = &engine.leases;
+        let mut request = Request::new(vec![tail1.clone()], Mode::Extract);
         request.origin = Origin::Watch;
         let leader = Arc::new(request.clone());
-        let follower = Arc::new(Request { cancel: Cancellation::new(), ..request.clone() });
+        let follower = Arc::new(Request {
+            inputs: vec![tail2.clone()], cancel: Cancellation::new(), ..request.clone()
+        });
+        let notify = |_: Event| {};
+        let members = test_run(&engine, &leader, &notify).watch_generations(&Discovered {
+            tasks: vec![task(&first), task(&second)], ..Discovered::default()
+        }).expect("two logical roots can share one physical generation union");
+        let follower_members = test_run(&engine, &follower, &notify).watch_generations(&Discovered {
+            tasks: vec![task(&second), task(&first)], ..Discovered::default()
+        }).unwrap();
+        assert_eq!(members.len(), 4);
         let mut cx = Context::from_waker(Waker::noop());
 
-        let Some(WatchFamily::Owner(owner)) = leases.claim_watch(key.clone(), 1, &members, &leader) else {
+        let WatchFamily::Owner(owner) = leases.claim_watch(1, &members, &leader) else {
             panic!("first request owns extraction");
         };
         let different_policy = Arc::new(Request { deep: true, ..request });
-        assert!(leases.claim_watch(key.clone(), 2, &members, &different_policy).is_none());
-        let Some(WatchFamily::Follower(family, id, settlement)) = leases.claim_watch(key.clone(), 3, &members, &follower) else {
+        let WatchFamily::Owner(other) = leases.claim_watch(2, &members, &different_policy) else {
+            panic!("different policy must execute independently");
+        };
+        let WatchFamily::Follower(key, id, settlement) = leases.claim_watch(3, &follower_members, &follower) else {
             panic!("equivalent request must join the active owner");
         };
         assert_eq!(id, 1);
-        let mut wait = Box::pin(leases.join_watch(&family, id, &settlement, &follower.cancel));
+        let mut wait = Box::pin(leases.join_watch(&key, id, &settlement, &follower.cancel));
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         follower.cancel.cancel();
         assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
@@ -5583,11 +5712,11 @@ mod tests {
         assert!(!leader.cancel.cancelled());
 
         let uncancelled = Cancellation::new();
-        let mut wait = Box::pin(leases.join_watch(&family, id, &settlement, &uncancelled));
+        let mut wait = Box::pin(leases.join_watch(&key, id, &settlement, &uncancelled));
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         owner.finish(&Err(io::Error::other("write failed")), &leader.cancel);
         // A replacement owner can register before existing followers wake.
-        let Some(WatchFamily::Owner(owner)) = leases.claim_watch(key, 4, &members, &leader) else {
+        let WatchFamily::Owner(owner) = leases.claim_watch(4, &members, &leader) else {
             panic!("failed owner must retire");
         };
         let Poll::Ready(Err(error)) = wait.as_mut().poll(&mut cx) else {
@@ -5596,9 +5725,11 @@ mod tests {
         assert_eq!(error.to_string(), "write failed");
         drop(wait);
         drop(owner);
+        drop(other);
         let state = leases.state.lock().unwrap();
         assert!(state.watch.is_empty() && state.waiters.is_empty() && state.blocked_by.is_empty());
-        fs::remove_file(source).unwrap();
+        drop(state);
+        for source in [first, second, tail1, tail2] { fs::remove_file(source).unwrap(); }
     }
 
     #[test]
@@ -5645,22 +5776,22 @@ mod tests {
         let (generations, missing) = run.capture_generations(&task);
         // Foreground/nested tasks and incomplete observations do not consume
         // the Watch-only completed family fact.
-        assert!(matches!(run.task_admission(&task, &generations, &[], true, false, None).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&task, &generations, &[], true, false, |_| None).unwrap(), TaskAdmission::Execute));
         let mut partial = generations.clone();
         partial.remove(&path_key(&tail.to_string_lossy()));
-        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, None).unwrap(), TaskAdmission::Execute));
-        assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true, None).unwrap(), TaskAdmission::Departed));
+        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |_| None).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true, |_| None).unwrap(), TaskAdmission::Departed));
         let single = Task { primary: None, owned_paths: vec![head.to_string_lossy().into_owned()],
             inputs: vec![LogicalInput { password_probe: None, input: task.entry().clone(), password: None, failure: None }],
             source: DiscoverySource::Relations, retry: None, scope: None };
-        assert!(matches!(run.task_admission(&single, &partial, &[], true, true, None).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&single, &partial, &[], true, true, |_| None).unwrap(), TaskAdmission::Execute));
         assert_eq!(observer.queries.load(Ordering::SeqCst), 0);
-        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, Some(&generations)).unwrap(),
+        assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(),
             TaskAdmission::Completed(ref path) if path == &output));
         assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, true,
-            Some(&generations)).unwrap(), TaskAdmission::Departed));
+            |path| generations.get(path)).unwrap(), TaskAdmission::Departed));
         let changed = HashMap::from([(path_key(&head.to_string_lossy()), generations[&path_key(&tail.to_string_lossy())].clone())]);
-        assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, true, Some(&generations)).unwrap(), TaskAdmission::Execute));
+        assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, true, |path| generations.get(path)).unwrap(), TaskAdmission::Execute));
         assert_eq!(observer.queries.swap(0, Ordering::SeqCst), 1);
         assert!(missing.is_empty());
         let outcome = Scheduler::new().run(1, Origin::Watch, &request.cancel, |spawner| {
@@ -5798,7 +5929,7 @@ mod tests {
             assert_eq!(absent, vec![missing.clone()]);
             assert_eq!(generations.len(), 1);
             assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
-            assert!(matches!(run.task_admission(&task, &generations, &absent, true, false, None).unwrap(), TaskAdmission::Execute));
+            assert!(matches!(run.task_admission(&task, &generations, &absent, true, false, |_| None).unwrap(), TaskAdmission::Execute));
             run.admit_missing_inputs(&mut task, &absent, false);
             assert!(task.inputs[0].failure.is_none());
             task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
@@ -6037,13 +6168,13 @@ mod tests {
                         retry: None,
                         scope: None,
                     };
-                    assert!(matches!(run.task_admission(&direct, &HashMap::new(), &[path.clone()], false, false, None).unwrap(), TaskAdmission::Execute));
+                    assert!(matches!(run.task_admission(&direct, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute));
                     // A replacement can be classified Relations while retaining
                     // the original Direct task's no-silent-skip boundary.
                     let mut replacement = direct;
                     replacement.source = DiscoverySource::Relations;
-                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], false, false, None).unwrap(), TaskAdmission::Execute));
-                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], true, false, None).unwrap(), TaskAdmission::Departed));
+                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], false, false, |_| None).unwrap(), TaskAdmission::Execute));
+                    assert!(matches!(run.task_admission(&replacement, &HashMap::new(), &[path.clone()], true, false, |_| None).unwrap(), TaskAdmission::Departed));
                 }
             }
         }
@@ -8007,7 +8138,7 @@ mod tests {
         struct Roots(std::sync::atomic::AtomicUsize);
         impl Observer for Roots {
             fn notify(&self, _: Event) {}
-            async fn root_finished(&self, _: TaskId, _: &Path, _: PublicOutcome) -> io::Result<PublicOutcome> {
+            async fn root_finished(&self, _: TaskId, _: &Path, _: PublicOutcome, _: u64) -> io::Result<PublicOutcome> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(PublicOutcome::default())
             }
@@ -8252,7 +8383,7 @@ mod tests {
         struct DetailedPublication(std::sync::atomic::AtomicBool);
         impl Observer for DetailedPublication {
             fn notify(&self, _: Event) {}
-            async fn root_finished(&self, _: TaskId, _: &Path, outcome: PublicOutcome) -> io::Result<PublicOutcome> {
+            async fn root_finished(&self, _: TaskId, _: &Path, outcome: PublicOutcome, _: u64) -> io::Result<PublicOutcome> {
                 assert_eq!(outcome.archives.len(), 3);
                 assert_eq!(outcome.checkpoints.len(), 3);
                 assert!(outcome.archives.iter().all(|entry| !entry.source_paths.is_empty() && entry.password.is_some()));

@@ -365,15 +365,33 @@ pub(super) fn discover(
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let table = directory_table(
-            &filtered,
-            &raw,
-            Some(FileTargets::new(targets)),
-            candidates,
-            &mut verified,
-            request,
-        )?;
-        tables.push(table);
+        let mut table = NativeCandidateTable::new();
+        table.append_directory(&raw, &filtered, Some(FileTargets::new(targets)))?;
+        match probe_relations(&mut table, &filtered, &raw, candidates, &mut verified, request) {
+            Ok(()) => tables.push(table),
+            Err(error) if request.watch_catalog.is_some() && !crate::io::cancellation::is_cancellation(&error) => {
+                // Main evaluates each Watch selection independently. On a
+                // real probe error, reuse the bucket snapshot to preserve
+                // those exact target/alias boundaries. Healthy buckets never
+                // rebuild a table or repeat password verification.
+                let targets = table.take_file_targets();
+                if let Some(path) = targets.only_path() {
+                    result.errors.push(watch_discovery_error(path.into(), error));
+                    continue;
+                }
+                let mut successful = NativeCandidateTable::new();
+                for (path, target) in targets.into_singles() {
+                    request.cancel.check_io()?;
+                    match directory_table(&filtered, &raw, Some(target), candidates, &mut verified, request) {
+                        Ok(mut single) => successful.extend(&mut single),
+                        Err(error) if crate::io::cancellation::is_cancellation(&error) => return Err(error),
+                        Err(error) => result.errors.push(watch_discovery_error(path.into(), error)),
+                    }
+                }
+                tables.push(successful);
+            }
+            Err(error) => return Err(error),
+        }
         retry_scopes.push(Arc::new(RetryScope {
             scope: Arc::new(scope),
             snapshot: raw,
@@ -651,6 +669,13 @@ pub(super) fn retry_volume(
     Ok(None)
 }
 
+fn watch_discovery_error(path: PathBuf, error: io::Error) -> InputError {
+    InputError {
+        path, message: error.to_string(), kind: InputErrorKind::WatchDiscoveryIo,
+        failure: None, scan_operation: None, scan_count: None,
+    }
+}
+
 fn directory_table(
     filtered: &NativeDirectorySnapshot,
     raw: &NativeDirectorySnapshot,
@@ -661,6 +686,18 @@ fn directory_table(
 ) -> io::Result<NativeCandidateTable> {
     let mut table = NativeCandidateTable::new();
     table.append_directory(raw, filtered, targets)?;
+    probe_relations(&mut table, filtered, raw, candidates, verified, request)?;
+    Ok(table)
+}
+
+fn probe_relations(
+    table: &mut NativeCandidateTable,
+    filtered: &NativeDirectorySnapshot,
+    raw: &NativeDirectorySnapshot,
+    candidates: &CandidateSet,
+    verified: &mut VerifiedPasswords,
+    request: &Request,
+) -> io::Result<()> {
     let mut passwords = Vec::new();
     let mut refresh = Vec::new();
     let mut failures = Vec::new();
@@ -718,7 +755,7 @@ fn directory_table(
         table.retry_relations(raw, filtered, passwords, Some(refresh))?;
     }
     table.record_relation_failures(failures);
-    Ok(table)
+    Ok(())
 }
 
 #[cfg(test)]

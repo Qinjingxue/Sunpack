@@ -91,6 +91,17 @@ impl FileTargets {
         }
     }
 
+    pub(crate) fn only_path(&self) -> Option<&str> {
+        (self.names_by_path.len() == 1).then(|| self.names_by_path.keys().next().unwrap().as_str())
+    }
+
+    pub(crate) fn into_singles(self) -> impl Iterator<Item = (String, Self)> {
+        self.names_by_path.into_iter().map(|(path, name)| {
+            let target = Self { names_by_path: HashMap::from([(path.clone(), name)]) };
+            (path, target)
+        })
+    }
+
     fn select(&self, snapshot: &NativeDirectorySnapshot) -> Option<NativeDirectorySnapshot> {
         let mut exact = 0;
         let rows: Vec<_> = snapshot
@@ -887,6 +898,10 @@ impl NativeCandidateTable {
             }
         }
         output
+    }
+
+    pub(crate) fn take_file_targets(&mut self) -> FileTargets {
+        self.targets.take().expect("file discovery table must have targets")
     }
 
     pub(crate) fn record_relation_failures(&mut self, failures: Vec<(String, String)>) {
