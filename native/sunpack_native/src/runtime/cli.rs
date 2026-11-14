@@ -1305,7 +1305,7 @@ impl Progress {
             .update(self.session.as_ref(), self.language, event, prompting);
     }
 
-    fn finish_scope(&self, id: TaskId, archives: &[ArchiveResult]) -> io::Result<()> {
+    fn finish_scope<'a>(&self, id: TaskId, archives: impl IntoIterator<Item = &'a ArchiveResult>) -> io::Result<()> {
         let mut display = self.display.lock().unwrap();
         if self.cancel.cancelled() {
             return Ok(());
@@ -1314,12 +1314,13 @@ impl Progress {
         self.apply_events(&mut display, false);
         let prompting = display.prompting;
         let Some(panel) = &mut display.panel else { return Ok(()); };
-        if archives.is_empty() {
+        let mut archives = archives.into_iter().peekable();
+        if archives.peek().is_none() {
             panel.remove(id);
         } else {
             // A directory kept for manual recovery is still a failed input.
             // Only accepted root inputs authorize the summary output.
-            let accepted = archives.iter().take_while(|archive| archive.depth == 1)
+            let accepted = archives.take_while(|archive| archive.depth == 1)
                 .any(|archive| archive.failure.is_none() || archive.partial);
             if prompting {
                 display.deferred_scopes.push((id, accepted));
@@ -1375,16 +1376,16 @@ impl Observer for Progress {
         }
     }
 
-    async fn scope_finished(
+    async fn scope_finished<'a>(
         &self,
         id: TaskId,
-        archives: Vec<ArchiveResult>,
-    ) -> io::Result<Vec<ArchiveResult>> {
+        archives: impl Iterator<Item = &'a ArchiveResult> + Send,
+    ) -> io::Result<()> {
         if self.visible {
-            crate::pipeline::stage("report", &Cancellation::new()).await?;
-            self.finish_scope(id, &archives)?;
+            crate::pipeline::stage("report", &Cancellation::default()).await?;
+            self.finish_scope(id, archives)?;
         }
-        Ok(archives)
+        Ok(())
     }
 
     async fn allow_recursive_async(&self, depth: usize, pending: usize) -> bool {

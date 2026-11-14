@@ -133,7 +133,16 @@ pub(crate) struct WorkerFrame {
     pub(crate) manifest: Option<NativeWorkerManifest>,
     pub(crate) recovery: Option<RecoveryPreview>,
     chunk: Option<ChunkData>,
-    manifest_inventory: Option<[u64; 5]>,
+    manifest_summary: Option<ManifestSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestSummary {
+    complete: bool,
+    file_count: usize,
+    total_size: u64,
+    chunk_count: usize,
 }
 
 impl WorkerFrame {
@@ -143,7 +152,7 @@ impl WorkerFrame {
             manifest: None,
             recovery: None,
             chunk: None,
-            manifest_inventory: None,
+            manifest_summary: None,
         }
     }
 }
@@ -161,20 +170,21 @@ impl<'de> Deserialize<'de> for WorkerFrame {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<WorkerFrame, A::Error> {
                 let mut fields = Map::new();
                 let mut chunk = None;
-                let mut manifest_inventory = None;
+                let mut manifest_summary = None;
                 while let Some(key) = map.next_key::<&str>()? {
                     let decoded = match key {
                         "rows" => ChunkData::Manifest(map.next_value::<WorkerRows>()?.0),
                         "items" => ChunkData::Trace(map.next_value()?),
                         "verified_manifest" => {
-                            let section = map.next_value_seed(SummarySection::Manifest)?;
-                            manifest_inventory = section.inventory;
-                            fields.insert(key.to_owned(), Value::Object(section.fields));
+                            if manifest_summary.is_some() {
+                                return Err(de::Error::duplicate_field("verified_manifest"));
+                            }
+                            manifest_summary = Some(map.next_value()?);
                             continue;
                         }
                         "diagnostics" => {
                             let section = map.next_value_seed(SummarySection::Diagnostics)?;
-                            fields.insert(key.to_owned(), Value::Object(section.fields));
+                            fields.insert(key.to_owned(), Value::Object(section));
                             continue;
                         }
                         _ => {
@@ -189,7 +199,7 @@ impl<'de> Deserialize<'de> for WorkerFrame {
 
                 let mut frame = WorkerFrame::envelope(Value::Object(fields));
                 frame.chunk = chunk;
-                frame.manifest_inventory = manifest_inventory;
+                frame.manifest_summary = manifest_summary;
                 Ok(frame)
             }
         }
@@ -200,61 +210,42 @@ impl<'de> Deserialize<'de> for WorkerFrame {
 
 #[derive(Clone, Copy)]
 enum SummarySection {
-    Manifest,
     Diagnostics,
     Trace,
 }
 
-struct Summary {
-    fields: Map<String, Value>,
-    inventory: Option<[u64; 5]>,
-}
-
 impl<'de> DeserializeSeed<'de> for SummarySection {
-    type Value = Summary;
+    type Value = Map<String, Value>;
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Summary, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         deserializer.deserialize_map(self)
     }
 }
 
 impl<'de> Visitor<'de> for SummarySection {
-    type Value = Summary;
+    type Value = Map<String, Value>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("worker result summary")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Summary, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut fields = Map::new();
-        let mut inventory = None;
         while let Some(key) = map.next_key::<&str>()? {
             let value = match (self, key) {
-                (Self::Manifest, "rows") | (Self::Trace, "items") => {
+                (Self::Trace, "items") => {
                     return Err(de::Error::custom(
                         "worker result details must arrive in chunks",
                     ));
                 }
-                (Self::Manifest, "inventory") => {
-                    let columns = map.next_value::<[u64; 5]>()?;
-                    let [complete, files, dirs, size, identity_paths] = columns;
-                    inventory = Some(columns);
-                    json!({
-                        "complete": complete != 0,
-                        "file_count": files,
-                        "dir_count": dirs,
-                        "total_size": size,
-                        "identity_paths": identity_paths != 0,
-                    })
-                }
                 (Self::Diagnostics, "output_trace") => {
-                    Value::Object(map.next_value_seed(Self::Trace)?.fields)
+                    Value::Object(map.next_value_seed(Self::Trace)?)
                 }
                 _ => map.next_value::<Value>()?,
             };
             fields.insert(key.to_owned(), value);
         }
-        Ok(Summary { fields, inventory })
+        Ok(fields)
     }
 }
 
@@ -352,24 +343,19 @@ impl NativeWorkerResultAccumulator {
             return Ok(None);
         }
 
-        let manifest = payload.get("verified_manifest");
         let trace = payload
             .get("diagnostics")
             .and_then(|d| d.get("output_trace"));
-        check_chunk_summary(manifest, self.manifest_seq, self.files.len(), "file_count")?;
         check_chunk_summary(trace, self.trace_seq, self.trace.items, "item_count")?;
-        if let Some(manifest) = payload
-            .get_mut("verified_manifest")
-            .and_then(Value::as_object_mut)
-        {
-            let columns = frame
-                .manifest_inventory
-                .ok_or_else(|| protocol_error("manifest inventory missing"))?;
-            frame.manifest = Some(NativeWorkerManifest::from_parts(
-                std::mem::take(&mut self.files),
-                columns,
-            )?);
-            manifest.remove("chunk_count");
+        match frame.manifest_summary.take() {
+            Some(summary) if summary.chunk_count == self.manifest_seq
+                && summary.file_count == self.files.len() => {
+                frame.manifest = Some(NativeWorkerManifest::from_parts(
+                    std::mem::take(&mut self.files), summary.complete, summary.total_size,
+                ));
+            }
+            None if self.manifest_seq == 0 => {}
+            _ => return Err(protocol_error("worker manifest chunk summary count mismatch")),
         }
         if let Some(trace) = payload
             .get_mut("diagnostics")
@@ -420,25 +406,10 @@ fn check_chunk_summary(
     }
 }
 
-/// One fixed 14-column array per regular file in the worker manifest.
+/// One output path, size, status, optional mtime, and magic prefix per file.
 struct WorkerRows(Vec<OutputFileRecord>);
 
-type WorkerRow<'a> = (
-    u32,
-    &'a str,
-    &'a str,
-    u64,
-    u64,
-    u8,
-    u32,
-    u8,
-    u32,
-    u8,
-    u8,
-    u8,
-    u64,
-    MagicBytes,
-);
+type WorkerRow<'a> = (&'a str, u64, u8, Option<u64>, MagicBytes);
 
 impl<'de> Deserialize<'de> for WorkerRows {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -453,33 +424,14 @@ impl<'de> Deserialize<'de> for WorkerRows {
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<WorkerRows, A::Error> {
                 let mut files = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(row) = seq.next_element::<WorkerRow<'de>>()? {
-                    let (
-                        _,
-                        path,
-                        output_path,
-                        size,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        status,
-                        has_mtime,
-                        mtime_ns,
-                        magic,
-                    ) = row;
+                while let Some((path, size, status, mtime_ns, magic)) =
+                    seq.next_element::<WorkerRow<'de>>()?
+                {
                     files.push(OutputFileRecord {
-                        path: if output_path.is_empty() {
-                            path
-                        } else {
-                            output_path
-                        }
-                        .to_owned(),
+                        path: path.to_owned(),
                         size,
                         status,
-                        mtime_ns: (has_mtime != 0).then_some(mtime_ns),
+                        mtime_ns,
                         magic: magic.0,
                     });
                 }
@@ -517,7 +469,7 @@ mod tests {
         let sentinel = "__binary_magic__";
         let mut bytes = encode_worker_frame(&json!({
             "type": "manifest_chunk", "job_id": job, "seq": 0,
-            "rows": [[0, job, format!("{job}-renamed.txt"), 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, sentinel]],
+            "rows": [[format!("{job}-renamed.txt"), 3, 1, 123, sentinel]],
         }))
         .unwrap();
         let body = bytes
@@ -538,7 +490,7 @@ mod tests {
             &encode_worker_frame(&json!({
                 "type": "result", "job_id": job,
                 "verified_manifest": {
-                    "file_count": files, "inventory": [1, files, 0, 3, 0],
+                    "file_count": files, "complete": true, "total_size": 3,
                     "chunk_count": 1,
                 },
             }))

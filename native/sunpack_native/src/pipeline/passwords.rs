@@ -169,11 +169,15 @@ impl AttemptCache {
 
 #[derive(Clone)]
 pub(super) struct CandidateSet {
+    sources: Arc<CandidateSources>,
+    inherited_scope: Option<Arc<Path>>,
+}
+
+struct CandidateSources {
     explicit: Arc<[Arc<str>]>,
     snapshot: Arc<PasswordSnapshot>,
-    explicit_signature: Arc<OnceLock<String>>,
+    explicit_signature: OnceLock<String>,
     cache: AttemptCache,
-    inherited_scope: Option<Arc<Path>>,
 }
 
 impl CandidateSet {
@@ -184,20 +188,19 @@ impl CandidateSet {
         inherited_scope: Option<&Path>,
     ) -> Self {
         Self {
-            explicit,
-            snapshot: snapshot.unwrap_or_default(),
-            explicit_signature: Arc::new(OnceLock::new()),
-            cache: cache.clone(),
+            sources: Arc::new(CandidateSources {
+                explicit,
+                snapshot: snapshot.unwrap_or_default(),
+                explicit_signature: OnceLock::new(),
+                cache: cache.clone(),
+            }),
             inherited_scope: inherited_scope.map(Arc::from),
         }
     }
 
     pub(super) fn with_scope(&self, scope: Option<&Path>) -> CandidateSet {
         CandidateSet {
-            explicit: Arc::clone(&self.explicit),
-            snapshot: self.snapshot.clone(),
-            explicit_signature: self.explicit_signature.clone(),
-            cache: self.cache.clone(),
+            sources: Arc::clone(&self.sources),
             inherited_scope: self.inherited_scope.clone().or_else(|| scope.map(Arc::from)),
         }
     }
@@ -207,10 +210,10 @@ impl CandidateSet {
         // once per request and share it with nested scopes; builtin snapshots
         // already cache each bucket, so rechecking N failures never rehashes P
         // password strings for every entry.
-        let explicit = self.explicit_signature.get_or_init(|| {
+        let explicit = self.sources.explicit_signature.get_or_init(|| {
             let mut hash = crate::fast_hash_core::Hash128::new();
-            hash.update(&(self.explicit.len() as u64).to_le_bytes());
-            for password in self.explicit.iter() {
+            hash.update(&(self.sources.explicit.len() as u64).to_le_bytes());
+            for password in self.sources.explicit.iter() {
                 hash.update(&(password.len() as u64).to_le_bytes());
                 hash.update(password.as_bytes());
             }
@@ -218,7 +221,7 @@ impl CandidateSet {
         });
         let mut hash = crate::fast_hash_core::Hash128::new();
         hash.update(explicit.as_bytes());
-        hash.update(self.snapshot.scope_signature(self.scope(path)).as_bytes());
+        hash.update(self.sources.snapshot.scope_signature(self.scope(path)).as_bytes());
         hash.hexdigest()
     }
 
@@ -228,13 +231,13 @@ impl CandidateSet {
     }
 
     fn configured<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
-        self.snapshot.scoped(self.scope(path)).flatten()
-            .chain(self.explicit.iter())
-            .chain(self.snapshot.global().iter())
+        self.sources.snapshot.scoped(self.scope(path)).flatten()
+            .chain(self.sources.explicit.iter())
+            .chain(self.sources.snapshot.global().iter())
     }
 
     fn for_path<'b>(&'b self, path: &'b str) -> impl Iterator<Item = &'b Arc<str>> + 'b {
-        let recent = self.cache.recent();
+        let recent = self.sources.cache.recent();
         let mut eligible = HashMap::with_capacity(recent.len());
         if !recent.is_empty() {
             let wanted: HashSet<&str> = recent.iter().map(Arc::as_ref).collect();
@@ -266,7 +269,7 @@ impl CandidateSet {
     }
 
     pub(super) fn remember_verified(&self, password: Arc<str>) {
-        self.cache.remember_recent(password);
+        self.sources.cache.remember_recent(password);
     }
 
     pub(super) fn plan(
@@ -275,8 +278,9 @@ impl CandidateSet {
         known: Option<Arc<str>>,
         cancellation: &Cancellation,
     ) -> io::Result<Result<PasswordPlan, Failure>> {
+        let cache = &self.sources.cache;
         if let Some(password) = known {
-            self.cache.remember_recent(password.clone());
+            cache.remember_recent(password.clone());
             return Ok(Ok(PasswordPlan::verified(password)));
         }
         if matches!(
@@ -303,7 +307,7 @@ impl CandidateSet {
             Vec::new()
         };
         let key = Key::for_input(input, &sessions);
-        if let Some(proof) = key.as_ref().and_then(|key| self.cache.proof(key)) {
+        if let Some(proof) = key.as_ref().and_then(|key| cache.proof(key)) {
             match proof {
                 None => return Ok(Ok(PasswordPlan::clear())),
                 Some(password)
@@ -312,7 +316,7 @@ impl CandidateSet {
                             .configured(&input.entry_path)
                             .any(|candidate| candidate == &password) =>
                 {
-                    self.cache.remember_recent(password.clone());
+                    cache.remember_recent(password.clone());
                     return Ok(Ok(PasswordPlan::verified(password)));
                 }
                 _ => {}
@@ -332,7 +336,7 @@ impl CandidateSet {
         if !needs_password {
             batch.push(Arc::from(""));
             if let Some(key) = key.as_ref() {
-                password_rejected |= self.cache.remove_rejected(key, &mut batch);
+                password_rejected |= cache.remove_rejected(key, &mut batch);
             }
         }
         loop {
@@ -340,7 +344,7 @@ impl CandidateSet {
             // Fill after skipping cached negatives; sparse survivors must still
             // reach the native parallel paths.
             if let Some(key) = key.as_ref() {
-                self.cache.fill_available(key, &mut batch, &mut candidates, cancellation)?;
+                cache.fill_available(key, &mut batch, &mut candidates, cancellation)?;
             } else {
                 batch.extend(candidates.by_ref().take(BATCH_SIZE - batch.len()).cloned());
             }
@@ -363,7 +367,7 @@ impl CandidateSet {
             match result.status {
                 "not_required" => {
                     if let Some(key) = key.as_ref() {
-                        self.cache.remember_proof(key.clone(), None);
+                        cache.remember_proof(key.clone(), None);
                     }
                     return Ok(Ok(PasswordPlan::clear()));
                 }
@@ -376,9 +380,9 @@ impl CandidateSet {
                     };
                     if !result.final_confirmation_required.unwrap_or(true) {
                         let password = Arc::clone(&batch[index]);
-                        self.cache.remember_recent(password.clone());
+                        cache.remember_recent(password.clone());
                         if let Some(key) = key.as_ref() {
-                            self.cache.remember_proof(key.clone(), Some(password.clone()));
+                            cache.remember_proof(key.clone(), Some(password.clone()));
                         }
                         return Ok(Ok(PasswordPlan::verified(password)));
                     }
@@ -395,7 +399,7 @@ impl CandidateSet {
                         }
                     }
                     if let Some(key) = key.as_ref().filter(|_| !rejected.is_empty()) {
-                        self.cache.reject(key.clone(), &rejected);
+                        cache.reject(key.clone(), &rejected);
                     }
                     evidence = match (evidence, result.match_evidence) {
                         (None, next) => next,
@@ -406,7 +410,7 @@ impl CandidateSet {
                 "no_match" => {
                     password_rejected |= result.attempts != 0;
                     if let Some(key) = key.as_ref().filter(|_| result.attempts != 0) {
-                        self.cache
+                        cache
                             .reject(key.clone(), &batch[..result.attempts.min(batch.len())]);
                     }
                     pending.extend(batch.iter().skip(result.attempts).cloned());
@@ -455,10 +459,9 @@ impl CandidateSet {
             evidence = Some("empty_password_direct");
         }
         let plan = PasswordPlan {
-            selected: Some(pending[0].clone()),
+            verified_password: None,
             candidates: pending,
             encrypted: needs_password.then_some(true),
-            verified: false,
             evidence,
             cache_key: key,
         };
@@ -489,22 +492,19 @@ fn open_sessions(input: &ArchiveInput) -> io::Result<Vec<NativeArchiveSession>> 
 }
 
 pub(super) struct PasswordPlan {
-    pub selected: Option<Arc<str>>,
+    pub verified_password: Option<Arc<str>>,
     pub candidates: Vec<Arc<str>>,
     pub encrypted: Option<bool>,
-    pub verified: bool,
     pub evidence: Option<&'static str>,
     cache_key: Option<Key>,
 }
 
 impl PasswordPlan {
     fn empty_fallback() -> Self {
-        let empty = Arc::from("");
         Self {
-            selected: Some(Arc::clone(&empty)),
-            candidates: vec![empty],
+            verified_password: None,
+            candidates: vec![Arc::from("")],
             encrypted: None,
-            verified: false,
             evidence: Some("empty_password_direct"),
             cache_key: None,
         }
@@ -512,10 +512,9 @@ impl PasswordPlan {
 
     fn clear() -> Self {
         Self {
-            selected: None,
+            verified_password: None,
             candidates: Vec::new(),
             encrypted: Some(false),
-            verified: false,
             evidence: None,
             cache_key: None,
         }
@@ -523,10 +522,9 @@ impl PasswordPlan {
 
     fn verified(password: Arc<str>) -> Self {
         Self {
-            selected: Some(password),
+            verified_password: Some(password),
             candidates: Vec::new(),
             encrypted: Some(true),
-            verified: true,
             evidence: None,
             cache_key: None,
         }
@@ -539,7 +537,9 @@ impl PasswordPlan {
     ) -> Option<&str> {
         let password = match index {
             Some(index) => self.candidates.get(index)?,
-            None if self.candidates.len() <= 1 => self.selected.as_ref()?,
+            None if self.candidates.len() <= 1 => {
+                self.verified_password.as_ref().or_else(|| self.candidates.first())?
+            }
             None => return None,
         };
         cache.remember_recent(Arc::clone(password));
@@ -619,8 +619,8 @@ mod tests {
                 assert_eq!(batches[0].iter().map(AsRef::as_ref).collect::<Vec<&str>>(), ["", "wrong1", "wrong2", tail]);
             });
             if tail == "correct" {
-                let plan = plan.unwrap(); assert!(plan.verified);
-                assert_eq!(plan.selected.as_deref(), Some("correct"));
+                let plan = plan.unwrap();
+                assert_eq!(plan.verified_password.as_deref(), Some("correct"));
             } else { assert!(matches!(plan, Err(Failure { kind: FailureKind::WrongPassword, .. }))); }
         }
         std::fs::remove_file(source).unwrap();
@@ -635,8 +635,7 @@ mod tests {
         let cache = AttemptCache::default();
         let candidates = CandidateSet::new(Arc::from([Arc::from("fixture-secret")]), None, &cache, None);
         let plan = candidates.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-        assert!(plan.verified);
-        assert_eq!(plan.selected.as_deref(), Some("fixture-secret"));
+        assert_eq!(plan.verified_password.as_deref(), Some("fixture-secret"));
         assert!(plan.candidates.is_empty(), "must not use the all-rejected candidate fallback");
         std::fs::remove_file(source).unwrap();
     }
@@ -733,13 +732,13 @@ mod tests {
         // Successful planning/display does not compute receipt fingerprints.
         assert_eq!(candidates.for_embedded(r"C:\root\input.zip"),
             [Arc::<str>::from(""), Arc::from("first"), Arc::from("second")]);
-        assert!(candidates.explicit_signature.get().is_none());
-        assert!(Arc::ptr_eq(&candidates.explicit_signature, &inherited.explicit_signature));
+        assert!(candidates.sources.explicit_signature.get().is_none());
+        assert!(Arc::ptr_eq(&candidates.sources, &inherited.sources));
         let signature = candidates.signature(r"C:\root\input.zip");
-        let digest = candidates.explicit_signature.get().unwrap().as_ptr();
+        let digest = candidates.sources.explicit_signature.get().unwrap().as_ptr();
         for index in 0..256 {
             assert_eq!(inherited.signature(&format!(r"C:\nested\{index}.zip")), signature);
-            assert_eq!(inherited.explicit_signature.get().unwrap().as_ptr(), digest);
+            assert_eq!(inherited.sources.explicit_signature.get().unwrap().as_ptr(), digest);
         }
         let reordered = CandidateSet::new(
             Arc::from([Arc::from(""), Arc::from("second"), Arc::from("first")]), None, &cache, None);
@@ -808,10 +807,9 @@ mod tests {
             .plan(&input, None, &Cancellation::new())
             .unwrap()
             .unwrap();
-        assert_eq!(plan.selected.as_deref(), Some("confirm-in-worker"));
-        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates, [Arc::<str>::from("confirm-in-worker")]);
         assert_eq!(plan.encrypted, Some(true));
-        assert!(!plan.verified);
+        assert!(plan.verified_password.is_none());
 
         drop(sessions);
         let _ = std::fs::remove_file(path);
@@ -824,7 +822,6 @@ mod tests {
         let cache = AttemptCache::default();
         let empty = CandidateSet::new(Arc::from([Arc::from("")]), None, &cache, None);
         let plan = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-        assert_eq!(plan.selected.as_deref(), Some(""));
         assert_eq!(plan.candidates, [Arc::<str>::from("")]);
         let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
         assert_eq!(absent.plan(&input, None, &Cancellation::new()).unwrap()
@@ -833,15 +830,13 @@ mod tests {
         cache.reject(Key::for_input(&input, &sessions).unwrap(), &[Arc::from("wrong")]);
         let mixed = CandidateSet::new(Arc::from([Arc::from("wrong"), Arc::from("")]), None, &cache, None);
         let plan = mixed.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-        assert_eq!(plan.selected.as_deref(), Some(""));
-        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates, [Arc::<str>::from("")]);
         let key = Key::for_input(&input, &sessions).unwrap();
         cache.remember_proof(key, Some(Arc::from("")));
         let cached = empty.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-        assert!(cached.verified);
-        assert_eq!(cached.selected.as_deref(), Some(""));
+        assert_eq!(cached.verified_password.as_deref(), Some(""));
         let known = empty.plan(&input, Some(Arc::from("")), &Cancellation::new()).unwrap().unwrap();
-        assert!(known.verified);
+        assert_eq!(known.verified_password.as_deref(), Some(""));
         drop(sessions);
         let _ = std::fs::remove_file(path);
     }
@@ -873,8 +868,7 @@ mod tests {
             // proof must return before parsing/KDF for every compound layout.
             let configured = CandidateSet::new(Arc::from([Arc::from("right")]), None, &cache, None);
             let plan = configured.plan(&input, None, &Cancellation::new()).unwrap().unwrap();
-            assert_eq!(plan.selected.as_deref(), Some("right"));
-            assert!(plan.verified);
+            assert_eq!(plan.verified_password.as_deref(), Some("right"));
             let mut changed = input.clone();
             changed.parts[1].extent.start = 1;
             assert!(cache.proof(&Key::for_input(&changed, &sessions).unwrap()).is_none());

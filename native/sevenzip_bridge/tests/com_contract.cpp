@@ -172,7 +172,7 @@ void check_archive_root_directory_entries()
             ExtractOutputTrace trace;
             auto *raw = new ExtractToDiskCallback(
                 archive.Interface(), L"", output.wstring(),
-                [&events](const ExtractProgressEvent &event) { events.push_back(event.event); }, dry_run, &trace, 1);
+                [&events](const ExtractProgressEvent &event) { events.emplace_back(event.event); }, dry_run, &trace, 1);
             CMyComPtr<IArchiveExtractCallback> callback(raw);
             CMyComPtr<ISequentialOutStream> stream;
             const HRESULT hr = callback->GetStream(0, &stream, kExtractMode);
@@ -352,19 +352,17 @@ void check_archive_open_start_and_carrier_fallback()
             output.write(tail.data(), tail.size());
         }
         const auto result = extract_archive(path.wstring(), {path.wstring()}, {}, L"rar", L"", root.wstring(), L"", {}, true);
-        check(result.status == PasswordTestStatus::Ok, "RAR4 opens with a generic family hint, including carrier prefix fallback");
+        check(result.status == PasswordTestStatus::Ok && result.archive_type == L"rar4",
+              "RAR4 opens with a generic family hint, including carrier prefix fallback");
         if (!prefix) {
-            check(result.handler_attempts.size() == 2 && result.handler_attempts.back().opened,
-                  "generic RAR reaches RAR4 on the initial handler pass");
             check(result.input_trace.total_bytes_returned < (512u << 10),
                   "wrong RAR handler does not consume the large carrier tail");
         } else {
-            check(result.handler_attempts.size() == 4 && result.handler_attempts.back().opened,
-                  "carrier prefix uses the existing signature search after the start-only pass");
             const std::vector<ExtractInputRange> ranges = {{path.wstring(), prefix, prefix + rar.size(), true}};
             const auto carved = extract_archive(path.wstring(), {}, ranges, L"rar", L"", root.wstring(), L"", {}, true);
-            check(carved.status == PasswordTestStatus::Ok && carved.handler_attempts.size() == 2,
-                  "canonical carrier range opens without searching the underlying prefix");
+            check(carved.status == PasswordTestStatus::Ok && carved.archive_type == L"rar4" &&
+                  carved.input_trace.total_bytes_returned < (512u << 10),
+                  "canonical carrier range opens without consuming the underlying prefix and tail");
         }
     }
     _putenv_s("SUNPACK_SEVENZIP_PREFETCH", previous_prefetch.c_str());

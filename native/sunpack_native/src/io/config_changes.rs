@@ -1,7 +1,7 @@
 //! Arm configuration notifications before publishing a directory subscription.
 use super::iocp::{CancelIoEx, Overlapped};
-use super::resource_lifecycle::TrackedFile;
 use std::ffi::c_void;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -57,7 +57,7 @@ pub(crate) struct DirectoryChange {
 }
 
 struct Request {
-    file: TrackedFile,
+    file: File,
     _event: OwnedHandle,
     // Both addresses must remain fixed until cancellation has completed.
     overlapped: Box<Overlapped>,
@@ -154,12 +154,12 @@ pub(crate) struct NativeConfigChanges {
 impl NativeConfigChanges {
     pub(crate) fn observe(path: PathBuf, recursive: bool, filter: u32, buffer_bytes: usize) -> io::Result<Self> {
         let stopped = event(false)?;
-        let file = TrackedFile::open_passive_with(path, |options| {
-            options
-                .access_mode(1)
-                .share_mode(7)
-                .custom_flags(0x4200_0000);
-        })?;
+        // Shares deletion, so promotion never needs to drain this subscription.
+        let file = OpenOptions::new()
+            .access_mode(1)
+            .share_mode(7)
+            .custom_flags(0x4200_0000)
+            .open(path)?;
         // OVERLAPPED completion events must remain signaled until the result is collected.
         let event = event(true)?;
         let mut request = Request {

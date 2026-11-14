@@ -831,14 +831,12 @@ pub(crate) trait Observer: Send + Sync {
         async { Ok(outcome) }
     }
 
-    // Reporting can wait for client capacity. Transfer the existing outcome
-    // vector so implementations can park the poll without copying its results.
-    fn scope_finished(
+    fn scope_finished<'a>(
         &self,
         _id: TaskId,
-        archives: Vec<ArchiveResult>,
-    ) -> impl std::future::Future<Output = io::Result<Vec<ArchiveResult>>> + Send {
-        async { Ok(archives) }
+        _archives: impl Iterator<Item = &'a ArchiveResult> + Send,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send {
+        async { Ok(()) }
     }
 
     fn claim_sources(&self, _path: &Path, _members: &[String], _depth: usize) -> io::Result<()> {

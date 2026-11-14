@@ -321,13 +321,22 @@ impl Journal {
     /// Use the existing publication gate without emitting a WAL record or
     /// advancing a cursor. An output's mkdir and durable registration cannot
     /// be observed halfway through by a directory-notification callback.
-    pub(super) fn filter_owned_events(&self, paths: &mut Vec<PathBuf>, boundary: &Path) {
+    pub(super) fn owned_event_filter<'a>(
+        &self, paths: impl Iterator<Item = &'a Path>, boundary: &Path,
+    ) -> Option<crate::watch_store::owned_outputs::OwnedEventFilter> {
         let records = {
             let frontier = self.frontier.lock().unwrap();
-            if frontier.fault.is_some() { return; }
+            if frontier.fault.is_some() { return None; }
             self.state.owned_event_records(paths)
         };
-        self.state.filter_owned_event_records(paths, boundary, records);
+        self.state.owned_event_filter(boundary, records)
+    }
+
+    #[cfg(test)]
+    fn filter_owned_events(&self, paths: &mut Vec<PathBuf>, boundary: &Path) {
+        if let Some(filter) = self.owned_event_filter(paths.iter().map(PathBuf::as_path), boundary) {
+            paths.retain(|path| !filter.contains(path));
+        }
     }
 
     pub(super) fn flush(&self) -> io::Result<()> {

@@ -713,9 +713,8 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         let before = Instant::now();
         scheduler.observe_file_changes_blocking(
             &HashMap::from([(root_id.clone(), HashSet::from([tail.clone()]))]),
-            &HashMap::from([(tail, PathChange { modified_only: false, event: Some(CandidateEvent::Created) })]),
+            &mut HashMap::from([(tail, PathChange { event: Some(CandidateEvent::Created), ..PathChange::default() })]),
             &HashSet::new(),
-            &mut HashMap::new(),
         ).unwrap();
         assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9),
             "quiet summary after volume arrival: {:?}", scheduler.pending[&id].quiet.summary());
@@ -789,7 +788,8 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             let observation = activity.capture(&path, &scheduler.hub.claims, &id).unwrap().unwrap();
             signals.changes.root_changed(&root_id, [(path.clone(), PathChange {
                 modified_only: kind == "modified", event: Some(event),
-            }, Some((activity, observation)))]);
+                observation: Some(Box::new((activity, observation))),
+            })]);
             // A second identity lookup would fail. The event already has the
             // matching observation, and readiness still rechecks on admission.
             *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(path.clone());
@@ -808,8 +808,8 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             // selecting the actual checkpoint branch rather than ordinary enqueue.
             let mut signals = Signals::default();
             signals.changes.root_changed(&root_id, [
-                (old.clone(), PathChange::default(), None),
-                (new.clone(), PathChange { modified_only: false, event: Some(CandidateEvent::Moved(old.clone())) }, None),
+                (old.clone(), PathChange::default()),
+                (new.clone(), PathChange { event: Some(CandidateEvent::Moved(old.clone())), ..PathChange::default() }),
             ]);
             if fail { *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(new.clone()); }
             scheduler.observe_root_changes(&mut signals.changes).unwrap();
@@ -828,7 +828,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             &scheduler.roots[&root_id].1, departed.to_str().unwrap()) == Some(false));
         fs::remove_file(departed).unwrap();
         let mut signals = Signals::default();
-        signals.changes.root_changed(&root_id, [(departed.clone(), PathChange::default(), None)]);
+        signals.changes.root_changed(&root_id, [(departed.clone(), PathChange::default())]);
         scheduler.observe_root_changes(&mut signals.changes).unwrap();
         assert!(!scheduler.pending.contains_key(&key(departed)));
         assert!(!scheduler.pending.contains_key(&key(&recovery)));

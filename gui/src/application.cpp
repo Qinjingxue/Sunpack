@@ -1351,12 +1351,15 @@ void Application::work() {
             initial_load_complete|=std::none_of(retries.begin(),retries.end(),[](const auto& retry){return retry.second.due!=Clock::time_point::max();});
             patch["errors"]=std::move(displayed_errors); patch["ready"]=initial_load_complete;
             Json changed_patch=Json::object();
-            for(auto it=patch.begin();it!=patch.end();++it) if(!previous_patch.contains(it.key()) || it.key()=="tasks" || it.key()=="passwords" || it.key()=="passwordDelta" || previous_patch[it.key()]!=it.value()) {
-                // These projections are generated only after source/filter
-                // changes. Keep an initialization marker, not a second full
-                // resident copy of the task/password list.
-                previous_patch[it.key()]=(it.key()=="tasks" || it.key()=="passwords" || it.key()=="passwordDelta")?Json():it.value();
-                changed_patch[it.key()]=std::move(it.value());
+            for(auto it=patch.begin();it!=patch.end();++it) {
+                // These projections are regenerated when their inputs change.
+                // Keep only their initialization markers in the worker.
+                const bool projection=it.key()=="tasks" || it.key()=="passwords" || it.key()=="passwordDelta" ||
+                    it.key()=="fields" || it.key()=="texts" || it.key()=="directories";
+                if(projection || !previous_patch.contains(it.key()) || previous_patch[it.key()]!=it.value()) {
+                    previous_patch[it.key()]=projection?Json():it.value();
+                    changed_patch[it.key()]=std::move(it.value());
+                }
             }
             changed_patch.update(edit_feedback);
             if(!changed_patch.empty()) publish(std::move(changed_patch));

@@ -160,13 +160,7 @@ pub(crate) fn watch_directories_changes_cached_impl(
         if cache.journal != journal || cache.next_usn != start_usn {
             previous.clear();
         }
-        let identity = |directory: &str| {
-            let (actual, id, _) = windows::watch_path_identity(Path::new(directory))?;
-            if !actual.eq_ignore_ascii_case(volume) {
-                return Err(std::io::Error::other("directory changed volume"));
-            }
-            sunpack_usn_core::protocol::parse_file_id(&id).map(|(id, _)| id)
-        };
+        let identity = |directory: &str| windows::directory_file_id(Path::new(directory), volume);
         let mut fresh = std::collections::HashMap::new();
         for root in roots {
             let key = crate::path_keys::path_key(root);

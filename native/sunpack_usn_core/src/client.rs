@@ -55,11 +55,7 @@ impl Drop for BrokerConnection {
 }
 
 impl BrokerConnection {
-    fn transact(&mut self, request: &Request) -> io::Result<Response> {
-        self.transact_query(request, &[], &mut Vec::new())
-    }
-
-    fn transact_query(
+    fn transact(
         &mut self,
         request: &Request,
         query: &[u8],
@@ -138,7 +134,7 @@ pub fn broker_probe_volume(volume_guid: &str) -> io::Result<()> {
 pub fn broker_volume_cursor(volume_guid: &str) -> io::Result<(u64, i64)> {
     let mut request = Request::simple(Opcode::ProbeVolume, next_request_id());
     request.volume_guid = volume_guid.to_owned();
-    let response = ensure_ok(transact_request(request)?)?;
+    let response = transact_request(&request, &[], &mut Vec::new())?;
     Ok((response.journal_id, response.next_usn))
 }
 
@@ -155,7 +151,7 @@ pub fn broker_read_change_reasons(
     request.file_id_len = file_id_len;
     request.previous_usn = previous_usn;
     request.current_usn = current_usn;
-    let response = ensure_ok(transact_request(request)?)?;
+    let response = transact_request(&request, &[], &mut Vec::new())?;
     Ok(ChangeReasons {
         all: response.reasons_all,
         without_close: response.reasons_without_close,
@@ -176,87 +172,65 @@ pub fn broker_for_each_directory_change(
             "invalid directory recovery query",
         ));
     }
-    let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
-    let mut state = state
-        .lock()
-        .map_err(|_| io::Error::other("broker client state poisoned"))?;
-    if state.leases == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "Watch Broker has not been acquired",
-        ));
-    }
-    if state.connection.is_none() {
-        state.connection = Some(connect_and_hello()?);
-    }
-    let mut complete_rejection = false;
-    let result = (|| {
-        let connection = state.connection.as_mut().unwrap();
-        let batch_ids = (MAX_DIRECTORY_QUERY_BYTES - 8) / FILE_ID_BYTES;
-        // Only the ID and cursor change between pages of this logical query.
-        let mut request = Request::simple(Opcode::ReadDirectoriesChanges, 0);
-        request.volume_guid = volume.to_owned();
-        request.current_usn = end;
-        let mut query = Vec::with_capacity(8 + directories.len().min(batch_ids) * FILE_ID_BYTES);
-        let mut payload = Vec::new();
-        for (batch, ids) in directories.chunks(batch_ids).enumerate() {
-            query.clear();
-            query.extend_from_slice(&journal.to_le_bytes());
-            for id in ids {
-                query.extend_from_slice(id);
+    let batch_ids = (MAX_DIRECTORY_QUERY_BYTES - 8) / FILE_ID_BYTES;
+    // Only the ID and cursor change between pages of this logical query.
+    let mut request = Request::simple(Opcode::ReadDirectoriesChanges, 0);
+    request.volume_guid = volume.to_owned();
+    request.current_usn = end;
+    let mut query = Vec::with_capacity(8 + directories.len().min(batch_ids) * FILE_ID_BYTES);
+    let mut payload = Vec::new();
+    for (batch, ids) in directories.chunks(batch_ids).enumerate() {
+        query.clear();
+        query.extend_from_slice(&journal.to_le_bytes());
+        query.extend_from_slice(ids.as_flattened());
+        let mut cursor = start;
+        while cursor < end {
+            request.request_id = next_request_id();
+            request.previous_usn = cursor;
+            // The pipe is unlocked after each complete frame. Parsing and
+            // applying the page can proceed alongside other broker requests.
+            let response = transact_request(&request, &query, &mut payload)?;
+            if response.journal_id != journal
+                || response.next_usn <= cursor
+                || response.next_usn > end
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid directory recovery cursor",
+                ));
             }
-            let mut cursor = start;
-            while cursor < end {
-                request.request_id = next_request_id();
-                request.previous_usn = cursor;
-                let response = connection.transact_query(&request, &query, &mut payload)?;
-                // A complete business rejection leaves the pipe framing intact.
-                // In particular, journal rollover must not release a live lease.
-                complete_rejection = response.status != Status::Ok;
-                ensure_ok(response)?;
-                if response.journal_id != journal
-                    || response.next_usn <= cursor
-                    || response.next_usn > end
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid directory recovery cursor",
-                    ));
+            let mut input = payload.as_slice();
+            let mut count = 0usize;
+            while !input.is_empty() {
+                if input.len() < 8 {
+                    return Err(io::Error::other("truncated directory change"));
                 }
-                let mut input = payload.as_slice();
-                let mut count = 0usize;
-                while !input.is_empty() {
-                    if input.len() < 8 {
-                        return Err(io::Error::other("truncated directory change"));
-                    }
-                    let index = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
-                    let length = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
-                    input = &input[8..];
-                    if index >= ids.len() || length > input.len() {
-                        return Err(io::Error::other("invalid directory change"));
-                    }
-                    let name = std::str::from_utf8(&input[..length])
-                        .map_err(|_| io::Error::other("invalid directory change UTF-8"))?;
-                    observe(batch * batch_ids + index, name)?;
-                    input = &input[length..];
-                    count += 1;
+                let index = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
+                let length = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+                input = &input[8..];
+                if index >= ids.len() || length > input.len() {
+                    return Err(io::Error::other("invalid directory change"));
                 }
-                if count != response.reasons_without_close as usize {
-                    return Err(io::Error::other("directory recovery count mismatch"));
-                }
-                cursor = response.next_usn;
+                let name = std::str::from_utf8(&input[..length])
+                    .map_err(|_| io::Error::other("invalid directory change UTF-8"))?;
+                observe(batch * batch_ids + index, name)?;
+                input = &input[length..];
+                count += 1;
             }
+            if count != response.reasons_without_close as usize {
+                return Err(io::Error::other("directory recovery count mismatch"));
+            }
+            cursor = response.next_usn;
         }
-        Ok(())
-    })();
-    // A truncated exchange must never poison the framing of the next request.
-    if result.is_err() && !complete_rejection {
-        state.connection.take();
     }
-    result
+    Ok(())
 }
 
-fn transact_request(request: Request) -> io::Result<Response> {
+fn transact_request(
+    request: &Request,
+    query: &[u8],
+    payload: &mut Vec<u8>,
+) -> io::Result<Response> {
     let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
     let mut state = state
         .lock()
@@ -277,8 +251,14 @@ fn transact_request(request: Request) -> io::Result<Response> {
         if state.connection.is_none() {
             state.connection = Some(connect_and_hello()?);
         }
-        match state.connection.as_mut().unwrap().transact(&request) {
-            Ok(response) => return Ok(response),
+        match state
+            .connection
+            .as_mut()
+            .unwrap()
+            .transact(request, query, payload)
+        {
+            // Business errors have completed their exchange and keep the lease.
+            Ok(response) => return ensure_ok(response),
             Err(error) => {
                 state.connection.take();
                 if !replay_safe || !is_transient_broker_io(&error) {
@@ -320,7 +300,11 @@ fn connect_and_hello() -> io::Result<BrokerConnection> {
             }
             Err(error) => return Err(error),
         };
-        match connection.transact(&Request::simple(Opcode::Hello, next_request_id())) {
+        match connection.transact(
+            &Request::simple(Opcode::Hello, next_request_id()),
+            &[],
+            &mut Vec::new(),
+        ) {
             Ok(response) => {
                 // Protocol errors and explicit broker rejection are terminal.
                 ensure_ok(response)?;
@@ -700,6 +684,130 @@ mod tests {
             io::ErrorKind::InvalidData,
             "invalid reply",
         )));
+    }
+
+    #[test]
+    fn directory_recovery_allows_another_request_between_pages() {
+        use crate::protocol::REQUEST_BYTES;
+        use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+        };
+
+        let name = wide(&format!(
+            r"\\.\pipe\SunPack.WatchBroker.Test.interleave.{}",
+            std::process::id()
+        ));
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                null(),
+            )
+        };
+        assert_ne!(pipe, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+        let server = BrokerConnection(pipe);
+        let client = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        assert_ne!(
+            client,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let client = BrokerConnection(client);
+        assert!(unsafe {
+            ConnectNamedPipe(server.0, null_mut()) != 0 || GetLastError() == ERROR_PIPE_CONNECTED
+        });
+        let mode = PIPE_READMODE_MESSAGE;
+        assert_ne!(
+            unsafe { SetNamedPipeHandleState(client.0, &mode, null(), null()) },
+            0
+        );
+
+        let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
+        *state.lock().unwrap() = ClientState {
+            connection: Some(client),
+            leases: 1,
+        };
+        thread::scope(|workers| {
+            let server = workers.spawn(move || {
+                // Keep ownership of the pipe in this thread even if a reply assertion fails.
+                let server = server;
+                let serve = |opcode, start, next, name: &[u8]| {
+                    let mut request = [0; REQUEST_BYTES];
+                    read_exact(server.0, &mut request).unwrap();
+                    let request = Request::decode(&request).unwrap();
+                    assert_eq!(request.opcode, opcode);
+                    assert_eq!(request.previous_usn, start);
+                    let mut reply = Response::ok(request.request_id);
+                    reply.journal_id = 42;
+                    reply.next_usn = next;
+                    let mut payload = Vec::new();
+                    if opcode == Opcode::ReadDirectoriesChanges {
+                        let mut length = [0; 4];
+                        let mut query = [0; 8 + FILE_ID_BYTES];
+                        read_exact(server.0, &mut length).unwrap();
+                        assert_eq!(u32::from_le_bytes(length) as usize, query.len());
+                        read_exact(server.0, &mut query).unwrap();
+                        payload.extend_from_slice(&0u32.to_le_bytes());
+                        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(name);
+                        reply.reasons_all = payload.len() as u32;
+                        reply.reasons_without_close = 1;
+                    }
+                    write_exact(server.0, &reply.encode()).unwrap();
+                    if !payload.is_empty() {
+                        write_exact(server.0, &payload).unwrap();
+                    }
+                };
+                serve(Opcode::ReadDirectoriesChanges, 1, 2, b"first");
+                serve(Opcode::ProbeVolume, 0, 3, b"");
+                serve(Opcode::ReadDirectoriesChanges, 2, 3, b"second");
+            });
+            let mut names = Vec::new();
+            let result = broker_for_each_directory_change(
+                "volume",
+                42,
+                &[[1; FILE_ID_BYTES]],
+                1,
+                3,
+                |index, name| {
+                    if index != 0 || state.try_lock().is_err() {
+                        return Err(io::Error::other(
+                            "directory observer ran inside the pipe lock",
+                        ));
+                    }
+                    if name == "first" && broker_volume_cursor("volume")? != (42, 3) {
+                        return Err(io::Error::other(
+                            "probe cursor did not survive interleaving",
+                        ));
+                    }
+                    names.push(name.to_owned());
+                    Ok(())
+                },
+            );
+            broker_release().unwrap();
+            let server_result = server.join();
+            result.unwrap();
+            server_result.unwrap();
+            assert_eq!(names, ["first", "second"]);
+        });
     }
 
     #[test]

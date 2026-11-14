@@ -932,7 +932,6 @@ struct RootChanges {
     changed_roots: HashMap<String, HashSet<PathBuf>>,
     topology_roots: HashSet<String>,
     paths: HashMap<PathBuf, PathChange>,
-    observations: HashMap<PathBuf, CapturedPath>,
 }
 
 type CapturedPath = (quiet::Activity, quiet::Observation);
@@ -941,23 +940,20 @@ type CapturedPath = (quiet::Activity, quiet::Observation);
 struct PathChange {
     modified_only: bool,
     event: Option<CandidateEvent>,
+    observation: Option<Box<CapturedPath>>,
 }
 
 impl RootChanges {
-    fn root_changed(&mut self, id: &str, paths: impl IntoIterator<Item = (PathBuf, PathChange, Option<CapturedPath>)>) {
+    fn root_changed(&mut self, id: &str, paths: impl IntoIterator<Item = (PathBuf, PathChange)>) {
         let changed = self.changed_roots.entry(id.to_owned()).or_default();
-        for (path, change, observation) in paths {
-            // A later notification invalidates the earlier snapshot even
-            // when its probe returned no file.
-            if let Some(observation) = observation {
-                self.observations.insert(path.clone(), observation);
-            } else {
-                self.observations.remove(&path);
-            }
+        for (path, change) in paths {
             let first_for_root = changed.insert(path.clone());
             let current = self.paths.entry(path).or_default();
             current.modified_only = change.modified_only && (first_for_root || current.modified_only);
             if current.event.is_none() { current.event = change.event; }
+            // A later notification invalidates the earlier snapshot even
+            // when its probe returned no file.
+            current.observation = change.observation;
         }
     }
 
@@ -972,8 +968,9 @@ impl RootChanges {
         // by idle maintenance, not a named subtree scan.
         for (root, paths) in &mut self.changed_roots {
             paths.retain(|path| {
-                if self.observations.contains_key(path) { return true; }
-                let modified = self.paths.get(path).is_some_and(|change| change.modified_only);
+                let change = self.paths.get(path);
+                if change.is_some_and(|change| change.observation.is_some()) { return true; }
+                let modified = change.is_some_and(|change| change.modified_only);
                 match fs::metadata(path) {
                     Ok(metadata) if metadata.is_dir() && modified => return false,
                     Ok(metadata) if metadata.is_file() => {}
@@ -1452,13 +1449,12 @@ impl RootObserver {
         // configuration/ancestor subscriptions keep their 4 KiB allocation.
         let observer = FileObserver::start_with_filter(
             directory, recursive, 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40 | 0x100, 64_000, move |names| {
-            let mut changes = HashMap::<_, PathChange>::new();
             let mut password_changed = false;
-            let mut rename_source = None;
-            let mut paths = names.map(|names| {
-                let mut paths = Vec::new();
+            let paths = names.map(|names| {
+                let mut changes = HashMap::<_, PathChange>::new();
+                let mut rename_source = None;
                 for change in names {
-                    let path = watched_dir.join(change.name);
+                    let path = watched_dir.join(&change.name);
                     let event = CandidateEvent::native(change.action, &path, &mut rename_source);
                     if path.file_name().is_some_and(|name| {
                         name.to_string_lossy().eq_ignore_ascii_case(&password_name)
@@ -1468,45 +1464,40 @@ impl RootObserver {
                     }
                     if !scope.contains(&path.to_string_lossy()) { continue; }
                     let modified = change.action == 3;
-                    match changes.entry(path.clone()) {
+                    match changes.entry(path) {
                         std::collections::hash_map::Entry::Occupied(mut entry) => {
                             let change = entry.get_mut();
                             change.modified_only &= modified;
                             if change.event.is_none() { change.event = event; }
                         }
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(PathChange { modified_only: modified, event });
-                            // The buffer contains names, not separate filesystem
-                            // observations. Probe each once while retaining event order.
-                            paths.push(path);
+                            entry.insert(PathChange { modified_only: modified, event, observation: None });
                         }
                     }
                 }
-                paths
+                if let Some(filter) = journal.owned_event_filter(changes.keys().map(PathBuf::as_path), &watched_dir) {
+                    changes.retain(|path, _| !filter.contains(path));
+                }
+                for (path, change) in &mut changes {
+                    let key = key(path);
+                    if hub.claims.lock().unwrap().contains_key(&key) { continue; }
+                    let activity = hub.activities.bind(key.clone(), || {
+                        catalog.observation(&path.to_string_lossy())
+                            .as_ref().map_or_else(quiet::Activity::default, quiet::Activity::saved)
+                    });
+                    if let Ok(Some(observation)) = activity.capture(path, &hub.claims, &key) {
+                        change.observation = Some(Box::new((activity, observation)));
+                    }
+                }
+                changes
             });
-            if let Some(paths) = paths.as_mut() {
-                journal.filter_owned_events(paths, &watched_dir);
-            }
-            let observations = paths.as_ref().into_iter().flatten().map(|path| {
-                let key = key(path);
-                if hub.claims.lock().unwrap().contains_key(&key) { return None; }
-                let activity = hub.activities.bind(key.clone(), || {
-                    catalog.observation(&path.to_string_lossy())
-                        .as_ref().map_or_else(quiet::Activity::default, quiet::Activity::saved)
-                });
-                activity.capture(path, &hub.claims, &key).ok().flatten()
-                    .map(|observation| (activity, observation))
-            }).collect::<Vec<_>>();
             let root_changed = paths.as_ref().is_none_or(|paths| !paths.is_empty());
             if password_changed || root_changed {
                 hub.update(|signals| {
                     signals.password_changed |= password_changed;
                     if !root_changed { return; }
                     if let Some(paths) = paths {
-                        signals.changes.root_changed(&id, paths.into_iter().zip(observations).map(|(path, observation)| {
-                            let change = changes.remove(&path).unwrap();
-                            (path, change, observation)
-                        }));
+                        signals.changes.root_changed(&id, paths);
                     } else {
                         signals.changes.topology_changed(id.clone());
                     }
@@ -1666,7 +1657,7 @@ struct Pending {
 // (300s), matching main's event/path diagnostic ownership and expiry.
 #[derive(Default)]
 struct CandidateDiagnostics {
-    paths: HashMap<Arc<str>, [Option<Instant>; 4]>,
+    paths: HashMap<Arc<str>, u8>,
     order: VecDeque<(Instant, Arc<str>, usize)>,
     next_expiry: Option<Instant>,
 }
@@ -1674,10 +1665,14 @@ struct CandidateDiagnostics {
 impl CandidateDiagnostics {
     fn retire_first(&mut self) {
         if let Some((_, path, event)) = self.order.pop_front() {
-            let slots = self.paths.get_mut(&path).unwrap();
-            slots[event] = None;
-            if slots.iter().all(Option::is_none) { self.paths.remove(&path); }
+            Self::remove_event(&mut self.paths, &path, event);
         }
+    }
+
+    fn remove_event(paths: &mut HashMap<Arc<str>, u8>, path: &str, event: usize) {
+        let events = paths.get_mut(path).unwrap();
+        *events &= !(1 << event);
+        if *events == 0 { paths.remove(path); }
     }
 
     fn clear_expired(&mut self, now: Instant) {
@@ -1685,9 +1680,7 @@ impl CandidateDiagnostics {
         let paths = &mut self.paths;
         self.order.retain(|(expiry, path, event)| {
             if *expiry > now { return true; }
-            let slots = paths.get_mut(path).unwrap();
-            slots[*event] = None;
-            if slots.iter().all(Option::is_none) { paths.remove(path); }
+            Self::remove_event(paths, path, *event);
             false
         });
         self.next_expiry = self.order.iter().map(|(expiry, _, _)| *expiry).min();
@@ -1701,12 +1694,13 @@ impl CandidateDiagnostics {
 
     fn admit(&mut self, now: Instant, id: &str, event: usize, seconds: u64) -> bool {
         self.clear_expired(now);
-        if self.paths.get(id).is_some_and(|slots| slots[event].is_some()) { return false; }
+        let flag = 1 << event;
+        if self.paths.get(id).is_some_and(|events| events & flag != 0) { return false; }
         if self.order.len() == 2048 { self.retire_first(); }
         let id = self.paths.get_key_value(id).map(|(id, _)| Arc::clone(id))
             .unwrap_or_else(|| Arc::from(id));
         let expiry = now + std::time::Duration::from_secs(seconds);
-        self.paths.entry(Arc::clone(&id)).or_default()[event] = Some(expiry);
+        *self.paths.entry(Arc::clone(&id)).or_default() |= flag;
         self.order.push_back((expiry, id, event));
         self.next_expiry = Some(self.next_expiry.map_or(expiry, |next| next.min(expiry)));
         true
@@ -3012,9 +3006,8 @@ impl Scheduler {
     fn observe_file_changes_blocking(
         &mut self,
         changed: &HashMap<String, HashSet<PathBuf>>,
-        path_changes: &HashMap<PathBuf, PathChange>,
+        path_changes: &mut HashMap<PathBuf, PathChange>,
         departed: &HashSet<PathBuf>,
-        observations: &mut HashMap<PathBuf, CapturedPath>,
     ) -> io::Result<()> {
         if self.options.is_none() { return Ok(()); }
         // Match main's ordinary file-event path: enqueue in memory without
@@ -3026,7 +3019,6 @@ impl Scheduler {
             let deep = root.deep;
             let scope = scope.clone();
             for path in paths {
-                let event = path_changes.get(path).and_then(|change| change.event.as_ref());
                 let source = path.to_string_lossy();
                 if !scope.contains(&source) || self.catalog.is_owned(&source) { continue; }
                 if departed.contains(path) && Path::new(&scope.root).is_dir() {
@@ -3035,10 +3027,12 @@ impl Scheduler {
                     self.scan_options(deep)?.catalog_update(&self.catalog, &scope, Some(&source))?;
                     self.departed(&source, false)?;
                 }
-                let (tracker, observation) = match observations.remove(path) {
-                    Some((tracker, observation)) => (Some(tracker), Some(observation)),
+                let mut change = path_changes.get_mut(path);
+                let (tracker, observation) = match change.as_mut().and_then(|change| change.observation.take()) {
+                    Some(capture) => (Some(capture.0), Some(capture.1)),
                     None => (None, None),
                 };
+                let event = change.and_then(|change| change.event.as_ref());
                 self.observe_candidate_with_event(id, source.to_string(), CandidateAdmission::Observe,
                     None, None, tracker, event, observation)?;
                 self.retry_volume_peers(&scope, &source, &mut retried)?;
@@ -3058,7 +3052,7 @@ impl Scheduler {
             });
             match departed {
                 Some(departed) => self.observe_file_changes_blocking(&changes.changed_roots,
-                    &changes.paths, &departed, &mut changes.observations),
+                    &mut changes.paths, &departed),
                 None => self.checkpoint_blocking(&changes.changed_roots, false, false, &changes.paths),
             }
         })?
@@ -6270,23 +6264,27 @@ fn prepare_flatten(
     leaf: &Path,
 ) -> io::Result<()> {
     journal.commit(true, |state| {
+        use crate::watch_store::NativeWatchOperations;
         let old = output_identity(&root.to_string_lossy())?;
         let new = output_identity(&leaf.to_string_lossy())?;
         let root_paths = crate::path_keys::output_path_aliases(root)?;
         let work_paths = crate::path_keys::output_path_aliases(work)?;
-        let mut values = vec![
-            json!({"op":"runtime","key":format!("flatten|{}",key(root)),
-                "value":{"owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,"new_identity":new,
-                    "root_paths":root_paths,"work_paths":work_paths}}),
-        ];
+        let mut operations = NativeWatchOperations::empty();
+        operations.set_runtime(format!("flatten|{}", key(root)), Some(json!({
+            "owner":owner,"root":root,"work":work,"leaf":leaf,"old_identity":old,
+            "new_identity":new,"root_paths":root_paths,"work_paths":work_paths,
+        })));
         if !owner.is_empty() {
-            values.push(json!({"op":"checkpoint_output","owner":owner,"output":root}));
+            if let Some(checkpoint) = state.promotion_operation(
+                owner, Vec::new(), vec![root.to_string_lossy().into_owned()],
+            ) {
+                operations.extend(checkpoint);
+            }
         }
-        let mut operations = state.decode_operations(&values)?;
-        operations.extend(crate::watch_store::NativeWatchOperations::owned_outputs(
+        operations.extend(NativeWatchOperations::owned_outputs(
             &root_paths, &[&old, &new],
         ));
-        operations.extend(crate::watch_store::NativeWatchOperations::owned_outputs(
+        operations.extend(NativeWatchOperations::owned_outputs(
             &work_paths, &[&old],
         ));
         Ok(operations)
@@ -6312,60 +6310,61 @@ fn recover_finish_flatten(journal: &journal::Journal, root: &str) -> io::Result<
 fn finish_flatten_operations(state: &crate::watch_store::NativeWatchState, root: &str)
     -> io::Result<crate::watch_store::NativeWatchOperations>
 {
+    use crate::watch_store::NativeWatchOperations;
     let record_key = format!("flatten|{}", watch_path_key(root));
     let Some(record) = state.runtime_record(&record_key) else {
-        return Ok(crate::watch_store::NativeWatchOperations::empty());
+        return Ok(NativeWatchOperations::empty());
     };
     let (Some(work), Some(leaf)) = (record["work"].as_str(), record["leaf"].as_str()) else {
-        return Ok(crate::watch_store::NativeWatchOperations::empty());
+        return Ok(NativeWatchOperations::empty());
     };
+    let work_paths = flatten_work_paths(&record)?;
     let current = output_identity(root)?;
-    let work_paths = record["work_paths"].as_array().map(|paths| {
-        paths.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()
-    }).unwrap_or_else(|| state.owned_output_paths(work, record["old_identity"].as_str().unwrap_or_default()));
     let mut work_exists = false;
-    for alias in &work_paths {
+    for alias in work_paths.clone() {
         work_exists |= Path::new(alias).try_exists()?;
     }
     let published = record["new_identity"].as_str() == Some(&current);
     if !published && (work_exists || record["old_identity"].as_str() != Some(&current)) {
-        return Ok(crate::watch_store::NativeWatchOperations::empty());
+        return Ok(NativeWatchOperations::empty());
     }
     let already_rebased = record["outputs_rebased"].as_bool() == Some(true);
     if work_exists && already_rebased {
-        return Ok(crate::watch_store::NativeWatchOperations::empty());
+        return Ok(NativeWatchOperations::empty());
     }
     let root_paths = crate::path_keys::output_path_aliases(Path::new(root))?;
-    let mut operations = Vec::new();
-    if !work_exists {
-        operations.push(json!({"op":"runtime","key":record_key}));
-    } else {
-        let mut next = record.clone();
+    let mut operations = NativeWatchOperations::empty();
+    operations.set_runtime(record_key, work_exists.then(|| {
+        let mut next = (*record).clone();
         next["outputs_rebased"] = Value::Bool(true);
         next["root_paths"] = json!(root_paths);
-        next["work_paths"] = json!(work_paths);
-        operations.push(json!({"op":"runtime","key":record_key,"value":next}));
-    }
+        next
+    }));
     let owner = record["owner"]
         .as_str()
         .filter(|owner| published && !already_rebased && !owner.is_empty());
     if let Some(owner) = owner {
         for source in [work, leaf] {
-            operations.push(json!({"op":"relocate_output","owner":owner,"source":source,
-                "destination":root,"identity":current}));
+            operations.relocate_output(owner, source.to_owned(), root.to_owned(), current.clone());
         }
     }
-    use crate::watch_store::NativeWatchOperations;
-    let mut operations = state.decode_operations(&operations)?;
     operations.extend(NativeWatchOperations::owned_outputs(
         &root_paths, &[&current],
     ));
     if !work_exists {
         if let Some(old) = record["old_identity"].as_str() {
+            let work_paths = work_paths.map(str::to_owned).collect::<Vec<_>>();
             operations.extend(state.remove_owned_output(&work_paths, old));
         }
     }
     Ok(operations)
+}
+
+fn flatten_work_paths(record: &Value) -> io::Result<impl Iterator<Item = &str> + Clone> {
+    record["work_paths"].as_array()
+        .filter(|paths| !paths.is_empty() && paths.iter().all(Value::is_string))
+        .map(|paths| paths.iter().filter_map(Value::as_str))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid flatten work paths"))
 }
 
 fn restore_checkpoints(
@@ -6418,6 +6417,10 @@ fn recover_flattens(journal: &journal::Journal, eligible: impl Fn(&str) -> bool)
         ) else {
             continue;
         };
+        if let Err(error) = flatten_work_paths(&record) {
+            journal.log(json!({"event":"flatten_recovery_failed","path":root,"error":error.to_string()}));
+            continue;
+        }
         let root_id = identity_if_present(root);
         let work_id = identity_if_present(work);
         let (Ok(root_id), Ok(work_id)) = (root_id, work_id) else {
@@ -6730,11 +6733,11 @@ mod tests {
         // diagnostic throttle would, until this Signals burst is consumed.
         let mut signals = Signals::default();
         signals.changes.root_changed("root", [(path.to_owned(), PathChange {
-            modified_only: false, event: Some(moved),
-        }, None)]);
+            modified_only: false, event: Some(moved), observation: None,
+        })]);
         signals.changes.root_changed("root", [(path.to_owned(), PathChange {
-            modified_only: true, event: Some(CandidateEvent::Modified),
-        }, None)]);
+            modified_only: true, event: Some(CandidateEvent::Modified), observation: None,
+        })]);
         assert_eq!(signals.changes.paths[path].event.as_ref().unwrap().kind(), "moved");
         assert!(!signals.changes.paths[path].modified_only);
         let captured = std::mem::take(&mut signals);
@@ -6768,7 +6771,7 @@ mod tests {
         history.log_wait(&journal, observation_at, "later", "later", Some(&error));
         history.clear_expired(now + std::time::Duration::from_secs(61));
         assert_eq!(history.order.len(), 1);
-        assert!(history.paths["observe"][2].is_some());
+        assert!(history.paths.contains_key("observe"));
         assert!(!history.paths.contains_key("later"));
         history.log_observation(&journal, now + std::time::Duration::from_secs(330), "observe", "observe", &error, None);
         assert_eq!(history.order.len(), 1);
@@ -6868,13 +6871,17 @@ mod tests {
         let source = crate::test_support::temp_file("flatten_probe_failure", b"owner");
         let directory = source.with_extension("state");
         let root = directory.join("missing");
+        let work = directory.join("work");
         let journal = journal::Journal::open(&directory, 7).unwrap();
         let record_key = format!("flatten|{}", key(&root));
-        journal.commit(true, |state| state.decode_operations(&[
-            json!({"op":"runtime","key":record_key,"value":{
-                "owner":"owner","root":root,"work":directory.join("work"),
-                "leaf":root.join("leaf"),"old_identity":"old","new_identity":"new"}})
-        ])).unwrap();
+        journal.commit(true, |_| {
+            let mut operations = crate::watch_store::NativeWatchOperations::empty();
+            operations.set_runtime(record_key.clone(), Some(json!({
+                "owner":"owner","root":root,"work":work,"work_paths":[work],
+                "leaf":root.join("leaf"),"old_identity":"old","new_identity":"new",
+            })));
+            Ok(operations)
+        }).unwrap();
         assert!(finish_flatten(&journal, root.to_str().unwrap()).is_err());
         recover_finish_flatten(&journal, root.to_str().unwrap()).unwrap();
         assert!(journal.state().runtime_record(&record_key).is_some());
@@ -6892,13 +6899,13 @@ mod tests {
         let missing = directory.join("departed.zip");
         let mut signals = Signals::default();
         signals.changes.root_changed("root", [directory.clone(), file.clone(), missing.clone()]
-            .map(|path| (path, PathChange { modified_only: true, event: None }, None)));
+            .map(|path| (path, PathChange { modified_only: true, ..PathChange::default() })));
         assert!(signals.changes.prepare(|_, _| false).is_some());
         assert!(!signals.changes.changed_roots["root"].contains(&directory));
         assert!(signals.changes.changed_roots["root"].contains(&file));
         for path in [directory.clone(), missing] {
             let mut signals = Signals::default();
-            signals.changes.root_changed("root", [(path, PathChange::default(), None)]);
+            signals.changes.root_changed("root", [(path, PathChange::default())]);
             assert!(signals.changes.prepare(|_, _| false).is_none());
         }
         let mut signals = Signals::default();
@@ -6988,7 +6995,8 @@ mod tests {
             file.sync_data().unwrap();
             let signals = hub.signals.lock().unwrap();
             let (_signals, wait) = hub.wake.wait_timeout_while(signals, Duration::from_secs(5), |signals| {
-                !signals.changes.observations.get(&source).is_some_and(|(_, value)| value.candidate.size == size)
+                !signals.changes.paths.get(&source).and_then(|change| change.observation.as_deref())
+                    .is_some_and(|(_, value)| value.candidate.size == size)
                     || activity.observed_size() != Some(size)
             }).unwrap();
             assert!(!wait.timed_out(), "observer did not publish size {size}");
@@ -7131,13 +7139,13 @@ mod tests {
     fn content_batches_do_not_invalidate_topology_but_overflow_does() {
         let mut signals = Signals::default();
         for _ in 0..100 {
-            signals.changes.root_changed("root-a", [(PathBuf::from("root-a/archive.zip"), PathChange::default(), None)]);
+            signals.changes.root_changed("root-a", [(PathBuf::from("root-a/archive.zip"), PathChange::default())]);
         }
         assert!(signals.changes.topology_roots.is_empty());
         assert_eq!(signals.changes.changed_roots.len(), 1);
         // A content event batched after an overflow must not erase the rearm.
         signals.changes.topology_changed("root-a".into());
-        signals.changes.root_changed("root-a", [(PathBuf::from("root-a/archive.zip"), PathChange::default(), None)]);
+        signals.changes.root_changed("root-a", [(PathBuf::from("root-a/archive.zip"), PathChange::default())]);
         assert_eq!(signals.changes.topology_roots, HashSet::from(["root-a".to_owned()]));
         assert_eq!(signals.changes.changed_roots["root-a"].len(), 1);
     }
@@ -7662,7 +7670,7 @@ mod tests {
         hub.queue_reload(Some(CommandReply::Sync(reload)));
         assert!(hub.queue_once(CommandReply::Sync(once)));
         hub.update(|signals| {
-            signals.changes.root_changed("old-root", [(PathBuf::from("archive.zip"), PathChange::default(), None)]);
+            signals.changes.root_changed("old-root", [(PathBuf::from("archive.zip"), PathChange::default())]);
             signals.password_changed = true;
         });
         hub.batch_completed("old-request".into());
@@ -8474,14 +8482,6 @@ mod tests {
         assert!(junction.status.success(), "{}", String::from_utf8_lossy(&junction.stderr));
         let journal = journal::Journal::open(&base.join("state"), 7).unwrap();
         prepare_flatten(&journal, "", &root, &work, &leaf).unwrap();
-        // Older intents had no path list. Their persisted owned aliases must
-        // still prevent a detached literal path from discarding physical work.
-        journal.commit(true, |state| {
-            let key = format!("flatten|{}", key(&root));
-            let mut record = state.runtime_record(&key).unwrap();
-            record.as_object_mut().unwrap().remove("work_paths");
-            state.decode_operations(&[json!({"op":"runtime","key":key,"value":record})])
-        }).unwrap();
         fs::rename(&root, &work).unwrap();
         fs::rename(physical_work.join("leaf"), &root).unwrap();
         fs::remove_dir(alias).unwrap();

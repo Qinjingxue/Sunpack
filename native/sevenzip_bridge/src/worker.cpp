@@ -535,8 +535,6 @@ std::size_t emit_output_trace_chunks(const std::string& job_id, const sunpack::s
 std::string output_trace_wire(const sunpack::sevenzip::ExtractOutputTrace& trace, std::size_t chunk_count) {
     return wire::object() +
         wire::key("total_bytes_written") + wire::number(trace.total_bytes_written) +
-        wire::key("current_item_index") + wire::number(trace.current_item_index) +
-        wire::key("current_item_path") + wire::text(wide_to_utf8(trace.current_item_path)) +
         wire::key("current_item_bytes_written") + wire::number(trace.current_item_bytes_written) +
         wire::key("last_write_size") + wire::number(trace.last_write_size) +
         wire::key("last_hresult") + wire::number(trace.last_hresult) +
@@ -573,82 +571,34 @@ std::string pipeline_timing_wire(const sunpack::sevenzip::ExtractPipelineTiming&
 }
 #endif
 
-std::string verified_manifest_wire(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result, bool validated) {
+std::string verified_manifest_wire(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result) {
     WorkerChunks chunks(job_id, "manifest_chunk", "rows");
     unsigned int file_count = 0;
     unsigned long long total_size = 0;
-    bool identity_paths = true;
-    // The writer already supplies safe relative paths with generic separators.
-    // Directory keys borrow that storage for the lifetime of this summary.
-    // A file implies all its parents, but an explicit directory only counts itself.
-    std::unordered_map<std::wstring_view, bool> directories;
     std::string row;
     row.reserve(256);
     for (const auto& item : result.output_trace.items) {
-        const std::wstring_view output_path(item.output_path);
-        if (item.is_dir) {
-            if (!output_path.empty()) directories.try_emplace(output_path, false);
-            continue;
-        }
-        auto parent = output_path;
-        for (auto separator = parent.rfind(L'/'); separator != std::wstring_view::npos;
-             separator = parent.rfind(L'/')) {
-            parent = parent.substr(0, separator);
-            auto& parents_counted = directories.try_emplace(parent, false).first->second;
-            if (parents_counted) break;
-            parents_counted = true;
-        }
+        if (item.is_dir) continue;
         ++file_count;
         total_size += item.bytes_written;
-        const bool identity_path = item.path == item.output_path ||
-            std::filesystem::path(item.path).lexically_normal().generic_wstring() == output_path;
-        identity_paths = identity_paths && identity_path;
         row.clear();
         row += wire::array();
-        wire::append_number(row, item.index);
-        wire::append_text(row, wide_to_utf8(item.path));
-        wire::append_text(row, identity_path ? std::string() : wide_to_utf8(item.output_path));
+        wire::append_text(row, wide_to_utf8(item.output_path));
         wire::append_number(row, item.has_expected_size ? item.expected_size : item.bytes_written);
-        wire::append_number(row, item.bytes_written);
-        wire::append_number(row, item.has_source_crc32 ? 1 : 0);
-        wire::append_number(row, item.source_crc32);
-        wire::append_number(row, item.has_output_crc32 ? 1 : 0);
-        wire::append_number(row, item.output_crc32);
-        wire::append_number(row, item.crc_verified ? 1 : 0);
         wire::append_number(row, item.done ? 1 : item.failed ? 2 : 0);
-        wire::append_number(row, item.has_mtime_ns ? 1 : 0);
-        wire::append_number(row, item.mtime_ns);
+        if (item.has_mtime_ns) wire::append_number(row, item.mtime_ns);
+        else row.push_back(wire::kNull);
         wire::append_text(row, std::string_view(reinterpret_cast<const char*>(item.magic.data()), item.magic.size()), wire::kBytes);
         row += wire::end();
         chunks.append(row);
     }
     const auto chunk_count = chunks.finish();
-    const bool inventory_complete = validated && result.output_inventory_complete && file_count == result.files_written;
+    const bool inventory_complete = result.output_inventory_complete && file_count == result.files_written;
     return wire::object() +
-        (wire::key("source") + wire::text("sevenzip_worker_extract")) +
-        wire::key("validated") + wire::boolean(validated) +
-        wire::key("item_count") + wire::number(result.item_count) +
+        wire::key("complete") + wire::boolean(inventory_complete) +
         wire::key("file_count") + wire::number(file_count) +
-        (wire::key("inventory") + wire::array()) + wire::number(inventory_complete ? 1 : 0) +
-        wire::number(file_count) +
-        wire::number(directories.size()) +
-        wire::number(total_size) +
-        wire::number(identity_paths ? 1 : 0) + wire::end() +
+        wire::key("total_size") + wire::number(total_size) +
         wire::key("chunk_count") + wire::number(chunk_count) + wire::end();
-}
-
-std::string handler_attempts_wire(const std::vector<sunpack::sevenzip::ExtractHandlerAttempt>& attempts) {
-    std::string out = wire::array();
-    for (std::size_t index = 0; index < attempts.size(); ++index) {
-        const auto& attempt = attempts[index];
-        out += (wire::object() + wire::key("format")) + wire::text(wide_to_utf8(attempt.format)) +
-            wire::key("created") + wire::boolean(attempt.created) +
-            wire::key("opened") + wire::boolean(attempt.opened) +
-            wire::key("create_hresult") + wire::number(attempt.create_hresult) +
-            wire::key("open_hresult") + wire::number(attempt.open_hresult) + wire::end();
-    }
-    out += wire::end();
-    return out;
 }
 
 std::string failed_item_wire(const sunpack::sevenzip::ExtractArchiveResult& result) {
@@ -677,7 +627,6 @@ std::string diagnostics_wire(const sunpack::sevenzip::ExtractArchiveResult& resu
         wire::key("password_candidate_count") + wire::number(result.password_candidate_count) +
         wire::key("password_attempts") + wire::number(result.password_attempts) +
         wire::key("matched_index") + wire::number(result.matched_index) +
-        wire::key("handler_attempts") + handler_attempts_wire(result.handler_attempts) +
         wire::key("input_trace") + input_trace_wire(result.input_trace) +
         wire::key("output_trace") + output_trace_wire(result.output_trace, trace_chunks) +
         wire::key("failed_item") + failed_item_wire(result) +
@@ -909,54 +858,22 @@ int run_request(
     }
 
     auto last_progress_emit = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-    unsigned int coalesced_progress_events = 0;
-    bool extract_started = false;
-    auto *cpu_job_context = sunpack::sevenzip::current_native_cpu_job_context();
+    bool reported_bytes = false;
     const bool volume_trials = !request.archive_input.volume_attempts.layouts.empty();
-    auto progress = [&job_id, last_progress_emit, coalesced_progress_events, extract_started, cpu_job_context, volume_trials](const ExtractProgressEvent& event) mutable {
+    auto progress = [&job_id, last_progress_emit, reported_bytes, volume_trials](const ExtractProgressEvent& event) mutable {
             if (volume_trials && event.event == "item_failed") return;
             const auto now = std::chrono::steady_clock::now();
-            if (!extract_started && event.completed_bytes > 0) {
-                extract_started = true;
-                print_frame(
-                    (wire::object() + wire::key("type") + wire::text("progress") + wire::key("job_id")) + wire::text(job_id) +
-                    (wire::key("event") + wire::text("extract_started")) +
-                    wire::key("completed_bytes") + wire::number(event.completed_bytes) +
-                    wire::key("total_bytes") + wire::number(event.total_bytes) +
-                    wire::key("item_index") + wire::number(event.item_index) +
-                    wire::key("item_path") + wire::text(wide_to_utf8(event.item_path)) +
-                    wire::key("coalesced_events") + wire::number(coalesced_progress_events) + wire::end());
-                const auto cpu = cpu_job_context
-                    ? cpu_job_context->snapshot()
-                    : sunpack::sevenzip::NativeCpuJobSnapshot{};
-                print_frame(
-                    (wire::object() + wire::key("type") + wire::text("native_cpu") + wire::key("job_id")) + wire::text(job_id) +
-                    (wire::key("event") + wire::text("decoder_started")) +
-                    wire::key("decoder_cpu_credits") + wire::number(1 + cpu.current_extra_credits) +
-                    wire::key("current_decoder_extra_credits") + wire::number(cpu.current_extra_credits) +
-                    wire::key("peak_decoder_extra_credits") + wire::number(cpu.peak_extra_credits) +
-                    wire::key("decoder_parallel") + wire::boolean(cpu.current_extra_credits) +
-                    wire::end());
-            }
-            const bool failure = event.event == "item_failed";
-            const bool boundary = event.event == "total" ||
+            const bool first_bytes = !reported_bytes && event.completed_bytes > 0;
+            const bool boundary = event.event == "total" || event.event == "item_failed" ||
                 (event.event == "item_start" && event.item_index == 0) ||
                 (event.event == "item_done" && event.item_index % 128 == 0);
-            const bool interval_elapsed = now - last_progress_emit >= std::chrono::milliseconds(100);
-            if (!failure && !boundary && !interval_elapsed) {
-                ++coalesced_progress_events;
-                return;
-            }
+            if (!first_bytes && !boundary && now - last_progress_emit < std::chrono::milliseconds(100)) return;
             print_frame(
                 (wire::object() + wire::key("type") + wire::text("progress") + wire::key("job_id")) + wire::text(job_id) +
-                wire::key("event") + wire::text(event.event) +
                 wire::key("completed_bytes") + wire::number(event.completed_bytes) +
-                wire::key("total_bytes") + wire::number(event.total_bytes) +
-                wire::key("item_index") + wire::number(event.item_index) +
-                wire::key("item_path") + wire::text(wide_to_utf8(event.item_path)) +
-                wire::key("coalesced_events") + wire::number(coalesced_progress_events) + wire::end());
+                wire::key("total_bytes") + wire::number(event.total_bytes) + wire::end());
+            reported_bytes |= first_bytes;
             last_progress_emit = now;
-            coalesced_progress_events = 0;
     };
 
     if (!request.archive_input.validation_error.empty()) {
@@ -1238,7 +1155,8 @@ int run_request(
             volume_attempt_fields += (wire::end() + wire::end());
         }
     }
-    const auto manifest_summary = verified_manifest_wire(job_id, result, ok && !dry_run);
+    const std::string manifest_field = (ok && !dry_run)
+        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result) : "";
     const auto trace_chunks = (!ok || dry_run) ? emit_output_trace_chunks(job_id, result.output_trace) : 0;
     const std::string failure_fields = ok ? "" :
         wire::key("failure_stage") + wire::text(result.failure_stage) +
@@ -1294,10 +1212,7 @@ int run_request(
         wire::key("dry_run") + wire::boolean(dry_run) +
         wire::key("open_mode") + wire::text(open_mode) +
         wire::key("archive_type") + wire::text(wide_to_utf8(result.archive_type)) +
-        wire::key("requested_codepage") + wire::text(wide_to_utf8(result.requested_codepage)) +
-        wire::key("applied_codepage") + wire::text(wide_to_utf8(result.applied_codepage)) +
-        wire::key("filename_decoder") + wire::text(wide_to_utf8(result.filename_decoder)) +
-        wire::key("verified_manifest") + manifest_summary +
+        manifest_field +
         wire::key("failed_item") + wire::text(wide_to_utf8(result.failed_item)) +
         wire::key("message") + wire::text(result.message) + metadata_warning_field +
         failure_fields + input_trace_field

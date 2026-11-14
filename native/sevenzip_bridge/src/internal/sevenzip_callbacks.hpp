@@ -1003,7 +1003,7 @@ namespace sunpack::sevenzip
 
             total_bytes_ = total;
 
-            emit("total", 0, L"");
+            emit("total");
 
             return S_OK;
         }
@@ -1023,7 +1023,7 @@ namespace sunpack::sevenzip
 
                 completed_bytes_ = *completeValue;
 
-                emit("progress", current_index_, current_item_);
+                emit("progress");
             }
 
             return S_OK;
@@ -1139,11 +1139,6 @@ namespace sunpack::sevenzip
 
             if (output_trace_)
             {
-
-                output_trace_->current_item_index = index;
-
-                output_trace_->current_item_path = name;
-
                 output_trace_->current_item_bytes_written = 0;
 
                 begin_item_trace(
@@ -1160,7 +1155,7 @@ namespace sunpack::sevenzip
             // Like 7z's normal x mode, ignore entries denoting the output root.
             if (is_dir && (name == L"." || name == L"./" || name == L".\\"))
             {
-                emit("item_start", index, name);
+                emit("item_start");
                 dirs_written_ += 1;
                 return S_OK;
             }
@@ -1183,7 +1178,7 @@ namespace sunpack::sevenzip
                 return E_INVALIDARG;
             }
 
-            emit("item_start", index, name);
+            emit("item_start");
 
             std::filesystem::path target;
             ReplayFile *receipt = nullptr;
@@ -1381,7 +1376,7 @@ namespace sunpack::sevenzip
                 failed_item_bytes_written_ = current_item_bytes_written_;
             }
 
-            emit(opRes == kOpOk ? "item_done" : "item_failed", current_index_, current_item_);
+            emit(opRes == kOpOk ? "item_done" : "item_failed");
 
             if (async_writer_)
             {
@@ -1937,30 +1932,10 @@ namespace sunpack::sevenzip
             output_trace_->last_win32_error = win32_error;
         }
 
-        void emit(const std::string &event, UInt32 item_index, const std::wstring &item_path)
+        // The callback methods already hold state_mutex_.
+        void emit(std::string_view event)
         {
-
-            std::lock_guard<std::recursive_mutex> lock(state_mutex_);
-
-            if (!progress_)
-            {
-
-                return;
-            }
-
-            ExtractProgressEvent progress;
-
-            progress.event = event;
-
-            progress.completed_bytes = completed_bytes_;
-
-            progress.total_bytes = total_bytes_;
-
-            progress.item_index = item_index;
-
-            progress.item_path = item_path;
-
-            progress_(progress);
+            if (progress_) progress_({event, completed_bytes_, total_bytes_, current_index_});
         }
 
 

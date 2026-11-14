@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <functional>
 #include <memory>
@@ -69,19 +70,10 @@ struct PasswordTestResult {
 };
 
 struct ExtractProgressEvent {
-    std::string event;
+    std::string_view event;
     unsigned long long completed_bytes = 0;
     unsigned long long total_bytes = 0;
     unsigned int item_index = 0;
-    std::wstring item_path;
-};
-
-struct ExtractHandlerAttempt {
-    std::wstring format;
-    int create_hresult = 0;
-    int open_hresult = 0;
-    bool created = false;
-    bool opened = false;
 };
 
 struct ExtractInputTrace {
@@ -166,10 +158,8 @@ struct ExtractOutputTrace {
     unsigned long long total_bytes_written = 0;
     unsigned long long current_item_bytes_written = 0;
     unsigned long long last_write_size = 0;
-    unsigned int current_item_index = 0;
     int last_hresult = 0;
     int last_win32_error = 0;
-    std::wstring current_item_path;
     std::vector<ExtractOutputItemTrace> items;
     unsigned int metadata_failed_files = 0;
     unsigned int metadata_failed_directories = 0;
@@ -216,16 +206,12 @@ struct ExtractArchiveResult {
     std::wstring archive_type;
     std::wstring failed_item;
     std::wstring missing_volume_name;
-    std::wstring requested_codepage;
-    std::wstring applied_codepage;
-    std::wstring filename_decoder;
     std::string failure_stage;
     std::string failure_kind;
     std::string missing_volume_evidence;
     std::string message;
     ExtractInputTrace input_trace;
     ExtractOutputTrace output_trace;
-    std::vector<ExtractHandlerAttempt> handler_attempts;
 };
 
 using ExtractProgressCallback = std::function<void(const ExtractProgressEvent&)>;

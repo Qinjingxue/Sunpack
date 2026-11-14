@@ -136,10 +136,7 @@ struct InputFrame {
 }
 
 #[derive(Default)]
-struct WriteCompletion {
-    state: Mutex<WriteState>,
-    changed: Condvar,
-}
+struct WriteCompletion(Mutex<WriteState>);
 
 #[derive(Default)]
 struct WriteState {
@@ -150,18 +147,17 @@ struct WriteState {
 impl WriteCompletion {
     fn finish(&self, result: io::Result<()>) {
         let wake = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.0.lock().unwrap();
             state.result = Some(result);
             state.waker.take()
         };
-        self.changed.notify_all();
         if let Some(wake) = wake {
             wake.wake();
         }
     }
 
     fn poll(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.0.lock().unwrap();
         if let Some(result) = state.result.take() {
             Poll::Ready(result)
         } else {
@@ -177,12 +173,7 @@ impl WriteCompletion {
     // Final shutdown and synchronous transport tests use the same ordered
     // writer as asynchronous submissions and process-mode changes.
     fn wait_blocking(&self) -> io::Result<()> {
-        let state = self.state.lock().unwrap();
-        let mut state = self
-            .changed
-            .wait_while(state, |state| state.result.is_none())
-            .unwrap();
-        state.result.take().unwrap()
+        super::scheduling::block_on(self.wait())
     }
 }
 

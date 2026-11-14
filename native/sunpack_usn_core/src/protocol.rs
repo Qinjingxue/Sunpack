@@ -222,25 +222,6 @@ impl Response {
     }
 }
 
-pub fn parse_file_id(value: &str) -> io::Result<([u8; FILE_ID_BYTES], u8)> {
-    let normalized = value.trim();
-    if normalized.len() != 16 && normalized.len() != 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "file ID must contain 8 or 16 bytes",
-        ));
-    }
-    let width = (normalized.len() / 2) as u8;
-    let mut little_endian = [0u8; FILE_ID_BYTES];
-    for (index, byte) in little_endian.iter_mut().enumerate().take(width as usize) {
-        let source = normalized.len() - (index + 1) * 2;
-        *byte = u8::from_str_radix(&normalized[source..source + 2], 16).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "file ID is not hexadecimal")
-        })?;
-    }
-    Ok((little_endian, width))
-}
-
 pub fn format_file_id(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut text = String::with_capacity(bytes.len() * 2);
@@ -257,14 +238,14 @@ mod tests {
 
     #[test]
     fn fixed_request_roundtrip_preserves_journal_query_fields() {
-        let (file_id, file_id_len) = parse_file_id("0000000000001234").unwrap();
+        let file_id = 0x1234u128.to_le_bytes();
         let request = Request {
             opcode: Opcode::ReadChangeReasons,
             request_id: 42,
             previous_usn: 100,
             current_usn: 101,
             file_id,
-            file_id_len,
+            file_id_len: 8,
             volume_guid: r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}".to_owned(),
         };
         assert_eq!(
@@ -286,11 +267,5 @@ mod tests {
         };
 
         assert_eq!(Response::decode(&response.encode()).unwrap(), response);
-    }
-
-    #[test]
-    fn file_id_parser_rejects_non_hex_and_unbounded_widths() {
-        assert!(parse_file_id("not-hex-not-hex!").is_err());
-        assert!(parse_file_id(&"0".repeat(34)).is_err());
     }
 }

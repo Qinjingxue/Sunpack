@@ -229,7 +229,6 @@ namespace sunpack::sevenzip
         ExtractArchiveResult result;
 
         result.backend_available = true;
-        result.requested_codepage = codepage;
 
 #ifdef SUP7Z_DEBUG
         auto pipeline_timing = std::make_shared<PipelineTiming>(pipeline_timing_enabled());
@@ -348,14 +347,6 @@ namespace sunpack::sevenzip
             const GUID &format = formats[attempt_index % formats.size()];
             const UInt64 *search_limit = attempt_index < formats.size() ? &start_only : nullptr;
 
-            ExtractHandlerAttempt attempt;
-
-            attempt.format = canonical_archive_type_for_guid(format);
-            if (attempt.format.empty())
-            {
-                attempt.format = L"unknown";
-            }
-
             CMyComPtr<IInArchive> archive;
 
 #ifdef SUP7Z_DEBUG
@@ -368,28 +359,19 @@ namespace sunpack::sevenzip
             HRESULT hr = create_in_archive(format, &archive);
 #endif
 
-            attempt.create_hresult = static_cast<int>(hr);
-
-            if (set_memory_failure(result, "handler_create", hr)) {
-                result.handler_attempts.push_back(attempt);
-                return result;
-            }
+            if (set_memory_failure(result, "handler_create", hr)) return result;
 
             if (hr != S_OK || !archive)
             {
 
                 last_hr = hr;
 
-                result.handler_attempts.push_back(attempt);
-
                 continue;
             }
 
-            attempt.created = true;
-
             any_format_created = true;
 
-            if (!codepage.empty() && attempt.format == L"zip")
+            if (!codepage.empty() && format.Data4[5] == 0x01)
             {
                 hr = apply_zip_codepage(archive.Interface(), codepage);
                 if (hr != S_OK)
@@ -397,11 +379,8 @@ namespace sunpack::sevenzip
                     result.status = PasswordTestStatus::Error;
                     set_failure(result, "filename_encoding", "codepage_apply_failed", hr);
                     result.message = "ZIP filename codepage could not be applied to the archive handler";
-                    result.handler_attempts.push_back(attempt);
                     return result;
                 }
-                result.applied_codepage = codepage;
-                result.filename_decoder = L"sevenzip_zip_codepage";
             }
 
             bool stream_opened = false;
@@ -432,8 +411,6 @@ namespace sunpack::sevenzip
 
                 result.message = "archive file could not be opened";
 
-                result.handler_attempts.push_back(attempt);
-
                 return result;
             }
 
@@ -460,11 +437,7 @@ namespace sunpack::sevenzip
             // evidence observed by an earlier handler for this password.
             last_encryption_evidence = last_encryption_evidence || raw_open_callback->password_requested();
 
-            if (set_memory_failure(result, "archive_open", hr)) {
-                attempt.open_hresult = static_cast<int>(hr);
-                result.handler_attempts.push_back(attempt);
-                return result;
-            }
+            if (set_memory_failure(result, "archive_open", hr)) return result;
 
             const auto volume_read_failed = [&]() {
                 const HRESULT callback_error = raw_open_callback->input_error();
@@ -494,25 +467,16 @@ namespace sunpack::sevenzip
                     "open_volume_callback_not_found",
                     raw_open_callback->missing_volume_name(),
                     hr);
-                result.handler_attempts.push_back(attempt);
                 return result;
             }
-
-            attempt.open_hresult = static_cast<int>(hr);
 
             if (hr != S_OK)
             {
 
                 last_hr = hr;
 
-                result.handler_attempts.push_back(attempt);
-
                 continue;
             }
-
-            attempt.opened = true;
-
-            result.handler_attempts.push_back(attempt);
 
             any_opened = true;
 

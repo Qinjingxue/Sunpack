@@ -135,7 +135,7 @@ impl Engine {
         &self, name: &'static str, origin: Origin, work: impl FnOnce() -> T + Send,
     ) -> io::Result<T> {
         if super::scheduling::in_stage() { return Ok(work()); }
-        let cancel = Cancellation::new();
+        let cancel = Cancellation::default();
         let id = self.next_id();
         self.scheduler.get_or_init(Scheduler::new).run(id, origin, &cancel, |_| Box::pin(async {
             stage(name, &cancel).await?;
@@ -181,7 +181,7 @@ impl Engine {
                     }.await;
                     // Failure to create the executor is an error completion,
                     // not permission to run normal reporting on the driver.
-                    match stage("report", &Cancellation::new()).await {
+                    match stage("report", &Cancellation::default()).await {
                         Ok(()) => complete(result),
                         Err(error) => complete(Err(error)),
                     }
@@ -1247,7 +1247,7 @@ impl<'run, O: Observer> Run<'run, O> {
         // Scheduler completion joins every writer, even on cancellation. Never
         // roll back a tree while a native job or recursive branch can write it.
         if self.request.cancel.cancelled() {
-            stage("cancel_cleanup", &Cancellation::new()).await?;
+            stage("cancel_cleanup", &Cancellation::default()).await?;
             let mut discarded = Outcome::default();
             self.created_outputs.lock().unwrap().rollback(
                 &*self.observer, executed.as_mut().unwrap_or(&mut discarded),
@@ -1405,7 +1405,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     discovery_source: task.source,
                     ..ArchiveResult::default()
                 };
-                let ready = stage("report", &Cancellation::new()).await;
+                let ready = stage("report", &Cancellation::default()).await;
                 let id = owner.queue_task(task.entry(), depth, parent_id, || None);
                 let mut result = match ready {
                     Ok(()) => owner.execute_task((task, sources, keys, requested), id, depth, scope, children).await,
@@ -1422,7 +1422,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 (id, cancelled, result, unowned_errors)
             })
         }).await;
-        stage("report", &Cancellation::new()).await?;
+        stage("report", &Cancellation::default()).await?;
         outcome.uncommitted |= executed.len() != task_count;
         let mut first_error = None;
         for (id, mut cancelled, branch, unowned_errors) in executed {
@@ -1465,7 +1465,7 @@ impl<'run, O: Observer> Run<'run, O> {
 
     async fn finish_root(&self, id: TaskId, path: &Path, result: io::Result<Outcome>) -> io::Result<Outcome> {
         if result.as_ref().is_ok_and(Outcome::settled) {
-            stage("report", &Cancellation::new()).await?;
+            stage("report", &Cancellation::default()).await?;
             let mut outcome = self.observer.root_finished(id, path, result.unwrap().into(), self.output_names.owner).await?;
             if self.request.mode == Mode::Extract {
                 outcome.compact_completed_extract();
@@ -1724,8 +1724,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 outcome.archives = completed.into();
                 if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
-                    outcome.archives = this.observer.scope_finished(task_id,
-                        std::mem::take(&mut outcome.archives).into_vec()).await?.into();
+                    this.observer.scope_finished(task_id, outcome.archives.iter()).await?;
                 }
                 return Ok(outcome);
             }
@@ -2223,7 +2222,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut children = Outcome::default();
             for (index, descendant) in descendants {
                 let (mut result, mut descendants, ran_recursive_children) = descendant?;
-                stage("output_state", &Cancellation::new()).await?;
+                stage("output_state", &Cancellation::default()).await?;
                 let mut children_complete = !cancel.cancelled() && descendants.subtree_complete();
                 if result.failure.is_none() && children_complete && !cancel.cancelled()
                 {
@@ -2408,7 +2407,7 @@ impl<'run, O: Observer> Run<'run, O> {
             let mut root_cleanup = None;
             if sources_complete && this.request.mode == Mode::Extract {
                 if let Some(family) = completed_family {
-                    stage("output_state", &Cancellation::new()).await?;
+                    stage("output_state", &Cancellation::default()).await?;
                     this.observer.sources_processed(family,
                         carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
                 }
@@ -2541,10 +2540,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
             }
             if depth == 1 && this.request.mode == Mode::Extract && !cancel.cancelled() {
-                outcome.archives = this
-                    .observer
-                    .scope_finished(task_id, std::mem::take(&mut outcome.archives).into_vec())
-                    .await?.into();
+                this.observer.scope_finished(task_id, outcome.archives.iter()).await?;
             }
             Ok(outcome)
         })
@@ -3138,8 +3134,8 @@ impl<'run, O: Observer> Run<'run, O> {
             }
         };
         drop(password_probe);
-        if plan.verified {
-            result.password = plan.selected.as_deref().map(str::to_owned);
+        if let Some(password) = &plan.verified_password {
+            result.password = Some(password.to_string());
         }
         let codepage = if self.request.mode == Mode::Extract
             && input.format_hint == "zip"
@@ -3170,9 +3166,12 @@ impl<'run, O: Observer> Run<'run, O> {
             "request_id": self.worker_request_id,
             "origin": if self.request.origin == Origin::Watch { "watch" } else { "foreground" },
             "output_dir": output_string, "output_volume_key": volume_key,
-            "archive_input": input.worker_input(), "password": plan.selected.as_deref().unwrap_or(""),
-            "password_verified": plan.verified, "password_candidates": plan.candidates,
+            "archive_input": input.worker_input(), "password_candidates": plan.candidates,
         });
+        if let Some(password) = &plan.verified_password {
+            request["password"] = Value::String(password.to_string());
+            request["password_verified"] = Value::Bool(true);
+        }
         if let Some(encrypted) = plan.encrypted {
             request["encrypted"] = Value::Bool(encrypted);
         }
@@ -3260,7 +3259,7 @@ impl<'run, O: Observer> Run<'run, O> {
                 }
                 if success && result.failure.is_none() {
                     let password_verified = self.request.mode == Mode::Extract
-                        || plan.verified
+                        || plan.verified_password.is_some()
                         || flag(value, "password_verified");
                     if result.encrypted == Some(true) && password_verified {
                         result.password = plan
@@ -3292,27 +3291,25 @@ impl<'run, O: Observer> Run<'run, O> {
                     {
                         plan.remember_rejections(&self.engine.password_attempts);
                     }
-                    if failure.kind != FailureKind::PasswordInconclusive
-                        && recoverable_content_failure(&frame)
-                    {
-                        if let Some(output) = &output {
-                            let verified_files = recoverable_file_count(&frame);
-                            let stats = scan_output_inventory_impl(&output_string);
-                            // Retaining damaged payload is not partial success:
-                            // main keeps nonempty failed output for manual recovery,
-                            // but only verified files authorize recursive processing.
-                            if verified_files > 0 || stats.file_count() > 0 {
-                                result.recovered_complete_files = recovery_complete_files(&failure, verified_files as u64);
-                                result.partial = accepts_partial_content(
-                                    self.request.config.extraction.content_requirement,
-                                    failure.kind, result.recovered_complete_files,
-                                );
-                                result.files = stats.file_count() as u64;
-                                result.bytes = stats.total_size();
-                                result.output = Some(output.clone());
-                                if result.partial {
-                                    inventory = Some(stats);
-                                }
+                    if let Some((output, verified_files)) = output.as_ref().zip(
+                        (failure.kind != FailureKind::PasswordInconclusive)
+                            .then(|| recoverable_file_count(&frame)).flatten(),
+                    ) {
+                        let stats = scan_output_inventory_impl(&output_string);
+                        // Retaining damaged payload is not partial success:
+                        // main keeps nonempty failed output for manual recovery,
+                        // but only verified files authorize recursive processing.
+                        if verified_files > 0 || stats.file_count() > 0 {
+                            result.recovered_complete_files = recovery_complete_files(&failure, verified_files as u64);
+                            result.partial = accepts_partial_content(
+                                self.request.config.extraction.content_requirement,
+                                failure.kind, result.recovered_complete_files,
+                            );
+                            result.files = stats.file_count() as u64;
+                            result.bytes = stats.total_size();
+                            result.output = Some(output.clone());
+                            if result.partial {
+                                inventory = Some(stats);
                             }
                         }
                     }
@@ -4029,7 +4026,7 @@ fn accepts_partial_content(requirement: ContentRequirement, failure: FailureKind
         && complete_files > 0
 }
 
-fn recoverable_content_failure(frame: &WorkerFrame) -> bool {
+fn recoverable_file_count(frame: &WorkerFrame) -> Option<usize> {
     let kind = frame.summary["failure_kind"].as_str().unwrap_or_default();
     let stage = frame.summary["failure_stage"].as_str().unwrap_or_default();
     if matches!(
@@ -4050,36 +4047,16 @@ fn recoverable_content_failure(frame: &WorkerFrame) -> bool {
             | "stream_truncated"
     ) || matches!(stage, "item_extract" | "archive_extract" | "archive_read"))
     {
-        return false;
+        return None;
     }
-    true
-}
-
-fn recoverable_file_count(frame: &WorkerFrame) -> usize {
-    if !recoverable_content_failure(frame) {
-        return 0;
-    }
-    if let Some(preview) = &frame.recovery {
-        return preview.complete_files;
-    }
-    frame.manifest.as_ref().map_or(0, |manifest| {
-        manifest
-            .records()
-            .iter()
-            .filter(|record| record.status == 1)
-            .count()
-    })
+    Some(frame.recovery.as_ref().map_or(0, |preview| preview.complete_files))
 }
 
 fn inventory_for(frame: &WorkerFrame, path: &str) -> NativeOutputInventory {
-    let validated = frame
-        .summary
-        .get("verified_manifest")
-        .is_some_and(|value| flag(value, "validated"));
     if let Some(manifest) = frame
         .manifest
         .as_ref()
-        .filter(|manifest| validated && manifest.complete())
+        .filter(|manifest| manifest.complete())
     {
         manifest.to_output_inventory(path.to_owned())
     } else {
@@ -6328,10 +6305,8 @@ mod tests {
             mtime_ns: Some(1),
             magic: Box::from(&data[..data.len().min(512)]),
         }).collect();
-        NativeWorkerManifest::from_parts(records, [
-            1, files.len() as u64, 0,
-            files.iter().map(|(_, data)| data.len() as u64).sum(), 1,
-        ]).unwrap()
+        NativeWorkerManifest::from_parts(records, true,
+            files.iter().map(|(_, data)| data.len() as u64).sum())
     }
 
     #[test]
@@ -8118,8 +8093,7 @@ mod tests {
             frame.recovery = Some(super::super::RecoveryPreview {
                 complete_files: 2, ..Default::default()
             });
-            assert_eq!(recoverable_content_failure(&frame), expected);
-            assert_eq!(recoverable_file_count(&frame), if expected { 2 } else { 0 });
+            assert_eq!(recoverable_file_count(&frame), expected.then_some(2));
         }
         for kind in [FailureKind::Damaged, FailureKind::MissingVolume,
             FailureKind::WrongPassword, FailureKind::Unsupported, FailureKind::PasswordInconclusive] {

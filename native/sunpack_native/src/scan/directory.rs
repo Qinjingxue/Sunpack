@@ -239,35 +239,26 @@ pub(crate) struct OutputFileRecord {
 pub(crate) struct NativeWorkerManifest {
     files: Arc<Vec<OutputFileRecord>>,
     complete: bool,
-    file_count: usize,
     total_size: u64,
 }
 
 impl NativeWorkerManifest {
-    /// Build from parsed rows and the five-column `inventory` summary.
     pub(crate) fn from_parts(
         files: Vec<OutputFileRecord>,
-        inventory: [u64; 5],
-    ) -> std::io::Result<Self> {
-        let count = |value: u64, what: &str| {
-            usize::try_from(value).map_err(|_| {
-                std::io::Error::other(format!("worker manifest {what} is out of range"))
-            })
-        };
-        let file_count = count(inventory[1], "file count")?;
+        complete: bool,
+        total_size: u64,
+    ) -> Self {
         // The immutable table owns this fact. Consumers must not repeatedly
         // walk every row, or trust a complete summary with incomplete rows.
-        let complete = inventory[0] != 0
-            && file_count == files.len()
-            && files.iter().all(|item| item.status == 1);
-        Ok(Self {
+        let complete = complete && files.iter().all(|item| item.status == 1);
+        Self {
             files: Arc::new(files),
             complete,
-            file_count,
-            total_size: inventory[3],
-        })
+            total_size,
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn records(&self) -> &Arc<Vec<OutputFileRecord>> {
         &self.files
     }
@@ -280,7 +271,7 @@ impl NativeWorkerManifest {
     pub(crate) fn to_output_inventory(&self, root: String) -> NativeOutputInventory {
         NativeOutputInventory {
             root,
-            file_count: self.file_count,
+            file_count: self.files.len(),
             total_size: self.total_size,
             unreadable_count: 0,
             files: Arc::clone(&self.files),
@@ -1775,74 +1766,32 @@ impl NativeWatchCatalog {
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
     ) -> Vec<String> {
-        let tables = self.catalogs.lock().unwrap();
-        let mut directories = vec![scope.root.clone()];
-        if scope.max_depth != Some(0) {
-            if let Some(table) = tables.get(&crate::path_keys::path_key(&scope.root)) {
-                directories.extend(
-                    table
-                        .rows
-                        .values()
-                        .filter(|r| r.persistent() && r.is_dir())
-                        .map(|r| r.path())
-                        .filter(|path| scope.contains(path) && !self.is_owned(path)),
-                );
-            }
+        if scope.max_depth == Some(0) {
+            return vec![scope.root.clone()];
         }
+        let mut directories: Vec<_> = {
+            let tables = self.catalogs.lock().unwrap();
+            std::iter::once(scope.root.clone())
+                .chain(tables.get(&crate::path_keys::path_key(&scope.root))
+                    .into_iter()
+                    .flat_map(|table| table.rows.values())
+                    .filter(|row| row.persistent() && row.is_dir())
+                    .map(CatalogRow::path))
+                .collect()
+        };
+        // The root is always queried, including when its children are excluded.
+        let mut first = true;
+        directories.retain(|path| {
+            std::mem::take(&mut first) || (scope.contains(path) && !self.is_owned(path))
+        });
         directories
     }
     pub(crate) fn output_roots(&self, under: &str) -> Vec<String> {
-        let key = format!(
-            "owned|{}",
-            crate::path_keys::path_key(under).trim_end_matches('\\')
-        );
-        let records = {
-            let data = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
-            let mut records = Vec::new();
-            let mut current = key.as_str();
-            loop {
-                if let Some(value) = data.runtime.get(current) {
-                    records.push((current["owned|".len()..].to_owned(), value.clone()));
-                }
-                let Some((parent, _)) = current.rsplit_once('\\') else {
-                    break;
-                };
-                current = parent;
-            }
-            let prefix = format!("{key}\\");
-            records.extend(
-                data.runtime
-                    .range(prefix.clone()..)
-                    .take_while(|(key, _)| key.starts_with(&prefix))
-                    .map(|(key, value)| (key["owned|".len()..].to_owned(), value.clone())),
-            );
-            records
-        };
-        // Snapshot only intersecting aliases from the existing ordered index.
-        // Identity I/O must not hold the shared Watch state lock.
-        records
-            .into_iter()
-            .filter(|(_, value)| crate::watch_store::output_identity_matches(value))
-            .map(|(path, _)| path)
-            .collect()
+        crate::watch_store::owned_outputs::owned_roots(&self.outputs, under)
     }
+
     pub(crate) fn is_owned(&self, path: &str) -> bool {
-        let key = crate::path_keys::path_key(path);
-        let mut current = key.trim_end_matches('\\');
-        let data = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if data
-                .runtime
-                .get(&format!("owned|{current}"))
-                .is_some_and(crate::watch_store::output_identity_matches)
-            {
-                return true;
-            }
-            let Some((parent, _)) = current.rsplit_once('\\') else {
-                return false;
-            };
-            current = parent;
-        }
+        crate::watch_store::owned_outputs::find_owned_root(&self.outputs, path).is_some()
     }
 }
 

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-mod owned_outputs;
+pub(crate) mod owned_outputs;
 
 fn recorded_file_presence(path: &str) -> Option<bool> {
     match std::fs::metadata(path) {
@@ -95,28 +95,9 @@ impl PathSet {
 
 // A carrier and its logical segments can have the same physical source.
 // Keep their output ownership independent without inventing synthetic paths.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ActiveOutputs(BTreeMap<String, Vec<String>>);
-
-impl<'de> Deserialize<'de> for ActiveOutputs {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Outputs {
-            Single(String),
-            Multiple(Vec<String>),
-        }
-        let values = BTreeMap::<String, Outputs>::deserialize(deserializer)?;
-        Ok(Self(values.into_iter().map(|(task, outputs)| {
-            let outputs = match outputs {
-                Outputs::Single(output) => vec![output],
-                Outputs::Multiple(outputs) => outputs,
-            };
-            (task, outputs)
-        }).collect()))
-    }
-}
 
 impl ActiveOutputs {
     pub(crate) fn is_empty(&self) -> bool {
@@ -412,7 +393,7 @@ enum Operation {
     Delete(Collection, String),
     SetMetadata(i64, String),
     SetCursors(BTreeMap<String, Cursor>),
-    Runtime(String, Option<Value>),
+    Runtime(String, Option<Arc<Value>>),
     Promoted(String, Option<Arc<PromotedSource>>),
 }
 
@@ -515,7 +496,7 @@ pub(crate) struct StateData {
     password_generation: i64,
     password_source_signature: String,
     cursors: BTreeMap<String, Cursor>,
-    pub(crate) runtime: BTreeMap<String, Value>,
+    runtime: BTreeMap<String, Arc<Value>>,
     promoted: BTreeMap<String, Arc<PromotedSource>>,
 }
 
@@ -605,6 +586,25 @@ impl NativeWatchOperations {
         Self {
             operations: Arc::new(Operations::default()),
         }
+    }
+
+    pub(crate) fn set_runtime(&mut self, key: String, value: Option<Value>) {
+        Arc::make_mut(&mut self.operations)
+            .0
+            .push(Operation::Runtime(key, value.map(Arc::new)));
+    }
+
+    pub(crate) fn relocate_output(
+        &mut self,
+        owner: &str,
+        source: String,
+        destination: String,
+        identity: String,
+    ) {
+        Arc::make_mut(&mut self.operations).0.push(Operation::Output(
+            path_key(owner),
+            OutputChange::Relocate { source, destination, identity },
+        ));
     }
 
     pub(crate) fn put_entry(&mut self, entry: Arc<EntryRecord>) {
@@ -747,7 +747,7 @@ struct SnapshotDocument<'a> {
     watch_cursors: &'a BTreeMap<String, Cursor>,
     pending_work: Records<'a, PendingRecord>,
     entries: Records<'a, EntryRecord>,
-    runtime: &'a BTreeMap<String, Value>,
+    runtime: &'a BTreeMap<String, Arc<Value>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     promoted: &'a BTreeMap<String, Arc<PromotedSource>>,
 }
@@ -761,7 +761,7 @@ struct SnapshotInput {
     pending_work: HashMap<String, Arc<PendingRecord>>,
     #[serde(deserialize_with = "read_records")]
     entries: HashMap<String, Arc<EntryRecord>>,
-    runtime: BTreeMap<String, Value>,
+    runtime: BTreeMap<String, Arc<Value>>,
     #[serde(default)]
     promoted: BTreeMap<String, Arc<PromotedSource>>,
 }
@@ -1053,7 +1053,8 @@ impl NativeWatchState {
                 return Ok(None);
             };
             if let Some(keep) = keep {
-                if !record.active_outputs.contains(&task, &output) {
+                let active = record.active_outputs.contains(&task, &output);
+                if !active {
                     if !keep {
                         // Rollback can remove a previously committed output.
                         // Finish must revoke its recovery and owned exclusions
@@ -1069,8 +1070,7 @@ impl NativeWatchState {
                         }));
                     }
                 }
-                keep && (!record.active_outputs.contains(&task, &output)
-                    || !record.output_identities.contains_key(&output))
+                keep && (!active || !record.output_identities.contains_key(&output))
             } else {
                 true
             }
@@ -1135,8 +1135,7 @@ impl NativeWatchState {
                 }));
             }
             if register {
-                operations.extend(NativeWatchOperations::owned_outputs(&owned_paths, &[&identity])
-                    .operations.0.iter().cloned());
+                operations.extend(owned_outputs::owned_operations(&owned_paths, &[&identity]));
             }
             OutputChange::Start {
                 task,
@@ -1150,7 +1149,7 @@ impl NativeWatchState {
         }))
     }
 
-    pub(crate) fn runtime_record(&self, key: &str) -> Option<Value> {
+    pub(crate) fn runtime_record(&self, key: &str) -> Option<Arc<Value>> {
         self.lock().runtime.get(key).cloned()
     }
 
@@ -1164,17 +1163,7 @@ impl NativeWatchState {
     }
 
     pub(crate) fn owned_root(&self, path: &str) -> Option<String> {
-        let key = path_key(path);
-        let records = {
-            let data = self.lock();
-            crate::path_keys::path_ancestors(&key).filter_map(|ancestor| {
-                data.runtime.get(&format!("owned|{ancestor}"))
-                    .map(|record| (ancestor.to_owned(), record.clone()))
-            }).collect::<Vec<_>>()
-        };
-        records.into_iter().find_map(|(path, record)| {
-            output_identity_matches(&record).then_some(path)
-        })
+        owned_outputs::find_owned_root(&self.data, path)
     }
 
     pub(crate) fn new() -> Self {
@@ -1403,20 +1392,6 @@ impl NativeWatchState {
         self.lock().cursors.get(&volume_key.to_lowercase()).copied()
     }
 
-    /// Validate external journal operation inputs with the replay schema.
-    pub(crate) fn decode_operations(
-        &self,
-        operations: &[Value],
-    ) -> std::io::Result<NativeWatchOperations> {
-        let decoded = operations
-            .iter()
-            .map(decode_operation)
-            .collect::<std::io::Result<_>>()?;
-        Ok(NativeWatchOperations {
-            operations: Arc::new(Operations(decoded)),
-        })
-    }
-
     pub(crate) fn apply(&self, operations: &NativeWatchOperations) {
         self.apply_operations(&operations.operations);
     }
@@ -1482,159 +1457,6 @@ pub(crate) fn is_path_under(path: &str, root: &str) -> bool {
 
 fn invalid(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
-}
-
-fn require_fields(object: &Map<String, Value>, required: &[&str]) -> std::io::Result<()> {
-    if required.iter().any(|name| !object.contains_key(*name))
-        || object.keys().any(|name| !required.contains(&name.as_str()))
-    {
-        return Err(invalid("invalid journal operation fields"));
-    }
-    Ok(())
-}
-
-fn decode_record<T: for<'de> Deserialize<'de>>(value: &Value) -> std::io::Result<T> {
-    if !value.is_object() {
-        return Err(std::io::Error::other(
-            "state record value must be an object",
-        ));
-    }
-    T::deserialize(value).map_err(|error| std::io::Error::other(error.to_string()))
-}
-
-fn decode_operation(operation: &Value) -> std::io::Result<Operation> {
-    let Some(object) = operation.as_object() else {
-        return Err(std::io::Error::other("journal operation must be an object"));
-    };
-    let action = object
-        .get("op")
-        .and_then(Value::as_str)
-        .ok_or_else(|| std::io::Error::other("journal operation op must be a string"))?;
-    match action {
-        "runtime" => {
-            require_fields(
-                object,
-                if object.contains_key("value") {
-                    &["op", "key", "value"]
-                } else {
-                    &["op", "key"]
-                },
-            )?;
-            let key = object
-                .get("key")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("runtime key missing"))?;
-            if !key.starts_with("owned|")
-                && !key.starts_with("flatten|")
-            {
-                return Err(invalid("unknown runtime record"));
-            }
-            return Ok(Operation::Runtime(
-                key.to_owned(),
-                object.get("value").filter(|v| !v.is_null()).cloned(),
-            ));
-        }
-        "relocate_output" => {
-            require_fields(
-                object,
-                &["op", "owner", "source", "destination", "identity"],
-            )?;
-            let string = |field: &str| {
-                object
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| invalid(format!("missing {field}")))
-            };
-            return Ok(Operation::Output(
-                path_key(&string("owner")?),
-                OutputChange::Relocate {
-                    source: string("source")?,
-                    destination: string("destination")?,
-                    identity: string("identity")?,
-                },
-            ));
-        }
-        "checkpoint_output" => {
-            require_fields(object, &["op", "owner", "output"])?;
-            let string = |field: &str| {
-                object
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| invalid(format!("missing {field}")))
-            };
-            return Ok(Operation::Output(
-                path_key(&string("owner")?),
-                OutputChange::Promote {
-                    destinations: Vec::new(),
-                    sources: vec![string("output")?],
-                },
-            ));
-        }
-        "set_metadata" => {
-            require_fields(object, &["op", "value"])?;
-            let value = object
-                .get("value")
-                .and_then(Value::as_object)
-                .ok_or_else(|| std::io::Error::other("metadata value must be an object"))?;
-            require_fields(value, &["password_generation", "password_source_signature"])?;
-            let generation = value
-                .get("password_generation")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| invalid("metadata password_generation must be an integer"))?;
-            let signature = value
-                .get("password_source_signature")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("metadata password_source_signature must be a string"))?;
-            if generation < 0 {
-                return Err(invalid("metadata password_generation must not be negative"));
-            }
-            return Ok(Operation::SetMetadata(generation, signature.to_owned()));
-        }
-        _ => {}
-    }
-    let collection_name = object
-        .get("collection")
-        .and_then(Value::as_str)
-        .ok_or_else(|| std::io::Error::other("journal operation collection must be a string"))?;
-    let collection = match collection_name {
-        "pending_work" => Collection::Pending,
-        "entries" => Collection::Entries,
-        other => return Err(invalid(format!("unknown state collection: {other}"))),
-    };
-    if action == "put" {
-        require_fields(object, &["op", "collection", "key", "value"])?;
-    } else {
-        require_fields(object, &["op", "collection", "key"])?;
-    }
-    let key = object
-        .get("key")
-        .and_then(Value::as_str)
-        .ok_or_else(|| std::io::Error::other("journal operation key must be a string"))?
-        .to_owned();
-    if key.is_empty() {
-        return Err(invalid("state operation key must not be empty"));
-    }
-    match action {
-        "delete" => Ok(Operation::Delete(collection, key)),
-        "put" => {
-            let value = object
-                .get("value")
-                .ok_or_else(|| std::io::Error::other("journal put operation requires value"))?;
-            Ok(match collection {
-                Collection::Pending => {
-                    let record: PendingRecord = decode_record(value)?;
-                    Operation::PutPending(path_key(&record.path), Arc::new(record))
-                }
-                Collection::Entries => {
-                    let record: EntryRecord = decode_record(value)?;
-                    Operation::PutEntry(path_key(&record.path), Arc::new(record))
-                }
-            })
-        }
-        other => Err(invalid(format!("unknown state operation: {other}"))),
-    }
 }
 
 fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
@@ -1731,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn carrier_outputs_survive_legacy_snapshot_and_incremental_replay() {
+    fn carrier_outputs_survive_snapshot_and_incremental_replay() {
         use std::fs::{self, OpenOptions};
         use std::io::Write;
 
@@ -1744,19 +1566,16 @@ mod tests {
         let first = base.join("carrier").join("first").to_string_lossy().into_owned();
         let second = base.join("carrier").join("second").to_string_lossy().into_owned();
         let moved = base.join("relocated").to_string_lossy().into_owned();
-        let pending = PendingRecord { path: owner.clone(), ..Default::default() };
-        let mut legacy = serde_json::to_value(pending).unwrap();
-        legacy["active_outputs"] = serde_json::json!({ task.clone(): container.clone() });
-        legacy["output_identities"] = serde_json::json!({ container.clone(): "container-id" });
-        // This is the old scalar-value schema, not the new serializer feeding
-        // its own decoder. A saved main-branch owner must remain recoverable.
-        let old_snapshot = serde_json::json!({
-            "password_generation": 0, "password_source_signature": "",
-            "watch_cursors": {}, "pending_work": [legacy], "entries": [], "runtime": {},
+        let mut pending = PendingRecord { path: owner.clone(), ..Default::default() };
+        pending.change_output(&OutputChange::Start {
+            task: task.clone(),
+            output: container.clone(),
+            identity: "container-id".into(),
         });
-        wal::write_snapshot(&mut fs::File::create(&snapshot).unwrap(), Kind::TaskSnapshot, 1, &old_snapshot).unwrap();
         let state = NativeWatchState::new();
-        assert_eq!(state.load_snapshot(snapshot.to_string_lossy().into_owned()).unwrap(), 1);
+        state.apply(&NativeWatchOperations {
+            operations: Arc::new(Operations(vec![Operation::PutPending(path_key(&owner), Arc::new(pending))])),
+        });
         assert!(state.pending(&owner).unwrap().active_outputs.contains(&task, &container));
         fs::write(&journal, wal::file_header(Kind::TaskWal)).unwrap();
         let append = |seq, changes: Vec<OutputChange>| {
@@ -1877,9 +1696,4 @@ mod tests {
         assert!(!is_path_under("c:\\a", "c:\\a"));
         assert!(is_path_under("c:\\a", "c:\\"));
     }
-}
-
-/// Ignore only the directory actually recorded; a reused path is ordinary input.
-pub(crate) fn output_identity_matches(record: &Value) -> bool {
-    owned_outputs::identity_matches(record)
 }

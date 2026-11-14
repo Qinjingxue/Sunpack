@@ -86,19 +86,8 @@ impl Drop for OwnedHandle {
 }
 
 pub(super) fn filesystem_type(path: &Path) -> io::Result<String> {
-    let path = canonical_wide(path)?;
-    let mut volume_path = vec![0u16; 32768];
-    if unsafe {
-        GetVolumePathNameW(
-            path.as_ptr(),
-            volume_path.as_mut_ptr(),
-            volume_path.len() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let mut filesystem_name = vec![0u16; 64];
+    let volume_path = volume_mount_path(path)?;
+    let mut filesystem_name = [0u16; 64];
     if unsafe {
         GetVolumeInformationW(
             volume_path.as_ptr(),
@@ -154,32 +143,29 @@ pub(super) fn watch_file_observation_known_kind(
 }
 
 pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i64)> {
-    use crate::io::resource_lifecycle::TrackedFile;
+    let observation = watch_path_usn(path)?;
+    Ok((volume_device(path)?, observation.id_text(), observation.usn))
+}
+
+pub(super) fn directory_file_id(path: &Path, volume: &str) -> io::Result<[u8; 16]> {
+    let observation = watch_path_usn(path)?;
+    if !volume_device(path)?.eq_ignore_ascii_case(volume) {
+        return Err(io::Error::other("directory changed volume"));
+    }
+    Ok(observation.id)
+}
+
+fn watch_path_usn(path: &Path) -> io::Result<FileUsn> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 
-    let metadata = std::fs::metadata(path)?;
-    // Identity probes share deletion and retain no handle after this query.
-    // Use the existing passive registration so promotion callbacks can record
-    // directory identities while the namespace is protected by their gate.
-    let observation = {
-        let file = TrackedFile::open_passive_with(path, |options| {
-            options
-                .read(true)
-                .access_mode(FILE_READ_ATTRIBUTES)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .custom_flags(if metadata.is_dir() {
-                    FILE_FLAG_BACKUP_SEMANTICS
-                } else {
-                    FILE_ATTRIBUTE_NORMAL
-                });
-        })?;
-        read_file_usn(file.as_raw_handle())?
-    };
-    Ok((
-        volume_device(path)?,
-        observation.id_text(),
-        observation.usn,
-    ))
+    // Backup semantics permits both files and directories. The handle shares
+    // deletion so promotion can query identity within its own publication gate.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    read_file_usn(file.as_raw_handle())
 }
 
 pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {
@@ -328,19 +314,8 @@ pub(super) fn watch_volume_cursor(path: &Path) -> io::Result<(String, u64, i64)>
 }
 
 fn volume_device(path: &Path) -> io::Result<String> {
-    let path = canonical_wide(path)?;
-    let mut mount_point = vec![0u16; 32768];
-    if unsafe {
-        GetVolumePathNameW(
-            path.as_ptr(),
-            mount_point.as_mut_ptr(),
-            mount_point.len() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let mut volume_name = vec![0u16; 64];
+    let mount_point = volume_mount_path(path)?;
+    let mut volume_name = [0u16; 64];
     if unsafe {
         GetVolumeNameForVolumeMountPointW(
             mount_point.as_ptr(),
@@ -352,6 +327,24 @@ fn volume_device(path: &Path) -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
     Ok(volume_key_from(&volume_name))
+}
+
+fn volume_mount_path(path: &Path) -> io::Result<Vec<u16>> {
+    let path = canonical_wide(path)?;
+    // On a volume-resolved path the mount point is a prefix. Allow room for
+    // its final separator when the input names the mount directory itself.
+    let mut mount_point = vec![0u16; path.len() + 1];
+    if unsafe {
+        GetVolumePathNameW(
+            path.as_ptr(),
+            mount_point.as_mut_ptr(),
+            mount_point.len() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(mount_point)
 }
 
 /// Volume identity for an output path that may not exist yet: the nearest existing
@@ -405,11 +398,13 @@ fn is_fully_rooted(path: &Path) -> bool {
 }
 
 fn volume_key_from(volume_name: &[u16]) -> String {
-    let mut volume = nul_terminated(volume_name).to_vec();
+    let mut volume = nul_terminated(volume_name);
     if volume.last() == Some(&('\\' as u16)) {
-        volume.pop();
+        volume = &volume[..volume.len() - 1];
     }
-    String::from_utf16_lossy(&volume).to_ascii_lowercase()
+    let mut result = String::from_utf16_lossy(volume);
+    result.make_ascii_lowercase();
+    result
 }
 
 fn canonical_wide(path: &Path) -> io::Result<Vec<u16>> {

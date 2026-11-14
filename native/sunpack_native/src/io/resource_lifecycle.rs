@@ -6,14 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-struct NativeResourceRecord {
-    paths: Vec<PathBuf>,
-    promotion_blocking: bool,
-}
-
 #[derive(Default)]
 struct NativeRegistry {
-    resources: HashMap<u64, NativeResourceRecord>,
+    resources: HashMap<u64, Vec<PathBuf>>,
     promotions: HashMap<u64, Vec<PathBuf>>,
 }
 
@@ -50,10 +45,7 @@ pub(crate) struct NativeReadScope {
 impl NativeReadScope {
     pub(crate) fn new(root: &Path) -> io::Result<Self> {
         let root = normalized_path(root.to_path_buf());
-        let guard = NativeResourceGuard::register_normalized(
-            vec![root.clone()],
-            true,
-        )?;
+        let guard = NativeResourceGuard::register_normalized(vec![root.clone()])?;
         #[cfg(windows)]
         let root = {
             use std::os::windows::ffi::OsStrExt;
@@ -178,33 +170,8 @@ impl TrackedFile {
     where
         F: FnOnce(&mut std::fs::OpenOptions),
     {
-        Self::open_with_promotion(path, true, configure)
-    }
-
-    // Passive directory observers own handles but cannot hold up file promotion.
-    pub(crate) fn open_passive_with<F>(
-        path: impl AsRef<Path>,
-        configure: F,
-    ) -> io::Result<Self>
-    where
-        F: FnOnce(&mut std::fs::OpenOptions),
-    {
-        Self::open_with_promotion(path, false, configure)
-    }
-
-    fn open_with_promotion<F>(
-        path: impl AsRef<Path>,
-        promotion_blocking: bool,
-        configure: F,
-    ) -> io::Result<Self>
-    where
-        F: FnOnce(&mut std::fs::OpenOptions),
-    {
         let path = path.as_ref();
-        let resource = NativeResourceGuard::register_with_promotion(
-            [path.to_path_buf()],
-            promotion_blocking,
-        )?;
+        let resource = NativeResourceGuard::register([path.to_path_buf()])?;
         let mut options = std::fs::OpenOptions::new();
         configure(&mut options);
         let file = options.open(path)?;
@@ -278,45 +245,28 @@ impl NativeResourceGuard {
     pub(crate) fn register(
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> io::Result<Self> {
-        Self::register_with_promotion(paths, true)
-    }
-
-    fn register_with_promotion(
-        paths: impl IntoIterator<Item = PathBuf>,
-        promotion_blocking: bool,
-    ) -> io::Result<Self> {
         let paths = paths.into_iter().map(normalized_path).collect::<Vec<_>>();
-        Self::register_normalized(paths, promotion_blocking)
+        Self::register_normalized(paths)
     }
 
-    fn register_normalized(
-        paths: Vec<PathBuf>,
-        promotion_blocking: bool,
-    ) -> io::Result<Self> {
+    fn register_normalized(paths: Vec<PathBuf>) -> io::Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut registry = registry()
             .registry
             .lock()
             .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-        if promotion_blocking
-            && registry
-                .promotions
-                .values()
-                .any(|roots| paths_overlap(&paths, roots))
+        if registry
+            .promotions
+            .values()
+            .any(|roots| paths_overlap(&paths, roots))
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("native resource registration blocked by promotion: {paths:?}"),
             ));
         }
-        registry.resources.insert(
-            id,
-            NativeResourceRecord {
-                paths,
-                promotion_blocking,
-            },
-        );
+        registry.resources.insert(id, paths);
         Ok(Self { id })
     }
 }
@@ -325,12 +275,13 @@ impl Drop for NativeResourceGuard {
     fn drop(&mut self) {
         let state = registry();
         if let Ok(mut registry) = state.registry.lock() {
-            if registry.resources.remove(&self.id).is_some() {
-                // Keep small tables reusable across short-lived probes, but
-                // do not retain a concurrent workload's peak allocation.
-                if registry.resources.capacity() > 256 {
-                    crate::collections::trim_map(&mut registry.resources);
-                }
+            registry.resources.remove(&self.id);
+            // Keep small tables reusable across short-lived probes, but
+            // do not retain a concurrent workload's peak allocation.
+            if registry.resources.capacity() > 256 {
+                crate::collections::trim_map(&mut registry.resources);
+            }
+            if !registry.promotions.is_empty() {
                 state.changed.notify_all();
             }
         }
@@ -414,9 +365,7 @@ impl Promotion {
             .map_err(|_| io::Error::other("native resource registry poisoned"))?;
         let _registry = state.changed.wait_while(registry, |registry| {
             let roots = &registry.promotions[&id];
-            registry.resources.values().any(|record| {
-                record.promotion_blocking && paths_overlap(&record.paths, roots)
-            })
+            registry.resources.values().any(|paths| paths_overlap(paths, roots))
         }).map_err(|_| io::Error::other("native resource registry poisoned"))?;
         Ok(guard)
     }
