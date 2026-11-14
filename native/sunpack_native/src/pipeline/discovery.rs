@@ -674,63 +674,31 @@ fn probe_relations(
     verified: &mut VerifiedPasswords,
     request: &Request,
 ) -> io::Result<()> {
-    let mut passwords = Vec::new();
-    let mut refresh = Vec::new();
-    let mut failures = Vec::new();
-    for group in table.encrypted_rar_groups() {
-        match candidates.plan(&group.input, None, &request.cancel) {
-            Ok(Ok(plan)) if plan.verified => {
-                let value = plan.selected.unwrap();
-                // A standalone RAR4 main header already establishes the layout.
-                // A full password proof can unblock it without revisiting its
-                // original (encrypted) relation facts or probing a split bucket.
-                if !group.standalone {
-                    passwords.extend(
-                        group
-                            .owned_paths
-                            .into_iter()
-                            .map(|path| (path, value.to_string())),
-                    );
-                }
-                verified.insert(password_key(&group.input), value);
-            }
-            Ok(Ok(_)) => failures.extend(
-                group
-                    .owned_paths
-                    .into_iter()
-                    .map(|path| (path, String::new())),
-            ),
-            Ok(Err(failure)) => {
-                let reason = match failure.kind {
-                    FailureKind::WrongPassword => "wrong_password",
-                    FailureKind::PasswordRequired => "needs_password",
-                    FailureKind::MissingVolume => "missing_volume",
-                    FailureKind::Damaged => "corrupt_archive",
-                    _ => "",
-                };
-                failures.extend(
-                    group
-                        .owned_paths
-                        .into_iter()
-                        .map(|path| (path, reason.to_owned())),
-                );
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                refresh.extend(group.owned_paths.iter().cloned());
-                failures.extend(
-                    group
-                        .owned_paths
-                        .into_iter()
-                        .map(|path| (path, "missing_volume".to_owned())),
-                );
-            }
+    use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
+    use rayon::prelude::*;
+    let pending = table.encrypted_rar_anchors();
+    if pending.is_empty() { return Ok(()); }
+    let resolved = pending.into_par_iter().map(|anchor| request.cancel.run(|| {
+        let passwords = candidates.for_embedded(&anchor.path);
+        let reader = match crate::io::reader::ManagedReader::open(&anchor.path) {
+            Ok(reader) => reader.probe_reader(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((anchor, None, true)),
             Err(error) => return Err(error),
+        };
+        let (anchor, matched) = resolve_encrypted_relation_anchor(&anchor, &reader, &passwords)?;
+        Ok((anchor, matched.map(|index| passwords[index].clone()), false))
+    })).collect::<io::Result<Vec<_>>>()?;
+    let mut anchors = Vec::with_capacity(resolved.len());
+    let mut refresh = Vec::new();
+    for (anchor, password, departed) in resolved {
+        if departed { refresh.push(anchor.path.clone()); }
+        if let Some(password) = password {
+            candidates.remember_verified(password.clone());
+            verified.insert((path_key(&anchor.path), anchor.structure_offset.unwrap_or(0)), password);
         }
+        anchors.push(anchor);
     }
-    if !passwords.is_empty() || !refresh.is_empty() {
-        table.retry_relations(raw, filtered, passwords, Some(refresh))?;
-    }
-    table.record_relation_failures(failures);
+    table.retry_relations(raw, filtered, anchors, Some(refresh))?;
     Ok(())
 }
 
@@ -987,13 +955,12 @@ fn project_task(
         ),
         CandidateProjection::Relation {
             relation,
-            failure_reason,
             ..
         } => {
             let password = (!verified.is_empty())
                 .then(|| verified.get(&password_key(&relation.input)).cloned())
                 .flatten();
-            let reason = failure_reason.or(relation.failure_reason);
+            let reason = relation.failure_reason;
             let failure =
                 if relation.standalone && password.is_some() && reason == Some("needs_password") {
                     None

@@ -182,6 +182,7 @@ mod tests {
             anchor_cell: None,
             anchor: seed.then(|| VolumeAnchor {
                 multivolume: true,
+                internal_volume_number: Some(1),
                 ..VolumeAnchor::default()
             }),
         }

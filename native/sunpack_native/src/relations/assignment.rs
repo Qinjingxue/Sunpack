@@ -698,18 +698,6 @@ pub(super) fn resolve_buckets(
             }
             // Multiple heads require a strong format-associated family name.
             // Unknown rows cannot be shared by competing archive families.
-            let encrypted_heads: Vec<_> = members
-                .iter()
-                .copied()
-                .filter(|i| {
-                    rows[*i].anchor.as_ref().is_some_and(|a| a.needs_password)
-                        && features.get(i).is_some_and(|f| {
-                            f.canonical
-                                .iter()
-                                .any(|p| p.family == format && p.number == 1)
-                        })
-                })
-                .collect();
             let head_indexes: HashSet<_> = members
                 .iter()
                 .copied()
@@ -722,7 +710,6 @@ pub(super) fn resolve_buckets(
                                 .as_ref()
                                 .is_some_and(|a| a.evidence.contains(&"zip:local_header")))
                 })
-                .chain(encrypted_heads)
                 .collect();
             let mut competing_families = false;
             let mut families: Vec<(String, Vec<usize>)> = if head_indexes.len() > 1 {
@@ -920,6 +907,11 @@ pub(super) fn materialize(
     shared_facts: Option<&Arc<RelationCache>>,
 ) -> Option<ProposalValidation> {
     let rows = view.rows;
+    if !assignment.slots.values().any(|i| {
+        rows[*i].anchor.as_ref().is_some_and(VolumeAnchor::is_volume_entry)
+    }) {
+        return None;
+    }
     let spanned = view.spanned();
     let sfx = view.format == "rar"
         && assignment
@@ -954,24 +946,17 @@ pub(super) fn materialize(
             .and_then(|f| f.numbers.iter().find(|n| n.value == 1))
             .map_or(3, |n| n.width)
     };
-    let mut volumes: Vec<_> = assignment
+    let volumes: Vec<_> = assignment
         .slots
         .iter()
         .map(|(&n, &i)| (rows[i].path.clone(), n))
         .collect();
-    let mut unresolved: Vec<_> = assignment
+    let unresolved: Vec<_> = assignment
         .unresolved
         .iter()
         .filter(|i| view.facts[i].owned)
         .map(|i| rows[*i].path.clone())
         .collect();
-    if volumes.is_empty() {
-        // Output still needs an entry path. Slot zero explicitly denotes an
-        // unresolved identity and is never handed to extraction.
-        let i = *view.indexes.iter().find(|i| view.facts[i].owned)?;
-        volumes.push((rows[i].path.clone(), 0));
-        unresolved.retain(|p| p != &rows[i].path);
-    }
     let facts = match shared_facts {
         Some(facts) => Arc::clone(facts),
         None => proposal_facts(view, &assignment.companions),
@@ -1375,6 +1360,10 @@ mod tests {
         head.sfx = true;
         head.pe_state = PeState::Confirmed;
         head.structure_offset = Some(128);
+        assert!(resolve(&rows).is_empty());
+        // Filenames alone cannot invent an entry behind encrypted headers.
+        // Once common header resolution proves it, reuse the same channel.
+        rows[0].anchor.as_mut().unwrap().internal_volume_number = Some(1);
         let mut groups = resolve(&rows);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].reason, None);
@@ -1565,12 +1554,9 @@ mod tests {
     }
 
     #[test]
-    fn lone_proven_split_member_stays_on_relation_path() {
+    fn lone_proven_split_member_waits_for_an_entry() {
         let rows = vec![row("same.part2.rar", "rar", Some(2), true)];
-        let mut groups = resolve(&rows);
-        validate::validate(&mut groups[0]);
-        assert_eq!(slots(&groups[0]), vec![2]);
-        assert_eq!(groups[0].reason, Some(RelationFailureReason::MissingVolume));
+        assert!(resolve(&rows).is_empty());
     }
 
     #[test]
@@ -1583,6 +1569,8 @@ mod tests {
         anchor.anchor_roles.clear();
         assert!(resolve(&rows).is_empty());
         rows[0].anchor.as_mut().unwrap().multivolume = true;
+        assert!(resolve(&rows).is_empty());
+        rows[0].anchor.as_mut().unwrap().internal_volume_number = Some(1);
         assert_eq!(resolve(&rows).len(), 1);
     }
 

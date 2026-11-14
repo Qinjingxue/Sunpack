@@ -9,8 +9,11 @@ pub(super) struct BucketIndex {
 
 impl BucketIndex {
     pub(super) fn has_seed(anchor: &VolumeAnchor) -> bool {
-        cheap_seed_strength(anchor).is_some()
-            || (!anchor.standalone && (anchor.multivolume || anchor.needs_password))
+        anchor.is_volume_entry()
+            || (!anchor.standalone && anchor.needs_password
+                && !anchor.continuation_from_previous
+                && !anchor.anchor_roles.contains(&"member"))
+            || (anchor.pe_state != PeState::None && !anchor.standalone)
     }
 
     pub fn build(rows: &[RelationInput], filtered_keys: Option<&HashSet<String>>) -> Self {

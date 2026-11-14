@@ -131,6 +131,12 @@ impl<'a> NameProfile<'a> {
         {
             return self.active_field(*ordinal, left, right).then_some(value);
         }
+        // Old RAR names encode r00 as logical volume 2, r01 as volume 3.
+        // A canonical name already establishes this translation; comparing its
+        // logical slot to the raw digit would discard every old-style member.
+        if matches!(channel, NumberChannel::Canonical { style, .. } if style == "rar_oldstyle") {
+            return Some(value);
+        }
         // Canonical and token channels share the same constant-field mask.
         name.numbers
             .iter()

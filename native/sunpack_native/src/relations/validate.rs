@@ -27,6 +27,9 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         return;
     }
     let proposal = &validation.proposal;
+    let unresolved_head = proposal.volumes.iter().find(|(_, slot)| *slot == 1)
+        .and_then(|(path, _)| validation.facts.anchors.get(&path_key(path)))
+        .is_some_and(VolumeAnchor::has_unresolved_carrier_extent);
     if let Some((key, end)) = mapped_carrier_end(
         &proposal.format,
         proposal.style == "zip_spanned",
@@ -81,6 +84,18 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
                 }
             }
             Ok(Some(false)) => {
+                if unresolved_head {
+                    // Total size cannot locate carrier padding while a tail is
+                    // absent. Preserve the entry and its known members, without
+                    // publishing the speculative trim as a physical boundary.
+                    if let Some(head) = Arc::make_mut(&mut validation.facts).anchors
+                        .get_mut(&path_key(&proposal.volumes[0].0)) {
+                        head.payload_end = None;
+                    }
+                    validation.status = ProposalStatus::Inconclusive;
+                    validation.reason = Some(RelationFailureReason::MissingVolume);
+                    return;
+                }
                 validation.status = ProposalStatus::Reject;
                 validation.reason = Some(RelationFailureReason::StructuralConflict);
                 return;

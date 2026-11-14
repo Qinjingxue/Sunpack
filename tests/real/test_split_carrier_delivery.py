@@ -253,11 +253,13 @@ def test_watch_embedded_rar_tail_before_head_is_retried(package, tmp_path):
     carriers.mkdir()
     wrapped = [_wrap_volume(part, carriers, index) for index, part in enumerate(parts)]
 
-    watch = watch_setup(package, tmp_path, passwords=["wrong-key", case.password], cleanup="d")
+    watch = watch_setup(package, tmp_path, passwords=["wrong-key", case.password], cleanup="d", start=False)
     tail = download(watch, wrapped[-1], mode="direct")
-    watch.await_event("suspended_missing_volume", path=tail.name)
+    package.json("watch", "start", "--once", "--no-tray")
+    watch.assert_no_terminal_failures()
     assert tail.read_bytes() == wrapped[-1].read_bytes()
     assert not marker_present(watch.output, case.marker_name)
+    watch.start()
     # Publish the head last, after the other two files are complete. A missing
     # result for the head can no longer be attributed to a partial download.
     middle = download(watch, wrapped[1])

@@ -130,61 +130,7 @@ impl StructuralFacts {
 pub(super) fn collect(
     rows: &mut [RelationInput],
     index: &BucketIndex,
-    passwords: Option<&[(String, String)]>,
 ) {
-    let password_map: HashMap<_, _> = passwords
-        .into_iter()
-        .flatten()
-        .map(|(p, password)| (path_key(p), password.as_str()))
-        .collect();
-    let encrypted: Vec<_> = index
-        .entries_by_path
-        .values()
-        .filter_map(|i| {
-            let row = &rows[*i];
-            (row.anchor
-                .as_ref()
-                .is_some_and(|a| a.needs_password && a.structure_offset.unwrap_or(0) == 0)
-                && password_map.contains_key(&row.path_key))
-            .then_some(row.path.clone())
-        })
-        .collect();
-    if !encrypted.is_empty() {
-        let upgraded = probe_volume_anchor_paths_cheap(&encrypted, passwords);
-        for anchor in upgraded {
-            if let Some(i) = index.entries_by_path.get(&path_key(&anchor.path)) {
-                // Embedded SFX headers need their known archive offset.
-                if rows[*i]
-                    .anchor
-                    .as_ref()
-                    .is_some_and(|a| a.structure_offset.unwrap_or(0) > 0)
-                {
-                    continue;
-                }
-                rows[*i].anchor = Some(anchor);
-            }
-        }
-    }
-    for &i in index.entries_by_path.values() {
-        if let Some(anchor) = rows[i]
-            .anchor
-            .as_ref()
-            .filter(|a| a.needs_password && a.structure_offset.unwrap_or(0) > 0)
-        {
-            if let Some(password) = password_map.get(&rows[i].path_key) {
-                let mut upgraded = probe_volume_anchor_at_offset(
-                    &rows[i].path,
-                    anchor.structure_offset.unwrap(),
-                    &anchor.format,
-                    Some(password),
-                );
-                upgraded.pe_state = anchor.pe_state;
-                upgraded.pe_image_end = anchor.pe_image_end;
-                upgraded.sfx = anchor.sfx;
-                rows[i].anchor = Some(upgraded);
-            }
-        }
-    }
     let pe_rows: Vec<_> = index
         .entries_by_path
         .values()
@@ -219,7 +165,7 @@ pub(super) fn collect(
             anchor.pe_state = probe.state();
             anchor.pe_image_end = probe.image_end();
         }
-        if let Some(anchor) = promote_sfx_archive_anchor(&rows[i], &reader, passwords) {
+        if let Some(anchor) = promote_sfx_archive_anchor(&rows[i], &reader) {
             rows[i].anchor = Some(anchor);
         }
         if let Some(anchor) = rows[i].anchor.as_mut() {
@@ -268,7 +214,7 @@ pub(super) fn collect(
                 i,
                 upgrade_relation_rar_end(
                     rows[i].anchor.as_ref().unwrap(),
-                    password_map.get(&rows[i].path_key).copied(),
+                    None,
                 ),
             )
         })

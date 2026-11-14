@@ -29,7 +29,6 @@ pub(crate) enum CandidateProjection<'a> {
     },
     Relation {
         relation: RelationProjection,
-        failure_reason: Option<&'a str>,
     },
 }
 
@@ -70,9 +69,6 @@ impl Candidate {
 pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
     targets: Option<FileTargets>,
-    // Sparse verifier evidence; owned only for this scan, never per-file caches.
-    // An empty reason preserves the extraction fallback for inconclusive proof.
-    relation_failures: HashMap<String, String>,
     // Shared physical facts; row indices survive only for this discovery scan.
     relation_sources: Vec<NativeDirectorySnapshot>,
 }
@@ -220,7 +216,6 @@ impl NativeCandidateTable {
         raw: &NativeDirectorySnapshot,
         filtered: &NativeDirectorySnapshot,
         targeted: Option<&NativeDirectorySnapshot>,
-        passwords: Option<&[(String, String)]>,
         cached: Option<&RelationCache>,
     ) -> Vec<NativeRelationGroup> {
         let routed_view;
@@ -231,7 +226,7 @@ impl NativeCandidateTable {
             &routed_view
         };
         let mut groups =
-            build_native_candidate_groups_from_snapshot(raw, selection, passwords, cached);
+            build_native_candidate_groups_from_snapshot(raw, selection, cached);
         // Only an explicit selection can nominate files on other routes.
         // Relations can claim them as parts, but ordinary results stay on
         // their original route.
@@ -919,7 +914,6 @@ impl NativeCandidateTable {
     pub(crate) fn extend(&mut self, other: &mut Self) {
         self.rows.append(&mut other.rows);
         self.relation_sources.append(&mut other.relation_sources);
-        self.relation_failures.extend(other.relation_failures.drain());
     }
 
     pub(crate) fn append_directory(
@@ -939,7 +933,6 @@ impl NativeCandidateTable {
                 raw_snapshot,
                 filtered_snapshot,
                 selected.as_ref(),
-                None,
                 None,
             );
             let filtered_snapshot = selected.as_ref().unwrap_or(filtered_snapshot);
@@ -965,46 +958,38 @@ impl NativeCandidateTable {
         Ok(())
     }
 
-    /// Prepare bounded Rust password probes for unresolved RAR relations.
-    pub(crate) fn encrypted_rar_groups(&self) -> Vec<RelationProjection> {
-        let mut output = Vec::new();
-        for row in &self.rows {
-            if let Candidate::Relation(group) = row {
-                let data = group.candidate_data();
-                if data.format_hint == "rar" && data.needs_password {
-                    let mut probe = group.project();
-                    if probe.input.analysis.origin == crate::io::archive_state::AnalysisOrigin::RelationsFallback
-                        && matches!(group.as_ref(), NativeRelationGroup::Proposal(_))
-                    {
-                        // Encrypted main headers can hide all volume numbers.
-                        // Verify the header at its known offset before asking
-                        // Relations to assign volumes using the decrypted facts.
-                        use crate::io::archive_state::{InputExtent, InputPart, OpenMode};
-                        let start = group.entry_anchor().and_then(|anchor| anchor.structure_offset).unwrap_or(0);
-                        probe.input.mode = OpenMode::FileRange;
-                        probe.input.parts = Box::new([InputPart::range(InputExtent {
-                            path: probe.input.entry_path.clone(),
-                            start,
-                            end: None,
-                        })]);
-                    }
-                    output.push(probe);
-                }
+    /// Decrypt only nominated RAR families. Until the hidden main header is
+    /// read, an encrypted RAR5 file can be either the entry or a continuation.
+    /// Keep the resulting byte facts in the same request-local relation cache.
+    pub(crate) fn encrypted_rar_anchors(&self) -> Vec<crate::analysis_native::volume_anchor::VolumeAnchor> {
+        let stems: HashSet<_> = self.rows.iter().filter_map(|row| match row {
+            Candidate::Relation(group) => group.entry_anchor()
+                .filter(|a| a.format == "rar" && a.needs_password && !a.standalone)
+                .map(|a| crate::scan::catalog::catalog_stem(&a.path)),
+            _ => None,
+        }).collect();
+        let mut anchors: HashMap<_, _> = self.rows.iter().filter_map(|row| match row {
+            Candidate::Relation(group) => group.entry_anchor()
+                .filter(|a| a.format == "rar" && a.needs_password)
+                .map(|a| (path_key(&a.path), a.clone())),
+            _ => None,
+        }).collect();
+        if stems.is_empty() { return anchors.into_values().collect(); }
+        for snapshot in &self.relation_sources {
+            for &row in snapshot.rows.iter() {
+                if !snapshot.table.relation_member_eligible[row] { continue; }
+                let Some(anchor) = snapshot.table.relation_anchors[row].as_ref()
+                    .and_then(CheapAnchor::anchor)
+                    .filter(|a| a.format == "rar" && a.needs_password)
+                    .filter(|a| stems.contains(&crate::scan::catalog::catalog_stem(&a.path))) else { continue; };
+                anchors.entry(path_key(&anchor.path)).or_insert_with(|| anchor.clone());
             }
         }
-        output
+        anchors.into_values().collect()
     }
 
     pub(crate) fn take_file_targets(&mut self) -> FileTargets {
         self.targets.take().expect("file discovery table must have targets")
-    }
-
-    pub(crate) fn record_relation_failures(&mut self, failures: Vec<(String, String)>) {
-        self.relation_failures.extend(
-            failures
-                .into_iter()
-                .map(|(path, reason)| (path_key(&path), reason)),
-        );
     }
 
     /// Replace the relation evidence for one table after a password is found.
@@ -1013,11 +998,12 @@ impl NativeCandidateTable {
 
         raw_snapshot: &NativeDirectorySnapshot,
         filtered_snapshot: &NativeDirectorySnapshot,
-        path_passwords: Vec<(String, String)>,
+        anchors: Vec<crate::analysis_native::volume_anchor::VolumeAnchor>,
         refresh_paths: Option<Vec<String>>,
     ) -> std::io::Result<()> {
         (|| {
-            let cached = self.relation_cache();
+            let mut cached = self.relation_cache();
+            cached.anchors.extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
             // A short password probe may start after another request consumed its
             // inputs. Drop only proven departures from that proposal, sharing the
             // original snapshot and surviving anchors instead of scanning again.
@@ -1052,7 +1038,6 @@ impl NativeCandidateTable {
                 raw,
                 filtered,
                 selected.as_ref(),
-                Some(&path_passwords),
                 Some(&cached),
             );
             self.rows.retain(|row| matches!(row, Candidate::File(..)));
@@ -1135,18 +1120,7 @@ impl NativeCandidateTable {
                 }
             }
             Candidate::Relation(group) => {
-                let data = group.candidate_data();
-                CandidateProjection::Relation {
-                    relation: group.project(),
-                    failure_reason: data
-                        .needs_password
-                        .then(|| {
-                            self.relation_failures
-                                .get(&path_key(data.entry_path))
-                                .map(String::as_str)
-                        })
-                        .flatten(),
-                }
+                CandidateProjection::Relation { relation: group.project() }
             }
         })
     }

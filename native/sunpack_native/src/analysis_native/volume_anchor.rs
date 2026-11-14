@@ -73,6 +73,17 @@ pub(crate) struct VolumeAnchor {
 }
 
 impl VolumeAnchor {
+    /// A volume set is discovered from one archive entry, never from an orphan
+    /// continuation. Other volumes contribute facts only to that entry's plan.
+    pub(crate) fn is_volume_entry(&self) -> bool {
+        !self.standalone
+            && (self.internal_volume_number == Some(1)
+                || self.anchor_roles.contains(&"first")
+                || (self.format == "zip"
+                    && (self.evidence.contains(&"zip:local_header")
+                        || self.anchor_roles.contains(&"terminal"))))
+    }
+
     pub(crate) fn has_unresolved_carrier_extent(&self) -> bool {
         self.payload_end.is_none()
             && (self.carrier_limit.is_some() || self.structure_offset.unwrap_or(0) > 0)
@@ -1342,6 +1353,7 @@ pub(crate) fn upgrade_relation_rar_end_reader(
     Ok(out)
 }
 
+#[cfg(test)]
 pub(crate) fn probe_volume_anchor_at_offset(
     path: &str,
     offset: u64,

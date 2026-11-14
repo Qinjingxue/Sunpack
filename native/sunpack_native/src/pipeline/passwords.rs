@@ -265,6 +265,10 @@ impl CandidateSet {
         self.for_path(path).cloned().collect()
     }
 
+    pub(super) fn remember_verified(&self, password: Arc<str>) {
+        self.cache.remember_recent(password);
+    }
+
     pub(super) fn plan(
         &self,
         input: &ArchiveInput,

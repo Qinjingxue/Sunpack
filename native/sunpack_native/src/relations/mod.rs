@@ -1,5 +1,4 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap,
     probe_volume_anchor_reader_at_offset, CheapAnchorCell, VolumeAnchor,
 };
 use crate::io::archive_state::{
@@ -206,7 +205,8 @@ impl<'a> RelationCandidateData<'a> {
 
 impl NativeRelationGroup {
     pub(crate) fn is_incomplete(&self) -> bool {
-        matches!(self, Self::Proposal(validation) if validation.status == ProposalStatus::Inconclusive)
+        matches!(self, Self::Proposal(validation) if matches!(validation.status,
+            ProposalStatus::Inconclusive | ProposalStatus::NeedsPassword))
     }
 
     pub(crate) fn entry_path(&self) -> &str {
@@ -419,7 +419,6 @@ pub(crate) fn relations_logical_name(filename: &str, is_archive: bool) -> String
 pub(crate) fn build_native_candidate_groups_from_snapshot(
     raw_snapshot: &NativeDirectorySnapshot,
     filtered_snapshot: &NativeDirectorySnapshot,
-    path_passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
 ) -> Vec<NativeRelationGroup> {
     let filtered_keys: HashSet<String> = filtered_snapshot
@@ -434,7 +433,6 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
     build_candidate_groups_from_source(
         RelationSource::Snapshot(raw_snapshot, cached),
         &filtered_keys,
-        path_passwords,
         cached,
     )
 }
@@ -514,7 +512,6 @@ pub(crate) fn resolve_embedded_volumes(
         output.extend(build_candidate_groups_from_source(
             RelationSource::Snapshot(&view, Some(&cache)),
             &keys,
-            None,
             Some(&cache),
         ));
     }
@@ -583,7 +580,7 @@ fn resolve_shared_carrier_volumes(
             let name_index = BucketIndex::build(&rows, Some(&selected));
             // Proven logical slices may share a physical lease. Ordinary path
             // arbitration would erase a blocked sibling when another succeeds.
-            for validation in resolve_candidate_validations(&mut rows, &name_index, None, Some(&cache)) {
+            for validation in resolve_candidate_validations(&mut rows, &name_index, Some(&cache)) {
                 let Some((head_path, _)) = validation.proposal.volumes.iter().find(|(_, slot)| *slot == 1) else { continue; };
                 let head_key = path_key(head_path);
                 let Some(head) = validation.facts.anchors.get(&head_key) else { continue; };
@@ -630,13 +627,13 @@ fn resolve_shared_carrier_volumes(
         if covered.contains(&(path_key(&anchor.path), anchor.structure_offset)) {
             continue;
         }
-        let Some(number) = anchor.internal_volume_number else {
+        let Some(number) = anchor.internal_volume_number.filter(|_| anchor.is_volume_entry()) else {
             continue;
         };
         let needs_password = anchor.needs_password || anchor.wrong_password;
         anchor.evidence.push("embedded:unresolved_volume");
-        // A proven volume is a logical input even while its family is missing
-        // or ambiguous. Keep its own blocker; do not discard the whole carrier.
+        // Only an entry can retain an unresolved logical input. Orphan slices
+        // remain available in the source snapshot for a later entry.
         let path = anchor.path.clone();
         let format = anchor.format.clone();
         let name = Path::new(&path)
@@ -682,10 +679,9 @@ fn resolve_shared_carrier_volumes(
 fn resolve_candidate_validations(
     rows: &mut [RelationInput],
     index: &BucketIndex,
-    passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
 ) -> Vec<ProposalValidation> {
-    structural::collect(rows, index, passwords);
+    structural::collect(rows, index);
     let mut validations = assignment::resolve_buckets(rows, index, cached);
     for validation in &mut validations {
         attempts::resolve_carrier_geometry(validation);
@@ -697,7 +693,6 @@ fn resolve_candidate_validations(
 fn build_candidate_groups_from_source(
     source: RelationSource<'_>,
     filtered_keys: &HashSet<String>,
-    path_passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
 ) -> Vec<NativeRelationGroup> {
     let scope = RelationScopeIndex::build(&source, filtered_keys);
@@ -708,7 +703,7 @@ fn build_candidate_groups_from_source(
         .map(|row| source.materialize(row))
         .collect();
     let name_index = BucketIndex::build(&directory_rows, Some(filtered_keys));
-    let validations = resolve_candidate_validations(&mut directory_rows, &name_index, path_passwords, cached);
+    let validations = resolve_candidate_validations(&mut directory_rows, &name_index, cached);
     // Arbitration considers every candidate in the active stem bucket,
     // including competitors whose head was not selected by the caller.
     let validation_owned_paths: Vec<HashSet<String>> =
@@ -810,43 +805,15 @@ fn build_candidate_groups_from_source(
         filtered_keys.contains(&row.path_key)
             && !claimed_paths.contains(&row.path_key)
             && !password_paths.contains(&row.path_key)
+            && !row.anchor.as_ref().is_some_and(|a| {
+                !a.standalone && !a.is_volume_entry()
+                    && (a.multivolume || a.continuation_from_previous)
+            })
     }) {
         let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
         output.push(NativeRelationGroup::Ordinary(row, confirmed));
     }
     output
-}
-
-fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
-    // A structure-proven standalone archive is already a complete logical
-    // input.  SFX is a carrier/layout property, not split evidence by itself.
-    if anchor.standalone {
-        return None;
-    }
-    if anchor.format.is_empty() && anchor.pe_state != PeState::None {
-        return Some("weak");
-    }
-    if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip") {
-        return None;
-    }
-    if anchor.format == "rar"
-        && anchor
-            .evidence
-            .iter()
-            .any(|item| *item == "rar5:encryption_header")
-    {
-        return Some("weak");
-    }
-    if anchor.format == "zip" && anchor.confidence == "weak" {
-        return Some("weak");
-    }
-    (anchor.confidence == "strong"
-        && (anchor.multivolume
-            || anchor.sfx
-            || anchor.continuation_from_previous
-            || anchor.continuation_to_next
-            || anchor.anchor_roles.contains(&"terminal")))
-    .then_some("strong")
 }
 
 fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
@@ -864,7 +831,6 @@ fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
 fn promote_sfx_archive_anchor(
     row: &RelationInput,
     reader: &crate::io::reader::ManagedReader,
-    path_passwords: Option<&[(String, String)]>,
 ) -> Option<VolumeAnchor> {
     let Some(facts) = row.anchor.as_ref() else {
         return None;
@@ -917,14 +883,8 @@ fn promote_sfx_archive_anchor(
 
     let archive_offset = overlay.offset;
 
-    let password = path_passwords.and_then(|items| {
-        items
-            .iter()
-            .find(|(candidate, _)| path_key(candidate) == row.path_key)
-            .map(|(_, password)| password.as_str())
-    });
     let mut anchor =
-        probe_volume_anchor_reader_at_offset(reader, &row.path, archive_offset, format, password)
+        probe_volume_anchor_reader_at_offset(reader, &row.path, archive_offset, format, None)
             .ok()?;
     if anchor.format != format || anchor.confidence != "strong" {
         return None;
@@ -1047,25 +1007,8 @@ fn project_proposal(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    if input.parts.is_empty() && input.volume_attempts.is_none() {
-        // Header-encrypted groups can own a set of candidate files before
-        // the password proves their volume numbers. Keep their physical
-        // paths for admission and receipts without inventing a volume layout.
-        input.mode = OpenMode::File;
-        input.analysis.origin = AnalysisOrigin::RelationsFallback;
-        input.parts = validation
-            .part_paths()
-            .map(|path| InputPart::range(InputExtent {
-                path: path.to_owned(),
-                start: 0,
-                end: None,
-            }))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-    } else {
-        input.volume_style = style;
-        input.parts.sort_unstable_by_key(|part| part.volume_number);
-    }
+    input.volume_style = style;
+    input.parts.sort_unstable_by_key(|part| part.volume_number);
     if proposal.format == "zip" && input.volume_attempts.is_none() {
         let mut logical_start = 0u64;
         for (path, _) in &proposal.volumes {
@@ -1098,7 +1041,9 @@ fn project_proposal(
     );
     let reason = match validation.status {
         ProposalStatus::Valid => None,
-        ProposalStatus::NeedsPassword => Some(RelationFailureReason::NeedsPassword.as_str()),
+        ProposalStatus::NeedsPassword => Some(if anchors.values().any(|a| a.wrong_password) {
+            "wrong_password"
+        } else { RelationFailureReason::NeedsPassword.as_str() }),
         ProposalStatus::Inconclusive => validation.reason.map(RelationFailureReason::as_str),
         ProposalStatus::Reject | ProposalStatus::Unsupported => {
             unreachable!("only admitted proposals become relation groups")
@@ -1812,6 +1757,7 @@ impl RelationRegexes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis_native::volume_anchor::probe_volume_anchor_paths_cheap;
 
     #[test]
     fn retired_regex_generation_lives_only_until_concurrent_parse_finishes() {

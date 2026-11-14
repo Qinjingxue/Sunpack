@@ -157,3 +157,35 @@ def test_opaque_carrier_head_recovers_when_tail_arrives(package, tmp_path, split
         watch.assert_no_terminal_failures()
     assert_extracted(case, output, exact=True)
     assert not any(inputs.iterdir())
+
+
+@pytest.mark.parametrize("entry_mode", ["cli", WATCH])
+def test_continuation_waits_for_disguised_entry(package, tmp_path, split_set, entry_mode):
+    # A continuation is a catalog candidate, not a failed archive. The later
+    # entry must still recall it, including after a Watch restart.
+    case, (original_head, middle, tail) = split_set
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    copyfile(middle, inputs / middle.name)
+    output = tmp_path / "out"
+    if entry_mode == "cli":
+        report = _cli_extract(package, inputs, output)
+        assert (report["summary"]["success_count"], report["summary"]["failed_count"]) == (0, 0), report
+        assert (inputs / middle.name).is_file()
+        _head_file(original_head, inputs, case.archive_format, "carrier-opaque")
+        copyfile(tail, inputs / tail.name)
+        report = _cli_extract(package, inputs, output)
+        assert (report["summary"]["success_count"], report["summary"]["failed_count"]) == (1, 0), report
+    else:
+        watch = watch_setup(package, tmp_path, passwords=PASSWORDS, cleanup="d", start=False)
+        stage_initial(watch, inputs / middle.name)
+        inputs = watch.root
+        assert not _watch_result(package, watch)
+        assert (inputs / middle.name).is_file()
+        head = _head_file(original_head, tmp_path, case.archive_format, "carrier-opaque")
+        stage_initial(watch, head)
+        stage_initial(watch, tail)
+        _watch_result(package, watch)
+        watch.assert_no_terminal_failures()
+    assert_extracted(case, output, exact=True)
+    assert not any(inputs.iterdir())
