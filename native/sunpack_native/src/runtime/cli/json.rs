@@ -10,7 +10,11 @@ impl Serialize for CommandResult {
         result.serialize_field("inputs", &self.inputs)?;
         result.serialize_field("summary", &self.summary)?;
         result.serialize_field("errors", &self.errors)?;
-        result.serialize_field("items", &self.items)?;
+        if let Some(sources) = &self.password_sources {
+            result.serialize_field("items", &[sources.item()])?;
+        } else {
+            result.serialize_field("items", &self.items)?;
+        }
         result.serialize_field("tasks", &self.tasks)?;
         result.serialize_field("logs", &self.logs)?;
         result.end()

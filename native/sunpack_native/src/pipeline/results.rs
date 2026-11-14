@@ -25,6 +25,7 @@ impl ResultFacts for CleanupResult {
 }
 impl ResultFacts for InputCheckpoint {}
 impl ResultFacts for PromotedSource {}
+#[cfg(test)]
 impl ResultFacts for String {}
 
 #[derive(Debug)]
@@ -141,7 +142,6 @@ pub(super) struct RunOutcome {
     pub checkpoints: Results<InputCheckpoint>,
     pub cleanup_results: Results<CleanupResult>,
     pub promoted_sources: Results<PromotedSource>,
-    pub removed_promotion_dirs: Results<String>,
     pub scan_incomplete: bool,
     pub uncommitted: bool,
 }
@@ -157,7 +157,7 @@ impl From<Outcome> for RunOutcome {
         Self { archives: value.archives.into(), errors: value.errors.into(),
             scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into(), cleanup_results: value.cleanup_results.into(),
-            promoted_sources: value.promoted_sources.into(), removed_promotion_dirs: value.removed_promotion_dirs.into(),
+            promoted_sources: value.promoted_sources.into(),
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }
     }
 }
@@ -166,7 +166,7 @@ impl From<RunOutcome> for Outcome {
         Self { archives: value.archives.into_vec(), errors: value.errors.into_vec(),
             scan_failures: value.scan_failures,
             checkpoints: value.checkpoints.into_vec(), cleanup_results: value.cleanup_results.into_vec(),
-            promoted_sources: value.promoted_sources.into_vec(), removed_promotion_dirs: value.removed_promotion_dirs.into_vec(),
+            promoted_sources: value.promoted_sources.into_vec(), coalesced_from: None,
             scan_incomplete: value.scan_incomplete, uncommitted: value.uncommitted }
     }
 }

@@ -69,7 +69,6 @@ impl Candidate {
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
-    filesystem_routed: bool,
     targets: Option<FileTargets>,
     // Sparse verifier evidence; owned only for this scan, never per-file caches.
     // An empty reason preserves the extraction fallback for inconclusive proof.
@@ -158,12 +157,7 @@ impl FileTargets {
 }
 
 impl NativeCandidateTable {
-    pub(crate) fn append_speculative_files(&mut self, snapshot: &NativeDirectorySnapshot) {
-        // The relations-only API projects every row as a group. File routing
-        // belongs only to the shared discovery table, including password retry.
-        if !self.filesystem_routed {
-            return;
-        }
+    fn append_speculative_files(&mut self, snapshot: &NativeDirectorySnapshot) {
         let mut pending: HashSet<_> = self
             .rows
             .iter()
@@ -203,14 +197,14 @@ impl NativeCandidateTable {
         }
     }
 
-    pub(crate) fn relation_cache(&self) -> RelationCache {
+    fn relation_cache(&self) -> RelationCache {
         collect_relation_cache(self.rows.iter().filter_map(|row| match row {
             Candidate::Relation(group) => Some(group.as_ref()),
             Candidate::File(..) => None,
         }))
     }
 
-    pub(crate) fn relation_groups(
+    fn relation_groups(
         &self,
         raw: &NativeDirectorySnapshot,
         filtered: &NativeDirectorySnapshot,
@@ -218,9 +212,13 @@ impl NativeCandidateTable {
         passwords: Option<&[(String, String)]>,
         cached: Option<&RelationCache>,
     ) -> Vec<NativeRelationGroup> {
-        let routed_view = (targeted.is_none() && self.filesystem_routed)
-            .then(|| filtered.file_route_view(FILE_ROUTE_RELATIONS));
-        let selection = targeted.or(routed_view.as_ref()).unwrap_or(filtered);
+        let routed_view;
+        let selection = if let Some(targeted) = targeted {
+            targeted
+        } else {
+            routed_view = filtered.file_route_view(FILE_ROUTE_RELATIONS);
+            &routed_view
+        };
         let mut groups =
             build_native_candidate_groups_from_snapshot(raw, selection, passwords, cached);
         // Only an explicit selection can nominate files on other routes.
@@ -241,7 +239,7 @@ impl NativeCandidateTable {
         groups
     }
 
-    pub(crate) fn retain_targets(&mut self) {
+    fn retain_targets(&mut self) {
         if let Some(targets) = &self.targets {
             targets.retain(&mut self.rows);
         }
@@ -826,7 +824,6 @@ impl NativeCandidateTable {
         targets: Option<FileTargets>,
     ) -> std::io::Result<()> {
         (|| {
-            self.filesystem_routed = true;
             self.targets = targets;
             let selected = self
                 .targets
@@ -870,7 +867,9 @@ impl NativeCandidateTable {
                 let data = group.candidate_data();
                 if data.format_hint == "rar" && data.needs_password {
                     let mut probe = group.project();
-                    if probe.input.mode.structured() && probe.input.parts.is_empty() {
+                    if probe.input.analysis.origin == crate::io::archive_state::AnalysisOrigin::RelationsFallback
+                        && matches!(group.as_ref(), NativeRelationGroup::Proposal(_))
+                    {
                         // Encrypted main headers can hide all volume numbers.
                         // Verify the header at its known offset before asking
                         // Relations to assign volumes using the decrypted facts.

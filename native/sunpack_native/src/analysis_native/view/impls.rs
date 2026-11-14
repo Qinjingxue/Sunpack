@@ -14,43 +14,21 @@ impl AnalysisBinaryView {
         self.reader.read_at(offset, size).map_err(reader_error)
     }
 
-    fn locate_zip_eocd_native(&self, offset: u64) -> io::Result<Option<ZipEocdCandidate>> {
-        let record = self.read_at_bytes(offset, 22)?;
-        Ok((record.len() == 22 && record.starts_with(ZIP_EOCD)).then(|| ZipEocdCandidate {
-            offset, comment_length: u64::from(u16_le(&record, 20)),
-        }))
-    }
-
     fn probe_zip_with_disk_starts(
         &self,
-
         eocd_offset: u64,
+        eocd: &[u8; 22],
         disk_starts: Option<&[u64]>,
     ) -> std::io::Result<ZipObservation> {
         let mut result = ZipObservation { eocd_offset, ..Default::default() };
 
-        let eocd = match self.read_field_at_bytes(eocd_offset, 22, "zip.eocd", FieldLocation::Tail)
-        {
-            Ok(data) => data,
-            Err(fault) => {
-                result.error = "eocd_too_small".to_owned();
-                result.read_fault = Some(fault);
-                return Ok(result);
-            }
-        };
-        if &eocd[0..4] != ZIP_EOCD {
-            result.error = "bad_eocd_signature".to_owned();
-            return Ok(result);
-        }
-        result.magic_matched = true;
-        let disk_number = u16_le(&eocd, 4);
-        let central_directory_disk = u16_le(&eocd, 6);
-        let disk_entries = u16_le(&eocd, 8);
-        let total_entries = u16_le(&eocd, 10);
-        let central_directory_size = u32_le(&eocd, 12) as u64;
-        let central_directory_offset = u32_le(&eocd, 16) as u64;
-        let comment_length = u16_le(&eocd, 20) as u64;
-        result.comment_length = comment_length;
+        let disk_number = u16_le(eocd, 4);
+        let central_directory_disk = u16_le(eocd, 6);
+        let disk_entries = u16_le(eocd, 8);
+        let total_entries = u16_le(eocd, 10);
+        let central_directory_size = u32_le(eocd, 12) as u64;
+        let central_directory_offset = u32_le(eocd, 16) as u64;
+        result.comment_length = u16_le(eocd, 20) as u64;
 
         // APPNOTE 4.3.14/4.3.15: a ZIP64 archive places the Zip64 end of
         // central directory record (56 bytes: 4-byte signature + 52 fixed

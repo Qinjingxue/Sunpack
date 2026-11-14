@@ -40,7 +40,7 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
         fs::create_dir_all(base.join("native")).unwrap();
         fs::write(base.join("native/Cargo.toml"), b"").unwrap();
         fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
-        for case in ["stable", "content", "claim", "error", "stop"] {
+        for case in ["stable", "content", "claim", "owned", "error", "stop"] {
             let directory = base.join(case);
             let watched = directory.join("watched");
             fs::create_dir_all(&watched).unwrap();
@@ -102,6 +102,16 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
                 if case == "claim" {
                     scheduler.hub.claims.lock().unwrap().insert(check_id, Arc::from("foreground"));
                 }
+                if case == "owned" {
+                    let output = check_source.parent().unwrap().to_string_lossy().into_owned();
+                    let identity = output_identity(&output).unwrap();
+                    scheduler.journal.commit(true, |_| {
+                        Ok(crate::watch_store::NativeWatchOperations::owned_outputs(
+                            &[output], &[&identity],
+                        ))
+                    }).unwrap();
+                    return Ok(());
+                }
                 if case == "stop" { scheduler.hub.stopped.store(true, Ordering::Release); }
                 // A live writer conflicts with watch_file_is_ready's read-only
                 // sharing, while permitting catalog readers and metadata probes.
@@ -121,9 +131,13 @@ fn checkpoint_admission_reuses_only_unchanged_unclaimed_readiness() {
             let result = scheduler.dispatch_ready();
             assert_eq!(result.is_err(), case == "error", "{case}: {result:?}");
             assert!(scheduler.admission_checkpoint.is_none(), "checkpoint barrier not reached: {case}");
-            if case == "stable" {
-                assert!(scheduler.pending.is_empty(), "stable candidate was re-probed");
+            if matches!(case, "stable" | "owned") {
+                assert!(scheduler.pending.is_empty(), "{case} candidate was requeued");
                 assert!(scheduler.due.is_empty());
+                if case == "owned" {
+                    assert!(scheduler.active.is_empty(), "owned output reached the worker");
+                    assert!(scheduler.journal.state().pending(source_text).is_none());
+                }
             } else {
                 assert!(!scheduler.pending[&id].admission_ready, "readiness leaked past {case}");
                 assert!(scheduler.active.is_empty());
@@ -495,6 +509,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         scheduler.observe_file_changes_blocking(
             &HashMap::from([(root_id.clone(), HashSet::from([tail.clone()]))]),
             &HashMap::from([(tail, CandidateEvent::Created)]),
+            &HashSet::new(),
         ).unwrap();
         assert!(scheduler.pending[&id].due >= before + Duration::from_secs(9),
             "quiet summary after volume arrival: {:?}", scheduler.pending[&id].quiet.summary());
@@ -581,8 +596,6 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
             let mut signals = Signals::default();
             signals.root_changed(&root_id, Some(vec![old.clone(), new.clone()]));
             signals.candidate_events.insert(new.clone(), CandidateEvent::Moved(old.clone()));
-            assert!(Signals::prepare_root_changes(&mut signals.changed_roots,
-                &signals.topology_roots, &signals.modified_paths));
             if fail { *crate::postprocess::WATCH_OBSERVATION_FAILURE.lock().unwrap() = Some(new.clone()); }
             scheduler.observe_root_changes(&mut signals.changed_roots, &signals.topology_roots,
                 &signals.modified_paths, &signals.candidate_events).unwrap();
@@ -594,6 +607,16 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         // A catalog/USN-only discovery keeps its business origin, not a native event.
         let recovery = watched.join("recovery.zip");
         fs::write(&recovery, b"archive").unwrap();
+        // A known file departure updates only that catalog row, even with no
+        // USN Broker. An unrelated arrival belongs to a subsequent checkpoint.
+        let departed = &expected[0].0;
+        assert!(scheduler.catalog.path_is_directory(
+            &scheduler.roots[&root_id].1, departed.to_str().unwrap()) == Some(false));
+        fs::remove_file(departed).unwrap();
+        let mut changes = HashMap::from([(root_id.clone(), HashSet::from([departed.clone()]))]);
+        scheduler.observe_root_changes(&mut changes, &HashSet::new(), &HashSet::new(), &HashMap::new()).unwrap();
+        assert!(!scheduler.pending.contains_key(&key(departed)));
+        assert!(!scheduler.pending.contains_key(&key(&recovery)));
         scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
         expected.push((recovery.clone(), "candidate_active", "usn_recovery", String::new()));
         scheduler.journal.flush().unwrap();
@@ -619,6 +642,11 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         scheduler.checkpoint(&HashMap::new(), true, false).unwrap();
         assert!(read_roots(&scheduler.root_file).unwrap()[0].scanned);
         assert!(scheduler.journal.state().pending(recovery.to_str().unwrap()).is_some());
+        scheduler.journal.flush().unwrap();
+        let records = display_events::read(&directory.join("state/events.json")).unwrap();
+        assert!(records["history"].as_array().unwrap().iter().any(|record| {
+            record["event"] == "initial_scan_completed" && record["roots"] == json!([watched])
+        }));
         return;
     }
     run_isolated("native_event_provenance_survives_ordinary_and_checkpoint_admission", CHILD);
@@ -683,4 +711,97 @@ fn process_mode_only_change_is_shell_policy_not_scheduler_policy() {
     } else { crate::core::config::ProcessMode::Normal };
     assert!(!scheduler_configuration_changed(&previous, &next));
     assert!(previous != next, "shell changes must not be reported as no-op");
+}
+
+#[test]
+fn a_retired_toast_activation_is_successful_and_leaves_current_request_running() {
+    const CHILD: &str = "SUNPACK_WATCH_RETIRED_TOAST_TEST";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
+        let mut scheduler = Scheduler::open(base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
+            Arc::new(Hub::new()), false, false, Arc::new(Mutex::new(None)), config::load_snapshot(&base).unwrap()).unwrap();
+        let retired = "80000000000000000000000000000000";
+        assert!(!scheduler.cancel_display_batch(retired).unwrap());
+        let toast = super::super::toast::Toast::start(
+            &base, Arc::clone(&scheduler.engine), base.join("state/toast_host_events.jsonl"),
+            7, |_, _| {},
+        ).unwrap();
+        let current = toast.register(Arc::from("00000000000000000000000000000001"), crate::core::i18n::Language::En);
+        scheduler.toast = Some(toast);
+        assert!(scheduler.cancel_display_batch(retired).unwrap());
+        // The active request can still finish through its original activity.
+        assert!(current.prepare_finish(&Ok(Outcome::default()), false, false, |_| None).is_some());
+        return;
+    }
+    run_isolated("a_retired_toast_activation_is_successful_and_leaves_current_request_running", CHILD);
+}
+
+#[test]
+fn coalesced_watch_completion_keeps_the_leaders_blocker() {
+    const CHILD: &str = "SUNPACK_WATCH_COALESCED_TEST";
+    if let Some(base) = std::env::var_os(CHILD) {
+        let base = PathBuf::from(base);
+        let watched = base.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        fs::create_dir_all(base.join("native")).unwrap();
+        fs::write(base.join("native/Cargo.toml"), b"").unwrap();
+        fs::write(base.join("sunpack_advanced_config.json"), b"{}").unwrap();
+        let mut scheduler = Scheduler::open(
+            base.clone(), Arc::new(Engine::new(base.join("unused-worker.exe"))),
+            Arc::new(Hub::new()), false, false, Arc::new(Mutex::new(None)),
+            config::load_snapshot(&base).unwrap(),
+        ).unwrap();
+        scheduler.journal.resume().unwrap();
+        let source = watched.join("family.7z.002");
+        fs::write(&source, b"follower generation").unwrap();
+        let candidate = watch_candidate_for_path(&source, None).unwrap().unwrap();
+        let id = watch_path_key(&candidate.path);
+        let blocker = Arc::new(observed_entry(&candidate, "failed_password", None));
+        scheduler.journal.commit(true, |state| {
+            let (mut operations, _) = state.pending_operations(
+                [(PendingObservation(candidate.path.clone(), candidate.size as i64,
+                    candidate.mtime, candidate.observation.file_id.clone(),
+                    candidate.observation.change_usn), String::new(), None)],
+                false, "", false, true, None,
+            )?;
+            operations.put_entry(Arc::clone(&blocker));
+            Ok(operations)
+        }).unwrap();
+        scheduler.active_paths.insert(id.clone(), Arc::from("follower"));
+        let release = Arc::new(super::super::cli::reporting::Reply::default());
+        let wait = Arc::clone(&release);
+        let cancel = Cancellation::new();
+        let request = scheduler.engine.spawn_control(Origin::Watch, &cancel, async move {
+            wait.wait().await.unwrap();
+            let mut outcome = Outcome::default();
+            outcome.coalesced_from = Some(1);
+            Completed {
+                cancelled: false,
+                result: Ok(outcome),
+                promoted: HashMap::new(), outputs: BTreeMap::new(),
+            }
+        }).unwrap();
+        let claimed = Arc::new(Mutex::new(ClaimedSources { coalesced: true, ..Default::default() }));
+        scheduler.active.insert("follower".into(), Active {
+            deep: false, root: key(&watched), recovery: None, password_scope: watched.clone(),
+            passwords: scheduler.passwords.snapshot(), inputs: HashMap::from([(id.clone(), candidate.clone())]),
+            quiet: HashMap::new(), dirty: HashSet::new(), claimed,
+            groups: Arc::default(), toast: None, cancel: cancel.clone(), request,
+        });
+        // The leader has already released its physical claim but the follower
+        // still awaits request completion. Stop must preserve the blocker.
+        let stopped = scheduler.cancel_batch("follower");
+        release.complete(Ok(()));
+        assert!(stopped && cancel.cancelled());
+        assert!(Arc::ptr_eq(&blocker, &scheduler.journal.state().entry(&candidate.path).unwrap()));
+        scheduler.complete("follower").unwrap();
+        assert!(!scheduler.active_paths.contains_key(&id));
+        assert!(scheduler.journal.state().pending(&candidate.path).is_none());
+        assert!(Arc::ptr_eq(&blocker, &scheduler.journal.state().entry(&candidate.path).unwrap()));
+        return;
+    }
+    run_isolated("coalesced_watch_completion_keeps_the_leaders_blocker", CHILD);
 }

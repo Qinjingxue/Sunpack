@@ -8,21 +8,18 @@ use std::time::UNIX_EPOCH;
 
 pub(crate) type PromotionResult = (
     Vec<(String, String)>,
-    Vec<String>,
-    Vec<String>,
     String,
     bool,
 );
 
 pub(crate) struct NativeBlockedInputPromotion {
     moves: Vec<(PathBuf, PathBuf)>,
-    destination: PathBuf,
 }
 
 impl NativeBlockedInputPromotion {
     pub(crate) fn new(paths: Vec<String>, destination: PathBuf) -> io::Result<Self> {
         let moves = plan_promotion_moves(paths, &destination)?;
-        Ok(Self { moves, destination })
+        Ok(Self { moves })
     }
 
     pub(crate) fn moves(&self) -> &[(PathBuf, PathBuf)] {
@@ -30,12 +27,7 @@ impl NativeBlockedInputPromotion {
     }
 
     pub(crate) fn execute(&self, before_move: impl FnOnce() -> io::Result<()>) -> PromotionResult {
-        promote_input_files_with_move(
-            &self.moves,
-            &self.destination,
-            before_move,
-            move_input_no_replace,
-        )
+        promote_input_files_with_move(&self.moves, before_move, move_input_no_replace)
     }
 }
 
@@ -88,12 +80,10 @@ fn plan_promotion_moves(
 
 fn promote_input_files_with_move(
     moves: &[(PathBuf, PathBuf)],
-    destination: &Path,
     before_move: impl FnOnce() -> io::Result<()>,
     mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> PromotionResult {
     let mut residual = Vec::new();
-    let mut removed = Vec::new();
     let mut parents = HashSet::new();
     // Recheck after acquiring publication leases, before the durable intent.
     for (source, target) in moves {
@@ -102,20 +92,18 @@ fn promote_input_files_with_move(
             Ok(true) => {
                 return (
                     residual,
-                    removed,
-                    Vec::new(),
                     "promotion destination exists".into(),
                     true,
                 )
             }
-            Err(error) => return (residual, removed, Vec::new(), error.to_string(), false),
+            Err(error) => return (residual, error.to_string(), false),
         }
         if let Some(parent) = source.parent() {
             parents.insert(parent.to_path_buf());
         }
     }
     if let Err(error) = before_move() {
-        return (residual, removed, Vec::new(), error.to_string(), false);
+        return (residual, error.to_string(), false);
     }
     for (index, (source, target)) in moves.iter().enumerate() {
         if let Err(error) = move_file(source, target) {
@@ -129,18 +117,14 @@ fn promote_input_files_with_move(
                 }
             }
             let collision = is_name_collision(&error) && residual.is_empty();
-            return (residual, removed, Vec::new(), message, collision);
+            return (residual, message, collision);
         }
     }
     for parent in &parents {
         // remove_dir itself atomically checks emptiness; never walk upwards.
-        if fs::remove_dir(parent).is_ok() {
-            removed.push(normalize_path(parent));
-        }
+        let _ = fs::remove_dir(parent);
     }
-    let mut touched: Vec<_> = parents.iter().map(|p| normalize_path(p)).collect();
-    touched.push(normalize_path(destination));
-    (residual, removed, touched, String::new(), false)
+    (residual, String::new(), false)
 }
 
 fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
@@ -484,7 +468,6 @@ mod tests {
         ] {
             let result = promote_input_files_with_move(
                 &moves,
-                &destination,
                 || Ok(()),
                 |old, new| {
                     if old == second {
@@ -494,8 +477,8 @@ mod tests {
                 },
             );
             assert!(result.0.is_empty());
-            assert!(result.3.contains("injected"));
-            assert_eq!(result.4, kind == io::ErrorKind::AlreadyExists);
+            assert!(result.1.contains("injected"));
+            assert_eq!(result.2, kind == io::ErrorKind::AlreadyExists);
             assert!(first.is_file() && second.is_file());
             assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
         }
@@ -524,7 +507,6 @@ mod tests {
         let mut attempted = Vec::new();
         let result = promote_input_files_with_move(
             &moves,
-            &destination,
             || Ok(()),
             |old, new| {
                 attempted.push(old.to_path_buf());
@@ -541,9 +523,9 @@ mod tests {
             result.0,
             vec![(normalize_path(&paths[1]), normalize_path(&moves[1].1))]
         );
-        assert!(result.3.contains("collision") && result.3.contains("retained"));
+        assert!(result.1.contains("collision") && result.1.contains("retained"));
         assert!(
-            !result.4,
+            !result.2,
             "partial rollback must not allow collision replanning"
         );
         assert_eq!(

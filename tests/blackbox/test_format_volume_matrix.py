@@ -7,6 +7,7 @@ not a reason to silently skip format coverage in a configured Windows run.
 import io
 import shutil
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -88,8 +89,21 @@ def test_renamed_rar5_volumes_resolve_encrypted_headers_before_numbering(package
     )
     parts = sorted(case.archive_dir.iterdir())
     assert len(parts) > 2 and parts[0] == case.entry_path
+
+    # Before decryption, renamed candidate members must still appear in scan
+    # even when their headers cannot establish the physical volume numbers.
+    disguised = []
+    for index, part in enumerate(parts):
+        target = part.with_name("renamed.xyz" if index == 0 else f"renamed.{index:03d}.jpg")
+        part.rename(target)
+        disguised.append(target)
+    report = package.json("scan", "-d", "--no-builtin-pw", case.archive_dir, code=1)
+    item, = report["items"]
+    assert item["error_kind"] == "password_required"
+    assert {Path(path) for path in item["all_parts"]} == set(disguised)
+
     renamed = []
-    for index, part in enumerate(parts, 1):
+    for index, part in enumerate(disguised, 1):
         target = part.with_name(f"renamed.opaque.{index:03d}")
         part.rename(target)
         renamed.append(target)

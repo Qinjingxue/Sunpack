@@ -214,39 +214,11 @@ impl Evidence {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReportHitKind {
-    ZipLocal,
-    ZipEocd,
-    ZipOther,
-    Rar,
-    SevenZip,
-}
-
-impl ReportHitKind {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "zip_local" => Some(Self::ZipLocal),
-            "zip_eocd" => Some(Self::ZipEocd),
-            "7z" => Some(Self::SevenZip),
-            name if name.starts_with("rar") => Some(Self::Rar),
-            name if name.starts_with("zip_") => Some(Self::ZipOther),
-            // Stream modules consume structural facts, not signature hits.
-            _ => None,
-        }
-    }
-}
-
-struct ReportSignatureHit {
-    kind: ReportHitKind,
-    offset: u64,
-}
-
 /// Probe access shared by single-file and multi-volume analysis.
 struct ReportContext<'a> {
     view: &'a AnalysisBinaryView,
     disk_starts: Option<&'a [u64]>,
-    hits: Arc<[SignatureHit]>,
+    signatures: LeadingSignatures,
     stream_structure: Option<Option<Arc<StreamObservation>>>,
 }
 
@@ -304,7 +276,7 @@ impl AnalysisBinaryView {
         let mut context = ReportContext {
             view: self,
             disk_starts,
-            hits: signature_prepass_native(&self.reader).map_err(reader_error)?,
+            signatures: LeadingSignatures::read(&self.reader).map_err(reader_error)?,
             stream_structure: None,
         };
         let mut evidences = Vec::new();
@@ -382,53 +354,22 @@ impl<'a> ReportContext<'a> {
         }
     }
 
-    fn hits(&self, matches: impl Fn(ReportHitKind) -> bool) -> Vec<ReportSignatureHit> {
-        self.hits
-            .iter()
-            .filter_map(|hit| {
-                let kind = ReportHitKind::from_name(hit.name())?;
-                matches(kind).then(|| ReportSignatureHit {
-                    kind,
-                    offset: hit.offset(),
-                })
-            })
-            .collect()
-    }
-
     // ---- RAR ------------------------------------------------------------
 
     fn rar_module(&mut self) -> std::io::Result<Evidence> {
-        let hits = self.hits(|kind| kind == ReportHitKind::Rar);
-        if hits.is_empty() {
+        if !self.signatures.rar {
             return Ok(Evidence::not_found("rar"));
         }
-        let mut candidates = Vec::new();
-        let mut starts = hits.iter().map(|hit| hit.offset).collect::<Vec<_>>();
-        starts.sort_unstable();
-        starts.dedup();
-        for start in starts {
-            let native = (self.view.probe_rar_native(start))?;
-            candidates.push(rar_from_native(native, start));
-        }
-        Ok(select_candidate("rar", candidates))
+        self.view.probe_rar_native(0).map(|raw| rar_from_native(raw, 0))
     }
 
     // ---- 7z -------------------------------------------------------------
 
     fn seven_zip_module(&mut self) -> std::io::Result<Evidence> {
-        let hits = self.hits(|kind| kind == ReportHitKind::SevenZip);
-        if hits.is_empty() {
+        if !self.signatures.seven_zip {
             return Ok(Evidence::not_found("7z"));
         }
-        let mut starts = hits.iter().map(|hit| hit.offset).collect::<Vec<_>>();
-        starts.sort_unstable();
-        starts.dedup();
-        let mut candidates = Vec::new();
-        for start in starts {
-            let native = (self.view.probe_seven_zip_native(start))?;
-            candidates.push(seven_zip_from_native(native, start));
-        }
-        Ok(select_candidate("7z", candidates))
+        self.view.probe_seven_zip_native(0).map(|raw| seven_zip_from_native(raw, 0))
     }
 
     // ---- TAR ------------------------------------------------------------
@@ -472,59 +413,17 @@ impl<'a> ReportContext<'a> {
     // ---- ZIP ------------------------------------------------------------
 
     fn zip_module(&mut self) -> std::io::Result<Evidence> {
-        let hits = self.hits(|kind| {
-            matches!(
-                kind,
-                ReportHitKind::ZipLocal | ReportHitKind::ZipEocd | ReportHitKind::ZipOther
-            )
-        });
-        if hits.is_empty() {
+        let Some((offset, record)) = self.signatures.zip_eocd.as_ref() else {
+            return Ok(Evidence::not_found("zip"));
+        };
+        let native = self.view.probe_zip_with_disk_starts(*offset, record, self.disk_starts)?;
+        let local = self.signatures.zip_local;
+        if native.archive_offset != 0 && local != Some(native.archive_offset) {
+            // A terminal record may belong to a ZIP inside a damaged leading
+            // input. A different root belongs to the existing embedded stage.
             return Ok(Evidence::not_found("zip"));
         }
-        // Resolve only on recovery, once per analysis, including an absent local header.
-        let mut earliest_local = None::<Option<u64>>;
-        let mut eocd_hits = Vec::new();
-        for hit in &hits {
-            if hit.kind == ReportHitKind::ZipEocd {
-                eocd_hits.push(hit.offset);
-            }
-        }
-        eocd_hits.sort_unstable_by(|left, right| right.cmp(left));
-        let mut evidences = Vec::new();
-        for eocd_offset in eocd_hits {
-            let native = self.zip_eocd_observation(eocd_offset)?;
-            if !(native.magic_matched || native.plausible)
-            {
-                continue;
-            }
-            let archive_offset = native.archive_offset;
-            if archive_offset != 0
-                && !hits
-                    .iter()
-                    .any(|hit| hit.kind == ReportHitKind::ZipLocal && hit.offset == archive_offset)
-            {
-                // A terminal record may belong to a ZIP inside a damaged
-                // leading input. Reuse the parser's origin fact; discovering
-                // a different root belongs to the existing embedded stage.
-                continue;
-            }
-            evidences.push(
-                match zip_local_header_recovery(&native, &hits, &mut earliest_local) {
-                    Some(recovered) => recovered,
-                    None => zip_from_native(native, &hits, self.view.reader.len()),
-                },
-            );
-        }
-        Ok(select_candidate("zip", evidences))
-    }
-
-    fn zip_eocd_observation(&self, requested: u64) -> std::io::Result<ZipObservation> {
-        let Some(candidate) = self.view.locate_zip_eocd_native(requested)? else {
-            return Ok(ZipObservation { error: "eocd_not_found".into(), ..Default::default() });
-        };
-        let mut raw = self.view.probe_zip_with_disk_starts(candidate.offset, self.disk_starts)?;
-        raw.comment_length = candidate.comment_length;
-        Ok(raw)
+        Ok(zip_from_native(native, local, self.view.reader.len()))
     }
 
     // ---- Compression streams -------------------------------------------
@@ -764,11 +663,20 @@ fn seven_zip_from_native(mut raw: SevenZipObservation, start: u64) -> Evidence {
 
 fn zip_from_native(
     native: ZipObservation,
-    hits: &[ReportSignatureHit],
+    local: Option<u64>,
     view_size: u64,
 ) -> Evidence {
-    if !native.magic_matched && hits.is_empty() {
-        return Evidence::new("zip", "not_found", Vec::new(), EvidenceDetails::Zip(Box::new(native)));
+    if let Some(start) = local.filter(|_| ZIP_LOCAL_RECOVERY_ERRORS.contains(&native.error.as_str())) {
+        return Evidence::new(
+            "zip",
+            "damaged",
+            vec![Segment::new(
+                start,
+                None,
+                vec!["central_directory_unreliable".into(), "local_header_recovery".into()],
+            )],
+            EvidenceDetails::Zip(Box::new(native)),
+        );
     }
     let archive_offset = native.archive_offset;
     let end_offset = (native.eocd_offset != 0).then(|| native.eocd_offset + 22 + native.comment_length);
@@ -781,50 +689,9 @@ fn zip_from_native(
     if !native.content_integrity_warning.is_empty() {
         damage_flags.push("content_integrity_bad_or_unknown".to_owned());
     }
-    let segments = if !hits.is_empty() || native.plausible {
-        let mut segment = Segment::new(archive_offset, end_offset.map(|end| end.min(view_size)), damage_flags);
-        segment.zip_eocd_offset = native.eocd_offset.checked_sub(archive_offset);
-        vec![segment]
-    } else { Vec::new() };
-    Evidence::new("zip", status, segments, EvidenceDetails::Zip(Box::new(native)))
-}
-
-fn zip_local_header_recovery(
-    native: &ZipObservation,
-    hits: &[ReportSignatureHit],
-    earliest_local: &mut Option<Option<u64>>,
-) -> Option<Evidence> {
-    if !ZIP_LOCAL_RECOVERY_ERRORS.contains(&native.error.as_str()) { return None; }
-    if earliest_local.is_none() {
-        *earliest_local = Some(hits.iter().filter(|hit| hit.kind == ReportHitKind::ZipLocal)
-            .map(|hit| hit.offset).min());
-    }
-    let Some(start) = (*earliest_local).flatten() else { return None; };
-    // The retained native facts still govern password and volume planning.
-    Some(Evidence::new(
-        "zip", "damaged", vec![Segment::new(start, None,
-            vec!["central_directory_unreliable".into(), "local_header_recovery".into()])],
-        EvidenceDetails::Zip(Box::new(native.clone())),
-    ))
-}
-
-fn select_candidate(format: &str, candidates: Vec<Evidence>) -> Evidence {
-    candidates
-        .into_iter()
-        .filter(|item| !item.segments.is_empty())
-        // Prefer established format state, then the first outer physical range.
-        .min_by_key(|item| (std::cmp::Reverse(status_rank(item.status)), item.range_key()))
-        .unwrap_or_else(|| Evidence::not_found(format))
-}
-
-fn status_rank(status: &str) -> u8 {
-    match status {
-        "error" => 1,
-        "weak" => 2,
-        "damaged" => 3,
-        "extractable" => 4,
-        _ => 0,
-    }
+    let mut segment = Segment::new(archive_offset, end_offset.map(|end| end.min(view_size)), damage_flags);
+    segment.zip_eocd_offset = native.eocd_offset.checked_sub(archive_offset);
+    Evidence::new("zip", status, vec![segment], EvidenceDetails::Zip(Box::new(native)))
 }
 
 struct SegmentPlan {
@@ -1204,19 +1071,6 @@ mod report_tests {
     }
 
     #[test]
-    fn selection_prefers_first_proven_outer_range() {
-        let candidates = vec![
-            evidence("rar", "weak", &[(0, None)], false),
-            evidence("rar", "extractable", &[(30, Some(50))], false),
-            evidence("rar", "extractable", &[(4, Some(20))], true),
-        ];
-        let selected = select_candidate("rar", candidates);
-        assert_eq!(selected.status, "extractable");
-        assert!(selected.details.password_required());
-        assert_eq!(selected.segments[0].start, 4);
-    }
-
-    #[test]
     fn typed_zip_and_tar_facts_retain_planning_boundaries() {
         // Exercise real probes and the final facts together: dictionary-field
         // conversion errors otherwise silently default password/boundary facts.
@@ -1232,10 +1086,11 @@ mod report_tests {
         let zip_path = crate::test_support::temp_file("typed_zip_facts", &zip);
         {
             let view = AnalysisBinaryView::new(&zip_path.to_string_lossy(), 0).unwrap();
-            let observed = view.probe_zip_with_disk_starts(76, None).unwrap();
+            let signatures = LeadingSignatures::read(&view.reader).unwrap();
+            let (offset, record) = signatures.zip_eocd.unwrap();
+            let observed = view.probe_zip_with_disk_starts(offset, &record, None).unwrap();
             assert!(observed.plausible && observed.password_required);
-            let evidence = zip_from_native(observed,
-                &[ReportSignatureHit { kind: ReportHitKind::ZipLocal, offset: 0 }], zip.len() as u64);
+            let evidence = zip_from_native(observed, signatures.zip_local, zip.len() as u64);
             assert_eq!(evidence.status, "extractable");
             assert_eq!(evidence.segments[0].end, Some(zip.len() as u64));
             let facts = evidence.analysis_facts();
@@ -1255,8 +1110,8 @@ mod report_tests {
         let tar_path = crate::test_support::temp_file("typed_tar_facts", &tar);
         {
             let view = AnalysisBinaryView::new(&tar_path.to_string_lossy(), 0).unwrap();
-            let context = ReportContext { view: &view, disk_starts: None, hits: Vec::new().into(),
-                stream_structure: None };
+            let context = ReportContext { view: &view, disk_starts: None,
+                signatures: LeadingSignatures::read(&view.reader).unwrap(), stream_structure: None };
             let evidence = context.tar_candidate(0).unwrap().unwrap();
             assert_eq!(evidence.status, "extractable");
             assert_eq!(evidence.segments[0].end, Some(tar.len() as u64));

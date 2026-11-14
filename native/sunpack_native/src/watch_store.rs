@@ -346,6 +346,21 @@ pub(crate) struct PendingRecord {
     pub(crate) promoted_destinations: PathSet,
 }
 
+impl PendingRecord {
+    pub(crate) fn matches_observation(&self, candidate: &crate::postprocess::WatchCandidateRow) -> bool {
+        self.size == candidate.size.min(i64::MAX as u64) as i64
+            && self.mtime == candidate.mtime
+            && self.file_id == candidate.observation.file_id
+            && self.change_usn == candidate.observation.change_usn
+    }
+
+    pub(crate) fn has_output_work(&self) -> bool {
+        !self.active_outputs.is_empty()
+            || self.committed_roots.iter().next().is_some()
+            || self.promoted_destinations.iter().next().is_some()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EntryRecord {
@@ -622,6 +637,12 @@ impl NativeWatchOperations {
                 retry,
                 Operation::Delete(Collection::Pending, key),
             ])),
+        }
+    }
+
+    pub(crate) fn retire_pending(key: String) -> Self {
+        Self {
+            operations: Arc::new(Operations(vec![Operation::Delete(Collection::Pending, key)])),
         }
     }
 

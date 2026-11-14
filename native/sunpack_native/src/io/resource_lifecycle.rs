@@ -6,10 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-#[derive(Clone)]
-pub(crate) struct NativeResourceRecord {
-    pub(crate) paths: Vec<PathBuf>,
-    pub(crate) promotion_blocking: bool,
+struct NativeResourceRecord {
+    paths: Vec<PathBuf>,
+    promotion_blocking: bool,
 }
 
 #[derive(Default)]
@@ -344,7 +343,11 @@ fn registry() -> &'static NativeRegistryState {
 }
 
 fn normalized_path(path: PathBuf) -> PathBuf {
-    let resolved = if let Ok(canonical) = std::fs::canonicalize(&path) {
+    resource_key(&resolve_path(path))
+}
+
+fn resolve_path(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
         canonical
     } else if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
         if let Ok(parent) = std::fs::canonicalize(parent) {
@@ -362,14 +365,17 @@ fn normalized_path(path: PathBuf) -> PathBuf {
         std::env::current_dir()
             .map(|current| current.join(&path))
             .unwrap_or(path)
-    };
+    }
+}
+
+fn resource_key(resolved: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         PathBuf::from(crate::path_keys::path_key(&resolved.to_string_lossy()))
     }
     #[cfg(not(windows))]
     {
-        resolved
+        resolved.to_path_buf()
     }
 }
 
@@ -381,95 +387,50 @@ fn paths_overlap(paths: &[PathBuf], roots: &[PathBuf]) -> bool {
     })
 }
 
-fn overlaps(record: &NativeResourceRecord, roots: &[PathBuf]) -> bool {
-    paths_overlap(&record.paths, roots)
-}
+pub(crate) struct Promotion(u64);
 
-pub(crate) fn native_begin_promotion(roots: Vec<String>) -> std::io::Result<u64> {
-    static NEXT_PROMOTION_ID: AtomicU64 = AtomicU64::new(1);
-    let roots = roots
-        .into_iter()
-        .map(PathBuf::from)
-        .map(normalized_path)
-        .collect::<Vec<_>>();
-    let mut registry = registry()
-        .registry
-        .lock()
-        .map_err(|_| std::io::Error::other("native resource registry poisoned"))?;
-    if registry
-        .promotions
-        .values()
-        .any(|existing| paths_overlap(&roots, existing))
-    {
-        return Err(std::io::Error::other(
-            "overlapping native promotion already active",
-        ));
-    }
-    let id = NEXT_PROMOTION_ID.fetch_add(1, Ordering::Relaxed);
-    registry.promotions.insert(id, roots);
-    Ok(id)
-}
-
-pub(crate) fn native_end_promotion(token: u64) -> std::io::Result<()> {
-    let mut registry = registry()
-        .registry
-        .lock()
-        .map_err(|_| std::io::Error::other("native resource registry poisoned"))?;
-    if registry.promotions.remove(&token).is_none() {
-        return Err(std::io::Error::other("unknown native promotion token"));
-    }
-    if registry.promotions.capacity() > 256 {
-        crate::collections::trim_map(&mut registry.promotions);
-    }
-    Ok(())
-}
-
-pub(crate) fn native_wait_for_resources(
-    roots: Vec<String>,
-    nonblocking: bool,
-) -> io::Result<Vec<(u64, NativeResourceRecord)>> {
-    let roots = roots
-        .into_iter()
-        .map(PathBuf::from)
-        .map(normalized_path)
-        .collect::<Vec<_>>();
-    let records = (move || {
+impl Promotion {
+    pub(crate) fn begin(paths: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let resolved = crate::path_keys::merge_roots(paths.into_iter().map(resolve_path), |path| {
+            crate::path_keys::path_key(&path.to_string_lossy())
+        });
+        let keys: Vec<_> = resolved.iter().map(|path| resource_key(path)).collect();
         let state = registry();
-        let registry = state
-            .registry
-            .lock()
-            .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-        if nonblocking {
-            return Ok::<_, io::Error>(matching_resources(&registry, &roots, true));
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut registry = state.registry.lock()
+                .map_err(|_| io::Error::other("native resource registry poisoned"))?;
+            if registry.promotions.values().any(|roots| paths_overlap(&keys, roots)) {
+                return Err(io::Error::other("overlapping native promotion already active"));
+            }
+            registry.promotions.insert(id, keys);
         }
-        let _registry = state
-            .changed
-            .wait_while(registry, |registry| {
-                registry.resources.values().any(|record| {
-                    record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots))
-                })
-            })
+        let guard = Self(id);
+        // Evict cached handles before joining live readers. The published gate
+        // prevents new overlapping readers from registering during the wait.
+        crate::io::reader::release_reader_resources_under_resolved_roots(&resolved)?;
+        let registry = state.registry.lock()
             .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-        Ok::<_, io::Error>(Vec::new())
-    })()
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(records)
+        let _registry = state.changed.wait_while(registry, |registry| {
+            let roots = &registry.promotions[&id];
+            registry.resources.values().any(|record| {
+                record.promotion_blocking && paths_overlap(&record.paths, roots)
+            })
+        }).map_err(|_| io::Error::other("native resource registry poisoned"))?;
+        Ok(guard)
+    }
 }
 
-fn matching_resources(
-    registry: &NativeRegistry,
-    roots: &[PathBuf],
-    promotion_only: bool,
-) -> Vec<(u64, NativeResourceRecord)> {
-    registry
-        .resources
-        .iter()
-        .filter(|(_, record)| {
-            (!promotion_only || record.promotion_blocking)
-                && (roots.is_empty() || overlaps(record, roots))
-        })
-        .map(|(id, record)| (*id, record.clone()))
-        .collect()
+impl Drop for Promotion {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = registry().registry.lock() {
+            registry.promotions.remove(&self.0);
+            if registry.promotions.capacity() > 256 {
+                crate::collections::trim_map(&mut registry.promotions);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

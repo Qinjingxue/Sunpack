@@ -313,10 +313,10 @@ impl Options {
                 if !unrecognized.is_empty() { return Err(parser_error("", "", "the following arguments are required: command")); }
                 return Ok(Self { help: true, ..Self::default() });
             };
-            if arg == "--" {
-                break args.pop_front().ok_or_else(|| parser_error("", "", "the following arguments are required: command"))?;
+            if arg == "--" && args.is_empty() {
+                return Err(parser_error("", "", "the following arguments are required: command"));
             }
-            if !looks_like_option(&arg) { break arg; }
+            if arg == "--" || !looks_like_option(&arg) { break arg; }
             if arg.starts_with("-h") && !arg.starts_with("--") {
                 validate_short_cluster(&arg, args.front().map(|arg| arg.as_ref()), "", "")?;
                 return Ok(Self { help: true, ..Self::default() });
@@ -349,10 +349,19 @@ impl Options {
             let from_cluster = std::mem::take(&mut in_cluster);
             supplied = true;
             if arg == "--" && !positional {
-                if paths_closed { unrecognized.push("--".to_owned()); }
-                after_action |= !options.action.is_empty();
+                // Only a command with positional operands consumes the
+                // separator. A subcommand selector instead sees it as a value.
+                let action_missing = matches!(command, "watch" | "config") && options.action.is_empty();
+                let has_operands = match (command, options.action.as_str()) {
+                    ("extract" | "scan", _) | ("watch", "add" | "remove") => true,
+                    ("watch", "startup") => options.paths.is_empty() || args.is_empty(),
+                    _ => false,
+                };
                 positional = true;
-                continue;
+                if (has_operands && !paths_closed) || (action_missing && args.is_empty()) {
+                    after_action |= !options.action.is_empty();
+                    continue;
+                }
             }
             if positional || !looks_like_option(&arg) {
                 if matches!(command, "watch" | "config") && options.action.is_empty() {
@@ -414,7 +423,7 @@ impl Options {
             if !arg.starts_with("--") && arg.len() > 2 && arg.as_bytes()[1].is_ascii() {
                 let short = short_option(arg.as_bytes()[1]).filter(|spec| spec.scope.accepts(command, &options.action));
                 if short.is_some_and(OptionSpec::takes_value) {
-                    if arg.as_bytes()[2] != b'=' {
+                    if from_cluster || arg.as_bytes()[2] != b'=' {
                         arg.to_mut().insert(2, '=');
                     }
                 } else if short.is_some() {
@@ -547,12 +556,18 @@ impl Options {
 }
 
 // argparse validates the arity of an entire short-option cluster before
-// executing any of its actions, including help. Unknown suffixes are deferred.
+// executing any of its actions, including help.
 fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: &str) -> io::Result<()> {
     if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 2 { return Ok(()); }
     for index in 1..arg.len() {
         let flag = arg.as_bytes()[index];
-        let Some(spec) = short_option(flag).filter(|spec| spec.scope.accepts(command, action)) else { break; };
+        let Some(spec) = short_option(flag).filter(|spec| spec.scope.accepts(command, action)) else {
+            if index >= 2 {
+                let previous = arg.as_bytes()[index - 1];
+                return Err(explicit_argument(command, action, &format!("-{}", char::from(previous)), &arg[index..]));
+            }
+            break;
+        };
         let takes_value = spec.takes_value();
         let tail = &arg[index + 1..]; // recognized option letters are ASCII
         if takes_value {
@@ -562,7 +577,8 @@ fn validate_short_cluster(arg: &str, next: Option<&str>, command: &str, action: 
             break;
         }
         if tail.starts_with('=') || tail.starts_with('-') {
-            return Err(explicit_argument(command, action, &format!("-{}", char::from(flag)), tail.strip_prefix('=').unwrap_or(tail)));
+            let value = if index == 1 { tail.strip_prefix('=').unwrap_or(tail) } else { tail };
+            return Err(explicit_argument(command, action, &format!("-{}", char::from(flag)), value));
         }
     }
     Ok(())
@@ -686,6 +702,7 @@ struct CommandResult {
     summary: Value,
     errors: Vec<String>,
     items: Vec<Value>,
+    password_sources: Option<Box<PasswordSources>>,
     tasks: Vec<Value>,
     logs: Vec<String>,
 }
@@ -698,6 +715,7 @@ impl CommandResult {
             summary: json!({}),
             errors: Vec::new(),
             items: Vec::new(),
+            password_sources: None,
             tasks: Vec::new(),
             logs: Vec::new(),
         }
@@ -762,14 +780,9 @@ pub(super) async fn run(
     cancel: Cancellation,
 ) -> io::Result<i32> {
     let session = owned_session.as_ref();
-    if args
-        .first()
-        .is_some_and(|arg| arg == "--cancel-watch-batch")
-    {
-        return Ok(match args.get(1) {
-            Some(id) if host.watch.cancel_batch_async(id).await => 0,
-            _ => 1,
-        });
+    if args.first().is_some_and(|arg| arg == "--cancel-watch-batch") {
+        let [_, id] = args.as_slice() else { return Ok(2); };
+        return Ok(i32::from(!host.watch.cancel_batch_async(id).await));
     }
     let options = match Options::parse(&args) {
         Ok(options) => options,
@@ -1495,6 +1508,8 @@ async fn archives(
         Ok(reservation) => Arc::new(reservation),
         Err(error) => return archive_request_error(error, &inputs, options.command, language),
     };
+    let foreground = windows::Foreground::enter_async(&engine, &host.watch, settings.runtime.process_mode).await;
+    let execution = async {
     let mut overrides = serde_json::Map::new();
     if let Some((depth, value)) = &options.depth {
         settings.recursive_extract = *depth;
@@ -1587,11 +1602,6 @@ async fn archives(
     });
     let max_depth = depth(settings.recursive_extract);
     let settings = Arc::new(settings);
-    if !host.watch.is_running() {
-        windows::configure_priority_async(&engine, settings.runtime.process_mode).await;
-    }
-    let foreground = windows::Foreground::enter_async(&engine, &host.watch).await;
-    let execution = async {
     let mut retries = 0;
     let mut archive_status = HashMap::new();
     let mut had_input_error = false;
@@ -1695,9 +1705,12 @@ async fn archives(
                 "partial_success_count": counts.partial, "recovered_outputs": counts.recovered, "use_builtin_passwords": !options.no_builtins,
                 "password_retry_count": 0, "cleanup_results": cleanup.values,
             });
-            result.items.push(serde_json::to_value(password_item(
-                &user, &clipboard, &engine.recent_passwords(), builtin.as_deref(), !options.no_builtins,
-            ))?);
+            result.password_sources = Some(Box::new(PasswordSources::new(
+                user,
+                clipboard,
+                engine.recent_passwords(),
+                builtin,
+            )));
             return Ok((i32::from(!result.errors.is_empty()), result));
         }
         let outputs = std::mem::take(&mut progress.display.lock().unwrap().outputs);
@@ -2230,46 +2243,50 @@ struct PasswordItem<'a> {
     clipboard_passwords: &'a [Arc<str>],
     builtin_passwords: &'a [Arc<str>],
     use_builtin_passwords: bool,
-    combined_passwords: Vec<&'a str>,
+    combined_passwords: &'a [Arc<str>],
 }
 
-fn password_item<'a>(
-    user: &'a [Arc<str>],
-    clipboard: &'a [Arc<str>],
-    recent: &'a [Arc<str>],
-    snapshot: Option<&'a passwords::PasswordSnapshot>,
-    use_builtin_passwords: bool,
-) -> PasswordItem<'a> {
-    let builtin = snapshot.map_or(&[][..], passwords::PasswordSnapshot::global);
-    let configured = user
-        .iter()
-        .chain(clipboard)
-        .map(Arc::as_ref)
-        .chain(builtin.iter().map(AsRef::as_ref));
-    let mut missing_recent: HashSet<&str> = recent.iter().map(AsRef::as_ref).collect();
-    if !missing_recent.is_empty() {
-        for value in configured.clone() {
-            missing_recent.remove(value);
-            if missing_recent.is_empty() {
-                break;
+struct PasswordSources {
+    user: Vec<Arc<str>>,
+    clipboard: Vec<Arc<str>>,
+    recent: Vec<Arc<str>>,
+    builtin: Option<Arc<passwords::PasswordSnapshot>>,
+    combined: Vec<Arc<str>>,
+}
+
+impl PasswordSources {
+    fn new(
+        user: Vec<Arc<str>>, clipboard: Vec<Arc<str>>, recent: Vec<Arc<str>>,
+        builtin: Option<Arc<passwords::PasswordSnapshot>>,
+    ) -> Self {
+        let global = builtin.as_deref().map_or(&[][..], passwords::PasswordSnapshot::global);
+        let configured = user.iter().chain(&clipboard).chain(global);
+        let mut missing_recent: HashSet<&str> = recent.iter().map(Arc::as_ref).collect();
+        if !missing_recent.is_empty() {
+            for value in configured.clone() {
+                missing_recent.remove(value.as_ref());
+                if missing_recent.is_empty() { break; }
             }
         }
+        let mut seen = HashSet::new();
+        let combined = recent.iter()
+            .filter(|value| !missing_recent.contains(value.as_ref()))
+            .chain(configured)
+            .filter(|&value| seen.insert(value.as_ref()))
+            .cloned()
+            .collect();
+        Self { user, clipboard, recent, builtin, combined }
     }
-    let mut seen = HashSet::new();
-    let combined_passwords = recent
-        .iter()
-        .map(AsRef::as_ref)
-        .filter(|value| !missing_recent.contains(value))
-        .chain(configured)
-        .filter(|value| seen.insert(*value))
-        .collect();
-    PasswordItem {
-        user_passwords: user,
-        recent_passwords: recent,
-        clipboard_passwords: clipboard,
-        builtin_passwords: builtin,
-        use_builtin_passwords,
-        combined_passwords,
+
+    fn item(&self) -> PasswordItem<'_> {
+        PasswordItem {
+            user_passwords: &self.user,
+            recent_passwords: &self.recent,
+            clipboard_passwords: &self.clipboard,
+            builtin_passwords: self.builtin.as_deref().map_or(&[][..], passwords::PasswordSnapshot::global),
+            use_builtin_passwords: self.builtin.is_some(),
+            combined_passwords: &self.combined,
+        }
     }
 }
 
@@ -2345,13 +2362,8 @@ async fn show_passwords(
     } else {
         Some(host.password_snapshot(cwd)?)
     };
-    let item = password_item(
-        &user,
-        &clipboard,
-        &[],
-        snapshot.as_deref(),
-        !options.no_builtins,
-    );
+    let sources = PasswordSources::new(user, clipboard, Vec::new(), snapshot);
+    let item = sources.item();
     let mut result = CommandResult::new("passwords");
     if options.json {
         result.inputs = json!({"json":true,"use_builtin_passwords":!options.no_builtins});
@@ -2360,7 +2372,7 @@ async fn show_passwords(
             "clipboard_password_count": item.clipboard_passwords.len(), "builtin_password_count": item.builtin_passwords.len(),
             "combined_password_count": item.combined_passwords.len(),
         });
-        result.items.push(serde_json::to_value(item)?);
+        result.password_sources = Some(Box::new(sources));
         return Ok((0, result));
     }
     line(session, Stream::Out, language.text("cli.passwords.summary"))?;
@@ -2375,7 +2387,7 @@ async fn show_passwords(
     ] {
         show(key, password_list_repr(values.iter().map(Arc::as_ref)))?;
     }
-    show("cli.passwords.final_order", password_list_repr(item.combined_passwords))?;
+    show("cli.passwords.final_order", password_list_repr(item.combined_passwords.iter().map(Arc::as_ref)))?;
     Ok((0, result))
 }
 
@@ -2821,12 +2833,16 @@ mod option_tests {
             assert!(parse(&["passwords", "--password", password]).is_err());
         }
         assert_eq!(parse(&["extract", "a.zip", "--", "-b.zip"]).unwrap().paths, ["a.zip", "-b.zip"]);
-        let value = parse(&["watch", "--json", "--", "start", "--once"]).unwrap();
+        let value = parse(&["watch", "--json", "start", "--once"]).unwrap();
         assert!(value.once);
         assert!(value.json); // main restores explicitly supplied parent flags
         assert!(parse(&["watch", "start", "--json"]).unwrap().json);
         assert!(parse(&["config", "validate", "--scan-rule-stdin"]).unwrap().rule_stdin);
-        assert_eq!(parse(&["--", "extract", "file.zip"]).unwrap().paths, ["file.zip"]);
+        assert!(parse(&["--", "extract", "file.zip"]).is_err());
+        assert!(parse(&["watch", "--json", "--", "start", "--once"]).is_err());
+        assert_eq!(parse(&["watch", "startup", "--", "status"]).unwrap().paths, ["status"]);
+        assert_eq!(parse(&["watch", "startup", "status", "--"]).unwrap().paths, ["status"]);
+        assert_eq!(parse(&["pw", "-jp=x"]).unwrap().passwords[0].as_ref(), "=x");
         assert!(parse(&["--he"]).is_err());
         assert!(parse(&["extract", "--he"]).is_err());
         for args in [
@@ -2834,8 +2850,6 @@ mod option_tests {
             vec!["extract", "--unknown", "--help"],
             vec!["extract", "--dire", "--help"],
             vec!["--unknown", "--help"],
-            vec!["-hx"],
-            vec!["extract", "-hx"],
             vec!["extract", "-hp", "secret"],
             vec!["extract", "-hvpsecret"],
             vec!["extract", "-hFf"],
@@ -2848,6 +2862,8 @@ mod option_tests {
             vec!["--unknown", "watch"],
         ] { assert!(parse(&args).unwrap().help, "{args:?}"); }
         for args in [
+            vec!["-hx"],
+            vec!["extract", "-hx"],
             vec!["extract", "--password", "--help"],
             vec!["extract", "-hp", "--help"],
             vec!["extract", "-hvp", "--help"],
@@ -3064,6 +3080,7 @@ mod recursive_prompt_tests {
             (&["config", "nonsense"], "sunpack config: error: argument config_action: invalid choice: 'nonsense' (choose from show, validate)\n"),
             (&["watch", "--json"], "sunpack watch: error: the following arguments are required: watch_action\n"),
             (&["config", "--json"], "sunpack config: error: the following arguments are required: config_action\n"),
+            (&["config", "--"], "sunpack config: error: the following arguments are required: config_action\n"),
             (&["watch", "startup", "nonsense"], "sunpack watch startup: error: argument action: invalid choice: 'nonsense' (choose from enable, disable, status)\n"),
             (&["watch", "startup", "enable", "disable"], "sunpack: error: unrecognized arguments: disable\n"),
             (&["scan", "-j"], "sunpack scan: error: the following arguments are required: paths\n"),
@@ -3072,7 +3089,10 @@ mod recursive_prompt_tests {
             (&["version", "-h=x"], "sunpack version: error: argument -h/--help: ignored explicit argument 'x'\n"),
             (&["extract", "x", "-h=x"], "sunpack extract: error: argument -h/--help: ignored explicit argument 'x'\n"),
             (&["scan", "x", "-jp"], "sunpack scan: error: argument -p/--password: expected one argument\n"),
-            (&["scan", "x", "-junknown"], "sunpack: error: unrecognized arguments: -unknown\n"),
+            (&["scan", "x", "-junknown"], "sunpack scan: error: argument -j/--json: ignored explicit argument 'unknown'\n"),
+            (&["pw", "-hjunk"], "sunpack passwords: error: argument -j/--json: ignored explicit argument 'unk'\n"),
+            (&["passwords", "--", "-j"], "sunpack: error: unrecognized arguments: -- -j\n"),
+            (&["config", "validate", "--"], "sunpack: error: unrecognized arguments: --\n"),
             (&["extract", "x", "-r", "0"], "sunpack extract: error: argument -r/--recur: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
             (&["extract", "x", "--recur=bad"], "sunpack extract: error: argument -r/--recur: recursive_extract must be \"*\", \"?\", or a positive integer\n"),
             (&["extract", "x", "-c", "bad"], "sunpack extract: error: argument -c/--cleanup: archive_cleanup_mode must be one of: d, r, k\n"),

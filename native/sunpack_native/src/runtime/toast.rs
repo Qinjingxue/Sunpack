@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(800);
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 - 20;
 
 // A failed snapshot is consumed. Recreate only when a later snapshot arrives;
 // component initialization failure is terminal, matching the host's lifecycle.
@@ -269,7 +270,7 @@ impl Snapshot {
         }
     }
 
-    pub(super) fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode(&self) -> io::Result<Vec<u8>> {
         let mode = if self.kind != 1 {
             0
         } else if self.progress.is_some() {
@@ -277,26 +278,33 @@ impl Snapshot {
         } else {
             2
         };
-        let mut result = Vec::new();
-        let action_count = u8::from(self.action.is_some()) + u8::from(self.report_action.is_some());
-        result.extend([self.kind, mode, action_count, 0]);
-        result.extend(self.progress.unwrap_or_default().to_le_bytes());
-        for field in [
+        let fields = [
             &self.batch,
             &self.title,
             &self.body,
             &self.label,
             &self.status,
             &self.value,
-        ] {
+        ];
+        let actions = self.action.iter().chain(&self.report_action);
+        let size = 12 + fields.iter().map(|value| 4 + value.len()).sum::<usize>()
+            + actions.clone().map(|(_, label, target)| 9 + label.len() + target.len()).sum::<usize>();
+        if size > MAX_SNAPSHOT_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "toast snapshot exceeds the 64 KiB size limit"));
+        }
+        let mut result = Vec::with_capacity(size);
+        let action_count = u8::from(self.action.is_some()) + u8::from(self.report_action.is_some());
+        result.extend([self.kind, mode, action_count, 0]);
+        result.extend(self.progress.unwrap_or_default().to_le_bytes());
+        for field in fields {
             push_text(&mut result, field);
         }
-        for (kind, label, target) in self.action.iter().chain(&self.report_action) {
+        for (kind, label, target) in actions {
             result.push(*kind);
             push_text(&mut result, label);
             push_text(&mut result, target);
         }
-        result
+        Ok(result)
     }
 }
 
@@ -1623,13 +1631,25 @@ impl Toast {
                             (Snapshot::completed(&completed, report.clone()), Some(completed), report)
                         }
                     };
-                    let payload = snapshot.encode();
                     // Validate and consume under the state gate, then call
                     // WinRT outside it. Only this thread performs native effects;
                     // newer progress, clear or stop is consumed on its next turn.
                     let mut available = true;
                     let mut failure = None;
                     let show = || {
+                        let payload = match snapshot.encode() {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                failure = Some(("toast_snapshot_rejected", error));
+                                if let Some(current) = &presenter {
+                                    if let Err(error) = current.clear() {
+                                        report_error("toast_error", &error);
+                                        presenter.take();
+                                    }
+                                }
+                                return;
+                            }
+                        };
                         sequence = sequence.wrapping_add(1);
                         available = show_snapshot(
                             &mut presenter,
@@ -1887,7 +1907,9 @@ mod tests {
         assert_eq!(snapshot.body, "Stop unconfirmed. Check the current processing status.");
         let target = format!("C:\\{}", "路径".repeat(1500));
         snapshot.action = Some((1, "Open".into(), target.clone()));
-        assert!(snapshot.encode().ends_with(target.as_bytes()));
+        assert!(snapshot.encode().unwrap().ends_with(target.as_bytes()));
+        snapshot.report_action = Some((2, "Report".into(), "路径".repeat(MAX_SNAPSHOT_BYTES / 6)));
+        assert_eq!(snapshot.encode().unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2575,6 +2597,14 @@ mod tests {
         assert!(fs::read_to_string(&report).unwrap().contains("archive failure before user stop"));
         assert!(Snapshot::completed(&completed, Some(report)).report_action.is_some());
         assert!(publisher.shared.present_completed(&completed, || {}));
+
+        let next = publisher.register(Arc::from("03"), Language::En);
+        next.event(queued(3, "next.zip", None, 0));
+        progress(&next, 3, "next.zip", 1, 2);
+        let next_batch = current(&publisher).batch;
+        assert_ne!(batch, next_batch);
+        assert!(publisher.stop_group(&batch).is_empty());
+        assert_eq!(publisher.stop_group(&next_batch), vec![Arc::<str>::from("03")]);
     }
 
     #[test]

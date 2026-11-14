@@ -848,7 +848,7 @@ mod tests {
             ).unwrap();
             let destination = plan.moves()[0].1.clone();
             assert_ne!(destination, root.join(filename));
-            let (_, _, _, error, _) = plan.execute(|| Ok(()));
+            let (_, error, _) = plan.execute(|| Ok(()));
             assert!(error.is_empty(), "{error}");
             let diagnostic = Arc::clone(checkpoint.failure.as_ref().unwrap());
             checkpoint.promoted(&super::super::coordinator::PromotionPaths::new(plan.moves())).unwrap();

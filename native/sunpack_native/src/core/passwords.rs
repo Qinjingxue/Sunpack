@@ -326,6 +326,13 @@ struct StoreState {
     snapshot: Arc<PasswordSnapshot>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    Refresh,
+    Observe,
+    CheckStamp,
+}
+
 pub struct BuiltinStore {
     path: PathBuf,
     state: Mutex<StoreState>,
@@ -397,7 +404,7 @@ impl BuiltinStore {
 
     pub fn reload(&self) -> io::Result<Arc<PasswordSnapshot>> {
         // File change notifications can observe writes with identical metadata.
-        self.read_snapshot(true)
+        self.read_snapshot(ReadMode::Refresh)
     }
 
     pub(crate) fn invalidate(&self) {
@@ -405,23 +412,28 @@ impl BuiltinStore {
     }
 
     pub(crate) fn observed_snapshot(&self) -> Arc<PasswordSnapshot> {
-        if self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            if let Err(error) = self.reload() {
-                eprintln!("Cannot load password JSON; keeping the last valid snapshot: {error}");
-            }
-        }
-        self.snapshot()
+        self.request_snapshot(ReadMode::Observe)
     }
 
     pub(crate) fn snapshot_for_request(&self) -> Arc<PasswordSnapshot> {
-        self.read_snapshot(false).unwrap_or_else(|error| {
+        self.request_snapshot(ReadMode::CheckStamp)
+    }
+
+    fn request_snapshot(&self, mode: ReadMode) -> Arc<PasswordSnapshot> {
+        self.read_snapshot(mode).unwrap_or_else(|error| {
             eprintln!("Cannot load password JSON; keeping the last valid snapshot: {error}");
             self.snapshot()
         })
     }
 
-    fn read_snapshot(&self, force: bool) -> io::Result<Arc<PasswordSnapshot>> {
+    fn read_snapshot(&self, mode: ReadMode) -> io::Result<Arc<PasswordSnapshot>> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Claim the notification under the lock that publishes its snapshot.
+        // Concurrent readers must wait for this reload before using the cache.
+        let dirty = self.dirty.swap(false, Ordering::AcqRel);
+        if !dirty && mode == ReadMode::Observe {
+            return Ok(Arc::clone(&state.snapshot));
+        }
         let mut file = match TrackedFile::open_reader(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -433,7 +445,7 @@ impl BuiltinStore {
             Err(error) => return Err(error),
         };
         let generation = physical_file_generation(&file).ok();
-        if !force && generation.is_some() && generation == state.generation {
+        if !dirty && mode == ReadMode::CheckStamp && generation.is_some() && generation == state.generation {
             return Ok(state.snapshot.clone());
         }
         let mut text = Vec::new();
@@ -482,20 +494,18 @@ impl BuiltinStore {
         document.read_passwords(None)?;
         let history = document.history()?;
         let mut seen = HashSet::with_capacity(history.len() + values.len());
-        let mut updated: Vec<&str> = history
-            .iter()
-            .map(String::as_str)
-            .filter(|value| seen.insert(*value))
-            .collect();
-        seen.clear();
+        let mut recent = Vec::with_capacity(values.len());
         for value in values {
             valid_text(value)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
             if seen.insert(value.as_str()) {
-                updated.retain(|previous| *previous != value.as_str());
-                updated.push(value);
+                recent.push(value.as_str());
             }
         }
+        let mut updated: Vec<&str> = history.iter().map(String::as_str)
+            .filter(|value| seen.insert(*value))
+            .collect();
+        updated.extend(recent);
         let updated = &updated[updated.len().saturating_sub(max_entries)..];
         if updated
             .iter()
@@ -634,6 +644,23 @@ mod tests {
     }
 
     #[test]
+    fn password_notification_overrides_an_unchanged_request_stamp() {
+        use super::{physical_file_generation, BuiltinStore, StoreState, TrackedFile};
+        let path = crate::test_support::temp_file("builtin_password_notify", br#"{"passwords":[{"value":"old"}]}"#);
+        let store = BuiltinStore { path: path.clone(), state: std::sync::Mutex::new(StoreState::default()), dirty: Default::default() };
+        assert_eq!(store.reload().unwrap().global()[0].as_ref(), "old");
+
+        fs::write(&path, br#"{"passwords":[{"value":"new"}]}"#).unwrap();
+        // Simulate an edit that leaves the cached generation unchanged.
+        store.state.lock().unwrap().generation = physical_file_generation(&TrackedFile::open_reader(&path).unwrap()).ok();
+        assert!(store.state.lock().unwrap().generation.is_some());
+        store.invalidate();
+        assert_eq!(store.snapshot_for_request().global()[0].as_ref(), "new");
+        assert_eq!(store.observed_snapshot().global()[0].as_ref(), "new");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn clipboard_save_reports_share_conflict_without_waiting_for_reader() {
         use std::{os::windows::fs::OpenOptionsExt, sync::{mpsc, Mutex}, time::Duration};
         let path = crate::test_support::temp_file("clipboard_share_conflict", br#"{"passwords":[],"clipboard_history":[]}"#);
@@ -651,6 +678,20 @@ mod tests {
         let error = result.expect("clipboard save waited for an external reader").unwrap_err();
         assert!(matches!(error.raw_os_error(), Some(32 | 33)));
         assert_eq!(fs::read(&path).unwrap(), br#"{"passwords":[],"clipboard_history":[]}"#);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_merge_moves_repeated_values_to_the_end_in_copy_order() {
+        use super::BuiltinStore;
+        let path = crate::test_support::temp_file("clipboard_merge_order", br#"{"passwords":[{"value":"configured"}],"clipboard_history":["old","copied","old","retained"]}"#);
+        let store = BuiltinStore { path: path.clone(), state: Default::default(), dirty: Default::default() };
+        let copied = ["copied".to_owned(), "new".to_owned(), "copied".to_owned()];
+        assert!(store.merge_clipboard(&copied, 3).unwrap());
+        assert!(!store.merge_clipboard(&copied, 3).unwrap());
+        let snapshot = store.reload().unwrap();
+        assert_eq!(snapshot.global().iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            ["configured", "retained", "copied", "new"]);
         fs::remove_file(path).unwrap();
     }
 

@@ -511,7 +511,7 @@ pub struct Outcome {
     #[serde(skip)]
     pub(crate) promoted_sources: Vec<PromotedSource>,
     #[serde(skip)]
-    pub(crate) removed_promotion_dirs: Vec<String>,
+    pub(crate) coalesced_from: Option<u64>,
     #[serde(skip)]
     scan_incomplete: bool,
     #[serde(skip)]
@@ -537,7 +537,6 @@ impl Outcome {
             self.checkpoints = Vec::new();
             self.promoted_sources = Vec::new();
         }
-        self.removed_promotion_dirs = Vec::new();
         let mut groups: HashMap<(String, usize), Vec<ArchiveResult>> = HashMap::new();
         let mut order = Vec::new();
         for archive in std::mem::take(&mut self.archives) {
@@ -802,6 +801,8 @@ pub(crate) trait Observer: Send + Sync {
     // Publish logical roots after discovery, before any root can complete.
     // Admitted physical aliases are not necessarily independent tasks.
     fn roots_planned<'a>(&self, _paths: impl Iterator<Item = &'a str>) {}
+
+    fn coalesced(&self) {}
 
     // The default keeps the caller's aggregate result. Watch transfers a
     // settled root to its ordinary completion queue without cloning receipts.

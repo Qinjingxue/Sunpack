@@ -1081,8 +1081,25 @@ fn project_proposal(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    input.volume_style = style;
-    input.parts.sort_unstable_by_key(|part| part.volume_number);
+    if input.parts.is_empty() && input.volume_attempts.is_none() {
+        // Header-encrypted groups can own a set of candidate files before
+        // the password proves their volume numbers. Keep their physical
+        // paths for admission and receipts without inventing a volume layout.
+        input.mode = OpenMode::File;
+        input.analysis.origin = AnalysisOrigin::RelationsFallback;
+        input.parts = validation
+            .part_paths()
+            .map(|path| InputPart::range(InputExtent {
+                path: path.to_owned(),
+                start: 0,
+                end: None,
+            }))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+    } else {
+        input.volume_style = style;
+        input.parts.sort_unstable_by_key(|part| part.volume_number);
+    }
     if proposal.format == "zip" && input.volume_attempts.is_none() {
         let mut logical_start = 0u64;
         for (path, _) in &proposal.volumes {

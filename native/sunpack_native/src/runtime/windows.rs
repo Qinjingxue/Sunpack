@@ -208,9 +208,11 @@ pub(super) struct Foreground<'a> {
 }
 
 impl<'a> Foreground<'a> {
-    pub(super) async fn enter_async(engine: &'a Engine, watch: &'a super::watch::Watch) -> Self {
+    pub(super) async fn enter_async(
+        engine: &'a Engine, watch: &'a super::watch::Watch, configured_mode: ProcessMode,
+    ) -> Self {
         let _transition = PRIORITY_TRANSITION.lock().await;
-        let (host, applied) = process::ForegroundPriority::enter();
+        let (host, applied) = process::ForegroundPriority::enter((!watch.is_running()).then_some(configured_mode));
         let mode = process::effective_mode();
         let worker = engine.set_process_mode_async(mode).await;
         super::diagnostics::qos(mode, engine.worker_pid(), &applied, &worker);
@@ -415,7 +417,7 @@ pub(super) fn activate_toast(cwd: &Path, identity: &str) -> io::Result<i32> {
     if !matches!(result, Ok(Some(0))) {
         let language = crate::core::config::load_language(cwd);
         let presenter = library.presenter(Path::new(""))?;
-        presenter.show(&super::toast::Snapshot::stop_failed(&id, language).encode(), 1)?;
+        presenter.show(&super::toast::Snapshot::stop_failed(&id, language).encode()?, 1)?;
     }
     result.map(|code| code.unwrap_or(1))
 }

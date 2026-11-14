@@ -1853,6 +1853,7 @@ fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
+#[cfg(test)]
 fn canonical_release_roots(paths: &[String]) -> Vec<PathBuf> {
     let roots = paths
         .iter()
@@ -1895,20 +1896,18 @@ pub(crate) fn clear_reader_resources() -> io::Result<HashMap<&'static str, u64>>
     Ok(metrics)
 }
 
-pub(crate) fn release_reader_resources_under_roots(
-    paths: Vec<String>,
-) -> io::Result<HashMap<&'static str, u64>> {
-    let (handles, cache_entries, cache_bytes) = (|| {
-        let roots = canonical_release_roots(&paths);
-        crate::password::context::release_under_roots(&roots);
-        crate::analysis_native::release_stream_structure_cache_under_roots(&roots);
-        manager().release_resources_under_roots(&roots)
-    })()?;
-    let mut metrics = HashMap::new();
-    metrics.insert("handles", (handles) as u64);
-    metrics.insert("cache_entries", (cache_entries) as u64);
-    metrics.insert("cache_bytes", (cache_bytes) as u64);
-    Ok(metrics)
+pub(crate) fn release_reader_resources_under_resolved_roots(roots: &[PathBuf]) -> io::Result<()> {
+    crate::password::context::release_under_roots(roots);
+    crate::analysis_native::release_stream_structure_cache_under_roots(roots);
+    if let Some(manager) = MANAGER.get() {
+        manager.release_resources_under_roots(roots)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn release_reader_resources_under_roots(paths: Vec<String>) -> io::Result<()> {
+    release_reader_resources_under_resolved_roots(&canonical_release_roots(&paths))
 }
 
 static MANAGER: OnceLock<ReaderManager> = OnceLock::new();
