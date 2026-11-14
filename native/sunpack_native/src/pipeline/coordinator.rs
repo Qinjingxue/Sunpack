@@ -2136,6 +2136,10 @@ impl<'run, O: Observer> Run<'run, O> {
                     for checkpoint in parent_checkpoints.iter_mut().flatten() { checkpoint.promoted(&paths)?; }
                 }
             }
+            // A replaced attempt is report history after successful cleanup,
+            // not a failed input of the replacement's physical execution.
+            let physical_complete = parent_outputs.iter()
+                .all(|(result, ..)| result.failure.is_none() && !result.partial);
             let promoted = parent_outputs.iter().map(|(result, ..)| result)
                 .chain(replacement_result.iter()).all(|result| result.promoted);
             let parent_outputs = parent_outputs.into_iter()
@@ -2251,7 +2255,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     this.observer.after_output(&result)?;
                     // Cancellation after this durable commit must not roll it
                     // back. Match main's commit/check then retire ordering.
-                    if commit_completed && !multi {
+                    if commit_completed && !multi && physical_complete {
                         if let Some(output) = result.output.as_deref() {
                             this.created_outputs.lock().unwrap().commit_if_unowned(output);
                         }
@@ -2322,12 +2326,17 @@ impl<'run, O: Observer> Run<'run, O> {
                     first.output = segment;
                     published?;
                 }
-                let mut created = this.created_outputs.lock().unwrap();
-                if let Some(root) = carrier.as_deref() {
-                    created.commit_if_unowned(root);
-                }
-                for output in completed.iter().filter_map(|result| result.output.as_deref()) {
-                    created.commit_if_unowned(output);
+                // Only physical complete success retires rollback ownership
+                // early. Accepted partial/salvage bytes survive normal request
+                // completion, but a later cancelled sibling must discard them.
+                if physical_complete {
+                    let mut created = this.created_outputs.lock().unwrap();
+                    if let Some(root) = carrier.as_deref() {
+                        created.commit_if_unowned(root);
+                    }
+                    for output in completed.iter().filter_map(|result| result.output.as_deref()) {
+                        created.commit_if_unowned(output);
+                    }
                 }
             }
             if let Some(root) = &carrier {
@@ -8213,6 +8222,128 @@ mod tests {
         assert!(!observer.0.lock().unwrap().contains(&sibling));
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn request_cancellation_rolls_back_partial_but_not_complete_or_continued_outputs() {
+        // Actual worker receipts, task commit, observer boundary and request
+        // rollback. Cancel after the task finishes but before the request does;
+        // this is the ownership window exposed by a later sibling cancellation.
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(worker) = crate::core::resources::worker_path(&checkout) else { return; };
+        fn zip(damaged: bool) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            let mut directory = Vec::new();
+            for (index, name) in [b"good.txt", b"late.txt"].into_iter().enumerate() {
+                let data = b"verified complete member";
+                let crc = crc32fast::hash(data) ^ u32::from(damaged && index == 1);
+                let offset = bytes.len() as u32;
+                bytes.extend(0x04034b50u32.to_le_bytes());
+                for value in [20u16, 0, 0, 0, 0] { bytes.extend(value.to_le_bytes()); }
+                for value in [crc, data.len() as u32, data.len() as u32] { bytes.extend(value.to_le_bytes()); }
+                bytes.extend((name.len() as u16).to_le_bytes()); bytes.extend(0u16.to_le_bytes());
+                bytes.extend(name); bytes.extend(data);
+                directory.extend(0x02014b50u32.to_le_bytes());
+                for value in [20u16, 20, 0, 0, 0, 0] { directory.extend(value.to_le_bytes()); }
+                for value in [crc, data.len() as u32, data.len() as u32] { directory.extend(value.to_le_bytes()); }
+                for value in [name.len() as u16, 0, 0, 0, 0] { directory.extend(value.to_le_bytes()); }
+                directory.extend(0u32.to_le_bytes()); directory.extend(offset.to_le_bytes()); directory.extend(name);
+            }
+            let offset = bytes.len() as u32;
+            let size = directory.len() as u32;
+            bytes.extend(directory); bytes.extend(0x06054b50u32.to_le_bytes());
+            for value in [0u16, 0, 2, 2] { bytes.extend(value.to_le_bytes()); }
+            bytes.extend(size.to_le_bytes()); bytes.extend(offset.to_le_bytes()); bytes.extend(0u16.to_le_bytes());
+            bytes
+        }
+        // Root ID must not collide with the engine-assigned carrier segment
+        // IDs: input_finished precedes the physical task commit boundary.
+        struct CancelAfterTask { cancel: Cancellation, enabled: bool }
+        impl Observer for CancelAfterTask {
+            fn notify(&self, event: Event) {
+                if self.enabled && matches!(event, Event::Finished { id: 1000, .. }) {
+                    self.cancel.cancel();
+                }
+            }
+        }
+        for multi in [false, true] {
+            for damaged in [false, true] {
+                for cancel_after in [false, true] {
+                    let first = zip(damaged);
+                    let mut bytes = first.clone();
+                    if multi { bytes.extend(zip(false)); }
+                    let source = crate::test_support::temp_file("partial_request_cancel", &bytes);
+                    let output = source.with_extension("output");
+                    fs::create_dir(&output).unwrap();
+                    let input = ArchiveInput::file(source.to_string_lossy().into_owned(), "zip".into(), "archive".into());
+                    let inputs = if multi {
+                        archive_input_slices(&input, &[("zip", 0, Some(first.len() as u64)),
+                            ("zip", first.len() as u64, Some(bytes.len() as u64))])
+                            .unwrap().0.into_iter().map(Option::unwrap).collect::<Vec<_>>()
+                    } else { vec![input] };
+                    let engine = Engine::new(worker.clone());
+                    let mut request = Request::new(vec![source.clone()], Mode::Extract);
+                    request.output_root = Some(output.clone());
+                    request.max_depth = 0;
+                    let config = Arc::make_mut(&mut request.config);
+                    config.extraction.content_requirement = ContentRequirement::AllowPartial;
+                    config.post_extract.archive_cleanup_mode = CleanupMode::Keep;
+                    config.post_extract.flatten_single_directory = false;
+                    let observer = CancelAfterTask { cancel: request.cancel.clone(), enabled: cancel_after };
+                    let run = test_run(&engine, &request, &observer);
+                    let task = Task { primary: None, inputs: inputs.iter().cloned().map(|input|
+                        LogicalInput { input, password_probe: None, password: None, failure: None }).collect(),
+                        owned_paths: vec![source.to_string_lossy().into_owned()],
+                        source: DiscoverySource::Embedded, retry: None, scope: None };
+                    let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
+                        let run = Arc::clone(&run);
+                        Box::pin(async move {
+                        let result = run.execute_task(run.register_task(task), 1000, 1, None, spawner).await;
+                        let before = result.as_ref().unwrap();
+                        assert_eq!(before.archives.len(), if multi { 2 } else { 1 });
+                        assert_eq!(before.archives[0].partial, damaged, "multi={multi} cancel={cancel_after} failure={:?}", before.archives[0].failure);
+                        assert!(before.archives[0].output.as_ref().unwrap().join("good.txt").is_file());
+                        run.finish(result).await
+                    })}).unwrap();
+                    assert!(source.is_file());
+                    for archive in &outcome.archives {
+                        assert_eq!(archive.output.is_some(), !cancel_after || !damaged,
+                            "multi={multi} damaged={damaged} cancel={cancel_after} failure={:?}", archive.failure);
+                    }
+                    if damaged && !cancel_after {
+                        // An existing continuation is not newly owned by the
+                        // cancelled request and must never be rolled back.
+                        let mut continued = request.clone();
+                        continued.cancel = Cancellation::new();
+                        continued.checkpoints = outcome.checkpoints.into_vec();
+                        let observer = CancelAfterTask { cancel: continued.cancel.clone(), enabled: true };
+                        let mut run = test_run(&engine, &continued, &observer);
+                        for (index, checkpoint) in continued.checkpoints.iter().enumerate() {
+                            Arc::get_mut(&mut run).unwrap().checkpoints.entry(Arc::from(path_key(&checkpoint.carrier().to_string_lossy())))
+                                .or_default().insert(checkpoint.key(), index);
+                        }
+                        let task = Task { primary: None, inputs: inputs.into_iter().map(|input|
+                            LogicalInput { input, password_probe: None, password: None, failure: None }).collect(),
+                            owned_paths: vec![source.to_string_lossy().into_owned()],
+                            source: DiscoverySource::Embedded, retry: None, scope: None };
+                        let retained = Scheduler::new().run(2, Origin::Foreground, &continued.cancel, |spawner| {
+                        let run = Arc::clone(&run);
+                        Box::pin(async move {
+                            let result = run.execute_task(run.register_task(task), 1000, 1, None, spawner).await;
+                            run.finish(result).await
+                        })}).unwrap();
+                        assert!(retained.archives.iter().all(|archive| archive.retained
+                            && archive.output.as_ref().unwrap().join("good.txt").is_file()));
+                    }
+                    drop(run);
+                    drop(engine);
+                    release_reader_resources_under_roots(vec![output.to_string_lossy().into_owned(), source.to_string_lossy().into_owned()]).unwrap();
+                    fs::remove_dir_all(output).unwrap();
+                    fs::remove_file(source).unwrap();
+                }
+            }
+        }
     }
 
     #[test]

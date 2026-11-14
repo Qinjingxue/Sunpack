@@ -284,8 +284,13 @@ pub(crate) struct NativeEmbeddedBatch {
     relation_cache: RelationCache,
     scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<io::Error>>>,
     ids: Vec<usize>,
+    cursor: usize,
+    nominated: usize,
+    peer_rows: Option<HashMap<(usize, String), Vec<usize>>>,
+    seen_paths: HashSet<String>,
     force_scan: bool,
     pending_volumes: Vec<PendingEmbeddedVolume>,
+    supplemental: HashSet<usize>,
     excluded: HashSet<String>,
     claimed_ranges: HashMap<String, Vec<(u64, u64)>>,
 }
@@ -460,45 +465,29 @@ impl NativeDiscoveryRoutes {
 
 impl NativeEmbeddedBatch {
     pub(crate) fn len(&self) -> usize {
-        self.ids.len()
+        self.ids.len() - self.cursor
     }
 
     /// Process selected jobs across roots and consume their cached scan evidence.
     /// Root-local policy, relation ownership and password evidence stay in each batch.
     pub(crate) fn scan_pages(
-        mut groups: Vec<(&NativeCandidateTable, &mut NativeEmbeddedBatch)>,
-        offset: usize,
+        mut groups: Vec<(&mut NativeCandidateTable, &mut NativeEmbeddedBatch)>,
         limit: usize,
     ) -> io::Result<Vec<(usize, Vec<EmbeddedPageRow>)>> {
         let mut jobs = Vec::new();
-        let mut skip = offset;
-        for (group, (_, batch)) in groups.iter().enumerate() {
-            if jobs.len() == limit {
-                break;
-            }
-            if skip >= batch.ids.len() {
-                skip -= batch.ids.len();
-                continue;
-            }
-            let take = (limit - jobs.len()).min(batch.ids.len() - skip);
-            jobs.extend(
-                batch.ids[skip..skip + take]
-                    .iter()
-                    .map(|&index| (group, index)),
-            );
-            skip = 0;
+        for (group, (table, batch)) in groups.iter_mut().enumerate() {
+            batch.enqueue_volume_peers(table);
+            let take = (limit - jobs.len()).min(batch.len());
+            jobs.extend(batch.ids[batch.cursor..batch.cursor + take].iter()
+                .map(|&index| (group, index)));
+            batch.cursor += take;
+            if jobs.len() == limit { break; }
         }
-        let borrowed: Vec<_> = groups
-            .iter()
-            .map(|(table, batch)| (*table, &**batch))
-            .collect();
+        let borrowed: Vec<_> = groups.iter().map(|(table, batch)| (&**table, &**batch)).collect();
         let outcomes = scan_embedded_jobs(&borrowed, &jobs)?;
         for (group, index) in jobs {
             let (_, batch) = &mut groups[group];
-            if !batch.scans.is_empty()
-                && batch.scans.remove(&index).is_some()
-                && batch.scans.is_empty()
-            {
+            if !batch.scans.is_empty() && batch.scans.remove(&index).is_some() && batch.scans.is_empty() {
                 batch.scans = HashMap::new();
             }
         }
@@ -506,13 +495,74 @@ impl NativeEmbeddedBatch {
         for (group, index, outcome) in outcomes {
             by_group.entry(group).or_default().push((index, outcome));
         }
-        by_group
-            .into_iter()
-            .map(|(group, outcomes)| {
-                let (table, batch) = &mut groups[group];
-                Ok((group, batch.project_outcomes(table, outcomes.into_iter())?))
-            })
-            .collect()
+        by_group.into_iter().map(|(group, outcomes)| {
+            let (table, batch) = &mut groups[group];
+            let mut rows = batch.project_outcomes(table, outcomes.into_iter())?;
+            // Supplemental rows supply relation facts, not additional targets.
+            rows.retain(|row| !batch.supplemental.contains(&row.index));
+            batch.enqueue_volume_peers(table);
+            Ok((group, rows))
+        }).collect()
+    }
+
+    // Volume evidence extends the same physical discovery frontier. Index raw
+    // row references only when needed, then consume each source/stem once.
+    fn enqueue_volume_peers(&mut self, table: &mut NativeCandidateTable) {
+        let mut selected = HashSet::new();
+        for item in &self.pending_volumes[self.nominated..] {
+            if !item.anchor.multivolume && !item.anchor.needs_password { continue; }
+            let stem = crate::scan::catalog::catalog_stem(&item.anchor.path);
+            let key = path_key(&item.anchor.path);
+            for (source, snapshot) in table.relation_sources.iter().enumerate() {
+                let contains = match &table.rows[item.index] {
+                    Candidate::File(facts, row) => Arc::ptr_eq(facts, &snapshot.table)
+                        && (snapshot.rows.len() == snapshot.table.paths.len() || snapshot.rows.contains(row)),
+                    Candidate::Relation(_) => snapshot.rows.iter()
+                        .any(|&row| path_key(&snapshot.table.paths[row]) == key),
+                };
+                if contains { selected.insert((source, stem.clone())); }
+            }
+        }
+        self.nominated = self.pending_volumes.len();
+        if selected.is_empty() { return; }
+        let index = self.peer_rows.get_or_insert_with(|| {
+            self.seen_paths.extend(table.rows.iter().map(|row| path_key(row.embedded_source().0)));
+            let mut index: HashMap<(usize, String), Vec<usize>> = HashMap::new();
+            // Original candidates already bound every stem this frontier can
+            // nominate; appended peers cannot introduce another filename stem.
+            // Build this set only if a raw unknown peer actually exists.
+            let mut candidate_stems = None;
+            for (source, snapshot) in table.relation_sources.iter().enumerate() {
+                for &row in snapshot.rows.iter() {
+                    if snapshot.table.is_dirs[row] || !snapshot.table.relation_member_eligible[row]
+                        || snapshot.table.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor).is_some() {
+                        continue;
+                    }
+                    let path = &snapshot.table.paths[row];
+                    let key = path_key(path);
+                    if self.seen_paths.contains(&key) || self.excluded.contains(&key)
+                        || self.relation_cache.anchors.contains_key(&key) { continue; }
+                    let stems = candidate_stems.get_or_insert_with(|| table.rows.iter()
+                        .map(|row| crate::scan::catalog::catalog_stem(row.embedded_source().0))
+                        .collect::<HashSet<_>>());
+                    let stem = crate::scan::catalog::catalog_stem(path);
+                    if stems.contains(&stem) { index.entry((source, stem)).or_default().push(row); }
+                }
+            }
+            index
+        });
+        for (source, stem) in selected {
+            let Some(rows) = index.remove(&(source, stem)) else { continue; };
+            let snapshot = &table.relation_sources[source];
+            for row in rows {
+                let key = path_key(&snapshot.table.paths[row]);
+                if self.excluded.contains(&key) || !self.seen_paths.insert(key) { continue; }
+                let row_index = table.rows.len();
+                table.rows.push(Candidate::File(Arc::clone(&snapshot.table), row));
+                self.supplemental.insert(row_index);
+                self.ids.push(row_index);
+            }
+        }
     }
 
     pub(crate) fn encrypted_volume_paths(&self, table: &NativeCandidateTable) -> Vec<String> {
@@ -596,6 +646,9 @@ impl NativeEmbeddedBatch {
             .collect();
         let mut cache = std::mem::take(&mut batch.relation_cache);
         let mut pending = std::mem::take(&mut batch.pending_volumes);
+        let requested: HashSet<_> = pending.iter()
+            .filter(|item| !batch.supplemental.contains(&item.index))
+            .map(|item| path_key(&item.anchor.path)).collect();
         let pending_keys: HashSet<_> = pending
             .iter()
             .map(|item| path_key(&item.anchor.path))
@@ -736,6 +789,7 @@ impl NativeEmbeddedBatch {
             })
             .collect();
         if anchors.is_empty() {
+            fallback.retain(|row| !batch.supplemental.contains(&row.index));
             return Ok(fallback);
         }
         let sources = &table.relation_sources;
@@ -793,6 +847,47 @@ impl NativeEmbeddedBatch {
                         .get(&stem(g.entry_path()))
                         .is_some_and(|p| p.len() > 1)
             });
+        }
+        if !batch.supplemental.is_empty() {
+            // Ownership is physical: a related carrier may also hold a second
+            // split head. Keep its connected groups before cleanup can own the
+            // carrier, without promoting unrelated same-stem archives.
+            let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut keep = vec![false; groups.len()];
+            let mut work = Vec::new();
+            for (index, group) in groups.iter().enumerate() {
+                let data = group.candidate_data();
+                for path in std::iter::once(data.entry_path).chain(data.parts())
+                    .chain(data.companions.iter().map(String::as_str)) {
+                    let key = path_key(path);
+                    if requested.contains(&key) && !keep[index] {
+                        keep[index] = true;
+                        work.push(index);
+                    }
+                    by_path.entry(key).or_default().push(index);
+                }
+            }
+            let mut owned = HashSet::new();
+            while let Some(index) = work.pop() {
+                let data = groups[index].candidate_data();
+                for path in std::iter::once(data.entry_path).chain(data.parts())
+                    .chain(data.companions.iter().map(String::as_str)) {
+                    let key = path_key(path);
+                    if let Some(peers) = by_path.remove(&key) {
+                        owned.insert(key);
+                        for peer in peers {
+                            if !keep[peer] {
+                                keep[peer] = true;
+                                work.push(peer);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut index = 0;
+            groups.retain(|_| { let retain = keep[index]; index += 1; retain });
+            fallback.retain(|row| !batch.supplemental.contains(&row.index)
+                || owned.contains(&path_key(table.rows[row.index].embedded_source().0)));
         }
         for group in groups {
             // Keep the decrypted head's password request-local. Execution uses
@@ -1386,8 +1481,13 @@ impl NativeCandidateTable {
             pending_volumes: Vec::new(),
             excluded,
             claimed_ranges,
+            supplemental: HashSet::new(),
             scans,
             ids,
+            cursor: 0,
+            nominated: 0,
+            peer_rows: None,
+            seen_paths: HashSet::new(),
             force_scan,
         }
     }
@@ -1425,6 +1525,8 @@ fn scan_embedded_candidate(
     if !metadata.is_file() || metadata.len() == 0 {
         return EmbeddedOutcome::Residual;
     }
+    #[cfg(test)]
+    peer_scan_tests::record_scan(path);
     match scan_embedded_path(path, parallel_files) {
         Ok(scan) if scan.has_candidates() => EmbeddedOutcome::Scan(Arc::new(scan)),
         Ok(_) => EmbeddedOutcome::Residual,
@@ -1462,4 +1564,101 @@ fn relation_path_keys<'a>(
         .filter(|path| !path.is_empty())
         .map(path_key)
         .collect()
+}
+
+#[cfg(test)]
+mod peer_scan_tests {
+    use super::*;
+    use crate::analysis_native::volume_anchor::VolumeAnchor;
+    use crate::scan::directory::DirectoryEntryRecord;
+
+    static SCANS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    pub(super) fn record_scan(path: &str) {
+        if let Some(count) = SCANS.lock().unwrap().get_mut(path) { *count += 1; }
+    }
+
+    #[test]
+    fn targeted_volume_peer_scan_reuses_known_facts_and_ignores_other_stems() {
+        let head = crate::test_support::temp_file("volume_peers", b"ordinary bytes");
+        let peer = head.with_extension("peer");
+        let peers: Vec<_> = std::iter::once(peer.clone())
+            .chain((1..257).map(|index| head.with_extension(format!("peer-{index}")))).collect();
+        for peer in &peers { std::fs::write(peer, b"ordinary peer bytes").unwrap(); }
+        let paths: Vec<_> = [head.clone(), peer.clone(), head.with_extension("cheap"),
+            head.with_extension("cached"), head.with_extension("excluded")]
+            .into_iter().map(|path| path.to_string_lossy().into_owned()).collect();
+        let anchor = VolumeAnchor { path: paths[0].clone(), multivolume: true, ..Default::default() };
+        let mut records: Vec<_> = paths.iter().map(|path| DirectoryEntryRecord {
+            path: path.clone(), relation_member_eligible: true, ..Default::default()
+        }).collect();
+        records[2].relation_anchor = Some(CheapAnchor::Full(Arc::new(VolumeAnchor {
+            path: paths[2].clone(), multivolume: true, ..Default::default()
+        })));
+        records.extend(peers.iter().skip(1).map(|path| DirectoryEntryRecord {
+            path: path.to_string_lossy().into_owned(), relation_member_eligible: true, ..Default::default()
+        }));
+        records.extend((0..10_000).map(|index| DirectoryEntryRecord {
+            path: format!("unrelated-{index}.bin"), relation_member_eligible: true, ..Default::default()
+        }));
+        let source = Arc::new(NativeDirectorySnapshot::build_table(records));
+        let snapshot = NativeDirectorySnapshot { rows: Arc::new((0..source.paths.len()).collect()), table: Arc::clone(&source) };
+        let other_path = head.parent().unwrap().join("other-scope").join(head.file_name().unwrap()).to_string_lossy().into_owned();
+        let other_table = Arc::new(NativeDirectorySnapshot::build_table(vec![DirectoryEntryRecord {
+            path: other_path.clone(), relation_member_eligible: true, ..Default::default()
+        }]));
+        let other = NativeDirectorySnapshot { rows: Arc::new(vec![0]), table: other_table };
+        let mut table = NativeCandidateTable {
+            rows: vec![Candidate::File(Arc::clone(&source), 0)],
+            relation_sources: vec![snapshot, other], ..Default::default()
+        };
+        let mut batch = NativeEmbeddedBatch::default();
+        batch.pending_volumes.push(PendingEmbeddedVolume { index: 0, anchor: anchor.clone(), scan: None });
+        batch.relation_cache.anchors.insert(path_key(&paths[3]), anchor.clone());
+        batch.excluded.insert(path_key(&paths[4]));
+        {
+            let mut scans = SCANS.lock().unwrap();
+            scans.extend(source.paths.iter().cloned().map(|path| (path, 0)));
+            scans.insert(other_path.clone(), 0);
+        }
+        NativeEmbeddedBatch::scan_pages(vec![(&mut table, &mut batch)], 256).unwrap();
+        assert_eq!(batch.supplemental.len(), 257);
+        assert_eq!(batch.len(), 1);
+        // Only the unselected same-stem source remains indexed; 10,000 other
+        // stems never allocate persistent buckets, and this scope cannot scan it.
+        assert_eq!(batch.peer_rows.as_ref().unwrap().len(), 1);
+        assert_eq!(table.rows[1].embedded_source().0, paths[1]);
+        // Re-entering this request reuses its rows, without a second peer job.
+        NativeEmbeddedBatch::scan_pages(vec![(&mut table, &mut batch)], 256).unwrap();
+        assert_eq!(table.rows.len(), 258);
+        assert_eq!(batch.len(), 0);
+        NativeEmbeddedBatch::scan_pages(vec![(&mut table, &mut batch)], 256).unwrap();
+        assert!(table.rows.iter().all(|row| matches!(row, Candidate::File(facts, _) if Arc::ptr_eq(facts, &source))));
+        {
+            let scans = SCANS.lock().unwrap();
+            for peer in &peers { assert_eq!(scans.get(peer.to_string_lossy().as_ref()), Some(&1)); }
+            assert_eq!(scans.get(&other_path), Some(&0));
+            for path in [&paths[0], &paths[2], &paths[3], &paths[4]] {
+                assert_eq!(scans.get(path), Some(&0));
+            }
+            assert!((0..10_000).all(|index| scans.get(&format!("unrelated-{index}.bin")) == Some(&0)));
+        }
+        // A directory pass has already scanned all these physical rows.
+        table.rows = (0..source.paths.len()).map(|row| Candidate::File(Arc::clone(&source), row)).collect();
+        batch.supplemental.clear();
+        batch.nominated = 0;
+        batch.peer_rows = None;
+        batch.seen_paths.clear();
+        NativeEmbeddedBatch::scan_pages(vec![(&mut table, &mut batch)], 256).unwrap();
+        assert!(batch.supplemental.is_empty());
+        {
+            let mut scans = SCANS.lock().unwrap();
+            assert_eq!(scans.get(&paths[1]), Some(&1));
+            for path in &source.paths { scans.remove(path); }
+            scans.remove(&other_path);
+        }
+        std::fs::remove_file(head).unwrap();
+        for peer in peers { std::fs::remove_file(peer).unwrap(); }
+    }
 }

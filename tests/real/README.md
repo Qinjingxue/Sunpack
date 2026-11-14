@@ -15,7 +15,7 @@
 | Watch 直写 RAR SFX 头卷 | `.exe` 是数据头卷。其他卷已到达、头卷仍有写句柄时不能提交头卷；关闭后应解压并清理。 |
 | CLI 存在两个同长度的中间卷 | 同一卷位的坏候选不能挡住正确候选；解压后只清理实际使用的分卷，保留坏候选。 |
 
-另有一条严格的预期失败：实时 Watch 先看到单独封装的 RAR 尾卷，随后其余载体卷写完，仍会把完整卷组判成缺卷。测试仅在发现该缺卷状态、未输出且所有输入保持原样时接受预期失败；修复后应去掉标记。
+The live Watch wrapped-RAR tail-first regression requires successful extraction and configured cleanup of all source volumes after the remaining carriers arrive; a complete group remaining suspended is a failure.
 
 在现有开发环境中构建测试工具后，可单独运行不需要 Watch Broker 的真实归档用例：
 

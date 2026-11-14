@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 /// mutable structural facts. All indices belong to this source's scan lifetime.
 pub(super) enum RelationSource<'a> {
     Snapshot(&'a NativeDirectorySnapshot, Option<&'a RelationCache>),
+    #[cfg(test)]
     Physical(&'a [RelationInput]),
 }
 
@@ -12,6 +13,7 @@ impl<'a> RelationSource<'a> {
     pub fn indices(&self) -> impl Iterator<Item = usize> + '_ + use<'_, 'a> {
         let len = match self {
             Self::Snapshot(snapshot, _) => snapshot.rows.len(),
+            #[cfg(test)]
             Self::Physical(rows) => rows.len(),
         };
         (0..len).filter_map(|offset| match self {
@@ -19,6 +21,7 @@ impl<'a> RelationSource<'a> {
                 let row = snapshot.rows[offset];
                 (!snapshot.table.is_dirs[row]).then_some(row)
             }
+            #[cfg(test)]
             Self::Physical(_) => Some(offset),
         })
     }
@@ -26,6 +29,7 @@ impl<'a> RelationSource<'a> {
     pub fn path(&self, row: usize) -> &'a str {
         match self {
             Self::Snapshot(snapshot, _) => &snapshot.table.paths[row],
+            #[cfg(test)]
             Self::Physical(rows) => &rows[row].path,
         }
     }
@@ -36,6 +40,7 @@ impl<'a> RelationSource<'a> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default(),
+            #[cfg(test)]
             Self::Physical(rows) => &rows[row].name,
         }
     }
@@ -47,6 +52,7 @@ impl<'a> RelationSource<'a> {
                 .or(snapshot.table.relation_anchors[row]
                     .as_ref()
                     .and_then(|fact| fact.anchor())),
+            #[cfg(test)]
             Self::Physical(rows) => rows[row].anchor.as_ref(),
         }
     }
@@ -57,6 +63,7 @@ impl<'a> RelationSource<'a> {
                 snapshot.table.sizes[row],
                 snapshot.table.relation_member_eligible[row],
             ),
+            #[cfg(test)]
             Self::Physical(rows) => (rows[row].size, rows[row].relation_member_eligible),
         };
         RelationInput {
@@ -69,6 +76,7 @@ impl<'a> RelationSource<'a> {
                 Self::Snapshot(snapshot, _) => snapshot.table.relation_anchors[row]
                     .as_ref()
                     .map(|fact| fact.materialize(self.path(row), size.unwrap_or(0))),
+                #[cfg(test)]
                 Self::Physical(_) => None,
             }),
             anchor_cell: match self {
@@ -78,6 +86,7 @@ impl<'a> RelationSource<'a> {
                     .get(row)
                     .cloned()
                     .flatten(),
+                #[cfg(test)]
                 Self::Physical(rows) => rows[row].anchor_cell.clone(),
             },
         }

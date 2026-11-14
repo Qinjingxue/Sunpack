@@ -436,7 +436,6 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
         &filtered_keys,
         path_passwords,
         cached,
-        None,
     )
 }
 
@@ -517,7 +516,6 @@ pub(crate) fn resolve_embedded_volumes(
             &keys,
             None,
             Some(&cache),
-            None,
         ));
     }
     output
@@ -564,82 +562,44 @@ fn resolve_shared_carrier_volumes(
         .collect();
     let mut proposals = Vec::new();
     let mut mappings = HashSet::new();
-    for anchor in &anchors {
-        let key = path_key(&anchor.path);
-        let stem = case_key(first_dot_stem(basename(&anchor.path)));
-        for buckets in &scopes {
-            let Some(scope) = buckets.get(&stem) else {
-                continue;
-            };
-            if !scope.iter().any(|row| row.path_key == key) {
-                continue;
-            }
-            let rows: Vec<_> = scope
-                .iter()
-                .filter_map(|row| {
-                    let mut row = row.clone();
-                    if let Some(options) = by_path.get(&row.path_key) {
-                        let chosen = if row.path_key == key {
-                            anchor
-                        } else {
-                            let mut matching = options
-                                .iter()
-                                .copied()
-                                .filter(|other| other.format == anchor.format);
-                            let first = matching.next()?;
-                            // The same slot's other analyzed slices become
-                            // source extents in the compact attempt plan.
-                            first
-                        };
-                        row.anchor = Some(chosen.clone());
-                        row.anchor_cell = None;
+    for buckets in &scopes {
+        for scope in buckets.values() {
+            // A physical row can contain several logical volume slices. Keep
+            // all already analyzed anchors before slot/layout construction;
+            // never choose a representative anchor and try to repair it later.
+            let mut rows = Vec::new();
+            for row in scope {
+                if let Some(options) = by_path.get(&row.path_key) {
+                    for anchor in options {
+                        let mut slice = row.clone();
+                        slice.anchor = Some((*anchor).clone());
+                        slice.anchor_cell = None;
+                        rows.push(slice);
                     }
-                    Some(row)
-                })
-                .collect();
-            for group in build_candidate_groups_from_source(
-                RelationSource::Physical(&rows),
-                &HashSet::from([key.clone()]),
-                None,
-                Some(&cache),
-                Some(&by_path),
-            ) {
-                let NativeRelationGroup::Proposal(ref validation) = group else {
-                    continue;
-                };
-                if !validation
-                    .facts
-                    .anchors
-                    .get(&key)
-                    .is_some_and(|a| a.structure_offset == anchor.structure_offset)
-                {
+                } else {
+                    rows.push(row.clone());
+                }
+            }
+            let name_index = BucketIndex::build(&rows, Some(&selected));
+            // Proven logical slices may share a physical lease. Ordinary path
+            // arbitration would erase a blocked sibling when another succeeds.
+            for validation in resolve_candidate_validations(&mut rows, &name_index, None, Some(&cache)) {
+                let Some((head_path, _)) = validation.proposal.volumes.iter().find(|(_, slot)| *slot == 1) else { continue; };
+                let head_key = path_key(head_path);
+                let Some(head) = validation.facts.anchors.get(&head_key) else { continue; };
+                if !by_path.get(&head_key).is_some_and(|anchors| anchors.iter().any(|anchor|
+                    anchor.format == validation.proposal.format
+                        && anchor.structure_offset == head.structure_offset)) {
                     continue;
                 }
-                if !validation
-                    .proposal
-                    .volumes
-                    .iter()
-                    .any(|part| part.1 > 0 && path_key(&part.0) == key)
-                {
-                    continue;
-                }
-                let mapping: Vec<_> = validation
-                    .proposal
-                    .volumes
-                    .iter()
-                    .map(|part| {
-                        let a = validation.facts.anchors.get(&path_key(&part.0));
-                        (
-                            path_key(&part.0),
-                            part.1,
-                            a.and_then(|a| a.structure_offset),
-                            a.and_then(|a| a.payload_end),
-                        )
-                    })
-                    .collect();
-                if mappings.insert(mapping) {
-                    proposals.push(group);
-                }
+                let group = NativeRelationGroup::Proposal(validation);
+                let NativeRelationGroup::Proposal(ref validation) = group else { unreachable!() };
+                let mapping: Vec<_> = validation.proposal.volumes.iter().map(|part| {
+                    let anchor = validation.facts.anchors.get(&path_key(&part.0));
+                    (path_key(&part.0), validation.proposal.format.clone(), part.1, anchor.and_then(|a| a.structure_offset),
+                        anchor.and_then(|a| a.payload_end))
+                }).collect();
+                if mappings.insert(mapping) { proposals.push(group); }
             }
         }
     }
@@ -719,12 +679,26 @@ fn resolve_shared_carrier_volumes(
     output
 }
 
+fn resolve_candidate_validations(
+    rows: &mut [RelationInput],
+    index: &BucketIndex,
+    passwords: Option<&[(String, String)]>,
+    cached: Option<&RelationCache>,
+) -> Vec<ProposalValidation> {
+    structural::collect(rows, index, passwords);
+    let mut validations = assignment::resolve_buckets(rows, index, cached);
+    for validation in &mut validations {
+        attempts::resolve_carrier_geometry(validation);
+        validate::validate(validation);
+    }
+    validations
+}
+
 fn build_candidate_groups_from_source(
     source: RelationSource<'_>,
     filtered_keys: &HashSet<String>,
     path_passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
-    alternative_anchors: Option<&HashMap<String, Vec<&VolumeAnchor>>>,
 ) -> Vec<NativeRelationGroup> {
     let scope = RelationScopeIndex::build(&source, filtered_keys);
     let mut output = Vec::new();
@@ -734,15 +708,7 @@ fn build_candidate_groups_from_source(
         .map(|row| source.materialize(row))
         .collect();
     let name_index = BucketIndex::build(&directory_rows, Some(filtered_keys));
-    structural::collect(&mut directory_rows, &name_index, path_passwords);
-    let mut validations = assignment::resolve_buckets(&directory_rows, &name_index, cached);
-    for validation in &mut validations {
-        if let Some(options) = alternative_anchors {
-            attempts::expand_carrier_sources(validation, options);
-        }
-        attempts::resolve_carrier_geometry(validation);
-        validate::validate(validation);
-    }
+    let validations = resolve_candidate_validations(&mut directory_rows, &name_index, path_passwords, cached);
     // Arbitration considers every candidate in the active stem bucket,
     // including competitors whose head was not selected by the caller.
     let validation_owned_paths: Vec<HashSet<String>> =

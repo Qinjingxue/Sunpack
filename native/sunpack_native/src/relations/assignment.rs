@@ -547,6 +547,8 @@ pub(super) fn resolve_buckets(
 ) -> Vec<ProposalValidation> {
     let mut output = Vec::new();
     for (stem, bucket) in &index.rows_by_stem {
+        let mut physical_paths = HashSet::new();
+        let shared_carrier = bucket.iter().any(|i| !physical_paths.insert(rows[*i].path_key.as_str()));
         let formats: HashSet<_> = bucket
             .iter()
             .filter_map(|i| rows[*i].anchor.as_ref())
@@ -583,7 +585,10 @@ pub(super) fn resolve_buckets(
                 }) {
                     continue;
                 }
-                if formats.len() > 1 && !f.owned {
+                // Independent slices share a scope, not a filename family.
+                // Opaque continuation disks remain candidates just as in each
+                // head's original scope; known other formats were excluded above.
+                if !shared_carrier && formats.len() > 1 && !f.owned {
                     let suffix = row.name.split_once('.').map_or("", |(_, s)| s);
                     if archive_family_hint(suffix) != Some(format) {
                         continue;
@@ -649,6 +654,25 @@ pub(super) fn resolve_buckets(
                     .all(|i| facts[i].exact_slot.is_some())
             {
                 members.retain(|i| facts[i].owned);
+            }
+            // Several analyzed slices can occupy one physical carrier. The
+            // unique-file assignment solver intentionally cannot express that;
+            // feed the same full structural facts to the existing slot-domain
+            // builder instead, before filename families can collapse a slice.
+            let mut physical = HashSet::new();
+            if members.iter().any(|i| !physical.insert(rows[*i].path_key.as_str())) {
+                for &i in &members {
+                    features.entry(i).or_insert_with(|| cached
+                        .and_then(|cache| cache.names.get(&rows[i].path_key)).cloned()
+                        .unwrap_or_else(|| NameFeatures::parse(&rows[i].name)));
+                }
+                let view = BucketView { rows, indexes: &members, facts: &facts,
+                    features: &features, format, loose_numeric_allowed: true };
+                let candidates = attempts::build(&view, None);
+                if !candidates.is_empty() {
+                    output.extend(candidates);
+                    continue;
+                }
             }
             let structural_only = BucketView {
                 rows,
@@ -853,7 +877,7 @@ pub(super) fn resolve_buckets(
                     family.clone()
                 };
                 if reason.is_some() {
-                    let candidates = attempts::build(&view, &logical);
+                    let candidates = attempts::build(&view, Some(&logical));
                     if !candidates.is_empty() {
                         output.extend(candidates);
                         continue;
@@ -1043,6 +1067,60 @@ mod tests {
 
     fn slots(validation: &ProposalValidation) -> Vec<u32> {
         validation.proposal.volumes.iter().map(|p| p.1).collect()
+    }
+
+    #[test]
+    fn shared_carrier_keeps_unique_terminal_and_fixed_heads_in_either_slice_order() {
+        for reverse in [false, true] {
+            let mut shared_head = row("same.shared", "rar", Some(1), false);
+            shared_head.anchor.as_mut().unwrap().structure_offset = Some(10);
+            shared_head.anchor.as_mut().unwrap().payload_end = Some(30);
+            let mut shared_tail = row("same.shared", "rar", Some(3), true);
+            shared_tail.anchor.as_mut().unwrap().structure_offset = Some(40);
+            shared_tail.anchor.as_mut().unwrap().payload_end = Some(60);
+            let mut shared = vec![shared_head, shared_tail];
+            if reverse { shared.reverse(); }
+            let mut rows = vec![row("same.game.part1.rar", "rar", Some(1), false),
+                row("same.middle", "rar", Some(2), false)];
+            rows.extend(shared);
+            let groups = resolve(&rows);
+            assert_eq!(groups.len(), 2);
+            for group in groups {
+                if group.proposal.volumes[0].0 == "same.game.part1.rar" {
+                    assert_eq!(group.proposal.logical_name, "same.game");
+                }
+                let plan = group.attempts.as_ref().unwrap();
+                let head = &group.facts.anchors[&path_key(&group.proposal.volumes[0].0)];
+                let mut physical = HashSet::new();
+                assert!(plan.base_sources().iter().all(|source| physical.insert(&source.path)));
+                assert_eq!(group.parts_len(), physical.len());
+                assert!(validation_owned_paths(&group).contains("same.shared"));
+                for layout in &plan.layouts {
+                    let first = &plan.sources[layout[0].1[0]];
+                    assert_eq!(first.path, head.path);
+                    assert_eq!(first.start, head.structure_offset.unwrap_or(0));
+                    assert_eq!(layout[0].1.len(), 1, "heads cannot mix within a domain");
+                    let tails = &layout.iter().find(|(number, _)| *number == 3).unwrap().1;
+                    assert!(tails.iter().any(|&i| plan.sources[i].path == "same.shared"
+                        && plan.sources[i].start == 40 && plan.sources[i].terminal));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_mixed_heads_keep_opaque_continuation_disks() {
+        let rows = vec![
+            row("same.001.image", "zip", Some(1), false),
+            row("same.001.image", "7z", Some(1), false),
+            row("same.z02.image", "", None, false),
+            row("same.zip.image", "zip", Some(3), true),
+            row("same.7z.002.image", "", None, false),
+            row("same.7z.003.image", "7z", Some(3), true),
+        ];
+        let groups = resolve(&rows);
+        let zip = groups.iter().find(|group| group.proposal.format == "zip").unwrap();
+        assert!(validation_owned_paths(zip).contains("same.z02.image"));
     }
 
     #[test]

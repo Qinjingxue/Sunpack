@@ -988,25 +988,53 @@ type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
 // Like main's completed Watch family cache, this outlives candidate admission but
 // remains bounded. Receipt publication can lag behind source lease release.
 const COMPLETED_FAMILY_LIMIT: usize = 4096;
-type CompletedFamilyKey = (Arc<[String]>, bool);
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+enum CompletedMember {
+    Object(u64, [u8; 16]),
+    Path(String),
+}
+
+impl CompletedMember {
+    fn new(path: &str, generation: &PhysicalFileGeneration) -> Self {
+        generation.object_id().map_or_else(|| Self::Path(path.to_owned()),
+            |(volume, file)| Self::Object(volume, file))
+    }
+}
+
+type CompletedFamilyKey = (Arc<[CompletedMember]>, bool);
+struct CompletedGenerations {
+    ordered: Vec<(Arc<str>, PhysicalFileGeneration)>,
+    by_path: HashSet<Arc<str>>,
+}
+
+impl CompletedGenerations {
+    fn new(generations: Vec<(String, PhysicalFileGeneration)>) -> Self {
+        let ordered: Vec<_> = generations.into_iter().map(|(path, generation)|
+            (Arc::<str>::from(path), generation)).collect();
+        let by_path = ordered.iter().map(|(path, _)| Arc::clone(path)).collect();
+        Self { ordered, by_path }
+    }
+}
 
 #[derive(Default)]
 struct CompletedFamilies {
     sequence: u64,
     by_family: HashMap<CompletedFamilyKey, u64>,
-    ordered: BTreeMap<u64, (CompletedFamilyKey, SourceGenerations, PathBuf)>,
+    ordered: BTreeMap<u64, (CompletedFamilyKey, CompletedGenerations, PathBuf)>,
 }
 
 impl CompletedFamilies {
     fn remember(&mut self, generations: SourceGenerations, deep: bool, output: &Path) {
         if generations.is_empty() { return; }
-        let mut members: Vec<_> = generations.keys().cloned().collect();
-        members.sort_unstable();
+        let mut ordered: Vec<_> = generations.into_iter().map(|(path, generation)|
+            (CompletedMember::new(&path, &generation), (path, generation))).collect();
+        ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let (members, generations): (Vec<_>, Vec<_>) = ordered.into_iter().unzip();
         let family = (Arc::from(members), deep);
         if let Some(previous) = self.by_family.remove(&family) { self.ordered.remove(&previous); }
         self.sequence += 1;
         self.by_family.insert(family.clone(), self.sequence);
-        self.ordered.insert(self.sequence, (family, generations, output.to_owned()));
+        self.ordered.insert(self.sequence, (family, CompletedGenerations::new(generations), output.to_owned()));
         while self.ordered.len() > COMPLETED_FAMILY_LIMIT {
             let (_, (family, _, _)) = self.ordered.pop_first().unwrap();
             self.by_family.remove(&family);
@@ -1014,12 +1042,32 @@ impl CompletedFamilies {
     }
 
     fn output(&mut self, generations: &SourceGenerations, deep: bool) -> Option<PathBuf> {
-        let mut members: Vec<_> = generations.keys().cloned().collect();
-        members.sort_unstable();
+        // Rename changes a spelling, not an already extracted physical member.
+        // Keep the full family and content-generation checks, without another
+        // metadata pass or a search through all cached families.
+        let mut current: Vec<_> = generations.iter().map(|(path, generation)|
+            (CompletedMember::new(path, generation), (path, generation))).collect();
+        current.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let (members, current): (Vec<_>, Vec<_>) = current.into_iter().unzip();
         let sequence = *self.by_family.get(&(Arc::from(members), deep))?;
-        let (_, previous, _) = &self.ordered[&sequence];
-        if !generations.iter().all(|(path, current)| current.matches_input(&previous[path].persisted())) {
+        let (_, previous, _) = self.ordered.get_mut(&sequence)?;
+        if !current.iter().zip(&previous.ordered).all(|((_, current), (_, previous))|
+            current.matches_input(&previous.persisted())) {
             return None;
+        }
+        // Late completion/failure checks must use the validated live names too.
+        // Share each name with the membership index and retain unchanged names,
+        // without filesystem observations beyond admission's snapshot.
+        let mut renamed = false;
+        for ((path, _), (stored, _)) in current.iter().zip(&mut previous.ordered) {
+            if stored.as_ref() != path.as_str() {
+                *stored = Arc::from(path.as_str());
+                renamed = true;
+            }
+        }
+        if renamed {
+            previous.by_path.clear();
+            previous.by_path.extend(previous.ordered.iter().map(|(path, _)| Arc::clone(path)));
         }
         self.refresh_output(sequence).map(Path::to_path_buf)
     }
@@ -1027,10 +1075,10 @@ impl CompletedFamilies {
     fn covers(&mut self, path: &Path, deep: bool) -> bool {
         let path = key(path);
         let matched = self.ordered.iter().find_map(|(sequence, (family, generations, _))| {
-            if family.1 != deep || !generations.contains_key(&path) { return None; }
+            if family.1 != deep || !generations.by_path.contains(path.as_str()) { return None; }
             // Require the entire current family, not only the old request's head.
-            generations.iter().all(|(member, previous)| {
-                crate::io::reader::capture_file_generation(Path::new(member))
+            generations.ordered.iter().all(|(member, previous)| {
+                crate::io::reader::capture_file_generation(Path::new(member.as_ref()))
                     .is_ok_and(|current| current.matches_input(&previous.persisted()))
             }).then_some(*sequence)
         });
@@ -6487,6 +6535,40 @@ mod tests {
     }
 
     #[test]
+    fn completed_family_reuses_renamed_members_but_rejects_new_objects() {
+        let head = crate::test_support::temp_file("renamed_family_head", b"head");
+        let tail = head.with_extension("downloading");
+        let arrived = head.with_extension("arrived");
+        let old = head.with_extension("old");
+        let output = head.with_extension("output");
+        fs::write(&tail, b"tail").unwrap();
+        fs::create_dir(&output).unwrap();
+        let capture = |tail: &Path| -> SourceGenerations {
+            [&*head, tail].into_iter().map(|path|
+                (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect()
+        };
+        let mut cache = CompletedFamilies::default();
+        cache.remember(capture(&tail), false, &output);
+        fs::rename(&tail, &arrived).unwrap();
+        let renamed = capture(&arrived);
+        assert_eq!(cache.output(&renamed, false), Some(output.clone()));
+        assert!(cache.covers(&arrived, false));
+        assert!(cache.covers(&head, false));
+        assert!(!cache.covers(&tail, false));
+        assert_eq!(cache.output(&renamed, true), None);
+        // A newly created object at the same name is not a completed member,
+        // even if it has the same bytes and size. Keep the old object alive.
+        fs::rename(&arrived, &old).unwrap();
+        fs::write(&arrived, b"tail").unwrap();
+        assert_eq!(cache.output(&capture(&arrived), false), None);
+        assert_ne!(CompletedMember::Object(1, [7; 16]), CompletedMember::Object(2, [7; 16]));
+        fs::remove_file(head).unwrap();
+        fs::remove_file(arrived).unwrap();
+        fs::remove_file(old).unwrap();
+        fs::remove_dir(output).unwrap();
+    }
+
+    #[test]
     fn idle_completed_families_release_old_output_but_live_requests_reuse_it() {
         let head = crate::test_support::temp_file("idle_family_head", b"head");
         let tail = crate::test_support::temp_file("idle_family_tail", b"tail");
@@ -6518,15 +6600,20 @@ mod tests {
         let generation = crate::io::reader::capture_file_generation(&head).unwrap();
         let mut cache = CompletedFamilies::default();
         cache.remember(HashMap::from([(key(&head), generation.clone())]), false, &directory);
+        // Synthetic unrelated families exercise the LRU without thousands of
+        // filesystem objects; spellings of the same object now intentionally coalesce.
         for n in 1..COMPLETED_FAMILY_LIMIT {
-            cache.remember(HashMap::from([(format!("other-{n}"), generation.clone())]), false, &directory);
+            let family: CompletedFamilyKey = (Arc::from([CompletedMember::Path(format!("other-{n}"))]), false);
+            cache.sequence += 1;
+            cache.by_family.insert(family.clone(), cache.sequence);
+            cache.ordered.insert(cache.sequence, (family, CompletedGenerations::new(vec![(format!("other-{n}"), generation.clone())]), directory.clone()));
         }
         assert!(cache.covers(&head, false));
-        cache.remember(HashMap::from([("new".into(), generation)]), false, &directory);
+        cache.remember(HashMap::from([(key(&head), generation)]), true, &directory);
         assert_eq!(cache.ordered.len(), COMPLETED_FAMILY_LIMIT);
         assert_eq!(cache.by_family.len(), COMPLETED_FAMILY_LIMIT);
         assert!(cache.covers(&head, false));
-        assert!(!cache.by_family.keys().any(|(members, _)| members.iter().any(|path| path == "other-1")));
+        assert!(!cache.by_family.keys().any(|(members, _)| members.iter().any(|member| matches!(member, CompletedMember::Path(path) if path == "other-1"))));
         fs::remove_dir_all(directory).unwrap();
     }
 

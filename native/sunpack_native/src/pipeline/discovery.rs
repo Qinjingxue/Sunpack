@@ -1,5 +1,5 @@
 use super::passwords::CandidateSet;
-use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Origin, Request};
+use super::{DiscoverySource, Failure, FailureKind, InputError, InputErrorKind, Request};
 use crate::core::config::{Config, ScanFilterKind};
 use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
@@ -416,28 +416,6 @@ pub(super) fn discover(
         }
     }
     result.project(&mut tables, candidates, &verified, request, false)?;
-    if request.origin == Origin::Watch {
-        let admitted = |path: &str| {
-            let key = path_key(path);
-            seen.contains(&key) || (!roots.is_empty() && covering_root(&key))
-        };
-        let ready = |path: &str| {
-            admitted(path) || crate::filesystem::watch_file_is_ready(path).unwrap_or(false)
-        };
-        // A late launcher-only SFX companion can resolve a complete family,
-        // but none of its data volumes belong to this batch. Related data
-        // must also have closed before even a provisional blocker is published.
-        result.tasks.retain(|task| {
-            task.inputs.iter().any(|logical| {
-                logical.failure.is_some() || logical.input.physical_paths().any(&admitted)
-            }) && task.inputs.iter().all(|logical| {
-                ready(&logical.input.entry_path)
-                    && logical.input.physical_extents().all(|extent| {
-                        extent.path == logical.input.entry_path || ready(&extent.path)
-                    })
-            })
-        });
-    }
     if request.direct {
         let covered: HashSet<_> = result
             .tasks
@@ -659,13 +637,7 @@ pub(super) fn retry_volume(
             && input.mode.structured()
             && (original.format.is_empty() || input.format_hint == original.format)
             && required.is_subset(&input.physical_paths().map(path_key).collect())
-            // A live refresh may discover a new volume before the Watch
-            // scheduler has admitted it. Let its close event retry the group.
-            && (request.origin != Origin::Watch
-                || input.physical_paths().all(|path| {
-                    required.contains(&path_key(path))
-                        || crate::filesystem::watch_file_is_ready(path).unwrap_or(false)
-                }))
+
         {
             return Ok(Some(task));
         }
@@ -801,27 +773,22 @@ impl Discovered {
             })
             .collect::<io::Result<Vec<_>>>()?;
         const PAGE_SIZE: usize = 256;
-        let mut total = 0;
-        let ends: Vec<_> = scopes
-            .iter()
-            .map(|(_, batch, _)| {
-                total += batch.len();
-                total
-            })
-            .collect();
-        for offset in (0..total).step_by(PAGE_SIZE) {
+        let mut first = 0;
+        while first < scopes.len() {
+            if scopes[first].1.len() == 0 { first += 1; continue; }
             #[cfg(test)]
             MEASURED_EMBEDDED_PAGES.with(|pages| pages.set(pages.get() + 1));
             request.cancel.check_io()?;
-            let first = ends.partition_point(|&end| end <= offset);
-            let last = ends.partition_point(|&end| end < (offset + PAGE_SIZE).min(total));
-            let local_offset = offset - if first == 0 { 0 } else { ends[first - 1] };
-            let groups = tables[first..=last]
-                .iter()
+            let mut last = first;
+            let mut count = scopes[first].1.len();
+            while count < PAGE_SIZE && last + 1 < scopes.len() {
+                last += 1;
+                count += scopes[last].1.len();
+            }
+            let groups = tables[first..=last].iter_mut()
                 .zip(scopes[first..=last].iter_mut())
-                .map(|(table, (_, batch, _))| (table, batch))
-                .collect();
-            for (group, rows) in NativeEmbeddedBatch::scan_pages(groups, local_offset, PAGE_SIZE)? {
+                .map(|(table, (_, batch, _))| (table, batch)).collect();
+            for (group, rows) in NativeEmbeddedBatch::scan_pages(groups, PAGE_SIZE)? {
                 let group = first + group;
                 let (scoped, _, tasks) = &mut scopes[group];
                 scoped.project_rows(&tables[group], rows, tasks, candidates, verified)?;

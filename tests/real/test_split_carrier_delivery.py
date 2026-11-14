@@ -164,21 +164,83 @@ def test_watch_recovers_when_the_final_pkzip_disk_finishes(package, tmp_path, de
             assert final.stat().st_ino != identity
 
     watch.await_archive(case)
+    watch.await_event("done", path=head.name)
     watch.stop()
     assert_once(watch, case)
     watch.assert_no_terminal_failures()
     assert all((watch.root / part.name).read_bytes() == part.read_bytes() for part in parts)
 
 
-class EmbeddedRarStillSuspended(AssertionError):
-    """All wrapped RAR volumes arrived but Watch still reports missing volumes."""
+@pytest.mark.parametrize("target_disk", [0, 2])
+def test_cli_single_wrapped_rar_member_restores_family_and_peer_sibling(package, tmp_path, target_disk):
+    require_generator("rar")
+    case = FACTORY.create(
+        tmp_path / "fixtures", "wrapped", "rar", password="wrapped-key", split=True,
+        payload_size=104 * 1024, split_volume_size=40 * 1024,
+    )
+    parts = sorted(case.archive_dir.iterdir())
+    assert len(parts) == 3
+    carriers = tmp_path / "carriers"
+    carriers.mkdir()
+    sibling = tmp_path / "sibling.zip"
+    with ZipFile(sibling, "w") as archive:
+        archive.writestr("peer-sibling.txt", b"independent payload in a related carrier")
+    wrapped = [
+        _wrap_volume(part, carriers, index, *((sibling,) if index == 1 else ()))
+        for index, part in enumerate(parts)
+    ]
+    unrelated = carriers / "wrapped.notes.bin"
+    with ZipFile(unrelated, "w") as archive:
+        archive.writestr("unrelated.txt", b"not a requested archive")
+    original = unrelated.read_bytes()
+    output = tmp_path / "out"
+    package.configure(filesystem={"scan_filters_enabled": False})
+    report = extract_report(package, wrapped[target_disk], output, passwords=[case.password], cleanup="d")
+    assert report["summary"]["failed_count"] == report["summary"]["partial_success_count"] == 0, report
+    assert marker_present(output, case.marker_name)
+    peer, = output.rglob("peer-sibling.txt")
+    assert peer.read_bytes() == b"independent payload in a related carrier"
+    assert not list(output.rglob("unrelated.txt"))
+    assert unrelated.read_bytes() == original
+    assert not any(path.exists() for path in wrapped)
+
+
+@pytest.mark.parametrize("sibling_format,head_first", [("7z", True), ("rar", True), ("rar", False)],
+                         ids=["mixed-formats", "same-format-head-first", "same-format-member-first"])
+def test_cli_wrapped_member_preserves_split_sibling_on_shared_peer(package, tmp_path, sibling_format, head_first):
+    require_generator("rar")
+    cases = [FACTORY.create(
+        tmp_path / "fixtures", f"wrapped.{name}", fmt, password=f"key-{name}", split=True,
+        payload_size=104 * 1024, split_volume_size=40 * 1024,
+    ) for name, fmt in (("a", "rar"), ("b", sibling_format))]
+    parts = [sorted(case.archive_dir.iterdir()) for case in cases]
+    assert all(len(group) == 3 for group in parts)
+    carriers = tmp_path / "carriers"
+    carriers.mkdir()
+    first = []
+    for index, part in enumerate(parts[0]):
+        target = carriers / f"{part.name}.图片"
+        members = [parts[1][0], part] if index == 1 else [part]
+        if index == 1 and not head_first:
+            members.reverse()
+        assemble_carrier(target, members, seed=50 + index)
+        first.append(target)
+    if sibling_format == "rar":
+        second = [_wrap_volume(part, carriers, index + 3) for index, part in enumerate(parts[1][1:])]
+    else:
+        second = [carriers / part.name for part in parts[1][1:]]
+        for source, target in zip(parts[1][1:], second, strict=True):
+            copyfile(source, target)
+    output = tmp_path / "out"
+    package.configure(filesystem={"scan_filters_enabled": False})
+    report = extract_report(package, first[0], output, passwords=[case.password for case in cases], cleanup="d")
+    assert report["summary"]["failed_count"] == report["summary"]["partial_success_count"] == 0, report
+    for case in cases:
+        assert marker_present(output, case.marker_name)
+    assert not any(path.exists() for path in [*first, *second])
 
 
 @pytest.mark.requires_watch_broker
-@pytest.mark.xfail(
-    strict=True, raises=EmbeddedRarStillSuspended,
-    reason="Live Watch can leave a complete set of separately embedded RAR volumes suspended",
-)
 def test_watch_embedded_rar_tail_before_head_is_retried(package, tmp_path):
     require_generator("rar")
     case = FACTORY.create(
@@ -200,21 +262,9 @@ def test_watch_embedded_rar_tail_before_head_is_retried(package, tmp_path):
     # result for the head can no longer be attributed to a partial download.
     middle = download(watch, wrapped[1])
     head = download(watch, wrapped[0])
-    wait_for(
-        lambda: watch.event("done", path=head.name)
-        or watch.event("suspended_missing_volume", path=head.name),
-        "a result for the delivered RAR head",
-    )
+    watch.await_archive(case)
     watch.stop()
     watch.assert_no_terminal_failures()
-    if not marker_present(watch.output, case.marker_name):
-        blockers = [row for row in watch.display()["live"] if row["event"] == "suspended_missing_volume"]
-        if any(Path(row["path"]) == head for row in blockers):
-            assert all(
-                path.read_bytes() == source.read_bytes()
-                for path, source in zip((head, middle, tail), wrapped, strict=True)
-            )
-            raise EmbeddedRarStillSuspended(blockers)
     assert_once(watch, case)
     assert not any(path.exists() for path in (head, middle, tail))
 

@@ -221,158 +221,7 @@ fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>
     (minimum.filter(|_| trim), minimum, trim)
 }
 
-pub(super) fn from_validation(validation: &ProposalValidation) -> VolumeAttempts {
-    let proposal = &validation.proposal;
-    let head = &validation.facts.anchors[&path_key(&proposal.volumes[0].0)];
-    let (head_size_from_total, minimum_size, trim) = head_geometry(head, &proposal.format);
-    VolumeAttempts {
-        base_source_count: proposal.volumes.len(),
-        sources: proposal
-            .volumes
-            .iter()
-            .map(|part| AttemptSource::new(&part.0, &validation.facts.anchors[&path_key(&part.0)]))
-            .collect(),
-        layouts: vec![proposal
-            .volumes
-            .iter()
-            .enumerate()
-            .map(|(i, part)| (part.1, Arc::new(vec![i])))
-            .collect()],
-        minimum_slots: vec![0],
-        head_size_from_total,
-        minimum_size,
-        tail_totals: if trim && proposal.format == "zip" && proposal.style != "zip_spanned" {
-            proposal
-                .volumes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, part)| {
-                    zip_total(&validation.facts.anchors[&path_key(&part.0)])
-                        .map(|total| (index, total))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        },
-    }
-}
-
-// Carrier discovery has already analyzed every slice. Expand only compatible
-// alternatives at the same proven slot; no new scan or path-only alias model.
-pub(super) fn expand_carrier_sources(
-    validation: &mut ProposalValidation,
-    by_path: &HashMap<String, Vec<&VolumeAnchor>>,
-) {
-    let head = validation
-        .proposal
-        .volumes
-        .iter()
-        .find(|part| part.1 == 1)
-        .map(|p| path_key(&p.0));
-    let Some(head) = head else {
-        return;
-    };
-    let had_plan = validation.attempts.is_some();
-    if !had_plan
-        && !validation.proposal.volumes.iter().any(|p| {
-            path_key(&p.0) != head
-                && by_path
-                    .get(&path_key(&p.0))
-                    .is_some_and(|options| options.len() > 1)
-        })
-    {
-        return;
-    }
-    let mut plan = validation
-        .attempts
-        .take()
-        .unwrap_or_else(|| from_validation(validation));
-    let original_count = plan.sources.len();
-    let mut expanded = HashMap::new();
-    for i in 0..original_count {
-        let source = &plan.sources[i];
-        let key = path_key(&source.path);
-        if key == head {
-            continue;
-        }
-        let Some(options) = by_path.get(&key) else {
-            continue;
-        };
-        let anchor = &validation.facts.anchors[&key];
-        let replacements: Vec<_> = options
-            .iter()
-            .filter(|a| {
-                a.format == validation.proposal.format
-                    && a.internal_volume_number == anchor.internal_volume_number
-                    && a.anchor_roles.contains(&"terminal") == source.terminal
-                    && a.structure_offset.unwrap_or(0) != source.start
-                    && a.internal_volume_number != Some(1)
-            })
-            .map(|a| (AttemptSource::new(&source.path, a), zip_total(a)))
-            .collect();
-        if !replacements.is_empty() {
-            let mut choices = vec![i];
-            for (source, total) in replacements {
-                let index = plan
-                    .sources
-                    .iter()
-                    .position(|old| *old == source)
-                    .unwrap_or_else(|| {
-                        plan.sources.push(source);
-                        plan.sources.len() - 1
-                    });
-                if !plan.tail_totals.is_empty()
-                    && !plan.tail_totals.iter().any(|(i, _)| *i == index)
-                {
-                    if let Some(total) = total {
-                        plan.tail_totals.push((index, total));
-                    }
-                }
-                if !choices.contains(&index) {
-                    choices.push(index);
-                }
-            }
-            expanded.insert(i, choices);
-        }
-    }
-    if !expanded.is_empty() {
-        let mut domains = Domains::default();
-        let mut replacements = HashMap::new();
-        for layout in &mut plan.layouts {
-            for (_, choices) in layout {
-                // Retain the key's allocation while replacing its last slot.
-                // Otherwise the allocator can reuse its address for a new domain.
-                let (_, replacement) =
-                    replacements.entry(Arc::as_ptr(choices)).or_insert_with(|| {
-                        (
-                            Arc::clone(choices),
-                            domains.intern(
-                                choices
-                                    .iter()
-                                    .flat_map(|i| {
-                                        expanded
-                                            .get(i)
-                                            .map_or(std::slice::from_ref(i), Vec::as_slice)
-                                            .iter()
-                                            .copied()
-                                    })
-                                    .collect(),
-                            ),
-                        )
-                    });
-                *choices = Arc::clone(replacement);
-            }
-        }
-        validation.status = ProposalStatus::Valid;
-        validation.reason = None;
-        validation.attempts = Some(plan);
-    } else if had_plan {
-        // Preserve an existing plan, including singleton domains.
-        validation.attempts = Some(plan);
-    }
-}
-
-pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidation> {
+pub(super) fn build(view: &BucketView<'_>, logical: Option<&str>) -> Vec<ProposalValidation> {
     let spanned = view.spanned();
     let mut heads: Vec<_> = view
         .indexes
@@ -777,6 +626,14 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             .into_iter()
             .collect();
         sources.sort_unstable_by_key(|i| (*i != head, *i));
+        let mut physical = HashSet::new();
+        let mut variants = Vec::new();
+        sources.retain(|i| {
+            if physical.insert(view.rows[*i].path_key.as_str()) { true }
+            else { variants.push(*i); false }
+        });
+        let base_source_count = sources.len();
+        sources.extend(variants);
         let positions: HashMap<_, _> = sources.iter().enumerate().map(|(n, i)| (*i, n)).collect();
         let remapped: HashMap<_, _> = domains
             .0
@@ -793,11 +650,26 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             ..Default::default()
         };
         let facts = shared_facts.get_or_insert_with(|| proposal_facts(view, &[]));
-        let mut proposal = materialize(view, assignment, logical, None, Some(facts)).unwrap();
+        // The physical facts map cannot represent two slices at one path.
+        // Its head entry must match this layout's fixed logical head; all peer
+        // slice geometry stays in the row-indexed source/domain plan below.
+        let mut facts = Arc::clone(facts);
+        let head_anchor = view.rows[head].anchor.as_ref().unwrap();
+        if facts.anchors.get(&view.rows[head].path_key)
+            .is_none_or(|anchor| anchor.structure_offset != head_anchor.structure_offset)
+        {
+            Arc::make_mut(&mut facts).anchors.insert(view.rows[head].path_key.clone(), head_anchor.clone());
+        }
+        let head_logical;
+        let logical = if let Some(logical) = logical { logical } else {
+            head_logical = super::filename::logical_name(&view.rows[head].name,
+                &view.features[&head], view.format);
+            &head_logical
+        };
+        let mut proposal = materialize(view, assignment, logical, None, Some(&facts)).unwrap();
         // The head identity is confirmed; its volume composition remains a plan.
         // No speculative bytes are parsed again here.
         proposal.status = ProposalStatus::Valid;
-        let head_anchor = view.rows[head].anchor.as_ref().unwrap();
         let (head_size_from_total, minimum_size, trim_head) =
             head_geometry(head_anchor, view.format);
         let tail_totals = if trim_head && view.format == "zip" && !spanned {
@@ -815,7 +687,7 @@ pub(super) fn build(view: &BucketView<'_>, logical: &str) -> Vec<ProposalValidat
             head_size_from_total,
             tail_totals,
             minimum_size,
-            base_source_count: sources.len(),
+            base_source_count,
             sources: sources
                 .iter()
                 .map(|i| {
